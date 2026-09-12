@@ -167,11 +167,11 @@ void Variant::attention_projection(const Tensor& hidden,
     // family already hands us four independently contiguous destinations, so
     // there is nothing to split afterwards -- which is the reason the declaration
     // keeps q, k and v unfused in the first place.
-    ops::linear(hidden, weights.query, query, kTextPolicy, workspace, stream);
+    ops::linear_projections(hidden, {{weights.query, query, kTextPolicy},
+                                     {weights.key, key, kTextPolicy},
+                                     {weights.value, value, kTextPolicy}}, &workspace, stream);
     apply_lora(weights.query, kQueryPort, hidden, query, stream);
-    ops::linear(hidden, weights.key, key, kTextPolicy, workspace, stream);
     apply_lora(weights.key, kKeyPort, hidden, key, stream);
-    ops::linear(hidden, weights.value, value, kTextPolicy, workspace, stream);
     apply_lora(weights.value, kValuePort, hidden, value, stream);
 }
 
@@ -232,9 +232,9 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     // fuse them and feed one `linear_swiglu`. That costs a launch and buys two
     // adaptable modules: `gate_proj` and `up_proj` have their own weights, so the
     // hook can add a delta to each instead of the fused targets' refusal.
-    ops::linear(hidden, weights.gate, gate, kTextPolicy, workspace, stream);
+    ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
+                                     {weights.up, up, kTextPolicy}}, &workspace, stream);
     apply_lora(weights.gate, kGatePort, hidden, gate, stream);
-    ops::linear(hidden, weights.up, up, kTextPolicy, workspace, stream);
     apply_lora(weights.up, kUpPort, hidden, up, stream);
     ops::gelu_mul(gate, up, kMlpActivation, activation, stream);
     ops::linear(activation, weights.down, projected, kTextPolicy, workspace, stream);

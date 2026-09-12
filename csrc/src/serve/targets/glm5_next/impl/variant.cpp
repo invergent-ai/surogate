@@ -327,12 +327,18 @@ void latent_key(const Tensor& hidden, const Payload& weights, Tensor& key,
 /// query and key norms every other target in this family carries.
 template <class Payload>
 void absorbed_query(const Tensor& hidden, const Payload& weights, Tensor& query,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    WorkspaceArena& workspace, cudaStream_t stream, Tensor* key = nullptr) {
     const std::int32_t tokens = hidden.ne[1];
     auto scope                = workspace.scope();
     Tensor q_low   = workspace.alloc(DType::BF16, {weights.query_a.n, tokens});
     Tensor q_heads = workspace.alloc(DType::BF16, {weights.query_b.n, tokens});
-    project("mla/query_a", hidden, weights.query_a, q_low, workspace, stream);
+    if (key != nullptr) {
+        ops::linear_projections(hidden, {{weights.kv_a, *key, kTextPolicy},
+                                         {weights.query_a, q_low, kTextPolicy}}, &workspace, stream);
+        ops::rmsnorm(*key, weights.kv_a_norm, weights.rms_epsilon, /*unit_offset=*/false, *key, stream);
+    } else {
+        project("mla/query_a", hidden, weights.query_a, q_low, workspace, stream);
+    }
     ops::rmsnorm(q_low, weights.query_a_norm, weights.rms_epsilon, /*unit_offset=*/false, q_low,
                  stream);
     project("mla/query_b", q_low, weights.query_b, q_heads, workspace, stream);
@@ -390,8 +396,7 @@ void Variant::attention_projection(const Tensor& hidden,
     // `gate` is deliberately untouched: this attention writes no output-gate rows and the family
     // skips the multiply (`Variant::attention_output_gate == false`).
     (void)gate;
-    latent_key(hidden, weights, key, workspace, stream);
-    absorbed_query(hidden, weights, query, workspace, stream);
+    absorbed_query(hidden, weights, query, workspace, stream, &key);
     CUDA_CHECK(cudaMemcpyAsync(value.data, key.data,
                                static_cast<std::size_t>(key.numel()) * sizeof(__nv_bfloat16),
                                cudaMemcpyDeviceToDevice, stream));
@@ -420,8 +425,7 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
                                        Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
     (void)gate; // no output-gate rows; the family's tail skips the multiply
-    latent_key(hidden, weights, key, workspace, stream);
-    absorbed_query(hidden, weights, query, workspace, stream);
+    absorbed_query(hidden, weights, query, workspace, stream, &key);
     CUDA_CHECK(cudaMemcpyAsync(value.data, key.data,
                                static_cast<std::size_t>(key.numel()) * sizeof(__nv_bfloat16),
                                cudaMemcpyDeviceToDevice, stream));
@@ -462,9 +466,9 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
     Tensor decay_low = workspace.alloc(DType::BF16, {weights.decay_a.n, tokens});
     Tensor decay     = workspace.alloc(DType::BF16, {weights.decay_b.n, tokens});
     Tensor update    = workspace.alloc(DType::BF16, {weights.beta.n, tokens});
-    project("kda/decay_a", hidden, weights.decay_a, decay_low, workspace, stream);
+    ops::linear_projections(hidden, {{weights.decay_a, decay_low, kTextPolicy},
+                                     {weights.beta, update, kTextPolicy}}, &workspace, stream);
     project("kda/decay_b", decay_low, weights.decay_b, decay, workspace, stream);
-    project("kda/beta", hidden, weights.beta, update, workspace, stream);
     ops::kda_gating(decay, update, weights.a_log, weights.decay_bias, weights.gate_lower_bound, g,
                     beta, stream);
 }
@@ -476,9 +480,9 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     auto scope                = workspace.scope();
     Tensor gate_low = workspace.alloc(DType::BF16, {weights.gate_a.n, tokens});
     Tensor gate     = gate_matrix(output_gate, weights.gate_b.n);
-    project("kda/query_key_value", hidden, weights.query_key_value, qkv, workspace, stream);
     // The output gate is low-rank, so it is two projections rather than rows of the fused one.
-    project("kda/gate_a", hidden, weights.gate_a, gate_low, workspace, stream);
+    ops::linear_projections(hidden, {{weights.query_key_value, qkv, kTextPolicy},
+                                     {weights.gate_a, gate_low, kTextPolicy}}, &workspace, stream);
     project("kda/gate_b", gate_low, weights.gate_b, gate, workspace, stream);
 }
 
@@ -496,8 +500,8 @@ void Variant::gdn_input_projection_snapshot(
     Tensor projected   = workspace.alloc(DType::BF16, {rows, width * batch});
     Tensor convolved   = workspace.alloc(DType::BF16, {rows, width * batch});
     Tensor gate_low    = workspace.alloc(DType::BF16, {weights.gate_a.n, width * batch});
-    project("kda/query_key_value", flat_hidden, weights.query_key_value, projected, workspace,
-            stream);
+    ops::linear_projections(flat_hidden, {{weights.query_key_value, projected, kTextPolicy},
+                                          {weights.gate_a, gate_low, kTextPolicy}}, &workspace, stream);
     // One convolution over the fused q|k|v, checkpointed per lane, then the three spans are
     // taken apart. The fused snapshot op the delta-net targets use projects the output gate as
     // rows of the same parent; here the gate is low-rank and cannot ride along.
@@ -513,7 +517,6 @@ void Variant::gdn_input_projection_snapshot(
     ops::extract_bf16_columns(convolved, per, flat_key, stream);
     ops::extract_bf16_columns(convolved, 2 * per, flat_value, stream);
     Tensor flat_gate = gate_matrix(output_gate, weights.gate_b.n);
-    project("kda/gate_a", flat_hidden, weights.gate_a, gate_low, workspace, stream);
     project("kda/gate_b", gate_low, weights.gate_b, flat_gate, workspace, stream);
 }
 
@@ -562,8 +565,9 @@ void dense_feed_forward(const Tensor& hidden, const FeedForwardPayload& weights,
     const std::int32_t width  = weights.gate_up.n / 2;
     Tensor gate = workspace.alloc(DType::BF16, {width, tokens});
     Tensor up   = workspace.alloc(DType::BF16, {width, tokens});
-    ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
-    ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
+    ops::linear_projections(hidden, {{weights.gate_up, gate, ops::LinearPolicy::A16Only, 0},
+                                     {weights.gate_up, up, ops::LinearPolicy::A16Only, width}},
+                            &workspace, stream);
     family::apply_lora_gate_up(weights.gate_up, hidden, gate, up, stream);
     // Clamped, like every other SwiGLU this model has.
     ops::silu_mul(gate, up, gate, weights.moe.swiglu_limit, stream);

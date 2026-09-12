@@ -226,7 +226,8 @@ void Variant::attention_projection(const Tensor& hidden,
     if (const auto* native = std::get_if<NativeAttentionProjectionPayload>(&weights)) {
         auto scope = workspace.scope();
         Tensor packed = workspace.alloc(DType::BF16, {native->query_gate.n, hidden.ne[1]});
-        ops::linear(hidden, native->query_gate, packed, stream);
+        ops::linear_projections(hidden, {{native->query_gate, packed}, {native->key, key},
+                                         {native->value, value}}, nullptr, stream);
         apply_lora(native->query_gate, family::kQueryPort, hidden, packed, stream);
         const std::size_t head_bytes = native->head_dim * sizeof(std::uint16_t);
         const std::size_t heads = query.numel() / native->head_dim;
@@ -235,8 +236,6 @@ void Variant::attention_projection(const Tensor& hidden,
         CUDA_CHECK(cudaMemcpy2DAsync(gate.data, head_bytes,
                                      static_cast<const std::byte*>(packed.data) + head_bytes,
                                      2 * head_bytes, head_bytes, heads, cudaMemcpyDeviceToDevice, stream));
-        ops::linear(hidden, native->key, key, stream);
-        ops::linear(hidden, native->value, value, stream);
         apply_lora(native->key, family::kKeyPort, hidden, key, stream);
         apply_lora(native->value, family::kValuePort, hidden, value, stream);
         return;
@@ -273,10 +272,9 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
     // view is one format the kernel can take. The packed launch and its split stay for the
     // formats whose fused parent is one plane.
     if (weights.packed.layout == QuantLayout::GgmlBlocks) {
-        ops::linear(hidden, weights.query, query, stream);
-        ops::linear(hidden, weights.key, key, stream);
-        ops::linear(hidden, weights.output_gate, gate, stream);
-        ops::linear(hidden, weights.value, value, stream);
+        ops::linear_projections(hidden, {{weights.query, query}, {weights.key, key},
+                                         {weights.output_gate, gate}, {weights.value, value}},
+                                nullptr, stream);
         return;
     }
     auto scope     = workspace.scope();
@@ -297,15 +295,13 @@ void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjecti
     // heads -- 512 rows -- so it takes the unfused pair, exactly as its q/gate
     // sibling below already does. Correctness first; the fusion can follow if a
     // route table is ever measured for this shape.
-    ops::linear(hidden, weights.key, key, stream);
-    ops::linear(hidden, weights.value, value, stream);
+    ops::linear_projections(hidden, {{weights.key, key}, {weights.value, value}}, nullptr, stream);
 }
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,
                                     const MtpAttentionProjectionWeights& weights, Tensor& query,
                                     Tensor& gate, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear(hidden, weights.query, query, stream);
-    ops::linear(hidden, weights.output_gate, gate, stream);
+    ops::linear_projections(hidden, {{weights.query, query}, {weights.output_gate, gate}}, nullptr, stream);
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
@@ -479,8 +475,8 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
         ops::rmsnorm(residual, norm_weight, eps, true, hidden, stream);
         Tensor a = workspace.alloc(DType::BF16, {control.a_projection.n, hidden.ne[1]});
         Tensor b = workspace.alloc(DType::BF16, {control.b_projection.n, hidden.ne[1]});
-        ops::linear(hidden, control.a_projection, a, stream);
-        ops::linear(hidden, control.b_projection, b, stream);
+        ops::linear_projections(hidden, {{control.a_projection, a}, {control.b_projection, b}},
+                                nullptr, stream);
         ops::lora_auto_bias(weights.dt_bias, a, stream);
         ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, g, beta, stream);
         return;
@@ -505,8 +501,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         Tensor gate = workspace.alloc(DType::BF16, {weights.gate.n, hidden.ne[1]});
         Tensor up = workspace.alloc(DType::BF16, {weights.up.n, hidden.ne[1]});
         Tensor activation = workspace.alloc(DType::BF16, {weights.gate.n, hidden.ne[1]});
-        ops::linear(hidden, weights.gate, gate, stream);
-        ops::linear(hidden, weights.up, up, stream);
+        ops::linear_projections(hidden, {{weights.gate, gate}, {weights.up, up}}, nullptr, stream);
         apply_lora(weights.gate, family::kGatePort, hidden, gate, stream);
         apply_lora(weights.up, family::kUpPort, hidden, up, stream);
         ops::silu_mul(gate, up, activation, stream);

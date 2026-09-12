@@ -273,7 +273,8 @@ void require_x_out(const Tensor& x, std::int32_t k, const Tensor& out, std::int3
 
 /// One row range of one weight against every column of x, written or accumulated into out.
 void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t rows, Tensor& out,
-         bool accumulate, WorkspaceArena* workspace, cudaStream_t stream, const char* op) {
+         bool accumulate, WorkspaceArena* workspace, cudaStream_t stream, const char* op,
+         std::byte* prepared = nullptr) {
     require_fp8_block_weight(w, op);
     if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n || (row_begin % w.scale_ne[1]) != 0 ||
         (row_begin % kTileRows) != 0 || (rows % kTileRows) != 0) {
@@ -300,14 +301,16 @@ void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t 
     }
     const std::size_t bytes = workspace_bytes(k, tokens);
     auto scope              = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
-    std::byte* scratch      = workspace != nullptr
+    std::byte* scratch      = prepared != nullptr ? prepared : workspace != nullptr
                                   ? static_cast<std::byte*>(workspace->alloc_bytes(bytes, kAlign).data)
                                   : static_cast<std::byte*>(ggml::scratch_for(bytes, stream));
     auto* x_codes  = reinterpret_cast<std::uint8_t*>(scratch);
     auto* x_scales = reinterpret_cast<float*>(scratch + codes_bytes(k, tokens));
-    quantize_blocks_kernel<<<dim3(static_cast<unsigned>(kblocks), static_cast<unsigned>(tokens)), kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales);
-    CUDA_CHECK(cudaGetLastError());
+    if (prepared == nullptr) {
+        quantize_blocks_kernel<<<dim3(static_cast<unsigned>(kblocks), static_cast<unsigned>(tokens)), kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales);
+        CUDA_CHECK(cudaGetLastError());
+    }
     const int work = (rows / kTileRows) * ((tokens + kTileCols - 1) / kTileCols);
     const int grid = std::min(work, persistent_blocks());
     if (accumulate) {
@@ -377,6 +380,31 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                   WorkspaceArena* workspace, cudaStream_t stream) {
     run(x, w, row_begin, out.ne[0], out, false, workspace, stream, "fp8 block project_rows");
+}
+
+void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
+                        WorkspaceArena* workspace, cudaStream_t stream) {
+    for (const auto& p : projections) {
+        const Weight view = weight_rows(p.weight, std::max(0, p.row_begin), p.out.ne[0]);
+        require_x_out(x, view.k, p.out, view.n, "fp8 block linear projections");
+    }
+    auto scope = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
+    std::byte* prepared = nullptr;
+    const int k = x.ne[0], tokens = x.ne[1];
+    if (tokens > kGemvMaxTokens && !projections.empty()) {
+        const auto bytes = workspace_bytes(k, tokens);
+        prepared = workspace != nullptr ? static_cast<std::byte*>(workspace->alloc_bytes(bytes, kAlign).data)
+                                         : static_cast<std::byte*>(ggml::scratch_for(bytes, stream));
+        quantize_blocks_kernel<<<dim3(k / kBlock, tokens), kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), k, tokens,
+            reinterpret_cast<std::uint8_t*>(prepared),
+            reinterpret_cast<float*>(prepared + codes_bytes(k, tokens)));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    for (const auto& p : projections) {
+        run(x, p.weight, std::max(0, p.row_begin), p.out.ne[0], p.out, false, workspace, stream,
+            "fp8 block linear projections", prepared);
+    }
 }
 
 } // namespace sinfer::ops::detail::fp8_block

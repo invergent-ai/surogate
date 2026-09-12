@@ -9,6 +9,7 @@
 
 #include "core/tensor.h"
 #include "core/arena.h"
+#include "api/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -43,5 +44,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 /// their parents with.
 void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                   WorkspaceArena* workspace, cudaStream_t stream);
+
+void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
+                        WorkspaceArena* workspace, cudaStream_t stream);
 
 } // namespace sinfer::ops::detail::fp8_block

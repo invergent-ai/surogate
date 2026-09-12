@@ -40,16 +40,6 @@ bool row_projectable(QType qtype) {
     return qtype == QType::BF16_CTRL || detail::ggml::is_ggml_qtype(qtype) ||
            detail::fp8_block::is_fp8_block_qtype(qtype);
 }
-void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
-                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (w.qtype == QType::BF16_CTRL) {
-        linear_rows(x, w, row_begin, out, workspace, stream);
-    } else if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
-        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
-    } else {
-        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
-    }
-}
 std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
                                                      std::int32_t max_tokens) {
     if (qtype == QType::BF16_CTRL) { return 0; }
@@ -341,8 +331,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         if (qkv.ne[0] + z.ne[0] != weight.n) {
             throw std::invalid_argument("gdn_input_proj: row-projected parent rows must equal qkv + z rows");
         }
-        project_rows_any(x, weight, 0, qkv, workspace, stream);
-        project_rows_any(x, weight, qkv.ne[0], z, workspace, stream);
+        linear_projections(x, {{weight, qkv, LinearPolicy::A16Only, 0},
+                              {weight, z, LinearPolicy::A16Only, qkv.ne[0]}}, workspace, stream);
         return;
     }
 
@@ -1034,8 +1024,8 @@ void project_split(const Tensor& x, const Weight& qkv_weight, const Weight& z_we
     if (qkv.ne[0] != qkv_weight.n || z.ne[0] != z_weight.n) {
         throw std::invalid_argument("gdn_input_proj split: destination rows do not match a half");
     }
-    linear(x, qkv_weight, qkv, first_policy, workspace, stream);
-    linear(x, z_weight, z, second_policy, workspace, stream);
+    linear_projections(x, {{qkv_weight, qkv, first_policy}, {z_weight, z, second_policy}},
+                       &workspace, stream);
 }
 
 /// The convolution plane and z from a query|key + value|z pair, for any row-addressable format.

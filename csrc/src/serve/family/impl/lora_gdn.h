@@ -55,11 +55,11 @@ void project_gdn_control(const Tensor& hidden, const P& p, Tensor& a, Tensor& b,
     } else if constexpr (requires { p.control_projection; }) {
         project_gdn_control(hidden, p.control_projection, a, b, workspace, stream);
     } else if constexpr (requires { p.a_projection; }) {
-        ops::linear(hidden, p.a_projection, a, stream);
-        ops::linear(hidden, p.b_projection, b, stream);
+        ops::linear_projections(hidden, {{p.a_projection, a}, {p.b_projection, b}}, nullptr, stream);
     } else {
-        ops::linear_rows(hidden, p.a_b_projection, 0, a, &workspace, stream);
-        ops::linear_rows(hidden, p.a_b_projection, a.ne[0], b, &workspace, stream);
+        ops::linear_projections(hidden, {{p.a_b_projection, a, ops::LinearPolicy::A16Only, 0},
+                                         {p.a_b_projection, b, ops::LinearPolicy::A16Only, a.ne[0]}},
+                                &workspace, stream);
     }
 }
 

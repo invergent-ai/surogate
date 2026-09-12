@@ -217,6 +217,66 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     lora_auto_linear(w, x, out, stream);
 }
 
+void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
+                        WorkspaceArena* workspace, cudaStream_t stream) {
+    const auto overlaps = [](const Tensor& a, const Tensor& b) {
+        const auto ap = reinterpret_cast<std::uintptr_t>(a.data);
+        const auto bp = reinterpret_cast<std::uintptr_t>(b.data);
+        return ap <= bp ? bp - ap < std::uint64_t(a.numel()) * 2 :
+                          ap - bp < std::uint64_t(b.numel()) * 2;
+    };
+    for (std::size_t i = 0; i < projections.size(); ++i) {
+        const auto& p = projections[i];
+        Weight logical = p.weight;
+        if (p.row_begin >= 0) {
+            if (p.out.ne[0] <= 0 || std::int64_t(p.row_begin) + p.out.ne[0] > p.weight.n) {
+                throw std::invalid_argument("linear projections: row range outside parent");
+            }
+            logical.n = p.out.ne[0];
+        } else if (p.row_begin != -1) {
+            throw std::invalid_argument("linear projections: invalid row range");
+        }
+        validate_linear_semantics(x, logical, p.out, p.policy);
+        if (overlaps(x, p.out)) {
+            throw std::invalid_argument("linear projections: output overlaps input");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (overlaps(projections[j].out, p.out)) {
+                throw std::invalid_argument("linear projections: outputs overlap");
+            }
+        }
+    }
+    for (std::size_t i = 0; i < projections.size();) {
+        const bool ggml = detail::ggml::is_ggml_qtype(projections[i].weight.qtype);
+        const bool fp8 = detail::fp8_block::is_fp8_block_qtype(projections[i].weight.qtype);
+        std::size_t end = i;
+        while (end < projections.size() &&
+               ((ggml && detail::ggml::is_ggml_qtype(projections[end].weight.qtype)) ||
+                (fp8 && detail::fp8_block::is_fp8_block_qtype(projections[end].weight.qtype)))) {
+            ++end;
+        }
+        if (end - i >= 2) {
+            if (ggml) {
+                detail::ggml::ggml_linear_projections(x, projections.subspan(i, end - i), workspace, stream);
+            } else {
+                detail::fp8_block::linear_projections(x, projections.subspan(i, end - i), workspace, stream);
+            }
+            for (; i < end; ++i) {
+                const auto& p = projections[i];
+                if (p.row_begin < 0) { lora_auto_linear(p.weight, x, p.out, stream); }
+            }
+        } else {
+            const auto& p = projections[i++];
+            if (p.row_begin >= 0) {
+                linear_rows(x, p.weight, p.row_begin, p.out, workspace, stream);
+            } else {
+                dispatch_linear(x, p.weight, p.out, p.policy, workspace, stream);
+                lora_auto_linear(p.weight, x, p.out, stream);
+            }
+        }
+    }
+}
+
 namespace {
 
 /// The row range as a weight of its own, for a format whose rows are independently addressable.

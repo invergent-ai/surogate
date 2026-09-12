@@ -32,14 +32,6 @@ namespace {
 bool row_projectable(QType qtype) {
     return detail::ggml::is_ggml_qtype(qtype) || detail::fp8_block::is_fp8_block_qtype(qtype);
 }
-void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
-                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
-        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
-    } else {
-        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
-    }
-}
 std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
                                                      std::int32_t max_tokens) {
     return detail::fp8_block::is_fp8_block_qtype(qtype)
@@ -170,8 +162,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         auto scope  = ws.scope();
         Tensor gate = ws.alloc(DType::BF16, {rows, t});
         Tensor up   = ws.alloc(DType::BF16, {rows, t});
-        project_rows_any(x, gate_up_weight, 0, gate, &ws, stream);
-        project_rows_any(x, gate_up_weight, rows, up, &ws, stream);
+        linear_projections(x, {{gate_up_weight, gate, LinearPolicy::A16Only, 0},
+                              {gate_up_weight, up, LinearPolicy::A16Only, rows}}, &ws, stream);
         silu_mul(gate, up, out, stream);
         return;
     }

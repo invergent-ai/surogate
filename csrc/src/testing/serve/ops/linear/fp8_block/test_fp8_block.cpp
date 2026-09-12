@@ -123,7 +123,54 @@ int run(const Case& c) {
         err += d * d; norm += ref[i] * ref[i]; max_abs = std::fmax(max_abs, std::fabs(d)); max_ref = std::fmax(max_ref, std::fabs(ref[i]));
     }
     const double rel = std::sqrt(err / std::fmax(norm, 1e-30));
-    const bool ok = rel <= 6e-3 && max_abs <= 1.5e-2 * max_ref;
+    bool ok = rel <= 6e-3 && max_abs <= 1.5e-2 * max_ref;
+    // Whole matrices and row ranges share the same quantization for either scale grid.
+    DeviceBuffer second(std::size_t(out_rows) * c.tokens * 2);
+    Tensor second_out(second.p, DType::BF16, {out_rows, c.tokens});
+    Weight companion = w;
+    if (c.per_row) {
+        // The row-scale payload also has enough entries for this smaller block grid.
+        companion.qtype = QType::FP8_E4M3FN_BLK128_F32S;
+        companion.scale_ne[0] = companion.scale_ne[1] = 128;
+    }
+    WorkspaceArena workspace(std::max(std::size_t{256}, ops::detail::fp8_block::workspace_bytes(c.k, c.tokens)));
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    for (bool arena : {false, true}) {
+        const auto grouped = [&] {
+            ops::linear_projections(xt, {{w, out, ops::LinearPolicy::A16Only, c.rows_view ? row_begin : -1},
+                                         {companion, second_out, ops::LinearPolicy::A16Only, row_begin}},
+                                    arena ? &workspace : nullptr, stream);
+        };
+        grouped(); CHECK_CUDA(cudaStreamSynchronize(stream));
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        grouped();
+        CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+        CHECK_CUDA(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        std::size_t nodes = 0;
+        CHECK_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
+        ok &= nodes == std::size_t(c.tokens <= 4 ? 2 : 3);
+        for (int round = 0; round < 3; ++round) {
+            for (auto& value : hx) { value = __float2bfloat16(ux(rng)); }
+            CHECK_CUDA(cudaMemcpyAsync(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice, stream));
+            ops::linear_rows(xt, w, row_begin, out, nullptr, stream);
+            ops::linear_rows(xt, companion, row_begin, second_out, nullptr, stream);
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+            std::vector<std::uint16_t> expected(got.size()), expected_second(got.size()), actual(got.size());
+            CHECK_CUDA(cudaMemcpy(expected.data(), d_out, got.size() * 2, cudaMemcpyDeviceToHost));
+            second.copy_to_host(expected_second.data(), second.bytes);
+            CHECK_CUDA(cudaGraphLaunch(exec, stream));
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+            CHECK_CUDA(cudaMemcpy(actual.data(), d_out, actual.size() * 2, cudaMemcpyDeviceToHost));
+            ok &= actual == expected;
+            second.copy_to_host(actual.data(), second.bytes);
+            ok &= actual == expected_second;
+        }
+        CHECK_CUDA(cudaGraphExecDestroy(exec)); CHECK_CUDA(cudaGraphDestroy(graph));
+    }
+    CHECK_CUDA(cudaStreamDestroy(stream));
     std::printf("  [%5d, %5d] T=%-4d %-12s %-8s rel_l2=%.2e max_abs=%.2e of max  %s\n", c.rows, c.k, c.tokens,
                 c.rows_view ? "linear_rows" : "linear", c.per_row ? "per-row" : "blk128", rel, max_abs / max_ref, ok ? "ok" : "FAIL");
     CHECK_CUDA(cudaFree(d_payload)); CHECK_CUDA(cudaFree(d_x)); CHECK_CUDA(cudaFree(d_out));

@@ -231,8 +231,13 @@ void linear_launch(GgmlType type, const void* blocks, std::int32_t rows, std::in
 void linear_prequantized_launch(GgmlType type, const void* blocks, std::int32_t rows,
                                 std::int32_t k, std::int32_t tokens, __nv_bfloat16* out,
                                 void* scratch, std::size_t scratch_bytes, cudaStream_t stream) {
-    if ((type != GgmlType::Q4_K && type != GgmlType::Q5_K && type != GgmlType::Q6_K &&
-         type != GgmlType::Q8_0 && type != GgmlType::IQ4_NL) ||
+    bool quantized = false;
+    switch (type) {
+#define SINFER_PREQUANTIZED_TYPE(Type) case GgmlType::Type: quantized = type != GgmlType::F16; break;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_PREQUANTIZED_TYPE)
+#undef SINFER_PREQUANTIZED_TYPE
+    }
+    if (!quantized ||
         rows <= 0 || k <= 0 || k % block_values(type) || tokens <= 0 || !blocks || !out || !scratch ||
         (reinterpret_cast<std::uintptr_t>(scratch) & 15u) ||
         scratch_bytes < linear_workspace_bytes(rows, k, tokens)) {

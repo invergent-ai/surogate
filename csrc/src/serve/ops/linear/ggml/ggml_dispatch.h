@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "api/ops/linear.h"
 #include "core/tensor.h"
 #include "ops/linear/ggml/ggml_mmvq.h"
 
@@ -40,6 +41,10 @@ Weight ggml_weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t ro
 /// into the caller's tensor. What the fused projections split their parents with.
 void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                        WorkspaceArena* workspace, cudaStream_t stream);
+
+/// Base projections only; the public linear_projections applies whole-matrix adapters.
+void ggml_linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
+                             WorkspaceArena* workspace, cudaStream_t stream);
 
 std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t output_rows,
                                                 std::int32_t input_rows,

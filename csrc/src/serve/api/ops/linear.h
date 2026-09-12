@@ -7,6 +7,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <span>
 
 namespace sinfer::ops {
 
@@ -117,6 +119,27 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+/// Independent projection of the same input. A nonnegative row_begin selects
+/// linear_rows semantics; -1 selects the whole matrix and its automatic adapter binding.
+struct LinearProjection {
+    const Weight& weight;
+    Tensor& out;
+    LinearPolicy policy = LinearPolicy::A16Only;
+    std::int32_t row_begin = -1;
+};
+
+/// Projects one input into disjoint outputs, sharing activation preparation where
+/// the stored formats permit it. Outputs must not alias the input or each other.
+/// Scratch capacity is the maximum of the individual projections, not their sum.
+/// Row ranges retain linear_rows' A16 policy; whole matrices use their own policy.
+void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
+                        WorkspaceArena* workspace, cudaStream_t stream);
+inline void linear_projections(const Tensor& x, std::initializer_list<LinearProjection> projections,
+                               WorkspaceArena* workspace, cudaStream_t stream) {
+    linear_projections(x, std::span<const LinearProjection>(projections.begin(), projections.size()),
+                       workspace, stream);
+}
 
 /**
  * @brief Projects one contiguous row range of a weight, as if that range were a weight of its own.

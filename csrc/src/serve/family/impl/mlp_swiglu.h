@@ -92,8 +92,8 @@ inline void swiglu_mlp(const Tensor& hidden, const Weight& gate_up, Tensor& acti
     Tensor gate = workspace.alloc(DType::BF16, {rows, columns});
     Tensor up   = workspace.alloc(DType::BF16, {rows, columns});
     if (swiglu_halves_addressable(gate_up)) {
-        ops::linear_rows(hidden, gate_up, 0, gate, &workspace, stream);
-        ops::linear_rows(hidden, gate_up, rows, up, &workspace, stream);
+        ops::linear_projections(hidden, {{gate_up, gate, ops::LinearPolicy::A16Only, 0},
+                                         {gate_up, up, ops::LinearPolicy::A16Only, rows}}, &workspace, stream);
     } else {
         Tensor packed = workspace.alloc(DType::BF16, {2 * rows, columns});
         ops::linear(hidden, gate_up, packed, policy, workspace, stream);

@@ -154,8 +154,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         auto pair_scope = workspace.scope();
         Tensor gate = workspace.alloc(DType::BF16, {weights.gate.n, hidden.ne[1]});
         Tensor up = workspace.alloc(DType::BF16, {weights.up.n, hidden.ne[1]});
-        ops::linear(hidden, weights.gate, gate, kTextPolicy, workspace, stream);
-        ops::linear(hidden, weights.up, up, kTextPolicy, workspace, stream);
+        ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
+                                         {weights.up, up, kTextPolicy}}, &workspace, stream);
         apply_lora(weights.gate, family::kGatePort, hidden, gate, stream);
         apply_lora(weights.up, family::kUpPort, hidden, up, stream);
         ops::silu_mul(gate, up, activation, stream);

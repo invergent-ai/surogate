@@ -29,6 +29,8 @@
 #include <cstring>
 #include <fstream>
 #include <algorithm>
+#include <array>
+#include <stdexcept>
 #include <random>
 #include <string>
 #include <type_traits>
@@ -744,6 +746,124 @@ int run_affine_zero(gg::GgmlType type, int tokens) {
     return failures;
 }
 
+int shared_projection_case(const Fixture& f, int tokens, int map_mode, bool arena) {
+    using namespace sinfer;
+    constexpr int guard = 8;
+    DeviceBuffer blocks(f.blocks.size());
+    blocks.copy_from_host(f.blocks.data(), blocks.bytes);
+    Weight full = make_weight(f, blocks.p);
+    const int other_rows = 19;
+    std::vector<gg::block_q8_0> qb(std::size_t(other_rows) * f.k / 32);
+    for (std::size_t b = 0; b < qb.size(); ++b) {
+        qb[b].d = __float2half_rn(.01f);
+        for (int j = 0; j < 32; ++j) { qb[b].qs[j] = (b + j) % 23 - 11; }
+    }
+    DeviceBuffer qblocks(qb.size() * sizeof(qb[0]));
+    qblocks.copy_from_host(qb.data(), qblocks.bytes);
+    Fixture qf; qf.type = gg::GgmlType::Q8_0; qf.n = other_rows; qf.k = f.k;
+    qf.blocks.resize(qblocks.bytes);
+    Weight quantized = make_weight(qf, qblocks.p);
+    std::vector<__half> hf(std::size_t(other_rows) * f.k);
+    for (std::size_t i = 0; i < hf.size(); ++i) { hf[i] = __float2half_rn((int(i % 17) - 8) * .03f); }
+    DeviceBuffer hblocks(hf.size() * sizeof(hf[0]));
+    hblocks.copy_from_host(hf.data(), hblocks.bytes);
+    qf.type = gg::GgmlType::F16; qf.blocks.resize(hblocks.bytes);
+    Weight half = make_weight(qf, hblocks.p);
+    DeviceBuffer map_a(f.k / 32 * sizeof(int)), map_b(map_a.bytes);
+    if (map_mode) {
+        full.input_group_map = static_cast<const int*>(map_a.p);
+        quantized.input_group_map = static_cast<const int*>(map_mode == 1 ? map_a.p : map_b.p);
+        half.input_group_map = map_mode == 1 ? static_cast<const int*>(map_a.p) : nullptr;
+    }
+    DeviceBuffer input(std::size_t(f.k) * tokens * 2);
+    Tensor x(input.p, DType::BF16, {f.k, tokens});
+    std::array<int, 4> rows{f.n, f.n - 2, other_rows, other_rows};
+    std::array<DeviceBuffer, 4> outputs;
+    std::array<Tensor, 4> out;
+    for (int i = 0; i < 4; ++i) {
+        outputs[i] = DeviceBuffer((std::size_t(rows[i]) * tokens + 2 * guard) * 2);
+        out[i] = Tensor(static_cast<std::uint16_t*>(outputs[i].p) + guard, DType::BF16, {rows[i], tokens});
+    }
+    const std::array<ops::LinearProjection, 4> projections{{
+        {full, out[0]}, {full, out[1], ops::LinearPolicy::A16Only, 1},
+        {quantized, out[2]}, {half, out[3]}}};
+    WorkspaceArena workspace(gg::linear_workspace_bytes(f.n, f.k, tokens));
+    WorkspaceArena* ws = arena ? &workspace : nullptr;
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto grouped = [&] { ops::linear_projections(x, projections, ws, stream); };
+    const auto scalar = [&] {
+        for (const auto& p : projections) {
+            if (p.row_begin >= 0) { ops::linear_rows(x, p.weight, p.row_begin, p.out, ws, stream); }
+            else if (ws) { ops::linear(x, p.weight, p.out, p.policy, *ws, stream); }
+            else { ops::linear(x, p.weight, p.out, stream); }
+        }
+    };
+    const auto update = [&](int round) {
+        auto hx = random_activation(f.k, tokens, 423 + round);
+        input.copy_from_host(hx.data(), input.bytes);
+        std::vector<int> map(f.k / 32);
+        for (int i = 0; i < int(map.size()); ++i) { map[i] = (i + 1 + round) % map.size(); }
+        map_a.copy_from_host(map.data(), map_a.bytes);
+        std::reverse(map.begin(), map.end());
+        map_b.copy_from_host(map.data(), map_b.bytes);
+    };
+    const auto clear = [&] {
+        for (auto& buffer : outputs) {
+            std::vector<__nv_bfloat16> bits(buffer.bytes / 2, __float2bfloat16(7.0f));
+            buffer.copy_from_host(bits.data(), buffer.bytes);
+        }
+    };
+    update(0);
+    clear();
+    grouped();
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    grouped();
+    CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+    CHECK_CUDA(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    std::size_t nodes = 0;
+    CHECK_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
+    const std::size_t expected_nodes = map_mode == 0 ? 5 : map_mode == 1 ? 6 :
+        f.type == gg::GgmlType::F16 ? 7 : 8;
+    bool ok = nodes == expected_nodes && workspace.peak_used() <= workspace.capacity();
+    if (tokens == 1 && map_mode == 0 && arena) {
+        const auto rejects = [&](std::initializer_list<ops::LinearProjection> bad) {
+            try { ops::linear_projections(x, bad, ws, stream); }
+            catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        ok &= rejects({{full, out[0]}, {full, out[0]}});
+        ok &= rejects({{full, out[1], ops::LinearPolicy::A16Only, full.n}});
+        Tensor alias(input.p, DType::BF16, {full.n, tokens});
+        ok &= rejects({{full, alias}});
+    }
+    for (int round = 0; round < 3; ++round) {
+        update(round);
+        clear(); scalar(); CHECK_CUDA(cudaStreamSynchronize(stream));
+        std::array<std::vector<std::uint16_t>, 4> expected;
+        for (int i = 0; i < 4; ++i) {
+            expected[i].resize(outputs[i].bytes / 2);
+            outputs[i].copy_to_host(expected[i].data(), outputs[i].bytes);
+        }
+        clear();
+        CHECK_CUDA(cudaGraphLaunch(exec, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        for (int i = 0; i < 4; ++i) {
+            std::vector<std::uint16_t> actual(expected[i].size());
+            outputs[i].copy_to_host(actual.data(), outputs[i].bytes);
+            ok &= actual == expected[i];
+        }
+    }
+    CHECK_CUDA(cudaGraphExecDestroy(exec)); CHECK_CUDA(cudaGraphDestroy(graph));
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    std::printf("  shared %-8s %-9s T=%d maps=%d arena=%d nodes=%zu: %s\n",
+        gg::type_name(f.type), f.label.c_str(), tokens, map_mode, arena, nodes, ok ? "ok" : "FAIL");
+    return !ok;
+}
+
 } // namespace
 
 int main() {
@@ -755,17 +875,20 @@ int main() {
         return 77;
     }
     int failures = 0, cases = 0;
-    for (int tokens : {1, 3, 8, 128, 8193}) {
-        failures += run_affine_zero<gg::block_q4_K>(gg::GgmlType::Q4_K, tokens);
-        failures += run_affine_zero<gg::block_q5_K>(gg::GgmlType::Q5_K, tokens);
-        failures += run_affine_zero<gg::block_q6_K>(gg::GgmlType::Q6_K, tokens);
-        failures += run_affine_zero<gg::block_q2_K>(gg::GgmlType::Q2_K, tokens);
-        failures += run_affine_zero<gg::block_q4_1>(gg::GgmlType::Q4_1, tokens);
-        failures += run_affine_zero<gg::block_q5_1>(gg::GgmlType::Q5_1, tokens);
-        cases += 18;
+    const bool shared_only = std::getenv("SINFER_GGML_SHARED_ONLY") != nullptr;
+    if (!shared_only) {
+        for (int tokens : {1, 3, 8, 128, 8193}) {
+            failures += run_affine_zero<gg::block_q4_K>(gg::GgmlType::Q4_K, tokens);
+            failures += run_affine_zero<gg::block_q5_K>(gg::GgmlType::Q5_K, tokens);
+            failures += run_affine_zero<gg::block_q6_K>(gg::GgmlType::Q6_K, tokens);
+            failures += run_affine_zero<gg::block_q2_K>(gg::GgmlType::Q2_K, tokens);
+            failures += run_affine_zero<gg::block_q4_1>(gg::GgmlType::Q4_1, tokens);
+            failures += run_affine_zero<gg::block_q5_1>(gg::GgmlType::Q5_1, tokens);
+            cases += 18;
+        }
+        failures += run_affine_zero<gg::block_q2_K>(gg::GgmlType::Q2_K, 65536);
+        cases += 3;
     }
-    failures += run_affine_zero<gg::block_q2_K>(gg::GgmlType::Q2_K, 65536);
-    cases += 3;
     const int built_in_cases = cases;
     // every format the list names, so a new one cannot ship untested
     const gg::GgmlType types[] = {
@@ -777,6 +900,17 @@ int main() {
         for (const char* label : {"synthetic", "odd", "tail", "decode_rows", "real", "big"}) {
             Fixture f;
             if (!load_fixture(dir, type, label, f)) { continue; }
+            if (f.label == "synthetic" || f.label == "tail") {
+                for (int t : {1, 3, 8, 9, 33, 129}) {
+                    for (int maps : {0, 1, 2}) {
+                        for (bool arena : {false, true}) {
+                            failures += shared_projection_case(f, t, maps, arena);
+                            ++cases;
+                        }
+                    }
+                }
+            }
+            if (shared_only) { continue; }
             const bool big = f.label == "big";
             void* d_blocks = nullptr;
             CHECK_CUDA(cudaMalloc(&d_blocks, f.blocks.size()));
@@ -850,7 +984,7 @@ int main() {
             CHECK_CUDA(cudaFree(d_blocks));
         }
     }
-    failures += run_large_swiglu(dir, cases);
+    if (!shared_only) { failures += run_large_swiglu(dir, cases); }
     if (cases == built_in_cases) {
         std::fprintf(stderr, "Only built-in zero-weight cases ran: no fixtures in %s (run gen_fixture.py)\n", dir.c_str());
     }

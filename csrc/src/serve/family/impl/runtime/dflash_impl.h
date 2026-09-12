@@ -165,8 +165,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
                                  value_flat, state.execution.device.stream);
             } else {
-                ops::linear(layer_context, weight.context_key, key_flat, state.execution.device.stream);
-                ops::linear(layer_context, weight.context_value, value_flat, state.execution.device.stream);
+                ops::linear_projections(layer_context, {{weight.context_key, key_flat},
+                                                        {weight.context_value, value_flat}},
+                                        nullptr, state.execution.device.stream);
             }
             Tensor key = layer_roots.key.view({config.head_dim, config.kv_heads, layer_columns});
             ops::rmsnorm(key_raw, weight.key_norm, config.rms_epsilon, false, key,

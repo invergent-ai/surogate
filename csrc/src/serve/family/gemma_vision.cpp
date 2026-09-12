@@ -161,16 +161,30 @@ bool encode_gemma_vision_step(const VisionGeometry& g, const VisionWeights& weig
             qh.nb[2] = kh.nb[2] = vh.nb[2] = qkv.nb[1];
         } else {
             rms(prefix + "input_norm", x, a);
-            linear(prefix + "attention/query", a, b);
             Tensor bh = b.view({g.head_dim(), g.heads * p});
             Tensor qn = q.view({g.head_dim(), g.heads * p});
-            rms(prefix + "attention/query_norm", bh, qn);
-            linear(prefix + "attention/key", a, b);
             Tensor kn = k.view({g.head_dim(), g.heads * p});
-            rms(prefix + "attention/key_norm", bh, kn);
-            linear(prefix + "attention/value", a, b);
             Tensor vn = v.view({g.head_dim(), g.heads * p});
-            ops::rmsnorm_unweighted(bh, g.norm_epsilon, vn, stream);
+            const auto unclipped = [&](const char* role) {
+                return !weights.extra_tensors.contains(prefix + role + "/clip");
+            };
+            if (unclipped("attention/query") && unclipped("attention/key") && unclipped("attention/value")) {
+                // Reuse the existing planes: normalize raw V first, then K, then Q.
+                // Each source has been consumed before its plane becomes a destination.
+                ops::linear_projections(a, {{weights.extra_linears.at(prefix + "attention/query"), b},
+                                            {weights.extra_linears.at(prefix + "attention/key"), q},
+                                            {weights.extra_linears.at(prefix + "attention/value"), k}}, nullptr, stream);
+                ops::rmsnorm_unweighted(kn, g.norm_epsilon, vn, stream);
+                rms(prefix + "attention/key_norm", qn, kn);
+                rms(prefix + "attention/query_norm", bh, qn);
+            } else {
+                linear(prefix + "attention/query", a, b);
+                rms(prefix + "attention/query_norm", bh, qn);
+                linear(prefix + "attention/key", a, b);
+                rms(prefix + "attention/key_norm", bh, kn);
+                linear(prefix + "attention/value", a, b);
+                ops::rmsnorm_unweighted(bh, g.norm_epsilon, vn, stream);
+            }
             gemma_vision::spatial_rope(positions, g.rope_theta, qh, kh, stream);
         }
         Tensor attended = a.view({g.head_dim(), g.heads, p});
@@ -196,8 +210,14 @@ bool encode_gemma_vision_step(const VisionGeometry& g, const VisionWeights& weig
             ops::add_bias(tensor(prefix + "mlp/fc2_bias"), b, stream);
             ops::residual_add(b, x, stream);
         } else {
-            linear(prefix + "mlp/gate", a, gate);
-            linear(prefix + "mlp/up", a, up);
+            if (!weights.extra_tensors.contains(prefix + "mlp/gate/clip") &&
+                !weights.extra_tensors.contains(prefix + "mlp/up/clip")) {
+                ops::linear_projections(a, {{weights.extra_linears.at(prefix + "mlp/gate"), gate},
+                                            {weights.extra_linears.at(prefix + "mlp/up"), up}}, nullptr, stream);
+            } else {
+                linear(prefix + "mlp/gate", a, gate);
+                linear(prefix + "mlp/up", a, up);
+            }
             ops::gelu_mul(gate, up, ops::GeluMode::Tanh, activated, stream, true);
             linear(prefix + "mlp/down", activated, b);
             rms(prefix + "post_feedforward_norm", b, a);

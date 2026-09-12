@@ -177,10 +177,6 @@ void Variant::attention_projection(const Tensor& hidden,
     // (Variant::attention_output_gate == false), so nothing reads the plane.
     (void)gate;
     auto scope = workspace.scope();
-    ops::linear(hidden, weights.query, query, kTextPolicy, workspace, stream);
-    apply_lora(weights.query, kQueryPort, hidden, query, stream);
-    ops::linear(hidden, weights.key, key, kTextPolicy, workspace, stream);
-    apply_lora(weights.key, kKeyPort, hidden, key, stream);
 
     // The value, which is where Gemma 4 differs from every other target here in two ways at
     // once.
@@ -207,6 +203,10 @@ void Variant::attention_projection(const Tensor& hidden,
     const std::int32_t heads     = kv_rows / head_dim;
     Tensor value_per_head        = value.view({head_dim, heads * columns});
     if (weights.value_is_key) {
+        ops::linear_projections(hidden, {{weights.query, query, kTextPolicy},
+                                         {weights.key, key, kTextPolicy}}, &workspace, stream);
+        apply_lora(weights.query, kQueryPort, hidden, query, stream);
+        apply_lora(weights.key, kKeyPort, hidden, key, stream);
         ops::rmsnorm_unweighted(key.view({head_dim, heads * columns}), weights.rms_epsilon,
                                 value_per_head, stream);
     } else {
@@ -214,7 +214,11 @@ void Variant::attention_projection(const Tensor& hidden,
         // `rmsnorm_unweighted` forbids aliasing its input with its output, and the raw value
         // is not wanted afterwards.
         Tensor raw = workspace.alloc(DType::BF16, {kv_rows, columns});
-        ops::linear(hidden, weights.value, raw, kTextPolicy, workspace, stream);
+        ops::linear_projections(hidden, {{weights.query, query, kTextPolicy},
+                                         {weights.key, key, kTextPolicy},
+                                         {weights.value, raw, kTextPolicy}}, &workspace, stream);
+        apply_lora(weights.query, kQueryPort, hidden, query, stream);
+        apply_lora(weights.key, kKeyPort, hidden, key, stream);
         apply_lora(weights.value, kValuePort, hidden, raw, stream);
         ops::rmsnorm_unweighted(raw.view({head_dim, heads * columns}), weights.rms_epsilon,
                                 value_per_head, stream);
@@ -280,9 +284,9 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     Tensor up         = workspace.alloc(DType::BF16, {intermediate, columns});
     Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
     Tensor dense      = workspace.alloc(DType::BF16, {width, columns});
-    ops::linear(hidden, weights.gate, gate, kTextPolicy, workspace, stream);
+    ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
+                                     {weights.up, up, kTextPolicy}}, &workspace, stream);
     apply_lora(weights.gate, kGatePort, hidden, gate, stream);
-    ops::linear(hidden, weights.up, up, kTextPolicy, workspace, stream);
     apply_lora(weights.up, kUpPort, hidden, up, stream);
     Variant::debug_probe("ffn_gate", gate, weights.probe_layer_count, stream);
     Variant::debug_probe("ffn_up", up, weights.probe_layer_count, stream);

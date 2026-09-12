@@ -93,6 +93,18 @@ void Variant::attention_projection(const Tensor& hidden,
                                    Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     Tensor head_gate(gate.data, DType::BF16, {weights.output_gate.n, hidden.ne[1]});
+    if (weights.query_key_value.layout == QuantLayout::GgmlBlocks ||
+        weights.query_key_value.layout == QuantLayout::Fp8Block128) {
+        const auto& parent = weights.query_key_value;
+        ops::linear_projections(hidden, {{weights.output_gate, head_gate},
+                                         {parent, query, ops::LinearPolicy::A16Only, 0},
+                                         {parent, key, ops::LinearPolicy::A16Only, query.ne[0]},
+                                         {parent, value, ops::LinearPolicy::A16Only, query.ne[0] + key.ne[0]}},
+                                nullptr, stream);
+        family::apply_lora(weights.output_gate, family::kAttentionGatePort, hidden, head_gate, stream);
+        family::apply_lora_qkv(parent, hidden, query, key, value, stream);
+        return;
+    }
     ops::linear(hidden, weights.output_gate, head_gate, stream);
     family::apply_lora(weights.output_gate, family::kAttentionGatePort, hidden, head_gate, stream);
     ops::attn_input_proj(hidden, weights.query_key_value, query, key, value, stream);
@@ -148,8 +160,9 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     Tensor gate = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     Tensor up = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
-    ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
-    ops::linear_rows(hidden, weights.gate_up, weights.gate_up.n / 2, up, &workspace, stream);
+    ops::linear_projections(hidden, {{weights.gate_up, gate, ops::LinearPolicy::A16Only, 0},
+                                     {weights.gate_up, up, ops::LinearPolicy::A16Only, weights.gate_up.n / 2}},
+                            &workspace, stream);
     family::apply_lora_gate_up(weights.gate_up, hidden, gate, up, stream);
     ops::gelu_mul(gate, up, ops::GeluMode::Exact, activation, stream, true);
     Tensor projected = workspace.alloc(DType::BF16, {weights.down.n, hidden.ne[1]});

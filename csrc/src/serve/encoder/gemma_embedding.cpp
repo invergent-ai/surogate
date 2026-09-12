@@ -289,9 +289,9 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
         // adjacent columns and a GEMM does not care where one ends.
         ops::rmsnorm(x, impl.norm(w.input_norm, config.hidden), config.rms_epsilon,
                      /*unit_offset*/ true, h, stream);
-        ops::linear(h, impl.matrix(w.query, config.query_size(), config.hidden), query, stream);
-        ops::linear(h, impl.matrix(w.key, config.head_dim, config.hidden), key, stream);
-        ops::linear(h, impl.matrix(w.value, config.head_dim, config.hidden), value, stream);
+        ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
+                                    {impl.matrix(w.key, config.head_dim, config.hidden), key},
+                                    {impl.matrix(w.value, config.head_dim, config.hidden), value}}, nullptr, stream);
 
         // Per-head QK norm: each head's features are contiguous, so the
         // [head_dim, heads * tokens] view is exactly the rows rmsnorm reduces
@@ -331,8 +331,8 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
         // --- MLP, between the other two ------------------------------------
         ops::rmsnorm(x, impl.norm(w.pre_feedforward_norm, config.hidden), config.rms_epsilon, true,
                      h, stream);
-        ops::linear(h, impl.matrix(w.gate, config.intermediate, config.hidden), gate, stream);
-        ops::linear(h, impl.matrix(w.up, config.intermediate, config.hidden), up, stream);
+        ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
+                                    {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
         // gelu_pytorch_tanh, per the checkpoint's hidden_activation.
         ops::gelu_mul(gate, up, ops::GeluMode::Tanh, gate, stream);
         ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);

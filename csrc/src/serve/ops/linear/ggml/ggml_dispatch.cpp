@@ -303,6 +303,66 @@ void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin,
                   in.planes.data, in.planes.bytes, stream);
 }
 
+void ggml_linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
+                             WorkspaceArena* workspace, cudaStream_t stream) {
+    const auto view_for = [](const LinearProjection& p) {
+        if (p.row_begin >= 0) { return ggml_weight_rows(p.weight, p.row_begin, p.out.ne[0]); }
+        require_ggml_weight(p.weight, "ggml linear projections");
+        require_homogeneous(p.weight, "ggml linear projections");
+        return p.weight;
+    };
+    bool mapped = false;
+    for (const auto& p : projections) {
+        const Weight view = view_for(p);
+        require_x_out(x, view.k, p.out, view.n, "ggml linear projections");
+        mapped |= view.input_group_map != nullptr;
+    }
+    if (projections.empty()) { return; }
+    const int k = x.ne[0], tokens = x.ne[1];
+    const auto plane_bytes = linear_workspace_bytes(1, k, tokens);
+    const auto x_bytes = mapped ? round_up(std::size_t(k) * tokens * sizeof(__nv_bfloat16), 256) : 0;
+    auto scope = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
+    Scratch planes;
+    __nv_bfloat16* permuted = nullptr;
+    if (workspace != nullptr) {
+        planes = scratch(workspace, plane_bytes, stream);
+        if (mapped) { permuted = static_cast<__nv_bfloat16*>(scratch_for(x_bytes, stream)); }
+    } else {
+        auto* base = static_cast<std::byte*>(scratch_for(x_bytes + plane_bytes, stream));
+        permuted = mapped ? reinterpret_cast<__nv_bfloat16*>(base) : nullptr;
+        planes = {base + x_bytes, plane_bytes};
+    }
+    const auto* input = static_cast<const __nv_bfloat16*>(x.data);
+    const std::int32_t* previous_map = nullptr;
+    bool quantized = false;
+    for (const auto& p : projections) {
+        const Weight view = view_for(p);
+        if (view.input_group_map != previous_map) {
+            input = static_cast<const __nv_bfloat16*>(x.data);
+            if (view.input_group_map != nullptr) {
+                permute_column_groups_launch(input, k, tokens, view.input_group_map, permuted, stream);
+                input = permuted;
+            }
+            previous_map = view.input_group_map;
+            quantized = false;
+        }
+        const auto type = ggml_type_for(view.qtype);
+        if (type == GgmlType::F16) {
+            linear_launch(type, view.qdata, view.n, k, input, tokens,
+                static_cast<__nv_bfloat16*>(p.out.data), planes.data, planes.bytes, stream);
+        } else {
+            if (!quantized) {
+                auto* codes = static_cast<std::int8_t*>(planes.data);
+                auto* ds = reinterpret_cast<__half2*>(codes + std::size_t(tokens) * k);
+                quantize_q8_1_planes_launch(input, k, tokens, codes, ds, stream);
+                quantized = true;
+            }
+            linear_prequantized_launch(type, view.qdata, view.n, k, tokens,
+                static_cast<__nv_bfloat16*>(p.out.data), planes.data, planes.bytes, stream);
+        }
+    }
+}
+
 bool ggml_swiglu_decode(const Tensor& x, const Weight& w, Tensor& out,
                        WorkspaceArena& workspace, cudaStream_t stream) {
     if (!is_ggml_qtype(w.qtype) || x.ne[1] <= 0 || x.ne[1] > 8) { return false; }

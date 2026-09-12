@@ -13,7 +13,9 @@ namespace sinfer::ops {
  *   second_out[:,t] = linear(x[:,t], second_weight).
  *
  * `x` is contiguous BF16 [K,T], both outputs are distinct contiguous BF16 [N,T], and both
- * weights have the same logical [N,K] shape and RowSplit W8G32_F16S encoding with FP16 scales.
+ * weights have the same logical [N,K] shape. GGUF and block/row-scaled FP8 weights
+ * share activation preparation; their formats and shapes follow linear().
+ * The specialized W8 path uses RowSplit W8G32_F16S encoding with FP16 scales.
  * The registry admits the paired [1024,5120] physical projection and the exact adjacent
  * [1024,2048] K/V row views (parent rows [4096,5120) and [5120,6144)) for every positive T.
  * Numeric semantics are those of linear(). Inputs, outputs, and weight planes must be mutually

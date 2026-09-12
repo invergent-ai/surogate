@@ -1,4 +1,7 @@
 #include "api/ops/linear_pair.h"
+#include "api/ops/linear.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 
 #include "ops/linear_pair/w8/w8_pair_plan.h"
 
@@ -90,6 +93,16 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
 
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                  Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    if (detail::ggml::is_ggml_qtype(first_weight.qtype) ||
+        detail::ggml::is_ggml_qtype(second_weight.qtype) ||
+        detail::fp8_block::is_fp8_block_qtype(first_weight.qtype) ||
+        detail::fp8_block::is_fp8_block_qtype(second_weight.qtype)) {
+        if (first_weight.n != second_weight.n) {
+            throw std::invalid_argument("linear_pair: projections must have the same row count");
+        }
+        linear_projections(x, {{first_weight, first_out}, {second_weight, second_out}}, nullptr, stream);
+        return;
+    }
     const std::int32_t cols = x.ne[1];
     if (x.ne[0] != 5120 && x.ne[0] != 2048) {
         throw std::invalid_argument("linear_pair: x K must be 5120 or 2048");

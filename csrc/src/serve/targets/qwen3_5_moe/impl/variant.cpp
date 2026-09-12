@@ -109,10 +109,11 @@ void Variant::attention_projection(const Tensor& hidden,
         // this is also the only exact way to run them. LoRA registers against the fused
         // parent's pointer and is not offered on the split path yet.
         const SplitAttentionWeights& split = *weights.split;
-        ops::linear(hidden, split.query, query, linear_policy_for(split.query), workspace, stream);
-        ops::linear(hidden, split.gate, gate, linear_policy_for(split.gate), workspace, stream);
-        ops::linear(hidden, split.key, key, linear_policy_for(split.key), workspace, stream);
-        ops::linear(hidden, split.value, value, linear_policy_for(split.value), workspace, stream);
+        ops::linear_projections(hidden, {{split.query, query, linear_policy_for(split.query)},
+                                         {split.gate, gate, linear_policy_for(split.gate)},
+                                         {split.key, key, linear_policy_for(split.key)},
+                                         {split.value, value, linear_policy_for(split.value)}},
+                                &workspace, stream);
         family::apply_lora(split.query, family::kQueryPort, hidden, query, stream);
         family::apply_lora(split.gate, family::kAttentionGatePort, hidden, gate, stream);
         family::apply_lora(split.key, family::kKeyPort, hidden, key, stream);
@@ -166,10 +167,9 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     if (weights.split) {
         // in_proj_qkv and in_proj_z as the checkpoint stores them, each in its own format.
         const SplitGdnInputWeights& split = *weights.split;
-        ops::linear(hidden, split.query_key_value, qkv, linear_policy_for(split.query_key_value),
-                    workspace, stream);
-        ops::linear(hidden, split.z, output_gate_flat, linear_policy_for(split.z), workspace,
-                    stream);
+        ops::linear_projections(hidden, {{split.query_key_value, qkv, linear_policy_for(split.query_key_value)},
+                                         {split.z, output_gate_flat, linear_policy_for(split.z)}},
+                                &workspace, stream);
         family::apply_lora_gdn_input(weights, hidden, qkv, output_gate_flat, stream);
         return;
     }

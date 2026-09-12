@@ -7,6 +7,8 @@
 #include "api/ops/add_bias.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/linear/ggml/ggml_blocks.h"
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -143,10 +145,86 @@ static void quantized_norms() {
     }
 }
 
+static void shared_automatic_projections() {
+    ops::EngineOpsContext context;
+    ops::bind_ops_context(&context);
+    constexpr int h = 64, tokens = 4, rank = 2;
+    std::vector<ops::detail::ggml::block_q8_0> blocks(h * h / 32);
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        blocks[i].d = __float2half_rn(.03125f);
+        for (int j = 0; j < 32; ++j) { blocks[i].qs[j] = (i + j) % 9 - 4; }
+    }
+    DeviceBuffer data(blocks.size() * sizeof(blocks[0]));
+    data.copy_from_host(blocks.data(), data.bytes);
+    Weight w = weight(data.p, h, h);
+    w.qtype = QType::Q8_0; w.layout = QuantLayout::GgmlBlocks;
+    w.group = w.group_size = 32; w.scale_dtype = DType::FP16; w.payload_bytes = data.bytes;
+    auto& store = ops::lora_store_for_current_device();
+    store.configure(2, rank, tokens);
+    family::bind_lora_auto(store, -1, "shared_head", w, {});
+    store.ensure_banks(); store.set_active(true);
+    std::vector<std::uint16_t> a(rank * h), b(h * rank);
+    for (std::size_t i = 0; i < a.size(); ++i) { a[i] = test::f32_to_bf16((int(i % 7) - 3) / 16.f); }
+    for (std::size_t i = 0; i < b.size(); ++i) { b[i] = test::f32_to_bf16((int(i % 5) - 2) / 32.f); }
+    store.set_module_slot(-1, "shared_head", 0, a, b, rank, h, h, 2.f, std::vector<float>(h, .75f));
+    store.set_module_slot(-1, "shared_head", 1, a, b, rank, h, h, -1.f);
+    auto ids = test::to_device_i32(std::vector<int>{-1, 0, 1, 0});
+    Tensor slots(ids.p, DType::I32, {tokens});
+    ops::lora_set_round({.slots = &slots, .scratch = store.scratch(tokens)});
+    auto input = test::to_device_bf16(std::vector<float>(h * tokens, .25f));
+    Tensor x(input.p, DType::BF16, {h, tokens});
+    std::array<DeviceBuffer, 3> buffers;
+    std::array<Tensor, 3> outputs;
+    for (int i = 0; i < 3; ++i) {
+        buffers[i] = DeviceBuffer(h * tokens * 2);
+        outputs[i] = Tensor(buffers[i].p, DType::BF16, {h, tokens});
+    }
+    cudaStream_t stream;
+    test::cuda_check(cudaStreamCreate(&stream), "shared adapter stream");
+    const auto grouped = [&] {
+        ops::linear_projections(x, {{w, outputs[0]}, {w, outputs[1]},
+                                    {w, outputs[2], ops::LinearPolicy::A16Only, 0}}, nullptr, stream);
+    };
+    grouped(); test::cuda_check(cudaStreamSynchronize(stream), "shared adapter warmup");
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    test::cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture shared adapters");
+    grouped();
+    test::cuda_check(cudaStreamEndCapture(stream, &graph), "end shared adapters");
+    test::cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate shared adapters");
+    for (int round = 0; round < 3; ++round) {
+        std::vector<int> selection{round - 1, 0, 1, 1 - round};
+        ids.copy_from_host(selection.data(), ids.bytes);
+        auto values = test::to_device_bf16(std::vector<float>(h * tokens, .125f * (round + 1)));
+        test::cuda_check(cudaMemcpy(input.p, values.p, input.bytes, cudaMemcpyDeviceToDevice), "update shared input");
+        ops::linear(x, w, outputs[0], stream); ops::linear(x, w, outputs[1], stream);
+        ops::linear_rows(x, w, 0, outputs[2], nullptr, stream);
+        test::cuda_check(cudaStreamSynchronize(stream), "scalar adapters");
+        std::array<std::vector<std::uint16_t>, 3> expected;
+        for (int i = 0; i < 3; ++i) {
+            expected[i].resize(h * tokens);
+            buffers[i].copy_to_host(expected[i].data(), buffers[i].bytes);
+            buffers[i].fill(0xff);
+        }
+        test::cuda_check(cudaGraphLaunch(exec, stream), "replay shared adapters");
+        test::cuda_check(cudaStreamSynchronize(stream), "shared adapter outputs");
+        for (int i = 0; i < 3; ++i) {
+            std::vector<std::uint16_t> actual(h * tokens);
+            buffers[i].copy_to_host(actual.data(), buffers[i].bytes);
+            assert(actual == expected[i]);
+        }
+    }
+    test::cuda_check(cudaGraphExecDestroy(exec), "destroy shared adapter graph");
+    test::cuda_check(cudaGraphDestroy(graph), "destroy shared adapter source");
+    test::cuda_check(cudaStreamDestroy(stream), "destroy shared adapter stream");
+    ops::lora_clear_round(); ops::bind_ops_context(nullptr);
+}
+
 int main() {
     if (test::cuda_unavailable()) {
         return 77;
     }
+    shared_automatic_projections();
     quantized_norms();
     router_bias();
     ops::EngineOpsContext context;

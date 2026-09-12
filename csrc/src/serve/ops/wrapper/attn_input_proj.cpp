@@ -35,16 +35,6 @@ bool row_projectable(QType qtype) {
     return qtype == QType::BF16_CTRL || detail::ggml::is_ggml_qtype(qtype) ||
            detail::fp8_block::is_fp8_block_qtype(qtype);
 }
-void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
-                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (w.qtype == QType::BF16_CTRL) {
-        linear_rows(x, w, row_begin, out, workspace, stream);
-    } else if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
-        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
-    } else {
-        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
-    }
-}
 std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
                                                      std::int32_t max_tokens) {
     if (qtype == QType::BF16_CTRL) { return 0; }
@@ -138,10 +128,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         if (rows_q + rows_k + rows_gate + rows_v != weight.n) {
             throw std::invalid_argument("attn_input_proj: row-projected parent rows must equal q+k+gate+v");
         }
-        project_rows_any(x, weight, 0, q, workspace, stream);
-        project_rows_any(x, weight, rows_q, k, workspace, stream);
-        project_rows_any(x, weight, rows_q + rows_k, gate, workspace, stream);
-        project_rows_any(x, weight, rows_q + rows_k + rows_gate, v, workspace, stream);
+        linear_projections(x, {{weight, q, LinearPolicy::A16Only, 0},
+                              {weight, k, LinearPolicy::A16Only, rows_q},
+                              {weight, gate, LinearPolicy::A16Only, rows_q + rows_k},
+                              {weight, v, LinearPolicy::A16Only, rows_q + rows_k + rows_gate}},
+                           workspace, stream);
         return;
     }
     if (weight.qtype == QType::BF16_CTRL) {
@@ -369,10 +360,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(k, kv_rows, cols, "k");
     require_matrix(v, kv_rows, cols, "v");
     // Four row ranges, four contiguous destinations: no staging plane is needed.
-    linear_rows(x, query_key_weight, 0, q, &workspace, stream);
-    linear_rows(x, query_key_weight, query_rows, k, &workspace, stream);
-    linear_rows(x, gate_value_weight, 0, gate, &workspace, stream);
-    linear_rows(x, gate_value_weight, query_rows, v, &workspace, stream);
+    linear_projections(x, {{query_key_weight, q, LinearPolicy::A16Only, 0},
+                          {query_key_weight, k, LinearPolicy::A16Only, query_rows},
+                          {gate_value_weight, gate, LinearPolicy::A16Only, 0},
+                          {gate_value_weight, v, LinearPolicy::A16Only, query_rows}}, &workspace, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
@@ -422,9 +413,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
         if (rows_q + rows_k + rows_v != query_key_value_weight.n) {
             throw std::invalid_argument("attn_input_proj: row-projected parent rows must equal q+k+v");
         }
-        project_rows_any(x, query_key_value_weight, 0, q, nullptr, stream);
-        project_rows_any(x, query_key_value_weight, rows_q, k, nullptr, stream);
-        project_rows_any(x, query_key_value_weight, rows_q + rows_k, v, nullptr, stream);
+        linear_projections(x, {{query_key_value_weight, q, LinearPolicy::A16Only, 0},
+                              {query_key_value_weight, k, LinearPolicy::A16Only, rows_q},
+                              {query_key_value_weight, v, LinearPolicy::A16Only, rows_q + rows_k}},
+                           nullptr, stream);
         return;
     }
     const std::int32_t kRows   = query_key_value_weight.n;
@@ -470,9 +462,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
         require_matrix(q, rows_q, cols, "q");
         require_matrix(k, rows_k, cols, "k");
         require_matrix(v, rows_v, cols, "v");
-        linear_rows(x, query_key_value_weight, 0, q, nullptr, stream);
-        linear_rows(x, query_key_value_weight, rows_q, k, nullptr, stream);
-        linear_rows(x, query_key_value_weight, rows_q + rows_k, v, nullptr, stream);
+        linear_projections(x, {{query_key_value_weight, q, LinearPolicy::A16Only, 0},
+                              {query_key_value_weight, k, LinearPolicy::A16Only, rows_q},
+                              {query_key_value_weight, v, LinearPolicy::A16Only, rows_q + rows_k}},
+                           nullptr, stream);
         return;
     }
     const std::int32_t kQRows  = split->q_rows;
