@@ -712,6 +712,50 @@ int test_streaming_events() {
     return failures;
 }
 
+int test_streaming_channel_transitions() {
+    int failures = 0;
+    for (const std::string channels : {"", "CCCC", "RRRR", "RRCC", "CCRRCCRRCC", "RCRCR"}) {
+        std::vector<Json> events;
+        MessagesStreamBlocks blocks([&](const std::string& event) { events.push_back(parse_sse(event)); });
+        for (std::size_t i = 0; i < channels.size(); ++i) {
+            blocks.append(channels[i] == 'R' ? sinfer::OutputChannel::Reasoning : sinfer::OutputChannel::Content,
+                          "part" + std::to_string(i));
+        }
+        blocks.close();
+        const auto closed_size = events.size();
+        blocks.close();
+        failures += check(events.size() == closed_size, "block close must be idempotent");
+        int open = -1, next = 0;
+        std::size_t delta = 0;
+        std::string kind;
+        for (const auto& event : events) {
+            const std::string type = event.at("type");
+            const int index = event.at("index");
+            if (type == "content_block_start") {
+                failures += check(open == -1 && index == next++, "content blocks must open sequentially");
+                open = index;
+                kind = event.at("content_block").at("type");
+            } else if (type == "content_block_stop") {
+                failures += check(index == open, "content block must stop before another opens");
+                open = -1;
+            } else {
+                failures += check(type == "content_block_delta" && index == open && delta < channels.size(),
+                                  "delta must belong to the currently open block");
+                if (delta >= channels.size()) { continue; }
+                const bool reasoning = channels[delta] == 'R';
+                const char* field = reasoning ? "thinking" : "text";
+                failures += check(kind == field && event.at("delta").at("type") == std::string(field) + "_delta" &&
+                                      event.at("delta").at(field) == "part" + std::to_string(delta),
+                                  "channel transitions must preserve text and event order");
+                ++delta;
+            }
+        }
+        failures += check(open == -1 && delta == channels.size() && next == blocks.next_index(),
+                          "all streamed blocks must close and account for their indices");
+    }
+    return failures;
+}
+
 int test_count_tokens_and_error() {
     int failures  = 0;
     const Json ct = Json::parse(make_count_tokens_response(123));
@@ -756,6 +800,7 @@ int main() {
     failures += test_stop_reason_mapping();
     failures += test_response_serialization();
     failures += test_streaming_events();
+    failures += test_streaming_channel_transitions();
     failures += test_count_tokens_and_error();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

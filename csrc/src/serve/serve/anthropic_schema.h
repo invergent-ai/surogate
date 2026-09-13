@@ -11,7 +11,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sinfer::serve {
@@ -38,8 +41,8 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                                    const CompletionUsage& usage);
 
 // Streaming SSE event strings ("event: <type>\ndata: {...}\n\n"). The transport
-// drives the block state machine (open/close, running index) and calls these pure
-// builders; thinking blocks precede the text block, tool_use blocks follow.
+// calls these pure builders. MessagesStreamBlocks keeps alternating text and
+// thinking spans sequential; tool_use blocks follow those spans.
 std::string make_message_start(const std::string& id, const std::string& model, int input_tokens);
 std::string make_content_block_start_text(int index);
 std::string make_content_block_start_thinking(int index);
@@ -51,6 +54,20 @@ std::string make_content_block_stop(int index);
 std::string make_message_delta(const char* stop_reason, int output_tokens);
 std::string make_message_stop();
 std::string make_messages_ping();
+
+class MessagesStreamBlocks {
+public:
+    explicit MessagesStreamBlocks(std::function<void(const std::string&)> emit)
+        : emit_(std::move(emit)) {}
+    void append(OutputChannel channel, const std::string& text);
+    void close();
+    [[nodiscard]] int next_index() const noexcept { return next_index_; }
+
+private:
+    std::function<void(const std::string&)> emit_;
+    std::optional<OutputChannel> open_;
+    int next_index_ = 0;
+};
 
 // Error object body (Anthropic shape) and its SSE `event: error` form.
 std::string make_messages_error_body(const ApiError& error);

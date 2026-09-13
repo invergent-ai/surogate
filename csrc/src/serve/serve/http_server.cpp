@@ -1283,37 +1283,18 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             }
             stream->started = true;
 
-            int next_index     = 0;
-            bool thinking_open = false;
-            int thinking_index = -1;
-            bool text_open     = false;
-            int text_index     = -1;
+            MessagesStreamBlocks blocks([&](const std::string& event) {
+                write_stream_item(sink, *stream, event);
+            });
             try {
                 write_stream_item(sink, *stream, make_message_start(id, model, input_tokens));
 
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    if (!thinking_open) {
-                        thinking_index = next_index++;
-                        thinking_open  = true;
-                        write_stream_item(sink, *stream,
-                                          make_content_block_start_thinking(thinking_index));
-                    }
-                    write_stream_item(sink, *stream,
-                                      make_content_block_delta_thinking(thinking_index, text));
+                    blocks.append(OutputChannel::Reasoning, text);
                 };
                 output.on_content = [&](const std::string& text) {
-                    if (thinking_open) {
-                        write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
-                        thinking_open = false;
-                    }
-                    if (!text_open) {
-                        text_index = next_index++;
-                        text_open  = true;
-                        write_stream_item(sink, *stream, make_content_block_start_text(text_index));
-                    }
-                    write_stream_item(sink, *stream,
-                                      make_content_block_delta_text(text_index, text));
+                    blocks.append(OutputChannel::Content, text);
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -1324,14 +1305,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
 
-                if (thinking_open) {
-                    write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
-                    thinking_open = false;
-                }
-                if (text_open) {
-                    write_stream_item(sink, *stream, make_content_block_stop(text_index));
-                    text_open = false;
-                }
+                blocks.close();
+                int next_index = blocks.next_index();
 
                 if (tool_capable) {
                     if (!remaining.empty()) {

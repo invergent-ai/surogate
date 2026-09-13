@@ -616,6 +616,25 @@ std::string make_message_start(const std::string& id, const std::string& model, 
     return sse("message_start", Json{{"type", "message_start"}, {"message", message}});
 }
 
+void MessagesStreamBlocks::append(OutputChannel channel, const std::string& text) {
+    if (!open_ || *open_ != channel) {
+        close();
+        open_ = channel;
+        const int index = next_index_++;
+        emit_(channel == OutputChannel::Reasoning ? make_content_block_start_thinking(index)
+                                                  : make_content_block_start_text(index));
+    }
+    emit_(channel == OutputChannel::Reasoning ? make_content_block_delta_thinking(next_index_ - 1, text)
+                                              : make_content_block_delta_text(next_index_ - 1, text));
+}
+
+void MessagesStreamBlocks::close() {
+    if (open_) {
+        emit_(make_content_block_stop(next_index_ - 1));
+        open_.reset();
+    }
+}
+
 std::string make_content_block_start_text(int index) {
     return sse("content_block_start",
                Json{{"type", "content_block_start"},
