@@ -26,7 +26,10 @@ pass across CPU and GPU, with the GPU server observed under Compute Sanitizer; 5
 launcher cases pass. The two pre-existing A3 inventory failures were excluded from that
 scoped launcher run. Live text and embedding launches both reported the supplied GGUF path
 in `/v1/models` and successful responses. The findings below retain the original audit
-reproductions; A3–A5 and the subsequent backlog remain open.
+reproductions. A3 is also resolved: the shared launcher switch inventory now forwards
+`--spec-adaptive` for server and one-shot generation, before or after the model argument.
+All 54 launcher tests pass, including the previously failing native inventories and native
+help checks. A4–A5 and the subsequent backlog remain open.
 
 ## Fix first
 
@@ -72,15 +75,15 @@ also need HTTP 400 rather than the inference catch-all's HTTP 500.
 
 Evidence: [embedding handler](../../serve/encoder/embedding_server.cpp#L173).
 
-### A3 — P2: the launcher rejects documented adaptive DFlash
+### A3 — resolved: the launcher rejects documented adaptive DFlash
 
 **Reproduced without loading a model.** Both launcher modes reject
 `--spec-adaptive` with `ValueError: unknown option: --spec-adaptive`.
 The native parsers support it, but the Python option inventory omits it.
 `test_native_option_inventory[server]` and `[generate]` fail for this reason.
 
-Add the switch to the shared launcher inventory and retain the inventory/help tests.
-The native binary can be invoked directly as a temporary workaround.
+The switch is now in the shared launcher inventory. The complete launcher suite, including
+both native option inventories and help checks, passes.
 
 Evidence: [launcher switches](../../../../surogate/cli/serve.py#L84),
 [native server parser](../../serve/serve/serve_options.cpp#L367),
