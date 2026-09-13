@@ -1519,6 +1519,53 @@ int test_interleaved_reasoning_round() {
     return failures;
 }
 
+int test_terminal_reasoning_preserves_content_stop_prefix() {
+    auto owned = resources();
+    auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
+    auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+    constexpr const char* open = "<|channel>thought\n";
+    config["response_template"]["fields"]["thinking"] = {{"open", open}, {"close", "<channel|>"}};
+    const std::string piece = std::string("before</ans") + open + "reasonEND";
+    tokenizer["added_tokens"].push_back(added(100, piece));
+    config["added_tokens_decoder"]["100"] = decoder_added(piece);
+    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_config_json = config.dump();
+    const auto frontend = FrontendFactory::create_component(owned, false);
+    const auto prompt = frontend.prepare_tokens({0});
+    sinfer::StopPolicy stops;
+    stops.strings = {{.text = "</answer>"},
+                    {.text = "ENDING", .channel = sinfer::OutputChannel::Reasoning}};
+    int failures = 0;
+    for (auto reason : {sinfer::FinishReason::OutputLimit, sinfer::FinishReason::ContextCapacity,
+                        sinfer::FinishReason::StopToken, sinfer::FinishReason::Cancelled}) {
+        auto session = frontend.make_output_session(prompt, stops);
+        std::string content, reasoning;
+        const auto collect = [&] {
+            const auto output = session.commit_preview();
+            content += channel_text(output, sinfer::OutputChannel::Content);
+            reasoning += channel_text(output, sinfer::OutputChannel::Reasoning);
+        };
+        if (reason == sinfer::FinishReason::Cancelled) {
+            (void)session.preview(std::array<sinfer::TokenId, 1>{100}, 8, sinfer::FinishReason::OutputLimit);
+            collect();
+            failures += check(content == "before" && reasoning == "reason",
+                              "unfinished stop prefixes must stay buffered before termination");
+            (void)session.preview_terminal(reason);
+        } else if (reason == sinfer::FinishReason::StopToken) {
+            const auto decision = session.preview(std::array<sinfer::TokenId, 2>{100, 6}, 8,
+                                                    sinfer::FinishReason::OutputLimit);
+            failures += check(decision.finish_reason == reason, "EOS terminal reason changed");
+        } else {
+            const auto decision = session.preview(std::array<sinfer::TokenId, 1>{100}, 1, reason);
+            failures += check(decision.finish_reason == reason, "length terminal reason changed");
+        }
+        collect();
+        failures += check(content == "before</ans" && reasoning == "reasonEND",
+                          "termination inside reasoning dropped an unfinished stop prefix");
+    }
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1871,6 +1918,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_interleaved_reasoning_round();
+    failures += test_terminal_reasoning_preserves_content_stop_prefix();
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

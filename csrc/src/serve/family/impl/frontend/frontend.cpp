@@ -860,6 +860,8 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
+        // Content may still hold a stop-string prefix from before this thought.
+        close_channel(state, OutputChannel::Content, emitted);
         feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,
                      committed_tokens, nullptr);
         state.think_marker_pending.clear();
