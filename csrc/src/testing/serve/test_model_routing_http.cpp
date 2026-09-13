@@ -97,6 +97,26 @@ int main() {
     gate.unlock();
     assert(unload.get()->status == 200);
     assert(primary.lora_slot("shared") < 0 && extra.lora_slot("shared") < 0);
+    assert(post("/v1/load_lora_adapter", {{"lora_name", "primary-adapter"}, {"lora_path", adapter}})->status == 200);
+    assert(post("/v1/load_lora_adapter?model=extra", {{"lora_name", "extra-adapter"}, {"lora_path", adapter}})->status == 200);
+    httplib::Client catalog_client("127.0.0.1", options.port);
+    auto listing = catalog_client.Get("/v1/models");
+    assert(listing && listing->status == 200);
+    const auto models = Json::parse(listing->body).at("data");
+    assert(models.size() == 4);
+    for (const auto& item : models) {
+        const auto id = item.at("id").get<std::string>();
+        auto result = catalog_client.Get("/v1/models/" + id);
+        assert(result && result->status == 200);
+        const auto model = Json::parse(result->body);
+        assert(model.at("id") == id);
+        if (id.ends_with("-adapter")) {
+            const auto parent = id == "primary-adapter" ? "primary" : "extra";
+            assert(model.at("parent") == parent && item.at("parent") == parent);
+        } else { assert(!model.contains("parent") && !item.contains("parent")); }
+    }
+    auto missing = catalog_client.Get("/v1/models/missing");
+    assert(missing && missing->status == 404);
     server.stop();
     assert(listener.wait_for(2s) == std::future_status::ready);
     assert(listener.get());

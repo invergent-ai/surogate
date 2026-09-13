@@ -5,6 +5,7 @@
 #include "serve/serve_options.h"
 
 #include <httplib.h>
+#include <nlohmann/json_fwd.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -62,6 +63,7 @@ private:
     void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
+    nlohmann::json model_listing() const;
     /// GET /kv_stats: per-model KV pool physical occupancy, for elastic-KV sizing.
     void handle_kv_stats(const httplib::Request& req, httplib::Response& res) const;
     /// Prometheus text exposition of the same snapshot `/kv_stats` reads. Behind the API key

@@ -466,16 +466,22 @@ void HttpServer::register_routes() {
     });
 }
 
-void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    std::vector<std::string> additional = service_->lora_adapter_names();
+nlohmann::json HttpServer::model_listing() const {
+    const auto created = unix_time_now();
+    auto listing = nlohmann::json::parse(
+        make_models_list(public_model_id_, created, service_->lora_adapter_names()));
     for (const auto& [name, service] : extra_services_) {
-        additional.push_back(name);
-        for (const std::string& adapter : service->lora_adapter_names()) {
-            additional.push_back(adapter);
+        const auto extra = nlohmann::json::parse(
+            make_models_list(name, created, service->lora_adapter_names()));
+        for (const auto& model : extra.at("data")) {
+            listing["data"].push_back(model);
         }
     }
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), additional),
-                    "application/json");
+    return listing;
+}
+
+void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(model_listing().dump(), "application/json");
 }
 
 void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res) const {
@@ -656,17 +662,19 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_ && service_->lora_slot(id) < 0 &&
-        extra_services_.count(id) == 0) {
-        ApiError error;
-        error.status  = 404;
-        error.type    = "invalid_request_error";
-        error.code    = "model_not_found";
-        error.message = "model '" + id + "' not found";
-        write_error(res, error);
-        return;
+    const auto listing = model_listing();
+    for (const auto& model : listing.at("data")) {
+        if (model.at("id") == id) {
+            res.set_content(model.dump(), "application/json");
+            return;
+        }
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+    ApiError error;
+    error.status  = 404;
+    error.type    = "invalid_request_error";
+    error.code    = "model_not_found";
+    error.message = "model '" + id + "' not found";
+    write_error(res, error);
 }
 
 PreparationGate HttpServer::wake_gate() {
