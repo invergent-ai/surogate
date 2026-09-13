@@ -148,7 +148,13 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
         adapter.directory    = directory;
         adapter.weights_file = weights_path;
         adapter.rank         = config.value("r", 0);
-        adapter.alpha        = config.value("lora_alpha", 0.0);
+        if (!config.contains("lora_alpha") || !config.at("lora_alpha").is_number()) {
+            bad(name, "adapter_config.json must specify a numeric lora_alpha");
+        }
+        adapter.alpha = config.at("lora_alpha").get<double>();
+        if (!std::isfinite(adapter.alpha)) {
+            bad(name, "adapter_config.json lora_alpha must be finite");
+        }
         if (adapter.rank <= 0) { bad(name, "adapter_config.json has no positive rank r"); }
         // PEFT scales the delta by alpha/r. `use_rslora` scales by alpha/sqrt(r)
         // instead, and silently applying the wrong one would change every adapted

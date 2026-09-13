@@ -87,6 +87,34 @@ int main() {
         }
         assert(rejected);
     }
+    for (int invalid = 0; invalid < 6; ++invalid) {
+        f.write("model.layers.0.self_attn.q_proj");
+        Json config{{"r", 1}};
+        if (invalid > 0) {
+            const Json values[]{nullptr, "8", true, Json::array(), Json::object()};
+            config["lora_alpha"] = values[invalid - 1];
+        }
+        std::ofstream(f.path / "adapter_config.json") << config;
+        bool rejected = false;
+        try { (void)f.read(skipped); }
+        catch (const std::invalid_argument& error) {
+            rejected = true;
+            assert(std::string(error.what()).find("lora_alpha") != std::string::npos);
+            assert(std::string(error.what()).find("policy") != std::string::npos);
+        }
+        assert(rejected);
+    }
+    // Explicit zero and negative alpha retain their PEFT scaling semantics.
+    for (double alpha : {0.0, -2.0, 0.5, 8.0}) {
+        for (bool rslora : {false, true}) {
+            const std::string module = "model.layers.0.self_attn.q_proj";
+            f.custom({{"r", 2}, {"lora_alpha", alpha}, {"use_rslora", rslora}},
+                {{module + ".lora_A.weight", {2, 4}}, {module + ".lora_B.weight", {4, 2}}});
+            payloads = f.read(skipped);
+            assert(payloads.size() == 1 && skipped.empty());
+            assert(std::abs(payloads[0].scale - alpha / (rslora ? std::sqrt(2.0) : 2.0)) < 1e-6);
+        }
+    }
     Json config = {{"r", 2}, {"lora_alpha", 8}, {"use_rslora", true}, {"use_dora", true},
         {"bias", "all"}, {"lora_bias", true}, {"rank_pattern", {{"self_attn.q_proj", 1}}},
         {"alpha_pattern", {{"self_attn.q_proj", 3}}}};
