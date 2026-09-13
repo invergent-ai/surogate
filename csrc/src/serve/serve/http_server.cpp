@@ -1164,6 +1164,9 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         RequestLimits limits;
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
+        // Match /v1/messages soft routing before constructing its wake gate.
+        const auto extra = extra_services_.find(request.model);
+        if (extra != extra_services_.end()) { t_routed_service = extra->second; }
         const int input_tokens          = svc().count_prompt_tokens(
             request, request_cancelled(req), wake_gate());
         res.set_content(make_count_tokens_response(input_tokens), "application/json");

@@ -1,5 +1,6 @@
 // Opt-in HTTP regression with two resident models on separate devices.
 #include "serve/http_server.h"
+#include "serve/anthropic_schema.h"
 
 #include <cassert>
 #include <future>
@@ -47,6 +48,7 @@ int main() {
     options.kv_capacity = KvCapacityPolicy::explicit_capacity(512);
     options.max_concurrency = 1;
     options.enable_lora = true;
+    options.enable_sleep_mode = true;
     options.max_loras = 2;
     options.max_lora_rank = 8;
     options.log_stats_interval_ms = 0;
@@ -55,6 +57,7 @@ int main() {
     auto extra_options = options;
     extra_options.device = 1;
     extra_options.model_id_override = "extra";
+    extra_options.chat_template = "Count from one to ten: 1, 2, 3, 4, 5, 6, 7, 8, 9,";
     GenerationService extra(extra_options);
     HttpServer server(options);
     assert(server.bind());
@@ -117,6 +120,28 @@ int main() {
     }
     auto missing = catalog_client.Get("/v1/models/missing");
     assert(missing && missing->status == 404);
+    ModelScheduler scheduler({{"primary", &primary}, {"extra", &extra}},
+                             {{0, primary.resident_bytes()}, {1, extra.resident_bytes()}});
+    server.attach_scheduler(scheduler);
+    Json chat{{"model", "extra"}, {"messages", Json::array({{{"role", "user"}, {"content", "Hello"}}})},
+              {"max_tokens", 1}};
+    const auto parsed = parse_messages_request(chat, RequestLimits{});
+    const int primary_count = primary.count_prompt_tokens(parsed);
+    const int extra_count = extra.count_prompt_tokens(parsed);
+    assert(primary_count != extra_count);
+    for (const auto& id : {"primary", "claude-client-alias", "extra"}) {
+        chat["model"] = id;
+        const bool routed_extra = std::string_view(id) == "extra";
+        if (routed_extra) { extra.sleep(); assert(extra.is_sleeping()); }
+        auto count = post("/v1/messages/count_tokens", chat);
+        assert(count && count->status == 200);
+        const int actual = Json::parse(count->body).at("input_tokens");
+        assert(actual == (routed_extra ? extra_count : primary_count));
+        if (routed_extra) { assert(!extra.is_sleeping()); }
+        auto generated = post("/v1/messages", chat);
+        assert(generated && generated->status == 200);
+        assert(Json::parse(generated->body).at("usage").at("input_tokens") == actual);
+    }
     server.stop();
     assert(listener.wait_for(2s) == std::future_status::ready);
     assert(listener.get());
