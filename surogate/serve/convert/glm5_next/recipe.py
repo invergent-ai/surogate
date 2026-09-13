@@ -47,7 +47,7 @@ from surogate.serve.convert.common.recipe import (
 
 from . import inventory as inv
 
-RECIPE_ID = "glm5-next-v4"
+RECIPE_ID = "glm5-next-v5"
 
 #: Objects whose op reads the row-split W8 planes rather than the file's own block format.
 #: Their weights are still read from the GGUF where they lie -- Q8_0 and W8G32_F16S hold the
@@ -182,7 +182,18 @@ def _mla(layer: int, prefix: str, geometry: inv.Geometry) -> list[TensorRecipe]:
     # it in, so no transpose and no materialisation.
     k_b = source(f"{blk}attn_k_b.weight", (heads, latent, nope))
     v_b = source(f"{blk}attn_v_b.weight", (heads, value, latent))
+    indexer = (
+        ("query", "indexer.attn_q_b.weight", (geometry.index_heads * geometry.index_dim, geometry.q_lora_rank)),
+        ("key", "indexer.attn_k.weight", (geometry.index_dim, geometry.hidden)),
+        ("head_weight", "indexer.proj.weight", (geometry.index_heads, geometry.hidden)),
+        ("compress", "indexer_compressor_gate.weight", (geometry.index_dim, geometry.hidden)),
+        ("key_norm", "indexer.k_norm.weight", (geometry.index_dim,)),
+        ("key_bias", "indexer.k_norm.bias", (geometry.index_dim,)),
+        ("ape", "indexer_compressor_ape.weight", (geometry.index_pool, geometry.index_dim)),
+    )
     return [
+        *(TensorRecipe(f"{prefix}mla/indexer/{name}", source(blk + stored, shape))
+          for name, stored, shape in indexer),
         TensorRecipe(
             f"{prefix}mla/query_a", source(f"{blk}attn_q_a.weight", (geometry.q_lora_rank, geometry.hidden))
         ),

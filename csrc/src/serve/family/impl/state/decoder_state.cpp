@@ -24,7 +24,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::uint32_t physical_page_cap = 0, bool overcommit = false,
                               std::int32_t global_kv_heads = 0,
                               std::int32_t global_head_dim = 0,
-                              const std::vector<std::uint32_t>& global_layers = {}) {
+                              const std::vector<std::uint32_t>& global_layers = {},
+                              DType indexer_dtype = DType::BF16) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -104,10 +105,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256});
             pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256});
         }
-        // The indexer plane is always BF16 and one head: the selection reads raw keys and a
-        // quantized cache would change which cells the model attends to, not just their values.
+        // Indexer precision is independent of K/V quantization: rounding selection
+        // controls can change which tokens the model attends to.
         if (indexer_head_dim > 0) {
-            pool_spec.planes.push_back({DType::BF16, indexer_head_dim, 1, 256});
+            pool_spec.planes.push_back({indexer_dtype, indexer_head_dim, 1, 256});
         }
     }
     return PagedKVCacheLayout{
@@ -175,12 +176,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.kv_skip_layers, spec.indexer_head_dim, spec.elastic_kv,
                                 spec.text_physical_page_cap, spec.elastic_kv_overcommit,
                                 spec.global_kv_heads, spec.global_attention_head_dim,
-                                spec.global_geometry_layers);
+                                spec.global_geometry_layers, spec.indexer_dtype);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups,
-                                   spec.kv_skip_layers, 0);
+                                   spec.kv_skip_layers, spec.mtp_indexer ? spec.indexer_head_dim : 0,
+                                   false, 0, false, 0, 0, {}, spec.indexer_dtype);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     if (spec.ple) { layout.ple = plan_ngram_ple_state_pool(builder, *spec.ple); }

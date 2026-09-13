@@ -33,7 +33,20 @@ help checks. A4 is resolved as well: wake admission now shares the request's tim
 cancellation, and capacity reservation; waiters can leave during an ongoing model transfer.
 A5 is resolved: the head projection and Spark expectations now follow their contracts,
 and KDA/GDN agreement is checked against a common FP64 reference with BF16-aware bounds.
-The memory, throughput, and coverage backlog below remains open.
+GLM's native sparse-context restriction is also resolved: the artifact includes the learned
+pooling/indexer weights, and paged FP32 indexer state follows trunk and MTP cache operations.
+Its raw keys and gates survive speculative rollback inside a pool; scoring scratch is tiled
+to at most 64 MiB. Older prepared artifacts are invalidated by the conversion cache version.
+The released 199.3 GB GGUF ran a 2,434-token prompt across physical GPUs 0–7 with
+context/KV capacity 4,096: 12 generated tokens without speculation, then 24 with MTP
+(7 rounds, 15 accepted draft tokens). Four reduced-checkpoint regressions passed for
+completed-turn reuse with BF16/FP8 caches and MTP on/off. Attention workspace planning now
+covers shorter histories that admit more query tiles. GPU op checks cover FP64 pooling/selection references,
+causality, signed head weights, ties, masked batches, rollback and CUDA graph replay;
+Compute Sanitizer reported zero errors. This is integration evidence, not a long-context
+quality or throughput benchmark. A reduced two-layer fixture has ~0.03 single-GPU/pipeline
+score differences even below the sparse threshold, so it is not used as an exact score oracle.
+The remaining memory, throughput, and coverage backlog below stays open.
 
 ## Fix first
 
@@ -195,7 +208,7 @@ speedup or memory saving was measured in this audit.
 | Adapter coverage | Full saved matrices outside embeddings/output heads still require merging. Loading recognizes LoRA/DoRA rather than arbitrary PEFT methods, and requires one `adapter_model.safetensors` file. Spatial LoRA B kernels must be unit-sized. Unsupported tensors are rejected explicitly. [Registry](../../serve/serve/lora_registry.cpp#L113). Existing expert prefill, CPU expert adapters, vision adapters, biases, and rank/alpha overrides are implemented. |
 | Additional-model ingestion | The positional model is prepared automatically; additional `--model` entries still require prepared `.sinfer` paths. [Launcher preparation](../../../../surogate/cli/serve.py#L230), [registry guard](../../serve/targets/registry.cpp#L43). Prepare all entries through the same ingestion API. |
 | LFM2 quantized memory | LFM2 conversion repacks compatible weights to W8 and dequantizes/re-encodes other GGUF formats into W8. Low-bit source size therefore does not describe loaded memory or prepared artifact size. [Converter](../../../../surogate/serve/convert/lfm2/convert.py#L1). Native GGUF execution here remains useful memory work. |
-| GLM sparse context / vision | The native GLM converter still omits the sparse indexer and caps context at `min(max_context, index_topk + index_pool - 1)`. Vision-bearing GLM and Qwen4exp GGUFs are refused by their text recipes. [GLM bound](../../../../surogate/serve/convert/glm5_next/inventory.py#L104), [GLM omissions](../../../../surogate/serve/convert/glm5_next/convert.py#L50), [Qwen4exp](../../../../surogate/serve/convert/qwen4exp/convert.py#L204). GLM already uses a latent KV geometry; the old expanded-KV limitation should not be repeated. |
+| GLM / Qwen4exp vision | Vision-bearing GGUFs are still refused by the text recipes. GLM's sparse indexer is now served and its former 2,051-token native context cap is removed; checkpoint context and available memory determine capacity. [GLM converter](../../../../surogate/serve/convert/glm5_next/convert.py), [Qwen4exp](../../../../surogate/serve/convert/qwen4exp/convert.py). |
 | Tokenizer coverage | Added tokens with `single_word`, `lstrip`, `rstrip`, or nontrivial normalized matching are rejected. These can prevent a checkpoint from loading even when its tensor architecture is supported. [Validation](../../serve/family/impl/frontend/tokenizer.cpp#L185). |
 | Hardware / encoder families | The common generation planner requires SM120. CPU execution is available for embeddings, not full generative inference. Embedding ingestion registers GemmaEmbedding, whose current attention backends require one KV head; arbitrary embedding architectures are not supported. [Generation guard](../../serve/family/impl/runtime/layouts_impl.h#L910), [encoder registry](../../../../surogate/serve/ingest.py#L664), [encoder geometry](../../serve/encoder/gemma_embedding.h#L55). |
 

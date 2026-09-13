@@ -10,7 +10,7 @@ from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.inventory import (
     BF16,
     DIRECT_FORMATS,
-    RESOURCE_SPECS,
+    RESOURCE_SPECS as COMMON_RESOURCE_SPECS,
     ResourceSpec,
     StoredObjectSpec,
     TensorSpec,
@@ -24,6 +24,8 @@ TARGET_KEY = "glm5_next"
 MODEL_ID = "glm5-next"
 WEIGHTS_ID = "w8-mhc-v1"
 CAPABILITIES = ("text",)
+RESOURCE_SPECS = tuple(spec for spec in COMMON_RESOURCE_SPECS
+                       if not spec.name.endswith("preprocessor_config.json"))
 
 #: The Hub repository the frontend (tokenizer, chat template, generation config) comes from.
 #: The weights are not fetched from it -- they are the GGUF's -- but a GGUF carries a token
@@ -64,6 +66,9 @@ class Geometry:
     nextn_layers: int
     max_context: int
     index_pool: int
+    index_heads: int
+    index_dim: int
+    index_norm_epsilon: float
     declared: declaration.Declaration = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -72,9 +77,15 @@ class Geometry:
         required = ("hidden", "layers", "query_heads", "dense_intermediate", "expert_intermediate",
                     "vocab", "experts", "experts_per_token", "hc_streams", "hc_sinkhorn_iterations",
                     "kda_heads", "kda_head_dim", "kda_conv_kernel", "kda_gate_rank", "q_lora_rank",
-                    "kv_lora_rank", "qk_head_dim", "v_head_dim", "max_context", "index_topk", "index_pool")
+                    "kv_lora_rank", "qk_head_dim", "v_head_dim", "max_context", "index_topk", "index_pool", "index_heads", "index_dim")
         for name in required:
             positive_int({name: getattr(self, name)}, name)
+        if self.index_topk % self.index_pool or self.index_pool > 64:
+            raise ValueError("index_topk must be divisible by index_pool, with pool size at most 64")
+        if self.index_dim > 256 or self.index_dim % 32 or self.index_heads > 64:
+            raise ValueError("unsupported GLM indexer head geometry")
+        if not math.isfinite(self.index_norm_epsilon) or self.index_norm_epsilon <= 0:
+            raise ValueError("indexer LayerNorm epsilon must be positive and finite")
         if self.layers > 256 or self.nextn_layers not in (0, 1):
             raise ValueError("GLM serving supports at most 256 text layers and one NextN layer")
         if self.experts_per_token > self.experts:
@@ -103,8 +114,7 @@ class Geometry:
 
     @property
     def serving_context(self) -> int:
-        # Without the sparse indexer, all complete pools and the unfinished tail fit here.
-        return min(self.max_context, self.index_topk + self.index_pool - 1)
+        return self.max_context
 
     @property
     def residual(self) -> int:
@@ -217,6 +227,9 @@ def geometry_from_gguf(kv: Callable[[str, Any], Any]) -> Geometry:
         nextn_layers=nextn,
         max_context=integer(need("context_length")),
         index_pool=integer(need("attention.indexer.kpool")),
+        index_heads=integer(need("attention.indexer.head_count")),
+        index_dim=integer(need("attention.indexer.key_length")),
+        index_norm_epsilon=number(need("attention.layer_norm_epsilon")),
     )
 
 
@@ -263,6 +276,8 @@ def config_from_geometry(geometry: Geometry) -> dict[str, Any]:
         "linear_conv_kernel_dim": geometry.kda_conv_kernel,
         "linear_lower_bound": geometry.kda_lower_bound,
         "index_topk": geometry.index_topk,
+        "index_n_heads": geometry.index_heads,
+        "index_head_dim": geometry.index_dim,
         "index_kpool": geometry.index_pool,
         "index_kpool_always_select_tail": True,
         "max_position_embeddings": geometry.max_context,

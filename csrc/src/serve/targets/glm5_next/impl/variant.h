@@ -2,6 +2,7 @@
 
 #include "targets/glm5_next/impl/config.h"
 #include <api/ops/gated_rmsnorm.h>
+#include <api/ops/gqa_attention.h>
 #include "targets/glm5_next/impl/load/bindings.h"
 #include <api/family/runtime.h>
 #include <api/family/text_geometry.h>
@@ -58,6 +59,15 @@ struct Variant {
     /// The latent attention writes no gate rows, so the multiply is skipped rather than applied
     /// to whatever the unwritten gate plane last held.
     static constexpr bool attention_output_gate = false;
+    static constexpr bool has_glm_indexer = true;
+    static ops::GqaBlockMask indexer_selection(const Tensor& hidden, const GlmIndexerWeights& weights,
+        const family::TextGeometry& geometry, const Tensor& positions, const Tensor& table_rows,
+        const Tensor& valid_columns, std::int32_t columns_per_row, std::int32_t keys,
+        std::int32_t capacity, PagedKVBatchLayerView cache, WorkspaceArena& workspace,
+        cudaStream_t stream, bool append_only = false);
+    static std::size_t indexer_workspace_capacity_bytes(const family::TextGeometry& geometry,
+        std::int32_t tokens, std::int32_t keys);
+
 
     /// The attention normalises its two low ranks, not its heads: there is no `query_norm` or
     /// `key_norm` object to bind and no per-head normalisation to apply.

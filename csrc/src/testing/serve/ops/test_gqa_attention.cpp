@@ -1,3 +1,4 @@
+#include "api/ops/gqa_workspace.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -1775,6 +1776,20 @@ int verify_geometry_registration_contract() {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
+    // GLM's 512-wide latent: a shorter history fits 127 one-query tiles, whereas
+    // the maximum history fits fewer. The broad interval must cover both.
+    for (const auto dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+        const auto capacity = ops::gqa_attention_history_workspace_capacity_bytes(512, 64, 1,
+            dtype, {1, 4096}, 1, 1, 128);
+        for (unsigned keys : {128U, 256U, 512U, 1024U, 2048U, 4096U}) {
+            const auto exact = ops::gqa_attention_workspace_capacity_bytes(512, 64, 1,
+                dtype, {keys, keys}, 1, 1, 128);
+            if (capacity < exact) {
+                std::cerr << "GLM workspace interval misses shorter-history prompt tiles\n";
+                ++failures;
+            }
+        }
+    }
     for (const DType dtype : {DType::BF16, DType::I8}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =

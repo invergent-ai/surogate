@@ -5,6 +5,8 @@
 #include "api/ops/gdn_gating.h"
 #include "api/ops/hyper_connection.h"
 #include "api/ops/linear.h"
+#include "api/ops/glm_indexer.h"
+#include "api/ops/qsa_indexer.h"
 #include "api/ops/silu_mul.h"
 #include "api/ops/head_linear.h"
 #include "api/ops/manifold_hyper_connection.h"
@@ -388,6 +390,54 @@ std::size_t unfold_capacity(const family::TextGeometry& geometry, WeightsProfile
 }
 
 } // namespace
+
+ops::GqaBlockMask Variant::indexer_selection(const Tensor& hidden, const GlmIndexerWeights& w,
+    const family::TextGeometry& g, const Tensor& positions, const Tensor& table_rows,
+    const Tensor& valid_columns, std::int32_t columns_per_row, std::int32_t keys,
+    std::int32_t capacity, PagedKVBatchLayerView cache, WorkspaceArena& workspace,
+    cudaStream_t stream, bool append_only) {
+    if (capacity <= g.indexer_top_k + g.indexer_block - 1) { return {}; }
+    const ops::GlmIndexerGeometry geometry{g.indexer_head_dim, g.indexer_heads,
+        g.indexer_block, g.indexer_top_k, g.indexer_norm_epsilon};
+    const int tokens = hidden.ne[1];
+    const bool sparse = !append_only && keys > g.indexer_top_k + g.indexer_block - 1;
+    const int words = sparse ? ops::qsa_block_mask_words(keys, g.indexer_block) : 0;
+    // Only the mask survives this call. Projection and score scratch can be reused by GQA.
+    Tensor mask = sparse ? workspace.alloc(DType::I32, {words, tokens}) : Tensor{};
+    auto scratch = workspace.scope();
+    Tensor key = workspace.alloc(DType::FP32, {g.indexer_head_dim, tokens});
+    Tensor gate = workspace.alloc(DType::FP32, {g.indexer_head_dim, tokens});
+    ops::glm_indexer_project(w.key, hidden, key, stream);
+    ops::glm_indexer_project(w.compress, hidden, gate, stream);
+    ops::glm_indexer_append(key, gate, w.key_norm, w.key_bias, w.ape, positions,
+        table_rows, valid_columns, columns_per_row, geometry, cache, stream);
+    if (!sparse) { return {}; }
+    Tensor low = workspace.alloc(DType::BF16, {g.q_lora_rank, tokens});
+    project("mla/query_a", hidden, w.query_a, low, workspace, stream);
+    ops::rmsnorm(low, w.query_a_norm, g.rms_epsilon, false, low, stream);
+    Tensor query = workspace.alloc(DType::FP32, {g.indexer_head_dim * g.indexer_heads, tokens});
+    Tensor head = workspace.alloc(DType::FP32, {g.indexer_heads, tokens});
+    ops::glm_indexer_project(w.query, low, query, stream);
+    ops::glm_indexer_project(w.head_weight, hidden, head, stream);
+    ops::glm_indexer_select(query.view({g.indexer_head_dim, g.indexer_heads, tokens}), head,
+        positions, table_rows, valid_columns, columns_per_row, geometry, cache, keys,
+        workspace, mask, stream);
+    return {.words = static_cast<const std::uint32_t*>(mask.data), .stride = words,
+            .block = g.indexer_block};
+}
+
+std::size_t Variant::indexer_workspace_capacity_bytes(const family::TextGeometry& g,
+    std::int32_t tokens, std::int32_t keys) {
+    const ops::GlmIndexerGeometry geometry{g.indexer_head_dim, g.indexer_heads,
+        g.indexer_block, g.indexer_top_k, g.indexer_norm_epsilon};
+    return 2 * plane_bytes(g.indexer_head_dim, tokens, DType::FP32) +
+        plane_bytes(g.q_lora_rank, tokens, DType::BF16) +
+        plane_bytes(g.indexer_head_dim * g.indexer_heads, tokens, DType::FP32) +
+        plane_bytes(g.indexer_heads, tokens, DType::FP32) +
+        plane_bytes(ops::qsa_block_mask_words(keys, g.indexer_block), tokens, DType::I32) +
+        ops::glm_indexer_select_workspace_capacity_bytes(tokens, keys, geometry) +
+        linear_capacity(WeightsProfile::GroupwiseInt, g.q_lora_rank, g.hidden, 1, tokens);
+}
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,

@@ -24,6 +24,8 @@ def metadata(*, hidden=256, qk_dim=64, experts=8, nextn=1):
         "attention.key_length_mla": qk_dim, "attention.value_length_mla": qk_dim,
         "attention.layer_norm_rms_epsilon": 1e-4,
         "attention.indexer.top_k": 128, "attention.indexer.kpool": 8,
+        "attention.indexer.head_count": 4, "attention.indexer.key_length": 64,
+        "attention.layer_norm_epsilon": 1e-6,
     }
     return {"glm5next." + key: value for key, value in values.items()}
 
@@ -47,7 +49,11 @@ def test_shapes_and_runtime_settings_follow_gguf(hidden, qk_dim, experts, nextn)
     runtime = _geometry_block(geometry, token_domain=geometry.vocab - 1)
     assert runtime["qk_head_dim"] == qk_dim and runtime["v_head_dim"] == qk_dim
     assert runtime["experts"] == experts and runtime["experts_per_token"] == 2
-    assert runtime["max_context"] == 135
+    assert runtime["max_context"] == 4096
+    assert runtime["indexer_heads"] == 4 and runtime["indexer_head_dim"] == 64
+    assert runtime["indexer_block"] == 8 and runtime["indexer_top_k"] == 128
+    assert by_name["text/layers/1/mla/indexer/query"].shape == (256, 64)
+    assert by_name["text/layers/1/mla/indexer/head_weight"].format == "FP32"
     assert runtime["hc_streams"] == 2 and runtime["residual"] == 2 * hidden
     assert runtime["hc_sinkhorn_iterations"] == 12 and runtime["hc_epsilon"] == 2e-5
     assert runtime["routed_scale"] == 1.5 and runtime["swiglu_limit"] == 7.0
@@ -59,6 +65,8 @@ def test_shapes_and_runtime_settings_follow_gguf(hidden, qk_dim, experts, nextn)
 
 
 @pytest.mark.parametrize("key", ["context_length", "attention.indexer.kpool", "attention.key_length_mla",
+                                 "attention.indexer.head_count", "attention.indexer.key_length",
+                                 "attention.layer_norm_epsilon",
                                  "hyper_connection.sinkhorn_iterations", "expert_count"])
 def test_missing_gguf_metadata_does_not_select_defaults(key):
     values = metadata()
@@ -72,3 +80,7 @@ def test_nonuniform_clamps_fail_explicitly():
     values["glm5next.swiglu_clamp_exp"][2] = 8.0
     with pytest.raises(ValueError, match="one SwiGLU clamp"):
         inventory.geometry_from_gguf(values.get)
+
+
+def test_text_artifact_does_not_include_optional_image_processors():
+    assert not any(s.name.endswith("preprocessor_config.json") for s in inventory.RESOURCE_SPECS)

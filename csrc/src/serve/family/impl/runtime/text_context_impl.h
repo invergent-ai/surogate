@@ -437,6 +437,20 @@ void TextContext::mtp_attention_output(const Tensor& attention, Tensor& out) {
         attention, mtp_.payload->attention, *mtp_.o_proj, out, work_, ctx_.stream);
 }
 
+template <class V>
+ops::GqaBlockMask TextContext::mtp_indexer_selection(const Tensor& hidden, const Tensor& positions,
+    std::int32_t keys, bool append_only) {
+    if constexpr (requires { V::has_glm_indexer; }) {
+        const auto& payload = static_cast<const typename V::MtpAttentionProjectionWeights&>(mtp_.payload->attention);
+        return V::indexer_selection(hidden, payload.indexer, cfg_geometry(), positions,
+            active_backend_kv_table_rows_ ? *active_backend_kv_table_rows_ : io_.backend_kv_table_row,
+            active_valid_columns_ ? *active_valid_columns_ : Tensor{},
+            active_sequence_batch_ ? active_sequence_width_ : hidden.ne[1], keys,
+            batch_mtp_kv_->max_context(), batch_mtp_kv_->batch_layer_view(0), work_, ctx_.stream,
+            append_only);
+    } else { return {}; }
+}
+
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden) {
@@ -475,6 +489,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     }
 
     Tensor a = results.attention.view({cfg_.head_dim, cfg_.n_q, T});
+    const auto selection = mtp_indexer_selection(ah, positions, envelope.max_visible_keys);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T ||
@@ -488,10 +503,10 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
                            *active_backend_kv_table_rows_, cfg_.attention_scale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s, selection);
     } else {
         ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, cfg_.attention_scale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s, selection);
     }
     // A head whose attention writes no gate rows skips the multiply, as the trunk does.
     if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
@@ -695,6 +710,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             ops::rope(rope_positions, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
         }
         ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        (void)mtp_indexer_selection(ah, positions, envelope.max_visible_keys, true);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -741,8 +757,15 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         }
 
         Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, cfg_.attention_scale, mtp_kv_.layer_view(0), envelope,
-                                  work_, a, s);
+        const auto selection = mtp_indexer_selection(ah_last, last_position, envelope.max_visible_keys);
+        if (selection.words != nullptr) {
+            ops::gqa_attention_cached(qn, last_position, Tensor{}, io_.backend_kv_table_row,
+                                      cfg_.attention_scale, batch_mtp_kv_->batch_layer_view(0), envelope,
+                                      work_, a, s, selection);
+        } else {
+            ops::gqa_attention_cached(qn, last_position, cfg_.attention_scale, mtp_kv_.layer_view(0),
+                                      envelope, work_, a, s);
+        }
         if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
 
         Tensor o = work_.alloc(DType::BF16, {cfg_.hidden, 1});
@@ -1295,7 +1318,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
             : text_indexer_selection(
                   w, h, T, cache_positions, rope_positions, kv_table_rows, indexer_columns_per_row,
                   static_cast<std::int32_t>(active_gqa_envelope_->max_visible_keys),
-                  batch_text_kv_->batch_layer_view(fidx));
+                  batch_text_kv_->batch_layer_view(fidx),
+                  active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{});
     if (!mtp && image_attention_end_ &&
         (weights_.vision_geometry.attention_mode == 1 ||
          (weights_.vision_geometry.attention_mode == 2 &&
@@ -1941,8 +1965,14 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
                                                       const Tensor& table_rows,
                                                       std::int32_t columns_per_row,
                                                       std::int32_t keys,
-                                                      PagedKVBatchLayerView cache) {
-    if constexpr (!requires { V::has_qsa_indexer; }) {
+                                                      PagedKVBatchLayerView cache,
+                                                      const Tensor& valid_columns) {
+    if constexpr (requires { V::has_glm_indexer; }) {
+        const auto& payload = static_cast<const typename V::FullAttentionProjectionWeights&>(*w.projection);
+        return V::indexer_selection(hidden, payload.indexer, cfg_geometry(), cache_positions,
+            table_rows, valid_columns, columns_per_row, keys, batch_text_kv_->max_context(),
+            cache, work_, ctx_.stream);
+    } else if constexpr (!requires { V::has_qsa_indexer; }) {
         return ops::GqaBlockMask{};
     } else {
         const ops::QsaIndexerGeometry geometry{
@@ -2440,7 +2470,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         full, h.slice(1, prefill_cols, decode_columns), decode_columns, decode.cache_positions,
                         rope_all.slice(0, prefill_cols, decode_columns), decode.kv_table_rows, width,
                         static_cast<std::int32_t>(decode.envelope.max_visible_keys),
-                        kv_view);
+                        kv_view, decode.valid_columns);
                     ops::GqaExecutionEnvelope decode_layer_envelope = decode.envelope;
                     decode_layer_envelope.sliding_window                = layer_window;
                     if (owns_kv) {

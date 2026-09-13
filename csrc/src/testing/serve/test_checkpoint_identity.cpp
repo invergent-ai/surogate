@@ -62,7 +62,9 @@ void check_glm() {
         {"geometry", {{"hidden", 256}, {"residual", 512}, {"layers", 4}, {"intermediate", 128},
                        {"output_rows", 512}, {"token_domain", 512}, {"query_heads", 4},
                        {"kv_heads", 1}, {"head_dim", 64}, {"rotary_dim", 0}, {"rope_theta", 0},
-                       {"max_context", 135}, {"rms_epsilon", 1e-4}, {"attention_scale", 0.125},
+                       {"max_context", 4096}, {"indexer_heads", 4}, {"indexer_head_dim", 64},
+                       {"indexer_top_k", 128}, {"indexer_block", 8}, {"indexer_norm_epsilon", 1e-6},
+                       {"rms_epsilon", 1e-4}, {"attention_scale", 0.125},
                        {"gdn_scale", 0.176776695}, {"hc_streams", 2}, {"hc_epsilon", 2e-5},
                        {"hc_sinkhorn_iterations", 12}, {"q_lora_rank", 64}, {"kv_lora_rank", 64},
                        {"qk_head_dim", 128}, {"v_head_dim", 128}, {"gdn_conv_kernel", 5},
@@ -79,8 +81,9 @@ void check_glm() {
     const sinfer::artifact::Reader reader(fixture.path);
     const auto geometry = Glm::declared_geometry(reader);
     assert(geometry.qk_head_dim == 128 && geometry.v_head_dim == 128 && geometry.experts == 8);
+    assert(geometry.max_context == 4096 && geometry.indexer_top_k == 128);
     assert(geometry.hc_streams == 2 && geometry.hc_sinkhorn_iterations == 12);
-    assert(geometry.max_context == 135 && geometry.kda_gate_bound == 3.0F);
+    assert(geometry.max_context == 4096 && geometry.kda_gate_bound == 3.0F);
     assert(!geometry.layer_attends(0) && geometry.layer_attends(1));
     for (const auto& [name, unused] : directory["geometry"].items()) {
         auto incomplete = directory;

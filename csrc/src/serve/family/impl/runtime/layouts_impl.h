@@ -6,6 +6,7 @@
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/vision_context.h"
 #include "api/ops/qsa_indexer.h"
+#include "api/ops/gqa_workspace.h"
 #include "family/impl/runtime/workspace_recipe.h"
 
 #include "core/device.h"
@@ -86,6 +87,9 @@ namespace {
     return (bytes + 255U) & ~static_cast<std::size_t>(255U);
 }
 
+template <class V>
+inline constexpr bool has_glm_indexer_v = requires { V::has_glm_indexer; };
+
 // QSA indexer width of the target (design/INFERENCE.md, phase 4), or 0 when the model has no
 // indexer: the KV cache then carries one extra BF16 plane per full-attention layer.
 // Transient bytes one full-attention layer's QSA indexer needs for `tokens` columns over a
@@ -93,7 +97,9 @@ namespace {
 template <class V>
 [[nodiscard]] std::size_t variant_indexer_workspace_bytes(const family::TextGeometry& g, std::int32_t tokens,
                                                           std::int32_t keys) noexcept {
-    if constexpr (!requires { V::has_qsa_indexer; }) {
+    if constexpr (requires { V::has_glm_indexer; }) {
+        return V::indexer_workspace_capacity_bytes(g, tokens, keys);
+    } else if constexpr (!requires { V::has_qsa_indexer; }) {
         (void)tokens;
         (void)keys;
         return 0;
@@ -235,7 +241,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .global_geometry_layers    = geometry_global_geometry_layers(plan.geometry),
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
-                     .indexer_head_dim          = plan.geometry.indexer_head_dim,
+                     .indexer_head_dim          = plan.geometry.indexer_head_dim *
+                         (has_glm_indexer_v<Variant> ? 3 : 1),
+                     .indexer_dtype = has_glm_indexer_v<Variant> ? DType::FP32 : DType::BF16,
+                     .mtp_indexer = has_glm_indexer_v<Variant>,
                      .kv_skip_layers            = plan.kv_skip_layers,
                      .enable_mtp                = plan.features.mtp(),
                      .elastic_kv                = plan.elastic_kv,
@@ -486,9 +495,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         // per-column block mask and the selection's score scratch. Reserved whenever the target
         // has an indexer — the selection engages only past its budget, but the append runs for
         // every column of every round, and a short workspace would be a hard failure.
-        scratch(layout, variant_indexer_workspace_bytes<Variant>(
-                            plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+        if constexpr (has_glm_indexer_v<Variant>) {
+            (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
+                plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
+        } else {
+            scratch(layout, variant_indexer_workspace_bytes<Variant>(
+                plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
+        }
+        scratch(layout, ops::gqa_attention_history_workspace_capacity_bytes(
                             plan.geometry.head_dim, plan.geometry.query_heads,
                             plan.geometry.kv_heads, plan.kv_dtype, envelope,
                             batch_size, min_width, max_width));
@@ -605,7 +619,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_attention_projection(layout, plan.geometry, tokens);
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(plan.geometry, tokens, tokens));
         (void)workspace_recipe::mtp_attention_results(layout, plan.geometry, tokens);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+        if constexpr (has_glm_indexer_v<Variant>) {
+            (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
+                plan.geometry, tokens, static_cast<std::int32_t>(text_envelope.max_visible_keys)));
+        }
+        scratch(layout, ops::gqa_attention_history_workspace_capacity_bytes(
                             plan.geometry.head_dim, plan.geometry.query_heads,
                             plan.geometry.kv_heads, plan.kv_dtype, envelope,
                             1, tokens, tokens));
@@ -634,15 +652,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(layout, DType::BF16, plan.geometry.kv_size(), last);
             matrix(layout, DType::BF16, plan.geometry.kv_size(), last);
             scratch(layout, Variant::mtp_kv_projection_workspace_capacity_bytes(plan.geometry, first, last));
+            if constexpr (has_glm_indexer_v<Variant>) {
+                scratch(layout, variant_indexer_workspace_bytes<Variant>(
+                    plan.geometry, last, static_cast<std::int32_t>(text_envelope.max_visible_keys)));
+            }
             matrix(layout, DType::BF16, plan.geometry.kv_size(), last);
         }
         matrix(layout, DType::BF16, plan.geometry.query_size(), 1);
         matrix(layout, DType::BF16, plan.geometry.query_size(), 1);
         scratch(layout, Variant::mtp_q_gate_projection_workspace_capacity_bytes(plan.geometry, 1, 1));
+        if constexpr (has_glm_indexer_v<Variant>) {
+            (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
+                plan.geometry, 1, static_cast<std::int32_t>(text_envelope.max_visible_keys)));
+        }
         matrix(layout, DType::BF16, plan.geometry.query_size(), 1);
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, plan.geometry.query_size(), 1);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+        scratch(layout, ops::gqa_attention_history_workspace_capacity_bytes(
                             plan.geometry.head_dim, plan.geometry.query_heads,
                             plan.geometry.kv_heads, plan.kv_dtype,
                             text_envelope, 1, 1, 1));
@@ -716,7 +742,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout,
                         Variant::mtp_attention_projection_workspace_capacity_bytes(plan.geometry, tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results(layout, plan.geometry, tokens);
-                scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                if constexpr (has_glm_indexer_v<Variant>) {
+                    (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
+                        plan.geometry, tokens, static_cast<std::int32_t>(text_envelope.max_visible_keys)));
+                }
+                scratch(layout, ops::gqa_attention_history_workspace_capacity_bytes(
                                     plan.geometry.head_dim, plan.geometry.query_heads,
                                     plan.geometry.kv_heads, plan.kv_dtype,
                                     text_envelope, batch, width, width));

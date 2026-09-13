@@ -48,7 +48,12 @@ struct HyperConnectionPlan {
 /// Multi-head latent attention, NoPE. The query passes through its own low rank and the
 /// key/value through theirs; the two halves of the expansion are separate objects because the
 /// checkpoint stores one of them transposed and only the other can be read where it lies.
+struct GlmIndexerPlan {
+    artifact::ObjectHandle query, key, head_weight, compress, key_norm, key_bias, ape;
+};
+
 struct LatentAttentionPlan {
+    GlmIndexerPlan indexer;
     WeightPlan query_a;
     artifact::ObjectHandle query_a_norm;
     WeightPlan query_b;
@@ -180,7 +185,14 @@ struct HyperConnectionPayload {
 };
 
 /// The attention site's payload: its hyper-connection and the latent projections.
+struct GlmIndexerWeights {
+    Tensor query, key, head_weight, compress, key_norm, key_bias, ape;
+    Weight query_a;
+    Tensor query_a_norm;
+};
+
 struct LatentAttentionPayload {
+    GlmIndexerWeights indexer;
     HyperConnectionPayload hc;
     /// The layer's `input_layernorm`, applied to the collapsed stream. It is the same tensor
     /// the family holds beside this payload; the collapse hook receives only the payload, so
@@ -245,6 +257,7 @@ struct FeedForwardPayload {
 /// because the head runs on a single-stream residual. The same member names as
 /// `LatentAttentionPayload`, so one loader fills either.
 struct MtpAttentionPayload {
+    GlmIndexerWeights indexer;
     float rms_epsilon = 0.0F;
     Weight query_a;
     Tensor query_a_norm;

@@ -373,6 +373,7 @@ set(sinfer_op_tests
   expert_slot_cache
   lora
   qsa_indexer
+  glm_indexer
   cpu_expert_compute
   l2norm
   gated_delta_net

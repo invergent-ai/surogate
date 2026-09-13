@@ -103,6 +103,7 @@ struct TextGeometry {
     std::int32_t indexer_head_dim = 0;
     std::int32_t indexer_top_k = 0;
     std::int32_t indexer_block = 0;
+    float indexer_norm_epsilon = 1e-6F;
     std::int32_t ple_layer = 0;
     std::int32_t ple_ngram = 0;
     std::int32_t ple_heads_per_ngram = 0;

@@ -50,11 +50,7 @@ RECIPE_ID = rcp.RECIPE_ID
 def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> inv.Geometry:
     """What the file carries that this artifact does not, said out loud.
 
-    The indexer is a real part of the published model, and serving without it changes what the
-    engine computes past a bound, which the artifact records so the engine can refuse rather
-    than quietly attend to more than the model was trained to. A draft head the file declares
-    but does not carry (a trunk-only export) is dropped from the geometry, so the artifact says
-    it has none and `--spec mtp` refuses by name.
+    A draft head declared but absent from a trunk-only export is dropped from the geometry.
     """
     if any(name.startswith(("v.", "mm.")) or "vision" in name for name in source.tensors):
         raise NotImplementedError(
@@ -66,11 +62,6 @@ def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> inv
               "export); the artifact is written without one and --spec mtp will refuse",
               flush=True)
         geometry = replace(geometry, nextn_layers=0)
-    if any(".indexer." in name for name in source.tensors):
-        print(f"note: the sparse indexer is present and is not bound. It selects "
-              f"{geometry.index_topk} tokens, so up to that context every visible token is "
-              f"selected and full attention is exactly what it would have asked for; the "
-              f"artifact records the bound and the engine refuses beyond it", flush=True)
     return geometry
 
 
@@ -114,6 +105,9 @@ def _geometry_block(g: inv.Geometry, *, token_domain: int) -> dict[str, int | fl
         "gdn_value_head_dim": g.kda_head_dim, "kda_gate_rank": g.kda_gate_rank,
         "kda_gate_bound": -g.kda_lower_bound, "mtp_layers": g.nextn_layers,
         "rms_epsilon": g.rms_epsilon, "max_context": g.serving_context,
+        "indexer_heads": g.index_heads, "indexer_head_dim": g.index_dim,
+        "indexer_top_k": g.index_topk, "indexer_block": g.index_pool,
+        "indexer_norm_epsilon": g.index_norm_epsilon,
         "attention_scale": g.kv_lora_rank ** -0.5, "gdn_scale": g.kda_head_dim ** -0.5,
     })
 

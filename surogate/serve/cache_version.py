@@ -1,4 +1,4 @@
 """Version of the prepared serving cache, independent of conversion dependencies."""
 
-# 6 adds Gemma vision resources and preserves supported GGUF projector quantization.
-SERVING_CACHE_VERSION = 6
+# 7 includes GLM pooled indexer weights and full checkpoint context metadata.
+SERVING_CACHE_VERSION = 7

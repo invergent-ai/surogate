@@ -69,6 +69,7 @@ TEXT_INT_FIELDS = (
 
 TEXT_FLOAT_FIELDS = (
     "rms_epsilon",
+    "indexer_norm_epsilon",
     "rope_theta",
     "embedding_scale",
     "logit_softcap",

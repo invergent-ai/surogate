@@ -67,16 +67,10 @@ struct TextConfig {
     static constexpr int qk_head_dim   = 256;
     static constexpr int v_head_dim    = 256;
 
-    // The sparse indexer, which this target does not run. It selects `index_top_k / index_pool`
-    // pools of `index_pool` tokens and, because `index_kpool_always_select_tail` is set, the up
-    // to `index_pool - 1` newest tokens that do not yet fill a pool; that is 2,051 cells, the
-    // `n_select` llama.cpp gates its own indexer on. Below that many cached tokens every visible
-    // one is selected, so dense attention is exactly what the indexer would have asked for;
-    // above it the two differ and the engine refuses rather than attending to more than the
-    // model was trained to.
-    static constexpr int index_top_k         = 2048;
-    static constexpr int index_pool          = 4;
-    static constexpr int dense_exact_context = index_top_k + index_pool - 1;
+    // Pooled sparse attention selects complete pools plus the unfinished causal tail.
+    static constexpr int index_top_k = 2048;
+    static constexpr int index_pool = 4;
+    static constexpr int maximum_context = 1048576;
 
     // The mixture: a sigmoid-plus-bias router over 288 experts, top-8 renormalised and scaled,
     // plus an always-on expert added with weight one. Its router therefore has one row per
@@ -151,7 +145,6 @@ static_assert(TextConfig::full_attention_index(3) == 0 &&
               TextConfig::full_attention_index(43) == 10);
 static_assert(TextConfig::gdn_index(0) == 0 && TextConfig::gdn_index(44) == 33);
 static_assert(TextConfig::hc_mix == 24 && TextConfig::hc_width == 16384);
-static_assert(TextConfig::dense_exact_context == 2051);
 static_assert(TextConfig::head_dim == TextConfig::kv_lora_rank && TextConfig::kv_heads == 1,
               "absorbed MLA attends over the latent itself");
 
@@ -197,9 +190,7 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 /// The NextN draft head proposes up to this many tokens a round, the family's bound.
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
-/// What this target serves, not what the checkpoint was trained for (1,048,576). The sparse
-/// indexer is not bound, and below its budget full attention is exactly what it would have
-/// selected; above it they are different models.
-inline constexpr std::uint32_t kNativeContext            = TextConfig::dense_exact_context;
+/// Released checkpoint maximum; individual artifacts declare their own context.
+inline constexpr std::uint32_t kNativeContext            = TextConfig::maximum_context;
 
 } // namespace sinfer::targets::glm5_next::detail

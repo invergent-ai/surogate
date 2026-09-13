@@ -31,8 +31,8 @@ struct PagedKVLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
-    // QSA indexer keys of this layer, raw and unrotated, one head of `indexer_head_dim`
-    // (design/INFERENCE.md, phase 4). Empty when the cache carries no indexer plane.
+    // Model-specific indexer state, sharing K/V pages and block tables.
+    // QSA: BF16 keys. GLM: three FP32 components (key, gate, pooled key).
     Tensor indexer_pages;
     Tensor block_table;
     std::int32_t head_dim     = 0;

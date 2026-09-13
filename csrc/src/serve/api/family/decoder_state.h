@@ -32,9 +32,11 @@ struct DecoderStateSpec {
     std::vector<std::uint32_t> global_geometry_layers;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
-    // QSA indexer keys per full-attention layer (0 = none): one BF16 plane of this width
-    // beside the layer's K/V, sharing the pages and block tables (phase 4).
+    // Indexer plane width per full-attention layer (0 = none), sharing K/V pages.
+    // QSA stores BF16 keys; GLM stores FP32 keys, pooling gates and pooled keys.
     std::int32_t indexer_head_dim           = 0;
+    DType indexer_dtype = DType::BF16;
+    bool mtp_indexer = false;
     // Full-attention layer indices held at the model dtype while the rest of
     // the cache is quantized. Linear-attention layers never appear here: they
     // hold no KV planes at all, so a quantized cache cannot reach them.

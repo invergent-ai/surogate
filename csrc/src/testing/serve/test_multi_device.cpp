@@ -33,7 +33,7 @@ int main() {
     if (const auto* context = std::getenv("SUROGATE_MULTI_DEVICE_TEST_CONTEXT")) {
         options.max_context = std::stoul(context);
     }
-    options.kv_capacity = sinfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.kv_capacity = sinfer::KvCapacityPolicy::explicit_capacity(std::max(2048U, options.max_context * 2));
     options.max_concurrency = 4;
     options.enable_sleep_mode = true;
     if (const auto* adapter = std::getenv("SUROGATE_MULTI_DEVICE_TEST_ADAPTER")) {
@@ -90,6 +90,11 @@ int main() {
             *request.raw_prompt += " sample";
         }
         *request.raw_prompt += "\nContinue: 1, 2, 3, 4,";
+    }
+    if (const auto* tokens = std::getenv("SUROGATE_MULTI_DEVICE_TEST_PROMPT_TOKENS")) {
+        request.raw_prompt.reset();
+        for (int i = 0; i < std::stoi(tokens); ++i) request.prompt_token_ids.push_back(100 + i % 101);
+        options.prefill_chunk = 128;
     }
     request.max_tokens = vision ? 16 : 128;
     if (vision) {
@@ -156,7 +161,12 @@ int main() {
             else {
                 assert(expected_scores.size() == result.token_logprobs.size());
                 for (std::size_t i = 0; i < expected_scores.size(); ++i) {
-                    assert(std::abs(expected_scores[i] - result.token_logprobs[i]) < 0.02f);
+                    const float error = std::abs(expected_scores[i] - result.token_logprobs[i]);
+                    if (error >= 0.02f) {
+                        std::cerr << "pipeline score mismatch at token " << i << ": "
+                                  << expected_scores[i] << " vs " << result.token_logprobs[i] << '\n';
+                    }
+                    assert(error < 0.02f);
                 }
             }
         }
@@ -188,6 +198,9 @@ int main() {
                 continued.messages.push_back(
                     {.role = sinfer::ChatRole::User, .content = {{.kind = ContentKind::Text,
                         .text = "Name the color again. Reply with one color only."}}});
+            } else if (!request.prompt_token_ids.empty()) {
+                continued.prompt_token_ids.insert(continued.prompt_token_ids.end(), expected.begin(), expected.end());
+                continued.prompt_token_ids.push_back(123);
             } else {
                 continued.raw_prompt = *request.raw_prompt + completed_text + "\nContinue.";
             }

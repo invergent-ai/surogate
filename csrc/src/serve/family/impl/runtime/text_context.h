@@ -434,7 +434,11 @@ public:
                                                            const Tensor& table_rows,
                                                            std::int32_t columns_per_row,
                                                            std::int32_t keys,
-                                                           PagedKVBatchLayerView cache);
+                                                           PagedKVBatchLayerView cache,
+                                                           const Tensor& valid_columns = Tensor{});
+    template <class V = Variant>
+    ops::GqaBlockMask mtp_indexer_selection(const Tensor& hidden, const Tensor& positions,
+        std::int32_t keys, bool append_only = false);
     [[nodiscard]] bool stage_embeds() const noexcept { return stage_first_ == 0; }
     [[nodiscard]] bool stage_finishes() const noexcept { return stage_last_ == cfg_.n_layers; }
     void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {

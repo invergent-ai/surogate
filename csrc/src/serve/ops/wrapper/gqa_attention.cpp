@@ -1,6 +1,7 @@
 // sinfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
 #include "core/limits.h"
 #include "api/ops/gqa_attention.h"
+#include "api/ops/gqa_workspace.h"
 
 #include "core/layout.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
@@ -602,6 +603,32 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
         maximum = std::max(maximum, exact_capacity(width));
     }
     if (max_width > last) { maximum = std::max(maximum, exact_capacity(max_width)); }
+
+    return maximum;
+}
+
+std::size_t gqa_attention_history_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t q_heads,
+    std::int32_t kv_heads, DType cache_dtype, GqaExecutionEnvelope envelope,
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::size_t maximum = gqa_attention_workspace_capacity_bytes(head_dim, q_heads, kv_heads,
+        cache_dtype, envelope, batch_size, min_width, max_width);
+    if (!optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype)) { return maximum; }
+    // Shorter histories can fit more query tiles under the prompt's 32 MiB limit.
+    // Their rounded allocation can exceed the one at max_visible_keys, even though
+    // each individual query needs fewer split buffers. Cover the entire history
+    // interval, including alignment of three partial planes and two metadata planes.
+    if (batch_size == 1 && cache_dtype != DType::I8 &&
+        envelope.min_visible_keys < envelope.max_visible_keys &&
+        detail::gqa_attention_resolve_route(q_heads, kv_heads, max_width, 1,
+            {envelope.min_visible_keys, envelope.min_visible_keys, envelope.sliding_window}) ==
+            detail::GqaAttentionRoute::Prompt) {
+        const int splits = detail::gqa_attention_split_capacity(head_dim, q_heads, kv_heads,
+            32, cache_dtype, envelope);
+        const std::size_t per_query = static_cast<std::size_t>(head_dim + 2) * q_heads * splits * 4;
+        const std::size_t payload = std::max(per_query,
+            std::min<std::size_t>(32U << 20, per_query * std::min(max_width, 128)));
+        maximum = std::max(maximum, payload + 2048);
+    }
     return maximum;
 }
 

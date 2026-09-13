@@ -251,6 +251,14 @@ _MLA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("mla/k_b", "quantised", ("KAbsorbDim", "NopeDim"), ("mla_kv_b_weight",)),
     ServeObject("mla/v_b", "quantised", ("VDim", "KVRank"), ("mla_kv_b_weight",)),
     ServeObject("mla/output", "quantised", ("C", "VDim"), ("mla_out_weight",)),
+    # Selection is sensitive to projection rounding, especially the signed head weights.
+    ServeObject("mla/indexer/query", "fp32", ("GlmIndexerQueryRows", "QRank"), ("mla_index_q_weight",)),
+    ServeObject("mla/indexer/key", "fp32", ("GlmIndexerDim", "C"), ("mla_index_k_weight",)),
+    ServeObject("mla/indexer/head_weight", "fp32", ("GlmIndexerHeads", "C"), ("mla_index_head_weight",)),
+    ServeObject("mla/indexer/compress", "fp32", ("GlmIndexerDim", "C"), ("mla_index_compress_weight",)),
+    ServeObject("mla/indexer/key_norm", "fp32", ("GlmIndexerDim",), ("mla_index_norm_weight",)),
+    ServeObject("mla/indexer/key_bias", "fp32", ("GlmIndexerDim",), ("mla_index_norm_bias",)),
+    ServeObject("mla/indexer/ape", "fp32", ("GlmIndexerPool", "GlmIndexerDim"), ("mla_index_ape",)),
 )
 
 #: The dense feed-forward of the leading layers, at `intermediate_size` rather than the

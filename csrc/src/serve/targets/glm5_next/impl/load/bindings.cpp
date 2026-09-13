@@ -158,6 +158,18 @@ void bind_latent_attention(artifact::Binder& binder, const std::string& prefix,
     mla.output = bind_weight(binder, prefix + "mla/output", weights,
                              {static_cast<std::uint64_t>(g.hidden),
                               static_cast<std::uint64_t>(g.query_heads) * g.v_head_dim});
+    const auto tensor = [&](const char* name, std::initializer_list<std::uint64_t> shape) {
+        return bind_layer_tensor(binder, prefix + "mla/indexer/" + name, NumericFormat::FP32, shape);
+    };
+    const auto d = static_cast<std::uint64_t>(g.indexer_head_dim);
+    const auto h = static_cast<std::uint64_t>(g.indexer_heads);
+    mla.indexer.query = tensor("query", {h * d, static_cast<std::uint64_t>(g.q_lora_rank)});
+    mla.indexer.key = tensor("key", {d, static_cast<std::uint64_t>(g.hidden)});
+    mla.indexer.head_weight = tensor("head_weight", {h, static_cast<std::uint64_t>(g.hidden)});
+    mla.indexer.compress = tensor("compress", {d, static_cast<std::uint64_t>(g.hidden)});
+    mla.indexer.key_norm = tensor("key_norm", {d});
+    mla.indexer.key_bias = tensor("key_bias", {d});
+    mla.indexer.ape = tensor("ape", {static_cast<std::uint64_t>(g.indexer_block), d});
 }
 
 /// The NextN draft head, bound where the trunk's layers are and placed by whether the run asked
@@ -428,6 +440,19 @@ void load_latent_projection(const artifact::MaterializedArtifact& backing,
                                       g.qk_head_dim);
     payload.v_b = materialized_weight(backing, source.v_b,
                                       g.query_heads * g.v_head_dim, g.kv_lora_rank);
+    const auto tensor = [&](artifact::ObjectHandle handle, std::initializer_list<std::int32_t> shape) {
+        return artifact::materialized_tensor(backing, handle, NumericFormat::FP32, shape);
+    };
+    const int d = g.indexer_head_dim, h = g.indexer_heads;
+    payload.indexer.query = tensor(source.indexer.query, {g.q_lora_rank, h * d});
+    payload.indexer.key = tensor(source.indexer.key, {g.hidden, d});
+    payload.indexer.head_weight = tensor(source.indexer.head_weight, {g.hidden, h});
+    payload.indexer.compress = tensor(source.indexer.compress, {g.hidden, d});
+    payload.indexer.key_norm = tensor(source.indexer.key_norm, {d});
+    payload.indexer.key_bias = tensor(source.indexer.key_bias, {d});
+    payload.indexer.ape = tensor(source.indexer.ape, {d, g.indexer_block});
+    payload.indexer.query_a = payload.query_a;
+    payload.indexer.query_a_norm = payload.query_a_norm;
 }
 
 } // namespace
@@ -448,7 +473,20 @@ family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& rea
     for (const char* name : {"leading_dense_layers", "shared_intermediate", "swiglu_limit", "mtp_layers"}) {
         require(name, false);
     }
+    for (const char* name : {"indexer_heads", "indexer_head_dim", "indexer_top_k",
+                             "indexer_block", "indexer_norm_epsilon"}) {
+        if (!reader.geometry().contains(name)) {
+            throw std::invalid_argument("GLM artifact lacks its sparse indexer; rebuild it from the original model");
+        }
+        require(name);
+    }
     const auto& g = geometry;
+    if (g.indexer_head_dim > 256 || g.indexer_head_dim % 32 != 0 || g.indexer_heads > 64 ||
+        g.indexer_block > 64 || g.indexer_top_k % g.indexer_block != 0 ||
+        std::int64_t(g.indexer_top_k) + g.indexer_block - 1 > INT32_MAX ||
+        std::int64_t(g.max_context) + g.indexer_block - 1 > INT32_MAX) {
+        throw std::invalid_argument("unsupported GLM sparse indexer geometry");
+    }
     if (g.kv_heads != 1 || g.rotary_dim != 0 || g.head_dim != g.kv_lora_rank ||
         static_cast<std::int64_t>(g.hc_streams) * g.hidden != g.residual ||
         g.gdn_key_heads != g.gdn_value_heads || g.gdn_key_head_dim != g.gdn_value_head_dim ||
