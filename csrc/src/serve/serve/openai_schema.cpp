@@ -438,6 +438,9 @@ void parse_stop(const Json& body, GenerationRequest& out) {
             out.prompt_token_ids.push_back(item.get<sinfer::TokenId>());
         }
         if (out.prompt_token_ids.empty()) { bad_request("tokens must not be empty", "tokens"); }
+        if (out.media_item_count() != 0) {
+            bad_request("tokens cannot be combined with images or video; send messages without tokens for vision input", "tokens");
+        }
     }
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     const Json& stop = body.at("stop");

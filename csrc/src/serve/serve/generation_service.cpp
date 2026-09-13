@@ -100,6 +100,15 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+void validate_token_media(const GenerationRequest& request) {
+    if (!request.prompt_token_ids.empty() && request.media_item_count() != 0) {
+        throw ApiException(ApiError{
+            .status = 400,
+            .message = "tokens cannot be combined with images or video; send messages without tokens for vision input",
+            .param = "tokens"});
+    }
+}
+
 [[noreturn]] void throw_preparation_cancelled();
 
 [[noreturn]] void throw_media_error(const sinfer::product::media_acquire::Error& exception) {
@@ -437,6 +446,7 @@ std::shared_ptr<RequestLifetime> GenerationService::begin_request(
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare) const {
+    validate_token_media(request);
     // A base model has no chat template, so there is no turn structure to render this into.
     // Refused here rather than in each handler: every chat-shaped endpoint arrives through
     // this one path, and /v1/completions is the shape that does fit.
@@ -509,10 +519,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         auto adapter = lora_slots_.acquire(request.lora_adapter, prepared.lifetime->deadline, is_cancelled);
         request_options.execution.lora_slot = adapter.slot;
         const auto acquisition_started = Clock::now();
-        // A raw prompt carries no content parts, so there is nothing to acquire and no
-        // template to render: the text is tokenized as written.
+        // Explicit tokens and raw text do not need structured message preparation.
         std::optional<sinfer::PromptInput> input;
-        if (!request.raw_prompt.has_value()) {
+        if (request.prompt_token_ids.empty() && !request.raw_prompt.has_value()) {
             std::size_t remaining_media_bytes =
                 std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
             input = to_prompt_input(request, semantics, [&](const ContentPart& part) {
@@ -567,6 +576,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare) const {
+    validate_token_media(request);
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
@@ -697,6 +707,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
 std::vector<sinfer::TokenId> GenerationService::tokenize(const GenerationRequest& request,
     std::function<bool()> is_cancelled, const PreparationGate& before_prepare) {
+    validate_token_media(request);
     const auto lifetime = begin_request(is_cancelled, before_prepare);
     try {
         std::vector<sinfer::TokenId> ids;

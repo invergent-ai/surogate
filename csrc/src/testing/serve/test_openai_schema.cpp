@@ -597,6 +597,33 @@ int test_prompt_token_bounds() {
     return failures;
 }
 
+int test_token_media_rejected() {
+    int failures = 0;
+    for (const auto* kind : {"image_url", "video_url"}) {
+        Json body{{"model", "test"}, {"tokens", Json::array({1, 2})},
+                  {"messages", Json::array({{{"role", "user"}, {"content", Json::array({
+                      {{"type", kind}, {kind, {{"url", "https://example.invalid/media"}}}}
+                  })}}})}};
+        try {
+            (void)parse_chat_completion_request(body, default_limits());
+            failures += fail("token IDs with media must be refused");
+        } catch (const ApiException& error) {
+            failures += check(error.error().status == 400 && error.error().param == "tokens",
+                              "mixed token/media input reports the tokens field");
+        }
+        body["messages"][0]["content"] = "text history";
+        failures += check(parse_chat_completion_request(body, default_limits()).prompt_token_ids ==
+                          std::vector<sinfer::TokenId>({1, 2}), "text history remains valid with tokens");
+        body["messages"][0]["content"] = Json::array({
+            {{"type", kind}, {kind, {{"url", "https://example.invalid/media"}}}}
+        });
+        body.erase("tokens");
+        failures += check(parse_chat_completion_request(body, default_limits()).media_item_count() == 1,
+                          "media remains valid without explicit tokens");
+    }
+    return failures;
+}
+
 int test_parse_sampling_carried() {
     int failures                = 0;
     const Json body             = {{"model", "m"},
@@ -829,6 +856,7 @@ int main() {
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
     failures += test_prompt_token_bounds();
+    failures += test_token_media_rejected();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
