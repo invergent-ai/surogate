@@ -397,9 +397,7 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
 }
 
 void parse_stop(const Json& body, GenerationRequest& out) {
-    if (body.contains("ignore_eos") && body.at("ignore_eos").is_boolean()) {
-        out.ignore_eos = body.at("ignore_eos").get<bool>();
-    }
+    out.ignore_eos = get_bool(body, "ignore_eos", false);
     if (const std::optional<int> minimum = get_int(body, "min_tokens")) {
         if (*minimum < 0) { bad_request("min_tokens must be nonnegative", "min_tokens"); }
         out.min_tokens = *minimum;
@@ -420,8 +418,8 @@ void parse_stop(const Json& body, GenerationRequest& out) {
         }
     }
     if (body.contains("add_generation_prompt") &&
-        body.at("add_generation_prompt").is_boolean()) {
-        out.add_generation_prompt = body.at("add_generation_prompt").get<bool>();
+        !body.at("add_generation_prompt").is_null()) {
+        out.add_generation_prompt = get_bool(body, "add_generation_prompt", true);
     }
     if (body.contains("tokens") && !body.at("tokens").is_null()) {
         const Json& tokens = body.at("tokens");
@@ -701,7 +699,10 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_sampling(body, out);
 
     out.stream = get_bool(body, "stream", false);
-    if (body.contains("stream_options") && body.at("stream_options").is_object()) {
+    if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
+        if (!body.at("stream_options").is_object()) {
+            bad_request("stream_options must be an object", "stream_options");
+        }
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
     parse_openai_enable_thinking(body, out);
@@ -945,7 +946,10 @@ GenerationRequest parse_completion_request(const Json& body, const RequestLimits
     parse_sampling(body, out);
 
     out.stream = get_bool(body, "stream", false);
-    if (body.contains("stream_options") && body.at("stream_options").is_object()) {
+    if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
+        if (!body.at("stream_options").is_object()) {
+            bad_request("stream_options must be an object", "stream_options");
+        }
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
 

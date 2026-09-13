@@ -597,6 +597,47 @@ int test_prompt_token_bounds() {
     return failures;
 }
 
+int test_optional_field_types() {
+    int failures = 0;
+    for (bool chat : {false, true}) {
+        Json base{{"model", "test"}};
+        if (chat) { base["messages"] = Json::array({{{"role", "user"}, {"content", "hi"}}}); }
+        else { base["prompt"] = "hi"; }
+        const auto parse = [&](const Json& body) {
+            return chat ? parse_chat_completion_request(body, default_limits()) : parse_completion_request(body, default_limits());
+        };
+        for (const auto* key : {"ignore_eos", "add_generation_prompt", "stream_options"}) {
+            for (const auto& value : {Json("false"), Json(0), Json(1.5), Json::array(),
+                                      std::string_view(key) == "stream_options" ? Json(false) : Json::object()}) {
+                Json body = base;
+                body[key] = value;
+                try {
+                    (void)parse(body);
+                    failures += fail(std::string(key) + " accepted wrong type " + value.dump());
+                } catch (const ApiException& error) {
+                    failures += check(error.error().status == 400 && error.error().param == key,
+                                      "wrong optional type returns a field-specific input error");
+                }
+            }
+        }
+        Json body = base;
+        body["ignore_eos"] = body["add_generation_prompt"] = body["stream_options"] = nullptr;
+        const auto defaults = parse(body);
+        failures += check(!defaults.ignore_eos && !defaults.add_generation_prompt.has_value() &&
+                          !defaults.include_usage, "null optional fields retain defaults");
+        for (bool enabled : {false, true}) {
+            body["ignore_eos"] = body["add_generation_prompt"] = enabled;
+            body["stream_options"] = {{"include_usage", enabled}};
+            const auto req = parse(body);
+            failures += check(req.ignore_eos == enabled && req.add_generation_prompt == enabled &&
+                              req.include_usage == enabled, "boolean options preserve their values");
+        }
+        body["stream_options"] = {{"include_usage", "true"}};
+        failures += check(throws_api([&] { (void)parse(body); }), "include_usage still requires a boolean");
+    }
+    return failures;
+}
+
 int test_token_media_rejected() {
     int failures = 0;
     for (const auto* kind : {"image_url", "video_url"}) {
@@ -857,6 +898,7 @@ int main() {
     failures += test_parse_stop_and_max_tokens();
     failures += test_prompt_token_bounds();
     failures += test_token_media_rejected();
+    failures += test_optional_field_types();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
