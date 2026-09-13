@@ -674,8 +674,21 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
 }
 
+PreparationGate HttpServer::wake_gate() {
+    if (scheduler_ == nullptr) { return {}; }
+    return [scheduler = scheduler_, service = &svc()](const PreparationControl& control) {
+        scheduler->ensure_awake(service, control);
+    };
+}
+
+std::function<bool()> HttpServer::request_cancelled(const httplib::Request& request) {
+    return [this, &request] {
+        return stopping_.load(std::memory_order_relaxed) ||
+               (request.is_connection_alive && !request.is_connection_alive());
+    };
+}
+
 // What a prompt tokenises to, without generating anything.
-//
 // A multi-turn RL client uses this to stitch turns: it asks what the next prompt
 // renders to so it can check that the ids it already holds are a prefix of it. So
 // the answer has to be this engine's own tokenisation of its own template, which
@@ -710,8 +723,8 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
                 ? parse_chat_completion_request(completed, limits)
                 : parse_completion_request(completed, limits);
         t_routed_service = &route_model(request.model, &request.lora_adapter);
-        if (scheduler_ != nullptr) { scheduler_->ensure_awake(t_routed_service); }
-        const std::vector<sinfer::TokenId> ids = svc().tokenize(request);
+        const std::vector<sinfer::TokenId> ids =
+            svc().tokenize(request, request_cancelled(req), wake_gate());
         nlohmann::json out{{"count", ids.size()},
                            {"max_model_len", svc().max_context()},
                            {"tokens", ids}};
@@ -749,9 +762,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         request                   = parse_chat_completion_request(body, limits);
         // `model` selects a served model or one of the primary's adapters.
         t_routed_service = &route_model(request.model, &request.lora_adapter);
-        // Overcommit: a sleeping model is woken here (evicting idle neighbours
-        // for room); the request waits instead of failing.
-        if (scheduler_ != nullptr) { scheduler_->ensure_awake(t_routed_service); }
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -761,10 +771,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     PreparedRequest prepared;
     try {
         prepared = svc().prepare(
-            request, [this, &req] {
-                return stopping_.load(std::memory_order_relaxed) ||
-                       (req.is_connection_alive && !req.is_connection_alive());
-            });
+            request, request_cancelled(req), wake_gate());
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
                                                                 request, e.error()));
@@ -996,7 +1003,6 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_completion_request(body, limits);
         t_routed_service          = &route_model(request.model, &request.lora_adapter);
-        if (scheduler_ != nullptr) { scheduler_->ensure_awake(t_routed_service); }
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -1006,10 +1012,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
     PreparedRequest prepared;
     try {
         prepared = svc().prepare(
-            request, [this, &req] {
-                return stopping_.load(std::memory_order_relaxed) ||
-                       (req.is_connection_alive && !req.is_connection_alive());
-            });
+            request, request_cancelled(req), wake_gate());
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "openai_completions", request, e.error()));
@@ -1157,10 +1160,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
         const int input_tokens          = svc().count_prompt_tokens(
-            request, [this, &req] {
-                return stopping_.load(std::memory_order_relaxed) ||
-                       (req.is_connection_alive && !req.is_connection_alive());
-            });
+            request, request_cancelled(req), wake_gate());
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
@@ -1197,7 +1197,6 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // the primary, preserving this endpoint's never-404 contract.
         const auto extra = extra_services_.find(request.model);
         if (extra != extra_services_.end()) { t_routed_service = extra->second; }
-        if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -1214,10 +1213,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     PreparedRequest prepared;
     try {
         prepared = svc().prepare(
-            request, [this, &req] {
-                return stopping_.load(std::memory_order_relaxed) ||
-                       (req.is_connection_alive && !req.is_connection_alive());
-            });
+            request, request_cancelled(req), wake_gate());
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));

@@ -2,7 +2,6 @@
 #include "serve/model_device_budget.h"
 
 #include "serve/console_log.h"
-#include "serve/generation_service.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -13,6 +12,15 @@ namespace sinfer::serve {
 using Clock = std::chrono::steady_clock;
 
 namespace {
+void check_wake_control(const PreparationControl& control) {
+    if (control.cancellation.requested()) {
+        throw RequestError(RequestErrorKind::Cancelled, "request cancelled while waiting for model wake");
+    }
+    if (control.deadline != Clock::time_point{} && Clock::now() >= control.deadline) {
+        throw RequestError(RequestErrorKind::QueueTimeout, "request expired while waiting for model wake");
+    }
+}
+
 std::chrono::milliseconds env_ms(const char* name, std::chrono::milliseconds fallback) {
     const char* raw = std::getenv(name);
     if (raw == nullptr) { return fallback; }
@@ -37,50 +45,70 @@ ModelScheduler::ModelScheduler(std::vector<Entry> entries, std::map<int, std::si
     ticker_ = std::thread([this] { tick_loop(); });
 }
 
+struct ModelScheduler::Waiter {
+    ScheduledModel* service;
+    Clock::time_point arrived;
+    Clock::time_point deadline;
+    std::atomic<bool> abandoned{false};
+    bool done = false; // guarded by wait_mutex_
+    std::exception_ptr error;
+};
+
 ModelScheduler::~ModelScheduler() {
-    {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        stopping_ = true;
-    }
+    stopping_.store(true);
     cv_.notify_all();
     if (ticker_.joinable()) { ticker_.join(); }
 }
 
-void ModelScheduler::ensure_awake(GenerationService* service) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    State* target = nullptr;
-    for (auto& state : models_) {
-        if (state.entry.service == service) { target = &state; break; }
-    }
-    if (target == nullptr) { return; } // unmanaged service: nothing to do
-    target->last_used = Clock::now();
-    if (!service->is_sleeping()) { return; }
-
-    const auto arrived  = Clock::now();
-    const auto deadline = arrived + wait_timeout_;
-    while (true) {
-        if (!service->is_sleeping()) { return; }
-        // Idle victims first; after the grace period, a busy model may be
-        // preempted at a round boundary -- its generations park and resume.
-        const bool preempt_ok = Clock::now() - arrived >= preempt_after_;
-        if (try_make_room_locked(*target, preempt_ok)) {
-            service->wake_up();
-            target->woke_at   = Clock::now();
-            target->last_used = target->woke_at;
-            cv_.notify_all();
+void ModelScheduler::ensure_awake(ScheduledModel* service, const PreparationControl& control) {
+    check_wake_control(control);
+    // The common awake path must not pay a worker handoff on every request.
+    if (std::unique_lock lock(mutex_, std::try_to_lock); lock.owns_lock() && !stopping_.load()) {
+        const auto target = std::find_if(models_.begin(), models_.end(), [&](const State& state) {
+            return state.entry.service == service;
+        });
+        if (target == models_.end()) { return; }
+        if (!service->is_sleeping()) {
+            target->last_used = Clock::now();
             return;
         }
-        if (cv_.wait_until(lock, std::min(deadline, Clock::now() + preempt_after_)) ==
-                std::cv_status::timeout &&
-            Clock::now() > deadline) {
-            throw std::runtime_error(
-                "the model is asleep and no room could be freed within the queue timeout -- "
-                "other models are busy; retry, or lower their load");
-        }
     }
+    auto waiter = std::make_shared<Waiter>();
+    waiter->service = service;
+    waiter->arrived = Clock::now();
+    waiter->deadline = control.deadline;
+    std::unique_lock lock(wait_mutex_);
+    waiters_.push_back(waiter);
+    cv_.notify_all();
+    const auto remove = [&] {
+        waiter->abandoned.store(true);
+        std::erase(waiters_, waiter);
+        cv_.notify_all();
+    };
+    try {
+        while (true) {
+            check_wake_control(control);
+            if (stopping_.load()) {
+                throw RequestError(RequestErrorKind::Unavailable, "model scheduler is stopping");
+            }
+            if (waiter->done) {
+                if (waiter->error) { std::rethrow_exception(waiter->error); }
+                break;
+            }
+            auto next = Clock::now() + std::chrono::milliseconds(10);
+            if (control.deadline != Clock::time_point{}) { next = std::min(next, control.deadline); }
+            cv_.wait_until(lock, next);
+        }
+    } catch (...) {
+        remove();
+        throw;
+    }
+    remove();
 }
 
-bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt) {
+bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt,
+                                           const PreparationControl& control) {
+    check_wake_control(control);
     const auto target_devices = target.entry.service->devices();
     const auto short_devices = [&] {
         DeviceBytes needed, resident;
@@ -108,6 +136,7 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt) {
                 state.entry.service->active_requests() != 0 || !occupies(state, shortfall)) {
                 continue;
             }
+            check_wake_control(control);
             state.entry.service->shrink_kv();
         }
     }
@@ -150,35 +179,88 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt) {
                               "scheduler: preempting busy model '" + victim->entry.name +
                                   "' at a round boundary; its generations resume after re-wake");
         }
+        check_wake_control(control);
         victim->entry.service->sleep(/*preempt=*/busy_pick);
     }
     return true;
 }
 
 void ModelScheduler::tick_loop() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (!stopping_) {
-        cv_.wait_for(lock, std::chrono::milliseconds(500));
-        if (stopping_) { return; }
-        // A preempted model holds parked generations that never re-enter the
-        // HTTP path, so nothing calls ensure_awake for them: wake it here as
-        // soon as idle room suffices. Never preempt on its behalf -- that
-        // would ping-pong two busy models forever.
-        for (auto& state : models_) {
-            GenerationService* service = state.entry.service;
-            if (!service->is_sleeping() || service->active_requests() == 0) { continue; }
+    auto next_resume = Clock::now() + std::chrono::milliseconds(500);
+    while (!stopping_.load()) {
+        std::vector<std::shared_ptr<Waiter>> pending;
+        {
+            std::unique_lock lock(wait_mutex_);
+            // New requests notify immediately; blocked requests are reconsidered every
+            // 10 ms without tying their HTTP worker to an eviction or restore operation.
+            cv_.wait_for(lock, waiters_.empty() ? std::chrono::milliseconds(500)
+                                               : std::chrono::milliseconds(10));
+            if (stopping_.load()) { return; }
+            pending = waiters_;
+        }
+        std::lock_guard model_lock(mutex_);
+        for (const auto& waiter : pending) {
+            if (waiter->abandoned.load() || stopping_.load()) { continue; }
+            const PreparationControl control{
+                .deadline = waiter->deadline,
+                // Never retain a callback referring to an HTTP request on this worker.
+                .cancellation = CancellationView([this, waiter] {
+                    return stopping_.load() || waiter->abandoned.load();
+                }),
+            };
+            std::exception_ptr error;
+            bool done = false;
             try {
-                if (try_make_room_locked(state, /*allow_preempt=*/false)) {
+                check_wake_control(control);
+                const auto target = std::find_if(models_.begin(), models_.end(), [&](const State& state) {
+                    return state.entry.service == waiter->service;
+                });
+                if (target == models_.end()) {
+                    done = true;
+                } else {
+                    target->last_used = Clock::now();
+                    if (!target->entry.service->is_sleeping()) {
+                        done = true;
+                    } else if (try_make_room_locked(*target,
+                                   Clock::now() - waiter->arrived >= preempt_after_, control)) {
+                        check_wake_control(control);
+                        target->entry.service->wake_up();
+                        target->woke_at = target->last_used = Clock::now();
+                        done = true;
+                    }
+                }
+            } catch (...) {
+                done = true;
+                error = std::current_exception();
+            }
+            if (done) {
+                std::lock_guard lock(wait_mutex_);
+                waiter->done = true;
+                waiter->error = error;
+                std::erase(waiters_, waiter);
+                cv_.notify_all();
+            }
+        }
+        if (Clock::now() < next_resume || stopping_.load()) { continue; }
+        next_resume = Clock::now() + std::chrono::milliseconds(500);
+        const PreparationControl resume_control{
+            .cancellation = CancellationView([this] { return stopping_.load(); }),
+        };
+        // Preempted generations never re-enter HTTP. Initial wake waiters must not
+        // count here: a cancelled request must not be revived by the resume ticker.
+        for (auto& state : models_) {
+            ScheduledModel* service = state.entry.service;
+            if (!service->is_sleeping() || service->resumable_requests() == 0) { continue; }
+            try {
+                if (try_make_room_locked(state, false, resume_control)) {
+                    check_wake_control(resume_control);
                     write_console_log(ConsoleLogLevel::Info,
                                       "scheduler: re-waking '" + state.entry.name +
                                           "' to finish its parked generations");
                     service->wake_up();
                     state.woke_at = Clock::now();
-                    cv_.notify_all();
                 }
             } catch (const std::exception& error) {
-                // A GPU's free memory can change after the budget check. Keep the worker
-                // parked and allow a later tick to retry the remaining device mappings.
                 write_console_log(ConsoleLogLevel::Error,
                     "scheduler: could not wake '" + state.entry.name + "': " + error.what());
             }

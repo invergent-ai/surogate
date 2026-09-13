@@ -127,7 +127,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 t_routed_service = extra->second;
             }
         }
-        if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
         return;
@@ -139,7 +138,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::uint64_t req_id = ++request_seq_;
     PreparedRequest prepared;
     try {
-        prepared = svc().prepare(request.generation, [&req] { return disconnected(req); });
+        prepared = svc().prepare(request.generation, request_cancelled(req), wake_gate());
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
@@ -260,9 +259,8 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
                 t_routed_service = extra->second;
             }
         }
-        if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
         const int tokens =
-            svc().count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
+            svc().count_prompt_tokens(request.generation, request_cancelled(req), wake_gate());
         res.set_content(make_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));

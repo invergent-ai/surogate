@@ -29,7 +29,9 @@ in `/v1/models` and successful responses. The findings below retain the original
 reproductions. A3 is also resolved: the shared launcher switch inventory now forwards
 `--spec-adaptive` for server and one-shot generation, before or after the model argument.
 All 54 launcher tests pass, including the previously failing native inventories and native
-help checks. A4–A5 and the subsequent backlog remain open.
+help checks. A4 is resolved as well: wake admission now shares the request's timeout,
+cancellation, and capacity reservation; waiters can leave during an ongoing model transfer.
+A5 and the subsequent backlog remain open.
 
 ## Fix first
 
@@ -89,7 +91,7 @@ Evidence: [launcher switches](../../../../surogate/cli/serve.py#L84),
 [native server parser](../../serve/serve/serve_options.cpp#L367),
 [inventory test](../../../../tests/serve/test_cli.py#L14).
 
-### A4 — P2: model wake waits bypass the request deadline and cancellation
+### A4 — resolved: model wake waits bypass the request deadline and cancellation
 
 **Confirmed by control-flow review; not exercised with a three-minute wake timeout.**
 HTTP handlers call `ensure_awake()` before `GenerationService::prepare()` acquires
@@ -99,13 +101,28 @@ not cover this wait, and disconnected callers can continue occupying HTTP worker
 while waiting for another model to release memory. Wake transitions also run under
 the scheduler's common mutex.
 
-Carry one request lifetime through model selection, wake admission, preparation,
-and engine admission. Make the wait cancellable and return an attributed timeout.
+Resolution: generation, tokenization, and token-counting handlers acquire one capacity
+reservation and deadline before requesting wake. The scheduler worker owns transfers;
+request waiters use a separate lock and poll cancellation at 10 ms intervals. A copy
+already in progress completes safely after its requester leaves, but abandoned requests
+cannot initiate subsequent evictions or wakes. The resume ticker distinguishes initial
+wake waiters from work that has passed wake admission. Already-awake requests retain
+the direct path without a worker handoff.
 
-Evidence: [HTTP ordering](../../serve/serve/http_server.cpp#L754),
-[wake loop](../../serve/serve/model_scheduler.cpp#L49),
-[180-second default](../../serve/serve/model_scheduler.h#L75),
-[request lifetime](../../serve/serve/generation_service.cpp#L372).
+Validation: deterministic scheduler tests cover deadlines and cancellation during blocked
+restores and eviction, error recovery, and parked-work resume. A TinyLlama HTTP test on
+physical GPU 7, with a simulated higher-priority resident imposing memory pressure,
+checks all seven affected endpoints, HTTP 503 timeouts, HTTP 429 capacity enforcement,
+disconnect release, no delayed wake for cancelled requests, successful restore and
+generation, a shared preparation deadline, and shutdown. Disconnect reservations released
+in approximately 8 ms in the recorded run. Two real replicas on physical GPUs 0 and 1
+also pass routing, sleep/wake, and concurrent generation. Ten scoped C++ tests and all
+54 launcher tests pass; the default Python serving suite reports 458 passed, 147 skipped.
+
+Evidence: [request admission](../../serve/serve/generation_service.cpp),
+[wake scheduler](../../serve/serve/model_scheduler.cpp),
+[scheduler regression tests](test_model_scheduler.cpp),
+[HTTP regression test](test_model_wake_http.cpp).
 
 ### A5 — P2: resolve the remaining numerical and parser test disagreements
 

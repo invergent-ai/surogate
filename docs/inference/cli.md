@@ -156,13 +156,15 @@ precisions. Force `q4` only when you want the RAM saving from reducing wider wei
 | `--max-num-seqs N` | 1 | Maximum active requests per model |
 | `--max-num-batched-tokens N` | 2048 | Prompt tokens processed at a time; must be a positive multiple of 128 |
 | `--max-pending-requests N` | 16 | Additional requests allowed to wait |
-| `--pending-timeout-ms N` | 30000 | Time allowed for prompt preparation and waiting to start generation |
+| `--pending-timeout-ms N` | 30000 | Time allowed for model wake-up, prompt preparation, and waiting to start generation |
 | `--default-max-tokens N` | 8192 | Output limit when a request omits it |
 
 Set `--max-num-seqs 256` (or higher) to allow more than 128 active requests per model.
 More simultaneous requests need more memory and may increase response latency; pair this
 setting with `--kv-capacity auto`. The pending timeout does not limit how long an
 already-running response may take.
+Wake waits count toward the pending-request limit. If the pending timeout expires,
+the request returns HTTP 503; disconnecting while waiting releases its queue slot.
 
 Incoming prompts can share a batch with requests already generating, including requests
 using different LoRA adapters, DFlash, and images or video. Lower `--max-num-batched-tokens`

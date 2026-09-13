@@ -6,6 +6,7 @@
 
 #include "api/engine.h"
 #include "serve/lora_slots.h"
+#include "serve/model_scheduler.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -23,6 +24,8 @@ namespace sinfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+// Runs after reserving ingress capacity; wake and preparation share this control.
+using PreparationGate = std::function<void(const PreparationControl&)>;
 
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
@@ -106,7 +109,7 @@ struct PreparedRequest {
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
-class GenerationService {
+class GenerationService : public ScheduledModel {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
 
@@ -121,7 +124,8 @@ public:
     }
     /// What a request's prompt tokenises to, without generating anything. Ids the
     /// client supplied are returned as given -- they are already the answer.
-    [[nodiscard]] std::vector<sinfer::TokenId> tokenize(const GenerationRequest& request);
+    [[nodiscard]] std::vector<sinfer::TokenId> tokenize(const GenerationRequest& request,
+        std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {});
     /// The text of each token id, for a tokenize response that asks for it.
     [[nodiscard]] std::vector<std::string> token_texts(const std::vector<sinfer::TokenId>& ids);
     /// The context this engine was configured for, which a stitching client needs
@@ -155,9 +159,9 @@ public:
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+        std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+        std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
@@ -169,14 +173,15 @@ public:
     /// requests to finish, then release the model's VRAM with its state parked
     /// in host RAM. `wake_up` restores it; requests then run against
     /// byte-identical state. Both are idempotent.
-    void sleep(bool preempt = false);
-    void wake_up();
-    [[nodiscard]] bool is_sleeping() const { return engine_->is_sleeping(); }
+    void sleep(bool preempt = false) override;
+    void wake_up() override;
+    [[nodiscard]] bool is_sleeping() const override { return engine_->is_sleeping(); }
     /// Return idle KV (prefix cache) so `resident_bytes` shrinks without sleeping.
-    void shrink_kv() { engine_->shrink_kv(); }
+    void shrink_kv() override { engine_->shrink_kv(); }
     /// Requests currently inside this service (admission-counted).
-    [[nodiscard]] std::size_t active_requests() const;
-    void prepare_sleep_backup() {
+    [[nodiscard]] std::size_t active_requests() const override;
+    [[nodiscard]] std::size_t resumable_requests() const override;
+    void prepare_sleep_backup() override {
         std::lock_guard lock(adapter_memory_mutex_);
         engine_->prepare_sleep_backup();
     }
@@ -185,13 +190,15 @@ public:
     /// Publish a complete adapter from GPU tensors, then reopen generation.
     void publish_shared_adapter(const std::string& name, const std::vector<DeviceAdapterModule>& modules);
     /// This model's VRAM footprint while awake (sleepable regions).
-    [[nodiscard]] std::size_t resident_bytes(int device = -1) const {
+    [[nodiscard]] std::size_t resident_bytes(int device = -1) const override {
         return engine_->sleepable_bytes(device);
     }
-    [[nodiscard]] std::vector<int> devices() const { return engine_->devices(); }
+    [[nodiscard]] std::vector<int> devices() const override { return engine_->devices(); }
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+    [[nodiscard]] std::shared_ptr<RequestLifetime> begin_request(
+        const std::function<bool()>& is_cancelled, const PreparationGate& before_prepare) const;
 
     ServeOptions options_;
     LoraSlots lora_slots_;

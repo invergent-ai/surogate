@@ -47,6 +47,8 @@ public:
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
 private:
+    PreparationGate wake_gate();
+    std::function<bool()> request_cancelled(const httplib::Request& request);
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_tokenize(const httplib::Request& req, httplib::Response& res);

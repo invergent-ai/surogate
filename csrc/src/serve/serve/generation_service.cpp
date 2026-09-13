@@ -28,6 +28,7 @@ struct RequestCapacity {
 
     std::mutex mutex;
     std::size_t active = 0;
+    std::size_t awaiting_wake = 0;
     const std::size_t maximum;
 };
 
@@ -40,8 +41,16 @@ struct RequestLifetime {
     ~RequestLifetime() {
         std::lock_guard lock(capacity->mutex);
         --capacity->active;
+        if (awaiting_wake) { --capacity->awaiting_wake; }
     }
 
+    void finish_wake() {
+        std::lock_guard lock(capacity->mutex);
+        --capacity->awaiting_wake;
+        awaiting_wake = false;
+    }
+
+    bool awaiting_wake = true;
     std::shared_ptr<RequestCapacity> capacity;
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point deadline;
@@ -381,6 +390,7 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
                                                      "inference request queue is full"));
         }
         ++request_capacity_->active;
+        ++request_capacity_->awaiting_wake;
     }
     try {
         return std::make_shared<RequestLifetime>(
@@ -389,12 +399,29 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     } catch (...) {
         std::lock_guard lock(request_capacity_->mutex);
         --request_capacity_->active;
+        --request_capacity_->awaiting_wake;
         throw;
     }
 }
 
+std::shared_ptr<RequestLifetime> GenerationService::begin_request(
+    const std::function<bool()>& is_cancelled, const PreparationGate& before_prepare) const {
+    auto lifetime = acquire_request_lifetime();
+    check_preparation_control(lifetime->deadline, is_cancelled);
+    try {
+        if (before_prepare) {
+            before_prepare(PreparationControl{
+                .deadline = lifetime->deadline, .cancellation = CancellationView(is_cancelled)});
+        }
+    } catch (const sinfer::RequestError& error) { throw_request_error(error); }
+    check_preparation_control(lifetime->deadline, is_cancelled);
+    lifetime->finish_wake();
+    return lifetime;
+}
+
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
-                                           std::function<bool()> is_cancelled) const {
+                                           std::function<bool()> is_cancelled,
+                                           const PreparationGate& before_prepare) const {
     // A base model has no chat template, so there is no turn structure to render this into.
     // Refused here rather than in each handler: every chat-shaped endpoint arrives through
     // this one path, and /v1/completions is the shape that does fit.
@@ -459,7 +486,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    prepared.lifetime = acquire_request_lifetime();
+    prepared.lifetime = begin_request(is_cancelled, before_prepare);
 
     try {
         // Pin before preparation/submission, closing the race with replacement
@@ -517,14 +544,15 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 }
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
-                                           std::function<bool()> is_cancelled) const {
+                                           std::function<bool()> is_cancelled,
+                                           const PreparationGate& before_prepare) const {
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+    const auto lifetime = begin_request(is_cancelled, before_prepare);
+    const auto deadline = lifetime->deadline;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     try {
@@ -650,21 +678,30 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     return outcome;
 }
 
-std::vector<sinfer::TokenId> GenerationService::tokenize(const GenerationRequest& request) {
-    if (!request.prompt_token_ids.empty()) { return request.prompt_token_ids; }
-    if (request.raw_prompt.has_value()) {
-        return engine_->prepare_text(*request.raw_prompt).token_ids();
-    }
-    const ResolvedPromptSemantics semantics =
-        resolve_prompt_semantics(request, options_, prompt_capabilities_);
-    std::size_t remaining_media_bytes =
-        std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
-    const auto never_cancelled = [] { return false; };
-    sinfer::PromptInput input  = to_prompt_input(request, semantics, [&](const ContentPart& part) {
-        return acquire_media(part, Clock::now() + std::chrono::seconds(30), never_cancelled,
-                             remaining_media_bytes);
-    });
-    return engine_->prepare(std::move(input)).token_ids();
+std::vector<sinfer::TokenId> GenerationService::tokenize(const GenerationRequest& request,
+    std::function<bool()> is_cancelled, const PreparationGate& before_prepare) {
+    const auto lifetime = begin_request(is_cancelled, before_prepare);
+    try {
+        std::vector<sinfer::TokenId> ids;
+        if (!request.prompt_token_ids.empty()) {
+            ids = request.prompt_token_ids;
+        } else if (request.raw_prompt.has_value()) {
+            ids = engine_->prepare_text(*request.raw_prompt).token_ids();
+        } else {
+            const auto semantics = resolve_prompt_semantics(request, options_, prompt_capabilities_);
+            std::size_t remaining_media_bytes =
+                std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
+            auto input = to_prompt_input(request, semantics, [&](const ContentPart& part) {
+                return acquire_media(part, lifetime->deadline, is_cancelled, remaining_media_bytes);
+            });
+            ids = engine_->prepare(std::move(input), PreparationControl{
+                .deadline = lifetime->deadline, .cancellation = CancellationView(is_cancelled)}).token_ids();
+        }
+        check_preparation_control(lifetime->deadline, is_cancelled);
+        return ids;
+    } catch (const ApiException&) { throw; } catch (const sinfer::RequestError& error) {
+        throw_request_error(error);
+    } catch (const std::invalid_argument& error) { throw_invalid_input(error); }
 }
 
 std::vector<std::string> GenerationService::token_texts(const std::vector<sinfer::TokenId>& ids) {
@@ -837,7 +874,9 @@ void GenerationService::sleep(bool preempt) {
     while (true) {
         {
             const std::lock_guard<std::mutex> lock(request_capacity_->mutex);
-            if (request_capacity_->active == 0) { break; }
+            // Wake waiters have not touched the engine yet and need the scheduler
+            // worker to finish this eviction before they can proceed.
+            if (request_capacity_->active == request_capacity_->awaiting_wake) { break; }
         }
         if (std::chrono::steady_clock::now() > deadline) {
             std::lock_guard lock(adapter_memory_mutex_);
@@ -852,8 +891,13 @@ void GenerationService::sleep(bool preempt) {
 }
 
 void GenerationService::wake_up() {
-    std::lock_guard lock(request_capacity_->mutex);
-    if (shared_training_) { throw std::logic_error("only the trainer can resume shared GRPO rollouts"); }
+    // Shared training needs phase exclusion. Ordinary serving must leave admission
+    // and lifetime release available while this potentially long copy is in progress.
+    std::unique_lock phase_lock(request_capacity_->mutex, std::defer_lock);
+    if (!options_.borrowed_weights.empty()) {
+        phase_lock.lock();
+        if (shared_training_) { throw std::logic_error("only the trainer can resume shared GRPO rollouts"); }
+    }
     std::lock_guard memory_lock(adapter_memory_mutex_);
     engine_->wake();
 }
@@ -916,6 +960,11 @@ void GenerationService::publish_shared_adapter(const std::string& name,
 std::size_t GenerationService::active_requests() const {
     const std::lock_guard<std::mutex> lock(request_capacity_->mutex);
     return request_capacity_->active;
+}
+
+std::size_t GenerationService::resumable_requests() const {
+    const std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->active - request_capacity_->awaiting_wake;
 }
 
 void GenerationService::warmup() {
