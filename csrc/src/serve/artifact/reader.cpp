@@ -205,6 +205,13 @@ TensorDescriptor parse_tensor(const Json& value) {
     for (const auto& dim : raw_shape) {
         shape.push_back(require_unsigned(dim, "shape dimension", true));
     }
+    if (transform == PayloadTransform::Q8ToW8RowSplit &&
+        (format != NumericFormat::W8G32_F16S || layout != StorageLayout::RowSplitK128V1 ||
+         shape.size() != 2 || !value.contains("runs"))) {
+        throw ArtifactError("tensor " + name +
+                            ": q8_0-to-w8g32 requires a rank-two W8G32_F16S "
+                            "row-split-k128-v1 destination and source runs");
+    }
 
     std::vector<TensorSegment> segments;
     if (value.contains("segments")) {
@@ -581,13 +588,14 @@ struct Reader::Impl {
                 const auto* tensor = std::get_if<TensorDescriptor>(&object);
                 const bool transformed =
                     tensor != nullptr && tensor->transform != PayloadTransform::None;
-                if (!transformed && covered != bytes) {
-                    throw ArtifactError("object " + std::string(name) + " declares " +
-                                        std::to_string(bytes) + " bytes but its runs cover " +
+                const auto source_bytes = transformed
+                    ? tensor_encoded_size(StorageLayout::GgmlBlocksV1, NumericFormat::Q8_0,
+                                          tensor->shape)
+                    : bytes;
+                if (covered != source_bytes) {
+                    throw ArtifactError("object " + std::string(name) + " requires " +
+                                        std::to_string(source_bytes) + " source bytes but its runs cover " +
                                         std::to_string(covered));
-                }
-                if (transformed && object_runs.empty()) {
-                    throw ArtifactError("object " + std::string(name) + " has no source runs");
                 }
             } else {
                 const auto end = checked_add(offset, bytes, "object payload range");

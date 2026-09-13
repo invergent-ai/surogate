@@ -204,6 +204,53 @@ void test_common_validation() {
     }
 }
 
+void test_transformed_source_validation() {
+    auto source = write_fixture(normative_directory(), "transform_source");
+    Json directory = {
+        {"identity", {{"model_id", "transform"}, {"weights_id", "transform"}}},
+        {"external", Json::array({{{"path", source.path.string()},
+                                   {"bytes", std::filesystem::file_size(source.path)}}})},
+        {"objects", Json::array({{{"name", "weight"}, {"kind", "tensor"},
+            {"shape", {3, 128}}, {"format", "W8G32_F16S"}, {"layout", "row-split-k128-v1"},
+            {"offset", 0}, {"bytes", 536}, {"transform", "q8_0-to-w8g32"},
+            {"runs", Json::array({{{"source", 1}, {"offset", 0}, {"bytes", 408}}})}}})}
+    };
+    for (const bool split : {false, true}) {
+        auto valid = directory;
+        if (split) {
+            valid["objects"][0]["runs"] = Json::array({
+                {{"source", 1}, {"offset", 20}, {"bytes", 100}},
+                {{"source", 1}, {"offset", 500}, {"bytes", 308}}});
+        }
+        auto fixture = write_fixture(valid, "transform_valid");
+        Reader reader(fixture.path);
+    }
+    const auto reject = [&](Json invalid, std::string_view label) {
+        auto fixture = write_fixture(invalid, "transform_invalid");
+        expect_artifact_error([&] { Reader reader(fixture.path); }, label);
+    };
+    for (const int count : {407, 409}) {
+        auto invalid = directory;
+        invalid["objects"][0]["runs"][0]["bytes"] = count;
+        reject(invalid, "incorrect transformed source coverage");
+    }
+    auto missing = directory;
+    missing["objects"][0].erase("runs");
+    reject(missing, "transform without source runs");
+    for (const auto shape : {Json::array({3, 128}), Json::array({3, 1, 128})}) {
+        auto invalid = directory;
+        auto& tensor = invalid["objects"][0];
+        tensor["format"] = "BF16";
+        tensor["layout"] = "contiguous-le-v1";
+        tensor["shape"] = shape;
+        tensor["bytes"] = 768;
+        reject(invalid, "invalid transformed destination");
+    }
+    auto bad_width = directory;
+    bad_width["objects"][0]["shape"] = {3, 127};
+    reject(bad_width, "Q8 source width not divisible by its block size");
+}
+
 } // namespace
 
 int main() {
@@ -211,6 +258,7 @@ int main() {
         test_registered_sizes();
         test_normative_fixture();
         test_common_validation();
+        test_transformed_source_validation();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
