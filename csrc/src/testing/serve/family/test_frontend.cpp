@@ -1447,6 +1447,78 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+// #102: a round may cross the model-opened reasoning boundary repeatedly,
+// including several markers inside one decoded token. Stops snapshot this output.
+int test_interleaved_reasoning_round() {
+    auto owned = resources();
+    auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
+    auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+    constexpr const char* open = "<|channel>thought\n";
+    constexpr const char* close = "<channel|>";
+    config["response_template"]["fields"]["thinking"] = {{"open", open}, {"close", close}};
+    std::string many = "content";
+    for (int i = 0; i < 32; ++i) many += std::string(open) + "thought" + close + "content";
+    const std::vector<std::string> pieces{
+        "before", open, "first", close, "middle", "second",
+        "afterSTOPdiscard",
+        std::string("before") + open + "first" + close + "middle" + open + "second" + close + "afterSTOPdiscard",
+        many};
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        const int id = 100 + static_cast<int>(i);
+        tokenizer["added_tokens"].push_back(added(id, pieces[i]));
+        config["added_tokens_decoder"][std::to_string(id)] = decoder_added(pieces[i]);
+    }
+    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_config_json = config.dump();
+    const auto frontend = FrontendFactory::create_component(owned, false);
+    const auto prompt = frontend.prepare_tokens({0});
+    const std::array<sinfer::TokenId, 8> burst{100, 101, 102, 103, 104, 101, 105, 103};
+    const auto matches = [](const PublishedOutput& output, const std::vector<std::string>& expected) {
+        if (output.size() != expected.size()) return false;
+        std::size_t i = 0;
+        for (const auto& delta : output) {
+            const auto channel = i % 2 ? sinfer::OutputChannel::Reasoning : sinfer::OutputChannel::Content;
+            if (delta.channel != channel || delta.text != expected[i++]) return false;
+        }
+        return true;
+    };
+    auto session = frontend.make_output_session(prompt, {});
+    const auto first = session.preview(burst, 16, sinfer::FinishReason::OutputLimit);
+    int failures = check(first.accepted_tokens == burst.size() && !first.finished(),
+                          "interleaved round did not accept its full token burst");
+    auto output = session.commit_preview();
+    failures += check(matches(output, {"before", "first", "middle", "second"}),
+                      "interleaved round lost channel order or text");
+    const auto next = session.preview(std::array<sinfer::TokenId, 1>{108}, 1, sinfer::FinishReason::OutputLimit);
+    std::vector<std::string> expected{"content"};
+    for (int i = 0; i < 32; ++i) { expected.push_back("thought"); expected.push_back("content"); }
+    failures += check(next.accepted_tokens == 1 && matches(session.commit_preview(), expected),
+                      "one token with many channel changes was truncated or retained an earlier preview");
+    failures += check(matches(output, {"before", "first", "middle", "second"}),
+                      "committed output changed when the session published another round");
+
+    for (bool include : {false, true}) {
+        sinfer::StopPolicy stop;
+        stop.strings.push_back({.text = "STOP", .include_in_output = include});
+        auto stopped = frontend.make_output_session(prompt, stop);
+        const auto decision = stopped.preview(std::array<sinfer::TokenId, 1>{107}, 8, sinfer::FinishReason::OutputLimit);
+        failures += check(decision.finish_reason == sinfer::FinishReason::StopString &&
+                              decision.accepted_tokens == 1 &&
+                              matches(stopped.commit_preview(), {"before", "first", "middle", "second", include ? "afterSTOP" : "after"}),
+                          "stop snapshot lost an interleaved delta or published the discarded suffix");
+    }
+    sinfer::StopPolicy eos;
+    eos.token_ids = {107};
+    auto stopped = frontend.make_output_session(prompt, eos);
+    auto hidden_stop = burst;
+    hidden_stop.back() = 107;
+    const auto decision = stopped.preview(hidden_stop, 16, sinfer::FinishReason::OutputLimit);
+    failures += check(decision.finish_reason == sinfer::FinishReason::StopToken &&
+                          matches(stopped.commit_preview(), {"before", "first", "middle", "second"}),
+                      "hidden stop token did not restore the interleaved output snapshot");
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1719,6 +1791,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_interleaved_reasoning_round();
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

@@ -66,8 +66,8 @@ private:
 
 class PublishedOutput {
 public:
-    using iterator       = std::array<OutputDelta, 2>::iterator;
-    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
+    using iterator       = OutputDelta*;
+    using const_iterator = const OutputDelta*;
 
     PublishedOutput()                                  = default;
     PublishedOutput(const PublishedOutput&)            = default;
@@ -79,23 +79,26 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 
-    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
+    [[nodiscard]] iterator begin() noexcept { return size_ > values_.size() ? overflow_.data() : values_.data(); }
 
-    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
+    [[nodiscard]] const_iterator begin() const noexcept { return size_ > values_.size() ? overflow_.data() : values_.data(); }
 
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
+    [[nodiscard]] iterator end() noexcept { return begin() + size_; }
 
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
+    [[nodiscard]] const_iterator end() const noexcept { return begin() + size_; }
 
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] OutputDelta& back() noexcept { return begin()[size_ - 1]; }
 
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] const OutputDelta& back() const noexcept { return begin()[size_ - 1]; }
 
     void clear() noexcept;
     void push_back(OutputDelta value);
 
 private:
+    // Most rounds publish one or two spans without allocating. Model-opened
+    // reasoning may alternate arbitrarily often, even within a single token.
     std::array<OutputDelta, 2> values_{};
+    std::vector<OutputDelta> overflow_;
     std::size_t size_ = 0;
 };
 

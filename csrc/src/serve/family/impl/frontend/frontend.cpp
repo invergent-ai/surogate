@@ -1110,26 +1110,35 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+    : values_(std::move(other.values_)), overflow_(std::move(other.overflow_)),
+      size_(std::exchange(other.size_, 0)) {}
 
 PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
     if (this != &other) {
         values_ = std::move(other.values_);
+        overflow_ = std::move(other.overflow_);
         size_   = std::exchange(other.size_, 0);
     }
     return *this;
 }
 
 void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
+    for (auto& value : *this) { value = {}; }
+    overflow_.clear();
     size_ = 0;
 }
 
 void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
-        throw std::logic_error("output decoder produced more than two channel transitions");
+    if (size_ < values_.size()) {
+        values_[size_] = std::move(value);
+    } else {
+        if (size_ == values_.size()) {
+            overflow_.reserve(values_.size() * 2);
+            for (auto& previous : values_) { overflow_.push_back(std::move(previous)); }
+        }
+        overflow_.push_back(std::move(value));
     }
-    values_[size_++] = std::move(value);
+    ++size_;
 }
 
 OutputSession::OutputSession() noexcept                           = default;
