@@ -15,7 +15,12 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -246,12 +251,50 @@ int test_l2norm() {
 
 } // namespace
 
-int main() {
+int test_runner_thread() {
+#if defined(_OPENMP)
+    int failures = 0;
+    for (int threads : {2, 4, 2}) {
+        cpu::ThreadPool pool(cpu::ThreadPlan{threads, {}});
+        std::thread runner([&] {
+            // A foreign std::thread starts with the process defaults, independently
+            // of the thread that loaded the model. Override them to expose that gap.
+            omp_set_num_threads(1);
+            failures += test_gemm(pool);
+            if (omp_get_max_threads() != pool.threads()) { ++failures; }
+            omp_set_num_threads(1);
+            pool.parallel_for(7, [](std::int64_t, std::int64_t) {});
+            if (omp_get_max_threads() != pool.threads()) { ++failures; }
+
+            omp_set_num_threads(1);
+            std::vector<std::uint16_t> w(8 * 16, to_bf16(0.25F)), x(16 * 3, to_bf16(0.5F));
+            std::vector<float> up(8 * 3, 3.F), out(8 * 3, -1.F);
+            const bool fused = cpu::gemm_gelu_mul(w.data(), x.data(), up.data(), out.data(), 8, 16, 3, pool);
+            if (omp_get_max_threads() != pool.threads()) { ++failures; }
+            if (cpu::gemm_backend() == cpu::GemmBackend::OneDnn && !fused) { ++failures; }
+            if (fused) {
+                const double z = 2.0;
+                const double expected = 1.5 * z * (1.0 + std::tanh(0.7978845608028654 * (z + 0.044715 * z*z*z)));
+                failures += check("runner fused GEMM", out, std::vector<double>(out.size(), expected), 1e-5);
+            }
+        });
+        runner.join();
+    }
+    if (failures) { std::cerr << "runner thread did not receive the CPU thread plan\n"; }
+    return failures;
+#else
+    return 0;
+#endif
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--runner-only") { return test_runner_thread(); }
     const cpu::ThreadPlan plan = cpu::ThreadPlan::detect();
     cpu::ThreadPool pool(plan);
     std::printf("cpu ops: %d threads on %zu pinned cpus\n", pool.threads(), plan.cpus.size());
 
     int failures = 0;
+    failures += test_runner_thread();
     failures += test_gemm(pool);
     failures += test_rmsnorm(pool);
     failures += test_attention(pool);

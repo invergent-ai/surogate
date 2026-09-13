@@ -391,6 +391,9 @@ target_link_libraries(sinfer_embed_cli PRIVATE sinfer_shared)
 sinfer_add_op_test(sinfer_cpu_ops_test
   SOURCES encoder/test_cpu_ops.cpp
   LIBRARIES sinfer_encoder)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(sinfer_cpu_ops_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 add_test(NAME sinfer_cpu_ops_limited_team_test COMMAND sinfer_cpu_ops_test)
 set_tests_properties(sinfer_cpu_ops_limited_team_test PROPERTIES ENVIRONMENT "OMP_THREAD_LIMIT=1")
 add_test(NAME sinfer_cpu_ops_dynamic_team_test COMMAND sinfer_cpu_ops_test)

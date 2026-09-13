@@ -64,6 +64,9 @@ public:
 
     [[nodiscard]] int threads() const noexcept;
 
+    /// Apply the plan to implicit OpenMP teams on the inference caller.
+    void bind_current_thread() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -151,7 +154,7 @@ void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16
 /// the caller to run `gemm` then `gelu_mul`.
 [[nodiscard]] bool gemm_gelu_mul(const std::uint16_t* w, const std::uint16_t* x, const float* up,
                                  float* out, std::int32_t n, std::int32_t k,
-                                 std::int32_t tokens);
+                                 std::int32_t tokens, ThreadPool& pool);
 
 /// FP32 to BF16, round to nearest even: the one conversion each activation pays
 /// on its way into a GEMM.

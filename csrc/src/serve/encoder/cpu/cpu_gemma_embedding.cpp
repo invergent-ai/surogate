@@ -431,7 +431,7 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
             // gelu(gate) * up rides the gate projection when a backend can fuse
             // it, which saves two passes over an [intermediate, tokens] buffer.
             if (!gemm_gelu_mul(w.gate.data(), h16.data(), up.data(), gate.data(),
-                               config.intermediate, config.hidden, tokens)) {
+                               config.intermediate, config.hidden, tokens, *impl.pool)) {
                 gemm(w.gate.data(), h16.data(), gate.data(), config.intermediate, config.hidden,
                      tokens, *impl.pool);
                 gelu_mul(gate.data(), up.data(), gate.data(),

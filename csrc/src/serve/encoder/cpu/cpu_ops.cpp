@@ -351,10 +351,6 @@ ThreadPool::ThreadPool(ThreadPlan plan) : impl_(std::make_unique<Impl>()) {
     for (int index = 0; index + 1 < impl_->threads; ++index) {
         impl_->workers.emplace_back([impl = impl_.get(), index] { impl->worker(index); });
     }
-#else
-    // Kernels dispatch onto the shared OpenMP team (see parallel_for); size it
-    // to the plan so oneDNN and the elementwise phases use the same threads.
-    omp_set_num_threads(impl_->threads);
 #endif
 }
 
@@ -371,9 +367,18 @@ ThreadPool::~ThreadPool() {
 
 int ThreadPool::threads() const noexcept { return impl_->threads; }
 
+void ThreadPool::bind_current_thread() const noexcept {
+#if defined(_OPENMP)
+    // The OpenMP ICV belongs to the caller, which may differ from the loading
+    // thread. Vendor GEMMs encounter implicit teams on this thread too.
+    omp_set_num_threads(threads());
+#endif
+}
+
 void ThreadPool::parallel_for(std::int64_t count,
                               const std::function<void(std::int64_t, std::int64_t)>& body) {
     if (count <= 0) { return; }
+    bind_current_thread();
 #if defined(_OPENMP)
     // One team for everything. oneDNN parallelises on OpenMP; if these kernels
     // ran on a private pool instead, every switch between a matmul and an
@@ -477,16 +482,16 @@ namespace {
 /// [n, k] with an `ab` (row-major) layout and the product asks for its
 /// transpose by giving the destination `[tokens, n]`, exactly as the ZenDNN
 /// path does.
-/// One cached primitive per (n, k, tokens, fused-activation) shape.
+/// One cached primitive per (n, k, tokens, threads, fused-activation) shape.
 ///
 /// A forward runs 168 of these, and a stack-built primitive_desc pays kernel
 /// selection every time. The encoder only ever sees a handful of distinct
 /// shapes, so they are built once and looked up.
 struct MatmulKey {
-    std::int32_t n, k, tokens;
+    std::int32_t n, k, tokens, threads;
     bool fused_gelu_mul;
     bool operator==(const MatmulKey& other) const noexcept {
-        return n == other.n && k == other.k && tokens == other.tokens &&
+        return n == other.n && k == other.k && tokens == other.tokens && threads == other.threads &&
                fused_gelu_mul == other.fused_gelu_mul;
     }
 };
@@ -495,6 +500,7 @@ struct MatmulKeyHash {
         return (static_cast<std::size_t>(key.n) * 0x9E3779B1u) ^
                (static_cast<std::size_t>(key.k) * 0x85EBCA77u) ^
                (static_cast<std::size_t>(key.tokens) * 0xC2B2AE3Du) ^
+               (static_cast<std::size_t>(key.threads) * 0x165667B1u) ^
                (key.fused_gelu_mul ? 0x27D4EB2Fu : 0u);
     }
 };
@@ -504,11 +510,11 @@ struct CachedMatmul {
 };
 
 const CachedMatmul& cached_matmul(const dnnl::engine& cpu_engine, std::int32_t n, std::int32_t k,
-                                  std::int32_t tokens, bool fused_gelu_mul) {
+                                  std::int32_t tokens, int threads, bool fused_gelu_mul) {
     using namespace dnnl;
     static std::unordered_map<MatmulKey, CachedMatmul, MatmulKeyHash> cache;
     static std::mutex cache_mutex;
-    const MatmulKey key{n, k, tokens, fused_gelu_mul};
+    const MatmulKey key{n, k, tokens, threads, fused_gelu_mul};
     const std::lock_guard<std::mutex> lock(cache_mutex);
     const auto found = cache.find(key);
     if (found != cache.end()) { return found->second; }
@@ -530,7 +536,7 @@ const CachedMatmul& cached_matmul(const dnnl::engine& cpu_engine, std::int32_t n
     // default because it is a numerical change, and a numerical change should be
     // asked for.
     if (std::getenv("SINFER_CPU_BF16") != nullptr) {
-        attributes.set_fpmath_mode(fpmath_mode::bf16, /*apply_to_int*/ true);
+        attributes.set_fpmath_mode(fpmath_mode::bf16);
     }
     if (fused_gelu_mul) {
         // Gemma's MLP is gelu(gate) * up. Both halves are post-ops here, so the
@@ -547,12 +553,12 @@ const CachedMatmul& cached_matmul(const dnnl::engine& cpu_engine, std::int32_t n
 }
 
 bool gemm_onednn(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32_t n,
-                 std::int32_t k, std::int32_t tokens, const float* gate_by) {
+                 std::int32_t k, std::int32_t tokens, const float* gate_by, int threads) {
     using namespace dnnl;
     static engine cpu_engine(engine::kind::cpu, 0);
     static stream cpu_stream(cpu_engine);
 
-    const CachedMatmul& entry = cached_matmul(cpu_engine, n, k, tokens, gate_by != nullptr);
+    const CachedMatmul& entry = cached_matmul(cpu_engine, n, k, tokens, threads, gate_by != nullptr);
     memory src_mem(entry.src, cpu_engine, const_cast<std::uint16_t*>(x));
     memory weight_mem(entry.weight, cpu_engine, const_cast<std::uint16_t*>(w));
     memory dst_mem(entry.dst, cpu_engine, out);
@@ -621,6 +627,7 @@ const char* gemm_backend_name() {
 
 void gemm(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32_t n,
           std::int32_t k, std::int32_t tokens, ThreadPool& pool) {
+    pool.bind_current_thread();
     // A vendor backend that declines a shape falls through to the builtin, so a
     // build with one is never *less* capable than a build without.
     switch (gemm_backend()) {
@@ -631,7 +638,7 @@ void gemm(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32
         break;
     case GemmBackend::OneDnn:
 #if defined(SINFER_WITH_ONEDNN)
-        if (gemm_onednn(w, x, out, n, k, tokens, nullptr)) { return; }
+        if (gemm_onednn(w, x, out, n, k, tokens, nullptr, pool.threads())) { return; }
 #endif
         break;
     case GemmBackend::Builtin:
@@ -685,10 +692,11 @@ void gemm(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32
 }
 
 bool gemm_gelu_mul(const std::uint16_t* w, const std::uint16_t* x, const float* up, float* out,
-                   std::int32_t n, std::int32_t k, std::int32_t tokens) {
+                   std::int32_t n, std::int32_t k, std::int32_t tokens, ThreadPool& pool) {
+    pool.bind_current_thread();
 #if defined(SINFER_WITH_ONEDNN)
     if (gemm_backend() == GemmBackend::OneDnn) {
-        return gemm_onednn(w, x, out, n, k, tokens, up);
+        return gemm_onednn(w, x, out, n, k, tokens, up, pool.threads());
     }
 #endif
     return false; // caller falls back to gemm + gelu_mul
@@ -807,7 +815,7 @@ bool attention_onednn(const std::uint16_t* q, const std::uint16_t* k, const std:
 
     primitive_attr attributes;
     if (std::getenv("SINFER_CPU_BF16") != nullptr) {
-        attributes.set_fpmath_mode(fpmath_mode::bf16, true);
+        attributes.set_fpmath_mode(fpmath_mode::bf16);
     }
 
     {
@@ -872,6 +880,7 @@ std::size_t attention_scratch(std::int32_t q_heads, std::int32_t tokens) {
 void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v, float* out,
                std::int32_t q_heads, std::int32_t head_dim, std::int32_t tokens,
                std::int32_t window, float scale, float* scratch, ThreadPool& pool) {
+    pool.bind_current_thread();
 #if defined(SINFER_WITH_ONEDNN)
     if (gemm_backend() == GemmBackend::OneDnn &&
         attention_onednn(q, k, v, out, q_heads, head_dim, tokens, window, scale, scratch, pool)) {
