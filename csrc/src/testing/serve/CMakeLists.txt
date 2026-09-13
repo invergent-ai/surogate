@@ -14,6 +14,14 @@ target_compile_options(sinfer_lora_slots_test PRIVATE -UNDEBUG)
 add_test(NAME sinfer_lora_slots_test COMMAND sinfer_lora_slots_test)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_lora_slots_test)
 
+add_executable(sinfer_device_footprint_test test_device_footprint.cpp ${SERVE_ROOT}/core/device_footprint.cpp)
+target_include_directories(sinfer_device_footprint_test PRIVATE ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_device_footprint_test PRIVATE Threads::Threads)
+target_link_options(sinfer_device_footprint_test PRIVATE -Wl,--wrap=dlopen -Wl,--wrap=dlsym)
+target_compile_options(sinfer_device_footprint_test PRIVATE -UNDEBUG)
+add_test(NAME sinfer_device_footprint_test COMMAND sinfer_device_footprint_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_device_footprint_test)
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
 add_executable(sinfer_public_api_test test_public_api.cpp)

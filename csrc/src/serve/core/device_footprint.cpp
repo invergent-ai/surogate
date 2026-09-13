@@ -3,10 +3,6 @@
 #include <cuda_runtime.h>
 #include <nvml.h>
 
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <string>
 #include <unistd.h>
 #include <vector>
 
@@ -14,6 +10,10 @@
 
 namespace sinfer {
 namespace {
+
+// A diagnostic belongs to the caller's latest sample. Literal storage also keeps
+// returned pointers valid across later samples, without allocating on failure paths.
+thread_local const char* last_note = nullptr;
 
 // NVML is loaded at runtime rather than linked. The CUDA toolkit ships a stub
 // libnvidia-ml.so for linking, and linking it makes the build depend on which
@@ -27,12 +27,12 @@ struct Nvml {
     nvmlReturn_t (*device_by_pci)(const char*, nvmlDevice_t*)                       = nullptr;
     nvmlReturn_t (*compute_procs)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*)  = nullptr;
     bool ready                                                                      = false;
-    std::string note = "NVML has not been probed";
+    const char* note = "NVML has not been probed";
 
-    template <class Fn> bool bind(Fn& slot, const char* symbol) {
+    template <class Fn> bool bind(Fn& slot, const char* symbol, const char* missing) {
         slot = reinterpret_cast<Fn>(dlsym(handle, symbol));
         if (slot == nullptr) {
-            note = std::string("NVML is loaded but ") + symbol + " is missing";
+            note = missing;
             return false;
         }
         return true;
@@ -44,13 +44,17 @@ struct Nvml {
             note = "libnvidia-ml.so.1 is not loadable";
             return;
         }
-        if (!bind(init, "nvmlInit_v2") || !bind(device_by_pci, "nvmlDeviceGetHandleByPciBusId_v2")) {
+        if (!bind(init, "nvmlInit_v2", "NVML is loaded but nvmlInit_v2 is missing") ||
+            !bind(device_by_pci, "nvmlDeviceGetHandleByPciBusId_v2",
+                  "NVML is loaded but nvmlDeviceGetHandleByPciBusId_v2 is missing")) {
             return;
         }
         // The v3 process list is the current one; v2 shares the field layout
         // this code reads, so an older driver still attributes correctly.
-        if (!bind(compute_procs, "nvmlDeviceGetComputeRunningProcesses_v3") &&
-            !bind(compute_procs, "nvmlDeviceGetComputeRunningProcesses_v2")) {
+        if (!bind(compute_procs, "nvmlDeviceGetComputeRunningProcesses_v3",
+                  "NVML is loaded but nvmlDeviceGetComputeRunningProcesses_v3 is missing") &&
+            !bind(compute_procs, "nvmlDeviceGetComputeRunningProcesses_v2",
+                  "NVML is loaded but nvmlDeviceGetComputeRunningProcesses_v2 is missing")) {
             return;
         }
         if (init() != NVML_SUCCESS) {
@@ -58,7 +62,7 @@ struct Nvml {
             return;
         }
         ready = true;
-        note.clear();
+        note = "";
     }
 };
 
@@ -72,21 +76,21 @@ Nvml& nvml() {
 // one and not the other).
 bool device_handle(int cuda_device, nvmlDevice_t& out) noexcept {
     Nvml& lib = nvml();
-    if (!lib.ready) { return false; }
+    if (!lib.ready) { last_note = lib.note; return false; }
     char bus_id[64] = {};
     if (cudaDeviceGetPCIBusId(bus_id, static_cast<int>(sizeof(bus_id)), cuda_device) !=
         cudaSuccess) {
-        lib.note = "cudaDeviceGetPCIBusId failed";
+        last_note = "cudaDeviceGetPCIBusId failed";
         return false;
     }
     if (lib.device_by_pci(bus_id, &out) != NVML_SUCCESS) {
-        lib.note = "no NVML device for this PCI bus id";
+        last_note = "no NVML device for this PCI bus id";
         return false;
     }
     return true;
 }
 
-bool process_used(int cuda_device, std::size_t& out) noexcept {
+bool process_used(int cuda_device, std::size_t& out) noexcept try {
     nvmlDevice_t device{};
     if (!device_handle(cuda_device, device)) { return false; }
     Nvml& lib = nvml();
@@ -95,13 +99,13 @@ bool process_used(int cuda_device, std::size_t& out) noexcept {
     // answer when there is at least one process.
     const nvmlReturn_t probe = lib.compute_procs(device, &count, nullptr);
     if (probe != NVML_SUCCESS && probe != NVML_ERROR_INSUFFICIENT_SIZE) {
-        lib.note = "the device's process list is unavailable (permission or namespace)";
+        last_note = "the device's process list is unavailable (permission or namespace)";
         return false;
     }
-    if (count == 0) { return false; }
+    if (count == 0) { last_note = "this device has no listed compute processes"; return false; }
     std::vector<nvmlProcessInfo_t> processes(count);
     if (lib.compute_procs(device, &count, processes.data()) != NVML_SUCCESS) {
-        lib.note = "the device's process list is unavailable (permission or namespace)";
+        last_note = "the device's process list is unavailable (permission or namespace)";
         return false;
     }
     const auto self = static_cast<unsigned int>(getpid());
@@ -111,16 +115,19 @@ bool process_used(int cuda_device, std::size_t& out) noexcept {
         // report reads as NVML_VALUE_NOT_AVAILABLE, which is not a byte count.
         if (processes[i].usedGpuMemory == 0 ||
             processes[i].usedGpuMemory == static_cast<unsigned long long>(-1)) {
-            lib.note = "this process is listed without a usage figure";
+            last_note = "this process is listed without a usage figure";
             return false;
         }
         out = static_cast<std::size_t>(processes[i].usedGpuMemory);
-        lib.note.clear();
+        last_note = "";
         return true;
     }
     // Under a PID namespace the device lists host pids, so this process is not
     // in a list that nonetheless describes it.
-    lib.note = "this process is not in the device's list (PID namespace?)";
+    last_note = "this process is not in the device's list (PID namespace?)";
+    return false;
+} catch (...) {
+    last_note = "NVML process list allocation failed";
     return false;
 }
 
@@ -133,7 +140,7 @@ DeviceFootprint sample_device_footprint() noexcept {
         sample.device_free_bytes = 0;
     }
     int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) { return sample; }
+    if (cudaGetDevice(&device) != cudaSuccess) { last_note = "cudaGetDevice failed"; return sample; }
     sample.attributed = process_used(device, sample.process_used_bytes);
     return sample;
 }
@@ -152,6 +159,6 @@ DeviceFootprintDelta device_footprint_delta(const DeviceFootprint& before,
             false};
 }
 
-const char* device_footprint_attribution_note() noexcept { return nvml().note.c_str(); }
+const char* device_footprint_attribution_note() noexcept { return last_note != nullptr ? last_note : nvml().note; }
 
 } // namespace sinfer
