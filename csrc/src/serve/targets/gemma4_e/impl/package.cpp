@@ -84,18 +84,26 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         store.register_module(
             index, "q_proj",
             Binding{attention.projection.query.qdata, 0, g.hidden, query_rows});
-        store.register_module(
-            index, "k_proj",
-            Binding{attention.projection.key.qdata, 1, g.hidden, kv_rows});
-        if (!attention.projection.value_is_key) {
+        if (attention.projection.owns_kv) {
             store.register_module(
-                index, "v_proj",
-                Binding{attention.projection.value.qdata, 2, g.hidden, kv_rows});
+                index, "k_proj",
+                Binding{attention.projection.key.qdata, 1, g.hidden, kv_rows});
+            if (!attention.projection.value_is_key) {
+                store.register_module(
+                    index, "v_proj",
+                    Binding{attention.projection.value.qdata, 2, g.hidden, kv_rows});
+            }
+        } else {
+            for (const char* module : {"k_proj", "v_proj"}) {
+                store.register_layer_refusal(index, module,
+                    "this layer uses an earlier layer's keys and values and has no K/V weights to adapt");
+            }
         }
         store.register_module(
             index, "o_proj",
             Binding{attention.output.qdata, 3, query_rows, g.hidden});
-        family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden, g.intermediate);
+        family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden,
+                                  g.intermediate_for(attention.projection.owns_kv));
         const auto& input = attention.post_mixer.per_layer_input;
         if (input.width > 0) {
             store.register_module(index, "per_layer_input_gate",

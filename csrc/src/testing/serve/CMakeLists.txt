@@ -268,6 +268,8 @@ sinfer_add_test(sinfer_lora_lifecycle_test
   SOURCES test_lora_lifecycle.cpp
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_lora_lifecycle_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_target_lora_models_test SOURCES test_target_lora_models.cpp LIBRARIES sinfer_engine CUDA::cudart)
+target_compile_options(sinfer_target_lora_models_test PRIVATE -UNDEBUG)
 set_tests_properties(sinfer_lora_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_burst_prefix_test SOURCES test_burst_prefix.cpp LIBRARIES sinfer_serve)
 target_compile_options(sinfer_burst_prefix_test PRIVATE -UNDEBUG -fno-fast-math)
