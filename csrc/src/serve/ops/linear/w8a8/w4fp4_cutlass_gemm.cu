@@ -3,9 +3,12 @@
 // header-only and heavy; nothing else includes it.
 
 #include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
+#include "core/engine_context.h"
+#include "ops/linear/plane_storage.h"
 
 #include <cuda_bf16.h>
 #include <type_traits>
+#include <thread>
 
 #include "cutlass/arch/arch.h"
 #include "cutlass/cutlass.h"
@@ -68,31 +71,38 @@ struct GemmDef {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-// Stream-K keeps partial tiles and barriers in device memory. One buffer per device, taken
-// the first time a stream-K launch runs eagerly; a launch that needs it inside a graph
-// capture, or needs more, reports false and the caller's own route runs instead.
+// Keep callers isolated as before, but own their workspaces in the engine and
+// distinguish pipeline devices. A capture may only reuse an eagerly prepared
+// buffer; its lifetime must also survive the thread that prepared the graph.
 constexpr std::size_t kStreamKWorkspaceBytes = std::size_t{64} << 20;
+struct StreamKDeviceState {
+    int device = 0;
+    int sm_count = 0;
+    std::mutex mutex;
+    std::map<std::thread::id, std::unique_ptr<DeviceArena>> workspaces;
+    StreamKDeviceState() {
+        CUDA_CHECK(cudaGetDevice(&device));
+        sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
+    }
+};
+StreamKDeviceState& streamk_state() {
+    return engine_slot<DevicePlaneStates<StreamKDeviceState>>().current();
+}
+
 void* streamk_workspace(std::size_t needed, cudaStream_t stream) {
-    static thread_local void* buffer = nullptr;
     if (needed > kStreamKWorkspaceBytes) { return nullptr; }
-    if (buffer == nullptr) {
+    auto& state = streamk_state();
+    const std::lock_guard<std::mutex> lock(state.mutex);
+    auto& buffer = state.workspaces[std::this_thread::get_id()];
+    if (!buffer) {
         cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(stream, &capturing) != cudaSuccess ||
             capturing != cudaStreamCaptureStatusNone) {
             return nullptr;
         }
-        if (cudaMalloc(&buffer, kStreamKWorkspaceBytes) != cudaSuccess) { buffer = nullptr; }
+        buffer = try_plane_storage(kStreamKWorkspaceBytes);
     }
-    return buffer;
-}
-
-int device_sm_count() {
-    static const int count = [] {
-        int device = 0;
-        cudaGetDevice(&device);
-        return cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
-    }();
-    return count;
+    return buffer ? buffer->base() : nullptr;
 }
 
 template <bool WithResidual, class Tile = Shape<_128, _128, _128>,
@@ -140,8 +150,9 @@ bool launch(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
     args.mainloop.layout_SFB = Cfg::tile_atom_to_shape_SFB(args.problem_shape);
     args.hw_info.cluster_shape          = dim3(1, 1, 1);
     args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
-    args.hw_info.device_id              = 0;
-    args.hw_info.sm_count               = device_sm_count();
+    const auto& hardware = streamk_state();
+    args.hw_info.device_id              = hardware.device;
+    args.hw_info.sm_count               = hardware.sm_count;
 
     // One adapter per instantiation: initialize validates and sets kernel
     // attributes once; per-call updates go through initialize with a null

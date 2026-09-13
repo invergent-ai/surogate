@@ -363,6 +363,9 @@ sinfer_add_test(sinfer_host_offload_test
 sinfer_add_test(sinfer_derived_plane_lifetime_test
   SOURCES test_derived_plane_lifetime.cpp
   LIBRARIES sinfer_engine CUDA::cudart)
+sinfer_add_test(sinfer_cutlass_streamk_devices_test
+  SOURCES test_cutlass_streamk_devices.cpp
+  LIBRARIES sinfer_engine CUDA::cudart)
 sinfer_add_test(sinfer_cli_options_test
   SOURCES test_cli_options.cpp ${SERVE_ROOT}/cli/options.cpp
   LIBRARIES sinfer_serve)
