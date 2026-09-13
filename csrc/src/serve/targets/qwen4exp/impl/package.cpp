@@ -90,14 +90,6 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         options.host_expert_bank == EngineOptions::HostExpertBank::Q4   ? family::BankPlanes::Q4
         : options.host_expert_bank == EngineOptions::HostExpertBank::W8 ? family::BankPlanes::W8
                                                                         : family::BankPlanes::Auto;
-    std::fprintf(stderr, "qwen4exp: host expert bank %s\n",
-                 planes == family::BankPlanes::Q4
-                     ? "Q4G32AM planes throughout (a requantisation for any half the file "
-                       "stores wider than four bits)"
-                 : planes == family::BankPlanes::W8
-                     ? "W8 planes throughout"
-                     : "Q4G32AM planes for the 4-bit halves, Q5G32AM for the 5-bit ones, W8 "
-                       "for the wider ones (--host-expert-bank w8|q4 forces one)");
     auto plan = detail::bind_artifact(binder, features, options.pipeline_stage_first,
                                       options.pipeline_stage_last, planes, options.load_progress);
     // What the runtime will derive from the resident weights once they are on the device: the

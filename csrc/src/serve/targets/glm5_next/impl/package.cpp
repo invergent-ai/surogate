@@ -194,17 +194,6 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                                     options.expert_slots)
             : 0);
     if (banks_experts()) {
-        std::fprintf(stderr, "glm5_next: host expert bank %s\n",
-                     planes == family::BankPlanes::Q4
-                         ? "Q4G32AM planes throughout (requantised while loading; this file's "
-                           "down experts are Q5_K/Q6_K and lose precision here)"
-                     : planes == family::BankPlanes::W8
-                         ? "W8 planes throughout (decoded while loading)"
-                         : "Q4G32AM planes for the 4-bit halves, Q5G32AM for the 5-bit ones, W8 "
-                           "for the wider ones (repacked while loading; --host-expert-bank w8|q4 "
-                           "forces one)");
-    }
-    if (banks_experts()) {
         // What the runtime will derive from the resident weights once they are on the device,
         // and the weights themselves, which at pool-sizing time are still in the artifact: an
         // automatic expert pool sizes itself before either is measured and has to leave both.
