@@ -120,10 +120,10 @@ void ngram_ple_mark_segment_last(Tensor& flags, const Tensor& count_scalar, std:
 /**
  * Column staging for a round that gives each lane `width` consecutive columns -- a speculative
  * verify or draft round. The columns of one lane are one segment: the lane's slot repeats
- * across them, the segment offset ramps 0..width-1, and only the last column closes it.
+ * across them, every column names the segment's absolute start, and only the last column closes it.
  *
  *   slots_out[b*width + j]     = slots_in[b]
- *   segment_begin[b*width + j] = j
+ *   segment_begin[b*width + j] = b*width
  *   segment_last[b*width + j]  = (j == width - 1)
  *
  * `slots_in` is I32 [batch]; the three outputs are I32 [width*batch].

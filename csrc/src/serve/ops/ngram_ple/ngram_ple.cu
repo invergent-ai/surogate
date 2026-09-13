@@ -311,7 +311,7 @@ __global__ void expand_columns_kernel(const int* __restrict__ slots_in, int widt
     const int lane   = i / width;
     const int offset = i - lane * width;
     slots_out[i]     = slots_in[lane];
-    begin[i]         = offset;
+    begin[i]         = lane * width;
     last[i]          = offset == width - 1 ? 1 : 0;
 }
 
