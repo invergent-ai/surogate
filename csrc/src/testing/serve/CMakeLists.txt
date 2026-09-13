@@ -159,6 +159,8 @@ sinfer_add_test(sinfer_model_wake_http_test SOURCES test_model_wake_http.cpp LIB
 target_compile_options(sinfer_model_wake_http_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_pipeline_partition_test SOURCES test_pipeline_partition.cpp)
 sinfer_add_test(sinfer_pipeline_schedule_test SOURCES test_pipeline_schedule.cpp)
+sinfer_add_test(sinfer_pipeline_prefill_sample_test SOURCES test_pipeline_prefill_sample.cpp)
+target_compile_options(sinfer_pipeline_prefill_sample_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_pipeline_schedule_test PRIVATE -UNDEBUG)
 sinfer_add_op_test(sinfer_bounded_expert_cache_test SOURCES ops/test_bounded_expert_cache.cpp LIBRARIES sinfer_ops)
 foreach(mode handshake callback)

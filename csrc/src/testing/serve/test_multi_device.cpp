@@ -177,6 +177,19 @@ int main() {
         return result.completion_token_ids;
     };
     GenerationRequest continued = request;
+    std::vector<GenerationRequest> distinct_prompts;
+    std::vector<std::pair<sinfer::TokenId, float>> distinct_samples;
+    if (score_tokens && !vision) {
+        for (int i = 0; i < 3; ++i) {
+            auto distinct = request;
+            distinct.raw_prompt.reset();
+            distinct.messages.clear();
+            distinct.prompt_token_ids.assign(33 + 17 * i, 100 + 7 * i);
+            distinct.max_tokens = 1;
+            distinct.prompt_logprobs = -1;
+            distinct_prompts.push_back(std::move(distinct));
+        }
+    }
     std::vector<sinfer::TokenId> expected, expected_turn;
     const auto continue_turn = [&](GenerationService& service) {
         auto prepared = service.prepare(continued);
@@ -191,6 +204,12 @@ int main() {
         expected = generate(baseline);
         assert(!expected.empty() && expected.size() <= request.max_tokens);
         if (!vision) { assert(expected.size() == 128); }
+        for (const auto& distinct : distinct_prompts) {
+            auto prepared = baseline.prepare(distinct);
+            const auto result = baseline.run(prepared, nullptr);
+            assert(result.completion_token_ids.size() == 1 && result.token_logprobs.size() == 1);
+            distinct_samples.emplace_back(result.completion_token_ids[0], result.token_logprobs[0]);
+        }
         if (cache_turn) {
             if (vision) {
                 continued.messages.push_back({.role = sinfer::ChatRole::Assistant,
@@ -212,6 +231,16 @@ int main() {
     }
     options.devices = devices;
     GenerationService pipeline(options);
+    if (!distinct_prompts.empty()) {
+        std::vector<decltype(pipeline.prepare(request))> prepared;
+        for (const auto& distinct : distinct_prompts) { prepared.push_back(pipeline.prepare(distinct)); }
+        for (std::size_t i = 0; i < prepared.size(); ++i) {
+            const auto result = pipeline.run(prepared[i], nullptr);
+            assert(result.completion_token_ids.size() == 1 && result.token_logprobs.size() == 1);
+            assert(result.completion_token_ids[0] == distinct_samples[i].first);
+            assert(std::abs(result.token_logprobs[0] - distinct_samples[i].second) < 0.02F);
+        }
+    }
     assert(generate(pipeline) == expected);
     if (cache_turn) {
         assert(continue_turn(pipeline) == expected_turn);

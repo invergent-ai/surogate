@@ -25,6 +25,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/engine/pipeline_schedule.h"
+#include "runtime/engine/prefill_sample.h"
 
 #include <algorithm>
 #include <cmath>
@@ -122,7 +123,6 @@ public:
         width_ = std::max<std::uint32_t>(1, stages_.front()->program->speculative_round_width());
         assembled_tokens_.resize(static_cast<std::size_t>(kMaximumBatchColumns) * width_);
         assembled_counts_.resize(kMaximumBatchColumns);
-        assembled_prefill_tokens_.fill(0);
         flights_.resize(groups_);
         stage_owner_.assign(stages_.size(), -1);
         held_by_.assign(stages_.size(), -1);
@@ -472,8 +472,8 @@ private:
         // A finished prompt's first sampled token, copied out of the last stage's egress buffer:
         // the executor reads the result after `tick()` returns, by which time another round may
         // have been launched on that stage and overwritten the buffer the span pointed into.
-        std::array<TokenId, runtime::kMaximumMixedPrefills> prefill_tokens{};
-        TokenId lone_prefill_token = 0;
+        std::array<PipelinePrefillSample, runtime::kMaximumMixedPrefills> prefill_samples{};
+        PipelinePrefillSample lone_prefill_sample;
         std::vector<std::byte> park;
         std::size_t carry_bytes = 0; // bytes of residual this flight carries across a boundary
         std::uint32_t dflash_window = 0;
@@ -564,7 +564,7 @@ private:
         if (f.kind == FlightKind::Prefill) {
             propagate_prefill_features(f.prefill_lane, f.result.prefill);
             if (f.result.prefill.complete) {
-                store_prefill_token(f.result.prefill, f.lone_prefill_token);
+                f.lone_prefill_sample.capture(f.result.prefill);
                 propagate_prefill_token(f.prefill_lane, f.result.prefill);
             }
         } else {
@@ -580,7 +580,7 @@ private:
                     PrefillStepResult& step = f.result.mixed.prefills[i];
                     propagate_prefill_features(f.prefill_lanes[i], step);
                     if (!step.complete) { continue; }
-                    store_prefill_token(step, f.prefill_tokens[i]);
+                    f.prefill_samples[i].capture(step);
                     propagate_prefill_token(f.prefill_lanes[i], step);
                 }
             }
@@ -727,14 +727,14 @@ private:
                             collect_tokens(group_rows[g], part.round);
                             assembled_mixed_.prefill_count = part.prefill_count;
                             assembled_mixed_.prefills      = part.prefills;
-                            // Same reason as store_prefill_token: the spans point into the
+                            // The result spans point into the
                             // stage's egress buffer, which the next round overwrites.
                             for (std::size_t i = 0; i < assembled_mixed_.prefill_count &&
-                                                    i < assembled_prefill_tokens_.size();
+                                                    i < assembled_prefill_samples_.size();
                                  ++i) {
                                 PrefillStepResult& step = assembled_mixed_.prefills[i];
                                 if (step.complete) {
-                                    store_prefill_token(step, assembled_prefill_tokens_[i]);
+                                    assembled_prefill_samples_[i].capture(step);
                                 }
                             }
                         }
@@ -840,16 +840,6 @@ private:
             stages_[s]->program->replace_pending_tokens(replaced_lanes, tokens);
         }
     }
-    // Copies a finished prompt's sampled token into flight-owned storage and re-points the
-    // result's span at it.
-    static void store_prefill_token(PrefillStepResult& step, TokenId& storage) {
-        if (step.round.tokens.size() != 1) {
-            throw std::logic_error("pipeline stages expect one sampled token from a finished prefill");
-        }
-        storage          = step.round.tokens[0];
-        step.round.tokens = std::span<const TokenId>(&storage, 1);
-    }
-
     void propagate_prefill_token(std::uint32_t lane, const PrefillStepResult& step) {
         if (stages_.size() < 2) { return; }
         if (step.round.tokens.size() != 1) {
@@ -869,7 +859,7 @@ private:
         }
     }
 
-    std::array<TokenId, runtime::kMaximumMixedPrefills> assembled_prefill_tokens_{};
+    std::array<PipelinePrefillSample, runtime::kMaximumMixedPrefills> assembled_prefill_samples_{};
     std::vector<Stage*> stages_;
     std::vector<int> devices_;
     bool trace_                = false;
