@@ -10,6 +10,11 @@
 namespace sinfer::runtime {
 struct ConcurrentExecutorTestAccess {
     template <class Instance>
+    static bool can_execute(ConcurrentExecutor<Instance>& executor) {
+        auto lock = executor.lock_awake_execution();
+        return lock.owns_lock();
+    }
+    template <class Instance>
     static void fail(ConcurrentExecutor<Instance>& executor) {
         executor.fail_all(std::make_exception_ptr(std::runtime_error("injected worker failure")));
     }
@@ -31,6 +36,25 @@ int main() {
         auto target = sinfer::targets::construct_target(options, device);
         auto& instance = *std::get<std::unique_ptr<sinfer::targets::Qwen3_5Instance>>(target.active);
         sinfer::runtime::ConcurrentExecutor executor(instance, options);
+        {
+            // The worker has passed its queue wait but is blocked at the execution gate.
+            // Sleep starts while the memory owner holds that gate for unmapping.
+            auto owner = executor.pause_execution();
+            std::promise<void> entering;
+            auto round = std::async(std::launch::async, [&] {
+                entering.set_value();
+                return sinfer::runtime::ConcurrentExecutorTestAccess::can_execute(executor);
+            });
+            entering.get_future().wait();
+            executor.set_asleep(true);
+            owner.unlock();
+            const bool ran_asleep = round.get();
+            executor.set_asleep(false);
+            if (ran_asleep || !sinfer::runtime::ConcurrentExecutorTestAccess::can_execute(executor)) {
+                std::cerr << "execution gate failed to respect sleep/wake after acquiring the lock\n";
+                return 1;
+            }
+        }
         auto paused = executor.pause_execution();
         std::promise<void> started;
         auto failure = std::async(std::launch::async, [&] {

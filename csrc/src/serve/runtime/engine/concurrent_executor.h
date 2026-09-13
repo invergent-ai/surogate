@@ -1557,6 +1557,14 @@ private:
         seg_timer_.stats += std::chrono::duration<double>(Clock::now() - t_stats).count();
     }
 
+    std::unique_lock<std::mutex> lock_awake_execution() {
+        auto lock = pause_execution();
+        // Sleep may have won the execution lock after this worker left the queue
+        // wait. Recheck before touching program state or unmapped device memory.
+        if (asleep()) { lock.unlock(); }
+        return lock;
+    }
+
     void fail_all(std::exception_ptr error) noexcept {
         std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
@@ -1629,7 +1637,8 @@ private:
             }
 
             try {
-                std::scoped_lock execution_lock(execution_mutex_);
+                auto execution_lock = lock_awake_execution();
+                if (!execution_lock.owns_lock()) { continue; }
                 const auto seg_t0                = Clock::now();
                 const bool have_pending          = expire_pending_requests();
                 auto cancelled_at_boundary = snapshot_cancellations();
