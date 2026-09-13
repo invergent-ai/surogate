@@ -1250,7 +1250,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             set_owned_content(res,
                               make_messages_response(id, model, outcome.text, outcome.reasoning,
-                                                     outcome.tool_calls, stop_reason, usage),
+                                                     outcome.tool_calls, stop_reason, usage, outcome.stop_sequence),
                               prepared.lifetime);
         } catch (const ApiException& e) {
             log_request_error(log_context, e.error().message);
@@ -1337,7 +1337,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const char* stop_reason =
                     messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
                 write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, outcome.completion_tokens));
+                                  make_message_delta(stop_reason, outcome.completion_tokens, outcome.stop_sequence));
                 write_stream_item(sink, *stream, make_message_stop());
                 sink.done();
                 return true;

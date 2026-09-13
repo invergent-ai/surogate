@@ -1499,13 +1499,17 @@ int test_interleaved_reasoning_round() {
 
     for (bool include : {false, true}) {
         sinfer::StopPolicy stop;
+        stop.strings.push_back({.text = "unmatched-stop"});
         stop.strings.push_back({.text = "STOP", .include_in_output = include});
+        stop.strings.push_back({.text = "STOPdiscard"});
         auto stopped = frontend.make_output_session(prompt, stop);
         const auto decision = stopped.preview(std::array<sinfer::TokenId, 1>{107}, 8, sinfer::FinishReason::OutputLimit);
         failures += check(decision.finish_reason == sinfer::FinishReason::StopString &&
                               decision.accepted_tokens == 1 &&
                               matches(stopped.commit_preview(), {"before", "first", "middle", "second", include ? "afterSTOP" : "after"}),
                           "stop snapshot lost an interleaved delta or published the discarded suffix");
+        failures += check(stopped.matched_stop_string() == "STOP",
+                          "stop metadata did not retain the matching declaration");
     }
     sinfer::StopPolicy eos;
     eos.token_ids = {107};

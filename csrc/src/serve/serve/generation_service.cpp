@@ -603,6 +603,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
     outcome.finish_reason     = result.finish_reason;
+    outcome.stop_sequence     = std::move(result.stop_sequence);
     if (prepared.return_token_ids) {
         outcome.prompt_token_ids     = std::move(prepared.prompt_token_ids);
         outcome.completion_token_ids = result.generated_token_ids;

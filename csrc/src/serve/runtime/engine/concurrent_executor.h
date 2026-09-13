@@ -540,6 +540,9 @@ private:
         result.reasoning               = std::move(request->reasoning);
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
+        if (reason == FinishReason::StopString) {
+            result.stop_sequence = request->output.matched_stop_string();
+        }
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;

@@ -604,6 +604,14 @@ int test_stop_reason_mapping() {
     failures += check(std::string(messages_stop_reason(sinfer::FinishReason::StopToken, false)) ==
                           "end_turn",
                       "stop token -> end_turn");
+    failures += check(std::string(messages_stop_reason(sinfer::FinishReason::StopString, false)) ==
+                          "stop_sequence", "stop string -> stop_sequence");
+    const auto stopped = Json::parse(make_messages_response(
+        "msg_stop", "model", "answer", "", {}, "stop_sequence", CompletionUsage{2, 1}, "</answer>"));
+    failures += check(stopped.at("stop_sequence") == "</answer>", "response echoes matched stop sequence");
+    const auto delta = parse_sse(make_message_delta("stop_sequence", 1, "</answer>"));
+    failures += check(delta.at("delta").at("stop_sequence") == "</answer>",
+                      "stream echoes matched stop sequence");
     failures += check(std::string(messages_stop_reason(sinfer::FinishReason::Cancelled, false)) ==
                           "end_turn",
                       "cancelled -> end_turn");

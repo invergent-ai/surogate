@@ -38,7 +38,7 @@ const char* messages_stop_reason(sinfer::FinishReason reason, bool has_tool_call
 std::string make_messages_response(const std::string& id, const std::string& model,
                                    const std::string& content, const std::string& reasoning,
                                    const std::vector<ToolCall>& tool_calls, const char* stop_reason,
-                                   const CompletionUsage& usage);
+                                   const CompletionUsage& usage, std::string_view stop_sequence = {});
 
 // Streaming SSE event strings ("event: <type>\ndata: {...}\n\n"). The transport
 // calls these pure builders. MessagesStreamBlocks keeps alternating text and
@@ -51,7 +51,7 @@ std::string make_content_block_delta_text(int index, const std::string& delta_te
 std::string make_content_block_delta_thinking(int index, const std::string& delta_text);
 std::string make_content_block_delta_tool_json(int index, const std::string& partial_json);
 std::string make_content_block_stop(int index);
-std::string make_message_delta(const char* stop_reason, int output_tokens);
+std::string make_message_delta(const char* stop_reason, int output_tokens, std::string_view stop_sequence = {});
 std::string make_message_stop();
 std::string make_messages_ping();
 

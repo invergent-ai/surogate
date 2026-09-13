@@ -67,6 +67,7 @@ struct GenerationOutcome {
     /// belongs to. Filled only alongside `token_logprobs`.
     std::vector<std::string> token_texts;
     sinfer::FinishReason finish_reason = sinfer::FinishReason::OutputLimit;
+    std::string stop_sequence;
     GenerationMetrics metrics;
 };
 

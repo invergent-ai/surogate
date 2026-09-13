@@ -688,6 +688,7 @@ struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
+    std::optional<std::uint32_t> matched_stop_index;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
     bool terminal                  = false;
@@ -1203,6 +1204,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
 
         if (match.found) {
             impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
+            impl_->preview_state.matched_stop_index = match.declaration_order;
             impl_->preview_output = std::move(match.output);
             return complete(match.committed_tokens, FinishReason::StopString);
         }
@@ -1252,6 +1254,11 @@ PublishedOutput OutputSession::commit_preview() noexcept {
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+}
+
+std::string_view OutputSession::matched_stop_string() const noexcept {
+    if (impl_ == nullptr || !impl_->state.matched_stop_index) { return {}; }
+    return impl_->policy.strings[*impl_->state.matched_stop_index].text;
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}

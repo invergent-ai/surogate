@@ -566,9 +566,10 @@ const char* messages_stop_reason(sinfer::FinishReason reason, bool has_tool_call
     case sinfer::FinishReason::OutputLimit:
     case sinfer::FinishReason::ContextCapacity:
         return "max_tokens";
+    case sinfer::FinishReason::StopString:
+        return "stop_sequence";
     case sinfer::FinishReason::None:
     case sinfer::FinishReason::StopToken:
-    case sinfer::FinishReason::StopString:
     case sinfer::FinishReason::Cancelled:
         return "end_turn";
     }
@@ -578,7 +579,7 @@ const char* messages_stop_reason(sinfer::FinishReason reason, bool has_tool_call
 std::string make_messages_response(const std::string& id, const std::string& model,
                                    const std::string& content, const std::string& reasoning,
                                    const std::vector<ToolCall>& tool_calls, const char* stop_reason,
-                                   const CompletionUsage& usage) {
+                                   const CompletionUsage& usage, std::string_view stop_sequence) {
     Json blocks = Json::array();
     if (!reasoning.empty()) {
         blocks.push_back(Json{{"type", "thinking"}, {"thinking", reasoning}, {"signature", ""}});
@@ -599,7 +600,8 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                           {"model", model},
                           {"content", std::move(blocks)},
                           {"stop_reason", stop_reason},
-                          {"stop_sequence", nullptr},
+                          {"stop_sequence", std::string_view(stop_reason) == "stop_sequence" && !stop_sequence.empty()
+                                                ? Json(std::string(stop_sequence)) : Json(nullptr)},
                           {"usage", Json{{"input_tokens", usage.prompt_tokens},
                                          {"output_tokens", usage.completion_tokens}}}};
     return payload.dump();
@@ -684,10 +686,12 @@ std::string make_content_block_stop(int index) {
     return sse("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}});
 }
 
-std::string make_message_delta(const char* stop_reason, int output_tokens) {
+std::string make_message_delta(const char* stop_reason, int output_tokens, std::string_view stop_sequence) {
     return sse("message_delta",
                Json{{"type", "message_delta"},
-                    {"delta", Json{{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
+                    {"delta", Json{{"stop_reason", stop_reason},
+                                   {"stop_sequence", std::string_view(stop_reason) == "stop_sequence" && !stop_sequence.empty()
+                                                         ? Json(std::string(stop_sequence)) : Json(nullptr)}}},
                     {"usage", Json{{"output_tokens", output_tokens}}}});
 }
 
