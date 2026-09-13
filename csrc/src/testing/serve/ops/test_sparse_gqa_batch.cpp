@@ -13,8 +13,9 @@ int main() {
     if (cuda_unavailable()) { return 77; }
     constexpr int dim = 256, heads = 16, kv_heads = 2, pages = 5, mask_stride = 3;
     int failures = 0;
-    for (const int batch : {1, 2, 4}) {
-        for (const int width : {1, 4, 16}) {
+    for (const auto dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+      for (const int batch : {1, 2, 4}) {
+        for (const int width : {1, 4, 6, 16}) {
             DeviceArena arena(16U << 20);
             Tensor q = arena.alloc(DType::BF16, {dim, heads, width, batch});
             Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, width, batch});
@@ -28,13 +29,14 @@ int main() {
             PagedKVBatchLayerView cache;
             cache.head_dim = dim;
             cache.num_kv_heads = kv_heads;
-            cache.dtype = DType::BF16;
+            cache.dtype = dtype;
             cache.k_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, pages * batch});
             cache.v_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, pages * batch});
             cache.block_tables = arena.alloc(DType::I32, {pages, batch});
             CUDA_CHECK(cudaMemset(cache.k_pages.data, 0, cache.k_pages.bytes()));
             std::vector<int> table(pages * batch), row_ids(batch), pos(width * batch);
             std::vector<std::uint16_t> values(cache.v_pages.numel());
+            std::vector<std::uint8_t> fp8_values(cache.v_pages.numel());
             std::vector<std::uint32_t> masks(batch * width * mask_stride, 0);
             for (int row = 0; row < batch; ++row) {
                 row_ids[row] = batch - row - 1;
@@ -43,9 +45,11 @@ int main() {
                     table[row * pages + page] = physical;
                     for (int h = 0; h < kv_heads; ++h) {
                         for (int t = 0; t < kPagedKVPageSize; ++t) {
-                            const auto value = f32_to_bf16(float(row * 64 + (page * 64 + t) / 4 + 1));
+                            const int exponent = (row + (page * 64 + t) / 4) % 7;
+                            const auto value = f32_to_bf16(float(1 << exponent));
                             const auto begin = ((physical * kv_heads + h) * kPagedKVPageSize + t) * dim;
                             std::fill_n(values.begin() + begin, dim, value);
+                            std::fill_n(fp8_values.begin() + begin, dim, std::uint8_t(0x38 + exponent * 8));
                         }
                     }
                 }
@@ -59,7 +63,9 @@ int main() {
             // An exact allocation also makes a mask-row overrun visible to memcheck.
             DeviceBuffer mask(masks.size() * sizeof(std::uint32_t));
             CUDA_CHECK(cudaMemcpy(mask.p, masks.data(), mask.bytes, cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(cache.v_pages.data, values.data(), cache.v_pages.bytes(), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(cache.v_pages.data,
+                                   dtype == DType::BF16 ? static_cast<const void*>(values.data()) : fp8_values.data(),
+                                   cache.v_pages.bytes(), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(cache.block_tables.data, table.data(), cache.block_tables.bytes(), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(rows.data, row_ids.data(), rows.bytes(), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
@@ -81,7 +87,7 @@ int main() {
                 for (int row = 0; row < batch; ++row) {
                     for (int col = 0; col < width; ++col) {
                         const int block = (row * 11 + col * 3) % 60;
-                        const auto expected = f32_to_bf16(float(row_ids[row] * 64 + block + 1));
+                        const auto expected = f32_to_bf16(float(1 << ((row_ids[row] + block) % 7)));
                         for (int i = 0; i < heads * dim; ++i) {
                             mismatches += actual[(row * width + col) * heads * dim + i] != expected;
                         }
@@ -89,11 +95,12 @@ int main() {
                 }
                 if (mismatches) {
                     ++failures;
-                    std::cerr << "sparse attention B=" << batch << " W=" << width
+                    std::cerr << "sparse attention dtype=" << int(dtype) << " B=" << batch << " W=" << width
                               << " cached=" << cached << ": " << mismatches << " mismatches\n";
                 }
             }
         }
+      }
     }
     return failures != 0;
 }
