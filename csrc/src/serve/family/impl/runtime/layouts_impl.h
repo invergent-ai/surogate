@@ -1,5 +1,6 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/layouts.h"
+#include "family/impl/runtime/kv_precision.h"
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
 #include "ops/linear/marlin/marlin_plane.h"
@@ -1088,7 +1089,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .speculative_backend   = options.speculative.backend,
         .kv_dtype              = kv_storage_dtype(kv_storage),
         .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,
-        .kv_skip_layers = options.kv_cache_skip_layers,
+        .kv_skip_layers = family::detail::kv_precision_layers(geometry, options.kv_cache_skip_layers),
         .elastic_kv                = options.elastic_kv,
         .elastic_kv_overcommit     = options.elastic_kv_overcommit,
         .proposal_head             = options.speculative.proposal_head,

@@ -6,6 +6,7 @@
 #include <api/family/vision_control.h>
 
 #include "family/impl/runtime/prefix_identity.h"
+#include "family/impl/runtime/kv_precision.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -143,6 +144,43 @@ void test_round_layout() {
            "K=15 DFlash storage is backend-owned");
     expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
            "DFlash layout does not allocate MTP storage");
+}
+
+void test_model_layer_cache_precision() {
+    q36::TextGeometry hybrid;
+    hybrid.layers = 24;
+    for (int layer = 3; layer < hybrid.layers; layer += 4) { hybrid.declare_attention_layer(layer); }
+    auto spec = decoder_spec(sinfer::DType::FP8_E4M3FN, true);
+    spec.full_attention_layers = 6;
+    spec.kv_skip_layers = q36::detail::kv_precision_layers(hybrid, {23, 3, 7, 3});
+    sinfer::LayoutBuilder builder;
+    const auto layout = q36::plan_decoder_state(builder, spec);
+    expect(layout.text_kv.layer_dtypes == std::vector{
+               sinfer::DType::BF16, sinfer::DType::BF16, sinfer::DType::FP8_E4M3FN,
+               sinfer::DType::FP8_E4M3FN, sinfer::DType::FP8_E4M3FN, sinfer::DType::BF16},
+           "hybrid precision exclusions apply to the requested model layers");
+    expect(layout.mtp_kv->layer_dtypes == std::vector{sinfer::DType::FP8_E4M3FN},
+           "hybrid model exclusions leave the MTP cache at its configured precision");
+    for (const std::uint32_t invalid : {0U, 24U, UINT32_MAX}) {
+        bool rejected = false;
+        try { (void)q36::detail::kv_precision_layers(hybrid, {invalid}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "cache precision rejects non-attending and out-of-range model layers");
+    }
+
+    q36::TextGeometry dense;
+    dense.layers = 6;
+    for (int layer = 0; layer < dense.layers; ++layer) {
+        dense.declare_attention_layer(layer);
+        if (layer % 2 == 0) { dense.declare_windowed_layer(layer); }
+    }
+    expect(q36::detail::kv_precision_layers(dense, {0, 3, 5}) ==
+               std::vector<std::uint32_t>{0, 3, 5}, "dense cache layer numbering is unchanged");
+    dense.declare_kv_sharing();
+    for (int layer = 0; layer < 4; ++layer) { dense.declare_kv_owner(layer); }
+    expect(q36::detail::kv_precision_layers(dense, {4, 2, 5, 3}) ==
+               std::vector<std::uint32_t>{2, 3},
+           "shared layers protect their latest owner of the same attention kind once");
 }
 
 void test_mtp_cache_precision_is_independent() {
@@ -332,6 +370,7 @@ void test_prefix_identity() {
 int main() {
     test_topology();
     test_decoder_layout();
+    test_model_layer_cache_precision();
     test_mtp_cache_precision_is_independent();
     test_round_layout();
     test_mtp_alignment();
