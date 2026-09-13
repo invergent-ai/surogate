@@ -374,8 +374,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         // A query column's own mask row; the heads of a column share one selection. The mask is
         // laid out like q — [words, full_width, batch] — so a batched round indexes its own
         // sequence's rows and a chunked launch adds its column offset.
-        const std::int64_t mask_base =
-            static_cast<std::int64_t>(MultiBatch ? batch : 0) * full_width + column_base;
+        const std::int64_t mask_base = column_base;
         const std::uint32_t* mask0 =
             Sparse && row0 < row_count
                 ? block_mask.words + (mask_base + token0) * block_mask.stride
