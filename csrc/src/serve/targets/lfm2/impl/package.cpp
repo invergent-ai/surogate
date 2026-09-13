@@ -108,10 +108,11 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         if (mlp.moe.routed_down.n > 0) {
             family::bind_lora_moe(store, index, mlp.moe);
         } else {
-            family::bind_lora_dense_mlp(store, index, mlp, g.hidden, g.intermediate);
-            store.register_module(index, "feed_forward.w1", {mlp.gate_up.qdata, family::kGatePort, g.hidden, g.intermediate});
-            store.register_module(index, "feed_forward.w3", {mlp.gate_up.qdata, family::kUpPort, g.hidden, g.intermediate});
-            store.register_module(index, "feed_forward.w2", {mlp.down.qdata, family::kDownPort, g.intermediate, g.hidden});
+            const auto width = g.experts ? g.dense_intermediate : g.intermediate;
+            family::bind_lora_dense_mlp(store, index, mlp, g.hidden, width);
+            store.register_module(index, "feed_forward.w1", {mlp.gate_up.qdata, family::kGatePort, g.hidden, width});
+            store.register_module(index, "feed_forward.w3", {mlp.gate_up.qdata, family::kUpPort, g.hidden, width});
+            store.register_module(index, "feed_forward.w2", {mlp.down.qdata, family::kDownPort, width, g.hidden});
         }
     }
     family::bind_lora_globals(store, runtime);

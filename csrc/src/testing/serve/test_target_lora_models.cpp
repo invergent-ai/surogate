@@ -34,12 +34,12 @@ int main() {
     const int layers = reader.geometry().at("layers");
     auto& stores = engine.lora_stores();
     const auto upload = [&](ops::LoraStore& store, int layer, const std::string& module,
-                            const std::string& object) {
+                            const std::string& object, int row_divisor = 1) {
         const auto* weight = reader.find(object);
         assert(weight && std::holds_alternative<artifact::TensorDescriptor>(*weight));
         const auto& shape = std::get<artifact::TensorDescriptor>(*weight).shape;
         assert(shape.size() == 2);
-        const int out = shape[0], in = shape[1];
+        const int out = shape[0] / row_divisor, in = shape[1];
         std::vector<std::uint16_t> a(in, 0), b(out, 0);
         store.validate_module(layer, module, a, b, 1, in, out, 1);
         store.set_module_slot(layer, module, 0, a, b, 1, in, out, 1);
@@ -58,6 +58,26 @@ int main() {
             const auto prefix = "text/layers/" + std::to_string(layer) + "/";
             if (reader.find(prefix + "mlp/down")) { upload(*owner, layer, "down_proj", prefix + "mlp/down"); }
             if (reader.find(prefix + "mla/output")) { upload(*owner, layer, "o_proj", prefix + "mla/output"); }
+        }
+    } else if (reader.identity().architecture == "lfm2_moe") {
+        auto& store = *stores.peek(engine.device());
+        assert(cudaSetDevice(engine.device()) == cudaSuccess);
+        const int dense = reader.geometry().at("leading_dense_layers");
+        const int expert_width = reader.geometry().at("intermediate");
+        const int hidden = reader.geometry().at("hidden");
+        assert(reader.geometry().at("dense_intermediate") != expert_width);
+        for (int layer = 0; layer < dense; ++layer) {
+            const auto prefix = "text/layers/" + std::to_string(layer) + "/mlp/";
+            for (const auto* module : {"gate_proj", "up_proj", "feed_forward.w1", "feed_forward.w3"}) {
+                upload(store, layer, module, prefix + "gate_up", 2);
+            }
+            upload(store, layer, "gate_up_proj", prefix + "gate_up");
+            for (const auto* module : {"down_proj", "feed_forward.w2"}) { upload(store, layer, module, prefix + "down"); }
+            try {
+                store.validate_module(layer, "gate_proj", std::vector<std::uint16_t>(hidden),
+                                      std::vector<std::uint16_t>(expert_width), 1, hidden, expert_width, 1);
+                assert(false && "dense adapter must not accept the routed expert width");
+            } catch (const std::invalid_argument&) {}
         }
     } else {
         assert(reader.identity().architecture == "gemma4_e");
