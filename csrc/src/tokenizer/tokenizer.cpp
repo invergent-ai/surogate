@@ -232,6 +232,10 @@ struct Tokenizer::Impl {
         if (variables.reasoning_effort.has_value()) {
             ctx_json["reasoning_effort"] = *variables.reasoning_effort;
         }
+        if (variables.preserve_thinking.has_value()) {
+            ctx_json["preserve_thinking"] = *variables.preserve_thinking;
+            ctx_json["clear_thinking"] = !*variables.preserve_thinking;
+        }
         if (!tool_jsons.empty()) {
             ctx_json["tools"] = json::array();
             for (const auto& tool : tool_jsons) { ctx_json["tools"].push_back(json::parse(tool)); }

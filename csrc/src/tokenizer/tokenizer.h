@@ -44,6 +44,7 @@ struct ChatMessage {
 struct ChatTemplateVariables {
     std::optional<bool> enable_thinking;
     std::optional<std::string> reasoning_effort;
+    std::optional<bool> preserve_thinking;
 };
 
 class Tokenizer {

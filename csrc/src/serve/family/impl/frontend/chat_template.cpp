@@ -314,6 +314,30 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
 
 } // namespace
 
+void discard_closed_thinking(std::vector<ChatMessage>& messages, const ReasoningSyntax& syntax) {
+    const long last_user = last_real_user_query(messages);
+    for (long i = 0; i < last_user; ++i) {
+        auto& message = messages[static_cast<std::size_t>(i)];
+        if (message.role != ChatRole::Assistant) { continue; }
+        message.reasoning_content.clear();
+        if (syntax.close.empty()) { continue; }
+        std::string content;
+        for (const auto& part : message.parts) {
+            if (part.kind == ChatPartKind::Text) { content += part.text; }
+        }
+        const auto end = content.find(syntax.close);
+        if (end == std::string::npos) { continue; }
+        std::size_t remove = end + syntax.close.size();
+        for (auto& part : message.parts) {
+            if (part.kind != ChatPartKind::Text) { continue; }
+            const auto count = std::min(remove, part.text.size());
+            part.text.erase(0, count);
+            remove -= count;
+            if (remove == 0) { break; }
+        }
+    }
+}
+
 bool ChatMessage::has_media() const noexcept {
     for (const ChatPart& part : parts) {
         if (part.kind != ChatPartKind::Text) { return true; }

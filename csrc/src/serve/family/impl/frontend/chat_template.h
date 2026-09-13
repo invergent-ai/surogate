@@ -79,6 +79,7 @@ struct ChatMessage {
 struct ChatTemplateVariables {
     std::optional<bool> enable_thinking;
     std::optional<std::string> reasoning_effort;
+    std::optional<bool> preserve_thinking;
 };
 
 struct ChatRenderOptions {
@@ -161,6 +162,10 @@ struct ReasoningSyntax {
     /// opening marker mid-stream, and only a checkpoint that states its pair gets that.
     bool model_opens = false;
 };
+
+/// Drop completed-turn reasoning before a Jinja renderer sees the messages.
+/// Current assistant/tool continuations and media parts retain their contents.
+void discard_closed_thinking(std::vector<ChatMessage>& messages, const ReasoningSyntax& syntax);
 
 /// Renders the template under test with the given variables, or throws the way the
 /// template does when it refuses them.

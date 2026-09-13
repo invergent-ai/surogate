@@ -777,6 +777,95 @@ int test_jinja_capability_probe() {
     return failures;
 }
 
+int test_jinja_thinking_retention() {
+    int failures = 0;
+    for (const std::string gate : {"preserve_thinking", "not clear_thinking", "true", "false"}) {
+        const auto& base = official_tokenizer_dir();
+        FrontendResources artifact;
+        artifact.tokenizer_json = read_file((base + "/tokenizer.json").c_str());
+        artifact.tokenizer_config_json = read_file((base + "/tokenizer_config.json").c_str());
+        artifact.generation_config_json = read_file((base + "/generation_config.json").c_str());
+        artifact.chat_template_jinja =
+            "{% for m in messages %}{{ m.role }}:"
+            "{% if m.reasoning_content is defined and (" + gate + ") %}"
+            "<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}\n{% endfor %}"
+            "{% if add_generation_prompt %}assistant:{% endif %}";
+        auto config = nlohmann::json::parse(artifact.tokenizer_config_json);
+        config["chat_template"] = artifact.chat_template_jinja;
+        artifact.tokenizer_config_json = config.dump();
+        const Frontend frontend = FrontendFactory::create_component(artifact, false);
+        const auto message = [](sinfer::ChatRole role, std::string content) {
+            sinfer::ChatMessage m;
+            m.role = role;
+            m.parts.push_back({.kind=sinfer::MessagePartKind::Text, .text=std::move(content)});
+            return m;
+        };
+        sinfer::PromptInput input;
+        auto old = message(sinfer::ChatRole::Assistant, "old answer");
+        old.reasoning_content = "historical reasoning";
+        auto current = message(sinfer::ChatRole::Assistant, "current answer");
+        current.reasoning_content = "active reasoning";
+        input.messages = {message(sinfer::ChatRole::User, "first"), old,
+                          message(sinfer::ChatRole::Assistant, "<think>embedded reasoning</think>embedded answer"),
+                          message(sinfer::ChatRole::User, "second"), current,
+                          message(sinfer::ChatRole::Tool, "tool result")};
+        const auto render = [&] {
+            const auto prompt = frontend.prepare(input);
+            const auto& data = FrontendFactory::inspect(prompt);
+            failures += check(frontend.count_tokens(input) == data.token_ids.size(),
+                              "thinking retention differs between counting and preparation");
+            std::string text;
+            for (const auto& piece : frontend.token_texts(data.token_ids)) { text += piece; }
+            return text;
+        };
+        const auto dropped = render();
+        failures += check(dropped.find("historical reasoning") == std::string::npos &&
+                          dropped.find("embedded reasoning") == std::string::npos &&
+                          dropped.find("old answer") != std::string::npos &&
+                          dropped.find("embedded answer") != std::string::npos,
+                          "Jinja default retained completed reasoning or removed the answer");
+        if (gate == "true") {
+            failures += check(dropped.find("active reasoning") != std::string::npos,
+                              "dropping closed reasoning removed the current tool turn's reasoning");
+        }
+        input.options.preserve_thinking = true;
+        if (gate == "false") {
+            failures += check(throws_invalid_argument([&] { (void)render(); }),
+                              "unsupported Jinja reasoning retention was silently accepted");
+            failures += check(throws_invalid_argument([&] { (void)frontend.count_tokens(input); }),
+                              "token counting ignored unsupported reasoning retention");
+        } else {
+            const auto retained = render();
+            failures += check(retained.find("historical reasoning") != std::string::npos &&
+                              retained.find("embedded reasoning") != std::string::npos,
+                              "Jinja did not honor requested reasoning retention");
+        }
+    }
+    return failures;
+}
+
+int test_closed_thinking_parts() {
+    auto previous = chat_message(sinfer::ChatRole::Assistant, "<thought>secret</th");
+    previous.reasoning_content = "also secret";
+    previous.parts.push_back(fi::ChatPart::image({}));
+    previous.parts.push_back(fi::ChatPart::text_part("ought>answer"));
+    auto current = chat_message(sinfer::ChatRole::Assistant, "<thought>current</thought>answer");
+    current.reasoning_content = "current field";
+    std::vector<fi::ChatMessage> messages{
+        chat_message(sinfer::ChatRole::User, "first"), previous,
+        chat_message(sinfer::ChatRole::User, "next"), current,
+        chat_message(sinfer::ChatRole::User, "<tool_response>result</tool_response>")};
+    fi::discard_closed_thinking(messages, {.open="<thought>", .close="</thought>"});
+    int failures = check(messages[1].reasoning_content.empty() && messages[1].parts[0].text.empty() &&
+                         messages[1].parts[1].kind == fi::ChatPartKind::Image &&
+                         messages[1].parts[2].text == "answer",
+                         "thinking removal lost media or mishandled split custom markers");
+    failures += check(messages[3].reasoning_content == "current field" &&
+                      messages[3].parts[0].text == current.parts[0].text,
+                      "legacy tool response was mistaken for a new user turn");
+    return failures;
+}
+
 int test_jinja_template_reasoning_effort() {
     // The artifact's own tokenizer, so the prompt below is the text the model would
     // be given, and its own Jinja rather than a hand-written reproduction.
@@ -1957,6 +2046,8 @@ int main() {
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_jinja_template_reasoning_effort();
+    failures += test_jinja_thinking_retention();
+    failures += test_closed_thinking_parts();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);

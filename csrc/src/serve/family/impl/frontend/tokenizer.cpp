@@ -924,7 +924,8 @@ Tokenizer::render_chat_template(const std::vector<std::pair<std::string, std::st
     return delegate_->inner.apply_chat_template(
         converted, add_generation_prompt,
         ::tokenizer::ChatTemplateVariables{.enable_thinking  = variables.enable_thinking,
-                                           .reasoning_effort = variables.reasoning_effort});
+                                           .reasoning_effort = variables.reasoning_effort,
+                                           .preserve_thinking = variables.preserve_thinking});
 }
 
 std::string Tokenizer::render_chat_template_json(
@@ -933,7 +934,8 @@ std::string Tokenizer::render_chat_template_json(
     if (!delegate_) { throw std::logic_error("tokenizer has no chat template renderer"); }
     return delegate_->inner.apply_chat_template_json(messages_json, tool_jsons, add_generation_prompt,
         ::tokenizer::ChatTemplateVariables{.enable_thinking = variables.enable_thinking,
-                                           .reasoning_effort = variables.reasoning_effort});
+                                           .reasoning_effort = variables.reasoning_effort,
+                                           .preserve_thinking = variables.preserve_thinking});
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {

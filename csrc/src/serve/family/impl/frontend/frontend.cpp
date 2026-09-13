@@ -961,6 +961,21 @@ public:
                                                },
                                                reasoning)
                 : chat_template.capabilities();
+        if (tokenizer->renders_chat_template()) {
+            // Probe a completed turn: a one-user generation prompt cannot reveal
+            // whether the template drops historical assistant reasoning.
+            constexpr auto marker = "surogate_retained_reasoning_probe_4927";
+            const nlohmann::json probe = nlohmann::json::array({
+                {{"role", "user"}, {"content", "first"}},
+                {{"role", "assistant"}, {"content", "answer"}, {"reasoning_content", marker}},
+                {{"role", "user"}, {"content", "next"}}});
+            try {
+                preserves_thinking = tokenizer->render_chat_template_json(
+                    probe.dump(), {}, true, {.preserve_thinking = true}).find(marker) != std::string::npos;
+            } catch (const std::exception&) {
+                preserves_thinking = false;
+            }
+        }
         if (registered_checkpoint && options.registered_tokenizer) {
             validate_registered_tokenizer(*tokenizer);
         }
@@ -978,6 +993,10 @@ public:
     /// and an effort it does not implement is refused rather than dropped.
     [[nodiscard]] fi::ChatTemplateVariables template_variables(const PromptOptions& options) const {
         fi::ChatTemplateVariables variables;
+        variables.preserve_thinking = options.preserve_thinking;
+        if (options.preserve_thinking && tokenizer->renders_chat_template() && !preserves_thinking) {
+            throw std::invalid_argument("loaded chat template does not support preserving completed-turn reasoning");
+        }
         if (capabilities.enable_thinking) { variables.enable_thinking = options.enable_thinking; }
         if (options.reasoning_effort) {
             if (!capabilities.reasoning_effort.supports(*options.reasoning_effort)) {
@@ -1033,6 +1052,7 @@ public:
     /// templates state it; an artifact's own Jinja is asked, by rendering it.
     PromptCapabilities capabilities;
     fi::ReasoningSyntax reasoning;
+    bool preserves_thinking = false;
     bool vision_enabled = true;
     /// Whether anything was compiled above. A checkpoint with no template is a base model, and
     /// only the raw-prompt path can serve it.
@@ -1318,6 +1338,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const auto start                      = Clock::now();
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    if (impl_->tokenizer->renders_chat_template()) {
+        (void)impl_->template_variables(options); // reject unsupported retention before media work
+        if (!options.preserve_thinking) { fi::discard_closed_thinking(messages, impl_->reasoning); }
+    }
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
@@ -1476,6 +1500,10 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    if (impl_->tokenizer->renders_chat_template()) {
+        (void)impl_->template_variables(options); // reject unsupported retention before media work
+        if (!options.preserve_thinking) { fi::discard_closed_thinking(messages, impl_->reasoning); }
+    }
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
