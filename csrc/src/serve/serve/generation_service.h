@@ -17,6 +17,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -54,7 +55,7 @@ struct GenerationOutcome {
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;
-    std::size_t streamed_content_bytes = 0;
+    std::string unstreamed_content;
     /// Populated only when the request asked for them. `token_logprobs` is either
     /// empty or exactly as long as `completion_token_ids`.
     std::vector<sinfer::TokenId> prompt_token_ids;
@@ -77,6 +78,9 @@ struct StreamSink {
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
 };
+
+void finalize_output_text(GenerationOutcome& outcome, ReasoningFormat format,
+                          std::optional<std::size_t> streamed_content_bytes = std::nullopt);
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
 ApiError request_error_to_api_error(const sinfer::RequestError& exception);

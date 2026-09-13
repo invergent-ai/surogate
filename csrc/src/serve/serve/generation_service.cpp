@@ -270,6 +270,21 @@ private:
 
 } // namespace
 
+void finalize_output_text(GenerationOutcome& outcome, ReasoningFormat format,
+                          std::optional<std::size_t> streamed_content_bytes) {
+    // The sink counts content bytes before reasoning is folded into the response.
+    outcome.unstreamed_content.clear();
+    if (streamed_content_bytes) {
+        if (*streamed_content_bytes > outcome.text.size()) {
+            throw std::logic_error("streamed content exceeds terminal content");
+        }
+        outcome.unstreamed_content = outcome.text.substr(*streamed_content_bytes);
+    }
+    auto split = split_reasoning(format, std::move(outcome.reasoning), std::move(outcome.text));
+    outcome.reasoning = std::move(split.reasoning);
+    outcome.text = std::move(split.content);
+}
+
 GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
     : options_(std::move(options)), lora_slots_(options_.max_loras) {
     sinfer::EngineOptions engine_options;
@@ -669,13 +684,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     // --reasoning-parser reconciles what the frontend already split. `none` folds
     // the span back into the answer rather than dropping it.
-    ReasoningSplit split = split_reasoning(options_.reasoning_format,
-                                           std::move(outcome.reasoning), std::move(outcome.text));
-    outcome.reasoning    = std::move(split.reasoning);
-    outcome.text         = std::move(split.content);
-    if (output_sink) {
-        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
-    }
+    finalize_output_text(outcome, options_.reasoning_format,
+        output_sink ? std::optional(output_sink->finish(is_tool_call_response)) : std::nullopt);
     return outcome;
 }
 

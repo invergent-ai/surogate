@@ -104,13 +104,6 @@ bool report_has_activity(const ThroughputReport& report) {
            report.scheduler.waiting_requests != 0;
 }
 
-std::string_view unstreamed_content(const GenerationOutcome& outcome) {
-    if (outcome.streamed_content_bytes > outcome.text.size()) {
-        throw std::logic_error("streamed content exceeds terminal content");
-    }
-    return std::string_view(outcome.text).substr(outcome.streamed_content_bytes);
-}
-
 } // namespace
 
 httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
@@ -909,7 +902,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_token_detail(id, model, created, detail, include_usage));
                 }
-                const std::string_view remaining = unstreamed_content(outcome);
+                const std::string_view remaining = outcome.unstreamed_content;
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
                         write_stream_item(sink, *stream,
@@ -1303,7 +1296,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                const std::string_view remaining = unstreamed_content(outcome);
+                const std::string_view remaining = outcome.unstreamed_content;
 
                 blocks.close();
                 int next_index = blocks.next_index();

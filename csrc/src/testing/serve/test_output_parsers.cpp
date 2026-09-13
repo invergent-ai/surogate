@@ -7,6 +7,7 @@
 // to keep its answer.
 
 #include "serve/output_parsers.h"
+#include "serve/generation_service.h"
 #include "serve/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
@@ -69,6 +70,21 @@ void test_reasoning_split() {
 
     const ReasoningSplit empty = split_reasoning(ReasoningFormat::None, "", "answer");
     check(empty.content == "answer", "none leaves a plain answer alone");
+    for (auto format : {ReasoningFormat::None, ReasoningFormat::ThinkTags}) {
+        for (const std::string reasoning : {"Hmm.", "a thought longer than the answer", "考え", ""}) {
+            const std::string answer = "Paris. Tail";
+            for (const auto published : {std::size_t{0}, std::size_t{6}, answer.size()}) {
+                GenerationOutcome outcome;
+                outcome.text = answer;
+                outcome.reasoning = reasoning;
+                finalize_output_text(outcome, format, published);
+                check(outcome.unstreamed_content == answer.substr(published),
+                      "reasoning formatting must not shift the unsent content tail");
+                check(outcome.text == (format == ReasoningFormat::None ? reasoning + answer : answer),
+                      "terminal text keeps the requested reasoning format");
+            }
+        }
+    }
 }
 
 void test_llama3_tool_calls() {
