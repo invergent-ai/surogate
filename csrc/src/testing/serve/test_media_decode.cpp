@@ -124,11 +124,41 @@ void test_issue_20_unaligned_jpeg() {
     expect_pixel(image, 150, 100, yellow, 4);
 }
 
+// Also run this test under LeakSanitizer: each decoder must release custom IO
+// after success, constructor failure, and cancellation during frame decoding.
+void test_decode_cleanup_paths() {
+    const auto encoded = decode_base64(issue_20_jpeg_base64);
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        // A still image has no video duration/frame count, exercising both the
+        // probe and count-frames decoders before the sampling decoder.
+        const auto video = sinfer::media::decode::decode_video(encoded, {}, 1.0, 1, 1);
+        if (video.frames.size() != 1 || video.width != 300 || video.height != 200) {
+            throw std::runtime_error("one-frame video dimensions mismatch");
+        }
+        const std::array<std::uint8_t, 4> malformed{0, 1, 2, 3};
+        try {
+            (void)sinfer::media::decode::decode_image(malformed, {});
+            throw std::runtime_error("malformed media was accepted");
+        } catch (const std::invalid_argument&) {}
+        int checkpoints = 0;
+        sinfer::media::decode::Policy cancelled;
+        cancelled.checkpoint = [&] {
+            if (++checkpoints == 2) { throw std::logic_error("cancelled frame decode"); }
+        };
+        try {
+            (void)sinfer::media::decode::decode_image(encoded, cancelled);
+            throw std::runtime_error("cancelled decode completed");
+        } catch (const std::logic_error&) {}
+        if (checkpoints != 2) { throw std::runtime_error("frame checkpoint was not reached"); }
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_issue_20_unaligned_jpeg();
+        test_decode_cleanup_paths();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
