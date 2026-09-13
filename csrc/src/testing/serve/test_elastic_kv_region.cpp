@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <vector>
 
@@ -317,6 +318,32 @@ int pool_overcommit_cases(sinfer::DeviceContext& device) {
     return failures;
 }
 
+int foreign_device_release_cases() {
+    int failures = 0;
+    for (const int owner : {0, 1}) {
+        sinfer::DeviceContext device(owner);
+        sinfer::ElasticKvRegion region({
+            .device = owner, .fence_stream = device.stream, .bytes = 4 * kMiB,
+            .page_count = kGranule, .granule_pages = kGranule, .reserve_granules = 0,
+            .planes = {{0, kPageBytes}, {2 * kMiB, kPageBytes}}});
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            region.acquire_page(0);
+            auto caller = std::async(std::launch::async, [&] {
+                CUDA_CHECK(cudaSetDevice(1 - owner));
+                region.release_page(0);
+                int after = -1;
+                CUDA_CHECK(cudaGetDevice(&after));
+                return after;
+            });
+            failures += expect(caller.get() == 1 - owner, "release preserves the caller's device");
+            region.wait_idle();
+            failures += expect(region.mapped_bytes() == 0,
+                               "foreign-device release retires the final page's granule");
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -336,6 +363,7 @@ int main() {
         failures += pool_cases(device);
         failures += overcommit_cases(device);
         failures += pool_overcommit_cases(device);
+        if (count >= 2) { failures += foreign_device_release_cases(); }
         if (failures == 0) { std::cout << "OK elastic kv region\n"; }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -354,6 +354,7 @@ std::size_t ElasticKvRegion::granule_bytes() const noexcept { return impl_->gran
 
 void ElasticKvRegion::acquire_page(std::int32_t page) {
     Impl& impl = *impl_;
+    const ScopedDevice selected(impl.spec.device);
     if (page < 0 || static_cast<std::uint32_t>(page) >= impl.spec.page_count) {
         throw std::out_of_range("elastic kv region: page out of range");
     }
@@ -367,8 +368,9 @@ void ElasticKvRegion::acquire_page(std::int32_t page) {
     if (granule.used_pages == 1) { impl.post(Impl::Job{Impl::Job::Kind::Trim}); } // top the reserve up
 }
 
-void ElasticKvRegion::release_page(std::int32_t page) noexcept {
+void ElasticKvRegion::release_page(std::int32_t page) noexcept try {
     Impl& impl = *impl_;
+    const ScopedDevice selected(impl.spec.device);
     if (page < 0 || static_cast<std::uint32_t>(page) >= impl.spec.page_count) { return; }
     const std::uint32_t g = static_cast<std::uint32_t>(page) / impl.spec.granule_pages;
     const std::lock_guard<std::mutex> lock(impl.mutex);
@@ -392,6 +394,8 @@ void ElasticKvRegion::release_page(std::int32_t page) noexcept {
         return;
     }
     impl.post(Impl::Job{Impl::Job::Kind::Unmap, g, granule.generation, fence});
+} catch (...) {
+    // Retirement is best effort, including when the CUDA device is unavailable.
 }
 
 std::size_t ElasticKvRegion::mapped_bytes() const noexcept {
@@ -461,8 +465,9 @@ void ElasticKvRegion::release_reserve() noexcept {
     impl.release_requested = true;
 }
 
-void ElasticKvRegion::flush_reserve_release() noexcept {
+void ElasticKvRegion::flush_reserve_release() noexcept try {
     Impl& impl = *impl_;
+    const ScopedDevice selected(impl.spec.device);
     const std::lock_guard<std::mutex> lock(impl.mutex);
     if (!impl.release_requested || impl.asleep || impl.stopping) { return; }
     // Only the engine's own thread may fence its stream: a record from anywhere else lands
@@ -488,6 +493,8 @@ void ElasticKvRegion::flush_reserve_release() noexcept {
         }
         impl.post(Impl::Job{Impl::Job::Kind::Unmap, g, granule.generation, fence, /*forced=*/true});
     }
+} catch (...) {
+    // Keep the region mapped if its device cannot be bound for retirement.
 }
 
 void ElasticKvRegion::wait_idle() {
