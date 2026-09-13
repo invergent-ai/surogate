@@ -181,7 +181,7 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups,
-                                   spec.kv_skip_layers, spec.mtp_indexer ? spec.indexer_head_dim : 0,
+                                   {}, spec.mtp_indexer ? spec.indexer_head_dim : 0,
                                    false, 0, false, 0, 0, {}, spec.indexer_dtype);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);

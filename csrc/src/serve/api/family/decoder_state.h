@@ -37,9 +37,10 @@ struct DecoderStateSpec {
     std::int32_t indexer_head_dim           = 0;
     DType indexer_dtype = DType::BF16;
     bool mtp_indexer = false;
-    // Full-attention layer indices held at the model dtype while the rest of
+    // Main pool full-attention layer indices held at the model dtype while the rest of
     // the cache is quantized. Linear-attention layers never appear here: they
-    // hold no KV planes at all, so a quantized cache cannot reach them.
+    // hold no KV planes at all, so a quantized cache cannot reach them. The MTP
+    // pool uses kv_dtype independently of these main-stack exclusions.
     std::vector<std::uint32_t> kv_skip_layers;
     bool enable_mtp                         = false;
     // The Main pool's planes follow demand (core/elastic_kv_region.h) instead of sitting in

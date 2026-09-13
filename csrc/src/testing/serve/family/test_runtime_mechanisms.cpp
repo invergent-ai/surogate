@@ -145,6 +145,23 @@ void test_round_layout() {
            "DFlash layout does not allocate MTP storage");
 }
 
+void test_mtp_cache_precision_is_independent() {
+    for (const std::uint32_t skipped : {0U, 1U}) {
+        auto spec = decoder_spec(sinfer::DType::FP8_E4M3FN, true);
+        spec.kv_skip_layers = {skipped};
+        sinfer::LayoutBuilder builder;
+        const auto layout = q36::plan_decoder_state(builder, spec);
+        for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
+            const auto expected = layer == skipped ? sinfer::DType::BF16 : sinfer::DType::FP8_E4M3FN;
+            expect(layout.text_kv.layer_dtypes[layer] == expected,
+                   "main cache preserves the selected layer precision");
+        }
+        expect(layout.mtp_kv && layout.mtp_kv->layer_dtypes ==
+                   std::vector{sinfer::DType::FP8_E4M3FN},
+               "main precision exclusions must not change the MTP cache");
+    }
+}
+
 void test_mtp_alignment() {
     const std::vector<std::int32_t> scatter{2, 4, 7};
     const q36::MtpAlignmentWindow first = q36::plan_mtp_alignment_window(8, 0, 4);
@@ -315,6 +332,7 @@ void test_prefix_identity() {
 int main() {
     test_topology();
     test_decoder_layout();
+    test_mtp_cache_precision_is_independent();
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();
