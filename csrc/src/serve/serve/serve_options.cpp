@@ -147,7 +147,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --served-model-name overrides the artifact identity.model_id reported by the "
+           "       --served-model-name overrides the supplied model argument reported by the "
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
@@ -769,6 +769,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_id) {
     if (options.model_id_override.has_value()) { return *options.model_id_override; }
+    if (!options.artifact_path.empty()) { return options.artifact_path; }
     if (artifact_model_id.empty()) {
         throw std::logic_error("loaded artifact model_id must not be empty");
     }

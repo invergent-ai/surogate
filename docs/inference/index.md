@@ -37,6 +37,10 @@ metadata. Keep the checkpoint's configuration and tokenizer files alongside loca
 weights. Renaming the directory or setting `--served-model-name` changes the name used to
 identify the model; it does not select a different model size or change its settings.
 
+The served ID defaults to the model argument you supplied, preserving a repository ID or local
+path through preparation. Set `--served-model-name` to choose another ID. `/v1/models` lists
+the names accepted by the server. This applies to text-generation and embedding servers.
+
 The first start prepares the model and saves reusable files under `~/.cache/surogate/serve`.
 Later starts skip that preparation, but still need time to load the model. Set
 `SUROGATE_SERVE_CACHE` to use a different cache directory; `--no-cache` rebuilds an entry.

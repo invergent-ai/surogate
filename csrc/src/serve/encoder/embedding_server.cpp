@@ -25,6 +25,7 @@
 
 #include "core/device.h"
 #include "encoder/options.h"
+#include "encoder/embedding_request.h"
 #include "encoder/cpu/cpu_gemma_embedding.h"
 #include "encoder/gemma_embedding.h"
 
@@ -45,35 +46,6 @@
 namespace {
 
 using json = nlohmann::json;
-
-/// All four `input` forms: one string, a list of strings, one list of ids, or a
-/// list of those. A bare list of integers is the single-sequence id form.
-std::vector<std::vector<std::int32_t>> parse_input(const json& input,
-                                                   const sinfer::encoder::GemmaTokenizer& tokenizer) {
-    std::vector<std::vector<std::int32_t>> out;
-    if (input.is_string()) {
-        out.push_back(tokenizer.encode(input.get<std::string>()));
-        return out;
-    }
-    if (!input.is_array() || input.empty()) {
-        throw std::invalid_argument("input must be a string, or a non-empty array");
-    }
-    if (input.front().is_number_integer()) {
-        out.push_back(input.get<std::vector<std::int32_t>>());
-        return out;
-    }
-    for (const json& element : input) {
-        if (element.is_string()) {
-            out.push_back(tokenizer.encode(element.get<std::string>()));
-            continue;
-        }
-        if (!element.is_array() || element.empty()) {
-            throw std::invalid_argument("each input must be a string or a non-empty array of ids");
-        }
-        out.push_back(element.get<std::vector<std::int32_t>>());
-    }
-    return out;
-}
 
 json error_body(const std::string& message, const char* type) {
     return json{{"error", {{"message", message}, {"type", type}, {"code", nullptr}}}};
@@ -111,6 +83,8 @@ int main(int argc, char** argv) {
                          static_cast<double>(gpu->weight_bytes()) / 1e6);
         }
         const auto& tokenizer = host_model ? host_model->tokenizer() : gpu->tokenizer();
+        const auto& config = host_model ? host_model->config() : gpu->config();
+        const auto& model_name = options.served_model_name;
         const auto embed_batch =
             [&](const std::vector<std::vector<std::int32_t>>& sequences) {
                 return host_model ? host_model->embed_batch(sequences)
@@ -170,23 +144,34 @@ int main(int argc, char** argv) {
             response.set_content(json{{"status", "ok"}}.dump(), "application/json");
         });
 
+        server.Get("/v1/models", [&](const httplib::Request&, httplib::Response& response) {
+            response.set_content(json{{"object", "list"}, {"data", json::array({
+                {{"id", model_name}, {"object", "model"}, {"created", 0}, {"owned_by", "surogate"}}
+            })}}.dump(), "application/json");
+        });
+
         server.Post("/v1/embeddings", [&](const httplib::Request& request,
                                           httplib::Response& response) {
             const auto began = std::chrono::steady_clock::now();
-            std::vector<std::vector<std::int32_t>> sequences;
-            std::string model_name = "embeddinggemma";
+            sinfer::encoder::EmbeddingRequest parsed;
             try {
-                const json body = json::parse(request.body);
-                if (body.contains("model") && body["model"].is_string()) {
-                    model_name = body["model"].get<std::string>();
-                }
-                sequences = parse_input(body.at("input"), tokenizer);
+                parsed = sinfer::encoder::parse_embedding_request(
+                    json::parse(request.body), model_name, config.vocab, config.max_tokens,
+                    config.hidden, [&](const std::string& text) { return tokenizer.encode(text); });
+            } catch (const sinfer::encoder::EmbeddingRequestError& error) {
+                response.status = error.status;
+                auto body = error_body(error.what(), "invalid_request_error");
+                body["error"]["param"] = error.param;
+                body["error"]["code"] = error.code;
+                response.set_content(body.dump(), "application/json");
+                return;
             } catch (const std::exception& error) {
                 response.status = 400;
                 response.set_content(error_body(error.what(), "invalid_request_error").dump(),
                                      "application/json");
                 return;
             }
+            const auto& sequences = parsed.sequences;
 
             json data = json::array();
             std::size_t prompt_tokens = 0;
@@ -210,7 +195,8 @@ int main(int argc, char** argv) {
                 for (std::size_t index = 0; index < vectors.size(); ++index) {
                     data.push_back(json{{"object", "embedding"},
                                         {"index", index},
-                                        {"embedding", vectors[index]}});
+                                        {"embedding", sinfer::encoder::encode_embedding(
+                                            std::move(vectors[index]), parsed.dimensions, parsed.base64)}});
                 }
             } catch (const std::exception& error) {
                 response.status = 500;

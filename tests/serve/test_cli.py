@@ -78,7 +78,8 @@ def test_execution_puts_resolved_model_first(mode, monkeypatch):
     execute = Mock()
     monkeypatch.setattr(serve.os, "execv", execute)
     serve.maybe_exec_serve()
-    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--device", "1"])
+    identity = ["--served-model-name", "model"] if mode != "generate" else []
+    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--device", "1", *identity])
     prepare = ingest.ensure_encoder_weights if mode == "embed" else ingest.ensure_engine_weights
     assert prepare.call_args.args == ("model",)
     assert prepare.call_args.kwargs["reuse_cache"] is False
@@ -136,7 +137,25 @@ def test_projector_is_consumed_before_native_execution(selector, monkeypatch):
     monkeypatch.setattr(serve.os, "execv", execute)
     serve.maybe_exec_serve()
     assert ingest.ensure_engine_weights.call_args.kwargs["mmproj"] == "projector.gguf"
-    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--vision"])
+    identity = ["--served-model-name", "model.gguf"] if not selector else []
+    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--vision", *identity])
+
+
+@pytest.mark.parametrize("selector", [[], ["--embed"]])
+@pytest.mark.parametrize("model", ["google/embeddinggemma-300m", "./models/my model.gguf", "/models/checkpoint"])
+@pytest.mark.parametrize("alias", [None, "deployment"])
+def test_public_model_id_preserves_original_argument(selector, model, alias, monkeypatch):
+    flags = [] if alias is None else ["--served-model-name", alias]
+    monkeypatch.setattr(sys, "argv", ["surogate", "serve", *selector, model, *flags])
+    monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")
+    ingest = Mock()
+    ingest.ensure_engine_weights.return_value = ingest.ensure_encoder_weights.return_value = Path("/cache/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.ingest", ingest)
+    execute = Mock()
+    monkeypatch.setattr(serve.os, "execv", execute)
+    serve.maybe_exec_serve()
+    execute.assert_called_once_with("/engine", ["/engine", "/cache/prepared.sinfer",
+                                              "--served-model-name", alias or model])
 
 
 @pytest.mark.parametrize("args", [["model.gguf", "--mmproj="], ["--embed", "model.gguf", "--mmproj", "p.gguf"]])

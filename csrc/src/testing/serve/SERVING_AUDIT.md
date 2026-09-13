@@ -13,9 +13,24 @@ No serving implementation was changed during this audit. Broad throughput benchm
 remain deferred. Audio and server-side Responses storage are intentionally outside
 the requested scope.
 
+## Follow-up status — 2026-09-13
+
+A1 and A2 are resolved: embedding token IDs and sequence lengths are validated before
+execution on both backends; dimensions and base64 output are honored, and unknown model
+names are rejected. Embedding requests may omit `model` to use the running encoder.
+Served names for generation and embeddings now preserve the original startup model argument,
+matching vLLM's default naming behavior; explicit deployment aliases still override it.
+
+Validation: the embedding request and server option C++ tests pass; 8 HTTP regression cases
+pass across CPU and GPU, with the GPU server observed under Compute Sanitizer; 52 relevant
+launcher cases pass. The two pre-existing A3 inventory failures were excluded from that
+scoped launcher run. Live text and embedding launches both reported the supplied GGUF path
+in `/v1/models` and successful responses. The findings below retain the original audit
+reproductions; A3–A5 and the subsequent backlog remain open.
+
 ## Fix first
 
-### A1 — P1: invalid embedding token IDs can terminate GPU serving
+### A1 — resolved: invalid embedding token IDs can terminate GPU serving
 
 **Reproduced with the local EmbeddingGemma Q8_0 checkpoint on physical GPU 2.**
 `POST /v1/embeddings` accepts an integer input array without checking its IDs against
@@ -41,7 +56,7 @@ Evidence: [HTTP parsing](../../serve/encoder/embedding_server.cpp#L51),
 [unchecked W8 gather](../../serve/ops/kernel/embed_gather.cuh#L142),
 [CPU bounds check](../../serve/encoder/cpu/cpu_ops.cpp#L696).
 
-### A2 — P2: embedding response options are silently ignored
+### A2 — resolved: embedding response options are silently ignored
 
 **Reproduced over HTTP in the same isolated GPU process.**
 

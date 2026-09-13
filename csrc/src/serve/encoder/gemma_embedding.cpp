@@ -1,3 +1,4 @@
+#include "encoder/embedding_input.h"
 #include "encoder/gemma_embedding.h"
 
 #include "api/ops/cast.h"
@@ -185,14 +186,15 @@ std::vector<float> GemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
 
 std::vector<std::vector<float>> GemmaEmbedding::embed_batch(
     const std::vector<std::vector<std::int32_t>>& sequences) {
+    for (const auto& sequence : sequences) {
+        validate_embedding_input(sequence, impl_->config.vocab, impl_->config.max_tokens);
+    }
     const std::int32_t budget = impl_->config.max_batch_tokens;
     std::vector<std::vector<float>> out;
     out.reserve(sequences.size());
 
     // Greedy partition: fill a forward until the next sequence would not fit.
-    // A single sequence longer than the budget still goes through on its own and
-    // is rejected there against max_tokens, which is the limit that means
-    // something to the model.
+    // Every sequence was validated against the model limit before the first forward.
     std::vector<std::vector<std::int32_t>> chunk;
     std::int32_t chunk_tokens = 0;
     const auto flush = [&]() {
@@ -205,7 +207,7 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_batch(
     };
     for (const std::vector<std::int32_t>& sequence : sequences) {
         const auto length = static_cast<std::int32_t>(sequence.size());
-        if (!chunk.empty() && chunk_tokens + length > budget) { flush(); }
+        if (!chunk.empty() && length > budget - chunk_tokens) { flush(); }
         chunk.push_back(sequence);
         chunk_tokens += length;
     }

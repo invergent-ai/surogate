@@ -97,7 +97,7 @@ _VALUE_OPTIONS = {
         --prompt --messages --max-new --max-context --prefill-chunk --kv-dtype
         --reasoning-effort --stop-token-id --stop --reasoning-stop
     """.split()),
-    "embed": frozenset("--host --port --device".split()),
+    "embed": frozenset("--host --port --device --served-model-name".split()),
 }
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""
@@ -236,7 +236,7 @@ def maybe_exec_serve() -> None:
         while i < len(rest):
             flag = rest[i]
             if flag in _VALUE_OPTIONS[mode]:
-                if flag in ("--device", "--devices"):
+                if flag in ("--device", "--devices", "--served-model-name"):
                     selected[flag] = rest[i + 1]
                 i += 2
             else:
@@ -257,6 +257,11 @@ def maybe_exec_serve() -> None:
         finally:
             if previous_conversion_device is None:
                 os.environ.pop("SUROGATE_CONVERT_DEVICE", None)
+        # Keep the public identity from the user's original argument, before the
+        # checkpoint is replaced by its prepared cache path (as vLLM does before
+        # resolving/redirecting a model). An explicit deployment alias wins.
+        if mode in ("server", "embed") and "--served-model-name" not in selected:
+            rest.extend(["--served-model-name", model])
         rest = [str(resolved), *rest]
 
     os.execv(binary, [binary] + rest)

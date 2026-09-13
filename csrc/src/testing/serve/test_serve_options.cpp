@@ -65,8 +65,8 @@ int main() {
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
             !defaults.sampling_overrides.frequency_penalty,
         "server defaults unexpectedly override registered model sampling");
-    failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
-                      "artifact model id was not selected by default");
+    failures += check(resolve_public_model_id(defaults, "artifact-model") == "model.sinfer",
+                      "supplied model argument was not selected by default");
 
     const ServeOptions model_alias =
         parse({"sinfer-serve", "model.sinfer", "--served-model-name", "deployment-alias"});
@@ -238,8 +238,8 @@ int main() {
     failures += check(serve_usage_text("sinfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
     failures +=
-        check(serve_usage_text("sinfer-serve").find("identity.model_id") != std::string::npos,
-              "serve help omits the artifact-derived model id default");
+        check(serve_usage_text("sinfer-serve").find("supplied model argument") != std::string::npos,
+              "serve help omits the model argument default");
 
     const ServeOptions inherited =
         parse({"sinfer-serve", "model.sinfer", "--max-model-len", "16384"});

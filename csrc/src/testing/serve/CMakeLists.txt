@@ -114,6 +114,7 @@ sinfer_add_test(sinfer_checkpoint_identity_test SOURCES test_checkpoint_identity
 target_compile_options(sinfer_checkpoint_identity_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_checkpoint_workspace_test SOURCES test_checkpoint_workspace.cpp)
 target_compile_options(sinfer_checkpoint_workspace_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_embedding_request_test SOURCES encoder/test_embedding_request.cpp)
 
 sinfer_add_test(sinfer_artifact_reader_test
   SOURCES test_sinfer_artifact_reader.cpp

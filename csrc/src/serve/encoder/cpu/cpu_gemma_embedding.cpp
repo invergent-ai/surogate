@@ -1,3 +1,4 @@
+#include "encoder/embedding_input.h"
 #include "encoder/cpu/cpu_gemma_embedding.h"
 
 #include "artifact/reader.h"
@@ -332,6 +333,9 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
     std::vector<std::vector<float>> out;
     out.reserve(sequences.size());
 
+    for (const auto& sequence : sequences) {
+        validate_embedding_input(sequence, config.vocab, config.max_tokens);
+    }
     // One sequence per forward here, where the GPU concatenates a batch. On CPU
     // the projections already saturate the cores with a single sequence -- the
     // measured llama.cpp throughput is flat in concurrency for exactly this

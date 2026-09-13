@@ -362,8 +362,19 @@ The API request is the same on either device:
 ```bash
 curl http://127.0.0.1:8413/v1/embeddings \
   -H 'Content-Type: application/json' \
-  -d '{"model":"embeddinggemma-300m","input":"the capital of France"}'
+  -d '{"input":"the capital of France"}'
 ```
+
+The served model name is the model argument you used to start the server, including a local
+file path. `/v1/models` lists it. Embedding requests can omit `model` to use the running model;
+if supplied, it must match that name. Unknown names return HTTP `404`. An optional
+`--served-model-name NAME` at startup overrides the inferred name.
+
+Omit `dimensions` for the full embedding, or set it to a positive integer up to the model's
+output width for a shorter, normalized vector. For example, `"dimensions": 128` returns
+128 coordinates. `encoding_format` accepts `"float"` (the default JSON array) or `"base64"`
+(base64-encoded float32 values). Both options work on CPU and GPU and apply to every input
+in a batch. Invalid dimensions, formats, token IDs, or input lengths return HTTP `400`.
 
 Use a GPU when embedding speed is the priority and a card is available. CPU serving is useful
 when the GPU is busy with text generation, on CPU-only hosts, or for modest retrieval workloads.

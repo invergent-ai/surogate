@@ -30,7 +30,7 @@ or after the model, and value options accept both `--flag value` and `--flag=val
 | `--host H` | `127.0.0.1` | Bind address; use `0.0.0.0` to accept remote connections |
 | `--port N` | `8080` | HTTP port |
 | `--api-key KEY` | none | Require this key through a bearer token or `x-api-key` header |
-| `--served-model-name ID` | model identity | Name clients use in the `model` field |
+| `--served-model-name ID` | model argument | Name clients use in the `model` field |
 | `--cors` | off | Allow browser cross-origin requests |
 | `--max-request-mib N` | 384 | Maximum request body size |
 | `--request-log-jsonl FILE` | none | Append request records to this file |
@@ -396,6 +396,7 @@ surogate serve --embed <model.gguf> --frontend <hf-snapshot-dir> --device 0
 | `--host H` | `127.0.0.1` | Bind address |
 | `--port N` | 8413 | HTTP port |
 | `--device N\|cpu` | `0` | GPU number, or `cpu` |
+| `--served-model-name NAME` | model argument | Model name accepted by requests and listed by `/v1/models` |
 | `--frontend DIR` | beside the GGUF | Model directory containing `tokenizer.model` and `tokenizer_config.json` for preparation |
 
 `--frontend` is needed during preparation only; it can be omitted once the model is cached.
