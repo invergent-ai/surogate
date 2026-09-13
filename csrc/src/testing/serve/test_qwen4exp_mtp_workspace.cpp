@@ -55,21 +55,18 @@ int main() {
                 device, options, V::WeightsProfile::W8HyperConnection, g, {});
             auto plan = std::move(planner).finalize(g.max_context / kPagedKVPageSize);
 
-            // An unavoidable live set while the draft block executes its MoE:
-            // trunk residual, collapsed trunk output, draft output, embedded next
-            // tokens, draft residual, and normalized MoE input. The small-tail plan
-            // omitted the wide draft tensors and the expert computation entirely.
+            // The input fold still spans the prompt: trunk residual and collapsed
+            // view, next-token embeddings, and the head's wide residual remain live.
             const std::size_t live = std::size_t(chunk) * sizeof(std::uint16_t) *
-                (3 * g.residual + 3 * g.hidden);
-            const auto moe = ops::sparse_moe_workspace_capacity_bytes(
-                targets::qwen4exp::detail::moe_geometry(g), QType::W8G32_F16S,
-                QType::W8G32_F16S, chunk, chunk);
-            const auto needed = live + moe;
+                (2 * g.residual + 2 * g.hidden);
+            const auto needed = live + V::mtp_fold_workspace_capacity_bytes(g, 1, chunk);
             const auto planned = plan.impl_->workspace.mtp_prefill;
             std::cout << "chunk=" << chunk << " drafts=" << drafts
                       << " prefill=" << planned << " required>=" << needed << '\n';
             assert(planned >= needed);
             assert(plan.workspace_capacity_bytes() >= planned);
+            // No full-prompt draft output or expert workspace remains.
+            if (chunk == 2048) { assert(planned < 389648640); }
             // Alignment and autoregressive draft calls need the same block at B*(K+1).
             const int columns = options.max_concurrency * (drafts + 1);
             const auto round_moe = ops::sparse_moe_workspace_capacity_bytes(

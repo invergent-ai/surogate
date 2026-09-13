@@ -169,6 +169,7 @@ struct Variant {
     /// in for the output norm this architecture does not have.
     static void mtp_collapse(const ModelView& model, const Tensor& residual, Tensor& hidden,
                              WorkspaceArena& workspace, cudaStream_t stream);
+    static void mtp_select_attention_column(std::int32_t column);
     /// The head's block, for the family to run.
     [[nodiscard]] static const detail::FullAttentionWeights& mtp_block(const ModelView& model);
     [[nodiscard]] static std::size_t

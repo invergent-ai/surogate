@@ -483,6 +483,10 @@ void Variant::mtp_collapse(const ModelView& model, const Tensor& residual, Tenso
                               stream);
 }
 
+void Variant::mtp_select_attention_column(std::int32_t column) {
+    t_inject = t_inject.slice(1, column, 1);
+}
+
 std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometry& g,
                                                        std::int32_t first, std::int32_t last) {
     if (first <= 0 || last < first) {

@@ -564,7 +564,10 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
     const int T             = ids.ne[0] * ids.ne[1];
     const std::int32_t wide = weights_.geometry.residual;
     // SUROGATE_SERVE_PREFILL_TIMING=1: where a head-block call spends its time, on the stream.
-    static const bool timing = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(s, &capture_status));
+    const bool timing = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr &&
+                        capture_status == cudaStreamCaptureStatusNone;
     cudaEvent_t lap[5]{};
     const auto mark = [&](int i) {
         if (!timing) { return; }
@@ -636,6 +639,63 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
     }
 }
 
+template <class V>
+void TextContext::mtp_prefill_trunk_block(const Tensor& ids, const Tensor& hidden,
+    const Tensor* input_embeddings, const Tensor& positions, const Tensor& rope_positions,
+    ops::GqaExecutionEnvelope envelope, Tensor* final_hidden) {
+    if constexpr (mtp_block_is_trunk_layer<V>()) {
+        const int tokens = ids.ne[0];
+        const auto& g = cfg_geometry();
+        const auto& block = V::mtp_block(weights_);
+        const auto s = ctx_.stream;
+        const auto roots = workspace_recipe::mtp_trunk_stem(work_, g, tokens, !input_embeddings);
+        Tensor embedding = input_embeddings ? *input_embeddings : roots.embedding;
+        if (!input_embeddings) { ops::embedding(ids, *embed_, embedding, s); }
+        Tensor x = roots.residual;
+        V::mtp_fold(weights_, embedding, hidden, x, work_, s);
+        Tensor last_x = x.slice(1, tokens - 1, 1);
+        {
+            auto attention = work_.scope();
+            const auto p = workspace_recipe::text_attention_projection(work_, g, tokens);
+            Tensor h = p.hidden, q = p.query, gate = p.gate, k = p.key, v = p.value;
+            Hooks::attention_norm(x, block.input_norm, cfg_.rms_eps, block.projection, h, work_, s);
+            // Keep the bulk projection's arithmetic for the final query as well as all keys.
+            V::attention_projection(h, block.projection, q, gate, k, v, Phase::Verify, work_, s);
+            Tensor keys = k.view({cfg_.head_dim, cfg_.n_kv, tokens});
+            Tensor kn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_kv, tokens});
+            ops::rmsnorm(keys, block.key_norm, cfg_.rms_eps, norm_unit_offset<V>(), kn, s);
+            Tensor rope = text_rope_positions<V>(rope_positions);
+            ops::rope(rope, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
+            ops::gqa_kv_append(kn, v.view({cfg_.head_dim, cfg_.n_kv, tokens}), positions,
+                               mtp_kv_.layer_view(0), s);
+            if (!final_hidden) { return; }
+
+            Tensor query = q.slice(1, tokens - 1, 1).view({cfg_.head_dim, cfg_.n_q, 1});
+            Tensor qn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
+            ops::rmsnorm(query, block.query_norm, cfg_.rms_eps, norm_unit_offset<V>(), qn, s);
+            Tensor last_rope = rope.slice(0, tokens - 1, 1);
+            ops::rope(last_rope, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
+            Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
+            ops::gqa_attention_cached(qn, positions.slice(0, tokens - 1, 1), cfg_.attention_scale,
+                                      mtp_kv_.layer_view(0), envelope, work_, a, s);
+            Tensor last_gate = gate.slice(1, tokens - 1, 1).view({cfg_.head_dim, cfg_.n_q, 1});
+            if constexpr (kAttentionOutputGate) { apply_attention_gate<V>(last_gate, a, s); }
+            V::mtp_select_attention_column(tokens - 1);
+            Hooks::attention_output(a.view({cfg_.q_size, 1}), block.output, block.projection,
+                                     last_x, Phase::Verify, work_, s);
+        }
+        {
+            auto mixture = work_.scope();
+            mlp_tail(&block.post_attention_norm, MlpW{&block.post_mixer}, last_x,
+                     cfg_.n_layers, Phase::Verify);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(final_hidden->data, last_x.data, final_hidden->bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+    } else {
+        throw std::logic_error("this target's draft head is not a trunk block");
+    }
+}
+
 void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings, const Tensor& positions,
                                     const Tensor& rope_positions,
@@ -670,16 +730,10 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     cudaStream_t s     = ctx_.stream;
     auto scratch_scope = work_.scope();
     if constexpr (mtp_block_is_trunk_layer<Variant>()) {
-        // The head's block is a trunk block, so the chunk runs through the same forward the
-        // decode rounds use. The bulk columns exist to fill the head's KV; the last one also
-        // carries the proposal.
-        Tensor chunk_hidden = work_.alloc(DType::BF16, {round_hidden_width(), T});
-        mtp_forward_core(ids, hidden, positions, rope_positions, envelope, chunk_hidden,
-                         input_embeddings);
+        // Earlier prompt columns contribute only keys and values to this one-layer head.
+        mtp_prefill_trunk_block(ids, hidden, input_embeddings, positions, rope_positions,
+                                envelope, final_chunk ? final_hidden : nullptr);
         if (!final_chunk) { return; }
-        Tensor last = chunk_hidden.slice(1, T - 1, 1);
-        CUDA_CHECK(cudaMemcpyAsync(final_hidden->data, last.data, final_hidden->bytes(),
-                                   cudaMemcpyDeviceToDevice, s));
         proposal_argmax(*final_hidden, *logits, *draft_token);
         return;
     }

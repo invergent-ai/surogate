@@ -701,6 +701,11 @@ private:
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                           const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                           Tensor& mtp_hidden, const Tensor* input_embeddings);
+    template <class V = Variant>
+    void mtp_prefill_trunk_block(const Tensor& ids, const Tensor& hidden,
+                                 const Tensor* input_embeddings, const Tensor& positions,
+                                 const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
+                                 Tensor* final_hidden);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::GqaExecutionEnvelope envelope, bool final_chunk,

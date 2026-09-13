@@ -684,12 +684,34 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             proposal_scratch(layout, 1);
         }
     };
+    const auto mtp_trunk_prefill_core = [&]<class V = Variant>(WorkspaceLayoutBuilder& layout,
+        std::int32_t first, std::int32_t last, bool preembedded) {
+        if constexpr (mtp_block_is_trunk_layer<V>()) {
+            auto core = layout.scope();
+            (void)workspace_recipe::mtp_trunk_stem(layout, plan.geometry, last, !preembedded);
+            scratch(layout, V::mtp_fold_workspace_capacity_bytes(plan.geometry, first, last));
+            {
+                auto attention = layout.scope();
+                (void)workspace_recipe::text_attention_projection(layout, plan.geometry, last);
+                scratch(layout, V::attention_projection_workspace_capacity_bytes(plan.geometry,
+                    plan.weights_profile, family::TextPhase::Verify, first, last));
+                matrix(layout, DType::BF16, plan.geometry.kv_size(), last);
+                matrix(layout, DType::BF16, plan.geometry.query_size(), 1);
+                matrix(layout, DType::BF16, plan.geometry.query_size(), 1);
+                scratch(layout, ops::gqa_attention_history_workspace_capacity_bytes(
+                    plan.geometry.head_dim, plan.geometry.query_heads, plan.geometry.kv_heads,
+                    plan.kv_dtype, text_envelope, 1, 1, 1));
+                scratch(layout, V::attention_output_projection_workspace_capacity_bytes(plan.geometry,
+                    plan.weights_profile, family::TextPhase::Verify, 1, 1));
+            }
+            post_mixer_stage(layout, 1, 1, family::TextPhase::Verify);
+        }
+    };
     const auto mtp_prefill_chunk = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                        std::int32_t last, bool preembedded) {
         auto call = layout.scope();
         if constexpr (mtp_block_is_trunk_layer<Variant>()) {
-            matrix(layout, DType::BF16, plan.geometry.residual, last);
-            mtp_trunk_core(layout, first, last, preembedded, 1, first, last, text_envelope);
+            mtp_trunk_prefill_core(layout, first, last, preembedded);
             proposal_scratch(layout, 1);
             return;
         }
