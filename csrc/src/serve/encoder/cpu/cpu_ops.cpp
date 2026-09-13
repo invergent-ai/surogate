@@ -396,7 +396,8 @@ void ThreadPool::parallel_for(std::int64_t count,
             }
 #endif
         }
-        const std::int64_t per   = (count + team - 1) / team;
+        const int actual_team = omp_get_num_threads();
+        const std::int64_t per   = (count + actual_team - 1) / actual_team;
         const std::int64_t begin = std::min<std::int64_t>(count, per * index);
         const std::int64_t end   = std::min<std::int64_t>(count, begin + per);
         if (begin < end) { body(begin, end); }

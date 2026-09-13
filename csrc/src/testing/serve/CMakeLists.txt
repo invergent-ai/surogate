@@ -367,6 +367,11 @@ target_link_libraries(sinfer_embed_cli PRIVATE sinfer_shared)
 sinfer_add_op_test(sinfer_cpu_ops_test
   SOURCES encoder/test_cpu_ops.cpp
   LIBRARIES sinfer_encoder)
+add_test(NAME sinfer_cpu_ops_limited_team_test COMMAND sinfer_cpu_ops_test)
+set_tests_properties(sinfer_cpu_ops_limited_team_test PROPERTIES ENVIRONMENT "OMP_THREAD_LIMIT=1")
+add_test(NAME sinfer_cpu_ops_dynamic_team_test COMMAND sinfer_cpu_ops_test)
+set_tests_properties(sinfer_cpu_ops_dynamic_team_test PROPERTIES
+  ENVIRONMENT "OMP_THREAD_LIMIT=2;OMP_DYNAMIC=TRUE")
 
 add_executable(sinfer_cpu_embed_cli encoder/cpu_embed_cli.cpp)
 target_include_directories(sinfer_cpu_embed_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT})
