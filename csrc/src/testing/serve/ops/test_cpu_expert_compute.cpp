@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <thread>
@@ -22,23 +24,13 @@ namespace {
 
 constexpr ops::SparseMoeGeometry kGeometry{128, 4, 2, 128}; // hidden 128, 4 experts, top-2, ffn 128 (16-row chunks: the tile path runs)
 
+// Use the compiler's IEEE binary16 conversion as an independent oracle, including
+// subnormals and round-to-nearest-even endpoints.
 std::uint16_t float_to_fp16(float f) {
-    std::uint32_t w;
-    std::memcpy(&w, &f, sizeof(w));
-    const std::uint32_t sign = (w >> 16) & 0x8000U;
-    const int exp            = static_cast<int>((w >> 23) & 0xFFU) - 127 + 15;
-    std::uint32_t mant       = w & 0x7FFFFFU;
-    if (exp <= 0) { return static_cast<std::uint16_t>(sign); }
-    if (exp >= 31) { return static_cast<std::uint16_t>(sign | 0x7C00U); }
-    return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (mant >> 13));
+    return std::bit_cast<std::uint16_t>(static_cast<_Float16>(f));
 }
 float fp16_to_float(std::uint16_t h) {
-    const std::uint32_t sign = (h >> 15) & 1U, exp = (h >> 10) & 0x1FU, mant = h & 0x3FFU;
-    if (exp == 0) { return sign ? -0.0F : 0.0F; }
-    std::uint32_t w = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-    float f;
-    std::memcpy(&f, &w, sizeof(f));
-    return f;
+    return static_cast<float>(std::bit_cast<_Float16>(h));
 }
 std::uint16_t float_to_bf16(float f) {
     std::uint32_t w;
@@ -388,6 +380,41 @@ int compare(const std::string& label, const std::vector<float>& got, const std::
     return ok ? 0 : 1;
 }
 
+int test_subnormal_q4() {
+    for (std::uint16_t scale_bits = 1; scale_bits <= 0x400; ++scale_bits) {
+        const float scale = fp16_to_float(scale_bits);
+        for (int mode = 0; mode < 3; ++mode) {
+            std::array<std::int8_t, 32> codes;
+            for (int i = 0; i < 32; ++i) {
+                codes[i] = static_cast<std::int8_t>(mode == 0 ? 1 : mode == 1 ? -1 : -127 + i * 254 / 31);
+            }
+            std::array<std::uint8_t, 16> packed;
+            std::uint16_t step_bits, min_bits;
+            ops::requantise_w8_expert_groups_to_q4(codes.data(), &scale_bits, 1, packed.data(), &step_bits, &min_bits);
+            const float lo = static_cast<float>(*std::min_element(codes.begin(), codes.end()));
+            const float hi = static_cast<float>(*std::max_element(codes.begin(), codes.end()));
+            const auto expected_min = float_to_fp16(lo * scale);
+            const auto expected_step = float_to_fp16((hi - lo) * scale / 15.F);
+            if (min_bits != expected_min || step_bits != expected_step) {
+                std::cerr << "FP16 subnormal endpoint mismatch: scale bits " << scale_bits << " mode " << mode << '\n';
+                return 1;
+            }
+            const float minimum = fp16_to_float(expected_min), step = fp16_to_float(expected_step);
+            const float inverse = step == 0.F ? 0.F : 1.F / step;
+            for (int i = 0; i < 32; ++i) {
+                const auto expected_code = std::clamp(std::lround((codes[i] * scale - minimum) * inverse), 0L, 15L);
+                const int actual_code = (packed[i / 2] >> ((i % 2) * 4)) & 15;
+                if (actual_code != expected_code) {
+                    std::cerr << "Q4 code does not fit the rounded subnormal endpoints\n";
+                    return 1;
+                }
+            }
+        }
+    }
+    std::cout << "ok   all FP16 subnormal Q4 endpoints and reconstruction codes\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -395,7 +422,7 @@ int main() {
     const Bank bank = make_bank(rng);
     const int H     = kGeometry.hidden;
     std::uniform_real_distribution<float> act(-2.0F, 2.0F);
-    int failures = 0;
+    int failures = test_subnormal_q4();
     std::cout << "avx512 path: " << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no (scalar)") << ", vnni: " << (ops::cpu_expert_compute_has_vnni() ? "yes" : "no") << ", tile: " << (ops::cpu_expert_compute_has_tile() ? "yes" : "no") << "\n";
 
     // Single job vs reference.

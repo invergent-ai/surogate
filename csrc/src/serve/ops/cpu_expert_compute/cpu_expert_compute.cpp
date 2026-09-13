@@ -149,8 +149,10 @@ std::uint16_t float_to_fp16(float value) {
         return static_cast<std::uint16_t>(sign | (f > 0x7F800000U ? 0x7E00U : 0x7C00U));
     }
     if (f < 0x38800000U) {                        // subnormal half
-        const float scaled = value < 0 ? -value : value;
-        const auto bits    = static_cast<std::uint32_t>(scaled * 0x1.0p24F + 0.5F) >> 13;
+        const float scaled = std::fabs(value) * 0x1.0p24F;
+        auto bits = static_cast<std::uint32_t>(scaled);
+        const float remainder = scaled - static_cast<float>(bits);
+        if (remainder > 0.5F || (remainder == 0.5F && (bits & 1U))) { ++bits; }
         return static_cast<std::uint16_t>(sign | bits);
     }
     const std::uint32_t mant = f & 0x00001FFFU;
