@@ -326,6 +326,16 @@ int test_explicit_rejections() {
     failures += check(named.generation.tool_choice.mode == ToolChoiceMode::Named &&
                       named.generation.tool_choice.name == "f" && !named.generation.parallel_tool_calls,
                       "named choice and parallel flag retained");
+    for (const auto& invalid : {Json(nullptr), Json(123), Json(true), Json::array(), Json::object()}) {
+        required["tool_choice"]["type"] = invalid;
+        try {
+            (void)parse_responses_request(required, limits());
+            failures += check(false, "non-string tool choice type must be refused");
+        } catch (const ApiException& error) {
+            failures += check(error.error().status == 400 && error.error().param == "tool_choice",
+                              "bad tool choice type must be an input error");
+        } catch (...) { failures += check(false, "bad tool choice type escaped as an internal error"); }
+    }
 
     Json structured = base;
     structured["text"] = Json{{"format", Json{{"type", "json_schema"}, {"name", "result"},

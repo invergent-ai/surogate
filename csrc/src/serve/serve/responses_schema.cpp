@@ -474,7 +474,7 @@ void parse_tool_choice(const Json& body, ResponsesRequest& out) {
         }
         out.tool_choice = value;
     } else if (choice.is_object()) {
-        if (choice.value("type", std::string{}) != "function") {
+        if (!choice.contains("type") || !choice.at("type").is_string() || choice.at("type") != "function") {
             bad_request("only function tool_choice objects are supported", "tool_choice");
         }
         out.generation.tool_choice.mode = ToolChoiceMode::Named;
