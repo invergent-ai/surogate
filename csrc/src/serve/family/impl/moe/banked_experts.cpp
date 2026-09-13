@@ -115,7 +115,6 @@ bool run_banked_experts(const BankedExperts& banked, const ops::SparseMoeWeights
     }
     cache.run(banked.mixture(weights), hidden, destination, workspace, stream, router_input);
     cache.add_pending_partial(destination, stream);
-    cache.tick_combine();
     return true;
 }
 
