@@ -1,6 +1,7 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/layouts.h"
 #include "family/impl/runtime/kv_precision.h"
+#include "family/impl/runtime/attention_workspace.h"
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
 #include "ops/linear/marlin/marlin_plane.h"
@@ -503,9 +504,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(layout, variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
         }
-        scratch(layout, ops::gqa_attention_history_workspace_capacity_bytes(
-                            plan.geometry.head_dim, plan.geometry.query_heads,
-                            plan.geometry.kv_heads, plan.kv_dtype, envelope,
+        scratch(layout, family::detail::attention_workspace_capacity_bytes(
+                            plan.geometry, plan.kv_dtype, envelope,
                             batch_size, min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(plan.geometry, plan.weights_profile, phase, first, last));
     };
