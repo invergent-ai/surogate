@@ -392,6 +392,7 @@ void HttpServer::register_routes() {
         }
         try {
             GenerationService& target = routed_management_service(req);
+            std::lock_guard namespace_lock(adapter_management_mutex_);
             // The flat namespace holds at runtime too: refuse a name any other
             // service already answers to.
             if (name == public_model_id_ || extra_services_.count(name) != 0) {
@@ -441,6 +442,7 @@ void HttpServer::register_routes() {
             return;
         }
         try {
+            std::lock_guard namespace_lock(adapter_management_mutex_);
             routed_management_service(req).unload_lora_adapter(name);
         } catch (const sinfer::RequestError& e) {
             write_error(res, request_error_to_api_error(e));

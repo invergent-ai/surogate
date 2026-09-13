@@ -47,6 +47,9 @@ public:
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
 private:
+    friend struct HttpServerTestAccess;
+    // Serialize namespace changes across the independently locked model services.
+    std::mutex adapter_management_mutex_;
     PreparationGate wake_gate();
     std::function<bool()> request_cancelled(const httplib::Request& request);
     void register_routes();

@@ -1,0 +1,104 @@
+// Opt-in HTTP regression with two resident models on separate devices.
+#include "serve/http_server.h"
+
+#include <cassert>
+#include <future>
+#include <iostream>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <nlohmann/json.hpp>
+
+using namespace sinfer;
+using namespace sinfer::serve;
+using namespace std::chrono_literals;
+using Json = nlohmann::json;
+
+namespace sinfer::serve {
+struct HttpServerTestAccess {
+    static std::unique_lock<std::mutex> lock_adapters(HttpServer& server) {
+        return std::unique_lock(server.adapter_management_mutex_);
+    }
+};
+}
+
+static int unused_port() {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t size = sizeof(address);
+    assert(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    close(fd);
+    return ntohs(address.sin_port);
+}
+
+int main() {
+    const char* artifact = std::getenv("SUROGATE_MODEL_ROUTING_ARTIFACT");
+    const char* adapter = std::getenv("SUROGATE_MODEL_ROUTING_ADAPTER");
+    if (!artifact || !adapter) { return 77; }
+    ServeOptions options;
+    options.artifact_path = artifact;
+    options.model_id_override = "primary";
+    options.port = unused_port();
+    options.max_context = 512;
+    options.kv_capacity = KvCapacityPolicy::explicit_capacity(512);
+    options.max_concurrency = 1;
+    options.enable_lora = true;
+    options.max_loras = 2;
+    options.max_lora_rank = 8;
+    options.log_stats_interval_ms = 0;
+    options.use_cuda_graph = false;
+    GenerationService primary(options);
+    auto extra_options = options;
+    extra_options.device = 1;
+    extra_options.model_id_override = "extra";
+    GenerationService extra(extra_options);
+    HttpServer server(options);
+    assert(server.bind());
+    server.attach(primary);
+    server.attach_extra(extra);
+    auto listener = std::async(std::launch::async, [&] { return server.listen(); });
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!server.is_running()) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(2ms);
+    }
+    auto post = [&](const std::string& path, const Json& body) {
+        httplib::Client client("127.0.0.1", options.port);
+        client.set_read_timeout(10, 0);
+        return client.Post(path, body.dump(), "application/json");
+    };
+    // A load cannot inspect the namespace or publish a name while another
+    // administrative operation holds the global gate, even on a different model.
+    auto gate = HttpServerTestAccess::lock_adapters(server);
+    const Json load{{"lora_name", "shared"}, {"lora_path", adapter}};
+    auto first = std::async(std::launch::async, [&] { return post("/v1/load_lora_adapter", load); });
+    auto second = std::async(std::launch::async, [&] { return post("/load_lora_adapter?model=extra", load); });
+    assert(first.wait_for(200ms) == std::future_status::timeout);
+    assert(second.wait_for(200ms) == std::future_status::timeout);
+    assert(primary.lora_slot("shared") < 0 && extra.lora_slot("shared") < 0);
+    gate.unlock();
+    auto a = first.get();
+    auto b = second.get();
+    assert(a && b);
+    if (a->status != 200 && b->status != 200) { std::cerr << a->body << '\n' << b->body << '\n'; }
+    assert((a->status == 200 && b->status == 400) || (a->status == 400 && b->status == 200));
+    const bool primary_owns = primary.lora_slot("shared") >= 0;
+    assert(primary_owns != (extra.lora_slot("shared") >= 0));
+    gate.lock();
+    auto unload = std::async(std::launch::async, [&] {
+        return post(primary_owns ? "/unload_lora_adapter" : "/v1/unload_lora_adapter?model=extra",
+                    {{"lora_name", "shared"}});
+    });
+    assert(unload.wait_for(200ms) == std::future_status::timeout);
+    gate.unlock();
+    assert(unload.get()->status == 200);
+    assert(primary.lora_slot("shared") < 0 && extra.lora_slot("shared") < 0);
+    server.stop();
+    assert(listener.wait_for(2s) == std::future_status::ready);
+    assert(listener.get());
+    std::cout << "Cross-model adapter administration and namespace uniqueness passed\n";
+}
