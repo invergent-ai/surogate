@@ -148,6 +148,7 @@ endif()
 sinfer_add_test(sinfer_device_test       SOURCES test_device.cpp)
 sinfer_add_test(sinfer_executor_failure_lock_test SOURCES test_executor_failure_lock.cpp LIBRARIES sinfer_engine)
 sinfer_add_test(sinfer_media_network_policy_test SOURCES test_media_network_policy.cpp)
+sinfer_add_test(sinfer_media_ipv6_test SOURCES test_media_ipv6.cpp LIBRARIES sinfer_media_acquire)
 sinfer_add_test(sinfer_dflash_admission_test SOURCES test_dflash_admission.cpp
   LIBRARIES sinfer_engine ${CMAKE_DL_LIBS})
 sinfer_add_test(sinfer_elastic_kv_rollback_test SOURCES test_elastic_kv_rollback.cpp

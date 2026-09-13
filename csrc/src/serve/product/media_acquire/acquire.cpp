@@ -123,7 +123,11 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* raw     = nullptr;
-    const int rc      = getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &raw);
+    // libcurl retains URI brackets around an IPv6 literal; getaddrinfo expects
+    // the bare address rather than its spelling inside a URL.
+    const std::string host = url.host.size() > 2 && url.host.front() == '[' && url.host.back() == ']'
+                                 ? url.host.substr(1, url.host.size() - 2) : url.host;
+    const int rc      = getaddrinfo(host.c_str(), url.port.c_str(), &hints, &raw);
     if (rc != 0) {
         throw Error(ErrorKind::RemoteUnavailable,
                     "failed to resolve media URL host: " + std::string(gai_strerror(rc)));
@@ -191,8 +195,11 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         check_control(policy);
         std::string resolve = parts.host + ":" + parts.port + ":";
         resolve += ip.find(':') == std::string::npos ? ip : "[" + ip + "]";
-        curl_slist* resolve_list = curl_slist_append(nullptr, resolve.c_str());
-        if (resolve_list == nullptr) { throw std::bad_alloc(); }
+        // Numeric IPv6 URLs already pin their destination. Older libcurl
+        // versions cannot parse a bracketed IPv6 host in CURLOPT_RESOLVE.
+        const bool ipv6_literal = parts.host.front() == '[' && parts.host.back() == ']';
+        curl_slist* resolve_list = ipv6_literal ? nullptr : curl_slist_append(nullptr, resolve.c_str());
+        if (!ipv6_literal && resolve_list == nullptr) { throw std::bad_alloc(); }
         std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> resolve_guard(
             resolve_list, curl_slist_free_all);
         std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
@@ -211,7 +218,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
         curl_easy_setopt(curl.get(), CURLOPT_PROXY, "");
-        curl_easy_setopt(curl.get(), CURLOPT_RESOLVE, resolve_list);
+        if (resolve_list) { curl_easy_setopt(curl.get(), CURLOPT_RESOLVE, resolve_list); }
         curl_easy_setopt(curl.get(), CURLOPT_MAXFILESIZE_LARGE,
                          static_cast<curl_off_t>(policy.max_bytes));
         curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
