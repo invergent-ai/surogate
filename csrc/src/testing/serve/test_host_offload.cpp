@@ -9,8 +9,11 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <dlfcn.h>
 #include <iostream>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace sinfer;
@@ -18,10 +21,72 @@ using artifact::NumericFormat;
 using artifact::StorageLayout;
 
 namespace {
+struct Advice { void* address; std::size_t bytes; int kind; };
+thread_local std::vector<Advice>* recorded_advice = nullptr;
+}
+
+extern "C" int madvise(void* address, std::size_t bytes, int kind) noexcept {
+    static const auto real = reinterpret_cast<decltype(&madvise)>(dlsym(RTLD_NEXT, "madvise"));
+    if (recorded_advice && (kind == MADV_SEQUENTIAL || kind == MADV_WILLNEED)) {
+        recorded_advice->push_back({address, bytes, kind});
+    }
+    return real(address, bytes, kind);
+}
+
+namespace {
 void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
 }
 void put_half(std::byte* out, std::uint16_t bits) { std::memcpy(out, &bits, 2); }
+
+void test_readahead() {
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    struct Mapping {
+        std::size_t bytes;
+        void* data;
+        explicit Mapping(std::size_t n) : bytes(n), data(mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) {
+            require(data != MAP_FAILED, "source mmap failed");
+        }
+        ~Mapping() { munmap(data, bytes); }
+    } mapping(page * 6);
+    auto* bytes = static_cast<std::byte*>(mapping.data);
+    for (std::size_t i = 0; i < mapping.bytes; ++i) { bytes[i] = std::byte(i % 251); }
+    for (bool split : {false, true}) {
+        family::HostObjectPlan source;
+        source.name = "readahead";
+        source.handle = {0};
+        if (split) { source.parts = {{bytes + 31, page + 9}, {}, {bytes + page * 3 + 47, page + 101}}; }
+        else { source.payload = {bytes + 17, page + 49}; }
+        std::vector<Advice> observed;
+        observed.reserve(64);
+        recorded_advice = &observed;
+        struct Reset { ~Reset() { recorded_advice = nullptr; } } reset;
+        const family::HostBank bank({.objects={source}});
+        recorded_advice = nullptr;
+        auto spans = source.parts;
+        if (spans.empty()) { spans.push_back(source.payload); }
+        std::vector<std::byte> expected;
+        for (const auto span : spans) {
+            if (span.empty()) { continue; }
+            expected.insert(expected.end(), span.begin(), span.end());
+            const auto address = reinterpret_cast<std::uintptr_t>(span.data());
+            const auto begin = address / page * page;
+            const auto size = span.size() + address - begin;
+            for (int kind : {MADV_SEQUENTIAL, MADV_WILLNEED}) {
+                require(std::any_of(observed.begin(), observed.end(), [&](const Advice& a) {
+                    return a.address == reinterpret_cast<void*>(begin) && a.bytes == size && a.kind == kind;
+                }), "host bank did not advise every source run");
+            }
+        }
+        require(std::none_of(observed.begin(), observed.end(), [](const Advice& a) {
+            return a.address == nullptr || a.bytes == 0;
+        }), "host bank advised an empty range");
+        const auto& object = bank.object(source.handle);
+        require(object.bytes == expected.size() && std::memcmp(object.host, expected.data(), expected.size()) == 0,
+                "multi-run host-bank copy changed payload bytes");
+    }
+}
 
 void test_host_codecs() {
     for (auto format : {NumericFormat::Q4G64_F16S, NumericFormat::Q5G64_F16S,
@@ -165,6 +230,7 @@ int main() {
         int count = 0;
         if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { std::cout << "SKIP: CUDA unavailable\n"; return 77; }
         DeviceContext device(0);
+        test_readahead();
         test_placement_and_isolation();
         std::cout << "ok\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

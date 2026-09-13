@@ -149,17 +149,21 @@ HostBank::HostBank(const HostBankPlan& plan) {
         void* device = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&device, object.host, 0));
         object.device = device;
-        // The artifact mapping is read-ahead-free (it serves random object reads), so a
-        // straight copy would fault it in one page at a time; ask for sequential readahead over
-        // the whole object first, then copy it with several threads.
-        {
-            const auto address = reinterpret_cast<std::uintptr_t>(source.payload.data());
-            const std::uintptr_t page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
-            const std::uintptr_t start = address & ~(page - 1);
-            const std::size_t length =
-                static_cast<std::size_t>(address + source.payload.size() - start);
+        // Bank construction consumes each source run sequentially. Advise every
+        // run, including GGUF objects assembled from several mapped tensors.
+        const long page_size = sysconf(_SC_PAGESIZE);
+        const auto advise = [&](std::span<const std::byte> payload) {
+            if (payload.empty() || page_size <= 0) { return; }
+            const auto address = reinterpret_cast<std::uintptr_t>(payload.data());
+            const auto page = static_cast<std::uintptr_t>(page_size);
+            const std::uintptr_t start = address - address % page;
+            const std::size_t length = payload.size() + static_cast<std::size_t>(address - start);
             (void)madvise(reinterpret_cast<void*>(start), length, MADV_SEQUENTIAL);
             (void)madvise(reinterpret_cast<void*>(start), length, MADV_WILLNEED);
+        };
+        if (source.parts.empty()) { advise(source.payload); }
+        else {
+            for (const auto part : source.parts) { advise(part); }
         }
         std::vector<std::thread> threads;
         if (source.q8_rows != 0) {
