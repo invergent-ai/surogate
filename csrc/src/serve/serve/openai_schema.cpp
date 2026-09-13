@@ -538,6 +538,20 @@ std::string sse_event(const Json& payload) { return "data: " + dump_lossy(payloa
 
 } // namespace
 
+void parse_openai_enable_thinking(const Json& body, GenerationRequest& out) {
+    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object() &&
+        body.at("chat_template_kwargs").contains("enable_thinking") &&
+        !body.at("chat_template_kwargs").at("enable_thinking").is_null()) {
+        const Json& value = body.at("chat_template_kwargs").at("enable_thinking");
+        if (!value.is_boolean()) {
+            bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
+                        "chat_template_kwargs");
+        }
+        out.enable_thinking       = value.get<bool>();
+        out.enable_thinking_param = "chat_template_kwargs.enable_thinking";
+    }
+}
+
 std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     std::optional<bool> top_level;
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
@@ -683,17 +697,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object() &&
-        body.at("chat_template_kwargs").contains("enable_thinking") &&
-        !body.at("chat_template_kwargs").at("enable_thinking").is_null()) {
-        const Json& value = body.at("chat_template_kwargs").at("enable_thinking");
-        if (!value.is_boolean()) {
-            bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
-                        "chat_template_kwargs");
-        }
-        out.enable_thinking       = value.get<bool>();
-        out.enable_thinking_param = "chat_template_kwargs.enable_thinking";
-    }
+    parse_openai_enable_thinking(body, out);
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
         out.enable_thinking       = get_bool(body, "enable_thinking", false);
         out.enable_thinking_param = "enable_thinking";

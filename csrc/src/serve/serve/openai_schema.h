@@ -30,6 +30,7 @@ GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
+void parse_openai_enable_thinking(const nlohmann::json& body, GenerationRequest& out);
 
 // Parse a /v1/completions body. The prompt is carried verbatim in
 // `GenerationRequest::raw_prompt`; everything else -- sampling, stops, streaming, the token

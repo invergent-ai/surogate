@@ -214,6 +214,31 @@ int test_reasoning_effort() {
 int test_preserve_thinking_options() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
+    for (bool enabled : {false, true}) {
+        Json body = base;
+        body["chat_template_kwargs"] = {{"enable_thinking", enabled}};
+        for (bool count_only : {false, true}) {
+            const auto parsed = count_only ? parse_response_input_tokens_request(body, limits())
+                                           : parse_responses_request(body, limits());
+            failures += check(parsed.generation.enable_thinking == enabled &&
+                              parsed.generation.enable_thinking_param == "chat_template_kwargs.enable_thinking",
+                              "Responses must retain the template thinking toggle");
+            ServeOptions server;
+            server.enable_thinking = !enabled;
+            failures += check(resolve_prompt_semantics(parsed.generation, server, effort_capabilities()).enable_thinking == enabled,
+                              "explicit Responses toggle must override the server default");
+        }
+    }
+    for (const auto& invalid : {Json(0), Json("false"), Json::array(), Json::object()}) {
+        Json body = base;
+        body["chat_template_kwargs"] = {{"enable_thinking", invalid}};
+        failures += check(throws_api([&] { (void)parse_responses_request(body, limits()); }),
+                          "non-boolean Responses thinking toggle must be refused");
+    }
+    Json unset = base;
+    unset["chat_template_kwargs"] = {{"enable_thinking", nullptr}};
+    failures += check(!parse_responses_request(unset, limits()).generation.enable_thinking,
+                      "null thinking toggle keeps the server default");
 
     Json kwargs                    = base;
     kwargs["chat_template_kwargs"] = Json{{"preserve_thinking", true}};

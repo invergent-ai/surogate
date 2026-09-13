@@ -706,6 +706,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     parse_tools(body, out);
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
+    parse_openai_enable_thinking(body, out.generation);
     out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
