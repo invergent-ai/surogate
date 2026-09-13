@@ -99,8 +99,10 @@ bool parse_llama3_object(const Json& node, std::size_t max_name_length, ToolCall
 
     Json args = Json::object();
     for (const char* key : {"parameters", "arguments"}) {
-        if (node.contains(key) && node.at(key).is_object()) {
+        if (node.contains(key)) {
             args = node.at(key);
+            if (args.is_string()) { args = Json::parse(args.get<std::string>(), nullptr, false); }
+            if (!args.is_object()) { return false; }
             break;
         }
     }

@@ -89,6 +89,20 @@ void test_reasoning_split() {
 
 void test_llama3_tool_calls() {
     constexpr std::size_t kMaxName = 64;
+    for (const auto* key : {"parameters", "arguments"}) {
+        const Json args{{"city", "Paris"}, {"days", 2}};
+        const auto encoded = Json{{"name", "get_weather"}, {key, args.dump()}}.dump();
+        const auto parsed = parse_tool_calls(ToolCallFormat::Llama3Json, encoded, kMaxName);
+        check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+              Json::parse(parsed.tool_calls[0].arguments_json) == args,
+              "string-encoded Llama arguments retain their values");
+        for (const auto& invalid : {Json("not json"), Json("[]"), Json("null"), Json::array({1}), Json(3), Json(nullptr)}) {
+            const auto text = Json{{"name", "get_weather"}, {key, invalid}}.dump();
+            const auto fallback = parse_tool_calls(ToolCallFormat::Llama3Json, text, kMaxName);
+            check(!fallback.is_tool_call_response && fallback.content == text,
+                  "invalid Llama argument bags remain verbatim content");
+        }
+    }
 
     const ParsedToolCalls one = parse_tool_calls(
         ToolCallFormat::Llama3Json, R"({"name": "get_weather", "parameters": {"city": "Paris"}})",
