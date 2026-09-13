@@ -249,6 +249,14 @@ FetchContent_MakeAvailable(cutlass)
 FetchContent_MakeAvailable(backward)
 
 FetchContent_MakeAvailable(minja)
+# FetchContent's patch step may already be stamped complete in an existing build.
+# Apply newly added compatibility fixes on reconfigure too; the script is idempotent.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_minja.sh)
+execute_process(
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_minja.sh
+    WORKING_DIRECTORY ${minja_SOURCE_DIR}
+    COMMAND_ERROR_IS_FATAL ANY)
 FetchContent_MakeAvailable(flash_attn)
 
 # Find libdw (elfutils) or libdwarf for stack traces with backward-cpp

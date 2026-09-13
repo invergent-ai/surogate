@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two things real chat templates use that minja does not implement. Each patch is guarded on
+# Jinja features real chat templates use that minja does not implement. Each patch is guarded on
 # its own, so applying one does not skip the other, and re-running is a no-op: FetchContent
 # re-runs this step whenever it re-populates the source.
 set -eu
@@ -84,4 +84,47 @@ open(path, "w").write(text.replace(old, new))
 PY
   grep -q 'adjacent string literal' "$header" || {
     echo "patch_minja: the adjacent string literal patch did not apply" >&2; exit 1; }
+fi
+
+# 4. Integer string subscripts. GLM checks `m.content[0].output is defined` to distinguish
+#    text tool results from structured output lists. Returning null for string[0] makes
+#    the following attribute lookup throw. Jinja returns one Unicode character, whose
+#    missing `output` attribute correctly fails the `defined` test.
+if ! grep -q 'Jinja string subscripts index Unicode characters' "$header"; then
+  python3 - "$header" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = """  Value get(const Value& key) {
+    if (array_) {
+"""
+new = """  Value get(const Value& key) {
+    if (is_string() && key.is_number_integer()) {
+      // Jinja string subscripts index Unicode characters, including negative indices.
+      // Stop at the requested character: GLM probes [0] even on long tool results.
+      const auto& text = primitive_.get_ref<const std::string&>();
+      auto index = key.get<int64_t>();
+      auto continuation = [&](size_t pos) {
+        return (static_cast<unsigned char>(text[pos]) & 0xc0) == 0x80;
+      };
+      size_t pos = index >= 0 ? 0 : text.size();
+      while (index > 0 && pos < text.size()) {
+        ++pos;
+        while (pos < text.size() && continuation(pos)) ++pos;
+        --index;
+      }
+      while (index < 0 && pos > 0) {
+        --pos;
+        while (pos > 0 && continuation(pos)) --pos;
+        ++index;
+      }
+      if (index != 0 || pos >= text.size()) return Value();
+      size_t end = pos + 1;
+      while (end < text.size() && continuation(end)) ++end;
+      return Value(text.substr(pos, end - pos));
+    } else if (array_) {
+"""
+assert text.count(old) == 1, "patch_minja: the string-subscript anchor was not found"
+open(path, "w").write(text.replace(old, new))
+PY
 fi

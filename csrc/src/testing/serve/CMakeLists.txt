@@ -40,6 +40,13 @@ target_compile_options(sinfer_checkpoint_geometry_test PRIVATE -UNDEBUG -fno-fas
 add_test(NAME sinfer_checkpoint_geometry_test COMMAND sinfer_checkpoint_geometry_test)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_checkpoint_geometry_test)
 
+# Template compatibility is CPU-only and must use this build's patched header.
+add_executable(sinfer_jinja_compat_test family/test_jinja_compat.cpp)
+target_include_directories(sinfer_jinja_compat_test PRIVATE
+  ${minja_SOURCE_DIR}/include ${SINFER_JSON_INCLUDE})
+add_test(NAME sinfer_jinja_compat_test COMMAND sinfer_jinja_compat_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_jinja_compat_test)
+
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
