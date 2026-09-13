@@ -888,6 +888,24 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         sources.chat_template_jinja   = std::string(resources.chat_template_jinja);
         delegate_.reset(new project_delegate::Handle{::tokenizer::Tokenizer::from_sources(sources)});
     }
+    if (delegate_ && delegate_->inner.adds_bos()) {
+        automatic_bos_id_ = delegate_->inner.bos_token_id();
+    } else if (tokenizer_config.value("add_bos_token", false)) {
+        const auto bos = tokenizer_config.value("bos_token", Json());
+        const auto content = bos.is_object() ? bos.value("content", Json()) : bos;
+        if (!content.is_string()) {
+            throw std::invalid_argument("add_bos_token requires a bos_token present in the tokenizer vocabulary");
+        }
+        const auto name = content.get<std::string>();
+        const auto added = std::find_if(added_tokens_.begin(), added_tokens_.end(),
+                                       [&](const AddedToken& token) { return token.content == name; });
+        if (added != added_tokens_.end()) { automatic_bos_id_ = added->id; }
+        else if (const auto found = vocab_token_to_id_.find(name); found != vocab_token_to_id_.end()) {
+            automatic_bos_id_ = found->second;
+        } else {
+            throw std::invalid_argument("add_bos_token requires a bos_token present in the tokenizer vocabulary");
+        }
+    }
 }
 
 bool Tokenizer::renders_chat_template() const noexcept { return delegate_ != nullptr; }
@@ -919,7 +937,14 @@ std::string Tokenizer::render_chat_template_json(
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
-    if (text.empty()) { return {}; }
+    const auto with_bos = [&](std::vector<int> ids) {
+        if (options.add_bos && automatic_bos_id_ >= 0 &&
+            (ids.empty() || ids.front() != automatic_bos_id_)) {
+            ids.insert(ids.begin(), automatic_bos_id_);
+        }
+        return ids;
+    };
+    if (text.empty()) { return with_bos({}); }
     if (delegate_encodes_) {
         // The project tokenizer handles added tokens itself, so the option maps
         // onto which of its two entry points to call.
@@ -927,21 +952,14 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         std::vector<int> ids = options.parse_added_tokens
                                    ? delegate_->inner.encode_with_special_tokens(owned)
                                    : delegate_->inner.encode_ordinary(owned);
-        // Llama opens every sequence with its BOS. It comes from the
-        // post-processor rather than the chat template, so nothing upstream has
-        // added it, and a prompt without one is a prompt the model never saw.
-        if (options.parse_added_tokens && options.add_bos && delegate_->inner.adds_bos() &&
-            (ids.empty() || ids.front() != delegate_->inner.bos_token_id())) {
-            ids.insert(ids.begin(), delegate_->inner.bos_token_id());
-        }
-        return ids;
+        return with_bos(std::move(ids));
     }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
         append_bpe_ids(ids, text, has_bpe_merges_, max_digit_run_,
                        split_patterns_, normalize_nfc_, ignore_merges_, bpe_merge_ranks_,
                        vocab_token_to_id_);
-        return ids;
+        return with_bos(std::move(ids));
     }
 
     std::vector<int> ids;
@@ -981,7 +999,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
                        bpe_merge_ranks_,
                        vocab_token_to_id_);
     }
-    return ids;
+    return with_bos(std::move(ids));
 }
 
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {

@@ -1566,6 +1566,51 @@ int test_terminal_reasoning_preserves_content_stop_prefix() {
     return failures;
 }
 
+int test_byte_level_bos() {
+    int failures = 0;
+    for (bool renderer : {false, true}) {
+        for (bool enabled : {false, true}) {
+            for (bool token_object : {false, true}) {
+                auto owned = resources();
+                auto root = nlohmann::json::parse(owned.tokenizer_json);
+                auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+                root["added_tokens"].push_back(added(100, "<bos>", true));
+                config["added_tokens_decoder"]["100"] = decoder_added("<bos>", true);
+                config["add_bos_token"] = enabled;
+                config["bos_token"] = token_object ? nlohmann::json{{"content", "<bos>"}}
+                                                    : nlohmann::json("<bos>");
+                owned.tokenizer_json = root.dump();
+                owned.tokenizer_config_json = config.dump();
+                fi::Tokenizer tokenizer({.tokenizer_json = owned.tokenizer_json,
+                    .tokenizer_config_json = owned.tokenizer_config_json,
+                    .generation_config_json = owned.generation_config_json,
+                    .chat_template_jinja = owned.chat_template_jinja,
+                    .render_chat_template = renderer});
+                for (bool parse_added : {false, true}) {
+                    for (bool add_bos : {false, true}) {
+                        const auto expected = enabled && add_bos ? std::vector<int>{100, 0}
+                                                                : std::vector<int>{0};
+                        failures += check(tokenizer.encode("x", {.parse_added_tokens = parse_added,
+                                                               .add_bos = add_bos}) == expected,
+                                          "byte-level BOS policy or encode override was ignored");
+                    }
+                }
+                failures += check(tokenizer.encode("<bos>x") == std::vector<int>{100, 0},
+                                  "explicit BOS was duplicated");
+                failures += check(tokenizer.encode("") == (enabled ? std::vector<int>{100}
+                                                                    : std::vector<int>{}),
+                                  "empty text did not honor BOS policy");
+                const auto frontend = FrontendFactory::create_component(owned, false);
+                const auto raw = frontend.prepare_text("x");
+                failures += check(sinfer::family::FrontendTestAccess::inspect(raw).token_ids ==
+                                      (enabled ? std::vector<int>{100, 0} : std::vector<int>{0}),
+                                  "raw prompt preparation dropped the checkpoint BOS");
+            }
+        }
+    }
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1919,6 +1964,7 @@ int main() {
     failures += test_reasoning_split(frontend);
     failures += test_interleaved_reasoning_round();
     failures += test_terminal_reasoning_preserves_content_stop_prefix();
+    failures += test_byte_level_bos();
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
