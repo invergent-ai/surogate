@@ -2,7 +2,6 @@
 
 #include "family/impl/frontend/chat_template.h"
 
-#include <array>
 #include <cstddef>
 #include <memory>
 #include <span>
@@ -113,7 +112,13 @@ private:
     /// Qwen family's, and it was the splitter's name that said so.
     std::size_t max_digit_run_ = 1;
     std::vector<AddedToken> added_tokens_;
-    std::array<std::vector<std::size_t>, 256> added_token_candidates_;
+    struct AddedTokenNode {
+        std::unordered_map<unsigned char, std::size_t> children;
+        std::size_t token_index = std::string::npos;
+    };
+    // Immutable after load. Longest matches do not require scanning every token
+    // sharing a prefix, including large sets of reserved image placeholders.
+    std::vector<AddedTokenNode> added_token_trie_;
     std::vector<int> default_stop_token_ids_;
     int automatic_bos_id_ = -1;
 

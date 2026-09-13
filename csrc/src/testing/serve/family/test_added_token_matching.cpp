@@ -1,4 +1,5 @@
 #include "tokenizer/tokenizer.h"
+#include "family/impl/frontend/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 #include <cassert>
@@ -24,8 +25,21 @@ int main() {
                                             {"id", 100 + i}, {"special", true}});
     }
     auto tokenizer = tokenizer::Tokenizer::from_sources({.tokenizer_json = fixture.dump()});
+    Json byte_fixture = fixture;
+    byte_fixture["model"]["byte_fallback"] = false;
+    byte_fixture["model"]["vocab"].erase("x"); // the family loader requires one ID per spelling
+    byte_fixture["normalizer"] = nullptr;
+    for (auto& token : byte_fixture["added_tokens"]) {
+        for (const char* flag : {"single_word", "lstrip", "rstrip", "normalized"}) { token[flag] = false; }
+    }
+    const Json byte_config = {{"added_tokens_decoder", {{"7100", {
+        {"content", "<image>tailmore"}, {"special", true}, {"single_word", false},
+        {"lstrip", false}, {"rstrip", false}, {"normalized", false}}}}}};
+    sinfer::family::frontend_internal::Tokenizer byte_tokenizer(
+        {byte_fixture.dump(), byte_config.dump(), R"({"eos_token_id":0})"});
     const auto check = [&](const std::string& text, std::vector<std::int32_t> expected) {
         assert(tokenizer.encode_with_special_tokens(text) == expected);
+        assert(byte_tokenizer.encode(text) == expected);
     };
     check("", {});
     check("abac", {11, 2});                 // Longest match at the first position.
@@ -36,7 +50,9 @@ int main() {
     check("z<image>tail<image>z", {4, 15, 14, 4});
     check("<<image>z", {5, 14, 4});
     check("<unused6999>", {7099});
+    assert((byte_tokenizer.encode("z<image>tailmore<image>tail") == std::vector<int>{4, 7100, 15}));
     assert((tokenizer.encode_ordinary("xxx") == std::vector<std::int32_t>{3, 3, 3}));
+    assert((byte_tokenizer.encode("aaa", {.parse_added_tokens=false}) == std::vector<int>{0, 0, 0}));
 
     std::string images;
     for (int i = 0; i < 256; ++i) { images += "<image>"; }

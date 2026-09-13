@@ -858,11 +858,17 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     merge_added_tokens_decoder(tokenizer_config, normalizer_is_identity, tokenizer_config_label,
                                id_to_token_, vocab_metadata.occupied_ids, vocab_token_to_id_,
                                added_tokens_);
+    added_token_trie_.emplace_back();
     for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
         const std::string& content = added_tokens_[index].content;
-        if (!content.empty()) {
-            added_token_candidates_[static_cast<unsigned char>(content.front())].push_back(index);
+        std::size_t node = 0;
+        for (const unsigned char byte : content) {
+            const auto [edge, inserted] = added_token_trie_[node].children.try_emplace(
+                byte, added_token_trie_.size());
+            node = edge->second;
+            if (inserted) { added_token_trie_.emplace_back(); }
         }
+        added_token_trie_[node].token_index = index;
     }
     if (valid_token_ids_.size() < id_to_token_.size()) {
         valid_token_ids_.resize(id_to_token_.size());
@@ -969,13 +975,15 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     std::size_t pos            = 0;
     while (pos < text.size()) {
         const AddedToken* match_token = nullptr;
-        const auto& candidates = added_token_candidates_[static_cast<unsigned char>(text[pos])];
-        for (const std::size_t index : candidates) {
-            const AddedToken& token = added_tokens_[index];
-            if (token.content.size() <= text.size() - pos &&
-                text.compare(pos, token.content.size(), token.content) == 0) {
-                match_token = &token;
-                break;
+        std::size_t node = 0;
+        for (std::size_t end = pos; end < text.size(); ++end) {
+            const auto& children = added_token_trie_[node].children;
+            const auto edge = children.find(static_cast<unsigned char>(text[end]));
+            if (edge == children.end()) { break; }
+            node = edge->second;
+            const auto index = added_token_trie_[node].token_index;
+            if (index != std::string::npos) {
+                match_token = &added_tokens_[index]; // longest match at this leftmost position
             }
         }
 
