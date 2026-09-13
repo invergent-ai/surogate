@@ -542,18 +542,29 @@ std::size_t ElasticKvRegion::wake() {
         for (std::uint32_t g = 0; g < impl.granules; ++g) {
             Impl::Granule& granule = impl.state[g];
             if (granule.used_pages == 0) { continue; }
+            if (granule.backup.empty()) {
+                if (!granule.mapped) { throw std::logic_error("live sleeping granule has no backup"); }
+                continue; // completed by an earlier wake attempt
+            }
+            if (granule.backup.size() != impl.spec.planes.size()) {
+                throw std::logic_error("sleep backup does not cover every cache plane");
+            }
+            const bool already_mapped = granule.mapped;
             impl.map_granule(g); // throws on OOM; granules already woken stay woken for a retry
+            if (!already_mapped) { mapped += impl.granule_bytes; }
             for (std::size_t p = 0; p < impl.spec.planes.size(); ++p) {
                 const std::size_t span = impl.spec.planes[p].page_bytes * impl.spec.granule_pages;
                 const auto at = reinterpret_cast<void*>(impl.va + impl.spec.planes[p].offset + span * g);
                 if (granule.backup[p] != nullptr) {
-                    CUDA_CHECK(cudaMemcpy(at, granule.backup[p], span, cudaMemcpyHostToDevice));
+                    const auto copied = cudaMemcpy(at, granule.backup[p], span, cudaMemcpyHostToDevice);
+                    if (copied != cudaSuccess) {
+                        throw std::runtime_error(std::string("elastic KV restore failed: ") + cudaGetErrorString(copied));
+                    }
                     (void)cudaFreeHost(granule.backup[p]);
                     granule.backup[p] = nullptr;
                 }
             }
             granule.backup.clear();
-            mapped += impl.granule_bytes;
         }
         impl.asleep = false;
         impl.post(Impl::Job{Impl::Job::Kind::Trim});
