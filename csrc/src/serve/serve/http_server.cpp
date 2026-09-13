@@ -382,6 +382,13 @@ void HttpServer::register_routes() {
             res.set_content("request body is not valid JSON", "text/plain");
             return;
         }
+        if (!body.is_object() ||
+            (body.contains("lora_name") && !body.at("lora_name").is_string()) ||
+            (body.contains("lora_path") && !body.at("lora_path").is_string())) {
+            res.status = 400;
+            res.set_content("both lora_name and lora_path must be strings", "text/plain");
+            return;
+        }
         const std::string name = body.value("lora_name", "");
         const std::string path = body.value("lora_path", "");
         if (name.empty() || path.empty()) {
@@ -432,6 +439,12 @@ void HttpServer::register_routes() {
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content("request body is not valid JSON", "text/plain");
+            return;
+        }
+        if (!body.is_object() ||
+            (body.contains("lora_name") && !body.at("lora_name").is_string())) {
+            res.status = 400;
+            res.set_content("lora_name must be a string", "text/plain");
             return;
         }
         const std::string name = body.value("lora_name", "");

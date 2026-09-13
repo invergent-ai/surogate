@@ -167,6 +167,8 @@ sinfer_add_test(sinfer_model_scheduler_test SOURCES test_model_scheduler.cpp LIB
 target_compile_options(sinfer_model_scheduler_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_model_wake_http_test SOURCES test_model_wake_http.cpp LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_model_routing_http_test SOURCES test_model_routing_http.cpp LIBRARIES sinfer_serve)
+sinfer_add_test(sinfer_lora_admin_http_test SOURCES test_lora_admin_http.cpp LIBRARIES sinfer_serve)
+target_compile_options(sinfer_lora_admin_http_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_model_routing_http_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_shutdown_http_test SOURCES test_shutdown_http.cpp LIBRARIES sinfer_serve)
 target_compile_options(sinfer_shutdown_http_test PRIVATE -UNDEBUG)
