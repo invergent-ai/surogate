@@ -4340,6 +4340,13 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         unbind_sequence_kv(sequence);
         sequence.retained = !truncated || reusable_append_frontier(sequence) != 0 ||
                             sequence.rewrite_checkpoint.valid;
+        if (!sequence.retained) {
+            // A truncated recurrent/PLE state without a checkpoint cannot be
+            // reused. Dropping growth entitlement alone leaves its mapped pages
+            // owned by an idle lane that neither admission nor eviction can see.
+            sequence.kv.reset();
+            decoder->release_checkpoint(sequence.lane);
+        }
         static const bool reuse_trace = std::getenv("SUROGATE_SERVE_REUSE_TRACE") != nullptr;
         if (reuse_trace && sequence.retained) {
             std::fprintf(stderr, "reuse-trace: retain lane %u frontier %u ledger %zu\n",

@@ -238,6 +238,7 @@ target_compile_options(sinfer_lora_lifecycle_test PRIVATE -UNDEBUG)
 set_tests_properties(sinfer_lora_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_burst_prefix_test SOURCES test_burst_prefix.cpp LIBRARIES sinfer_serve)
 target_compile_options(sinfer_burst_prefix_test PRIVATE -UNDEBUG -fno-fast-math)
+sinfer_add_test(sinfer_completed_kv_test SOURCES test_completed_kv.cpp LIBRARIES sinfer_engine)
 sinfer_add_test(sinfer_conversation_checkpoints_test SOURCES test_conversation_checkpoints.cpp
   LIBRARIES sinfer_engine CUDA::cudart)
 target_compile_options(sinfer_conversation_checkpoints_test PRIVATE -UNDEBUG)
