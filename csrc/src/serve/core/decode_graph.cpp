@@ -146,11 +146,11 @@ bool DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
         // pipeline stage's 64-lane profiles) is not fatal: re-instantiate from the new
         // definition instead. Slower to switch, identical to run.
         (void)cudaGetLastError();
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
+        // Rebuilding is routine when graph topology changes and needs no operator action.
+        // Keep the diagnostic with the opt-in graph details, not normal startup output.
+        if (std::getenv("SUROGATE_SERVE_GRAPH_NODES") != nullptr) {
             std::fprintf(stderr,
-                         "decode graph: executable update refused (%s, result %d); re-instantiating instead\n",
+                         "graph-update: rebuilding executable (%s, result %d)\n",
                          cudaGetErrorName(err), static_cast<int>(result.result));
         }
         instantiate(definition);
