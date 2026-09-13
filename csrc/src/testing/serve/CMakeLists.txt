@@ -174,6 +174,8 @@ sinfer_add_test(sinfer_shutdown_http_test SOURCES test_shutdown_http.cpp LIBRARI
 target_compile_options(sinfer_shutdown_http_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_model_wake_http_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_pipeline_partition_test SOURCES test_pipeline_partition.cpp)
+sinfer_add_test(sinfer_pipeline_kv_test SOURCES test_pipeline_kv.cpp)
+target_compile_options(sinfer_pipeline_kv_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_pipeline_schedule_test SOURCES test_pipeline_schedule.cpp)
 sinfer_add_test(sinfer_pipeline_prefill_sample_test SOURCES test_pipeline_prefill_sample.cpp)
 target_compile_options(sinfer_pipeline_prefill_sample_test PRIVATE -UNDEBUG)

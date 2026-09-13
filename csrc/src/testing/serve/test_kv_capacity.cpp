@@ -87,6 +87,20 @@ int main() {
     failures += check(insufficient_rejected,
                       "automatic KV capacity accepted less than the minimum reservation");
 
+    // Recurrent-only pipeline stages keep page ledgers without any KV payload.
+    auto metadata_only = curve;
+    metadata_only.bytes_per_additional_main_page_group = 0;
+    for (const auto policy : {sinfer::KvCapacityPolicy::automatic(50),
+                              sinfer::KvCapacityPolicy::explicit_capacity(384)}) {
+        const auto result = sinfer::runtime::resolve_kv_capacity(policy, metadata_only, 1050);
+        failures += check(result.main_page_groups == 6 && result.runtime_reservation_bytes == 1000,
+                          "metadata-only stage did not expand its page ledger at constant cost");
+        bool refused = false;
+        try { (void)sinfer::runtime::resolve_kv_capacity(policy, metadata_only, 999); }
+        catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "metadata-only stage ignored its fixed memory requirement");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

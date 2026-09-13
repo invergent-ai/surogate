@@ -1,6 +1,7 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/layouts.h"
 #include "family/impl/runtime/kv_precision.h"
+#include "family/impl/runtime/cache_layers.h"
 #include "family/impl/runtime/attention_workspace.h"
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
@@ -236,6 +237,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.decoder = family::plan_decoder_state(
         builder, family::DecoderStateSpec{
                      .full_attention_layers     = geometry_full_attention_layers(plan.geometry),
+                     .text_kv_layers = family::detail::stage_kv_layers(
+                         plan.geometry, plan.pipeline_stage_first, plan.pipeline_stage_last),
                      .mtp_layers                = plan.geometry.mtp_layers,
                      .capacity                  = plan.capacity,
                      .kv_heads                  = plan.geometry.kv_heads,
@@ -1127,8 +1130,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
-        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
-            throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
+        if (adjacent->device_reservation_bytes < planner->minimum->device_reservation_bytes) {
+            throw std::logic_error("Sequence layout has a negative KV capacity stride");
         }
         planner->curve.bytes_per_additional_main_page_group =
             adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;

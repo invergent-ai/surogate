@@ -25,11 +25,16 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::int32_t global_kv_heads = 0,
                               std::int32_t global_head_dim = 0,
                               const std::vector<std::uint32_t>& global_layers = {},
-                              DType indexer_dtype = DType::BF16) {
+                              DType indexer_dtype = DType::BF16,
+                              std::optional<KvLayerRange> owned_layers = std::nullopt) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
+    }
+    const auto owned = owned_layers.value_or(KvLayerRange{0, layers});
+    if (owned.first > owned.last || owned.last > layers) {
+        throw std::invalid_argument("Paged KV stage layer range is invalid");
     }
     // I8 carries a per-group scale plane pair; FP8_E4M3FN stores raw e4m3 codes
     // with no side planes, so it has the same plane count as BF16 and can be
@@ -69,7 +74,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.overcommit            = elastic && overcommit;
     const std::size_t planes_per_layer =
         (grouped ? 4ULL : 2ULL) + (indexer_head_dim > 0 ? 1ULL : 0ULL);
-    pool_spec.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
+    pool_spec.planes.reserve(static_cast<std::size_t>(owned.last - owned.first) * planes_per_layer);
     std::vector<DType> layer_dtypes(layers, dtype);
     for (const std::uint32_t skipped : skip_layers) { layer_dtypes[skipped] = DType::BF16; }
     // A second attention geometry sizes the planes of the layers that use it. The plane
@@ -95,7 +100,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         layer_kv_heads[global] = global_kv_heads;
         layer_head_dim[global] = global_head_dim;
     }
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+    for (std::uint32_t layer = owned.first; layer < owned.last; ++layer) {
         const DType layer_dtype = layer_dtypes[layer];
         const std::int32_t heads = layer_kv_heads[layer];
         const std::int32_t width = layer_head_dim[layer];
@@ -113,17 +118,22 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
     return PagedKVCacheLayout{
         .pool        = plan_paged_kv_pool(builder, pool_spec),
-        .layers      = layers,
+        .first_layer = owned.first,
+        .layers      = owned.last - owned.first,
         .max_context = capacity,
         .kv_heads    = kv_heads,
         .head_dim    = head_dim,
         .dtype        = dtype,
         .quant_group  = quant_group,
         .indexer_head_dim = indexer_head_dim,
-        .layer_dtypes = std::move(layer_dtypes),
-        .layer_kv_heads = second_geometry ? std::move(layer_kv_heads)
+        .layer_dtypes = {layer_dtypes.begin() + owned.first, layer_dtypes.begin() + owned.last},
+        .layer_kv_heads = second_geometry ? std::vector<std::int32_t>{
+                                              layer_kv_heads.begin() + owned.first,
+                                              layer_kv_heads.begin() + owned.last}
                                           : std::vector<std::int32_t>{},
-        .layer_head_dim = second_geometry ? std::move(layer_head_dim)
+        .layer_head_dim = second_geometry ? std::vector<std::int32_t>{
+                                              layer_head_dim.begin() + owned.first,
+                                              layer_head_dim.begin() + owned.last}
                                           : std::vector<std::int32_t>{},
     };
 }
@@ -176,7 +186,7 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.kv_skip_layers, spec.indexer_head_dim, spec.elastic_kv,
                                 spec.text_physical_page_cap, spec.elastic_kv_overcommit,
                                 spec.global_kv_heads, spec.global_attention_head_dim,
-                                spec.global_geometry_layers, spec.indexer_dtype);
+                                spec.global_geometry_layers, spec.indexer_dtype, spec.text_kv_layers);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
@@ -191,7 +201,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
                            const PagedKVElasticOptions* elastic)
-    : pool_(backing, layout.pool, elastic), layers_(layout.layers), max_context_(layout.max_context),
+    : pool_(backing, layout.pool, elastic), first_layer_(layout.first_layer),
+      layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group), indexer_head_dim_(layout.indexer_head_dim),
       layer_dtypes_(layout.layer_dtypes), layer_kv_heads_(layout.layer_kv_heads),
@@ -217,7 +228,10 @@ PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocatio
 }
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
-    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    if (layer < first_layer_ || layer - first_layer_ >= layers_) {
+        throw std::out_of_range("Paged KV layer is outside this stage");
+    }
+    layer -= first_layer_;
     // Only the int8 cache adds scale planes, so it alone widens the stride; an
     // fp8 layer occupies the same two planes a bf16 layer does, which is what
     // lets the two be mixed within one pool.
@@ -240,7 +254,10 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
-    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    if (layer < first_layer_ || layer - first_layer_ >= layers_) {
+        throw std::out_of_range("Paged KV layer is outside this stage");
+    }
+    layer -= first_layer_;
     // Only the int8 cache adds scale planes, so it alone widens the stride; an
     // fp8 layer occupies the same two planes a bf16 layer does, which is what
     // lets the two be mixed within one pool.

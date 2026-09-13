@@ -16,8 +16,16 @@ namespace sinfer::family {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
 
+// Half-open range in the model's KV-owner numbering, not its transformer-layer numbering.
+struct KvLayerRange {
+    std::uint32_t first = 0;
+    std::uint32_t last = 0;
+};
+
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
+    // Absent for a complete model; pipeline stages store only their own owners.
+    std::optional<KvLayerRange> text_kv_layers;
     std::uint32_t mtp_layers                = 0;
     std::uint32_t capacity                  = 0;
     std::int32_t kv_heads                   = 0;
@@ -61,6 +69,7 @@ struct DecoderStateSpec {
 
 struct PagedKVCacheLayout {
     PagedKVPoolLayout pool;
+    std::uint32_t first_layer = 0;
     std::uint32_t layers      = 0;
     std::uint32_t max_context = 0;
     std::int32_t kv_heads     = 0;
@@ -128,6 +137,7 @@ private:
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
     PagedKVPool pool_;
+    std::uint32_t first_layer_ = 0;
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;

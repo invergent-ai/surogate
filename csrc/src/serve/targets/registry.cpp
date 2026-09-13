@@ -655,6 +655,12 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
                 ++stage.host_moe_layers;
                 fit = fit_or_zero(stage);
             }
+            if (fit.kv_tokens == 0) {
+                throw std::invalid_argument(
+                    "pipeline stage " + std::to_string(s) +
+                    " cannot fit the requested context even after offloading all its experts; "
+                    "reduce --max-model-len or the runtime memory requirements");
+            }
             out.host_moe[s] = stage.host_moe_layers;
             if (stage.host_moe_layers != 0) {
                 std::fprintf(stderr,

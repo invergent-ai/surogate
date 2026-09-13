@@ -46,13 +46,14 @@ int run(std::int32_t hidden, std::int32_t tokens, std::int32_t count, std::uint3
 
     DeviceBuffer dx = to_device_bf16(x);
     DeviceBuffer dout(static_cast<std::size_t>(hidden) * sizeof(float));
-    cuda_check(cudaMemset(dout.p, 0, static_cast<std::size_t>(hidden) * sizeof(float)),
-               "memset");
     Tensor tx(dx.p, DType::BF16, {hidden, tokens});
     Tensor to(dout.p, DType::FP32, {hidden});
 
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    // A default-stream memset does not order with this nonblocking stream and can
+    // overwrite the kernel's result. Initialize on the stream that consumes it.
+    cuda_check(cudaMemsetAsync(dout.p, 0, dout.bytes, stream), "memset");
     ops::mean_pool(tx, count, /*accumulate*/ false, to, stream);
     cuda_synchronize(stream);
     cuda_check(cudaStreamDestroy(stream), "stream destroy");
@@ -73,13 +74,12 @@ int run_chunked(std::int32_t hidden, std::int32_t tokens, std::uint32_t seed) {
 
     DeviceBuffer dx = to_device_bf16(x);
     DeviceBuffer dout(static_cast<std::size_t>(hidden) * sizeof(float));
-    cuda_check(cudaMemset(dout.p, 0, static_cast<std::size_t>(hidden) * sizeof(float)),
-               "memset");
     Tensor to(dout.p, DType::FP32, {hidden});
 
     const std::int32_t split = tokens / 2;
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    cuda_check(cudaMemsetAsync(dout.p, 0, dout.bytes, stream), "memset");
     {
         Tensor first(dx.p, DType::BF16, {hidden, split});
         ops::mean_pool(first, split, /*accumulate*/ true, to, stream);

@@ -26,10 +26,7 @@ void validate_curve(const SequenceCapacityCurve& curve) {
         curve.minimum_device_reservation_bytes == 0) {
         throw std::invalid_argument("sequence capacity curve is invalid");
     }
-    if (curve.minimum_main_page_groups < curve.maximum_main_page_groups &&
-        curve.bytes_per_additional_main_page_group == 0) {
-        throw std::invalid_argument("expandable sequence capacity curve has zero byte stride");
-    }
+    // A stage with no KV-owning layers can expand its page ledger without GPU payload.
 }
 
 std::uint32_t explicit_page_groups(const KvCapacityPolicy& policy,
@@ -116,7 +113,9 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                 " bytes of automatic headroom, but only " +
                 std::to_string(available_runtime_bytes) + " bytes are available after weights");
         }
-        if (curve.minimum_main_page_groups < curve.maximum_main_page_groups) {
+        if (curve.bytes_per_additional_main_page_group == 0) {
+            pages = curve.maximum_main_page_groups;
+        } else if (curve.minimum_main_page_groups < curve.maximum_main_page_groups) {
             const std::size_t additional =
                 (capacity_budget - curve.minimum_device_reservation_bytes) /
                 curve.bytes_per_additional_main_page_group;

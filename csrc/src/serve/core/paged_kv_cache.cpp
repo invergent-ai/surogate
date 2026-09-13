@@ -51,7 +51,8 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     if (spec.table_rows <= 0) {
         throw std::invalid_argument("Paged KV table row count must be positive");
     }
-    if (spec.planes.empty()) { throw std::invalid_argument("Paged KV pool must contain planes"); }
+    // A pipeline stage containing only recurrent layers still needs page/row admission and
+    // block tables, but owns no KV payload. Such a pool is metadata-only.
     if (spec.elastic && spec.plane_order != PagedKVPlaneOrder::PageMajor) {
         // A head-major plane scatters one page across its heads; there is no page-granular
         // byte range to map, so only page-major pools can follow demand.
@@ -137,11 +138,11 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
                          const PagedKVElasticOptions* elastic)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
-    if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
+    if (layout.planes.size() != spec_.planes.size()) {
         throw std::invalid_argument("Paged KV layout plane inventory is inconsistent");
     }
     DeviceSpan plane_backing = backing;
-    if (spec_.elastic) {
+    if (spec_.elastic && !layout.planes.empty()) {
         if (elastic == nullptr) {
             throw std::invalid_argument("Elastic Paged KV pool needs its engine's device and stream");
         }
