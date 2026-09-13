@@ -54,9 +54,11 @@ int main() {
     options.log_stats_interval_ms = 0;
     options.use_cuda_graph = false;
     GenerationService primary(options);
-    auto extra_options = options;
-    extra_options.device = 1;
-    extra_options.model_id_override = "extra";
+    ServeOptions::ExtraModel extra_model;
+    extra_model.artifact_path = artifact;
+    extra_model.name = "extra";
+    extra_model.device = 1;
+    auto extra_options = extra_model_options(options, extra_model);
     extra_options.chat_template = "Count from one to ten: 1, 2, 3, 4, 5, 6, 7, 8, 9,";
     GenerationService extra(extra_options);
     HttpServer server(options);

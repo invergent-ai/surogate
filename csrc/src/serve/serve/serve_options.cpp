@@ -791,7 +791,7 @@ ServeOptions extra_model_options(const ServeOptions& primary, const ServeOptions
     if (extra.kv_tokens != 0) { out.kv_capacity = KvCapacityPolicy::explicit_capacity(extra.kv_tokens); }
     if (extra.max_num_seqs != 0) { out.max_concurrency = extra.max_num_seqs; }
     if (extra.max_context != 0) { out.max_context = extra.max_context; }
-    out.enable_lora = !extra.lora.empty();
+    out.enable_lora = primary.enable_lora || !extra.lora.empty();
     out.lora_modules = extra.lora;
     out.speculative = extra.speculative;
     out.model_priority = extra.priority;

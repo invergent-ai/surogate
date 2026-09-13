@@ -134,6 +134,25 @@ int main() {
                                    "--model", "other=other.sinfer"});
     failures += check(sinfer::serve::extra_model_options(inherited_placement, inherited_placement.extra_models[0]).devices ==
                           inherited_placement.devices, "extra model did not inherit device placement");
+    for (bool enabled : {false, true}) {
+        for (bool startup_adapter : {false, true}) {
+            auto primary = defaults;
+            primary.enable_lora = enabled;
+            primary.max_loras = 4;
+            primary.max_lora_rank = 16;
+            primary.lora_modules = {{"primary-adapter", "/primary"}};
+            ServeOptions::ExtraModel extra;
+            extra.name = "extra";
+            extra.artifact_path = "extra.sinfer";
+            if (startup_adapter) { extra.lora = {{"extra-adapter", "/extra"}}; }
+            const auto derived = extra_model_options(primary, extra);
+            failures += check(derived.enable_lora == (enabled || startup_adapter),
+                              "extra model discarded inherited LoRA capability");
+            failures += check(derived.max_loras == 4 && derived.max_lora_rank == 16 &&
+                              derived.lora_modules.size() == extra.lora.size(),
+                              "extra model must inherit capacity without primary adapter weights");
+        }
+    }
     for (const auto* invalid : {"x=m.sinfer,devices=1:1", "x=m.sinfer,devices=1:",
                                "x=m.sinfer,device=-1", "x=m.sinfer,device=0,devices=1:2"}) {
         bool rejected = false;
