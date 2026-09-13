@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -610,6 +611,66 @@ void append_symbol_id(std::vector<int>& ids,
     }
 }
 
+void append_bpe_word(std::vector<int>& ids, const std::string& word,
+                     const std::unordered_map<std::string, int>& merge_ranks,
+                     const std::unordered_map<std::string, int>& token_to_id) {
+    constexpr auto none = std::numeric_limits<std::size_t>::max();
+    struct Symbol {
+        std::size_t previous, next, begin, length;
+    };
+    std::vector<Symbol> symbols;
+    {
+        const auto spans = uni::utf8_codepoints(word, "Tokenizer::encode byte-level text");
+        symbols.reserve(spans.size());
+        for (const auto& span : spans) {
+            const auto index = symbols.size();
+            symbols.push_back({index == 0 ? none : index - 1, none, span.offset, span.length});
+            if (index != 0) { symbols[index - 1].next = index; }
+        }
+    }
+    if (symbols.empty()) { return; }
+    struct Candidate {
+        int rank;
+        std::size_t left, right, left_length, right_length;
+    };
+    const auto later = [](const Candidate& a, const Candidate& b) {
+        return a.rank != b.rank ? a.rank > b.rank : a.left > b.left;
+    };
+    std::priority_queue<Candidate, std::vector<Candidate>, decltype(later)> pending(later);
+    std::string key;
+    const auto offer = [&](std::size_t left, std::size_t right) {
+        if (left == none || right == none) { return; }
+        const auto& l = symbols[left];
+        const auto& r = symbols[right];
+        key.assign(word, l.begin, l.length);
+        key.push_back('\0');
+        key.append(word, r.begin, r.length);
+        if (const auto found = merge_ranks.find(key); found != merge_ranks.end()) {
+            pending.push({found->second, left, right, l.length, r.length});
+        }
+    };
+    for (std::size_t i = 0; i + 1 < symbols.size(); ++i) { offer(i, i + 1); }
+    // Preserve lowest-rank, leftmost-pair ordering, but only reconsider the
+    // neighbours a merge changes. Spans avoid copying the growing symbols.
+    while (!pending.empty()) {
+        const auto best = pending.top();
+        pending.pop();
+        auto& left = symbols[best.left];
+        auto& right = symbols[best.right];
+        if (left.next != best.right || left.length != best.left_length ||
+            right.length != best.right_length) { continue; }
+        left.length += right.length;
+        left.next = right.next;
+        right.length = 0;
+        if (left.next != none) { symbols[left.next].previous = best.left; }
+        offer(left.previous, best.left);
+        offer(best.left, left.next);
+    }
+    for (std::size_t i = 0; i != none; i = symbols[i].next) {
+        append_symbol_id(ids, token_to_id, std::string_view(word).substr(symbols[i].begin, symbols[i].length));
+    }
+}
+
 void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
                     std::size_t max_digit_run,
                     const std::vector<std::string>& split_patterns, bool normalize_nfc,
@@ -640,22 +701,7 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
                 continue;
             }
         }
-        std::vector<std::string> symbols = byte_level_symbols(word);
-        while (symbols.size() > 1) {
-            int best_rank              = std::numeric_limits<int>::max();
-            std::size_t best_pair_left = symbols.size();
-            for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
-                const auto rank = merge_ranks.find(merge_pair_key(symbols[i], symbols[i + 1]));
-                if (rank != merge_ranks.end() && rank->second < best_rank) {
-                    best_rank      = rank->second;
-                    best_pair_left = i;
-                }
-            }
-            if (best_pair_left == symbols.size()) { break; }
-            symbols[best_pair_left] += symbols[best_pair_left + 1];
-            symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pair_left + 1));
-        }
-        for (const std::string& symbol : symbols) { append_symbol_id(ids, token_to_id, symbol); }
+        append_bpe_word(ids, word, merge_ranks, token_to_id);
     }
 }
 

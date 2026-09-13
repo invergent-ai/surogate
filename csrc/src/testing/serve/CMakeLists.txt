@@ -200,6 +200,9 @@ target_include_directories(sinfer_family_frontend_test PRIVATE
 sinfer_add_test(sinfer_family_pretokenizer_digits_test
   SOURCES family/test_pretokenizer_digits.cpp
   LIBRARIES sinfer_engine sinfer_core)
+sinfer_add_test(sinfer_family_bpe_merges_test
+  SOURCES family/test_bpe_merges.cpp LIBRARIES sinfer_engine)
+set_tests_properties(sinfer_family_bpe_merges_test PROPERTIES TIMEOUT 30)
 target_include_directories(sinfer_family_pretokenizer_digits_test PRIVATE
   ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/family/impl)
