@@ -147,6 +147,14 @@ sinfer_add_test(sinfer_pipeline_partition_test SOURCES test_pipeline_partition.c
 sinfer_add_test(sinfer_pipeline_schedule_test SOURCES test_pipeline_schedule.cpp)
 target_compile_options(sinfer_pipeline_schedule_test PRIVATE -UNDEBUG)
 sinfer_add_op_test(sinfer_bounded_expert_cache_test SOURCES ops/test_bounded_expert_cache.cpp LIBRARIES sinfer_ops)
+foreach(mode handshake callback)
+  add_test(NAME sinfer_cpu_split_${mode}_test COMMAND sinfer_bounded_expert_cache_test)
+  set_tests_properties(sinfer_cpu_split_${mode}_test PROPERTIES
+    ENVIRONMENT "SUROGATE_TEST_CPU_SPLIT=1;SUROGATE_CPU_EXPERT_THREADS=8"
+    TIMEOUT 120 SKIP_RETURN_CODE 77)
+endforeach()
+set_property(TEST sinfer_cpu_split_callback_test APPEND PROPERTY
+  ENVIRONMENT "SUROGATE_SERVE_NO_MEMOP_HANDSHAKE=1")
 target_compile_options(sinfer_pipeline_partition_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_multi_device_test SOURCES test_multi_device.cpp LIBRARIES sinfer_serve)
 target_compile_options(sinfer_multi_device_test PRIVATE -UNDEBUG)

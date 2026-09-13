@@ -47,8 +47,11 @@ struct Context {
 struct DeviceWeight {
     DeviceBuffer storage;
     Weight weight;
-    explicit DeviceWeight(quantized_weight::PackedWeight packed)
-        : storage(to_device(packed.payload)), weight(packed.device_weight(storage.p)) {}
+    std::vector<std::uint8_t> host;
+    explicit DeviceWeight(quantized_weight::PackedWeight packed, bool retain_host = false)
+        : storage(to_device(packed.payload)), weight(packed.device_weight(storage.p)) {
+        if (retain_host) { host = std::move(packed.payload); }
+    }
 };
 
 struct Cache {
@@ -90,11 +93,14 @@ struct Cache {
     }
 };
 
-int check(const ops::SparseMoeGeometry& g) {
+int check_cpu_rounds(family::ExpertCache& cache, family::BankedMixture mixture,
+                     const ops::SparseMoeWeights& weights, cudaStream_t stream);
+
+int check(const ops::SparseMoeGeometry& g, bool cpu_split = false) {
     DeviceWeight gate(quantized_weight::make_patterned_weight(
-        QType::W8G32_F16S, g.routed_gate_rows(), g.hidden, 291));
+        QType::W8G32_F16S, g.routed_gate_rows(), g.hidden, 291), cpu_split);
     DeviceWeight down(quantized_weight::make_patterned_weight(
-        QType::W8G32_F16S, g.routed_down_rows(), g.intermediate, 311));
+        QType::W8G32_F16S, g.routed_down_rows(), g.intermediate, 311), cpu_split);
     std::unique_ptr<DeviceWeight> shared_gate, shared_down;
     if (g.has_shared()) {
         shared_gate = std::make_unique<DeviceWeight>(quantized_weight::make_patterned_weight(
@@ -139,14 +145,22 @@ int check(const ops::SparseMoeGeometry& g) {
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     int failures = 0;
     for (int slots : {g.experts_per_token, g.experts_per_token * 2 + 1, 64}) {
+        if (cpu_split && slots != 64) { continue; }
         Context context;
         EngineOptions options;
         options.expert_slots = slots;
-        options.cpu_moe_share = 0;
+        options.cpu_moe_share = cpu_split ? 1.0F : 0.0F;
+        options.cpu_moe_min_tokens = 1;
         options.cpu_moe_prefill_share = 0;
         family::ExpertCache::configure(options, 0, g.experts);
         auto& family_cache = family::ExpertCache::for_current_device(g, 2);
         family::BankedMixture mixture{.layer = 0, .layers = 2, .op = &weights};
+        if (cpu_split) {
+            mixture.host_gate_up = reinterpret_cast<const std::byte*>(gate.host.data());
+            mixture.host_down = reinterpret_cast<const std::byte*>(down.host.data());
+            failures += check_cpu_rounds(family_cache, mixture, weights, stream);
+            continue;
+        }
         Cache cache(g, slots, weights);
         auto pooled = ops::expert_slot_weights(cache.pool, cache.directory, 0, weights);
         pooled.slot_of_expert = static_cast<const int*>(cache.active.data);
@@ -225,10 +239,71 @@ int check(const ops::SparseMoeGeometry& g) {
     return failures;
 }
 
+int check_cpu_rounds(family::ExpertCache& cache, family::BankedMixture mixture,
+                     const ops::SparseMoeWeights& weights, cudaStream_t stream) {
+    const auto& g = ops::kSparseMoeQwen3MoeGeometry;
+    constexpr int maximum = 19;
+    const auto elements = static_cast<std::size_t>(g.hidden) * maximum;
+    DeviceBuffer input(elements * 2), output(elements * 2), expected(elements * 2);
+    WorkspaceArena workspace(ops::sparse_moe_workspace_capacity_bytes(
+        g, QType::W8G32_F16S, QType::W8G32_F16S, 1, maximum));
+    std::array<cudaGraphExec_t, maximum + 1> graphs{};
+    int failures = 0;
+    // 19 columns create 8+8+3 slices; the next 16-column round ends at a
+    // context that was previously non-final. Change widths and inputs to expose
+    // stale done flags, then repeat the same sequence under captured graphs.
+    for (const bool captured : {false, true}) {
+        for (int iteration = 0; iteration < 16; ++iteration) {
+            const int tokens = std::array{19, 16, 8, 16}[iteration % 4];
+            std::vector<float> values(elements);
+            fill_uniform(values, 107 + iteration, -0.125F, 0.125F);
+            std::vector<std::uint16_t> bits(elements);
+            std::transform(values.begin(), values.end(), bits.begin(), f32_to_bf16);
+            CUDA_CHECK(cudaMemcpyAsync(input.p, bits.data(), input.bytes, cudaMemcpyHostToDevice, stream));
+            Tensor x(input.p, DType::BF16, {g.hidden, tokens});
+            Tensor actual(output.p, DType::BF16, {g.hidden, tokens});
+            Tensor reference(expected.p, DType::BF16, {g.hidden, tokens});
+            CUDA_CHECK(cudaMemsetAsync(reference.data, 0, reference.bytes(), stream));
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, reference, workspace, stream);
+            CUDA_CHECK(cudaMemsetAsync(actual.data, 0, actual.bytes(), stream));
+            if (captured) {
+                if (!graphs[tokens]) {
+                    cudaGraph_t graph{};
+                    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                    cache.run(mixture, x, actual, workspace, stream);
+                    if (!cache.has_pending_partial()) { throw std::runtime_error("CPU split did not engage"); }
+                    cache.add_pending_partial(actual, stream);
+                    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+                    CUDA_CHECK(cudaGraphInstantiate(&graphs[tokens], graph, nullptr, nullptr, 0));
+                    CUDA_CHECK(cudaGraphDestroy(graph));
+                }
+                CUDA_CHECK(cudaGraphLaunch(graphs[tokens], stream));
+            } else {
+                cache.run(mixture, x, actual, workspace, stream);
+                if (!cache.has_pending_partial()) { throw std::runtime_error("CPU split did not engage"); }
+                cache.add_pending_partial(actual, stream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // CPU intermediates are FP32 while the GPU reference rounds its
+            // expert intermediates to BF16. Use the existing MoE A16 contract;
+            // ULP distance is unsuitable for cancellation near zero.
+            failures += verify_reduction(captured ? "CPU split graph slices" : "CPU split eager slices",
+                                         from_device_bf16(actual.data, actual.numel()),
+                                         from_device_bf16(reference.data, reference.numel()),
+                                         {1.2e-2, 1.0e-3, 1.5e-2});
+        }
+    }
+    for (auto graph : graphs) { if (graph) { CUDA_CHECK(cudaGraphExecDestroy(graph)); } }
+    return failures;
+}
+
 } // namespace
 
 int main() {
     if (cuda_unavailable()) { return 77; }
+    if (std::getenv("SUROGATE_TEST_CPU_SPLIT")) {
+        return check(ops::kSparseMoeQwen3MoeGeometry, true) ? 1 : 0;
+    }
     if (std::getenv("SUROGATE_TEST_BOUNDED_GLM")) {
         return check(ops::kSparseMoeGlm53Geometry) ? 1 : 0;
     }

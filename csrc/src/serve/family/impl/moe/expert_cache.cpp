@@ -274,14 +274,17 @@ JoinProbe& join_probe() {
     return probe;
 }
 
+constexpr std::size_t kMaximumCpuSlices = 8;
+
 // A host-computed partial of the block being executed: consumed by the next combine.
 struct PendingPartial {
     const float* device_alias = nullptr;
     cudaEvent_t join          = nullptr;
     int device                = -1; // the device whose buffers this partial points at
-    // Memop handshake: the combine waits for the slice's `done` flag and clears it, instead of
-    // waiting on the join event, when the handshake carried the round.
-    CUdeviceptr done_device = 0;
+    // The coordinator may finish slices out of order. Every slice needs its own
+    // join and reset; an event may also cover slices using the callback fallback.
+    std::array<CUdeviceptr, kMaximumCpuSlices> done_devices{};
+    std::size_t done_count = 0;
 };
 
 // --- what the run configured, per device, before the cache exists ---
@@ -400,7 +403,7 @@ struct ExpertCache::Impl {
         float* weights       = nullptr;
         long long* count     = nullptr;
     };
-    static constexpr int kJobMirrors = 8;
+    static constexpr int kJobMirrors = kMaximumCpuSlices;
     std::array<JobMirror, kJobMirrors> mirrors{};
     // Host-function contexts. A hook runs at graph capture and its context pointer is baked
     // into the host-function node, so a context must stay valid and unchanged for every
@@ -1000,7 +1003,7 @@ struct ExpertCache::Impl {
 
     // Stages one slice of the round (columns [round_offset, round_offset + tokens) of the
     // block) and forks its host round onto the side stream; the block's combine joins the
-    // last slice's event and adds the round-wide partial (v2 overlap).
+    // slices and adds the round-wide partial (v2 overlap).
     void cpu_round(Layer& entry, const Tensor& x, cudaStream_t stream) {
         const std::int32_t hidden = geometry.hidden;
         const std::int32_t tokens = static_cast<std::int32_t>(x.numel() / hidden);
@@ -1034,6 +1037,8 @@ struct ExpertCache::Impl {
         entry.round_offset = offset + tokens;
         int partial_device = -1;
         CUDA_CHECK(cudaGetDevice(&partial_device));
+        pending.device_alias = static_cast<const float*>(out_device_alias);
+        pending.device = partial_device;
         if (handshake.enabled && !stagecheck && slice.handshake_slot >= 0) {
             // The slot belongs to this slice alone and was published when its context was
             // created, so the address the stream raises and the context the coordinator reads
@@ -1042,9 +1047,11 @@ struct ExpertCache::Impl {
             const CUresult rc = stream_write_value64()(
                 stream, handshake.ready_device + k * sizeof(unsigned long long), 1ULL, 0U);
             if (rc != CUDA_SUCCESS) { throw std::runtime_error("expert cache: cuStreamWriteValue64 failed"); }
-            pending = PendingPartial{static_cast<const float*>(out_device_alias), nullptr,
-                                     partial_device,
-                                     handshake.done_device + k * sizeof(unsigned long long)};
+            if (pending.done_count == pending.done_devices.size()) {
+                throw std::logic_error("expert cache: too many pending CPU slices");
+            }
+            pending.done_devices[pending.done_count++] =
+                handshake.done_device + k * sizeof(unsigned long long);
             return;
         }
         // Fork only the host function onto the side stream so it overlaps the GPU experts.
@@ -1057,8 +1064,7 @@ struct ExpertCache::Impl {
         }
         CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &Impl::run_cpu_round, &slice));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
-        pending = PendingPartial{static_cast<const float*>(out_device_alias), join_event,
-                                 partial_device};
+        pending.join = join_event;
     }
 
     // SUROGATE_SERVE_CPU_MOE_SHADOW=<n>: every n-th split round is recomputed entirely on the
@@ -1755,12 +1761,13 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     // The host partial is ready when its join event fires, or -- under the memop handshake --
     // when its done flag is raised. Wait without clearing the flag: the combine that follows
     // waits on it too and is the one that clears it.
-    if (cache.pending.done_device != 0) {
-        if (stream_wait_value64()(stream, cache.pending.done_device, 1ULL, kStreamWaitValueGeq) !=
+    for (std::size_t i = 0; i < cache.pending.done_count; ++i) {
+        if (stream_wait_value64()(stream, cache.pending.done_devices[i], 1ULL, kStreamWaitValueGeq) !=
             CUDA_SUCCESS) {
             throw std::runtime_error("expert cache: shadow wait on the done flag failed");
         }
-    } else {
+    }
+    if (cache.pending.join != nullptr) {
         CUDA_CHECK(cudaStreamWaitEvent(stream, cache.pending.join, 0));
     }
     const std::size_t n = static_cast<std::size_t>(hidden_rows) * tokens;
@@ -1965,17 +1972,21 @@ const float* ExpertCache::wait_pending_partial(cudaStream_t stream) {
     check_device_handoff("a host expert partial", cache.pending.device);
     // Join the host round before the caller reads its partial: the done flag when the memop
     // handshake carried the round, the side stream's event otherwise.
-    if (cache.pending.done_device != 0) {
+    if (cache.pending.done_count != 0) {
         // Wait for the round, then clear the flag so the next raise -- the next replay of this
         // graph, or the next round through this slot -- starts from zero. The join probe
         // straddles the wait as it does the event path's, so it measures the handshake too
         // (eagerly; the probe records nothing under capture).
         join_probe().begin(stream);
-        CUresult rc = stream_wait_value64()(stream, cache.pending.done_device, 1ULL, kStreamWaitValueGeq);
-        if (rc == CUDA_SUCCESS) { rc = stream_write_value64()(stream, cache.pending.done_device, 0ULL, 0U); }
-        if (rc != CUDA_SUCCESS) { throw std::runtime_error("expert cache: stream memop failed at the join"); }
+        for (std::size_t i = 0; i < cache.pending.done_count; ++i) {
+            const auto done = cache.pending.done_devices[i];
+            CUresult rc = stream_wait_value64()(stream, done, 1ULL, kStreamWaitValueGeq);
+            if (rc == CUDA_SUCCESS) { rc = stream_write_value64()(stream, done, 0ULL, 0U); }
+            if (rc != CUDA_SUCCESS) { throw std::runtime_error("expert cache: stream memop failed at the join"); }
+        }
         join_probe().end(stream);
-    } else {
+    }
+    if (cache.pending.join != nullptr) {
         join_probe().wrap(stream, cache.pending.join);
     }
     return cache.pending.device_alias;
