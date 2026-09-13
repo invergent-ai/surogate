@@ -10,6 +10,7 @@
 #include "ops/sparse_moe/marlin/vendor/kernel.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -540,8 +541,14 @@ std::size_t marlin_moe_scale_bytes(std::int32_t n, std::int32_t k) noexcept {
     return static_cast<std::size_t>(n) * static_cast<std::size_t>(k / 64) * sizeof(std::uint16_t);
 }
 
-std::size_t marlin_moe_c_tmp_bytes(std::int32_t assignments, std::int32_t n) noexcept {
-    return static_cast<std::size_t>(assignments) * static_cast<std::size_t>(n) * sizeof(float);
+std::size_t marlin_moe_c_tmp_bytes(std::int32_t assignments, std::int32_t n,
+                                   std::int32_t experts, std::int32_t block_size,
+                                   std::int32_t sms) noexcept {
+    // The kernel indexes reductions by padded tiles or CTA, not assignment row.
+    // Match vLLM's allocation bound, including the doubled tile for block size 8.
+    const auto rows = static_cast<std::size_t>(marlin_moe_padded_rows(assignments, experts, block_size));
+    const auto grid = static_cast<std::size_t>(sms) * 4 * block_size * MARLIN_NAMESPACE_NAME::max_thread_n;
+    return std::min(rows * n, grid) * (block_size == 8 ? 2 : 1) * sizeof(float);
 }
 
 std::size_t marlin_moe_lock_bytes() noexcept {

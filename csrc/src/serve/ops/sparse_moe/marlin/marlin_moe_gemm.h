@@ -58,7 +58,8 @@ void marlin_moe_silu_mul(const void* product, void* out, std::int32_t rows,
 
 // Workspace the GEMM needs beside its operands: fp32 reduce buffer and lock words.
 [[nodiscard]] std::size_t marlin_moe_c_tmp_bytes(std::int32_t assignments,
-                                                 std::int32_t n) noexcept;
+                                                 std::int32_t n, std::int32_t experts,
+                                                 std::int32_t block_size, std::int32_t sms) noexcept;
 [[nodiscard]] std::size_t marlin_moe_lock_bytes() noexcept;
 
 // Whether the route is enabled (SUROGATE_SERVE_MOE_MARLIN, default off while it proves out).

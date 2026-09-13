@@ -315,7 +315,11 @@ MarlinMoePlane& marlin_moe_plane_for(const Weight& weight, std::int32_t experts,
             detail::marlin_moe_padded_rows(assignments, experts, kMarlinMoeBlock);
         CUDA_CHECK(cudaMalloc(&plane.product,
                               static_cast<std::size_t>(assignments) * n * sizeof(__nv_bfloat16)));
-        CUDA_CHECK(cudaMalloc(&plane.c_tmp, detail::marlin_moe_c_tmp_bytes(assignments, n)));
+        int device = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        CUDA_CHECK(cudaMalloc(&plane.c_tmp,
+            detail::marlin_moe_c_tmp_bytes(assignments, n, experts, kMarlinMoeBlock, sms)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&plane.sorted_token_ids),
                               static_cast<std::size_t>(padded) * sizeof(std::int32_t)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&plane.expert_ids),
