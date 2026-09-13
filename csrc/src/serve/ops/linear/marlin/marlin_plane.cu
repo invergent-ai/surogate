@@ -2,6 +2,8 @@
 
 #include "ops/linear/marlin/marlin_plane.h"
 #include "core/engine_context.h"
+#include "ops/linear/plane_storage.h"
+#include <atomic>
 
 #include "ops/linear/marlin/marlin_gemm.h"
 #include "ops/linear/marlin/marlin_repack.h"
@@ -15,17 +17,10 @@
 namespace sinfer::ops::detail {
 namespace {
 
-bool g_enabled = false;
-std::mutex g_mutex;
-std::size_t g_bytes = 0;
-
-struct PlaneEntry {
-    void* b_packed    = nullptr;
-    void* scales      = nullptr;
-    cudaEvent_t ready = nullptr;
+struct PlaneEntry : PlaneStorage {
+    void* b_packed = nullptr;
+    void* scales = nullptr;
 };
-
-std::map<const void*, PlaneEntry> g_planes;
 
 // Guard bytes in front of the locks array; see the note at its allocation.
 constexpr std::size_t kLockGuardBytes = 256;
@@ -33,6 +28,10 @@ constexpr std::size_t kLockGuardBytes = 256;
 // The scratch is per device: pipeline stages on several devices each run the Marlin route,
 // and a buffer allocated on one device is an illegal address on another.
 struct ScratchState {
+    std::mutex mutex;
+    std::map<const void*, PlaneEntry> planes;
+    std::size_t bytes = 0;
+    std::unique_ptr<DeviceArena> io_storage, reduction_storage, fused_storage;
     MarlinScratch scratch;
     std::size_t out_bytes = 0;
     std::size_t a_bytes   = 0;
@@ -42,28 +41,17 @@ struct ScratchState {
 };
 // Everything mutable the plane owns, homed per engine so two models in one
 // process cannot race the staging scratch or close each other's adoption.
-struct MarlinPlaneState {
-    std::map<int, ScratchState> scratch_by_device; // pipeline stages: one per device
-    bool adoption_closed          = false;
-    int fixed_m                   = 32;
-    ~MarlinPlaneState() {
-        int previous = 0;
-        const bool restore = cudaGetDevice(&previous) == cudaSuccess;
-        for (auto& [device, state] : scratch_by_device) {
-            (void)cudaSetDevice(device);
-            if (state.scratch.gemm_out != nullptr) { (void)cudaFree(state.scratch.gemm_out); }
-            if (state.scratch.a_pad != nullptr) { (void)cudaFree(state.scratch.a_pad); }
-            if (state.fused_parent != nullptr) { (void)cudaFree(state.fused_parent); }
-        }
-        if (restore) { (void)cudaSetDevice(previous); }
-    }
+struct MarlinPlaneState : DevicePlaneStates<ScratchState> {
+    std::atomic<bool> enabled{false};
+    std::atomic<bool> adoption_closed{false};
+    int fixed_m = 32;
 };
 MarlinPlaneState& plane_state() { return engine_slot<MarlinPlaneState>(); }
-ScratchState& scratch_state() {
-    int device = 0;
-    (void)cudaGetDevice(&device);
-    return plane_state().scratch_by_device[device];
-}
+ScratchState& scratch_state() { return plane_state().current(); }
+#define g_enabled (plane_state().enabled)
+#define g_mutex (scratch_state().mutex)
+#define g_planes (scratch_state().planes)
+#define g_bytes (scratch_state().bytes)
 #define g_scratch (scratch_state().scratch)
 #define g_scratch_out_bytes (scratch_state().out_bytes)
 #define g_scratch_a_bytes (scratch_state().a_bytes)
@@ -74,87 +62,51 @@ ScratchState& scratch_state() {
 #define g_fused_parent_bytes (scratch_state().fused_parent_bytes)
 
 bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t stream) {
-    if (g_scratch.gemm_out != nullptr && out_bytes <= g_scratch_out_bytes &&
-        a_bytes <= g_scratch_a_bytes) {
-        return true;
+    auto& state = scratch_state();
+    if (state.scratch.gemm_out && out_bytes <= state.out_bytes && a_bytes <= state.a_bytes) { return true; }
+    if (state.frozen) { return false; }
+    const auto want_out = std::max(out_bytes, state.out_bytes);
+    const auto want_a = std::max(a_bytes, state.a_bytes);
+    auto io = try_plane_storage(want_out + want_a + 256);
+    if (!io) { return false; }
+    void* out = io->alloc_bytes(want_out).data;
+    void* a = io->alloc_bytes(want_a).data;
+
+    std::unique_ptr<DeviceArena> reduction;
+    MarlinScratch scratch = state.scratch;
+    std::size_t reduction_bytes = 0, lock_bytes = 0;
+    void* lock_base = nullptr;
+    if (!state.reduction_storage) {
+        int device = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        const auto c_tmp_bytes = marlin_c_tmp_floats(sms, 64) * sizeof(float);
+        // Keep the guard before the lock array owned with the reduction buffer.
+        lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int) + kLockGuardBytes;
+        reduction_bytes = c_tmp_bytes + lock_bytes;
+        reduction = try_plane_storage(reduction_bytes + 256);
+        if (!reduction) { return false; }
+        scratch.c_tmp = reduction->alloc_bytes(c_tmp_bytes).data;
+        auto* locks = static_cast<char*>(reduction->alloc_bytes(lock_bytes).data);
+        lock_base = locks;
+        scratch.locks = reinterpret_cast<int*>(locks + kLockGuardBytes);
+        scratch.sm_count = sms;
     }
-    // The scratch grows only until the engine freezes it after capture: from
-    // then on its addresses live inside captured graphs and must not move.
-    if (g_scratch_frozen) { return false; }
-    if (g_scratch.gemm_out != nullptr) {
-        const std::size_t want_out = out_bytes > g_scratch_out_bytes ? out_bytes
-                                                                     : g_scratch_out_bytes;
-        const std::size_t want_a   = a_bytes > g_scratch_a_bytes ? a_bytes : g_scratch_a_bytes;
-        void* grown_out = nullptr;
-        void* grown_a   = nullptr;
-        if (cudaMalloc(&grown_out, want_out) != cudaSuccess) { return false; }
-        if (cudaMalloc(&grown_a, want_a) != cudaSuccess) {
-            cudaFree(grown_out);
-            return false;
-        }
-        cudaMemsetAsync(grown_a, 0, want_a, stream);
-        // The buffers being replaced may still be referenced by kernels this
-        // stream has not finished — the warmup round derives every weight in
-        // one pass, and a later, larger weight (the vocab head dwarfs any
-        // layer) triggers growth while earlier layers' GEMMs are still in
-        // flight. Freeing them under those kernels is a use-after-free that
-        // corrupts whatever is allocated next. Drain first.
-        cudaStreamSynchronize(stream);
-        cudaFree(g_scratch.gemm_out);
-        cudaFree(g_scratch.a_pad);
-        g_bytes -= g_scratch_out_bytes + g_scratch_a_bytes;
-        g_scratch.gemm_out  = grown_out;
-        g_scratch.a_pad     = grown_a;
-        g_scratch_out_bytes = want_out;
-        g_scratch_a_bytes   = want_a;
-        g_bytes += want_out + want_a;
-        return true;
-    }
-    int device = 0;
-    cudaGetDevice(&device);
-    int sms = 0;
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    // FP8 also runs unpadded prefills wider than the decode band. Those calls
-    // use up to 64 rows per reduction tile, even with a 32-row decode band.
-    // Reserve the full tile now so captured calls never need to grow it.
-    const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, 64) * sizeof(float);
-    std::size_t lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int);
-    void* out_buf   = nullptr;
-    void* a_buf     = nullptr;
-    void* c_tmp_buf = nullptr;
-    void* lock_buf  = nullptr;
-    if (cudaMalloc(&out_buf, out_bytes) != cudaSuccess) { return false; }
-    if (cudaMalloc(&a_buf, a_bytes) != cudaSuccess) {
-        cudaFree(out_buf);
-        return false;
-    }
-    if (cudaMalloc(&c_tmp_buf, c_tmp_bytes) != cudaSuccess) {
-        cudaFree(out_buf);
-        cudaFree(a_buf);
-        return false;
-    }
-    // Defensive, NOT a fix for the wide-band fault. The reduce computes
-    // locks_off = (iters * blockIdx.x) / k_tiles - 1 on the branch taken when
-    // the problem's mn-tile count is below the grid width, which is -1 for
-    // block 0 (marlin_template.h:422) — a real one-int write before the array
-    // that lands in the adjacent allocation instead of faulting. Front-padding
-    // makes it harmless. It was measured against the 0.8B wide-band corruption
-    // and did NOT change the failure rate (3 clean / 1 crash over four 90 s
-    // runs, same as unguarded), so the observed fault is elsewhere.
-    lock_bytes += kLockGuardBytes;
-    if (cudaMalloc(&lock_buf, lock_bytes) != cudaSuccess) {
-        cudaFree(out_buf);
-        cudaFree(a_buf);
-        cudaFree(c_tmp_buf);
-        return false;
-    }
-    cudaMemsetAsync(a_buf, 0, a_bytes, stream);
-    cudaMemsetAsync(lock_buf, 0, lock_bytes, stream);
-    lock_buf = static_cast<void*>(static_cast<char*>(lock_buf) + kLockGuardBytes);
-    g_scratch = MarlinScratch{out_buf, a_buf, c_tmp_buf, static_cast<int*>(lock_buf), sms};
-    g_scratch_out_bytes = out_bytes;
-    g_scratch_a_bytes   = a_bytes;
-    g_bytes += out_bytes + a_bytes + c_tmp_bytes + lock_bytes;
+    // Older scratch can still be in flight during warmup growth. Drain before
+    // replacing its arena; after freeze the captured addresses never change.
+    const bool a_ready = cudaMemsetAsync(a, 0, want_a, stream) == cudaSuccess;
+    const bool locks_ready = !lock_base || cudaMemsetAsync(lock_base, 0, lock_bytes, stream) == cudaSuccess;
+    const bool drained = cudaStreamSynchronize(stream) == cudaSuccess;
+    if (!a_ready || !locks_ready || !drained) { return false; }
+    scratch.gemm_out = out;
+    scratch.a_pad = a;
+    state.bytes -= plane_storage_bytes(state.io_storage.get());
+    state.bytes += plane_storage_bytes(io.get()) + plane_storage_bytes(reduction.get());
+    state.out_bytes = want_out;
+    state.a_bytes = want_a;
+    state.scratch = scratch;
+    state.io_storage = std::move(io);
+    if (reduction) { state.reduction_storage = std::move(reduction); }
     return true;
 }
 
@@ -165,7 +117,10 @@ void marlin_plane_set_enabled(bool enabled) noexcept {
     g_enabled = enabled && !(veto != nullptr && veto[0] == '0');
 }
 bool marlin_plane_enabled() noexcept { return g_enabled; }
-std::size_t marlin_plane_bytes() noexcept { return g_bytes; }
+std::size_t marlin_plane_bytes() noexcept {
+    const std::lock_guard<std::mutex> lock(g_mutex);
+    return g_bytes;
+}
 MarlinScratch marlin_scratch() noexcept { return g_scratch; }
 void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
 
@@ -253,7 +208,7 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
         g_bytes + b_bytes + s_bytes > total_bytes / 4) {
-        // Global budget: planes duplicate the residency they accelerate, so a
+        // Per-device engine budget: planes duplicate the residency they accelerate, so a
         // large model would otherwise consume the memory the KV cache and the
         // decode graphs need and abort capture. A quarter of the card bounds
         // it; weights past the budget keep the engine's own kernels.
@@ -265,25 +220,22 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
     }
 
     PlaneEntry entry;
-    void* gptq_tmp = nullptr;
-    if (cudaMalloc(&entry.b_packed, b_bytes) != cudaSuccess) { return {}; }
-    if (cudaMalloc(&entry.scales, s_bytes) != cudaSuccess) {
-        cudaFree(entry.b_packed);
-        return {};
-    }
-    if (cudaMalloc(&gptq_tmp, gptq_bytes) != cudaSuccess) {
-        cudaFree(entry.b_packed);
-        cudaFree(entry.scales);
-        return {};
-    }
+    entry.storage = try_plane_storage(b_bytes + s_bytes + 256);
+    if (!entry.storage) { return {}; }
+    entry.b_packed = entry.storage->alloc_bytes(b_bytes).data;
+    entry.scales = entry.storage->alloc_bytes(s_bytes).data;
+    std::unique_ptr<DeviceBuffer> gptq;
+    try { gptq = std::make_unique<DeviceBuffer>(gptq_bytes); }
+    catch (const std::exception&) { return {}; }
+    void* gptq_tmp = gptq->p;
     marlin_repack_w8g32(weight.qdata, weight.scales, n, k, gptq_tmp, entry.b_packed,
                         entry.scales, stream);
-    cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming);
-    cudaEventRecord(entry.ready, stream);
-    cudaEventSynchronize(entry.ready);
-    cudaFree(gptq_tmp);
-    g_bytes += b_bytes + s_bytes;
-    g_planes.emplace(weight.qdata, entry);
+    if (cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventRecord(entry.ready, stream) != cudaSuccess ||
+        cudaEventSynchronize(entry.ready) != cudaSuccess) { return {}; }
+    const auto stored_bytes = plane_storage_bytes(entry.storage.get());
+    g_planes.emplace(weight.qdata, std::move(entry));
+    g_bytes += stored_bytes;
     return {entry.b_packed, entry.scales};
 }
 
@@ -360,7 +312,7 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
         g_bytes + b_bytes + s_bytes > total_bytes / 4) {
-        // Global budget: planes duplicate the residency they accelerate, so a
+        // Per-device engine budget: planes duplicate the residency they accelerate, so a
         // large model would otherwise consume the memory the KV cache and the
         // decode graphs need and abort capture. A quarter of the card bounds
         // it; weights past the budget keep the engine's own kernels.
@@ -372,25 +324,22 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     }
 
     PlaneEntry entry;
-    void* gptq_tmp = nullptr;
-    if (cudaMalloc(&entry.b_packed, b_bytes) != cudaSuccess) { return {}; }
-    if (cudaMalloc(&entry.scales, s_bytes) != cudaSuccess) {
-        cudaFree(entry.b_packed);
-        return {};
-    }
-    if (cudaMalloc(&gptq_tmp, gptq_bytes) != cudaSuccess) {
-        cudaFree(entry.b_packed);
-        cudaFree(entry.scales);
-        return {};
-    }
+    entry.storage = try_plane_storage(b_bytes + s_bytes + 256);
+    if (!entry.storage) { return {}; }
+    entry.b_packed = entry.storage->alloc_bytes(b_bytes).data;
+    entry.scales = entry.storage->alloc_bytes(s_bytes).data;
+    std::unique_ptr<DeviceBuffer> gptq;
+    try { gptq = std::make_unique<DeviceBuffer>(gptq_bytes); }
+    catch (const std::exception&) { return {}; }
+    void* gptq_tmp = gptq->p;
     marlin_repack_fp8_row(weight.qdata, weight.scales, n, k, gptq_tmp, entry.b_packed,
                           entry.scales, stream);
-    cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming);
-    cudaEventRecord(entry.ready, stream);
-    cudaEventSynchronize(entry.ready);
-    cudaFree(gptq_tmp);
-    g_bytes += b_bytes + s_bytes;
-    g_planes.emplace(weight.qdata, entry);
+    if (cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventRecord(entry.ready, stream) != cudaSuccess ||
+        cudaEventSynchronize(entry.ready) != cudaSuccess) { return {}; }
+    const auto stored_bytes = plane_storage_bytes(entry.storage.get());
+    g_planes.emplace(weight.qdata, std::move(entry));
+    g_bytes += stored_bytes;
     return {entry.b_packed, entry.scales};
 }
 
@@ -437,16 +386,16 @@ void* marlin_fused_parent(std::size_t bytes, cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     (void)cudaStreamIsCapturing(stream, &status);
     if (status != cudaStreamCaptureStatusNone) { return nullptr; }
-    void* grown = nullptr;
-    if (cudaMalloc(&grown, bytes) != cudaSuccess) { return nullptr; }
+    auto grown = try_plane_storage(bytes);
+    if (!grown) { return nullptr; }
     if (g_fused_parent != nullptr) {
-        cudaStreamSynchronize(stream);
-        cudaFree(g_fused_parent);
-        g_bytes -= g_fused_parent_bytes;
+        if (cudaStreamSynchronize(stream) != cudaSuccess) { return nullptr; }
+        g_bytes -= plane_storage_bytes(scratch_state().fused_storage.get());
     }
-    g_fused_parent       = grown;
+    g_fused_parent = grown->base();
+    scratch_state().fused_storage = std::move(grown);
     g_fused_parent_bytes = bytes;
-    g_bytes += bytes;
+    g_bytes += plane_storage_bytes(scratch_state().fused_storage.get());
     return g_fused_parent;
 }
 

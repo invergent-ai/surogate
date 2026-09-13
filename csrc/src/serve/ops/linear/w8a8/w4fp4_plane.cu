@@ -4,6 +4,9 @@
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "core/device.h"
+#include "core/engine_context.h"
+#include "ops/linear/plane_storage.h"
+#include <atomic>
 #include "ops/linear/w8a8/w8fp8_plane.h"
 
 #include <cuda_bf16.h>
@@ -286,18 +289,28 @@ __global__ void w4fp4_act_quant_atom_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-struct PlaneEntry {
+struct PlaneEntry : PlaneStorage {
     std::uint8_t* codes   = nullptr;
     std::uint8_t* sf      = nullptr;
     std::uint8_t* sf_atom = nullptr;
     float* row_scales     = nullptr;
-    cudaEvent_t ready     = nullptr;
 };
 
-std::mutex g_mutex;
-std::size_t g_allocated_bytes = 0;
-std::unordered_map<const void*, PlaneEntry> g_planes;
-PrefillQuantMode g_mode = PrefillQuantMode::Fp8;
+struct DeviceState {
+    std::mutex mutex;
+    std::size_t bytes = 0;
+    std::unordered_map<const void*, PlaneEntry> planes;
+    std::unique_ptr<DeviceArena> alpha_one;
+};
+struct PlaneState : DevicePlaneStates<DeviceState> {
+    std::atomic<PrefillQuantMode> mode{PrefillQuantMode::Fp8};
+};
+PlaneState& plane_state() { return engine_slot<PlaneState>(); }
+DeviceState& device_state() { return plane_state().current(); }
+#define g_mutex (device_state().mutex)
+#define g_allocated_bytes (device_state().bytes)
+#define g_planes (device_state().planes)
+#define g_mode (plane_state().mode)
 
 constexpr std::size_t align16(std::size_t bytes) noexcept {
     return (bytes + 15u) & ~std::size_t{15u};
@@ -348,31 +361,21 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
     const std::size_t total         = code_bytes + sf_bytes + sf_atom_bytes + scale_bytes;
 
     std::size_t free_bytes = 0, total_bytes = 0;
-    const auto fail = [&](PlaneEntry entry) {
-        cudaFree(entry.codes);
-        cudaFree(entry.sf);
-        cudaFree(entry.sf_atom);
-        cudaFree(entry.row_scales);
-        if (entry.ready != nullptr) { cudaEventDestroy(entry.ready); }
+    const auto fail = [&] {
+        (void)cudaStreamSynchronize(stream);
         g_planes.emplace(weight.qdata, PlaneEntry{});
-        return W4Fp4Plane{nullptr, nullptr, nullptr};
+        return W4Fp4Plane{nullptr, nullptr, nullptr, nullptr};
     };
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < 2 * total) {
-        return fail(PlaneEntry{});
-    }
-
-    
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < 2 * total) { return fail(); }
     PlaneEntry entry;
-    if (cudaMalloc(&entry.codes, code_bytes) != cudaSuccess) { return fail(entry); }
-    if (cudaMalloc(&entry.sf, sf_bytes) != cudaSuccess) { return fail(entry); }
-    if (cudaMalloc(&entry.sf_atom, sf_atom_bytes) != cudaSuccess) { return fail(entry); }
-    if (cudaMemsetAsync(entry.sf_atom, 0, sf_atom_bytes, stream) != cudaSuccess) {
-        return fail(entry);
-    }
-    if (cudaMalloc(&entry.row_scales, scale_bytes) != cudaSuccess) { return fail(entry); }
-    if (cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming) != cudaSuccess) {
-        return fail(entry);
-    }
+    entry.storage = try_plane_storage(total + 3 * 256);
+    if (!entry.storage) { return fail(); }
+    entry.codes = static_cast<std::uint8_t*>(entry.storage->alloc_bytes(code_bytes).data);
+    entry.sf = static_cast<std::uint8_t*>(entry.storage->alloc_bytes(sf_bytes).data);
+    entry.sf_atom = static_cast<std::uint8_t*>(entry.storage->alloc_bytes(sf_atom_bytes).data);
+    entry.row_scales = static_cast<float*>(entry.storage->alloc_bytes(scale_bytes).data);
+    if (cudaMemsetAsync(entry.sf_atom, 0, sf_atom_bytes, stream) != cudaSuccess ||
+        cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming) != cudaSuccess) { return fail(); }
 
     w4fp4_derive_kernel<<<weight.n, kThreads, 0, stream>>>(
         static_cast<const std::int8_t*>(weight.qdata),
@@ -380,14 +383,15 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
         entry.row_scales, weight.k);
     if (cudaGetLastError() != cudaSuccess ||
         cudaEventRecord(entry.ready, stream) != cudaSuccess) {
-        return fail(entry);
+        return fail();
     }
 
     // The sizes just allocated, not a device-wide free-memory delta:
     // the delta counts every process on the card, and the graph budget
     // subtracts this from a measurement of its own.
-    g_allocated_bytes += code_bytes + sf_bytes + sf_atom_bytes + scale_bytes;
-    g_planes.emplace(weight.qdata, entry);
+    const auto stored_bytes = plane_storage_bytes(entry.storage.get());
+    g_planes.emplace(weight.qdata, std::move(entry));
+    g_allocated_bytes += stored_bytes;
     return {entry.codes, entry.sf, entry.row_scales, entry.sf_atom};
 }
 
@@ -420,14 +424,18 @@ W4Fp4AtomActivations w4fp4_act_quant_atom(const Tensor& x, void* workspace,
 }
 
 const float* w4fp4_alpha_one() {
-    static const float* device_one = [] {
-        float* p          = nullptr;
-        const float value = 1.0f;
-        if (cudaMalloc(&p, sizeof(float)) != cudaSuccess) { return static_cast<float*>(nullptr); }
-        cudaMemcpy(p, &value, sizeof(float), cudaMemcpyHostToDevice);
-        return p;
-    }();
-    return device_one;
+    auto& state = device_state();
+    const std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.alpha_one) {
+        auto storage = try_plane_storage(sizeof(float));
+        const float value = 1.0F;
+        if (!storage || cudaMemcpy(storage->base(), &value, sizeof(value), cudaMemcpyHostToDevice) != cudaSuccess) {
+            return nullptr;
+        }
+        state.alpha_one = std::move(storage);
+        state.bytes += plane_storage_bytes(state.alpha_one.get());
+    }
+    return static_cast<const float*>(state.alpha_one->base());
 }
 
 std::size_t w4fp4_cutlass_workspace_bytes(std::int32_t parent_rows, std::int32_t input_rows,

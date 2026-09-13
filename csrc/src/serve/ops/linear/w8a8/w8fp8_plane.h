@@ -20,7 +20,8 @@
 // clamping by construction). Quality class: FP8 per-row (vLLM-FP8-like),
 // prefill only.
 //
-// The registry is process-global and keyed by the device codes pointer.
+// Each engine/device owns its registry, keyed by the weight's codes pointer.
+// Its arenas participate in sleep and release their memory with the engine.
 // Derivation is opt-in: the engine enables it (w8fp8_plane_set_enabled) so
 // op tests keep int8-exact numerics by default. A VRAM guard skips
 // derivation (falling back to IMMA) when free memory is below twice the
@@ -43,7 +44,7 @@ struct W8Fp8Plane {
 void w8fp8_plane_set_enabled(bool enabled) noexcept;
 bool w8fp8_plane_enabled() noexcept;
 
-// Total device bytes held by derived planes (FP8 + FP4 registries). The
+// Bytes held by the current engine/device's derived planes, including VMM padding. The
 // engine's graph-preparation accounting subtracts this: planes carry their
 // own VRAM guard and are not graph memory.
 std::size_t w8_derived_plane_bytes() noexcept;

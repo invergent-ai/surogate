@@ -6,6 +6,9 @@
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "core/device.h"
+#include "core/engine_context.h"
+#include "ops/linear/plane_storage.h"
+#include <atomic>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -88,16 +91,26 @@ __global__ void w8fp8_act_quant_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-struct PlaneEntry {
+struct PlaneEntry : PlaneStorage {
     std::uint8_t* codes   = nullptr;
     float* row_scales     = nullptr;
-    cudaEvent_t ready     = nullptr;  // recorded on the deriving stream
 };
 
-std::mutex g_mutex;
-std::size_t g_allocated_bytes = 0;
-std::unordered_map<const void*, PlaneEntry> g_planes;
-bool g_enabled = false;
+struct DeviceState {
+    std::mutex mutex;
+    std::size_t bytes = 0;
+    std::unordered_map<const void*, PlaneEntry> planes;
+    int compute_capability = 0;
+};
+struct PlaneState : DevicePlaneStates<DeviceState> {
+    std::atomic<bool> enabled{false};
+};
+PlaneState& plane_state() { return engine_slot<PlaneState>(); }
+DeviceState& device_state() { return plane_state().current(); }
+#define g_mutex (device_state().mutex)
+#define g_allocated_bytes (device_state().bytes)
+#define g_planes (device_state().planes)
+#define g_enabled (plane_state().enabled)
 
 bool env_vetoed() {
     static const bool vetoed = [] {
@@ -114,14 +127,16 @@ void w8fp8_plane_set_enabled(bool enabled) noexcept { g_enabled = enabled; }
 namespace {
 // Cached compute capability of the current device (e.g. 89, 120).
 int device_cc() noexcept {
-    static const int cc = [] {
+    auto& state = device_state();
+    const std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.compute_capability == 0) {
         int dev = 0, major = 0, minor = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) { return 0; }
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        return major * 10 + minor;
-    }();
-    return cc;
+        state.compute_capability = major * 10 + minor;
+    }
+    return state.compute_capability;
 }
 } // namespace
 
@@ -182,19 +197,14 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     }
 
     PlaneEntry entry;
-    if (cudaMalloc(&entry.codes, code_bytes) != cudaSuccess) {
+    entry.storage = try_plane_storage(code_bytes + scale_bytes + 256);
+    if (!entry.storage) {
         g_planes.emplace(weight.qdata, PlaneEntry{});
         return {nullptr, nullptr};
     }
-    if (cudaMalloc(&entry.row_scales, scale_bytes) != cudaSuccess) {
-        cudaFree(entry.codes);
-        g_planes.emplace(weight.qdata, PlaneEntry{});
-        return {nullptr, nullptr};
-    }
-
+    entry.codes = static_cast<std::uint8_t*>(entry.storage->alloc_bytes(code_bytes).data);
+    entry.row_scales = static_cast<float*>(entry.storage->alloc_bytes(scale_bytes).data);
     if (cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming) != cudaSuccess) {
-        cudaFree(entry.codes);
-        cudaFree(entry.row_scales);
         g_planes.emplace(weight.qdata, PlaneEntry{});
         return {nullptr, nullptr};
     }
@@ -206,19 +216,18 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         static_cast<const __half*>(weight.scales), entry.codes, entry.row_scales, weight.k);
     if (cudaGetLastError() != cudaSuccess ||
         cudaEventRecord(entry.ready, stream) != cudaSuccess) {
-        cudaFree(entry.codes);
-        cudaFree(entry.row_scales);
-        cudaEventDestroy(entry.ready);
+        (void)cudaStreamSynchronize(stream);
         g_planes.emplace(weight.qdata, PlaneEntry{});
         return {nullptr, nullptr};
     }
 
-    // What this plane cost, from the sizes just allocated. A free-memory delta
-    // across the two cudaMalloc calls would be device-wide: another process
+    // What this plane cost, including VMM granularity when sleep is enabled. A free-memory delta
+    // across the allocation would be device-wide: another process
     // allocating in the window overstates it, freeing understates it, and the
     // graph budget subtracts this figure from a measurement of its own.
-    g_allocated_bytes += code_bytes + scale_bytes;
-    g_planes.emplace(weight.qdata, entry);
+    const auto stored_bytes = plane_storage_bytes(entry.storage.get());
+    g_planes.emplace(weight.qdata, std::move(entry));
+    g_allocated_bytes += stored_bytes;
     return {entry.codes, entry.row_scales};
 }
 

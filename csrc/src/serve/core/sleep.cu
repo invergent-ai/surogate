@@ -256,6 +256,12 @@ std::size_t sleep_owned_bytes(const void* owner, int device) noexcept {
     return bytes;
 }
 
+std::size_t sleep_allocation_bytes(const void* base) noexcept {
+    const std::lock_guard<std::mutex> lock(registry().mutex);
+    const auto found = registry().regions.find(const_cast<void*>(base));
+    return found == registry().regions.end() ? 0 : found->second.bytes;
+}
+
 void sleep_prepare_backups(const void* owner) {
     const std::lock_guard<std::mutex> lock(registry().mutex);
     for (auto& [base, region] : registry().regions) {

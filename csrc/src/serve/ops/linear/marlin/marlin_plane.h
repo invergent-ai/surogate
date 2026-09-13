@@ -3,7 +3,7 @@
 // Derived Marlin residency for W8G32 weights: the artifact stays W8G32 and
 // at first decode-band use the engine repacks a weight into the Marlin B
 // tile format plus permuted FP16 scales (see marlin_repack.h). Registry
-// discipline mirrors w8fp8_plane.h: process-global, keyed by the device
+// discipline mirrors w8fp8_plane.h: owned per engine and device, keyed by the
 // codes pointer, derive-on-first-use with a VRAM guard; a capturing stream
 // may look up a finished plane (the pre-capture batch-band warmup derives
 // and synchronizes it) but never derives. Shared per-call scratch (gemm
@@ -26,6 +26,7 @@ struct MarlinPlane {
 
 void marlin_plane_set_enabled(bool enabled) noexcept;
 bool marlin_plane_enabled() noexcept;
+// Current engine/device's planes and scratch, including VMM allocation padding.
 std::size_t marlin_plane_bytes() noexcept;
 
 MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream);

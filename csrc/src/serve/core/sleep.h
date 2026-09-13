@@ -47,6 +47,9 @@ void set_sleepable_allocations(bool enabled) noexcept;
 /// registered region -- the caller then owns freeing it the ordinary way.
 bool sleep_free(void* base) noexcept;
 
+/// Physical allocation size, including VMM granularity, or zero for an ordinary allocation.
+[[nodiscard]] std::size_t sleep_allocation_bytes(const void* base) noexcept;
+
 /// Change a registered region's tag (startup only, before the first sleep).
 void sleep_tag_region(const void* base, SleepTag tag);
 

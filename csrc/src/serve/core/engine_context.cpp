@@ -1,4 +1,5 @@
 #include "core/engine_context.h"
+#include "core/sleep.h"
 
 #include <atomic>
 #include <cstdio>
@@ -9,6 +10,10 @@ namespace {
 thread_local EngineOpsContext* t_context = nullptr;
 
 EngineOpsContext& default_context() {
+    // Its arenas can be released during static teardown. Construct the sleep
+    // registry first so it remains alive until after this context is destroyed.
+    static const bool registry_ready = [] { (void)sleep_owned_bytes(nullptr); return true; }();
+    (void)registry_ready;
     static EngineOpsContext instance;
     return instance;
 }
