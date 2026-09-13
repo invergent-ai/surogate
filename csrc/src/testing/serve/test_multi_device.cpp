@@ -1,6 +1,7 @@
 // Opt-in: SUROGATE_MULTI_DEVICE_TEST_ARTIFACT. DEVICES is a colon-separated list;
 // the default 0:0 exercises serial pipeline stages on one physical test GPU.
 #include "serve/generation_service.h"
+#include "core/device.h"
 
 #include <cassert>
 #include <cmath>
@@ -191,6 +192,18 @@ int main() {
         }
     }
     std::vector<sinfer::TokenId> expected, expected_turn;
+    const auto shrink_from_other_thread = [&](GenerationService& service) {
+        for (int caller : devices) {
+            auto shrink = std::async(std::launch::async, [&service, caller] {
+                CUDA_CHECK(cudaSetDevice(caller));
+                service.shrink_kv();
+                int after = -1;
+                CUDA_CHECK(cudaGetDevice(&after));
+                assert(after == caller && "KV shrink changed the caller's CUDA device");
+            });
+            shrink.get();
+        }
+    };
     const auto continue_turn = [&](GenerationService& service) {
         auto prepared = service.prepare(continued);
         auto result = service.run(prepared, nullptr);
@@ -200,7 +213,9 @@ int main() {
         return result.completion_token_ids;
     };
     {
-        GenerationService baseline(options);
+        auto baseline_options = options;
+        baseline_options.device = devices.back();
+        GenerationService baseline(baseline_options);
         expected = generate(baseline);
         assert(!expected.empty() && expected.size() <= request.max_tokens);
         if (!vision) { assert(expected.size() == 128); }
@@ -225,6 +240,7 @@ int main() {
             }
             expected_turn = continue_turn(baseline);
         }
+        shrink_from_other_thread(baseline);
     }
     if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_SINGLE_ONLY")) {
         return 0;
@@ -245,6 +261,7 @@ int main() {
     if (cache_turn) {
         assert(continue_turn(pipeline) == expected_turn);
     }
+    shrink_from_other_thread(pipeline);
     const auto footprint = pipeline.resident_bytes();
     std::size_t sum = 0;
     for (int device : pipeline.devices()) {

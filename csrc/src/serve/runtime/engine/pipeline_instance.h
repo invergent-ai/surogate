@@ -346,7 +346,10 @@ public:
         return stages_.front()->program->kv_occupancy();
     }
     void kv_settle() noexcept {
-        for (Stage* stage : stages_) { stage->program->kv_settle(); }
+        for (std::size_t s = 0; s < stages_.size(); ++s) {
+            select(s);
+            stages_[s]->program->kv_settle();
+        }
     }
     [[nodiscard]] bool kv_under_pressure() const noexcept {
         for (Stage* stage : stages_) {

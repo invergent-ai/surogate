@@ -40,7 +40,8 @@ struct DeviceContext {
 /// an engine's memory outside its executor needs one of these.
 class ScopedDevice {
 public:
-    explicit ScopedDevice(int device);
+    // restore_always also restores scopes whose body selects other devices.
+    explicit ScopedDevice(int device, bool restore_always = false);
     ~ScopedDevice();
 
     ScopedDevice(const ScopedDevice&)            = delete;

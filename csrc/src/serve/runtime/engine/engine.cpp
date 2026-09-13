@@ -582,6 +582,7 @@ ops::LoraStoreSet& Engine::lora_stores() { return impl_->ops_context.slot<ops::L
 int Engine::device() const { return impl_->device.device; }
 
 void Engine::shrink_kv() {
+    const ScopedDevice on_engine_device(impl_->device.device, /*restore_always=*/true);
     std::visit(
         [](auto& executor) {
             using Executor = std::remove_cvref_t<decltype(executor)>;

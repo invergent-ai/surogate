@@ -80,12 +80,13 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     load_stream = load;
 }
 
-ScopedDevice::ScopedDevice(int device) {
+ScopedDevice::ScopedDevice(int device, bool restore_always) {
     int current = 0;
     CUDA_CHECK(cudaGetDevice(&current));
+    previous_ = current;
+    restore_ = restore_always;
     if (current == device) { return; }
     CUDA_CHECK(cudaSetDevice(device));
-    previous_ = current;
     restore_  = true;
 }
 
