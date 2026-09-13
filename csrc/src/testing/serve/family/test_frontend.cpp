@@ -1763,6 +1763,85 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+int test_media_cancelled_producer_drains() {
+    int failures = 0;
+    for (const bool deadline : {false, true}) {
+        fi::MediaPreprocessCache cache(1ULL << 20, 2ULL << 20, 1);
+        std::promise<void> started, release;
+        auto release_future = release.get_future().share();
+        std::atomic<bool> cancel{false}, finished{false};
+        sinfer::PreparationControl control;
+        control.cancellation = sinfer::CancellationView([&] { return cancel.load(); });
+        if (deadline) { control.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200); }
+        auto request = std::async(std::launch::async, [&] {
+            fi::MediaCacheRequestStats stats;
+            try {
+                (void)cache.get_or_prepare({}, control, [&]() -> fi::PreparedMedia {
+                    started.set_value();
+                    release_future.wait();
+                    finished = true;
+                    // A builder failure during the drain must not replace the
+                    // cancellation/deadline error that ended the request.
+                    throw std::runtime_error("worker stopped");
+                }, stats);
+            } catch (const sinfer::RequestError& error) {
+                return std::pair{error.kind(), finished.load()};
+            }
+            return std::pair{sinfer::RequestErrorKind::Unavailable, false};
+        });
+        started.get_future().wait();
+        if (!deadline) { cancel = true; }
+        const auto limit = deadline ? control.deadline + std::chrono::milliseconds(100)
+                                    : std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        const bool drained = request.wait_until(limit) == std::future_status::timeout;
+        release.set_value();
+        const auto [kind, worker_finished] = request.get();
+        failures += check(drained && worker_finished,
+                          "cancelled media producer returned before its worker stopped");
+        failures += check(kind == (deadline ? sinfer::RequestErrorKind::QueueTimeout
+                                           : sinfer::RequestErrorKind::Cancelled),
+                          "media drain replaced the original request error");
+    }
+    return failures;
+}
+
+int test_media_cancelled_waiter_does_not_drain_another_request() {
+    fi::MediaPreprocessCache cache(1ULL << 20, 2ULL << 20, 1);
+    std::promise<void> started, release;
+    auto release_future = release.get_future().share();
+    auto pending = cache.begin_prepare({}, {}, [&] {
+        started.set_value();
+        release_future.wait();
+        return fi::PreparedMedia{{}, cache.allocate_payload(1, {})};
+    });
+    started.get_future().wait();
+    std::atomic<bool> cancel{false};
+    sinfer::PreparationControl control{
+        .cancellation = sinfer::CancellationView([&] { return cancel.load(); })};
+    auto waiter = std::async(std::launch::async, [&] {
+        fi::MediaCacheRequestStats stats;
+        try {
+            (void)cache.get_or_prepare({}, control, []() -> fi::PreparedMedia {
+                throw std::runtime_error("waiter must not build");
+            }, stats);
+        } catch (const sinfer::RequestError& error) {
+            return error.kind() == sinfer::RequestErrorKind::Cancelled;
+        }
+        return false;
+    });
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (cache.stats().singleflight_waits == 0 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::yield();
+    }
+    cancel = true;
+    const bool prompt = waiter.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
+    release.set_value();
+    const bool cancelled = waiter.get();
+    fi::MediaCacheRequestStats stats;
+    (void)cache.await(pending, {}, stats);
+    return check(prompt && cancelled, "cancelled media waiter waited for another request's worker");
+}
+
 } // namespace
 
 int main() {
@@ -1800,6 +1879,8 @@ int main() {
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
+    failures += test_media_cancelled_producer_drains();
+    failures += test_media_cancelled_waiter_does_not_drain_another_request();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
 }

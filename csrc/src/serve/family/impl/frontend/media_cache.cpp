@@ -370,7 +370,19 @@ PreparedMedia MediaPreprocessCache::get_or_prepare(const MediaCacheKey& key,
                                                    const PreparationControl& control,
                                                    Builder builder,
                                                    MediaCacheRequestStats& request_stats) {
-    return await(begin_prepare(key, control, std::move(builder)), control, request_stats);
+    const auto pending = begin_prepare(key, control, std::move(builder));
+    try {
+        return await(pending, control, request_stats);
+    } catch (...) {
+        if (pending.disposition == MediaCacheDisposition::Producer) {
+            // The builder and cancellation predicate may borrow this caller's
+            // stack. Keep it alive until its worker stops, including when the
+            // request is cancelled before the queued builder starts running.
+            MediaCacheRequestStats discarded;
+            try { (void)await(pending, {}, discarded); } catch (...) {}
+        }
+        throw;
+    }
 }
 
 PreparedMedia MediaPreprocessCache::await(const PendingMedia& pending,
