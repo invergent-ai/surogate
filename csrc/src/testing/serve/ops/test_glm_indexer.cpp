@@ -159,7 +159,77 @@ void tiled_selection() {
     ops::glm_indexer_select(q, weights, positions, rows, Tensor{}, 1, g, cache, length, workspace, mask, nullptr);
     const auto result = from_device<unsigned>(dm, words * queries);
     for (int r = 0; r < queries; ++r) for (int w = 0; w < words; ++w)
-        expect(result[r * words + w] == (w == 0 ? 255U : 0U), "selection scratch tile boundary changed ties");
+            expect(result[r * words + w] == (w == 0 ? 255U : 0U), "selection scratch tile boundary changed ties");
+}
+void decode_history() {
+    // Decode's parallel history scoring must produce exactly the prefill path's masks,
+    // including when a captured 1M-token profile replays at a much shorter position.
+    constexpr int dim = 128, heads = 32, keys = 1048576, length = 32768, reference_rows = 33;
+    const ops::GlmIndexerGeometry g{dim, heads, 4, 2048, 1e-6F};
+    const int words = ops::qsa_block_mask_words(keys, g.block);
+    std::vector<int> tables(keys / 64, -1);
+    for (int p = 0; p < length / 64; ++p) { tables[p] = (p * 17) % (length / 64); }
+    std::vector<float> cache(length * 3 * dim), q(dim * heads * reference_rows), weights(heads * reference_rows);
+    fill_uniform(cache, 119, -1, 1);
+    std::vector<float> query(dim * heads), signed_weights(heads);
+    fill_uniform(query, 129, -1, 1); fill_uniform(signed_weights, 139, -1, 1);
+    for (int r = 0; r < reference_rows; ++r) {
+        std::copy(query.begin(), query.end(), q.begin() + r * dim * heads);
+    }
+    auto dc = to_device(cache), dt = to_device(tables), dq = to_device(q), dw = to_device(weights),
+         dp = to_device(std::vector<int>(reference_rows, 0)),
+         dr = to_device(std::vector<int>(reference_rows, 0)),
+         dv = to_device(std::vector<int>(reference_rows, 1));
+    DeviceBuffer decoded(words * 4), reference(words * reference_rows * 4);
+    PagedKVBatchLayerView kv;
+    kv.indexer_pages = Tensor(dc.p, DType::FP32, {3 * dim, 64, 1, length / 64});
+    kv.block_tables = Tensor(dt.p, DType::I32, {keys / 64, 1});
+    Tensor qt(dq.p, DType::FP32, {dim, heads, reference_rows}), wt(dw.p, DType::FP32, {heads, reference_rows}),
+           pos(dp.p, DType::I32, {reference_rows}), rows(dr.p, DType::I32, {reference_rows}),
+           valid(dv.p, DType::I32, {reference_rows}), mask(decoded.p, DType::I32, {words, 1}),
+           expected(reference.p, DType::I32, {words, reference_rows});
+    WorkspaceArena workspace(ops::glm_indexer_select_workspace_capacity_bytes(reference_rows, keys, g));
+    cudaStream_t stream; cuda_check(cudaStreamCreate(&stream), "decode stream");
+    auto run = [&] {
+        ops::glm_indexer_select(qt.slice(2, 0, 1), wt.slice(1, 0, 1), pos.slice(0, 0, 1),
+            rows.slice(0, 0, 1), valid.slice(0, 0, 1), 1, g, kv, keys, workspace, mask, stream);
+    };
+    run(); cuda_synchronize(stream);
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "decode capture"); run();
+    cuda_check(cudaStreamEndCapture(stream, &graph), "end decode capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate decode");
+    for (int mode = 0; mode < 3; ++mode) {
+        for (int r = 0; r < reference_rows; ++r) for (int h = 0; h < heads; ++h) {
+            weights[r * heads + h] = mode == 0 ? signed_weights[h]
+                : mode == 1 ? 0.F : -std::abs(signed_weights[h]);
+        }
+        dw.copy_from_host(weights.data(), dw.bytes);
+        for (int visible : {127, 2048, 2051, 21003, 23100, length, 0, 4099}) {
+            std::vector<int> positions(reference_rows, visible - 1), validity(reference_rows, visible != 0);
+            dp.copy_from_host(positions.data(), dp.bytes); dv.copy_from_host(validity.data(), dv.bytes);
+            cuda_check(cudaGraphLaunch(exec, stream), "decode replay");
+            ops::glm_indexer_select(qt, wt, pos, rows, valid, 1, g, kv, keys, workspace, expected, stream);
+            cuda_synchronize(stream);
+            const auto got = from_device<unsigned>(decoded, words);
+            const auto ref = from_device<unsigned>(reference, words * reference_rows);
+            expect(std::equal(got.begin(), got.end(), ref.begin()), "decode and prefill pool masks differ");
+            unsigned selected = 0;
+            for (unsigned word : got) { selected += __builtin_popcount(word); }
+            expect(selected == std::min(visible / g.block, g.top_k / g.block) + (visible % g.block != 0),
+                   "decode changed selection budget or incomplete tail");
+            if (mode == 1) {
+                for (int b = 0; b < words * 32; ++b) {
+                    const bool wanted = b < std::min(visible / g.block, g.top_k / g.block) ||
+                        (visible % g.block && b == visible / g.block);
+                    expect(bool((got[b / 32] >> (b % 32)) & 1) == wanted, "decode changed exact-tie ordering");
+                }
+            }
+        }
+    }
+    cuda_check(cudaGraphExecDestroy(exec), "destroy decode exec");
+    cuda_check(cudaGraphDestroy(graph), "destroy decode graph");
+    cuda_check(cudaStreamDestroy(stream), "destroy decode stream");
 }
 void projection(int k = 96, int n = 39, int tokens = 7) {
     std::vector<float> w(k * n), x(k * tokens);
@@ -181,6 +251,7 @@ int main() {
     tiled_selection();
     exercise(64, 4, 8, 128, 301);
     exercise(128, 32, 4, 2048, 4099);
+    decode_history();
     const ops::GlmIndexerGeometry g{128, 32, 4, 2048, 1e-6F};
     expect(ops::glm_indexer_select_workspace_capacity_bytes(4096, 1048576, g) <= (64ULL << 20) + 256,
            "long-context scratch exceeded bound");

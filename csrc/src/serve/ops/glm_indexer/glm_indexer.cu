@@ -114,6 +114,41 @@ __device__ unsigned ordered(float value) {
     const unsigned bits = __float_as_uint(value == 0 ? 0.F : value);
     return bits & 0x80000000U ? ~bits : bits ^ 0x80000000U;
 }
+__device__ float pool_score(const float* q, const float* weights, const float* cache,
+    const int* table, int row, int b, int dim, int heads, int pool, float scale) {
+    const int lane = threadIdx.x % 32;
+    const float* key = cache + offset(table, b * pool, dim) + 2 * dim;
+    float total = 0;
+    for (int h = 0; h < heads; ++h) {
+        const float* query = q + (static_cast<long long>(row) * heads + h) * dim;
+        float dot = 0;
+        for (int d = lane; d < dim; d += 32) { dot = fmaf(query[d], key[d], dot); }
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) { total = fmaf(fmaxf(dot, 0.F), weights[row * heads + h] * scale, total); }
+    }
+    return total;
+}
+
+// Decode has too few queries to occupy the GPU with one CTA per query. Distribute
+// each query's history across CTAs, retaining the original per-pool reduction order.
+__global__ void score_kernel(const float* q, const float* weights, const int* positions,
+    const int* rows, const int* valid, int width, int first_row, const int* tables, int stride,
+    const float* cache, float* scores, int score_stride, int dim, int heads, int pool, int budget) {
+    const int row = first_row + blockIdx.y;
+    if (!valid_column(row, width, valid)) { return; }
+    const int complete = (positions[row] + 1) / pool;
+    if (complete <= budget) { return; }
+    const int* table = tables + static_cast<long long>(rows[row / width]) * stride;
+    float* local_scores = scores + static_cast<long long>(blockIdx.y) * score_stride;
+    const float scale = rsqrtf(static_cast<float>(dim * heads));
+    for (int b = blockIdx.x * kWarps + threadIdx.x / 32;
+         b < complete; b += gridDim.x * kWarps) {
+        const float total = pool_score(q, weights, cache, table, row, b, dim, heads, pool, scale);
+        if (threadIdx.x % 32 == 0) { local_scores[b] = total; }
+    }
+}
+
+template <bool Precomputed>
 __global__ void select_kernel(const float* q, const float* weights, const int* positions,
     const int* rows, const int* valid, int width, int first_row, const int* tables, int stride,
     const float* cache, unsigned* masks, float* scores, int score_stride, int words,
@@ -133,18 +168,12 @@ __global__ void select_kernel(const float* q, const float* weights, const int* p
         return;
     }
     float* local_scores = scores + static_cast<long long>(blockIdx.x) * score_stride;
-    const float scale = rsqrtf(static_cast<float>(dim * heads));
-    for (int b = warp; b < complete; b += kWarps) {
-        const float* key = cache + offset(table, b * pool, dim) + 2 * dim;
-        float total = 0;
-        for (int h = 0; h < heads; ++h) {
-            const float* query = q + (static_cast<long long>(row) * heads + h) * dim;
-            float dot = 0;
-            for (int d = lane; d < dim; d += 32) { dot = fmaf(query[d], key[d], dot); }
-            dot = warp_reduce_sum(dot);
-            if (lane == 0) { total = fmaf(fmaxf(dot, 0.F), weights[row * heads + h] * scale, total); }
+    if constexpr (!Precomputed) {
+        const float scale = rsqrtf(static_cast<float>(dim * heads));
+        for (int b = warp; b < complete; b += kWarps) {
+            const float total = pool_score(q, weights, cache, table, row, b, dim, heads, pool, scale);
+            if (lane == 0) { local_scores[b] = total; }
         }
-        if (lane == 0) { local_scores[b] = total; }
     }
     __syncthreads();
     __shared__ unsigned threshold;
@@ -240,13 +269,30 @@ void glm_indexer_select(const Tensor& q, const Tensor& head_weights, const Tenso
     auto scope = workspace.scope();
     auto scores = workspace.alloc(DType::FP32, {blocks, tile});
     for (int first = 0; first < tokens; first += tile) {
-        select_kernel<<<std::min(tile, tokens - first), kThreads, 0, stream>>>(
-            static_cast<const float*>(q.data), static_cast<const float*>(head_weights.data),
-            static_cast<const int*>(positions.data), static_cast<const int*>(tables.data),
-            static_cast<const int*>(valid.data), width, first,
-            static_cast<const int*>(cache.block_tables.data), cache.block_tables.ne[0],
-            static_cast<const float*>(cache.indexer_pages.data), static_cast<unsigned*>(mask.data),
-            static_cast<float*>(scores.data), blocks, words, g.head_dim, g.heads, g.block, g.top_k / g.block);
+        const int count = std::min(tile, tokens - first);
+        const auto launch = [&]<bool Parallel>() {
+            if constexpr (Parallel) {
+                // Bound launch size by occupancy, not the graph's maximum context: replay
+                // reads actual positions and strides over only the history currently visible.
+                const int score_ctas = std::min((blocks + kWarps - 1) / kWarps, std::max(1, 256 / count));
+                score_kernel<<<dim3(score_ctas, count), kThreads, 0, stream>>>(
+                    static_cast<const float*>(q.data), static_cast<const float*>(head_weights.data),
+                    static_cast<const int*>(positions.data), static_cast<const int*>(tables.data),
+                    static_cast<const int*>(valid.data), width, first,
+                    static_cast<const int*>(cache.block_tables.data), cache.block_tables.ne[0],
+                    static_cast<const float*>(cache.indexer_pages.data), static_cast<float*>(scores.data),
+                    blocks, g.head_dim, g.heads, g.block, g.top_k / g.block);
+            }
+            select_kernel<Parallel><<<count, kThreads, 0, stream>>>(
+                static_cast<const float*>(q.data), static_cast<const float*>(head_weights.data),
+                static_cast<const int*>(positions.data), static_cast<const int*>(tables.data),
+                static_cast<const int*>(valid.data), width, first,
+                static_cast<const int*>(cache.block_tables.data), cache.block_tables.ne[0],
+                static_cast<const float*>(cache.indexer_pages.data), static_cast<unsigned*>(mask.data),
+                static_cast<float*>(scores.data), blocks, words, g.head_dim, g.heads, g.block, g.top_k / g.block);
+        };
+        if (tokens <= 32) { launch.template operator()<true>(); }
+        else { launch.template operator()<false>(); }
     }
     CUDA_CHECK(cudaGetLastError());
 }
