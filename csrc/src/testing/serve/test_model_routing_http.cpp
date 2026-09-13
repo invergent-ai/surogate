@@ -102,6 +102,20 @@ int main() {
     assert(primary.lora_slot("shared") < 0 && extra.lora_slot("shared") < 0);
     assert(post("/v1/load_lora_adapter", {{"lora_name", "primary-adapter"}, {"lora_path", adapter}})->status == 200);
     assert(post("/v1/load_lora_adapter?model=extra", {{"lora_name", "extra-adapter"}, {"lora_path", adapter}})->status == 200);
+    for (bool explicit_name : {false, true}) {
+        auto collision_options = options;
+        collision_options.model_id_override.reset();
+        const std::string name = explicit_name ? "primary-adapter" :
+            resolve_public_model_id(collision_options, primary.load_summary().model_id);
+        if (explicit_name) { collision_options.model_id_override = name; }
+        else { primary.load_lora_adapter(name, adapter); }
+        HttpServer collision(collision_options);
+        try { collision.attach(primary); assert(false && "served model collides with a loaded adapter"); }
+        catch (const std::invalid_argument& error) {
+            assert(std::string(error.what()).find("collides with an adapter") != std::string::npos);
+        }
+        if (!explicit_name) { primary.unload_lora_adapter(name); }
+    }
     httplib::Client catalog_client("127.0.0.1", options.port);
     auto listing = catalog_client.Get("/v1/models");
     assert(listing && listing->status == 200);

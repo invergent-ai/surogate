@@ -639,7 +639,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!options.lora_modules.empty() && !options.enable_lora) {
         throw std::invalid_argument("--lora-modules needs --enable-lora");
     }
-    if (!options.extra_models.empty()) {
+    {
         std::vector<std::string> names;
         for (const auto& extra : options.extra_models) {
             if (extra.max_num_seqs > kMaximumConcurrency) {

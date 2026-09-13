@@ -29,6 +29,15 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"sinfer-serve", "model.sinfer"});
+    for (bool extra : {false, true}) {
+        std::vector<std::string> args{"sinfer-serve", "model.sinfer", "--served-model-name", "tuned",
+                                      "--enable-lora", "--lora-modules", "tuned=/adapters/tuned"};
+        if (extra) { args.insert(args.end(), {"--model", "other=other.sinfer"}); }
+        bool rejected = false;
+        try { (void)parse(args); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "base model and adapter name collision was accepted");
+    }
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     for (const auto* removed : {"--rewrite-checkpoints", "--no-rewrite-checkpoints"}) {
         bool rejected = false;

@@ -1438,7 +1438,11 @@ void HttpServer::attach(GenerationService& service) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     const sinfer::LoadSummary load = service.load_summary();
-    public_model_id_               = resolve_public_model_id(options_, load.model_id);
+    const auto id = resolve_public_model_id(options_, load.model_id);
+    if (service.lora_slot(id) >= 0) {
+        throw std::invalid_argument("served model id '" + id + "' collides with an adapter name");
+    }
+    public_model_id_               = id;
     service_                       = &service;
     const sinfer::MemorySummary memory = service.memory_summary();
     device_                            = memory.device;
