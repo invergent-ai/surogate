@@ -157,12 +157,13 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
     const std::size_t bf16 = sizeof(std::uint16_t);
     const std::size_t arena_bytes =
         bf16 * tokens *
-            (6 * static_cast<std::size_t>(config.hidden) +      // x, h, attn_out, mlp_out, spare
+            (3 * static_cast<std::size_t>(config.hidden) +      // x, h, attn
              2 * static_cast<std::size_t>(config.intermediate) + // gate, up
-             static_cast<std::size_t>(config.query_size()) + 2 * static_cast<std::size_t>(config.head_dim)) +
-        // pooled (FP32) and the head's output
-        sizeof(float) * static_cast<std::size_t>(config.hidden) +
-        bf16 * 2 * static_cast<std::size_t>(config.hidden) + (1u << 20);
+             2 * static_cast<std::size_t>(config.query_size()) + // query, attn_out
+             2 * static_cast<std::size_t>(config.head_dim)) +   // key, value
+        // One pooled FP32 column, pooled BF16 column and projected BF16 column
+        // per sequence. A batch can contain one sequence per token.
+        (sizeof(float) + bf16 * 2) * static_cast<std::size_t>(config.hidden) * tokens + (1u << 20);
     impl.arena = std::make_unique<DeviceArena>(arena_bytes);
 
     // Attention is per-sequence, so the score matrix is sized by the longest

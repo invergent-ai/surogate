@@ -142,3 +142,24 @@ def test_batch_and_text_input(encoder):
     for text in ["Hello", ["Hello", "World"]]:
         response = post(encoder, input=text, dimensions=128)
         assert response.ok, response.text
+
+
+def test_many_single_token_sequences(encoder, request):
+    if request.node.callspec.params["encoder"] != "gpu":
+        pytest.skip("GPU arena regression")
+    expected = vector(post(encoder, input=[42], dimensions=128))
+    # Fill the entire batch budget, then cross it to exercise chunking. These
+    # requests previously exhausted the arena when allocating the output head.
+    for count in (7000, 8193):
+        response = post(encoder, input=[[42]] * count, dimensions=128)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["usage"]["prompt_tokens"] == count
+        assert len(body["data"]) == count
+        for index, item in enumerate(body["data"]):
+            assert item["index"] == index
+            actual = item["embedding"]
+            assert len(actual) == len(expected)
+            assert sum(v * v for v in actual) == pytest.approx(1.0, abs=1e-5)
+            # BF16 projections select different kernels for a wide batch.
+            assert sum(a * b for a, b in zip(actual, expected)) > 0.995
