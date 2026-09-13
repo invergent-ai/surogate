@@ -66,7 +66,8 @@ std::size_t HostBankPlan::total_bytes() const noexcept {
     return total;
 }
 
-HostBank::HostBank(const HostBankPlan& plan) {
+// Delegation makes the bank destructor run if filling a later object throws.
+HostBank::HostBank(const HostBankPlan& plan) : HostBank() {
     objects_.reserve(plan.objects.size());
     // The bank is filled object by object, and each one is a whole layer's routed experts, so
     // the byte count moves in steps a reader can see. Reported before the first copy as well,
@@ -77,13 +78,20 @@ HostBank::HostBank(const HostBankPlan& plan) {
     };
     report(0);
     for (const auto& source : plan.objects) {
+        if (source.decode_rows != 0 && (source.decode_rows < 0 || source.decode_k <= 0 || source.decode_k % 32 != 0)) {
+            throw std::invalid_argument("host bank object " + source.name +
+                                        " requires positive rows and a decode width divisible by 32");
+        }
         const bool q4 = source.q4_rows > 0;
         const bool q5 = source.q5_rows > 0;
         const ops::Q4BankPlanes q4_planes =
             q4 ? ops::q4_bank_planes(source.q4_rows, source.q4_k) : ops::Q4BankPlanes{};
         const ops::Q5BankPlanes q5_planes =
             q5 ? ops::q5_bank_planes(source.q5_rows, source.q5_k) : ops::Q5BankPlanes{};
-        HostObject object;
+        // Own each allocation before starting work so worker errors release this
+        // object as well as the ones filled earlier in the same load.
+        objects_.emplace_back(source.handle.index, HostObject{});
+        HostObject& object = objects_.back().second;
         object.planes = q4 ? BankPlanes::Q4 : q5 ? BankPlanes::Q5
                            : source.decode_rows != 0 ? BankPlanes::W8 : BankPlanes::Native;
         object.bytes = q4 ? q4_planes.total_bytes : object_bytes(source);
@@ -107,6 +115,8 @@ HostBank::HostBank(const HostBankPlan& plan) {
             void* mem = ::mmap(nullptr, object.bytes, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (mem != MAP_FAILED) {
+                const auto unmap = [bytes = object.bytes](void* pointer) { (void)::munmap(pointer, bytes); };
+                std::unique_ptr<void, decltype(unmap)> mapping(mem, unmap);
 #if defined(SINFER_HOST_BANK_NUMA)
                 if (numa_available() >= 0 && numa_num_configured_nodes() > 1) {
                     (void)::mbind(mem, object.bytes, MPOL_INTERLEAVE, numa_all_nodes_ptr->maskp,
@@ -116,7 +126,7 @@ HostBank::HostBank(const HostBankPlan& plan) {
                 {
                     const std::size_t touch_workers = std::max<std::size_t>(
                         16, std::thread::hardware_concurrency() / 2);
-                    std::vector<std::thread> touchers;
+                    std::vector<std::jthread> touchers;
                     touchers.reserve(touch_workers);
                     const std::size_t chunk =
                         (object.bytes + touch_workers - 1) / touch_workers;
@@ -135,9 +145,9 @@ HostBank::HostBank(const HostBankPlan& plan) {
                     cudaSuccess) {
                     object.host       = mem;
                     object.registered = true;
+                    (void)mapping.release();
                 } else {
                     (void)cudaGetLastError();
-                    (void)::munmap(mem, object.bytes);
                 }
             }
         }
@@ -165,7 +175,7 @@ HostBank::HostBank(const HostBankPlan& plan) {
         else {
             for (const auto part : source.parts) { advise(part); }
         }
-        std::vector<std::thread> threads;
+        std::vector<std::jthread> threads;
         if (source.q8_rows != 0) {
             // The loader rearranges this object on the way to the card, so the bank has to hold
             // what the card would have held, not what the file holds. It runs the loader's own
@@ -284,11 +294,13 @@ HostBank::HostBank(const HostBankPlan& plan) {
             const std::size_t workers = std::max<std::size_t>(16, std::thread::hardware_concurrency());
             const std::int64_t chunk  = (rows + static_cast<std::int64_t>(workers) - 1) /
                                        static_cast<std::int64_t>(workers);
+            std::vector<std::future<void>> jobs;
+            jobs.reserve(workers);
             for (std::size_t w = 0; w < workers; ++w) {
                 const std::int64_t begin = static_cast<std::int64_t>(w) * chunk;
                 if (begin >= rows) { break; }
                 const std::int64_t end = std::min(rows, begin + chunk);
-                threads.emplace_back([=, stretches, first_row, &source] {
+                jobs.push_back(std::async(std::launch::async, [=, &source] {
                     std::vector<std::int8_t> row_codes(q4 ? static_cast<std::size_t>(k) : 0);
                     std::vector<std::uint16_t> row_scales(q4 ? static_cast<std::size_t>(k / 32) : 0);
                     std::size_t part = 0;
@@ -332,8 +344,9 @@ HostBank::HostBank(const HostBankPlan& plan) {
                                 q4_dst_scales + group0, q4_dst_mins + group0);
                         }
                     }
-                });
+                }));
             }
+            for (auto& job : jobs) { job.get(); }
         } else if (q4) {
             // Requantise while copying: every worker owns a contiguous group range of the
             // parallel (row, k-group) order, reading the W8 codes and scales planes and
@@ -390,7 +403,6 @@ HostBank::HostBank(const HostBankPlan& plan) {
         }
         for (auto& thread : threads) { thread.join(); }
         total_bytes_ += object.bytes;
-        objects_.emplace_back(source.handle.index, object);
         report(total_bytes_);
     }
     report(planned);

@@ -7,6 +7,7 @@
 #include "core/device.h"
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <dlfcn.h>
@@ -23,6 +24,33 @@ using artifact::StorageLayout;
 namespace {
 struct Advice { void* address; std::size_t bytes; int kind; };
 thread_local std::vector<Advice>* recorded_advice = nullptr;
+std::atomic<int> live_pinned{0};
+}
+
+extern "C" cudaError_t CUDARTAPI cudaHostRegister(void* pointer, std::size_t bytes, unsigned flags) {
+    static const auto real = reinterpret_cast<decltype(&cudaHostRegister)>(dlsym(RTLD_NEXT, "cudaHostRegister"));
+    const auto result = real(pointer, bytes, flags);
+    if (result == cudaSuccess) { ++live_pinned; }
+    return result;
+}
+extern "C" cudaError_t CUDARTAPI cudaHostUnregister(void* pointer) {
+    static const auto real = reinterpret_cast<decltype(&cudaHostUnregister)>(dlsym(RTLD_NEXT, "cudaHostUnregister"));
+    const auto result = real(pointer);
+    if (result == cudaSuccess) { --live_pinned; }
+    return result;
+}
+extern "C" cudaError_t CUDARTAPI cudaHostAlloc(void** pointer, std::size_t bytes, unsigned flags) {
+    using Allocate = cudaError_t(CUDARTAPI*)(void**, std::size_t, unsigned);
+    static const auto real = reinterpret_cast<Allocate>(dlsym(RTLD_NEXT, "cudaHostAlloc"));
+    const auto result = real(pointer, bytes, flags);
+    if (result == cudaSuccess) { ++live_pinned; }
+    return result;
+}
+extern "C" cudaError_t CUDARTAPI cudaFreeHost(void* pointer) {
+    static const auto real = reinterpret_cast<decltype(&cudaFreeHost)>(dlsym(RTLD_NEXT, "cudaFreeHost"));
+    const auto result = real(pointer);
+    if (pointer && result == cudaSuccess) { --live_pinned; }
+    return result;
 }
 
 extern "C" int madvise(void* address, std::size_t bytes, int kind) noexcept {
@@ -152,6 +180,53 @@ void test_host_codecs() {
     }
 }
 
+void test_decode_failure_recovery() {
+    const int baseline = live_pinned;
+    for (bool odd_width : {true, false}) {
+        std::vector<std::uint16_t> values(4 * (odd_width ? 33 : 32), 0x3f80);
+        family::HostObjectPlan source;
+        source.name = "failing decode";
+        source.handle = {1};
+        source.payload = std::as_bytes(std::span(values));
+        source.decode_type = QType::BF16_CTRL;
+        source.decode_rows = 4;
+        source.decode_k = odd_width ? 33 : 32;
+        if (!odd_width) {
+            // Force a real row-conversion failure after workers have started.
+            source.q5_rows = 4;
+            source.q5_k = 32;
+        }
+        auto first = source;
+        first.handle = {0};
+        first.name = "already loaded";
+        first.decode_rows = first.q5_rows = 0;
+        const family::HostBankPlan plan{.objects={first, source}};
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            bool rejected = false;
+            try { (void)family::HostBank::shared(plan); }
+            catch (const std::exception& error) {
+                rejected = std::string(error.what()).find(source.name) != std::string::npos;
+            }
+            require(rejected, "invalid host row did not report a recoverable load error");
+            require(live_pinned == baseline, "failed host-bank construction leaked pinned allocations");
+        }
+    }
+    std::vector<std::uint16_t> values(128, 0x3f80);
+    family::HostObjectPlan source;
+    source.name = "valid decode";
+    source.handle = {0};
+    source.payload = std::as_bytes(std::span(values));
+    source.decode_rows = 4; source.decode_k = 32; source.decode_type = QType::BF16_CTRL;
+    {
+        const auto bank = family::HostBank::shared({.objects={source}});
+        const auto& object = bank->object(source.handle);
+        const auto* codes = static_cast<const std::int8_t*>(object.host);
+        require(object.bytes == 136 && std::all_of(codes, codes + 128, [](auto code) { return code == 127; }),
+                "valid host decode failed after a rejected bank");
+    }
+    require(live_pinned == baseline, "valid decoded bank leaked pinned allocations");
+}
+
 void test_slot_limits() {
     const ops::SparseMoeGeometry geometry{128, 256, 8, 128};
     require(family::ExpertCache::pool_floor_bytes(geometry, 2, 0) ==
@@ -231,6 +306,7 @@ int main() {
         if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { std::cout << "SKIP: CUDA unavailable\n"; return 77; }
         DeviceContext device(0);
         test_readahead();
+        test_decode_failure_recovery();
         test_placement_and_isolation();
         std::cout << "ok\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
