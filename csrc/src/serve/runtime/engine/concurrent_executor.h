@@ -39,6 +39,7 @@ namespace sinfer::runtime {
 template <class Instance>
 class ConcurrentExecutor {
     struct Request;
+    friend struct ConcurrentExecutorTestAccess;
 
 public:
     using Package  = typename Instance::Package;
@@ -1557,6 +1558,7 @@ private:
     }
 
     void fail_all(std::exception_ptr error) noexcept {
+        std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);
