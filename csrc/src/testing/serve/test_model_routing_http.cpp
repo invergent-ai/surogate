@@ -120,6 +120,16 @@ int main() {
     }
     auto missing = catalog_client.Get("/v1/models/missing");
     assert(missing && missing->status == 404);
+    for (const auto& path : {"/v1/chat/completions", "/v1/completions"}) {
+        Json invalid{{"model", "primary"}, {"tokens", Json::array({2147483647})}, {"max_tokens", 1}};
+        if (std::string_view(path) == "/v1/completions") { invalid["prompt"] = "Hello"; }
+        else { invalid["messages"] = Json::array({{{"role", "user"}, {"content", "Hello"}}}); }
+        auto rejected = post(path, invalid);
+        assert(rejected && rejected->status == 400);
+        const auto error = Json::parse(rejected->body).at("error");
+        assert(error.at("param") == "tokens");
+        assert(error.at("message").get<std::string>().find("vocabulary") != std::string::npos);
+    }
     ModelScheduler scheduler({{"primary", &primary}, {"extra", &extra}},
                              {{0, primary.resident_bytes()}, {1, extra.resident_bytes()}});
     server.attach_scheduler(scheduler);

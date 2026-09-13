@@ -431,7 +431,11 @@ void parse_stop(const Json& body, GenerationRequest& out) {
             if (!item.is_number_integer()) {
                 bad_request("tokens must be an array of integers", "tokens");
             }
-            out.prompt_token_ids.push_back(static_cast<sinfer::TokenId>(item.get<std::int64_t>()));
+            if ((!item.is_number_unsigned() && item.get<std::int64_t>() < 0) ||
+                item.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<sinfer::TokenId>::max())) {
+                bad_request("tokens entries must be nonnegative 32-bit token IDs", "tokens");
+            }
+            out.prompt_token_ids.push_back(item.get<sinfer::TokenId>());
         }
         if (out.prompt_token_ids.empty()) { bad_request("tokens must not be empty", "tokens"); }
     }

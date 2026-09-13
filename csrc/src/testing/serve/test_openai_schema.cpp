@@ -571,6 +571,32 @@ int test_parse_stop_and_max_tokens() {
     return failures;
 }
 
+int test_prompt_token_bounds() {
+    int failures = 0;
+    for (bool chat : {false, true}) {
+        Json body{{"model", "test"}, {"tokens", Json::array({0, 42, 2147483647})}};
+        if (chat) { body["messages"] = Json::array({{{"role", "user"}, {"content", "hi"}}}); }
+        else { body["prompt"] = "hi"; }
+        const auto parse = [&] {
+            return chat ? parse_chat_completion_request(body, default_limits()) : parse_completion_request(body, default_limits());
+        };
+        failures += check(parse().prompt_token_ids == std::vector<sinfer::TokenId>({0, 42, 2147483647}),
+                          "representable token IDs are preserved");
+        for (const auto& value : {Json(-1), Json(-2147483649LL), Json(2147483648LL),
+                                  Json(4294967296ULL), Json(18446744073709551615ULL), Json(1.5), Json("1")}) {
+            body["tokens"] = Json::array({value});
+            try {
+                (void)parse();
+                failures += fail("invalid prompt token was accepted: " + value.dump());
+            } catch (const ApiException& error) {
+                failures += check(error.error().status == 400 && error.error().param == "tokens",
+                                  "invalid prompt IDs report a tokens input error");
+            }
+        }
+    }
+    return failures;
+}
+
 int test_parse_sampling_carried() {
     int failures                = 0;
     const Json body             = {{"model", "m"},
@@ -802,6 +828,7 @@ int main() {
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
+    failures += test_prompt_token_bounds();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();

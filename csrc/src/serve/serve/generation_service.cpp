@@ -530,12 +530,18 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         // Ids given by the client win over anything the template would render: that
         // is the whole point of the token-in endpoint, and the messages are still
         // parsed above for the tools and the parser state they carry.
-        sinfer::PreparedPrompt prompt =
-            !request.prompt_token_ids.empty()
-                ? engine_->prepare_tokens(request.prompt_token_ids)
-                : (request.raw_prompt.has_value()
-                       ? engine_->prepare_text(*request.raw_prompt)
-                       : engine_->prepare(std::move(*input), control));
+        sinfer::PreparedPrompt prompt;
+        if (!request.prompt_token_ids.empty()) {
+            try {
+                prompt = engine_->prepare_tokens(request.prompt_token_ids);
+            } catch (const std::out_of_range& error) {
+                throw ApiException(ApiError{.status = 400, .message = error.what(), .param = "tokens"});
+            }
+        } else if (request.raw_prompt.has_value()) {
+            prompt = engine_->prepare_text(*request.raw_prompt);
+        } else {
+            prompt = engine_->prepare(std::move(*input), control);
+        }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
