@@ -236,8 +236,29 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    const PreparedPromptData& prompt,
                                                    const RequestBasePlan& base_plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    auto resident = plan_request_for_sequence(lane, sequences[lane], prompt, base_plan);
+    if (base_plan.impl_->allow_prefix_reuse && prompt.identity.reusable) {
+        auto saved = archived_prefixes.match(prompt.token_ids, [&](const ArchivedSequence& value) {
+            return plan_request_for_sequence(lane, value.state, prompt, base_plan, true)
+                .summary().reusable_prompt_tokens;
+        }, speculative_backend == SpeculativeBackend::None &&
+           decoder->linear_attention.layer_count() == 0 && decoder->ple.empty());
+        if (saved) {
+            auto cached = plan_request_for_sequence(lane, saved->state, prompt, base_plan, true);
+            if (cached.summary().reusable_prompt_tokens > resident.summary().reusable_prompt_tokens) {
+                cached.impl_->archived = std::move(saved);
+                return cached;
+            }
+        }
+    }
+    return resident;
+}
+
+RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
+    const SequenceState& sequence, const PreparedPromptData& prompt,
+    const RequestBasePlan& base_plan, bool archived) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
-    const SequenceState& sequence = sequences[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
         throw std::logic_error("cannot plan a request while Program is active or pending");
@@ -247,6 +268,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
+    plan->retain_prefix               = base.allow_prefix_reuse && prompt.identity.reusable;
     plan->prompt_logprobs = base.prompt_logprobs;
     plan->top_logprobs = base.top_logprobs;
     plan->sampling                    = base.sampling;
@@ -271,6 +293,20 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         auto append_frontier = reusable_append_frontier(sequence);
+        if (speculative_backend == SpeculativeBackend::None &&
+            decoder->linear_attention.layer_count() == 0 && decoder->ple.empty()) {
+            // Attention KV is reusable at any matching token boundary. If the
+            // saved hidden belongs to a later token, replay the prompt's final
+            // token to recover the correct head input.
+            const auto limit = std::min({std::size_t(sequence.text_kv_valid),
+                                         sequence.ledger.size(), prompt.token_ids.size()});
+            std::uint32_t shared = 0;
+            while (shared < limit && sequence.ledger[shared] == prompt.token_ids[shared]) { ++shared; }
+            if (shared != sequence.execution_frontier || !sequence.tail_hidden_valid) {
+                shared = std::min(shared, static_cast<std::uint32_t>(prompt.token_ids.size() - 1));
+            }
+            append_frontier = shared;
+        }
         if (!sequence.tail_hidden_valid && append_frontier >= prompt.token_ids.size()) {
             append_frontier = static_cast<std::uint32_t>(prompt.token_ids.size() - 1);
         }
@@ -282,7 +318,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                             append_frontier, base.lora_slot)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = append_frontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
+        } else if ((!archived || decoder->can_acquire_checkpoint(lane)) &&
+                   sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
                    sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                    family::detail::prefix_matches(prompt, sequence.ledger,
                                                    sequence.prefix_identity,
@@ -309,7 +346,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
-        (!dflash || !sequence.kv || !sequence.kv->backend ||
+        (!dflash || (!archived && (!sequence.kv || !sequence.kv->backend)) ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
@@ -330,6 +367,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     const std::optional<RewriteCheckpointSpec>& desired =
         base.allow_prefix_reuse ? base.rewrite_checkpoint : kNoCheckpoint;
     const bool existing_checkpoint_matches =
+        (!archived || decoder->can_acquire_checkpoint(lane)) &&
         desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,

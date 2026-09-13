@@ -62,8 +62,11 @@ void exercise(DType cache_dtype, bool recurrent) {
     assert(decoder.linear_attention.slot_count() == resident_slots + lanes);
     assert(decoder.linear_attention.all_layers_view().spec.slot_count == resident_slots);
 
+    assert(decoder.can_acquire_checkpoint(0));
     assert(decoder.try_acquire_checkpoint(0));
     assert(decoder.try_acquire_checkpoint(0)); // Idempotent; no extra page or reference.
+    assert(!decoder.can_acquire_checkpoint(1));
+    assert(!decoder.can_acquire_checkpoint(lanes));
     assert(!decoder.try_acquire_checkpoint(1));
     assert(decoder.checkpoint_mapped_bytes() == snapshots.slot_bytes);
     assert(elastic_kv_unmapped_commitment(0) == prior_commitment);
@@ -100,6 +103,7 @@ void exercise(DType cache_dtype, bool recurrent) {
     decoder.release_checkpoint(0);
     decoder.flush_checkpoint_releases();
     assert(!decoder.has_checkpoint(0));
+    assert(decoder.can_acquire_checkpoint(1));
     assert(decoder.checkpoint_mapped_bytes() == 0);
     bool refused = false;
     try { (void)decoder.linear_attention.conv_slot(0, resident_slots); }

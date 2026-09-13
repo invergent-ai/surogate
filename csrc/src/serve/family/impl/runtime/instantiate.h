@@ -24,3 +24,4 @@
 #include "family/impl/runtime/mtp_impl.h"
 #include "family/impl/runtime/request_plan_impl.h"
 #include "family/impl/runtime/program_impl.h"
+#include "family/impl/runtime/prefix_cache_impl.h"

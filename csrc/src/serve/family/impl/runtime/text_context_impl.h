@@ -3487,7 +3487,7 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
     }
     if (checkpoint_rel > 0 && t0 + len == checkpoint_rel &&
         rewrite_checkpoint_hidden_output_ != nullptr) {
-        require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16, {cfg_.hidden, 1},
+        require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16, {round_hidden_width(), 1},
                              "rewrite checkpoint hidden output");
         Tensor xf                      = matrix_window(prefill_hidden_, len);
         const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
@@ -3849,7 +3849,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (checkpoint_rel > 0 && t0 + len == checkpoint_rel &&
                 rewrite_checkpoint_hidden_output_ != nullptr) {
                 require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
-                                     {cfg_.hidden, 1}, "rewrite checkpoint hidden output");
+                                     {round_hidden_width(), 1}, "rewrite checkpoint hidden output");
                 const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
                 CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
                                            checkpoint_hidden.data, checkpoint_hidden.bytes(),

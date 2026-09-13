@@ -221,6 +221,11 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
+void Program<Variant>::evict_archived_prefixes() noexcept {
+    impl_->evict_archived_prefixes();
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
 }

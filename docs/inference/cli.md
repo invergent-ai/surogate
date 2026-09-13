@@ -60,8 +60,10 @@ context is explicit, omitted cache capacity defaults to that same token count. U
 `--kv-capacity auto` explicitly to make more cache available for simultaneous requests.
 
 Compatible conversation context is cached automatically, including after a response
-ends on EOS or a stop string. Cache memory is bounded; older entries can be released
-as new requests arrive. Changing earlier messages, requesting additional prompt
+ends on EOS or a stop string. Completed conversations can also be reused after an
+unrelated request. Each model has a 512 MiB host cache budget per GPU; conversations
+that exceed that budget are not retained there. Older entries
+can be released as new requests arrive. Changing earlier messages, requesting additional prompt
 logprobs, or a cache miss can require some or all of the prompt to be processed again.
 Use `--no-prefix-reuse` to disable reuse.
 

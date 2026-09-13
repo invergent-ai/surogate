@@ -95,6 +95,9 @@ struct ChatRenderOptions {
 struct RewriteCheckpointByteSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::size_t offset         = 0;
+    // A generic Jinja probe may stop inside a tokenizer merge. Keep only the
+    // exact shared tokens; hand-written template boundaries remain strict.
+    bool require_exact_tokens = true;
 };
 
 struct RenderedChat {

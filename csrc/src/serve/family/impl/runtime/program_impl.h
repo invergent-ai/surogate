@@ -500,6 +500,11 @@ void ProgramImplCore::burst_egress_copy_host(void* user) noexcept {
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    if (plan.impl_->archived &&
+        (is_rewrite_checkpoint_restore(plan.impl_->reuse) ||
+         plan.impl_->rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting ||
+         plan.impl_->rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting) &&
+        !decoder->can_acquire_checkpoint(lane)) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
@@ -526,6 +531,11 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    if (plan.impl_->archived &&
+        (is_rewrite_checkpoint_restore(plan.impl_->reuse) ||
+         plan.impl_->rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting ||
+         plan.impl_->rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting) &&
+        !decoder->can_acquire_checkpoint(lane)) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
@@ -618,6 +628,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
+    if (request_plan.archived || request_plan.reuse == ReusePath::FullReset ||
+        request_plan.reuse_base < sequence.execution_frontier ||
+        is_rewrite_checkpoint_restore(request_plan.reuse)) {
+        archive_sequence(sequence);
+    }
+    if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
+    sequence.cacheable = request_plan.retain_prefix;
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
@@ -1187,7 +1204,12 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
+void ProgramImplCore::evict_archived_prefixes() noexcept {
+    archived_prefixes.clear();
+}
+
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
+    archived_prefixes.clear();
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
 }

@@ -206,6 +206,8 @@ struct DecoderState {
     void configure_checkpoints(const DecoderCheckpointLayout& layout,
                                const PagedKVElasticOptions& options);
     [[nodiscard]] bool has_checkpoint(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool can_acquire_checkpoint(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint64_t checkpoint_revision() const noexcept;
     [[nodiscard]] bool try_acquire_checkpoint(std::uint32_t lane);
     void release_checkpoint(std::uint32_t lane) noexcept;
     [[nodiscard]] CyclicKVCache& checkpoint_dflash(std::uint32_t lane);

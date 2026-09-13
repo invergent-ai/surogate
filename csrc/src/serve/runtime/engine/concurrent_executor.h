@@ -106,6 +106,9 @@ public:
     /// idle model before it would sleep one.
     void shrink_kv() {
         auto paused = pause_execution();
+        // Adapter updates may drain only that adapter while other lanes remain
+        // active. Archived state must be invalidated independently of idle lanes.
+        instance_.program->evict_archived_prefixes();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane)) {
                 instance_.program->evict_retained_lane(lane);

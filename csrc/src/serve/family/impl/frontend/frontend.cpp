@@ -1021,25 +1021,74 @@ public:
         }
         // A checkpoint whose template this family does not reproduce by hand is
         // rendered by the tokenizer, from the artifact's own Jinja.
-        auto structured = nlohmann::ordered_json::array();
-        for (const fi::ChatMessage& message : messages) {
-            nlohmann::ordered_json item{{"role", jinja_role_name(message.role)},
-                                        {"content", message.rendered_content()}};
-            if (!message.reasoning_content.empty()) { item["reasoning_content"] = message.reasoning_content; }
-            if (!message.tool_call_id.empty()) { item["tool_call_id"] = message.tool_call_id; }
-            if (!message.tool_calls.empty()) {
-                item["tool_calls"] = nlohmann::ordered_json::array();
-                for (const auto& call : message.tool_calls) {
-                    auto arguments = nlohmann::ordered_json::parse(call.arguments_json);
-                    item["tool_calls"].push_back({{"id", call.id}, {"type", "function"},
-                        {"function", {{"name", call.name}, {"arguments", std::move(arguments)}}}});
+        const auto structured_messages = [](const std::vector<fi::ChatMessage>& values) {
+            auto structured = nlohmann::ordered_json::array();
+            for (const fi::ChatMessage& message : values) {
+                nlohmann::ordered_json item{{"role", jinja_role_name(message.role)},
+                                            {"content", message.rendered_content()}};
+                if (!message.reasoning_content.empty()) { item["reasoning_content"] = message.reasoning_content; }
+                if (!message.tool_call_id.empty()) { item["tool_call_id"] = message.tool_call_id; }
+                if (!message.tool_calls.empty()) {
+                    item["tool_calls"] = nlohmann::ordered_json::array();
+                    for (const auto& call : message.tool_calls) {
+                        auto arguments = nlohmann::ordered_json::parse(call.arguments_json);
+                        item["tool_calls"].push_back({{"id", call.id}, {"type", "function"},
+                            {"function", {{"name", call.name}, {"arguments", std::move(arguments)}}}});
+                    }
+                }
+                structured.push_back(std::move(item));
+            }
+            return structured;
+        };
+        const auto variables = template_variables(options);
+        fi::RenderedChat rendered;
+        rendered.text = tokenizer->render_chat_template_json(structured_messages(messages).dump(),
+            options.tool_jsons, options.add_generation_prompt, variables);
+        if (options.add_generation_prompt && !rendered.text.empty()) {
+            rendered.rewrite_checkpoint = fi::RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.text.size()};
+            if (!options.preserve_thinking) {
+                // Ask the actual template where the current turn stops being a
+                // stable prefix after a new user arrives. This also handles
+                // templates outside the hand-written digest allowlist.
+                std::vector<fi::ChatMessage> next_turn;
+                next_turn.reserve(messages.size() + 2);
+                for (const auto& message : messages) {
+                    fi::ChatMessage copy{.role = message.role, .parts = {},
+                        .reasoning_content = message.reasoning_content,
+                        .tool_calls = message.tool_calls, .tool_call_id = message.tool_call_id};
+                    // Rendering needs media placeholders, not another copy of
+                    // potentially large image/video payloads.
+                    for (const auto& part : message.parts) {
+                        copy.parts.push_back(fi::ChatPart{.kind = part.kind, .text = part.text});
+                    }
+                    next_turn.push_back(std::move(copy));
+                }
+                next_turn.push_back(fi::ChatMessage{.role = ChatRole::Assistant,
+                    .parts = {fi::ChatPart::text_part("cache boundary answer")},
+                    .reasoning_content = "cache boundary reasoning"});
+                next_turn.push_back(fi::ChatMessage{.role = ChatRole::User,
+                    .parts = {fi::ChatPart::text_part("cache boundary next question")}});
+                fi::discard_closed_thinking(next_turn, reasoning);
+                try {
+                    const auto future = tokenizer->render_chat_template_json(
+                        structured_messages(next_turn).dump(), options.tool_jsons, true, variables);
+                    auto common = static_cast<std::size_t>(std::mismatch(
+                        rendered.text.begin(), rendered.text.end(), future.begin(), future.end()).first -
+                        rendered.text.begin());
+                    while (common > 0 && common < rendered.text.size() &&
+                           (static_cast<unsigned char>(rendered.text[common]) & 0xc0) == 0x80) { --common; }
+                    rendered.rewrite_checkpoint = common > 0
+                        ? std::optional(fi::RewriteCheckpointByteSpec{
+                            .kind = RewriteCheckpointKind::TurnClosure,
+                            .offset = static_cast<std::size_t>(common), .require_exact_tokens = false})
+                        : std::nullopt;
+                } catch (const std::exception&) {
+                    // A template can reject the hypothetical turn while accepting
+                    // this request. Its exact prompt can still be replayed.
                 }
             }
-            structured.push_back(std::move(item));
         }
-        fi::RenderedChat rendered;
-        rendered.text = tokenizer->render_chat_template_json(structured.dump(), options.tool_jsons,
-            options.add_generation_prompt, template_variables(options));
         return rendered;
     }
 

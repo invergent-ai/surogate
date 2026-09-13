@@ -126,6 +126,16 @@ struct PagedKVElasticOptions {
 class PagedKVAllocation;
 struct PagedKVResize;
 
+struct PagedKVHostImage {
+    std::uint32_t pages = 0;
+    std::vector<std::vector<std::byte>> planes;
+    [[nodiscard]] std::size_t bytes() const noexcept {
+        std::size_t total = 0;
+        for (const auto& plane : planes) { total += plane.size(); }
+        return total;
+    }
+};
+
 /**
  * Physical occupancy of one pool at an instant, for demand-mapped-KV sizing.
  *
@@ -189,6 +199,12 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr,
                     int byte = 0);
+    // Images are in logical page order and include every plane, including quantization
+    // scales and indexer state. The caller fences the stream before using/freeing host data.
+    [[nodiscard]] PagedKVHostImage download_pages(std::span<const std::int32_t> page_ids,
+                                                 cudaStream_t stream) const;
+    void upload_pages(const PagedKVHostImage& image, std::span<const std::int32_t> page_ids,
+                       cudaStream_t stream) const;
 
     /// The demand-mapped plane region, or null for a pool inside the arena.
     [[nodiscard]] ElasticKvRegion* elastic_region() noexcept { return elastic_.get(); }

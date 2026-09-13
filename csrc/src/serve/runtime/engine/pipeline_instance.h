@@ -145,6 +145,19 @@ public:
             select(s);
             out.stages.push_back(stages_[s]->program->plan_request_for_lane(lane, prompt, base.stages[s]));
         }
+        // Stage-local cache budgets can evict different snapshots. A boundary is
+        // reusable only when every stage can resume from that same position.
+        const auto frontier = out.stages.front().summary().reusable_prompt_tokens;
+        if (std::any_of(out.stages.begin(), out.stages.end(), [&](const auto& plan) {
+                return plan.summary().reusable_prompt_tokens != frontier;
+            })) {
+            out.stages.clear();
+            for (std::size_t s = 0; s < stages_.size(); ++s) {
+                select(s);
+                stages_[s]->program->evict_retained_lane(lane);
+                out.stages.push_back(stages_[s]->program->plan_request_for_lane(lane, prompt, base.stages[s]));
+            }
+        }
         return out;
     }
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -300,6 +313,9 @@ public:
     }
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept {
         return stages_.front()->program->has_retained_lane(lane);
+    }
+    void evict_archived_prefixes() noexcept {
+        for (auto* stage : stages_) { stage->program->evict_archived_prefixes(); }
     }
     void evict_retained_lane(std::uint32_t lane) noexcept {
         for (std::size_t s = 0; s < stages_.size(); ++s) {

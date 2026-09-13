@@ -439,7 +439,10 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             const std::size_t boundary = rendered.rewrite_checkpoint->offset;
             const std::size_t end      = position + needle.size();
             if (position < boundary && boundary < end) {
-                throw std::logic_error("rewrite checkpoint intersects a media placeholder");
+                if (rendered.rewrite_checkpoint->require_exact_tokens) {
+                    throw std::logic_error("rewrite checkpoint intersects a media placeholder");
+                }
+                rendered.rewrite_checkpoint->offset = position;
             }
             if (end <= boundary) {
                 rendered.rewrite_checkpoint->offset = boundary - needle.size() + replacement.size();
@@ -595,16 +598,19 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     const std::vector<int> prefix = tokenizer.encode(
         std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
-    if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
-        !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+    const auto shared = static_cast<std::size_t>(std::mismatch(
+        prefix.begin(), prefix.end(), encoded.input_ids.begin(), encoded.input_ids.end()).first - prefix.begin());
+    if (rendered.rewrite_checkpoint->require_exact_tokens &&
+        (prefix.empty() || shared != prefix.size())) {
         throw std::logic_error("rewrite checkpoint is not an exact token prefix");
     }
-    if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+    if (shared == 0) { return encoded; }
+    if (shared > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
     }
     encoded.rewrite_checkpoint = RewriteCheckpointSpec{
         .kind     = rendered.rewrite_checkpoint->kind,
-        .frontier = static_cast<std::uint32_t>(prefix.size()),
+        .frontier = static_cast<std::uint32_t>(shared),
     };
     return encoded;
 }

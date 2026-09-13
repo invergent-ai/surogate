@@ -160,6 +160,7 @@ public:
     std::vector<std::unique_ptr<Slot>> slots;
     std::vector<std::uint32_t> free;
     std::size_t peak_bytes = 0;
+    std::uint64_t revision = 0;
 
     DecoderCheckpointStore(const DecoderCheckpointLayout& plan, const PagedKVElasticOptions& options)
         : layout(plan), slots(plan.lanes) {
@@ -326,9 +327,19 @@ bool DecoderState::try_acquire_checkpoint(std::uint32_t lane) {
         throw;
     }
     store.free.pop_back();
+    ++store.revision;
     linear_attention.checkpoint_slots[lane] = &store.slots[lane]->linear;
     if (!ple.empty()) { ple.checkpoint_slots[lane] = &store.slots[lane]->ple; }
     return true;
+}
+
+bool DecoderState::can_acquire_checkpoint(std::uint32_t lane) const noexcept {
+    return checkpoints_ && lane < checkpoints_->slots.size() &&
+           (checkpoints_->slots[lane] || !checkpoints_->free.empty());
+}
+
+std::uint64_t DecoderState::checkpoint_revision() const noexcept {
+    return checkpoints_ ? checkpoints_->revision : 0;
 }
 
 void DecoderState::release_checkpoint(std::uint32_t lane) noexcept {
@@ -340,6 +351,7 @@ void DecoderState::release_checkpoint(std::uint32_t lane) noexcept {
     store.slots[lane].reset();
     if (store.region) { store.region->release_page(static_cast<std::int32_t>(page)); }
     store.free.push_back(page);
+    ++store.revision;
 }
 
 CyclicKVCache& DecoderState::checkpoint_dflash(std::uint32_t lane) {

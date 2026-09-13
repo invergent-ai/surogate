@@ -828,6 +828,19 @@ int test_jinja_thinking_retention() {
             failures += check(dropped.find("active reasoning") != std::string::npos,
                               "dropping closed reasoning removed the current tool turn's reasoning");
         }
+        const auto cached = frontend.prepare(input);
+        const auto& cached_data = FrontendFactory::inspect(cached);
+        auto next_turn = input;
+        next_turn.messages.push_back(message(sinfer::ChatRole::Assistant, "generated answer"));
+        next_turn.messages.push_back(message(sinfer::ChatRole::User, "next question"));
+        const auto future = frontend.prepare(next_turn);
+        const auto& future_data = FrontendFactory::inspect(future);
+        const auto boundary = cached_data.identity.rewrite_checkpoint;
+        failures += check(boundary && boundary->frontier > 0 &&
+            boundary->frontier <= future_data.token_ids.size() &&
+            std::equal(cached_data.token_ids.begin(), cached_data.token_ids.begin() + boundary->frontier,
+                       future_data.token_ids.begin()),
+            "Jinja rewrite checkpoint did not preserve a stable prefix across a new user turn");
         input.options.preserve_thinking = true;
         if (gate == "false") {
             failures += check(throws_invalid_argument([&] { (void)render(); }),

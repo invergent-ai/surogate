@@ -19,7 +19,7 @@ template <class Instance>
 void exercise(Instance& instance, bool truncated_cache_reusable) {
     auto& program = *instance.program;
     auto& frontend = instance.loaded->frontend;
-    auto start = [&](std::uint32_t lane, std::uint32_t prompt_tokens) {
+    auto start = [&](std::uint32_t lane, std::uint32_t prompt_tokens, bool terminal = false) {
         auto prompt = frontend.prepare_tokens(std::vector<sinfer::TokenId>(prompt_tokens, 1));
         sinfer::runtime::ResolvedExecutionOptions options;
         options.requested_output_tokens = 16;
@@ -34,7 +34,7 @@ void exercise(Instance& instance, bool truncated_cache_reusable) {
         while (!step.complete) { step = program.advance_prefill_lane(lane); }
         require(step.round.tokens.size() == 1, "prefill must produce one token");
         const auto first = step.round.tokens.front();
-        program.resolve_prefill_lane(lane, false);
+        program.resolve_prefill_lane(lane, terminal);
         instance.request_memory.deactivate();
         return first;
     };
@@ -105,6 +105,22 @@ void exercise(Instance& instance, bool truncated_cache_reusable) {
     require(program.kv_occupancy().entitled_pages == 8, "retained cache must still own its pages");
     program.evict_retained_lane(0);
     require(program.kv_occupancy().entitled_pages == 0, "retained eviction must release its pages");
+
+    // Archive A while B uses its execution lane. Invalidation for an adapter
+    // replacement must remove A even though the lane remains actively decoding B.
+    (void)start(0, 193, true);
+    (void)start(0, 65);
+    const auto reusable_archive = [&] {
+        auto prompt = frontend.prepare_tokens(std::vector<sinfer::TokenId>(194, 1));
+        sinfer::runtime::ResolvedExecutionOptions execution;
+        execution.requested_output_tokens = 1;
+        auto base = program.plan_request_base(prompt, execution);
+        return program.plan_request_for_lane(1, prompt, base).summary().reusable_prompt_tokens;
+    };
+    require(reusable_archive() == 193, "an unrelated active request must not discard archived A");
+    program.evict_archived_prefixes();
+    require(reusable_archive() == 0, "adapter invalidation must clear archives while B is active");
+    program.abort_lane(0);
 }
 } // namespace
 

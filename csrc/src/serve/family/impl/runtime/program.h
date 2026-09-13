@@ -19,6 +19,7 @@
 #include "family/impl/runtime/dflash_context.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/prefix_identity.h"
+#include "family/impl/radix_prefix_cache.h"
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/vision_context.h"
 #include "family/impl/runtime/vision_prefill.h"
@@ -38,6 +39,7 @@
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
 using PreparedPromptData    = family::PreparedPromptData;
+struct ArchivedSequence;
 using RewriteCheckpointKind = family::RewriteCheckpointKind;
 using RewriteCheckpointSpec = family::RewriteCheckpointSpec;
 
@@ -100,6 +102,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     SINFER_FAMILY_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         SINFER_FAMILY_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
+    bool retain_prefix = true;
+    std::shared_ptr<const SINFER_FAMILY_RUNTIME_NS::ArchivedSequence> archived;
     std::optional<SINFER_FAMILY_RUNTIME_NS::VisionPrefillPlan> vision;
     SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -226,7 +230,24 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    bool cacheable                = true;
     RewriteCheckpoint rewrite_checkpoint;
+    void copy_metadata(const SequenceState& source) {
+        execution_frontier = source.execution_frontier; ledger_frontier = source.ledger_frontier;
+        ledger = source.ledger; cached_scores = source.cached_scores;
+        prefix_identity = source.prefix_identity; rope_delta = source.rope_delta;
+        text_kv_valid = source.text_kv_valid; mtp_kv_valid = source.mtp_kv_valid;
+        dflash_context_frontier = source.dflash_context_frontier;
+        mtp_drafts = source.mtp_drafts; mtp_draft_count = source.mtp_draft_count;
+        tail_hidden_valid = source.tail_hidden_valid; retained = source.retained;
+        cacheable = source.cacheable; rewrite_checkpoint = source.rewrite_checkpoint;
+    }
+};
+
+struct ArchivedSequence {
+    SequenceState state;
+    PagedKVHostImage text, backend;
+    std::vector<std::vector<std::byte>> current, checkpoint;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -322,7 +343,8 @@ public:
     [[nodiscard]] std::uint32_t reusable_append_frontier(const SequenceState& sequence) const noexcept;
     [[nodiscard]] bool acquire_rewrite_checkpoint(SequenceState& sequence);
     [[nodiscard]] std::uint64_t prefix_cache_revision(std::uint32_t lane) const noexcept {
-        return lane < checkpoint_revisions.size() ? checkpoint_revisions[lane] : 0;
+        return decoder->checkpoint_revision() + archived_prefixes.revision() +
+               (lane < checkpoint_revisions.size() ? checkpoint_revisions[lane] : 0);
     }
     static void burst_egress_copy_host(void* user) noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
@@ -333,6 +355,7 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    void evict_archived_prefixes() noexcept;
     TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const;
     void cache_logprobs(std::uint32_t lane, const GenerationResult& result);
     void collect_logprobs(std::uint32_t lane, GenerationResult& result);
@@ -499,6 +522,9 @@ public:
 
     std::vector<SequenceState> sequences;
     std::vector<RequestControl> requests;
+    // Host snapshots retain complete continuation state without reserving another active
+    // lane or increasing the GPU KV pool. Each pipeline stage has a bounded local cache.
+    family::detail::RadixPrefixCache<ArchivedSequence> archived_prefixes{512ULL << 20};
 
     DecodeGraphFamily ordinary_graphs;
     // Round chaining (PATCHES.md #32): the chained flavor of every ordinary
@@ -595,6 +621,13 @@ float* host_token_logprob = nullptr;
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
+    [[nodiscard]] RequestPlan plan_request_for_sequence(std::uint32_t lane,
+        const SequenceState& sequence, const PreparedPromptData& prompt,
+        const RequestBasePlan& base, bool archived = false);
+    [[nodiscard]] std::vector<Tensor> prefix_state_tensors(const SequenceState& sequence,
+                                                          bool checkpoint) const;
+    void archive_sequence(const SequenceState& sequence);
+    void restore_archived_sequence(SequenceState& sequence, const RequestPlanImpl& plan);
     void prepare_graphs();
     void bind_dflash_window(std::uint32_t drafts);
     [[nodiscard]] ops::SamplingConfig staged_sampling(RequestControl& request,
