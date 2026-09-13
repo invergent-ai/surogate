@@ -37,6 +37,8 @@ struct ScratchState {
     std::size_t out_bytes = 0;
     std::size_t a_bytes   = 0;
     bool frozen           = false;
+    void* fused_parent = nullptr;
+    std::size_t fused_parent_bytes = 0;
 };
 // Everything mutable the plane owns, homed per engine so two models in one
 // process cannot race the staging scratch or close each other's adoption.
@@ -44,14 +46,16 @@ struct MarlinPlaneState {
     std::map<int, ScratchState> scratch_by_device; // pipeline stages: one per device
     bool adoption_closed          = false;
     int fixed_m                   = 32;
-    void* fused_parent            = nullptr;
-    std::size_t fused_parent_bytes = 0;
     ~MarlinPlaneState() {
+        int previous = 0;
+        const bool restore = cudaGetDevice(&previous) == cudaSuccess;
         for (auto& [device, state] : scratch_by_device) {
+            (void)cudaSetDevice(device);
             if (state.scratch.gemm_out != nullptr) { (void)cudaFree(state.scratch.gemm_out); }
             if (state.scratch.a_pad != nullptr) { (void)cudaFree(state.scratch.a_pad); }
+            if (state.fused_parent != nullptr) { (void)cudaFree(state.fused_parent); }
         }
-        if (fused_parent != nullptr) { (void)cudaFree(fused_parent); }
+        if (restore) { (void)cudaSetDevice(previous); }
     }
 };
 MarlinPlaneState& plane_state() { return engine_slot<MarlinPlaneState>(); }
@@ -66,8 +70,8 @@ ScratchState& scratch_state() {
 #define g_scratch_frozen (scratch_state().frozen)
 #define g_adoption_closed (plane_state().adoption_closed)
 #define g_fixed_m (plane_state().fixed_m)
-#define g_fused_parent (plane_state().fused_parent)
-#define g_fused_parent_bytes (plane_state().fused_parent_bytes)
+#define g_fused_parent (scratch_state().fused_parent)
+#define g_fused_parent_bytes (scratch_state().fused_parent_bytes)
 
 bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t stream) {
     if (g_scratch.gemm_out != nullptr && out_bytes <= g_scratch_out_bytes &&
