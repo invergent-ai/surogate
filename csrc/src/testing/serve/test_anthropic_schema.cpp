@@ -123,6 +123,12 @@ int test_parse_basic_and_system() {
     failures += check(req.messages[1].role == sinfer::ChatRole::User, "user turn follows system");
     failures += check(req.messages[1].content[0].text == "hello", "user text carried");
     failures += check(!req.stream, "stream defaults false");
+    for (const char* role : {"user", "assistant"}) {
+        auto empty = body;
+        empty["messages"][0] = {{"role", role}, {"content", Json::array()}};
+        failures += check(throws_api([&] { (void)parse_messages_request(empty, default_limits()); }),
+                          std::string(role) + " message with no content blocks must be rejected");
+    }
     return failures;
 }
 

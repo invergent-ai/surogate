@@ -312,6 +312,7 @@ void parse_assistant_content(const Json& content, GenerationRequest& out) {
 }
 
 void parse_user_content(const Json& content, GenerationRequest& out) {
+    if (content.empty()) { bad_request("user message content must not be empty", "messages"); }
     // Anthropic represents tool results as blocks within a user message. Expand
     // them into protocol-neutral Tool turns without moving text/media blocks
     // across the position at which each tool result appeared.
