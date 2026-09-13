@@ -1406,12 +1406,9 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
             if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
-            *dflash_host_ingress                         = {};
-            dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(family::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
+            // Admission can overlap an unconsumed round whose DMA still reads
+            // dflash_host_ingress. Prefill stages its own device controls only
+            // when advance_prefill owns this pipeline stage.
         }
     } catch (...) {
         if (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) {
@@ -2311,10 +2308,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
 
         if (dflash && io.dflash_decode) {
-            // Other admissions and decode rounds reuse this frame between chunks.
-            // Restore the current prompt's draft lane and table before feature capture.
-            dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+            // Set the prefill controls without touching the decode DMA source.
             Tensor lane                                  = io.dflash_decode->lanes.slice(0, 0, 1);
             Tensor row = io.dflash_decode->dflash_kv_table_rows.slice(0, 0, 1);
             set_device_i32(lane, static_cast<std::int32_t>(sequence.lane));

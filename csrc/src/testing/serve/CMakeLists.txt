@@ -136,6 +136,8 @@ if(SINFER_ENABLE_FFMPEG)
     LIBRARIES sinfer_media_decode)
 endif()
 sinfer_add_test(sinfer_device_test       SOURCES test_device.cpp)
+sinfer_add_test(sinfer_dflash_admission_test SOURCES test_dflash_admission.cpp
+  LIBRARIES sinfer_engine ${CMAKE_DL_LIBS})
 sinfer_add_test(sinfer_elastic_kv_rollback_test SOURCES test_elastic_kv_rollback.cpp
   LIBRARIES ${CMAKE_DL_LIBS})
 sinfer_add_test(sinfer_elastic_kv_device_gate_test SOURCES test_elastic_kv_device_gate.cpp
