@@ -209,7 +209,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         bool nvfp4_generic;  ///< NVFP4 through the generic GEMM-then-fold route (#84)
         bool fp8;            ///< row-scaled FP8, via Marlin
     };
-    static constexpr std::array<FusedShape, 8> kFusedShapes{{
+    static constexpr std::array<FusedShape, 7> kFusedShapes{{
         {5120, 34816, true, false, true, false, true},    // Qwen3.5-27B
         {2048, 12288, false, true, false, true, false},   // Qwen3.5/3.6
         {1024, 7168, false, true, false, true, false},    // Qwen3.5-0.8B
@@ -217,7 +217,6 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         {1024, 6144, false, true, false, false, false},   // Qwen3-0.6B
         {2048, 11264, false, true, false, false, false},  // TinyLlama-1.1B
         {2048, 16384, false, true, false, false, false},  // LFM2-1.2B
-        {4096, 24576, false, true, false, false, false},  // GLM-5.3-Flash's dense layers
     }};
     const auto matched = std::find_if(
         kFusedShapes.begin(), kFusedShapes.end(), [&](const FusedShape& shape) {
