@@ -891,7 +891,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     write_stream_item(sink, *stream, make_chat_chunk_token_detail(id, model, created, detail, include_usage));
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
+                    return stopping_.load(std::memory_order_relaxed) ||
+                           stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
@@ -1096,7 +1097,8 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                     }
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
+                    return stopping_.load(std::memory_order_relaxed) ||
+                           stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
@@ -1300,7 +1302,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     blocks.append(OutputChannel::Content, text);
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
+                    return stopping_.load(std::memory_order_relaxed) ||
+                           stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 

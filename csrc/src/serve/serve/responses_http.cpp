@@ -75,10 +75,6 @@ Json parse_json_body(const httplib::Request& request) {
     }
 }
 
-bool disconnected(const httplib::Request& request) {
-    return request.is_connection_alive && !request.is_connection_alive();
-}
-
 void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,
                        const std::string& item) {
     if (request.cancelled.load(std::memory_order_acquire) ||
@@ -162,7 +158,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     if (!request.stream) {
         try {
             const GenerationOutcome outcome =
-                svc().run(prepared, nullptr, [&req] { return disconnected(req); });
+                svc().run(prepared, nullptr, request_cancelled(req));
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
             log_request_done(log_context, outcome);
@@ -209,7 +205,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     write_stream_items(sink, *stream, stream->encoder->scores_delta(scored));
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
+                    return stopping_.load(std::memory_order_relaxed) ||
+                           stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
