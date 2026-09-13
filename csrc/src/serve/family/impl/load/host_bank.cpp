@@ -658,7 +658,13 @@ Weight host_q4_weight(const HostObject& object, std::int32_t rows, std::int32_t 
 
 BankPlanes bank_as_planes(HostObjectPlan& plan, std::int64_t rows, std::int32_t columns,
                           QType stored, BankPlanes planes) {
-    if (planes == BankPlanes::Native) { return planes; }
+    if (planes == BankPlanes::Native) {
+        if (plan.source_tensor.segments.empty() && plan.source_tensor.group_map.empty()) { return planes; }
+        // Native gathers use one codec and one byte stride for every expert.
+        // Normalize mixed segments and permuted columns through the row decoder
+        // before exposing the bank to those gathers.
+        planes = BankPlanes::W8;
+    }
     if (stored == QType::W8G32_F16S && columns % 128 == 0 && plan.q8_rows == 0 &&
         plan.source_tensor.group_map.empty() && plan.source_tensor.segments.empty()) {
         if (planes == BankPlanes::Q4) {

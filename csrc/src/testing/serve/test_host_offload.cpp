@@ -6,9 +6,11 @@
 #include "core/engine_context.h"
 #include "core/device.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <dlfcn.h>
 #include <iostream>
@@ -243,6 +245,63 @@ void test_slot_limits() {
     }
 }
 
+void test_mixed_native_bank() {
+    for (bool wider_first : {false, true}) {
+        for (bool permuted : {false, true}) {
+            std::vector<std::byte> bytes;
+            family::HostObjectPlan source;
+            source.name = "mixed native experts";
+            source.handle = {0};
+            source.source_tensor.shape = {4, 64};
+            source.source_tensor.layout = StorageLayout::GgmlBlocksV1;
+            std::vector<std::size_t> offsets{0};
+            for (int row = 0; row < 4; ++row) {
+                const bool f16 = (row % 2 == 0) == wider_first;
+                const auto format = f16 ? NumericFormat::F16 : NumericFormat::Q8_0;
+                source.source_tensor.segments.push_back({format, 1});
+                const auto offset = bytes.size();
+                bytes.resize(offset + (f16 ? 128 : 68));
+                for (int group = 0; group < 2; ++group) {
+                    const int value = row * 2 + group + 1;
+                    if (f16) {
+                        const auto bits = std::bit_cast<std::uint16_t>(static_cast<_Float16>(value));
+                        for (int i = 0; i < 32; ++i) { put_half(bytes.data() + offset + (group * 32 + i) * 2, bits); }
+                    } else {
+                        put_half(bytes.data() + offset + group * 34, 0x3c00);
+                        std::fill_n(bytes.data() + offset + group * 34 + 2, 32, std::byte(value));
+                    }
+                }
+                offsets.push_back(bytes.size());
+            }
+            source.source_tensor.format = source.source_tensor.segments.front().format;
+            if (permuted) { source.source_tensor.group_map = {1, 0}; }
+            for (int row = 0; row < 4; ++row) {
+                source.parts.emplace_back(bytes.data() + offsets[row], offsets[row + 1] - offsets[row]);
+            }
+            const auto chosen = family::bank_as_planes(source, 4, 64,
+                artifact::qtype_for(source.source_tensor.format), family::BankPlanes::Native);
+            require(chosen == family::BankPlanes::W8 && source.generic_decode,
+                    "mixed native bank did not select a representation the gather can read");
+            const family::HostBank bank({.objects={source}});
+            const auto weight = family::host_w8_weight(bank.object(source.handle), 4, 64);
+            const auto* codes = static_cast<const std::int8_t*>(bank.object(source.handle).host);
+            require(weight.n == 4 && weight.k == 64, "decoded native bank lost its logical shape");
+            for (int row = 0; row < 4; ++row) {
+                for (int group = 0; group < 2; ++group) {
+                    std::uint16_t bits;
+                    std::memcpy(&bits, reinterpret_cast<const std::byte*>(codes) + 256 + (row * 2 + group) * 2, 2);
+                    const float scale = static_cast<float>(std::bit_cast<_Float16>(bits));
+                    const float expected = static_cast<float>(row * 2 + (permuted ? 1 - group : group) + 1);
+                    for (int i = 0; i < 32; ++i) {
+                        require(std::abs(codes[row * 64 + group * 32 + i] * scale - expected) < 0.004F,
+                                "mixed bank decoded a row with the wrong codec, offset or group permutation");
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_placement_and_isolation() {
     using test::artifact_fixture::Json;
     Json objects = Json::array();
@@ -307,6 +366,7 @@ int main() {
         DeviceContext device(0);
         test_readahead();
         test_decode_failure_recovery();
+        test_mixed_native_bank();
         test_placement_and_isolation();
         std::cout << "ok\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
