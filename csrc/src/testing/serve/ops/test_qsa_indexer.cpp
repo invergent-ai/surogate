@@ -84,7 +84,7 @@ struct Cache {
     DeviceBuffer table;
     std::vector<int> table_host;
     explicit Cache(int pages_in) : pages(pages_in), plane(0), table(0) {
-        plane = DeviceBuffer(static_cast<std::size_t>(pages) * kPageSize * kHeadDim * 2);
+        plane = DeviceBuffer(static_cast<std::size_t>(pages) * kPageSize * ops::kQsaIndexerStorageHeadDim * 2);
         cudaMemset(plane.p, 0, plane.bytes);
         table_host.resize(static_cast<std::size_t>(pages));
         std::iota(table_host.begin(), table_host.end(), 0);
@@ -95,7 +95,7 @@ struct Cache {
     PagedKVLayerView layer_view() const {
         PagedKVLayerView view;
         view.indexer_pages = Tensor(const_cast<void*>(plane.p), DType::BF16,
-                                    {kHeadDim, kPageSize, pages});
+                                    {ops::kQsaIndexerStorageHeadDim, kPageSize, pages});
         view.block_table   = Tensor(const_cast<void*>(table.p), DType::I32, {pages});
         view.head_dim      = kHeadDim;
         view.num_kv_heads  = 1;
@@ -104,7 +104,7 @@ struct Cache {
     PagedKVBatchLayerView batch_view() const {
         PagedKVBatchLayerView view;
         view.indexer_pages = Tensor(const_cast<void*>(plane.p), DType::BF16,
-                                    {kHeadDim, kPageSize, pages});
+                                    {ops::kQsaIndexerStorageHeadDim, kPageSize, pages});
         view.block_tables  = Tensor(const_cast<void*>(table.p), DType::I32, {pages, 1});
         view.head_dim      = kHeadDim;
         view.num_kv_heads  = 1;
@@ -112,7 +112,8 @@ struct Cache {
     }
     std::size_t cell_offset(int position) const {
         const int page = table_host[static_cast<std::size_t>(position / kPageSize)];
-        return (static_cast<std::size_t>(page) * kPageSize + (position % kPageSize)) * kHeadDim;
+        return static_cast<std::size_t>(page) * kPageSize * ops::kQsaIndexerStorageHeadDim +
+               kPageSize * kHeadDim + ((position % kPageSize) / kBlock) * kHeadDim;
     }
 };
 
@@ -164,7 +165,20 @@ int main() {
     for (int t = 256; t < tokens; ++t) { append(t, 1); }
     expect(cudaGetLastError() == cudaSuccess, "append launched cleanly");
 
-    // Every complete block's first cell holds its block key.
+    // A rejected speculative suffix can start inside an already folded block.
+    // Replace its keys and replay it, including suffixes crossing physical pages.
+    for (const auto [begin, count] : {std::pair{13, 3}, {62, 6}, {127, 5}, {254, 2}}) {
+        for (int token = begin; token < begin + count; ++token) {
+            for (int d = 0; d < kHeadDim; ++d) { raw[token * kHeadDim + d] = dist(rng); }
+        }
+        append(begin, count);
+        const auto first = from_device_bf16(cache.plane, cache.plane.bytes / 2);
+        append(begin, count);
+        const auto replay = from_device_bf16(cache.plane, cache.plane.bytes / 2);
+        expect(first == replay, "re-appending a speculative suffix must be idempotent");
+    }
+
+    // Every complete block has a pooled key separate from its raw cells.
     const std::vector<double> plane_host =
         from_device_bf16(cache.plane, cache.plane.bytes / 2);
     // The plane stores BF16, so a component is exact only to one BF16 ulp (~0.4 % relative,

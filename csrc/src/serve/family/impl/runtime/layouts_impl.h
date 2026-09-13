@@ -91,6 +91,8 @@ namespace {
 
 template <class V>
 inline constexpr bool has_glm_indexer_v = requires { V::has_glm_indexer; };
+template <class V>
+inline constexpr bool has_qsa_indexer_v = requires { V::has_qsa_indexer; };
 
 // QSA indexer width of the target (design/INFERENCE.md, phase 4), or 0 when the model has no
 // indexer: the KV cache then carries one extra BF16 plane per full-attention layer.
@@ -243,8 +245,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .global_geometry_layers    = geometry_global_geometry_layers(plan.geometry),
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
-                     .indexer_head_dim          = plan.geometry.indexer_head_dim *
-                         (has_glm_indexer_v<Variant> ? 3 : 1),
+                     .indexer_head_dim          = has_glm_indexer_v<Variant>
+                         ? plan.geometry.indexer_head_dim * 3
+                         : has_qsa_indexer_v<Variant>
+                               ? ops::kQsaIndexerStorageHeadDim : plan.geometry.indexer_head_dim,
                      .indexer_dtype = has_glm_indexer_v<Variant> ? DType::FP32 : DType::BF16,
                      .mtp_indexer = has_glm_indexer_v<Variant>,
                      .kv_skip_layers            = plan.kv_skip_layers,

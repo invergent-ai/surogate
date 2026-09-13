@@ -6,13 +6,9 @@
 // than the attention budget costs a budget-sized attention. llama.cpp's `build_qsa_top_k`
 // (study/llama.cpp-master/src/models/qwen4exp.cpp:469) is the oracle.
 //
-// The engine keeps the indexer keys in the text KV pool, one BF16 plane of `head_dim` per
-// full-attention layer, sharing pages and block tables with K/V. Two states live in that plane:
-//
-//   * cell p of an incomplete block holds the token's RAW indexer key (no norm, no rotation);
-//   * once a block is complete, the cell of its FIRST position holds the block's key — the mean
-//     of its `block` raw keys, RMS-normalised and roped at the block's first position. The other
-//     cells of a complete block are dead.
+// Each physical page stores every raw token key followed by one pooled key per complete
+// block. Pooling never overwrites raw keys: speculative rollback may rewrite a suffix that
+// starts inside a previously completed block, which must then be folded again.
 //
 // A block is complete as soon as its last position is cached, so `qsa_indexer_append` folds it
 // in the same launch that writes the raw keys.
@@ -26,6 +22,10 @@
 #include <cuda_runtime.h> // cudaStream_t
 
 namespace sinfer::ops {
+
+// 64 raw 128-wide keys and 16 pooled keys per page: 160 BF16 values per token
+// for the registered 128-wide, four-cell indexer.
+inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 160;
 
 struct QsaIndexerGeometry {
     std::int32_t head_dim   = 0; // indexer key/query width

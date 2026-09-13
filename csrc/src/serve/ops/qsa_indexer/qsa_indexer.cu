@@ -22,10 +22,15 @@ constexpr int kWarps    = 4;
 constexpr std::int64_t kSelectScratchBytes = 64LL << 20;
 constexpr int kThreads  = kWarps * kWarp;
 
-// The indexer plane holds one head of `kHeadDim` per cell.
+// Raw and pooled keys occupy disjoint regions within each physical page.
+template <bool Pooled = false>
 __device__ __forceinline__ std::int64_t indexer_offset(const std::int32_t* block_table,
                                                        std::int32_t position) {
-    return paged_kv_element_offset<kHeadDim, 1>(block_table, 0, position, 0);
+    const int cell = position % kPagedKVPageSize;
+    const auto page = paged_kv_element_offset<kQsaIndexerStorageHeadDim, 1>(
+        block_table, 0, position - cell, 0);
+    return page + (Pooled ? kPagedKVPageSize * kHeadDim + (cell / kBlock) * kHeadDim
+                          : cell * kHeadDim);
 }
 
 // Same arithmetic as the engine's rope kernel (ops/kernel/rope.cuh): an accurate `powf` for the
@@ -61,7 +66,7 @@ __global__ void qsa_append_raw_kernel(const __nv_bfloat16* __restrict__ keys,
 }
 
 // One warp per new column: if the column completed a block, folds that block's raw keys into the
-// block key kept at the block's first cell — mean, RMSNorm, rope at the first position. A
+// separate block key — mean, RMSNorm, rope at the first position. A
 // separate launch from the raw writes above: a block's cells can be written by warps of other
 // CTAs, and only a launch boundary orders those against this read.
 __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ positions,
@@ -129,7 +134,7 @@ __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ position
         value[i] = d < half ? value[i] * cos_a - partner[i] * sin_a
                             : value[i] * cos_a + partner[i] * sin_a;
     }
-    __nv_bfloat16* block_dst = plane + indexer_offset(block_table, first) + d0;
+    __nv_bfloat16* block_dst = plane + indexer_offset<true>(block_table, first) + d0;
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) { block_dst[i] = __float2bfloat16(value[i]); }
 }
@@ -184,7 +189,7 @@ __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
 
     float* row_scores = scores + static_cast<std::int64_t>(row) * score_stride;
     for (int b = warp; b < scored; b += kWarps) {
-        const __nv_bfloat16* k = plane + indexer_offset(block_table, b * kBlock) + d0;
+        const __nv_bfloat16* k = plane + indexer_offset<true>(block_table, b * kBlock) + d0;
         float kv[kPerLane];
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) { kv[i] = __bfloat162float(k[i]); }
@@ -295,6 +300,10 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
     require(positions.dtype == DType::I32, "positions must be I32");
     require(keys.ne[0] == kHeadDim, "keys must be [head_dim, T]");
     require(cache.indexer_pages.data != nullptr, "the cache carries no indexer plane");
+    require(cache.indexer_pages.dtype == DType::BF16 &&
+                cache.indexer_pages.ne[0] == kQsaIndexerStorageHeadDim &&
+                cache.indexer_pages.ne[1] == kPagedKVPageSize,
+            "indexer pages must hold separate raw and pooled keys");
     require(cache.block_tables.data != nullptr, "the cache view has no block tables");
     const int tokens = static_cast<int>(keys.ne[1]);
     if (tokens == 0) { return; }
@@ -330,6 +339,10 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
                 table_rows.dtype == DType::I32 && mask.dtype == DType::I32,
             "select tensor dtypes are wrong");
     require(cache.indexer_pages.data != nullptr, "the cache carries no indexer plane");
+    require(cache.indexer_pages.dtype == DType::BF16 &&
+                cache.indexer_pages.ne[0] == kQsaIndexerStorageHeadDim &&
+                cache.indexer_pages.ne[1] == kPagedKVPageSize,
+            "indexer pages must hold separate raw and pooled keys");
     require(q.ne[0] == kHeadDim && q.ne[1] == geometry.heads, "q must be [head_dim, heads, rows]");
     const int rows = static_cast<int>(q.ne[2]);
     if (rows == 0) { return; }
