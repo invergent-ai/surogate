@@ -10,6 +10,7 @@
 // produces a plausible-looking matrix), and the combine really is a mix -- with `post` zero the
 // residual is a pure recombination of the streams, so their total mass per channel is preserved.
 #include "api/ops/manifold_hyper_connection.h"
+#include "core/device.h"
 #include "ops/op_tester.h"
 
 #include <cmath>
@@ -267,7 +268,7 @@ int run_case(const Case& item) {
 
     // Sized by the op's own answer: the split projection lands its partial sums in the arena.
     WorkspaceArena arena(ops::manifold_hyper_connection_mix_workspace_capacity_bytes(
-        item.streams, item.hidden, item.tokens, item.tokens));
+        item.streams, item.hidden, 1, item.tokens));
     ops::manifold_hyper_connection_mix(residual_tensor, weights, item.streams,
                                        static_cast<float>(kRmsEps), static_cast<float>(kHcEps),
                                        item.iterations, collapsed, post, comb, arena, nullptr);
@@ -284,6 +285,54 @@ int run_case(const Case& item) {
     failures += verify_pointwise((label + " comb").c_str(),
                                  read_f32(device_comb.data(), expected_comb.size()), expected_comb,
                                  gate_criterion());
+
+    // Identical input must produce identical mixing weights, independent of CTA
+    // completion order. Check FP32 bits as well as the rounded BF16 collapse.
+    const auto post_bits = from_device<std::uint32_t>(device_post.data(), expected_post.size());
+    const auto comb_bits = from_device<std::uint32_t>(device_comb.data(), expected_comb.size());
+    const auto collapse_bits = from_device<std::uint16_t>(device_collapsed.data(), expected_collapsed.size());
+    const auto unchanged = [&] {
+        return post_bits == from_device<std::uint32_t>(device_post.data(), post_bits.size()) &&
+               comb_bits == from_device<std::uint32_t>(device_comb.data(), comb_bits.size()) &&
+               collapse_bits == from_device<std::uint16_t>(device_collapsed.data(), collapse_bits.size());
+    };
+    cudaStream_t replay_stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&replay_stream, cudaStreamNonBlocking));
+    const auto mix_again = [&] {
+        ops::manifold_hyper_connection_mix(residual_tensor, weights, item.streams,
+            static_cast<float>(kRmsEps), static_cast<float>(kHcEps), item.iterations,
+            collapsed, post, comb, arena, replay_stream);
+    };
+    // The number of slice partials can peak before max_tokens. Use the same
+    // capacity for shorter rounds, including the last point before a split drops.
+    for (const int prefix : {1, std::max(1, item.tokens / 2), std::max(1, item.tokens - 1), item.tokens}) {
+        Tensor prefix_residual(device_residual.data(), DType::BF16, {layout.width(), prefix});
+        Tensor prefix_collapsed(device_collapsed.data(), DType::BF16, {item.hidden, prefix});
+        Tensor prefix_post(device_post.data(), DType::FP32, {item.streams, prefix});
+        Tensor prefix_comb(device_comb.data(), DType::FP32, {item.streams, item.streams, prefix});
+        ops::manifold_hyper_connection_mix(prefix_residual, weights, item.streams,
+            static_cast<float>(kRmsEps), static_cast<float>(kHcEps), item.iterations,
+            prefix_collapsed, prefix_post, prefix_comb, arena, replay_stream);
+    }
+    for (int repeat = 0; repeat < 24; ++repeat) {
+        mix_again();
+        CUDA_CHECK(cudaStreamSynchronize(replay_stream));
+        if (!unchanged()) { std::cerr << label << ": eager mHC was not bit-reproducible\n"; ++failures; break; }
+    }
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    CUDA_CHECK(cudaStreamBeginCapture(replay_stream, cudaStreamCaptureModeThreadLocal));
+    mix_again();
+    CUDA_CHECK(cudaStreamEndCapture(replay_stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (int repeat = 0; repeat < 24; ++repeat) {
+        CUDA_CHECK(cudaGraphLaunch(executable, replay_stream));
+        CUDA_CHECK(cudaStreamSynchronize(replay_stream));
+        if (!unchanged()) { std::cerr << label << ": captured mHC was not bit-reproducible\n"; ++failures; break; }
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaStreamDestroy(replay_stream));
 
     // Sinkhorn's whole purpose: rows and columns each sum to one. A wrong iteration order still
     // yields a positive matrix that a pointwise check against a matching oracle would pass, so
@@ -465,6 +514,9 @@ int run_mean() {
 
 int main() {
     int failures = 0;
+    int device = 0, multiprocessors = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
     const Case cases[] = {
         // GLM-5.3-Flash: four streams over a 4096 hidden, one token (decode) and a prefill run.
         {4, 4096, 1, 20, 11u, "mHC decode, 4 streams x 4096"},
@@ -472,9 +524,12 @@ int main() {
         // The degenerate ends of the geometry: one stream (comb is the 1x1 identity) and two.
         {1, 2048, 4, 20, 17u, "mHC one stream"},
         {2, 1024, 8, 20, 19u, "mHC two streams"},
+        {3, 768, 3, 20, 21u, "mHC three streams"},
+        {4, 8192, 3, 20, 22u, "mHC maximum residual width"},
         // A single Sinkhorn iteration is column-normalisation alone: rows will not sum to one,
         // and the row check below is skipped for it by construction (streams == 1).
         {1, 512, 3, 1, 23u, "mHC one Sinkhorn iteration"},
+        {1, 512, 2 * multiprocessors, 1, 29u, "mHC workspace interval at adaptive split boundary"},
     };
     for (const Case& item : cases) { failures += run_case(item); }
     failures += run_mass_conservation();

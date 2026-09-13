@@ -24,7 +24,7 @@ constexpr int kMaxWidth = 32768;
 
 /// The projection, split across the width. One block per (token, slice): each accumulates its
 /// slice's contribution to the column's sum of squares and to every projection row, into an
-/// FP32 workspace of `1 + rows` floats per token.
+/// FP32 workspace of `1 + rows` floats per (token, slice).
 ///
 /// A block per *token* was the first shape, staging the whole column in shared memory so it
 /// could be read once for the norm, once per projection row and once for the collapse. That is
@@ -67,7 +67,7 @@ __global__ __launch_bounds__(kThreads) void manifold_project_kernel(
         const int slot = static_cast<int>(threadIdx.x);
         float sum      = 0.0F;
         for (int w = 0; w < kWarps; ++w) { sum += reduce[w * (rows + 1) + slot]; }
-        atomicAdd(&partials[static_cast<std::int64_t>(token) * (rows + 1) + slot], sum);
+        partials[(static_cast<std::int64_t>(token) * slices + slice) * (rows + 1) + slot] = sum;
     }
 }
 
@@ -82,17 +82,25 @@ template <int kStreams>
 __global__ void manifold_reduce_kernel(const float* __restrict__ partials,
                                        const float* __restrict__ base,
                                        const float* __restrict__ scale, int width, int tokens,
-                                       int rows, float rms_eps, float hc_eps,
+                                       int rows, int slices, float rms_eps, float hc_eps,
                                        int sinkhorn_iterations, float* __restrict__ pre_out,
                                        float* __restrict__ post, float* __restrict__ comb) {
     constexpr int streams = kStreams;
     const int token       = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
                             static_cast<int>(threadIdx.x);
     if (token >= tokens) { return; }
-    const float* accumulated = partials + static_cast<std::int64_t>(token) * (rows + 1);
-    const float inv          = rsqrtf(accumulated[0] / static_cast<float>(width) + rms_eps);
-
     constexpr int kRows = (2 + kStreams) * kStreams;
+    const float* source = partials + static_cast<std::int64_t>(token) * slices * (rows + 1);
+    float accumulated[kRows + 1]{};
+    // CTA completion order never participates in floating-point summation.
+    for (int slice = 0; slice < slices; ++slice) {
+#pragma unroll
+        for (int row = 0; row <= kRows; ++row) {
+            accumulated[row] += source[slice * (kRows + 1) + row];
+        }
+    }
+    const float inv = rsqrtf(accumulated[0] / static_cast<float>(width) + rms_eps);
+
     float logits[kRows];
 #pragma unroll
     for (int r = 0; r < kRows; ++r) { logits[r] = accumulated[1 + r] * inv; }
@@ -366,6 +374,13 @@ unsigned grid_for(std::int64_t count) {
     return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
 
+int projection_parallelism() {
+    int device = 0, multiprocessors = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    return std::max(1, 2 * multiprocessors);
+}
+
 } // namespace
 
 std::size_t manifold_hyper_connection_mix_workspace_capacity_bytes(std::int32_t streams,
@@ -376,12 +391,16 @@ std::size_t manifold_hyper_connection_mix_workspace_capacity_bytes(std::int32_t 
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("manifold_hyper_connection: invalid token interval");
     }
-    // `partials` (one sum of squares plus one dot per projection row, per token) and `pre`.
+    // Each slice owns its partials. For every T in the interval,
+    // T * min(slice_cap, ceil(parallelism/T)) <= min(slice_cap*T, parallelism+T-1).
+    // This bounds the adaptive split without reserving slice_cap rows for every
+    // prefill token, where the actual slice count can fall to one.
     const std::int32_t rows = (2 + streams) * streams;
-    const std::size_t per_token =
-        (static_cast<std::size_t>(rows) + 1 + static_cast<std::size_t>(streams)) * sizeof(float);
+    const auto tokens = static_cast<std::size_t>(max_tokens);
+    const auto cap = static_cast<std::size_t>((streams * hidden + kThreads - 1) / kThreads);
+    const auto partial_rows = std::min(cap * tokens, static_cast<std::size_t>(projection_parallelism()) + tokens - 1);
+    const std::size_t bytes = ((rows + 1) * partial_rows + streams * tokens) * sizeof(float);
     // One arena allocation, rounded the way the arena rounds it.
-    const std::size_t bytes = per_token * static_cast<std::size_t>(max_tokens);
     return (bytes + 255U) / 256U * 256U + 256U;
 }
 
@@ -391,7 +410,6 @@ void manifold_hyper_connection_mix(const Tensor& residual,
                                    std::int32_t sinkhorn_iterations, Tensor& collapsed,
                                    Tensor& post, Tensor& comb, WorkspaceArena& workspace,
                                    cudaStream_t stream) {
-    (void)workspace;
     const std::int32_t tokens = residual.ne[1];
     if (tokens <= 0) { return; }
     if (residual.ne[0] % streams != 0) {
@@ -435,29 +453,20 @@ void manifold_hyper_connection_mix(const Tensor& residual,
 
     // Enough blocks to fill the card, and never more slices than there is width to divide:
     // a decode round has one token and would otherwise run a single CTA against the
-    // projection's whole 786 KB. Two blocks per SM is the point where more stops helping and
-    // the atomics start to cost.
+    // projection's whole 786 KB. Keep the existing two-blocks-per-SM target;
+    // deterministic slice storage does not require increasing the launch grid.
     const int slice_cap = (width + kThreads - 1) / kThreads;
-    int slices          = 1;
-    {
-        int device_id = 0;
-        CUDA_CHECK(cudaGetDevice(&device_id));
-        int multiprocessors = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
-                                          device_id));
-        const int wanted = (2 * multiprocessors + tokens - 1) / tokens;
-        slices           = std::max(1, std::min(slice_cap, wanted));
-    }
+    const int wanted = 1 + (projection_parallelism() - 1) / tokens;
+    const int slices = std::min(slice_cap, wanted);
 
     const std::size_t partial_floats =
-        static_cast<std::size_t>(rows + 1) * static_cast<std::size_t>(tokens);
+        static_cast<std::size_t>(rows + 1) * static_cast<std::size_t>(tokens) * slices;
     const std::size_t pre_floats =
         static_cast<std::size_t>(streams) * static_cast<std::size_t>(tokens);
     const DeviceArena::Scope reserved = workspace.scope();
     const DeviceSpan span = workspace.alloc_bytes((partial_floats + pre_floats) * sizeof(float));
     auto* partials        = static_cast<float*>(span.data);
     float* pre            = partials + partial_floats;
-    CUDA_CHECK(cudaMemsetAsync(partials, 0, partial_floats * sizeof(float), stream));
 
     const dim3 project_grid(static_cast<unsigned>(slices), static_cast<unsigned>(tokens));
     manifold_project_kernel<<<project_grid, kThreads, 0, stream>>>(
@@ -477,7 +486,7 @@ void manifold_hyper_connection_mix(const Tensor& residual,
             constexpr int kStreams = decltype(tag)::value;
             manifold_reduce_kernel<kStreams><<<grid, kReduceThreads, 0, stream>>>(
                 partials, static_cast<const float*>(weights.base.data),
-                static_cast<const float*>(weights.scale.data), width, tokens, rows, rms_eps,
+                static_cast<const float*>(weights.scale.data), width, tokens, rows, slices, rms_eps,
                 hc_eps, sinkhorn_iterations, pre, static_cast<float*>(post.data),
                 static_cast<float*>(comb.data));
         };
