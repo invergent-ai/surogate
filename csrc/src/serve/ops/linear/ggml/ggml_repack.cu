@@ -10,8 +10,8 @@ namespace {
 
 // The row-split geometry for an 8-bit format at group 32, spelled here rather than pulled from
 // the artifact layer: 32 code bytes per group in the first plane, two scale bytes per group in
-// the second, the second starting at the next 256-byte boundary. `k` is a multiple of 128 for
-// every weight this runs on, so there are no padding groups to fill.
+// the second, the second starting at the next 256-byte boundary. Stored rows are padded to
+// 128 columns; source blocks and group maps contain only the logical columns.
 constexpr std::size_t kPlaneAlignment = 256;
 
 constexpr std::size_t align_up(std::size_t value, std::size_t alignment) {
@@ -24,6 +24,7 @@ __global__ void q8_0_to_w8_rowsplit_kernel(const block_q8_0* __restrict__ blocks
                                            std::uint8_t* __restrict__ scales,
                                            const std::int32_t* __restrict__ group_map,
                                            const std::int32_t groups_per_row,
+                                           const std::int32_t padded_groups_per_row,
                                            const std::int64_t groups) {
     const std::int64_t group =
         static_cast<std::int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
@@ -36,9 +37,11 @@ __global__ void q8_0_to_w8_rowsplit_kernel(const block_q8_0* __restrict__ blocks
             : (group / groups_per_row) * groups_per_row + group_map[group % groups_per_row];
     const block_q8_0& source = blocks[source_group];
     const int lane           = static_cast<int>(threadIdx.x);
-    codes[group * QK8_0 + lane] = static_cast<std::uint8_t>(source.qs[lane]);
+    const auto destination_group = (group / groups_per_row) * padded_groups_per_row +
+                                   group % groups_per_row;
+    codes[destination_group * QK8_0 + lane] = static_cast<std::uint8_t>(source.qs[lane]);
     if (lane == 0) {
-        *reinterpret_cast<__half*>(scales + group * 2) = source.d;
+        *reinterpret_cast<__half*>(scales + destination_group * 2) = source.d;
     }
 }
 
@@ -60,9 +63,11 @@ void q8_0_to_w8_rowsplit_launch(const void* blocks, void* out, std::int32_t rows
     }
     const std::size_t groups_per_row = static_cast<std::size_t>(k) / QK8_0;
     const std::size_t groups         = static_cast<std::size_t>(rows) * groups_per_row;
-    const std::size_t code_bytes     = groups * QK8_0;
+    const std::size_t padded_groups_per_row = align_up(static_cast<std::size_t>(k), 128) / QK8_0;
+    const std::size_t padded_groups = static_cast<std::size_t>(rows) * padded_groups_per_row;
+    const std::size_t code_bytes     = padded_groups * QK8_0;
     const std::size_t scale_offset   = align_up(code_bytes, kPlaneAlignment);
-    if (out_bytes < scale_offset + groups * 2) {
+    if (out_bytes < scale_offset + padded_groups * 2) {
         throw std::invalid_argument("q8_0 repack: destination is too small for the planes");
     }
     // The gap the plane alignment leaves is never read, but zeroing it keeps a materialised
@@ -73,7 +78,8 @@ void q8_0_to_w8_rowsplit_launch(const void* blocks, void* out, std::int32_t rows
     const dim3 grid(static_cast<unsigned>((groups + 7) / 8));
     q8_0_to_w8_rowsplit_kernel<<<grid, block, 0, stream>>>(
         static_cast<const block_q8_0*>(blocks), bytes, bytes + scale_offset, group_map,
-        static_cast<std::int32_t>(groups_per_row), static_cast<std::int64_t>(groups));
+        static_cast<std::int32_t>(groups_per_row), static_cast<std::int32_t>(padded_groups_per_row),
+        static_cast<std::int64_t>(groups));
     CUDA_CHECK(cudaGetLastError());
 }
 

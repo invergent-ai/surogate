@@ -4,6 +4,7 @@
 #include "artifact/typed_binding.h"
 #include "artifact_fixture.h"
 #include "core/device.h"
+#include "ops/linear/ggml/ggml_repack.h"
 
 #include <cuda_runtime.h>
 
@@ -79,6 +80,75 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
+void test_q8_padded_repack(sinfer::DeviceContext& device) {
+    using namespace sinfer;
+    using namespace sinfer::artifact;
+    using Json = test::artifact_fixture::Json;
+    for (const int columns : {32, 64, 96, 128, 160, 2880}) {
+        for (const bool permuted : {false, true}) {
+            constexpr int rows = 3;
+            const int groups = columns / 32;
+            std::vector<std::uint8_t> source_bytes(rows * groups * 34);
+            for (int group = 0; group < rows * groups; ++group) {
+                const std::uint16_t scale = 0x3800 + group % 128;
+                source_bytes[group * 34] = scale & 255;
+                source_bytes[group * 34 + 1] = scale >> 8;
+                for (int j = 0; j < 32; ++j) { source_bytes[group * 34 + 2 + j] = (group * 7 + j) % 256; }
+            }
+            test::artifact_fixture::TemporaryArtifact source{
+                std::filesystem::temp_directory_path() / "surogate_q8_padding_source.bin"};
+            {
+                std::ofstream file(source.path, std::ios::binary);
+                file.write(reinterpret_cast<const char*>(source_bytes.data()), source_bytes.size());
+                require(bool(file), "could not write Q8 fixture");
+            }
+            const std::array<std::uint64_t, 2> shape{rows, static_cast<std::uint64_t>(columns)};
+            const auto layout = row_split_geometry(NumericFormat::W8G32_F16S, shape);
+            std::vector<std::int32_t> map;
+            if (permuted) { for (int i = 0; i < groups; ++i) { map.push_back(groups - i - 1); } }
+            Json tensor{{"name", "weight"}, {"kind", "tensor"}, {"shape", shape},
+                {"format", "W8G32_F16S"}, {"layout", "row-split-k128-v1"},
+                {"offset", 0}, {"bytes", layout.encoded_bytes}, {"transform", "q8_0-to-w8g32"},
+                {"runs", Json::array({{{"source", 1}, {"offset", 0}, {"bytes", 17}},
+                                      {{"source", 1}, {"offset", 17}, {"bytes", source_bytes.size() - 17}}})}};
+            if (permuted) { tensor["group_map"] = map; }
+            auto fixture = test::artifact_fixture::write_fixture({
+                {"identity", {{"model_id", "q8-padding"}, {"weights_id", "test"}}},
+                {"external", Json::array({{{"path", source.path.string()}, {"bytes", source_bytes.size()}}})},
+                {"objects", Json::array({tensor})}}, "q8_padding");
+            Reader reader(fixture.path);
+            Binder binder(reader);
+            const auto weight = binder.require_tensor("weight", NumericFormat::W8G32_F16S,
+                                                      StorageLayout::RowSplitK128V1, shape);
+            binder.materialize_on_device(weight);
+            auto result = materialize(reader, binder.finish(), device);
+            std::vector<std::uint8_t> expected(layout.encoded_bytes, 0), actual(layout.encoded_bytes);
+            for (int row = 0; row < rows; ++row) {
+                for (int group = 0; group < groups; ++group) {
+                    const auto src = (row * groups + (permuted ? map[group] : group)) * 34;
+                    const auto dst = row * layout.groups_per_row + group;
+                    std::copy_n(source_bytes.begin() + src + 2, 32, expected.begin() + dst * 32);
+                    std::copy_n(source_bytes.begin() + src, 2, expected.begin() + layout.scale_plane_offset + dst * 2);
+                }
+            }
+            CUDA_CHECK(cudaMemcpy(actual.data(), result.device_data(weight), actual.size(), cudaMemcpyDeviceToHost));
+            if (actual != expected) {
+                throw std::runtime_error("Q8 padded repack differs at K=" + std::to_string(columns) +
+                                         (permuted ? " with a group map" : " without a group map"));
+            }
+            require(result.stats().h2d_bytes == source_bytes.size(), "Q8 source accounting includes destination padding");
+            DeviceBuffer input(source_bytes.size());
+            input.copy_from_host(source_bytes.data(), source_bytes.size());
+            bool rejected = false;
+            try {
+                ops::detail::ggml::q8_0_to_w8_rowsplit_launch(input.p, const_cast<void*>(result.device_data(weight)),
+                    rows, columns, layout.encoded_bytes - 1, nullptr, device.stream);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "Q8 repack accepted a buffer shorter than the padded layout");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -152,6 +222,7 @@ int main() {
                 "binder produced the wrong materialization plan");
 
         sinfer::DeviceContext device(0);
+        test_q8_padded_repack(device);
         auto materialized = sinfer::artifact::materialize(reader, plan, device);
 
         std::array<std::byte, kTensor.size()> copied{};
