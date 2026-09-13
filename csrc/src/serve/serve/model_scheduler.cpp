@@ -110,12 +110,24 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt,
                                            const PreparationControl& control) {
     check_wake_control(control);
     const auto target_devices = target.entry.service->devices();
-    const auto short_devices = [&] {
-        DeviceBytes needed, resident;
+    DeviceBytes needed;
+    for (int device : target_devices) {
+        const auto bytes = target.entry.service->resident_bytes(device);
+        const auto budget = device_budgets_.at(device);
+        if (bytes > budget) {
+            throw RequestError(RequestErrorKind::Unavailable,
+                "model '" + target.entry.name + "' needs " + std::to_string(bytes) +
+                " bytes on device " + std::to_string(device) + ", exceeding its " +
+                std::to_string(budget) + " byte memory budget");
+        }
+        needed[device] = bytes;
+    }
+    const auto short_devices = [&](const std::vector<State*>& removed = {}) {
+        DeviceBytes resident;
         for (int device : target_devices) {
-            needed[device] = target.entry.service->resident_bytes(device);
             for (const auto& state : models_) {
-                if (!state.entry.service->is_sleeping() && state.entry.service != target.entry.service) {
+                if (!state.entry.service->is_sleeping() && state.entry.service != target.entry.service &&
+                    std::find(removed.begin(), removed.end(), &state) == removed.end()) {
                     resident[device] += state.entry.service->resident_bytes(device);
                 }
             }
@@ -127,6 +139,24 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt,
             return state.entry.service->resident_bytes(device) != 0;
         });
     };
+    const auto can_evict = [&](const State& state, bool busy) {
+        if (busy) {
+            return allow_preempt && state.entry.priority <= target.entry.priority &&
+                   Clock::now() - state.woke_at >= min_dwell_;
+        }
+        const auto warmth = state.entry.priority == 2 ? keep_warm_ * 2
+                            : state.entry.priority == 0 ? keep_warm_ / 2 : keep_warm_;
+        return Clock::now() - state.last_used >= warmth;
+    };
+    // Even removing every idle model cannot help if protected busy residents
+    // already leave too little space. Preserve idle prefix caches in that case.
+    std::vector<State*> reclaimable;
+    for (auto& state : models_) {
+        if (state.entry.service == target.entry.service || state.entry.service->is_sleeping()) { continue; }
+        const bool busy = state.entry.service->active_requests() != 0;
+        if (!busy || can_evict(state, true)) { reclaimable.push_back(&state); }
+    }
+    if (!short_devices(reclaimable).empty()) { return false; }
     // The cheap move first: an idle awake model's KV is mostly prefix cache, and an elastic
     // pool gives those granules back without the model leaving the device. Shrink every idle
     // neighbour once and re-check before any model is put to sleep.
@@ -140,26 +170,19 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt,
             state.entry.service->shrink_kv();
         }
     }
-    for (auto shortfall = short_devices(); !shortfall.empty(); shortfall = short_devices()) {
+    // Plan the complete set before sleeping anyone. A partial set may free space
+    // on one device while another is blocked by a model we cannot evict.
+    std::vector<State*> victims;
+    std::vector<bool> preempt;
+    for (auto shortfall = short_devices(victims); !shortfall.empty(); shortfall = short_devices(victims)) {
         State* victim  = nullptr;
         bool busy_pick = false;
-        const auto now = Clock::now();
         for (auto& state : models_) {
             if (state.entry.service == target.entry.service) { continue; }
+            if (std::find(victims.begin(), victims.end(), &state) != victims.end()) { continue; }
             if (state.entry.service->is_sleeping() || !occupies(state, shortfall)) { continue; }
             const bool busy = state.entry.service->active_requests() != 0;
-            if (busy && !allow_preempt) { continue; }
-            // The preemption fence: a busy model yields only to an equal or
-            // higher priority target. A lower-priority requester waits for the
-            // natural drain instead -- that is what priority means here.
-            if (busy && state.entry.priority > target.entry.priority) { continue; }
-            // Idle models of any tier stay evictable (nothing pins VRAM by
-            // being idle), but higher tiers keep their warmth longer.
-            const auto warmth = state.entry.priority == 2   ? keep_warm_ * 2
-                                : state.entry.priority == 0 ? keep_warm_ / 2
-                                                            : keep_warm_;
-            if (!busy && now - state.last_used < warmth) { continue; }
-            if (busy && now - state.woke_at < min_dwell_) { continue; }
+            if (!can_evict(state, busy)) { continue; }
             // Idle victims strictly before busy ones; within a class, lower
             // priority first, then LRU.
             const bool better =
@@ -174,13 +197,18 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt,
             }
         }
         if (victim == nullptr) { return false; }
-        if (busy_pick) {
+        victims.push_back(victim);
+        preempt.push_back(busy_pick);
+    }
+    for (std::size_t i = 0; i < victims.size(); ++i) {
+        State* victim = victims[i];
+        if (preempt[i]) {
             write_console_log(ConsoleLogLevel::Info,
                               "scheduler: preempting busy model '" + victim->entry.name +
                                   "' at a round boundary; its generations resume after re-wake");
         }
         check_wake_control(control);
-        victim->entry.service->sleep(/*preempt=*/busy_pick);
+        victim->entry.service->sleep(/*preempt=*/preempt[i]);
     }
     return true;
 }
