@@ -970,6 +970,7 @@ public:
         reasoning_started = true;
         ids.reasoning     = new_response_item_id("rs");
         reasoning_index   = next_output_index++;
+        output_order.push_back(ids.reasoning);
         const Json item   = {{"id", ids.reasoning},
                              {"type", "reasoning"},
                              {"status", "in_progress"},
@@ -1012,6 +1013,7 @@ public:
         message_started = true;
         ids.message     = new_response_item_id("msg");
         message_index   = next_output_index++;
+        output_order.push_back(ids.message);
         const Json item = {{"id", ids.message},
                            {"type", "message"},
                            {"status", "in_progress"},
@@ -1059,6 +1061,7 @@ public:
     ResponsesRequest request;
     ResponsesRuntimeValues runtime;
     std::uint64_t sequence = 0;
+    std::vector<std::string> output_order;
     int next_output_index  = 0;
     int reasoning_index    = -1;
     int message_index      = -1;
@@ -1192,6 +1195,7 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
         const std::string item_id = new_response_item_id("fc");
         impl_->ids.function_calls.push_back(item_id);
         const int output_index = impl_->next_output_index++;
+        impl_->output_order.push_back(item_id);
         const Json added_item  = {{"id", item_id},           {"type", "function_call"},
                                   {"status", "in_progress"}, {"call_id", call.id},
                                   {"name", call.name},       {"arguments", ""}};
@@ -1219,6 +1223,22 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
 
     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,
                                        outcome, impl_->ids);
+    // The first emitted delta can be content, even on a model that later emits
+    // reasoning. Preserve the indices already published to streaming clients.
+    auto& items = finished.response.output_items;
+    std::vector<Json> ordered;
+    ordered.reserve(impl_->output_order.size());
+    for (const auto& id : impl_->output_order) {
+        const auto item = std::find_if(items.begin(), items.end(), [&](const Json& value) {
+            return value.is_object() && value.at("id") == id;
+        });
+        if (item == items.end()) {
+            throw std::logic_error("streamed output item is missing from the terminal response");
+        }
+        ordered.push_back(std::move(*item));
+    }
+    items = std::move(ordered);
+    finished.response.body["output"] = items;
     return finished;
 }
 

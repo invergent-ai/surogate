@@ -516,6 +516,58 @@ int test_sse_sequence() {
     return failures;
 }
 
+int test_sse_output_indices() {
+    int failures = 0;
+    // Content before reasoning, reasoning first, and reasoning arriving only at finish.
+    for (int order = 0; order < 3; ++order) {
+        for (bool incomplete : {false, true}) {
+            ResponsesRequest request = parse_responses_request(
+                Json{{"model", "m"}, {"input", "hello"}, {"stream", true}}, limits());
+            ResponsesEventStream encoder("resp_order", 123, request, {});
+            auto wire = encoder.start();
+            const auto append = [&](const std::vector<std::string>& events) {
+                wire.insert(wire.end(), events.begin(), events.end());
+            };
+            if (order == 1) { append(encoder.reasoning_delta("thought")); }
+            append(encoder.content_delta("\n"));
+            if (order == 0) { append(encoder.reasoning_delta("thought")); }
+            append(encoder.content_delta("answer"));
+            GenerationOutcome outcome;
+            outcome.text = "\nanswer";
+            outcome.reasoning = "thought";
+            outcome.finish_reason = incomplete ? sinfer::FinishReason::OutputLimit : sinfer::FinishReason::StopToken;
+            outcome.tool_calls = {{"call_one", "first", "{}"}, {"call_two", "second", R"({"x":1})"}};
+            auto finish = encoder.finish(outcome);
+            append(finish.events_before_terminal);
+            const auto terminal = parse_event(encoder.terminal(finish.response));
+            const auto& output = terminal.at("response").at("output");
+            failures += check(output == Json(finish.response.output_items), "both terminal views share the stream order");
+            failures += check(output.size() == 4, "reasoning, message, and both calls are retained");
+            failures += check(output[0]["type"] == (order == 1 ? "reasoning" : "message"), "first delta determines output order");
+            std::size_t added = 0, done = 0;
+            for (const auto& event : wire) {
+                const auto payload = parse_event(event);
+                if (!payload.contains("output_index")) { continue; }
+                const auto index = payload.at("output_index").get<std::size_t>();
+                if (index >= output.size()) { failures += check(false, "stream index is outside terminal output"); continue; }
+                if (payload.contains("item_id")) {
+                    failures += check(payload.at("item_id") == output[index].at("id"), "delta index identifies the terminal item");
+                }
+                if (payload.contains("item")) {
+                    failures += check(payload.at("item").at("id") == output[index].at("id"), "item event index identifies the terminal item");
+                    if (payload.at("type") == "response.output_item.added") { ++added; }
+                    if (payload.at("type") == "response.output_item.done") {
+                        ++done;
+                        failures += check(payload.at("item") == output[index], "completed item matches terminal slot");
+                    }
+                }
+            }
+            failures += check(added == output.size() && done == output.size(), "every terminal item has one start and finish");
+        }
+    }
+    return failures;
+}
+
 int test_sse_function_call() {
     ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
                                                             {"input", "weather"},
@@ -631,6 +683,7 @@ int main() {
     failures += test_response_object();
     failures += test_logprob_token_bytes();
     failures += test_sse_sequence();
+    failures += test_sse_output_indices();
     failures += test_sse_function_call();
     failures += test_spark_stream_suffix();
     failures += test_input_tokens_schema();
