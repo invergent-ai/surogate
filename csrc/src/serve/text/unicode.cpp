@@ -93,7 +93,7 @@ bool is_number(std::int32_t codepoint) noexcept {
 }
 
 bool is_whitespace(std::int32_t codepoint) noexcept {
-    if (is_ascii_whitespace(codepoint)) { return true; }
+    if (is_ascii_whitespace(codepoint) || codepoint == 0x85) { return true; }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_ZS:
     case UTF8PROC_CATEGORY_ZL:

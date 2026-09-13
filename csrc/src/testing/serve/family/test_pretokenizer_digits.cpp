@@ -11,6 +11,7 @@
 
 #include "family/impl/frontend/test_access.h"
 #include "family/impl/frontend/tokenizer.h"
+#include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
 
@@ -136,6 +137,43 @@ void check_split_sequence() {
 
 }
 
+void check_unicode_whitespace() {
+    using Json = nlohmann::json;
+    using sinfer::text::unicode_internal::is_whitespace;
+    // Unicode White_Space, plus controls/format characters outside that property.
+    for (int cp : {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680,
+                   0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007,
+                   0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000}) {
+        if (!is_whitespace(cp)) { std::cerr << "missing whitespace " << cp << '\n'; ++failures; }
+    }
+    for (int cp : {0x08, 0x0E, 0x1C, 0x84, 0x86, 0x180E, 0x200B, 0x2060, 0xFEFF}) {
+        if (is_whitespace(cp)) { std::cerr << "unexpected whitespace " << cp << '\n'; ++failures; }
+    }
+    auto assets = resources(kSingleDigit);
+    auto root = Json::parse(assets.tokenizer_json);
+    root["normalizer"] = nullptr;
+    root["model"]["vocab"] = Json{{"Ġ", 0}, {"Â", 1}, {"ħ", 2}, {"a", 3}, {"!", 4}, {"ĠĠ", 5}, {"ĠÂ", 6}};
+    root["model"]["merges"] = Json::array({"Ġ Ġ", "Ġ Â"});
+    for (bool declared : {true, false}) {
+        if (!declared) {
+            // Legacy byte-level artifacts use the built-in word splitter.
+            root["pre_tokenizer"] = root["pre_tokenizer"]["pretokenizers"].back();
+        }
+        assets.tokenizer_json = root.dump();
+        // Expected IDs from Hugging Face tokenizers applying the same declared
+        // Split + ByteLevel and BPE vocabulary. The Ġ+Â merge exposes moved boundaries.
+        expect_resources("NEL alone", assets, "\u0085", {1, 2});
+        expect_resources("punctuation before NEL", assets, "!\u0085", {4, 1, 2});
+        expect_resources("space before trailing NEL", assets, " \u0085", {6, 2});
+        expect_resources("spaces before trailing NEL", assets, "  \u0085", {5, 1, 2});
+        expect_resources("NEL prefix before a letter", assets, " \u0085a", {0, 1, 2, 3});
+        expect_resources("spaces before NEL letter", assets, "  \u0085a", {5, 1, 2, 3});
+        expect_resources("NEL inside text", assets, "a \u0085a", {3, 0, 1, 2, 3});
+        expect_resources("spaces around NEL", assets, "  \u0085  ", {5, 1, 2, 5});
+        expect_resources("NEL before punctuation", assets, "  \u0085!", {5, 1, 2, 4});
+    }
+}
+
 void check_combining_marks() {
     using Json = nlohmann::json;
     for (const bool marks_are_letters : {false, true}) {
@@ -164,6 +202,7 @@ void check_combining_marks() {
 
 int main() {
     check_combining_marks();
+    check_unicode_whitespace();
     check_split_sequence();
     // `17`: one word of two digits merges to the vocabulary's `17`; two words of one digit
     // cannot, whatever merges exist, because a merge never crosses a word boundary.
