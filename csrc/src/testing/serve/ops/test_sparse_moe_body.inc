@@ -1045,7 +1045,7 @@ public:
     /// kernels — the same crossover `ops::sparse_moe` applies.
     [[nodiscard]] bool runs_on_runner(std::int32_t tokens) const {
         return profile_.routed_gate_up == QType::NVFP4 &&
-               tokens >= ops::kSparseMoeTrtllmMinTokens;
+               tokens >= profile_.runner_min_tokens;
     }
 
     [[nodiscard]] Nvfp4ActivationModel activation_model() const {

@@ -1146,6 +1146,17 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
         return;
         SINFER_GGML_FOR_EACH_TYPE(SINFER_D4_SMALL)
 #undef SINFER_D4_SMALL
+    case QType::NVFP4:
+        if (adaptive_route_jobs == nullptr) {
+            launch_d4_small_t_codec<Nvfp4CodecFor<kIntermediate / 16>, false>(
+                weights, destination, token_ids, token_alpha, shared_scale, token_activations,
+                tokens, schedule, stream, nullptr);
+        } else {
+            launch_d4_small_t_codec<Nvfp4CodecFor<kIntermediate / 16>, true>(
+                weights, destination, token_ids, token_alpha, shared_scale, token_activations,
+                tokens, schedule, stream, adaptive_route_jobs);
+        }
+        return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D4 codec");
     }

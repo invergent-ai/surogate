@@ -484,6 +484,9 @@ sinfer_add_op_test(sinfer_manifold_hyper_connection_test
 sinfer_add_op_test(sinfer_sparse_moe_test
     SOURCES ops/test_sparse_moe.cpp
     LIBRARIES sinfer_ops)
+add_test(NAME sinfer_sparse_moe_nvfp4_small_t_test COMMAND sinfer_sparse_moe_test --nvfp4-small-t)
+set_tests_properties(sinfer_sparse_moe_nvfp4_small_t_test PROPERTIES
+    SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_TRTLLM_MIN=16")
 add_test(NAME sinfer_sparse_moe_qwen3_vl_235b_test
     COMMAND sinfer_sparse_moe_test --qwen3-vl-235b)
 set_tests_properties(sinfer_sparse_moe_qwen3_vl_235b_test PROPERTIES SKIP_RETURN_CODE 77)

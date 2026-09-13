@@ -42,6 +42,7 @@ struct CodecProfile {
     QType routed_down;
     std::span<const std::int32_t> token_cases;
     bool verify_graph_replay;
+    std::int32_t runner_min_tokens = ops::kSparseMoeTrtllmMinTokens;
 };
 
 /// One registered mixture's constants, as the kernels' own instantiation blocks spell them.
@@ -110,6 +111,12 @@ int main(int argc, char** argv) {
     }
 
     if (argc == 2 && std::string(argv[1]) == "--lfm2") { return run_lfm2() ? 1 : 0; }
+    if (argc == 2 && std::string(argv[1]) == "--nvfp4-small-t") {
+        constexpr std::array<std::int32_t, 7> tokens{{1, 2, 4, 15, 16, 17, 31}};
+        const CodecProfile profile{"nvfp4 small-T crossover", QType::NVFP4,
+                                   QType::NVFP4, tokens, true, 16};
+        return qwen36::run_profile(profile) ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--qwen3-vl-235b") {
         constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 128}};
         const CodecProfile profile{"qwen3_vl_235b w8+w8", QType::W8G32_F16S,
@@ -176,4 +183,3 @@ int main(int argc, char** argv) {
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;
 }
-
