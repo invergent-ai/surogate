@@ -1,6 +1,7 @@
 #include "runtime/engine/kv_capacity.h"
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -52,6 +53,31 @@ int main() {
     failures += check(sinfer::runtime::minimum_kv_reservation_bytes(
                           sinfer::KvCapacityPolicy::explicit_capacity(384), curve) == 1512,
                       "expert cache floor must leave the whole pipeline KV capacity");
+
+    for (const auto tokens : {1U, 64U, 65U, 128U, 384U, 385U, std::numeric_limits<std::uint32_t>::max()}) {
+        const auto policy = sinfer::KvCapacityPolicy::explicit_capacity(tokens);
+        const auto result = sinfer::runtime::resolve_kv_capacity(policy, curve, 1512);
+        const bool floor = tokens <= 128;
+        failures += check(result.main_page_groups == (floor ? 2U : 6U) &&
+                          result.resolved_tokens == (floor ? 128U : 384U) &&
+                          result.runtime_reservation_bytes == (floor ? 1000U : 1512U) &&
+                          sinfer::runtime::minimum_kv_reservation_bytes(policy, curve) == result.runtime_reservation_bytes,
+                          "explicit KV capacity or expert staging floor escaped the curve domain");
+    }
+    const sinfer::runtime::SequenceCapacityCurve lane_floor{
+        .main_page_tokens=64, .minimum_main_page_groups=64, .maximum_main_page_groups=128,
+        .minimum_device_reservation_bytes=1000, .bytes_per_additional_main_page_group=128};
+    const auto lanes = sinfer::runtime::resolve_kv_capacity(
+        sinfer::KvCapacityPolicy::explicit_capacity(2048), lane_floor, 1000);
+    failures += check(lanes.main_page_groups == 64 && lanes.resolved_tokens == 4096,
+                      "explicit context capacity did not reserve one page per concurrent lane");
+    for (const auto tokens : {1U, 385U}) {
+        bool rejected = false;
+        try { (void)sinfer::runtime::resolve_kv_capacity(sinfer::KvCapacityPolicy::explicit_capacity(tokens),
+                                                         curve, tokens == 1 ? 999 : 1511); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "clamped explicit KV capacity ignored available memory");
+    }
 
     bool insufficient_rejected = false;
     try {

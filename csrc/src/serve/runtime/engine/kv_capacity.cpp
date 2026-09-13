@@ -97,7 +97,8 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         if (policy.automatic_headroom_bytes != 0) {
             throw std::invalid_argument("explicit KV capacity must not carry automatic headroom");
         }
-        pages = explicit_page_groups(policy, curve);
+        pages = std::clamp(explicit_page_groups(policy, curve), curve.minimum_main_page_groups,
+                            curve.maximum_main_page_groups);
         break;
     case KvCapacityMode::Automatic:
         if (available_runtime_bytes < policy.automatic_headroom_bytes) {
