@@ -75,10 +75,13 @@ std::size_t outstanding_on(int device, const void* except) noexcept {
     }
     return bytes;
 }
-std::size_t device_free_bytes() noexcept {
+std::size_t region_device_free_bytes(int device) noexcept try {
+    const ScopedDevice selected(device);
     std::size_t free_bytes = 0, total_bytes = 0;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) { return 0; }
     return free_bytes;
+} catch (...) {
+    return 0;
 }
 
 } // namespace
@@ -290,7 +293,7 @@ ElasticKvRegion::ElasticKvRegion(ElasticKvRegionSpec spec) : impl_(std::make_uni
         const std::size_t cap_granules = (cap_pages + impl.spec.granule_pages - 1) / impl.spec.granule_pages;
         const std::size_t cap_bytes    = cap_granules * impl.granule_bytes;
         const std::size_t free_bytes =
-            impl.spec.free_bytes_probe != nullptr ? impl.spec.free_bytes_probe() : device_free_bytes();
+            impl.spec.free_bytes_probe != nullptr ? impl.spec.free_bytes_probe() : region_device_free_bytes(impl.spec.device);
         const std::size_t spoken_for = elastic_kv_unmapped_commitment(impl.spec.device);
         if (cap_bytes > free_bytes - std::min(spoken_for, free_bytes)) {
             throw std::runtime_error(
@@ -434,7 +437,7 @@ bool ElasticKvRegion::try_entitle(std::uint32_t pages) noexcept {
         // engine keeps for graph captures and workspace growth.
         const std::size_t slack = std::max(2 * impl.granule_bytes, impl.spec.headroom_bytes);
         const std::size_t free_bytes =
-            impl.spec.free_bytes_probe != nullptr ? impl.spec.free_bytes_probe() : device_free_bytes();
+            impl.spec.free_bytes_probe != nullptr ? impl.spec.free_bytes_probe() : region_device_free_bytes(impl.spec.device);
         if (others + growth + slack <= free_bytes) {
             mine.entitled = bytes;
             return true;

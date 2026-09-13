@@ -136,6 +136,8 @@ endif()
 sinfer_add_test(sinfer_device_test       SOURCES test_device.cpp)
 sinfer_add_test(sinfer_elastic_kv_rollback_test SOURCES test_elastic_kv_rollback.cpp
   LIBRARIES ${CMAKE_DL_LIBS})
+sinfer_add_test(sinfer_elastic_kv_device_gate_test SOURCES test_elastic_kv_device_gate.cpp
+  LIBRARIES ${CMAKE_DL_LIBS})
 sinfer_add_test(sinfer_decode_graph_test SOURCES test_decode_graph.cpp)
 sinfer_add_test(sinfer_tensor_test       SOURCES test_tensor.cpp)
 sinfer_add_test(sinfer_arena_test        SOURCES test_arena.cpp)
