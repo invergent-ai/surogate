@@ -113,12 +113,11 @@ public:
             const long parsed = std::strtol(raw, nullptr, 10);
             if (parsed >= 1 && parsed <= 128) { min_lanes_per_group_ = static_cast<std::uint32_t>(parsed); }
         }
-        // One host staging slot per (boundary, group): a stage's export of one group is parked
-        // there while the stage moves on to the next group.
+        // Only metadata for the synchronous grouped API. The executor uses
+        // flights and their own park buffers, so grouped payloads stay lazy.
         slots_.resize(stages_.size() > 1 ? stages_.size() - 1 : 0);
         for (auto& boundary : slots_) {
             boundary.resize(groups_);
-            for (auto& slot : boundary) { slot.resize(boundary_bytes_); }
         }
         width_ = std::max<std::uint32_t>(1, stages_.front()->program->speculative_round_width());
         assembled_tokens_.resize(static_cast<std::size_t>(kMaximumBatchColumns) * width_);
@@ -706,6 +705,11 @@ private:
         const bool mixed = !prefill_lanes.empty();
         if (mixed && active.empty()) {
             throw std::logic_error("pipeline mixed round needs decode lanes");
+        }
+        // Allocate active grouped slots before launching any stage. Subsequent
+        // rounds reuse them; the flight executor never reaches this allocation.
+        for (auto& boundary : slots_) {
+            for (const auto group : active) { boundary[group].resize(boundary_bytes_); }
         }
         const std::uint32_t mixed_group = mixed ? active.front() : groups;
         const std::size_t N = stages_.size(), G = active.size();
