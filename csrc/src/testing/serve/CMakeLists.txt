@@ -469,6 +469,9 @@ sinfer_add_op_test(sinfer_gqa_attention_test
 sinfer_add_op_test(sinfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_gqa_long_context_test
+  SOURCES ops/test_gqa_long_context.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_swa_test
   SOURCES ops/test_swa.cpp
   LIBRARIES sinfer_ops)

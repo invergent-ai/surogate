@@ -10,7 +10,7 @@
 
 namespace sinfer::ops {
 
-inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
 
 /// QSA sparse selection (design/INFERENCE.md, phase 4): one bit per block of `block` cache cells
 /// for every query column, `stride` words apart. A key whose block bit is clear scores -inf; a

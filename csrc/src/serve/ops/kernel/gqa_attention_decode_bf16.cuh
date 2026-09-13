@@ -102,7 +102,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     constexpr int QKKs    = D / 16;
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
+    // Absolute key partitions span at most 2048 keys (32 aligned cache pages),
+    // independently of the total context length.
     constexpr int PageIds       = 64;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;

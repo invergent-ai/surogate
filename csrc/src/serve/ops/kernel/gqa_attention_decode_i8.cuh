@@ -80,7 +80,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
+    // Cache the first page IDs of each split. Long contexts can exceed this
+    // prefix; subsequent pages are read directly from the block table.
     constexpr int PageIds         = 64;
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
@@ -208,7 +209,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
-    for (int page = tid; page < page_count; page += Threads) {
+    for (int page = tid; page < min(page_count, PageIds); page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
 
@@ -523,7 +524,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (has_next) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
+                const int page = (next_k0 >> kPagedKVPageShift) - first_page;
+                physical_page = page < PageIds ? physical_pages_s[page]
+                                               : block_table[first_page + page];
             }
             issue_kv_tile(next_k0, physical_page);
         }
