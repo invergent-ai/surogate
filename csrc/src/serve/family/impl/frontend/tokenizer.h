@@ -104,7 +104,7 @@ private:
     bool has_bpe_merges_ = true;
     bool ignore_merges_ = false;
     bool normalize_nfc_ = false;
-    /// Ordered Split stages preceding ByteLevel, when a single word rule is insufficient.
+    /// Ordered Split stages preceding ByteLevel, including single-stage rules.
     std::vector<std::string> split_patterns_;
     /// How many digits a pre-token may hold. Every checkpoint this family served until GLM-5.3
     /// declares `\p{N}` and takes one; GLM-5.3 declares `\p{N}{1,3}` and takes up to three,

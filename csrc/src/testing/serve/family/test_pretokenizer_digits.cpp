@@ -136,9 +136,34 @@ void check_split_sequence() {
 
 }
 
+void check_combining_marks() {
+    using Json = nlohmann::json;
+    for (const bool marks_are_letters : {false, true}) {
+        auto assets = resources(kSingleDigit);
+        auto root = Json::parse(assets.tokenizer_json);
+        std::string pattern = root["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"];
+        if (marks_are_letters) {
+            pattern.replace(pattern.find(R"(\p{L}+)"), 6, R"([\p{L}\p{M}]+)");
+            const auto punctuation = pattern.find(R"([^\s\p{L}\p{N}])");
+            pattern.replace(punctuation, 15, R"([^\s\p{L}\p{M}\p{N}])");
+        }
+        root["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = pattern;
+        root["model"]["vocab"] = Json{{"e", 0}, {"Ì", 1}, {"ģ", 2}, {"b", 3},
+                                     {"Ìģ", 4}, {"eÌģ", 5}, {"Ìģb", 6}, {"eÌģb", 7}};
+        root["model"]["merges"] = Json::array({"Ì ģ", "e Ìģ", "Ìģ b", "eÌģ b"});
+        root["normalizer"] = nullptr;
+        assets.tokenizer_json = root.dump();
+        expect_resources("declared mark category", assets, "e\u0301b",
+                         marks_are_letters ? std::vector<int>{7} : std::vector<int>{0, 6});
+        expect_resources("trailing combining mark", assets, "e\u0301",
+                         marks_are_letters ? std::vector<int>{5} : std::vector<int>{0, 4});
+    }
+}
+
 } // namespace
 
 int main() {
+    check_combining_marks();
     check_split_sequence();
     // `17`: one word of two digits merges to the vocabulary's `17`; two words of one digit
     // cannot, whatever merges exist, because a merge never crosses a word boundary.

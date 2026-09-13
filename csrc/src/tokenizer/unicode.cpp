@@ -520,7 +520,8 @@ static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT
 // Qwen3 system regex: "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 // Same as Llama3 but with \p{N} (single digit) instead of \p{N}{1,3} (1-3 digits).
 static std::vector<size_t> unicode_regex_split_custom_qwen(const std::string& text,
-                                                           const std::vector<size_t>& offsets) {
+                                                           const std::vector<size_t>& offsets,
+                                                           bool marks_are_letters = false) {
     std::vector<size_t> bpe_offsets;
     bpe_offsets.reserve(offsets.size());
 
@@ -539,8 +540,10 @@ static std::vector<size_t> unicode_regex_split_custom_qwen(const std::string& te
         };
 
         auto _get_flags = [&](const size_t pos) -> unicode_cpt_flags {
-            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos])
-                                                           : unicode_cpt_flags{};
+            auto flags = (offset_ini <= pos && pos < offset_end)
+                             ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+            if (marks_are_letters && flags.is_accent_mark) { flags.is_letter = true; }
+            return flags;
         };
 
         size_t _prev_end = offset_ini;
@@ -1167,11 +1170,12 @@ unicode_regex_split_custom(const std::string& text, const std::string& regex_exp
                              "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|"
                              "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         bpe_offsets = unicode_regex_split_custom_gpt_oss(text, offsets);
-    } else if (regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}"
+    } else if (regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|"
+                             "\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
+               regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}"
                              "\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
-        // Qwen3.5 pattern (includes \p{M} accent marks in letter matching)
-        // Reuses Qwen handler — accent marks are treated as letters by unicode_cpt_flags
-        bpe_offsets = unicode_regex_split_custom_qwen(text, offsets);
+        // Qwen3.5 includes marks in letter runs and excludes them from punctuation.
+        bpe_offsets = unicode_regex_split_custom_qwen(text, offsets, true);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);

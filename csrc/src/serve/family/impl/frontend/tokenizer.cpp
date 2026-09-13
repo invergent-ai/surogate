@@ -768,8 +768,9 @@ std::vector<std::string> declared_split_sequence(const Json& root) {
             patterns.push_back(item.at("pattern").at("Regex").get<std::string>());
         }
     }
-    // Keep the existing fast splitter for single-stage tokenizers.
-    if (patterns.size() < 2) { patterns.clear(); }
+    // A single Split still defines the checkpoint's word boundaries, including
+    // whether combining marks join letters. The shared splitter has fast paths
+    // for these declared patterns as well as ordered multi-stage tokenizers.
     return patterns;
 }
 
