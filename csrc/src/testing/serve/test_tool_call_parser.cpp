@@ -1,4 +1,5 @@
 #include "serve/tool_call_parser.h"
+#include "serve/tool_constraints.h"
 
 #include <nlohmann/json.hpp>
 
@@ -185,6 +186,45 @@ int test_checkpoint_json_and_schema_strings() {
 
 } // namespace
 
+int test_literal_schema_types() {
+    using namespace sinfer::serve;
+    int failures = 0;
+    const auto verify = [&](const std::string& raw, const Json& property, const Json& expected) {
+        ToolDefinition tool;
+        tool.name = "pick";
+        tool.strict = true;
+        tool.strict_set = true;
+        tool.parameters_json = Json{{"type", "object"}, {"properties", {{"code", property}}},
+                                    {"required", Json::array({"code"})},
+                                    {"$defs", {{"Code", {{"const", raw}}}}}}.dump();
+        const std::string qwen = "<tool_call><function=pick><parameter=code>" + raw +
+                                 "</parameter></function></tool_call>";
+        const std::string spark = "<tool_call>pick<arg_key>code</arg_key><arg_value>" + raw +
+                                  "</arg_value></tool_call>";
+        for (const auto& parsed : {parse_qwen_tool_call_output(qwen, 64, {tool}),
+                                   parse_spark_tool_call_output(spark, 64, {tool})}) {
+            failures += check(parsed.tool_calls.size() == 1, "literal-schema tool call parsed");
+            if (parsed.tool_calls.empty()) { continue; }
+            failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("code") == expected,
+                              "XML argument changed the schema's literal type");
+            failures += check(tool_arguments_match_schema(tool, parsed.tool_calls[0].arguments_json),
+                              "XML argument must satisfy the literal schema");
+        }
+    };
+    for (const auto* raw : {"123", "0", "true", "false", "null", "1.0"}) {
+        verify(raw, {{"const", raw}}, raw);
+        verify(raw, {{"enum", Json::array({raw, "other"})}}, raw);
+        verify(raw, {{"$ref", "#/$defs/Code"}}, raw);
+        verify(raw, {{"anyOf", Json::array({Json{{"const", raw}}, Json{{"const", 99}}})}}, raw);
+        verify(raw, {{"type", Json::array({"string", "null"})}, {"enum", Json::array({raw})}}, raw);
+    }
+    verify("123", {{"enum", Json::array({"123", 456})}}, "123");
+    verify("456", {{"enum", Json::array({"123", 456})}}, 456);
+    verify("true", {{"const", true}}, true);
+    verify("null", {{"enum", Json::array({"yes", nullptr})}}, nullptr);
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_single_call();
@@ -195,6 +235,7 @@ int main() {
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
     failures += test_checkpoint_json_and_schema_strings();
+    failures += test_literal_schema_types();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

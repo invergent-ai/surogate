@@ -74,27 +74,50 @@ Json function_schema(std::string_view name, const std::vector<ToolDefinition>& t
     return Json::object();
 }
 
-unsigned schema_types(const Json& param, const Json& root, unsigned depth = 0) {
+unsigned schema_types(const Json& param, const Json& root, const std::string& raw,
+                      const Json& parsed, unsigned depth = 0) {
     // Bits represent string, null, and other types. Resolve local definitions
     // and nullable unions without following external URLs or reference cycles.
-    if (!param.is_object() || depth >= 16) { return 4; }
+    if (depth >= 16) { return 7; }
+    if (!param.is_object()) { return param == false ? 0 : 7; }
+    unsigned types = 7;
     if (param.contains("$ref")) {
-        if (!param["$ref"].is_string()) { return 4; }
+        if (!param["$ref"].is_string()) { return 7; }
         const auto ref = param["$ref"].get<std::string>();
-        if (ref.rfind("#/", 0) != 0) { return 4; }
-        try { return schema_types(root.at(Json::json_pointer(ref.substr(1))), root, depth + 1); }
-        catch (const Json::exception&) { return 4; }
+        if (ref.rfind("#/", 0) != 0) { return 7; }
+        try { types &= schema_types(root.at(Json::json_pointer(ref.substr(1))), root, raw, parsed, depth + 1); }
+        catch (const Json::exception&) { return 7; }
     }
     const auto kind = [](const Json& type) { return type == "string" ? 1U : type == "null" ? 2U : 4U; };
-    unsigned types = 0;
     if (param.contains("type")) {
+        unsigned declared = 0;
         if (param["type"].is_array()) {
-            for (const auto& type : param["type"]) { types |= kind(type); }
-        } else { types |= kind(param["type"]); }
+            for (const auto& type : param["type"]) { declared |= kind(type); }
+        } else { declared = kind(param["type"]); }
+        types &= declared;
+    }
+    // Enumerations can mix strings with JSON literals. Consider the two actual
+    // interpretations, so enum ["123", 456] preserves 123 as text but parses 456.
+    const auto literal_kind = [&](const Json& literal) {
+        if (literal.is_string()) { return literal == raw ? 1U : 0U; }
+        if (parsed.is_discarded() || literal != parsed) { return 0U; }
+        return literal.is_null() ? 2U : 4U;
+    };
+    if (param.contains("const")) { types &= literal_kind(param["const"]); }
+    if (param.contains("enum") && param["enum"].is_array()) {
+        unsigned members = 0;
+        for (const auto& literal : param["enum"]) { members |= literal_kind(literal); }
+        types &= members;
     }
     for (const char* variant : {"anyOf", "oneOf", "allOf"}) {
         if (param.contains(variant) && param[variant].is_array()) {
-            for (const auto& option : param[variant]) { types |= schema_types(option, root, depth + 1); }
+            const bool all = std::string_view(variant) == "allOf";
+            unsigned branches = all ? 7 : 0;
+            for (const auto& option : param[variant]) {
+                const auto branch = schema_types(option, root, raw, parsed, depth + 1);
+                if (all) { branches &= branch; } else { branches |= branch; }
+            }
+            types &= branches;
         }
     }
     return types;
@@ -103,7 +126,7 @@ unsigned schema_types(const Json& param, const Json& root, unsigned depth = 0) {
 Json argument_value(const std::string& raw, const Json& schema, const std::string& key) {
     auto value = Json::parse(raw, nullptr, false);
     if (schema.contains("properties") && schema["properties"].is_object() && schema["properties"].contains(key)) {
-        const auto types = schema_types(schema["properties"][key], schema);
+        const auto types = schema_types(schema["properties"][key], schema, raw, value);
         if (types == 1 || (types == 3 && !value.is_null())) { return raw; }
     }
     return value.is_discarded() ? Json(raw) : value;
