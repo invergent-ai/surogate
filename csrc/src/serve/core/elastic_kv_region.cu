@@ -140,7 +140,12 @@ struct ElasticKvRegion::Impl {
             const std::size_t span = spec.planes[p].page_bytes * spec.granule_pages;
             const CUdeviceptr at   = va + spec.planes[p].offset + span * g;
             CUmemGenericAllocationHandle handle{};
-            driver_check(cuMemCreate(&handle, span, &prop, 0), "cuMemCreate");
+            const CUresult created = cuMemCreate(&handle, span, &prop, 0);
+            if (created != CUDA_SUCCESS) {
+                for (std::size_t q = 0; q < p; ++q) { unmap_plane(g, q); }
+                granule.handles.clear();
+                driver_check(created, "cuMemCreate");
+            }
             CUresult mapped_result = cuMemMap(at, span, 0, handle, 0);
             if (mapped_result == CUDA_SUCCESS) {
                 mapped_result = cuMemSetAccess(at, span, &access, 1);
