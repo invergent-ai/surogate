@@ -1,15 +1,14 @@
 // Public-contract qualification for kimi_delta_net().
 //
-// The oracle evaluates the recurrence in FP64 from the represented BF16 inputs and the FP32
+// The oracle evaluates the recurrence in FP64 from the represented BF16 inputs and the represented BF16
 // initial state, indexing every tensor the way the *contract* says it is laid out. It shares no
 // code with the kernel and none with the gated delta net's reference: the two differ in exactly
 // the place this op exists for, and a reference that reached for the neighbouring one would
 // agree with the wrong recurrence.
 //
-// The check that matters most is the last case. Give every key channel the same gate and this
-// op must compute what the gated delta net computes -- a scalar decay is a diagonal one whose
-// entries happen to be equal -- so the two are run against each other on identical inputs. If
-// the per-channel alpha were folded in at the wrong point, that case is where it shows.
+// Uniform-gate cases also run both ops against one independent FP64 reference. Factoring a
+// scalar decay out of a reduction changes FP32 accumulation order; final BF16 values can land
+// on opposite sides of a rounding midpoint, so cross-op agreement accounts for that spacing.
 #include "api/ops/gated_delta_net.h"
 #include "api/ops/kimi_delta_net.h"
 
@@ -96,20 +95,28 @@ Inputs make_inputs(const Case& item, std::uint32_t seed) {
             }
         }
     }
-    // q/k/v reach the op as BF16, so the oracle must see exactly what it will.
+    if (item.uniform_gate && !item.normalize_qk) {
+        // Keep long raw-Q/K recurrences stable without asking either op to normalize them.
+        for (float& value : in.q) { value *= 0.125f; }
+        for (float& value : in.k) { value *= 0.125f; }
+    }
+    // Activations and the initial state reach the op as BF16.
     round_to_bf16(in.q);
     round_to_bf16(in.k);
     round_to_bf16(in.v);
+    round_to_bf16(in.state);
     return in;
 }
 
 struct Reference {
     std::vector<double> out;
     std::vector<double> final_state;
+    std::vector<double> snapshots;
 };
 
 /// The documented recurrence, in FP64, with the gate applied per key channel.
-Reference evaluate(const Inputs& in, double scale, bool normalize_qk) {
+Reference evaluate(const Inputs& in, double scale, bool normalize_qk,
+                   bool record_snapshots = false, bool bf16_normalization = false) {
     const std::int64_t S = kStateDim, Hq = in.qk_heads, Hv = in.value_heads, T = in.tokens;
     std::vector<double> q(in.q.begin(), in.q.end()), k(in.k.begin(), in.k.end());
     if (normalize_qk) {
@@ -126,6 +133,10 @@ Reference evaluate(const Inputs& in, double scale, bool normalize_qk) {
                 for (std::int64_t d = 0; d < S; ++d) {
                     q[base + d] *= qi;
                     k[base + d] *= ki;
+                    if (bf16_normalization) {
+                        q[base + d] = bf16_to_f32(f32_to_bf16(static_cast<float>(q[base + d])));
+                        k[base + d] = bf16_to_f32(f32_to_bf16(static_cast<float>(k[base + d])));
+                    }
                 }
             }
         }
@@ -134,6 +145,7 @@ Reference evaluate(const Inputs& in, double scale, bool normalize_qk) {
     Reference out;
     out.out.assign(static_cast<std::size_t>(S * Hv * T), 0.0);
     out.final_state.assign(static_cast<std::size_t>(S * S * Hv), 0.0);
+    if (record_snapshots) { out.snapshots.resize(static_cast<std::size_t>(S * S * Hv * T)); }
     std::vector<double> state(static_cast<std::size_t>(S * S));
     std::vector<double> delta(static_cast<std::size_t>(S));
     std::vector<double> alpha(static_cast<std::size_t>(S));
@@ -170,6 +182,10 @@ Reference evaluate(const Inputs& in, double scale, bool normalize_qk) {
                     dot += state[static_cast<std::size_t>(row * S + c)] * q[qk_base + c];
                 }
                 out.out[v_base + row] = scale * dot;
+            }
+            if (record_snapshots) {
+                std::copy(state.begin(), state.end(),
+                          out.snapshots.begin() + static_cast<std::size_t>((t * Hv + h) * S * S));
             }
         }
         for (std::int64_t i = 0; i < S * S; ++i) { out.final_state[sbase + i] = state[i]; }
@@ -217,10 +233,32 @@ int run_case(const Case& item, std::uint32_t seed) {
     return failures;
 }
 
-/// A uniform gate makes this recurrence the gated delta net's, so the two must agree on the
-/// same inputs -- the one comparison that pins where the per-channel alpha belongs.
-int run_against_gated_delta_net(std::uint32_t seed) {
-    const Case item{"uniform gate vs gated_delta_net", 4, 8, 24, true, true};
+// One BF16 spacing per value, plus FP32 cancellation noise near zero. The relative-L2 bound
+// remains 1e-3: allowing adjacent rounded values must not admit a systematic change in output.
+int verify_bf16_agreement(const std::string& label, const std::vector<double>& a,
+                          const std::vector<double>& b) {
+    constexpr double fp32_floor = 1e-6;
+    constexpr ReductionCriterion agreement{1e-3, 0.0, 1.0 / 128.0 + fp32_floor};
+    int failures = verify_recurrence(label, a, b, agreement);
+    double maximum = 0.0;
+    for (double value : b) { maximum = std::max(maximum, std::abs(value)); }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const double magnitude = std::max(std::abs(a[i]), std::abs(b[i]));
+        if (!std::isfinite(magnitude)) { continue; } // reduction check reports non-finite values
+        const int exponent = magnitude == 0.0 ? -126 : std::max(-126, std::ilogb(magnitude));
+        const double spacing = std::ldexp(1.0, exponent - 7);
+        if (std::abs(a[i] - b[i]) > spacing + fp32_floor * maximum) {
+            std::cerr << label << ": exceeds one BF16 spacing at " << i
+                      << " actual=" << a[i] << " reference=" << b[i] << '\n';
+            ++failures;
+            break;
+        }
+    }
+    return failures;
+}
+
+/// A uniform gate makes both recurrences mathematically identical, including the final state.
+int run_against_gated_delta_net(const Case& item, std::uint32_t seed) {
     const Inputs in   = make_inputs(item, seed);
     const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
 
@@ -259,22 +297,34 @@ int run_against_gated_delta_net(std::uint32_t seed) {
     Tensor ot1(o1.data(), DType::BF16, {kStateDim, item.value_heads, item.tokens});
     Tensor ot2(o2.data(), DType::BF16, {kStateDim, item.value_heads, item.tokens});
 
-    ops::kimi_delta_net(qt, kt, vt, gt, bt, scale, true, st1, ot1, nullptr);
+    ops::kimi_delta_net(qt, kt, vt, gt, bt, scale, item.normalize_qk, st1, ot1, nullptr);
 
     const std::size_t ws_bytes = ops::gated_delta_net_workspace_capacity_bytes(
-        item.qk_heads, item.value_heads, true, item.tokens, item.tokens);
+        item.qk_heads, item.value_heads, item.normalize_qk, item.tokens, item.tokens);
     GuardedDeviceBuffer ws(std::max<std::size_t>(ws_bytes, 256));
     WorkspaceArena arena(DeviceSpan{ws.data(), ws.bytes()});
-    ops::gated_delta_net(qt, kt, vt, gst, bt, scale, true, arena, st2, ot2, nullptr);
+    ops::gated_delta_net(qt, kt, vt, gst, bt, scale, item.normalize_qk, arena, st2, ot2, nullptr);
     cuda_synchronize();
 
-    const std::string label = "kimi_delta_net uniform gate matches gated_delta_net";
-    // Two kernels, the same mathematics: they need not be bit-identical, but they must agree
-    // far inside the bound either is held to against its own oracle.
-    constexpr ReductionCriterion kAgreement{/*relative_l2=*/1.0e-3, /*gross_absolute=*/1.0e-5,
-                                            /*gross_relative_to_max_reference=*/1.0e-3};
-    return verify_recurrence(label, from_device_bf16(o1.data(), vb.size()),
-                             from_device_bf16(o2.data(), vb.size()), kAgreement);
+    const auto a = from_device_bf16(o1.data(), vb.size());
+    const auto b = from_device_bf16(o2.data(), vb.size());
+    const auto as = from_device_bf16(s1.data(), sb.size());
+    const auto bs = from_device_bf16(s2.data(), sb.size());
+    // Account for the normalized BF16 staging shared by both implementations. The recurrence
+    // itself stays FP64 and independent of either GPU reduction or gate implementation.
+    const auto ref = evaluate(in, scale, item.normalize_qk, false, true);
+    const std::string label = std::string("uniform gate ") + item.name;
+    int failures = verify_recurrence(label + " KDA vs FP64", a, ref.out, output_criterion());
+    failures += verify_recurrence(label + " GDN vs FP64", b, ref.out, output_criterion());
+    failures += verify_recurrence(label + " KDA state vs FP64", as, ref.final_state, state_criterion());
+    failures += verify_recurrence(label + " GDN state vs FP64", bs, ref.final_state, state_criterion());
+    failures += verify_bf16_agreement(label + " KDA/GDN output", a, b);
+    failures += verify_bf16_agreement(label + " KDA/GDN state", as, bs);
+    failures += s1.verify_guards((label + " KDA state").c_str());
+    failures += s2.verify_guards((label + " GDN state").c_str());
+    failures += o1.verify_guards((label + " KDA output").c_str());
+    failures += o2.verify_guards((label + " GDN output").c_str());
+    return failures;
 }
 
 /// The decode round's shape: B independent lanes, each starting from its own state slot and
@@ -350,34 +400,15 @@ int run_snapshot_case(const SnapshotCase& item, std::uint32_t seed) {
         std::copy_n(pool.begin() + static_cast<std::size_t>(initial[static_cast<std::size_t>(b)]) *
                         S * S * Hv,
                     lane.state.size(), lane.state.begin());
-        // One column at a time, because a checkpoint is taken after each and the contract says
-        // which slot it lands in.
-        std::vector<float> carried = lane.state;
+        // Snapshots are BF16 writes; within this call the next column continues
+        // from the unrounded register state, rather than reloading the snapshot.
+        const auto ref = evaluate(lane, scale, true, true);
+        std::copy(ref.out.begin(), ref.out.end(), expected_out.begin() + static_cast<std::size_t>(b) * W * S * Hv);
         for (int t = 0; t < columns; ++t) {
-            Inputs step{Hq, Hv, 1, {}, {}, {}, {}, {}, carried};
-            step.q.assign(lane.q.begin() + static_cast<std::size_t>(t) * S * Hq,
-                          lane.q.begin() + static_cast<std::size_t>(t + 1) * S * Hq);
-            step.k.assign(lane.k.begin() + static_cast<std::size_t>(t) * S * Hq,
-                          lane.k.begin() + static_cast<std::size_t>(t + 1) * S * Hq);
-            step.v.assign(lane.v.begin() + static_cast<std::size_t>(t) * S * Hv,
-                          lane.v.begin() + static_cast<std::size_t>(t + 1) * S * Hv);
-            step.g.assign(lane.g.begin() + static_cast<std::size_t>(t) * S * Hv,
-                          lane.g.begin() + static_cast<std::size_t>(t + 1) * S * Hv);
-            step.beta.assign(lane.beta.begin() + static_cast<std::size_t>(t) * Hv,
-                             lane.beta.begin() + static_cast<std::size_t>(t + 1) * Hv);
-            const Reference ref = evaluate(step, static_cast<double>(scale), true);
-            for (std::size_t i = 0; i < ref.out.size(); ++i) {
-                expected_out[(static_cast<std::size_t>(b) * W + t) * S * Hv + i] = ref.out[i];
-            }
-            const std::size_t at =
+            const auto from = ref.snapshots.begin() + static_cast<std::size_t>(t) * S * S * Hv;
+            const auto to = expected_pool.begin() +
                 static_cast<std::size_t>(base[static_cast<std::size_t>(b)] + t) * S * S * Hv;
-            for (std::size_t i = 0; i < ref.final_state.size(); ++i) {
-                expected_pool[at + i] = ref.final_state[i];
-            }
-            // The next column starts from the checkpoint just taken, as BF16: that is what the
-            // pool holds and what the kernel carries.
-            carried.assign(ref.final_state.begin(), ref.final_state.end());
-            round_to_bf16(carried);
+            std::copy_n(from, static_cast<std::size_t>(S) * S * Hv, to);
         }
         // An invalid tail is exact zero and leaves its reserved slots untouched.
         for (int t = columns; t < W; ++t) {
@@ -446,7 +477,18 @@ int main() {
     };
     std::uint32_t seed = 7u;
     for (const Case& item : cases) { failures += run_case(item, seed += 17u); }
-    failures += run_against_gated_delta_net(seed + 31u);
+    // Retain the original failing seed/shape, plus decode, grouping and raw-Q/K coverage.
+    failures += run_against_gated_delta_net({"original T=24", 4, 8, 24, true, true}, seed + 31u);
+    const Case uniform_cases[] = {
+        {"decode T=1", 4, 4, 1, true, true},
+        {"grouped T=2", 2, 8, 2, true, true},
+        {"recurrent T=63", 4, 8, 63, true, true},
+        {"raw Q/K T=24", 2, 8, 24, false, true},
+    };
+    auto uniform_seed = seed;
+    for (const auto& item : uniform_cases) {
+        failures += run_against_gated_delta_net(item, uniform_seed += 13u);
+    }
 
     // The decode round's shape. Every lane owns a state slot and a reserved interval, and the
     // pool is checked whole: a lane that wrote outside its interval would show up as a

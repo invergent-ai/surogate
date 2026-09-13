@@ -5,6 +5,7 @@
 #include "serve/generation_service.h"
 #include "serve/responses_schema.h"
 #include "serve/translate.h"
+#include "serve/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
 
@@ -517,6 +518,53 @@ int test_sse_function_call() {
     return failures;
 }
 
+int test_spark_stream_suffix() {
+    const auto request = parse_responses_request(
+        Json{{"model", "spark"}, {"input", "weather"}, {"stream", true}}, limits());
+    const std::string text = "Checking.\n<tool_call>weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value></tool_call>\nThen refresh."
+        "<tool_call>refresh</tool_call>\nDone.";
+    const auto parsed = parse_tool_calls(ToolCallFormat::Spark25, text, 64);
+    const std::string expected = "Checking.\nThen refresh.\nDone.";
+    int failures = check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                             parsed.content == expected, "Spark terminal content and calls");
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        ToolCallStreamFilter filter;
+        ResponsesEventStream encoder("resp_spark", 123, request, {});
+        auto wire = encoder.start();
+        const auto publish = [&](const std::string& content) {
+            const auto events = encoder.content_delta(content);
+            wire.insert(wire.end(), events.begin(), events.end());
+        };
+        publish(filter.feed(std::string_view(text).substr(0, split)));
+        publish(filter.feed(std::string_view(text).substr(split)));
+        publish(filter.finish(parsed.is_tool_call_response));
+        GenerationOutcome outcome;
+        outcome.text = parsed.content;
+        outcome.tool_calls = parsed.tool_calls;
+        outcome.finish_reason = sinfer::FinishReason::StopToken;
+        const auto finish = encoder.finish(outcome);
+        wire.insert(wire.end(), finish.events_before_terminal.begin(), finish.events_before_terminal.end());
+        wire.push_back(encoder.terminal(finish.response));
+        std::string visible;
+        std::vector<std::string> calls;
+        for (const auto& event : wire) {
+            const auto payload = parse_event(event);
+            if (payload.at("type") == "response.output_text.delta") {
+                visible += payload.at("delta").get<std::string>();
+            }
+            if (payload.at("type") == "response.output_item.done" &&
+                payload.at("item").at("type") == "function_call") {
+                calls.push_back(payload.at("item").at("name").get<std::string>());
+            }
+        }
+        failures += check(visible == expected, "Spark stream preserves prefix, inter-call text and suffix exactly once");
+        failures += check(calls == std::vector<std::string>{"weather", "refresh"},
+                          "Spark stream preserves both function calls in order");
+    }
+    return failures;
+}
+
 int test_input_tokens_schema() {
     const ResponsesRequest request = parse_response_input_tokens_request(
         Json{{"model", "qwen3.6-27b"}, {"input", "hello"}}, limits());
@@ -549,6 +597,7 @@ int main() {
     failures += test_logprob_token_bytes();
     failures += test_sse_sequence();
     failures += test_sse_function_call();
+    failures += test_spark_stream_suffix();
     failures += test_input_tokens_schema();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

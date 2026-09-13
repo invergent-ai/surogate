@@ -32,17 +32,17 @@ namespace sinfer::ops {
  * amount.
  *
  * Shapes/dtypes are contiguous q/k BF16 [128,Hqk,T], v/out BF16 [128,Hv,T], g FP32 [128,Hv,T]
- * (the per-channel gate, laid out like v), beta FP32 [Hv,T], and state FP32 [128,128,Hv], where
+ * (the per-channel gate, laid out like v), beta FP32 [Hv,T], and state BF16 [128,128,Hv], where
  * Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When `normalize_qk` is true the
  * implementation consumes raw q/k and applies x / sqrt(sum(x^2) + 1e-6) to every 128-element row
  * before using it; when false they are consumed as supplied.
  *
  * The oracle evaluates the complete recurrence and `ideal` naively in FP64 from the represented
- * inputs and the FP32 initial state. The BF16 out is promoted and compared with that; output
+ * inputs and the represented BF16 initial state. The BF16 out is promoted and compared with that; output
  * storage rounding belongs to the Op's numerical criterion, not the oracle. Inputs and out do
  * not overlap the state or one another. T may be any positive value.
  *
- * This overload reads and writes the same `ssm_state`, publishing it after all T tokens.
+ * This overload reads and writes the same `ssm_state`, publishing it in BF16 after all T tokens; intermediate state stays in FP32.
  */
 void kimi_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                     const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
@@ -68,7 +68,8 @@ void kimi_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
  *
  * Row b starts from initial_state_slots[b] and writes the state after valid column j to
  * snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero and do not mutate
- * state. The caller reserves disjoint complete [base,base+W) intervals and prevents one row from
+ * state. Snapshots round to BF16; the recurrence continues from its FP32 register state.
+ * The caller reserves disjoint complete [base,base+W) intervals and prevents one row from
  * overwriting another row's initial slot; a row may overwrite its own initial slot after loading
  * it. No arena allocation; `ssm_states` is the only persistent state mutated.
  *

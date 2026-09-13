@@ -26,6 +26,25 @@ namespace {
 // reads the same in relative L2. 4e-3 on each admits exactly that and nothing structural.
 constexpr ReductionCriterion kHeadLinearTolerance{4.5e-3, 4.0e-3, 4.0e-3};
 
+// This op multiplies int8 codes by FP16 scales in FP32. The shared dense A16
+// projection oracle rounds those weights to BF16, which is a different contract.
+std::vector<double> head_projection_oracle(const quantized_weight::PackedWeight& weight,
+    int row_offset, int rows, const std::vector<float>& activation, int hidden, int tokens) {
+    const auto selected = sampled_rows(rows, 7);
+    std::vector<double> expected(selected.size() * tokens);
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+        const auto decoded = quantized_weight::materialize_row_fp64(weight, row_offset + selected[i]);
+        for (int t = 0; t < tokens; ++t) {
+            double sum = 0.0;
+            for (int c = 0; c < hidden; ++c) {
+                sum += decoded[c] * static_cast<double>(activation[static_cast<std::size_t>(t) * hidden + c]);
+            }
+            expected[i * tokens + t] = sum;
+        }
+    }
+    return expected;
+}
+
 int run_case(std::int32_t heads, std::int32_t n, std::int32_t k, std::int32_t tokens,
              float out_scale, std::uint32_t seed) {
     const std::string label = "head_linear heads=" + std::to_string(heads) + " n=" +
@@ -58,7 +77,7 @@ int run_case(std::int32_t heads, std::int32_t n, std::int32_t k, std::int32_t to
             }
         }
         std::vector<double> expected =
-            projection_oracle(weight.host, head * n, n, slice, k, tokens);
+            head_projection_oracle(weight.host, head * n, n, slice, k, tokens);
         for (double& value : expected) { value *= static_cast<double>(out_scale); }
         failures += compare(label + " head " + std::to_string(head),
                             gather_rows(got, heads * n, head * n, n, tokens), expected,

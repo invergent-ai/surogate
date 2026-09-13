@@ -13,8 +13,8 @@ struct Inputs {
     std::int64_t value_heads = 0;
     std::int64_t tokens      = 0;
 
-    // q/k/v contain the exact FP32 values represented by their public BF16 tensors.
-    // g/beta/state contain the exact public FP32 values.
+    // q/k/v/state contain the exact FP32 values represented by their public BF16 tensors.
+    // g/beta contain the exact public FP32 values.
     std::vector<float> q;
     std::vector<float> k;
     std::vector<float> v;

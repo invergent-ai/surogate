@@ -31,7 +31,9 @@ reproductions. A3 is also resolved: the shared launcher switch inventory now for
 All 54 launcher tests pass, including the previously failing native inventories and native
 help checks. A4 is resolved as well: wake admission now shares the request's timeout,
 cancellation, and capacity reservation; waiters can leave during an ongoing model transfer.
-A5 and the subsequent backlog remain open.
+A5 is resolved: the head projection and Spark expectations now follow their contracts,
+and KDA/GDN agreement is checked against a common FP64 reference with BF16-aware bounds.
+The memory, throughput, and coverage backlog below remains open.
 
 ## Fix first
 
@@ -124,9 +126,10 @@ Evidence: [request admission](../../serve/serve/generation_service.cpp),
 [scheduler regression tests](test_model_scheduler.cpp),
 [HTTP regression test](test_model_wake_http.cpp).
 
-### A5 — P2: resolve the remaining numerical and parser test disagreements
+### A5 — resolved: numerical and parser test disagreements
 
-All three C++ failures reproduced individually on otherwise idle devices/processes.
+Original audit findings: all three C++ failures reproduced individually on otherwise idle
+devices/processes.
 
 | Test | Finding | Follow-up |
 |---|---|---|
@@ -134,13 +137,38 @@ All three C++ failures reproduced individually on otherwise idle devices/process
 | `sinfer_kimi_delta_net_test` | Uniform-gate KDA/GDN comparison fails: example output `0.029541` versus `0.0296631`. Its other checks complete; the cause of the cross-operation disagreement remains unresolved. | Compare both implementations against the same independent recurrence, including state storage boundaries; determine whether the kernel or comparison contract needs correction. |
 | `sinfer_output_parsers_test` | The Spark test calls text after a complete tool call malformed. The shared parser now preserves trailing answer text, and the Qwen parser test explicitly requires that behavior. | Reconcile the Spark expectation with the shared behavior and cover streaming suffix handling. |
 
-Evidence: [head contract](../../serve/api/ops/head_linear.h#L28),
-[head reference](ops/test_head_linear.cpp#L61),
-[head kernel](../../serve/ops/kernel/head_linear.cuh#L67),
-[KDA comparison](ops/test_kimi_delta_net.cpp#L220),
-[Spark expectation](test_output_parsers.cpp#L167),
-[shared suffix parsing](../../serve/serve/tool_call_parser.cpp#L235),
-[suffix contract test](test_tool_call_parser.cpp#L80).
+Resolution: the head test now decodes its sampled weights in FP32 and accumulates in FP64,
+without changing its tolerances or the shared BF16 weight oracle used by dense projections.
+Spark suffixes remain content alongside the parsed calls; malformed suffixes containing an
+unfinished second call still fall back to the original text. Streaming tests cover every
+split of the tagged response, including text between calls and after the last call.
+
+The KDA/GDN failure is a BF16 midpoint case. For the original seed and shape, the independent
+FP64 recurrence, including represented BF16 initial state and normalized Q/K staging, yields
+`0.029602048704048176` at output index 1767. The midpoint between the two GPU outputs,
+`0.029541015625` and `0.0296630859375`, is `0.02960205078125`: only about `2.08e-9` away.
+Factoring scalar decay outside the reduction versus applying diagonal decay inside it changes
+FP32 arithmetic; the final BF16 rounding can therefore differ by one representable step.
+Cross-op relative L2 is `1.31e-4` for output and `1.77e-5` for final state, both well below the
+unchanged `1e-3` aggregate bound. The comparison now also checks each value against one BF16
+spacing with a small FP32 cancellation floor, instead of imposing a global maximum error
+smaller than a BF16 step. Both kernels independently pass against the same FP64 reference.
+
+The KDA and GDN test inputs now start from the BF16 state actually uploaded to the GPU. Snapshot references
+retain unrounded state across a call: writing a BF16 snapshot does not reload that rounded
+copy into the running recurrence. Public op comments were corrected to name BF16 state
+storage. GPU kernels and production parser behavior are unchanged.
+
+Validation: the full C++ serving suite reports 136 passed, 13 skipped, and zero failures;
+the Python serving and contract suite reports 501 passed, 153 skipped. The numerical checks
+ran on physical GPUs 0 and 4 with `CUDA_DEVICE_ORDER=PCI_BUS_ID`. The corrected standalone
+GDN initial-state fixture also passes its full test. Skips require optional model fixtures;
+they do not establish full-checkpoint coverage.
+
+Evidence: [head reference](ops/test_head_linear.cpp),
+[KDA references and agreement checks](ops/test_kimi_delta_net.cpp),
+[Spark parser expectations](test_output_parsers.cpp),
+[Spark streaming suffix test](test_responses_schema.cpp).
 
 ## Memory and throughput backlog
 

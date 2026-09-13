@@ -33,11 +33,11 @@ namespace sinfer::ops {
  *   ideal[:,h,t] = scale * S_h * q[:,qh,t].
  *
  * Shapes/dtypes are contiguous q/k BF16 [128,Hqk,T], v/out BF16 [128,Hv,T], g/beta FP32 [Hv,T],
- * and state FP32 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When
+ * and state BF16 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When
  * `normalize_qk` is true, the recurrent implementation consumes raw q/k and applies
  * x / sqrt(sum(x^2) + 1e-6) independently to every 128-element row before using it. When false,
  * q/k are consumed as supplied. The oracle evaluates the complete recurrence and `ideal` naively
- * in FP64 from the represented inputs and FP32 initial state. The BF16 out is promoted and
+ * in FP64 from the represented inputs and represented BF16 initial state. The BF16 out is promoted and
  * compared directly with that result; output storage rounding belongs to the Op's numerical
  * criterion, not the oracle. Recurrent implementations may apply the normalization directly;
  * chunked implementations may use private normalized staging. The corresponding private storage
@@ -64,14 +64,15 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 /**
  * Snapshot form for B independent recurrences. q/k are contiguous BF16 [128,Hqk,W,B], v/out are
- * BF16 [128,Hv,W,B], g/beta are FP32 [Hv,W,B], and `ssm_states` is contiguous FP32
+ * BF16 [128,Hv,W,B], g/beta are FP32 [Hv,W,B], and `ssm_states` is contiguous BF16
  * [128,128,Hv,Slots]. `initial_state_slots` and `snapshot_base_slots` are contiguous I32 [B].
  * `valid_columns` is either contiguous I32 [B], with every value in [1,W], or an empty Tensor
  * meaning every row has W valid columns. B=1 accepts every positive W; B=2..8 accepts W=1..16.
  *
  * Row b starts from initial_state_slots[b] and writes the state after valid column j to
  * snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero and do not mutate
- * state. The caller reserves disjoint complete [base,base+W) intervals and prevents one row from
+ * state. Snapshots round to BF16; the recurrence continues from its FP32 register state.
+ * The caller reserves disjoint complete [base,base+W) intervals and prevents one row from
  * overwriting another row's initial slot; a row may overwrite its own initial slot after loading
  * it. This form uses no arena allocation and `ssm_states` is the only persistent state mutated.
  */
@@ -86,7 +87,7 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  *
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
  * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
- * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM execution domain is
+ * are FP32 [Hv,T,B], and ssm_states is BF16 [128,128,Hv,S]. The ReplaySSM execution domain is
  * B=1..8 and T=2..16, with Hq=16 and Hv in {32,48}. scale is 1/sqrt(128).
  *
  * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in

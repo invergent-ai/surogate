@@ -119,6 +119,7 @@ gdn_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     round_to_bf16(in.q);
     round_to_bf16(in.k);
     round_to_bf16(in.v);
+    round_to_bf16(in.state);
     return in;
 }
 

@@ -164,12 +164,26 @@ void test_spark_tool_calls() {
         content += filter.finish(true);
         check(content == parsed.content, "Spark split-stream content");
     }
+    const auto trailing = parse_tool_calls(ToolCallFormat::Spark25,
+        "<tool_call>weather</tool_call>trailing", 64);
+    check(trailing.is_tool_call_response && trailing.tool_calls.size() == 1 &&
+              trailing.tool_calls[0].name == "weather" &&
+              trailing.tool_calls[0].arguments_json == "{}" && trailing.content == "trailing",
+          "Spark preserves the call and trailing answer separately");
     for (const auto malformed : {
         "<tool_call>bad/name</tool_call>", "<tool_call>weather<arg_key>city</arg_key></tool_call>",
         "<tool_call>weather<arg_key>x</arg_key><arg_value>1</arg_value><arg_key>x</arg_key><arg_value>2</arg_value></tool_call>",
-        "<tool_call>weather", "<tool_call>weather</tool_call>trailing"}) {
+        "<tool_call>weather", "<tool_call>weather</tool_call>trailing<tool_call>unfinished"}) {
         const auto result = parse_tool_calls(ToolCallFormat::Spark25, malformed, 64);
-        check(!result.is_tool_call_response && result.content == malformed, "Spark malformed fallback");
+        check(!result.is_tool_call_response && result.tool_calls.empty() && result.content == malformed,
+              "Spark malformed fallback");
+        for (std::size_t split = 0; split <= result.content.size(); ++split) {
+            ToolCallStreamFilter filter;
+            auto visible = filter.feed(std::string_view(malformed).substr(0, split));
+            visible += filter.feed(std::string_view(malformed).substr(split));
+            visible += filter.finish(result.is_tool_call_response);
+            check(visible == malformed, "Spark malformed split-stream fallback preserves all text");
+        }
     }
 }
 
