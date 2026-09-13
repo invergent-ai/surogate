@@ -110,7 +110,10 @@ bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t str
     cudaGetDevice(&device);
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, marlin_fixed_m()) * sizeof(float);
+    // FP8 also runs unpadded prefills wider than the decode band. Those calls
+    // use up to 64 rows per reduction tile, even with a 32-row decode band.
+    // Reserve the full tile now so captured calls never need to grow it.
+    const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, 64) * sizeof(float);
     std::size_t lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int);
     void* out_buf   = nullptr;
     void* a_buf     = nullptr;

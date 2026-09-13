@@ -97,6 +97,7 @@ function(sinfer_add_op_test name)
 endfunction()
 
 sinfer_add_op_test(sinfer_sparse_gqa_batch_test SOURCES ops/test_sparse_gqa_batch.cpp LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_marlin_fp8_wide_test SOURCES ops/test_marlin_fp8_wide.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)
   sinfer_add_op_test(${name}
