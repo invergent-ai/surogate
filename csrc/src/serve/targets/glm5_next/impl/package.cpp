@@ -73,6 +73,11 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
     std::size_t kda_index  = 0;
     for (std::int32_t index = 0; index < g.layers; ++index) {
         const bool attends = g.layer_attends(index);
+        if ((attends ? runtime.full_layers.at(full_index).input_norm.data
+                     : runtime.gdn_layers.at(kda_index).input_norm.data) == nullptr) {
+            if (attends) { ++full_index; } else { ++kda_index; }
+            continue;
+        }
         const detail::FeedForwardPayload& mlp =
             attends ? runtime.full_layers.at(full_index).post_mixer
                     : runtime.gdn_layers.at(kda_index).post_mixer;

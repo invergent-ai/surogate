@@ -25,6 +25,11 @@ int main() {
     options.lora_enable = true;
     options.lora_slots = 1;
     options.lora_max_rank = 2;
+    if (const auto* devices = std::getenv("SUROGATE_TARGET_LORA_TEST_DEVICES")) {
+        std::istringstream selected(devices);
+        for (std::string item; std::getline(selected, item, ':');) { options.devices.push_back(std::stoi(item)); }
+        options.device = options.devices.front();
+    }
     Engine engine(options);
     const int layers = reader.geometry().at("layers");
     auto& stores = engine.lora_stores();
@@ -39,28 +44,45 @@ int main() {
         store.validate_module(layer, module, a, b, 1, in, out, 1);
         store.set_module_slot(layer, module, 0, a, b, 1, in, out, 1);
     };
-    assert(reader.identity().architecture == "gemma4_e");
-    const int first_shared = layers - static_cast<int>(reader.geometry().at("kv_shared_layers"));
-    assert(first_shared > 0 && first_shared < layers);
-    auto& store = *stores.peek(engine.device());
-    assert(cudaSetDevice(engine.device()) == cudaSuccess);
-    for (int layer = 0; layer < layers; ++layer) {
-        const auto prefix = "text/layers/" + std::to_string(layer) + "/";
-        for (const auto* module : {"gate", "up", "down"}) {
-            upload(store, layer, std::string(module) + "_proj", prefix + "mlp/" + module);
+    if (reader.identity().architecture == "glm5_next") {
+        for (int layer = 0; layer < layers; ++layer) {
+            ops::LoraStore* owner = nullptr;
+            for (int device : stores.devices()) {
+                auto* candidate = stores.peek(device);
+                if (!candidate || !candidate->covers_layer(layer)) { continue; }
+                assert(!owner && "an adapter layer must belong to only one physical stage");
+                owner = candidate;
+                assert(cudaSetDevice(device) == cudaSuccess);
+            }
+            assert(owner && "every layer must have a resident adapter owner");
+            const auto prefix = "text/layers/" + std::to_string(layer) + "/";
+            if (reader.find(prefix + "mlp/down")) { upload(*owner, layer, "down_proj", prefix + "mlp/down"); }
+            if (reader.find(prefix + "mla/output")) { upload(*owner, layer, "o_proj", prefix + "mla/output"); }
         }
-        upload(store, layer, "q_proj", prefix + "attention/query");
-        upload(store, layer, "o_proj", prefix + "attention/output");
-        for (const auto* module : {"k_proj", "v_proj"}) {
-            if (layer < first_shared) {
-                const auto object = prefix + (std::string_view(module) == "k_proj" ? "attention/key" : "attention/value");
-                if (reader.find(object)) { upload(store, layer, module, object); }
-            } else {
-                try {
-                    store.validate_module(layer, module, {0}, {0}, 1, 1, 1, 1);
-                    assert(false && "shared-KV projection cannot have its own adapter");
-                } catch (const std::invalid_argument& error) {
-                    assert(std::string(error.what()).find("earlier layer") != std::string::npos);
+    } else {
+        assert(reader.identity().architecture == "gemma4_e");
+        const int first_shared = layers - static_cast<int>(reader.geometry().at("kv_shared_layers"));
+        assert(first_shared > 0 && first_shared < layers);
+        auto& store = *stores.peek(engine.device());
+        assert(cudaSetDevice(engine.device()) == cudaSuccess);
+        for (int layer = 0; layer < layers; ++layer) {
+            const auto prefix = "text/layers/" + std::to_string(layer) + "/";
+            for (const auto* module : {"gate", "up", "down"}) {
+                upload(store, layer, std::string(module) + "_proj", prefix + "mlp/" + module);
+            }
+            upload(store, layer, "q_proj", prefix + "attention/query");
+            upload(store, layer, "o_proj", prefix + "attention/output");
+            for (const auto* module : {"k_proj", "v_proj"}) {
+                if (layer < first_shared) {
+                    const auto object = prefix + (std::string_view(module) == "k_proj" ? "attention/key" : "attention/value");
+                    if (reader.find(object)) { upload(store, layer, module, object); }
+                } else {
+                    try {
+                        store.validate_module(layer, module, {0}, {0}, 1, 1, 1, 1);
+                        assert(false && "shared-KV projection cannot have its own adapter");
+                    } catch (const std::invalid_argument& error) {
+                        assert(std::string(error.what()).find("earlier layer") != std::string::npos);
+                    }
                 }
             }
         }
@@ -68,14 +90,19 @@ int main() {
     RequestOptions request;
     request.execution.requested_output_tokens = 4;
     request.execution.sampling.temperature = 0;
+    request.execution.top_logprobs = 0;
     const auto base = engine.generate(engine.prepare_tokens({100, 101, 102}), request);
-    request.execution.lora_slot = 0;
     request.execution.allow_prefix_reuse = false;
+    request.execution.lora_slot = 0;
     const auto adapted = engine.generate(engine.prepare_tokens({100, 101, 102}), request);
     assert(!base.generated_token_ids.empty() && adapted.generated_token_ids == base.generated_token_ids);
-    assert(adapted.token_logprobs.size() == base.token_logprobs.size());
-    for (std::size_t i = 0; i < base.token_logprobs.size(); ++i) {
-        assert(std::abs(adapted.token_logprobs[i] - base.token_logprobs[i]) < 0.005F);
+    assert(base.completion_logprobs.size() == base.generated_token_ids.size());
+    assert(adapted.completion_logprobs.size() == base.completion_logprobs.size());
+    for (std::size_t i = 0; i < base.completion_logprobs.size(); ++i) {
+        const float original = base.completion_logprobs[i].selected.logprob;
+        const float selected = adapted.completion_logprobs[i].selected.logprob;
+        assert(std::isfinite(original) && std::isfinite(selected));
+        assert(std::abs(selected - original) < 0.005F);
     }
     std::cout << "Target adapter shapes, uploads, absent-module refusals and zero-adapter generation passed\n";
 }
