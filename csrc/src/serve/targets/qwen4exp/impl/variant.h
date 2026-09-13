@@ -174,6 +174,9 @@ struct Variant {
     [[nodiscard]] static std::size_t
     mtp_fold_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                       std::int32_t last);
+    [[nodiscard]] static std::size_t
+    mtp_collapse_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
+                                          std::int32_t last);
 
     // --- workspace capacities ---
     [[nodiscard]] static std::size_t

@@ -487,7 +487,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, family::TextPhase phase,
                                      std::int32_t batch_size, std::int32_t min_width,
-                                     std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+                                     std::int32_t max_width, ops::GqaExecutionEnvelope envelope,
+                                     bool mtp = false) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection(layout, plan.geometry, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.geometry, plan.weights_profile,
@@ -504,9 +505,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         // per-column block mask and the selection's score scratch. Reserved whenever the target
         // has an indexer — the selection engages only past its budget, but the append runs for
         // every column of every round, and a short workspace would be a hard failure.
-        if constexpr (has_glm_indexer_v<Variant>) {
+        if (mtp) {
+            // A trunk-block MTP head attends densely and has no text indexer.
+        } else if constexpr (has_glm_indexer_v<Variant>) {
             (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
+        } else if constexpr (has_qsa_indexer_v<Variant>) {
+            const auto mask_bytes = round_up_256(static_cast<std::size_t>(
+                ops::qsa_block_mask_words(envelope.max_visible_keys, plan.geometry.indexer_block)) *
+                last * sizeof(std::int32_t));
+            // Selection retains its mask; projections and scores are released before GQA.
+            (void)layout.alloc_bytes(mask_bytes);
+            scratch(layout, variant_indexer_workspace_bytes<Variant>(
+                plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)) - mask_bytes);
         } else {
             scratch(layout, variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
@@ -605,7 +616,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 plan.geometry, first, last));
         }
     };
+    const auto collapse_scratch = [&]<class V = Variant>(WorkspaceLayoutBuilder& layout,
+                                                         std::int32_t columns) {
+        if constexpr (mtp_block_is_trunk_layer<V>()) {
+            matrix(layout, DType::BF16, plan.geometry.hidden, columns);
+            scratch(layout, V::mtp_collapse_workspace_capacity_bytes(plan.geometry, columns, columns));
+        }
+    };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
+        collapse_scratch(layout, columns);
         if (plan.proposal_head == ProposalHead::Optimized) {
             matrix(layout, DType::BF16, plan.geometry.draft_vocab, columns);
         }
@@ -620,8 +639,24 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                         std::int32_t last) {
         scratch(layout, mtp_attention_output_capacity_bytes<Variant>(plan.geometry, first, last));
     };
+    const auto mtp_trunk_core = [&]<class V = Variant>(WorkspaceLayoutBuilder& layout,
+        std::int32_t first, std::int32_t last, bool preembedded, std::int32_t batch,
+        std::int32_t min_width, std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        if constexpr (mtp_block_is_trunk_layer<V>()) {
+            auto core = layout.scope();
+            (void)workspace_recipe::mtp_trunk_stem(layout, plan.geometry, last, !preembedded);
+            scratch(layout, V::mtp_fold_workspace_capacity_bytes(plan.geometry, first, last));
+            attention_stage(layout, first, last, family::TextPhase::Verify, batch,
+                            min_width, max_width, envelope, true);
+            post_mixer_stage(layout, first, last, family::TextPhase::Verify);
+        }
+    };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::GqaExecutionEnvelope envelope) {
+        if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+            mtp_trunk_core(layout, tokens, tokens, false, 1, tokens, tokens, envelope);
+            return;
+        }
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
         (void)workspace_recipe::mtp_attention_projection(layout, plan.geometry, tokens);
@@ -652,6 +687,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto mtp_prefill_chunk = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                        std::int32_t last, bool preembedded) {
         auto call = layout.scope();
+        if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+            matrix(layout, DType::BF16, plan.geometry.residual, last);
+            mtp_trunk_core(layout, first, last, preembedded, 1, first, last, text_envelope);
+            proposal_scratch(layout, 1);
+            return;
+        }
         matrix(layout, DType::BF16, plan.geometry.hidden, 1);
         matrix(layout, DType::BF16, plan.geometry.hidden, 1);
         {
@@ -710,6 +751,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         text_common_root(mtp_prefill, chunk);
         target_body(mtp_prefill, 1, chunk, family::TextPhase::Prefill, GdnWorkspacePath::Prefill,
                     1, 1, chunk, text_envelope);
+        if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+            // finish_prefill retains the wide residual for MTP and a collapsed LM-head view.
+            collapse_scratch(mtp_prefill, chunk);
+        }
         matrix(mtp_prefill, DType::I32, 1, chunk);
         if (plan.features.vision) {
             matrix(mtp_prefill, DType::BF16, plan.geometry.hidden, chunk);
@@ -717,7 +762,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         mtp_prefill_chunk(mtp_prefill, 1, chunk, plan.features.vision);
         for (std::int32_t i = 1; i < drafts; ++i) {
-            matrix(mtp_prefill, DType::BF16, plan.geometry.hidden, 1);
+            matrix(mtp_prefill, DType::BF16,
+                   mtp_block_is_trunk_layer<Variant>() ? plan.geometry.residual : plan.geometry.hidden, 1);
             mtp_full_call(mtp_prefill, 1, text_envelope, true);
         }
         out.mtp_prefill = finish(mtp_prefill);
@@ -744,6 +790,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
             const auto mtp_decode_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t width) {
                 const std::int32_t tokens = batch * width;
+                if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+                    mtp_trunk_core(layout, tokens, tokens, false, batch, width, width, text_envelope);
+                    return;
+                }
                 auto core                 = layout.scope();
                 mtp_stem(layout, tokens, false);
                 (void)workspace_recipe::mtp_attention_projection(layout, plan.geometry, tokens);

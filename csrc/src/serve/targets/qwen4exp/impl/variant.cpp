@@ -492,8 +492,12 @@ std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometr
         return plane_bytes(rows, columns, DType::BF16);
     };
     return plane(g.hidden, last) + plane(g.residual, last) + plane(2 * g.hidden, g.hc_streams * last) +
-           w8_capacity(g.hidden, 2 * g.hidden, g.hc_streams * first, g.hc_streams * last) +
-           mix_capacity(g, first, last);
+           w8_capacity(g.hidden, 2 * g.hidden, g.hc_streams * first, g.hc_streams * last);
+}
+
+std::size_t Variant::mtp_collapse_workspace_capacity_bytes(const family::TextGeometry& g,
+                                                           std::int32_t first, std::int32_t last) {
+    return mix_capacity(g, first, last);
 }
 
 void Variant::mtp_attention_projection(const Tensor&, const MtpAttentionProjectionWeights&,

@@ -2004,13 +2004,18 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
             return ops::GqaBlockMask{};
         }
         cudaStream_t s = ctx_.stream;
+        const bool sparse = !ops::qsa_selection_is_dense(keys, geometry);
+        const std::int32_t words = sparse ? ops::qsa_block_mask_words(keys, geometry.block) : 0;
+        Tensor mask = sparse ? work_.alloc(DType::I32, {words, tokens}) : Tensor{};
+        // Only the mask survives selection. Its inputs and scores can be reused by attention.
+        auto scratch = work_.scope();
         // The keys are cached raw for every column, whatever the history length: a later query
         // pools them into a block key, so skipping the append below the budget would leave holes.
         Tensor raw_keys = work_.alloc(DType::BF16, {geometry.head_dim, tokens});
         ops::detail::bf16_cublaslt_gemm(indexer.key, hidden, raw_keys, s);
         ops::qsa_indexer_append(raw_keys, cache_positions, table_rows, columns_per_row,
                                 indexer.key_norm, geometry, cache, s);
-        if (ops::qsa_selection_is_dense(keys, geometry)) { return ops::GqaBlockMask{}; }
+        if (!sparse) { return ops::GqaBlockMask{}; }
 
         const std::int32_t width = geometry.head_dim * geometry.heads;
         Tensor queries           = work_.alloc(DType::BF16, {width, tokens});
@@ -2022,8 +2027,6 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         Tensor rope_view = rope_positions.view({tokens});
         ops::rope(rope_view, geometry.rotary_dim, geometry.rope_theta, heads_norm, s);
 
-        const std::int32_t words = ops::qsa_block_mask_words(keys, geometry.block);
-        Tensor mask              = work_.alloc(DType::I32, {words, tokens});
         ops::qsa_indexer_select(heads_norm, cache_positions, table_rows, columns_per_row, geometry,
                                 cache, keys, work_, mask, s);
         return ops::GqaBlockMask{.words  = static_cast<const std::uint32_t*>(mask.data),
