@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <compare>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -133,20 +134,23 @@ public:
         return prompt_tokens + 127U;
     }
 
-    [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
-                                                std::int32_t batch_bucket,
-                                                std::int32_t band) noexcept {
-        // The frontier band belongs in the key: the captured body bakes the
-        // band's envelope into its decode attention grid, so a replay under a
-        // different band truncates attention for every lane past the captured
-        // max. `band` is the ordinary profile's index — not its topology class,
-        // which is zero for every profile and once left the band out of the key.
-        return (band << 20) | mixed_key(chunk_bucket, batch_bucket);
+    struct Key {
+        bool mixed;
+        std::int32_t chunk, batch, band;
+        auto operator<=>(const Key&) const = default;
+    };
+
+    [[nodiscard]] static Key prefill_key(std::int32_t chunk_bucket) noexcept {
+        return {false, chunk_bucket, 0, 0};
     }
 
-    [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
-                                                std::int32_t batch_bucket) noexcept {
-        return (chunk_bucket << 8) | batch_bucket;
+    [[nodiscard]] static Key mixed_key(std::int32_t chunk_bucket,
+                                        std::int32_t batch_bucket,
+                                        std::int32_t band = 0) noexcept {
+        // The captured chunk width and decode envelope are independent. Keep
+        // their full values and the graph kind rather than overlapping bit fields.
+        // `band` is the ordinary profile's index, not its shared topology class.
+        return {true, chunk_bucket, batch_bucket, band};
     }
     // Round the decode batch up to the next multiple of 8, never past the
     // concurrency ceiling. The bucket must be >= the real row count: a bucket
@@ -170,11 +174,15 @@ public:
     }
 
     DecodeGraphExecutable* ensure(std::int32_t bucket, const std::function<void()>& body) {
-        auto found = buckets_.find(bucket);
+        return ensure(prefill_key(bucket), body);
+    }
+
+    DecodeGraphExecutable* ensure(Key key, const std::function<void()>& body) {
+        auto found = buckets_.find(key);
         if (found != buckets_.end()) { return &found->second; }
         if (std::getenv("SUROGATE_SERVE_PREFILL_GRAPH_LOG") != nullptr) {
-            std::fprintf(stderr, "prefill-graph: capturing bucket %d (chunk %d)\n", bucket,
-                         prefill_chunk_);
+            std::fprintf(stderr, "prefill-graph: capturing %s chunk %d batch %d band %d\n",
+                         key.mixed ? "mixed" : "prefill", key.chunk, key.batch, key.band);
         }
         try {
             const DeviceFootprint footprint_before = sample_device_footprint();
@@ -201,7 +209,7 @@ public:
             graph_bytes_ +=
                 device_footprint_delta(footprint_before, sample_device_footprint()).bytes;
 
-            auto emplaced = buckets_.emplace(bucket, std::move(executable));
+            auto emplaced = buckets_.emplace(key, std::move(executable));
             return &emplaced.first->second;
         } catch (const std::exception& error) {
             // Do not degrade to the eager body. A capture that runs out of
@@ -213,11 +221,11 @@ public:
             // for the operator to make up front with --enforce-eager, so
             // report the shortfall and stop while the state is still sound.
             std::fprintf(stderr,
-                         "prefill-graph: capture for bucket %d failed: %s\n"
+                         "prefill-graph: capture for chunk %d batch %d band %d failed: %s\n"
                          "The device has no room left for CUDA Graphs at this configuration. "
                          "Re-run with --enforce-eager to serve without them, or lower "
                          "--max-num-seqs / --kv-capacity to leave room.\n",
-                         bucket, error.what());
+                         key.chunk, key.batch, key.band, error.what());
             std::fflush(stderr);
             std::_Exit(EXIT_FAILURE);
         }
@@ -235,7 +243,7 @@ private:
     void* iota_storage_                 = nullptr;
     void* rope_positions_storage_       = nullptr;
 
-    std::map<std::int32_t, DecodeGraphExecutable> buckets_;
+    std::map<Key, DecodeGraphExecutable> buckets_;
     std::size_t graph_bytes_ = 0;
 };
 

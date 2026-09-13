@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <set>
 
 namespace {
 
@@ -37,6 +38,23 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    failures += check(PrefillGraphFamily::mixed_key(6144, 4, 0) !=
+                          PrefillGraphFamily::mixed_key(2048, 4, 1),
+                      "mixed captures with different chunk widths and attention bands collide");
+    failures += check(PrefillGraphFamily::prefill_key(32896) !=
+                          PrefillGraphFamily::mixed_key(128, 128, 0),
+                      "plain and mixed prefill captures collide");
+    std::set<PrefillGraphFamily::Key> keys;
+    for (const int chunk : {128, 2048, 4096, 6144, 8192, 32768, 32896, 65536, 1048576, 2147483520}) {
+        failures += check(keys.insert(PrefillGraphFamily::prefill_key(chunk)).second,
+                          "duplicate plain graph key");
+        for (const int batch : {1, 4, 8, 32, 64, 128}) {
+            for (const int band : {0, 1, 2, 4, 8, 16, 256, 2147483647}) {
+                failures += check(keys.insert(PrefillGraphFamily::mixed_key(chunk, batch, band)).second,
+                                  "duplicate mixed graph key");
+            }
+        }
+    }
 
     // The lemma, exhaustively, for every prompt a 4096 context can hold.
     for (std::uint32_t prompt = 1; prompt <= 4096; ++prompt) {
