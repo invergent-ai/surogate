@@ -815,7 +815,7 @@ Key inference options:
 | `max_loras`               | `8`            | Max simultaneously loaded LoRA adapters                |
 | `seed`                    | `0`            | Sampling seed                                          |
 | `enable_auto_tool_choice` | `false`        | Permit `tool_choice: "auto"`. Needed by a tool-using environment |
-| `tool_call_parser`     | engine default | How the model marks a tool call; takes vLLM's names     |
+| `tool_call_parser`        | engine default | How the model marks a tool call; takes vLLM's names |
 | `rope_scaling`            | `null`         | RoPE scaling configuration dict                        |
 
 ### Orchestrator config
