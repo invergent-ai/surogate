@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections import Counter, defaultdict
 from dataclasses import field
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
@@ -14,7 +14,12 @@ from surogate.grpo.orchestrator.advantage import dataclass
 from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.orchestrator.patches import ROLLOUT_DEPTH_CAP_KEY
 from surogate.grpo.orchestrator.utils import get_sampling_args
-from surogate.grpo.orchestrator.vf_utils import get_seq_len, get_task, run_rollout
+from surogate.grpo.orchestrator.vf_utils import (
+    get_seq_len,
+    get_task,
+    run_rollout,
+    score_group_if_deferred,
+)
 from surogate.grpo.utils.asynyc_utils import safe_cancel, safe_cancel_all
 from surogate.grpo.utils.client import InferencePool
 from surogate.grpo.utils.logger import ProgressTracker, get_logger
@@ -513,13 +518,11 @@ class Scheduler:
         return task in self.deferred_group_scoring_tasks and self.config.verification.enabled
 
     async def _score_group_if_deferred(self, completed_rollouts: list[vf.RolloutOutput]) -> list[vf.RolloutOutput]:
-        if not completed_rollouts:
-            return completed_rollouts
-        task = get_task(completed_rollouts[0])
-        if not self._should_defer_group_scoring(task):
-            return completed_rollouts
-        env_for_task = self.env.get_env_for_name(task)
-        await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
+        # Shared with the validation path, which had the same rule written a second
+        # way and drifted from this one. `deferred_group_scoring_tasks` is already
+        # empty when verification is off (see grpo_orch), so the flag need not be
+        # re-checked here.
+        await score_group_if_deferred(self.env, completed_rollouts, self.deferred_group_scoring_tasks)
         return completed_rollouts
 
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:

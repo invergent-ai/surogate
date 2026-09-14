@@ -227,6 +227,35 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         env_cfg.extra_env_kwargs["score_rollouts"] = (
             verification_enabled and train_env_name not in train_env_deferred_group_scoring_tasks
         )
+    # A group-level rubric ranks trajectories against each other, so a group of one
+    # has nothing to rank. Training already refuses `rollouts_per_example < 2`
+    # (grpo_orch_config), but `val.rollouts_per_example` defaults to 1: every val
+    # rollout would be generated and left unrankable, which is the symptom this path
+    # exists to prevent, arriving by default.
+    #
+    # A floor, not a match to training's size. Matching would make the two means
+    # directly comparable, but `generate()` fires every group at once with no
+    # limiter, so it multiplies an uncapped val burst (16 -> 128 at
+    # `rollouts_per_example: 8`) that competes with the training batch generated
+    # alongside it, and in a mixed env group it would N-fold the inline-scored envs
+    # too, where group size means nothing. The val curve is read as a trend at a
+    # consistent size, which a floor gives; strict comparability is not worth that.
+    #
+    # Not written back onto `config`: it was already dumped to `control/orch.yaml`
+    # and snapshotted for the run record, and a config that disagrees with its own
+    # record is worse than an override that says so.
+    val_rollouts_per_example = config.val.rollouts_per_example if config.val else None
+    if train_env_deferred_group_scoring_tasks and config.val and (val_rollouts_per_example or 0) < 2:
+        logger.warning(
+            f"Scoring validation in groups of 2 rather than {val_rollouts_per_example}: "
+            "a group-scored rubric ranks trajectories against each other, so a single "
+            "rollout cannot be scored."
+        )
+        val_rollouts_per_example = 2
+    # Only read on steps that ran validation, but bound here so the read cannot
+    # depend on that reasoning staying true.
+    val_rollouts_expected = 0
+
     if not verification_enabled:
         logger.info("Verification disabled; all training envs will skip scoring.")
     elif train_env_deferred_group_scoring_tasks:
@@ -612,15 +641,17 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
             if val_buffer and config.val and progress.step % config.val.interval == 0:
                 logger.info(f"Running validation for step {progress.step}")
                 val_examples = val_buffer.sample_examples(config.val.num_examples)
+                val_rollouts_expected = len(val_examples) * (val_rollouts_per_example or 0)
                 val_task = asyncio.create_task(
                     generate(
                         env=train_env_group,
                         model_name=scheduler.model_name,
                         examples=val_examples,
-                        rollouts_per_example=config.val.rollouts_per_example,
+                        rollouts_per_example=val_rollouts_per_example,
                         sampling_args=sampling_args,
                         clients=inference_pool.clients,
                         pbar_description="Generating rollouts (val)",
+                        deferred_tasks=train_env_deferred_group_scoring_tasks,
                     )
                 )
             else:
@@ -775,6 +806,9 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
                     ruler_step_totals["ruler/score_mean"] = float(metrics_df["ruler_score"].mean())
                     ruler_step_totals["ruler/score_std"] = float(metrics_df["ruler_score"].std())
 
+            # Reported only when something scored these rollouts. With verification
+            # off nothing does, and a val block of zeroes reads as "the model learned
+            # nothing" where a missing one reads as "not measured".
             val_results_df = (
                 pd.DataFrame(
                     {
@@ -783,7 +817,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
                         "reward": [rollout["reward"] for rollout in val_outputs],
                     }
                 )
-                if val_outputs is not None
+                if val_outputs and verification_enabled
                 else None
             )
 
@@ -907,6 +941,15 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
             if val_results_df is not None:
                 to_log.update(
                     {
+                        # Beside the mean, because a group whose judge failed is dropped
+                        # rather than averaged in as zero, and judge failures are not
+                        # uniform: a timeout correlates with long trajectories, which
+                        # correlate with hard examples. The surviving mean therefore
+                        # skews optimistic exactly when the judge is struggling, and the
+                        # curve alone cannot show that. `rollouts` falling short of
+                        # `rollouts_expected` is how a reader sees it.
+                        "val_reward/rollouts": float(len(val_results_df)),
+                        "val_reward/rollouts_expected": float(val_rollouts_expected),
                         "val_reward/mean": val_results_df.reward.mean(),
                         "val_reward/std": val_results_df.reward.std(),
                         "val_reward/min": val_results_df.reward.min(),
