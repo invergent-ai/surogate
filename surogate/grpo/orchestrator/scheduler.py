@@ -27,6 +27,38 @@ from surogate.grpo.utils.utils import (
 )
 
 
+# One example whose rollouts keep failing is a bad row, not a broken run: drop
+# the group and let the buffer supply another, the way the rollout-raised path
+# below already does. The group is the unit here, not the task: a rejected
+# request fails in milliseconds and is re-scheduled immediately, while a
+# healthy rollout takes seconds, so a per-task counter lets a single poison row
+# outrun the first success of a cold start and kill a run whose dataset is
+# otherwise fine.
+MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
+
+# ...but when groups keep dying with no rollout completing in between, the data
+# is not the problem. Observed 2026-09-03: vLLM rejected every rollout with a
+# 400 it would never accept — the same message 10,729 times in twenty minutes,
+# ``(0/4 complete)`` never advancing, two GPUs held, and the run still
+# ``running`` with ``error`` null until a human cancelled it.
+#
+# Eight, because the counter resets on any rollout that completes: in a run
+# that is merely working through some bad rows, successes keep arriving between
+# the failures. Eight groups dying back to back with nothing getting through is
+# not a dataset shape. It can still be reached at a cold start by a dataset
+# that is mostly unrunnable — where failing is the right answer anyway.
+MAX_CONSECUTIVE_DROPPED_GROUPS = 8
+
+
+class RolloutFailureLoop(RuntimeError):
+    """Groups kept being dropped with no rollout completing in between.
+
+    Its own type because ``generate_batch``'s rollout handling ends in a broad
+    ``except Exception`` that logs and carries on — the behaviour this exists
+    to stop, and which would otherwise swallow it.
+    """
+
+
 class InflightRolloutInfo(NamedTuple):
     """Metadata for an in-flight request."""
 
@@ -128,6 +160,11 @@ class Scheduler:
         self.inflight_policy_update_task: asyncio.Task | None = None
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
+        # Deliberately not cleared in get_metrics() alongside the three
+        # per-step counters below: these measure streaks, and a reset every
+        # step would hide a task that fails every rollout of every step.
+        self.failed_attempts_by_group: dict[int, int] = defaultdict(int)
+        self.dropped_groups_by_task: dict[str, int] = defaultdict(int)
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
@@ -212,6 +249,40 @@ class Scheduler:
             clients = self.inference_pool.clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
+
+    async def _note_rollout_outcome(self, task: str, group_id: int, failure: str | None) -> bool:
+        """Record a rollout's outcome and report whether its group survives.
+
+        ``failure`` is why the rollout is being re-scheduled, or None when it
+        completed. Returns False once the group has been dropped, so the caller
+        stops treating it as live.
+        """
+        if failure is None:
+            self.failed_attempts_by_group.pop(group_id, None)
+            self.dropped_groups_by_task[task] = 0
+            return True
+
+        self.failed_attempts_by_group[group_id] += 1
+        if self.failed_attempts_by_group[group_id] < MAX_ROLLOUT_ATTEMPTS_PER_GROUP:
+            return True
+
+        self.logger.warning(
+            f"Dropping group {group_id} ({task}) after {MAX_ROLLOUT_ATTEMPTS_PER_GROUP} "
+            f"failed rollouts: {failure}"
+        )
+        await self.drop_group(group_id)
+        self.failed_attempts_by_group.pop(group_id, None)
+        self._note_dropped_group(task, failure)
+        return False
+
+    def _note_dropped_group(self, task: str, failure: str) -> None:
+        """Count a dropped group; fail the run once dropping stops helping."""
+        self.dropped_groups_by_task[task] += 1
+        if self.dropped_groups_by_task[task] >= MAX_CONSECUTIVE_DROPPED_GROUPS:
+            raise RolloutFailureLoop(
+                f"{task}: {MAX_CONSECUTIVE_DROPPED_GROUPS} groups dropped in a row with no rollout "
+                f"completing in between, so re-scheduling cannot recover. Last failure: {failure}"
+            )
 
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it."""
@@ -487,23 +558,25 @@ class Scheduler:
 
                     task = rollout_info.task
                     self.total_rollouts_by_task[task] += 1
-                    should_reschedule = False
+                    failure: str | None = None
                     if len(rollout["trajectory"]) == 0:
                         self.empty_rollouts_by_task[task] += 1
-                        should_reschedule = True
+                        failure = "empty trajectory"
                         self.logger.warning(
                             f"Empty trajectory in group {group_id} ({task}), re-scheduling "
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
                         )
                     if rollout["error"] is not None:
                         self.errored_rollouts_by_task[task] += 1
-                        should_reschedule = True
+                        failure = rollout["error"]["error_chain_repr"]
                         self.logger.warning(
                             f"Rollout error in group {group_id} ({task}), re-scheduling "
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
-                            f"{rollout['error']['error_chain_repr']}"
+                            f"{failure}"
                         )
-                    if should_reschedule:
+                    if not await self._note_rollout_outcome(task, group_id, failure):
+                        continue
+                    if failure is not None:
                         group.rollouts_to_schedule += 1
                         continue
 
@@ -516,10 +589,17 @@ class Scheduler:
                     if group_id is not None:
                         await self.drop_group(group_id)
                     continue
+                except RolloutFailureLoop:
+                    raise
                 except Exception as e:
+                    # A rollout that *raised* never reaches the accounting
+                    # above, so count the drop here too — otherwise a transport
+                    # failure storm spins exactly the way a rejection storm did.
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
+                        self.failed_attempts_by_group.pop(group_id, None)
+                        self._note_dropped_group(rollout_info.task, repr(e))
                     continue
 
                 # Group is complete. Either dispatch deferred scoring (concurrent with
