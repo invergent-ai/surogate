@@ -26,8 +26,8 @@
 #include "core/device.h"
 #include "encoder/options.h"
 #include "encoder/embedding_request.h"
-#include "encoder/cpu/cpu_gemma_embedding.h"
-#include "encoder/gemma_embedding.h"
+#include "encoder/cpu/cpu_text_embedding.h"
+#include "encoder/text_embedding.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -67,18 +67,18 @@ int main(int argc, char** argv) {
 
         // One of the two encoders, behind the same three calls the handler uses.
         std::unique_ptr<sinfer::DeviceContext> gpu_device;
-        std::unique_ptr<sinfer::encoder::GemmaEmbedding> gpu;
-        std::unique_ptr<sinfer::encoder::cpu::CpuGemmaEmbedding> host_model;
+        std::unique_ptr<sinfer::encoder::TextEmbedding> gpu;
+        std::unique_ptr<sinfer::encoder::cpu::CpuTextEmbedding> host_model;
         if (device == "cpu") {
-            host_model = std::make_unique<sinfer::encoder::cpu::CpuGemmaEmbedding>(
-                sinfer::encoder::cpu::CpuGemmaEmbedding::load(artifact));
+            host_model = std::make_unique<sinfer::encoder::cpu::CpuTextEmbedding>(
+                sinfer::encoder::cpu::CpuTextEmbedding::load(artifact));
             std::fprintf(stderr, "cpu: %.0f MB on %d threads, gemm backend %s\n",
                          static_cast<double>(host_model->weight_bytes()) / 1e6,
                          host_model->threads(), sinfer::encoder::cpu::gemm_backend_name());
         } else {
             gpu_device = std::make_unique<sinfer::DeviceContext>(options.device_index);
-            gpu        = std::make_unique<sinfer::encoder::GemmaEmbedding>(
-                sinfer::encoder::GemmaEmbedding::load(artifact, *gpu_device));
+            gpu        = std::make_unique<sinfer::encoder::TextEmbedding>(
+                sinfer::encoder::TextEmbedding::load(artifact, *gpu_device));
             std::fprintf(stderr, "gpu %s: %.0f MB\n", device.c_str(),
                          static_cast<double>(gpu->weight_bytes()) / 1e6);
         }

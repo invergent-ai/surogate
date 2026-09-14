@@ -416,7 +416,7 @@ surogate serve --embed <model.gguf> --device 0
 | `--served-model-name NAME` | model argument | Model name accepted by requests and listed by `/v1/models` |
 | `--frontend DIR` | automatic | Optional tokenizer override containing `tokenizer.model` and `tokenizer_config.json` |
 
-EmbeddingGemma GGUF files include their tokenizer, so no separate download or `--frontend`
+EmbeddingGemma and Harrier (270M, 0.6B, 27B) Q8_0 GGUF files include their tokenizer, so no separate download or `--frontend`
 is required. If both tokenizer files are beside the GGUF, they are used instead. An explicit
 `--frontend` takes precedence; keep it in the command when using a custom tokenizer.
 

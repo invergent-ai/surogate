@@ -71,6 +71,7 @@ TEXT_FLOAT_FIELDS = (
     "rms_epsilon",
     "indexer_norm_epsilon",
     "rope_theta",
+    "rope_frequency_scale",
     "embedding_scale",
     "logit_softcap",
     "sliding_rope_theta",

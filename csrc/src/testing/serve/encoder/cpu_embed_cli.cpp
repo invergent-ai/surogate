@@ -2,7 +2,7 @@
 //
 //   sinfer_cpu_embed_cli --artifact model.sinfer --text "..." [--threads N] [--repeat N]
 
-#include "encoder/cpu/cpu_gemma_embedding.h"
+#include "encoder/cpu/cpu_text_embedding.h"
 
 #include <charconv>
 #include <chrono>
@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
         if (artifact.empty()) { throw std::invalid_argument("--artifact is required"); }
 
         const auto began = std::chrono::steady_clock::now();
-        auto model = sinfer::encoder::cpu::CpuGemmaEmbedding::load(artifact, plan);
+        auto model = sinfer::encoder::cpu::CpuTextEmbedding::load(artifact, plan);
         const double load_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
         if (have_text) { tokens = model.tokenizer().encode(text); }

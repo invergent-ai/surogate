@@ -248,7 +248,8 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
                                            std::int32_t active_pairs, float theta,
                                            std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride, int height_pairs, int width_pairs) {
+                                           std::int64_t k_token_stride, int height_pairs, int width_pairs,
+                                           float frequency_scale) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -268,7 +269,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             sin_cache[pair] = 0.0F;
             continue;
         }
-        if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
+        if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F && frequency_scale == 1.0F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
         } else {
@@ -286,7 +287,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
                 : -2.0 * pair / rotary_dim;
             const double frequency = pow(static_cast<double>(theta), power);
             const double angle =
-                static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) * frequency;
+                static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) * frequency * frequency_scale;
             double sine, cosine;
             sincos(angle, &sine, &cosine);
             sin_cache[pair] = static_cast<float>(sine);

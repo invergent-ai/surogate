@@ -15,7 +15,7 @@ namespace sinfer::ops::detail {
 // Host entry; assumes inputs already validated by the wrapper.
 void encoder_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                               std::int32_t window, float scale, Tensor& out, void* workspace,
-                              cudaStream_t stream);
+                              cudaStream_t stream, std::int32_t kv_heads, bool causal);
 
 void encoder_attention_prewarm();
 

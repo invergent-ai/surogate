@@ -37,11 +37,13 @@ __device__ __forceinline__ float block_reduce(float value, float* shared, bool t
 /// `window` 0 admits every key; positive W admits abs(query - key) < W.
 __launch_bounds__(kEncoderSoftmaxBlock) __global__
     void encoder_softmax_kernel(const float* __restrict__ scores, __nv_bfloat16* __restrict__ probs,
-                                std::int32_t tokens, std::int32_t window, float scale) {
-    const std::int64_t matrix = static_cast<std::int64_t>(blockIdx.y) * tokens * tokens;
-    const std::int32_t query  = blockIdx.x;
-    const float* row          = scores + matrix + static_cast<std::int64_t>(query) * tokens;
-    __nv_bfloat16* out        = probs + matrix + static_cast<std::int64_t>(query) * tokens;
+                                std::int32_t tokens, std::int32_t queries,
+                                std::int32_t query_offset, std::int32_t key_offset,
+                                std::int32_t window, float scale, bool causal) {
+    const std::int64_t matrix = static_cast<std::int64_t>(blockIdx.y) * tokens * queries;
+    const std::int32_t query  = query_offset + blockIdx.x - key_offset;
+    const float* row          = scores + matrix + static_cast<std::int64_t>(blockIdx.x) * tokens;
+    __nv_bfloat16* out        = probs + matrix + static_cast<std::int64_t>(blockIdx.x) * tokens;
 
     __shared__ float shared[kEncoderSoftmaxBlock];
 
@@ -49,7 +51,8 @@ __launch_bounds__(kEncoderSoftmaxBlock) __global__
     // symmetric window, which is what bidirectional attention means -- not the
     // causal half-window.
     const std::int32_t lo = window > 0 ? max(0, query - window + 1) : 0;
-    const std::int32_t hi = window > 0 ? min(tokens, query + window) : tokens;
+    const std::int32_t hi = causal ? min(tokens, query + 1)
+                                   : window > 0 ? min(tokens, query + window) : tokens;
 
     float local_max = -FLT_MAX;
     for (std::int32_t key = lo + threadIdx.x; key < hi; key += kEncoderSoftmaxBlock) {

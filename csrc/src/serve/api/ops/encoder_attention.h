@@ -10,11 +10,11 @@
 namespace sinfer::ops {
 
 /**
- * Non-causal grouped-query attention over one whole sequence.
+ * Causal or bidirectional grouped-query attention over one sequence.
  *
  * An encoder has no KV cache and no decode step: every row attends every column
  * in a single pass, and the window -- when there is one -- is symmetric. For
- * `q_heads` query heads sharing one key/value head, head `h` and query position
+ * `q_heads` query heads sharing `kv_heads` key/value heads, head `h` and query position
  * `i`:
  *
  *   s[i, j] = scale * sum over d of q[h, d, i] * k[d, j]        for admitted j
@@ -30,13 +30,14 @@ namespace sinfer::ops {
  * that produced the published checkpoint's own numbers.
  *
  * `q` is a contiguous BF16 tensor [q_heads*head_dim, tokens]; `k` and `v` are
- * contiguous BF16 [head_dim, tokens], shared across the query heads. They are
+ * contiguous BF16 [kv_heads*head_dim, tokens], shared within each query group. They are
  * taken separately rather than as one fused projection because everything
  * upstream already holds them that way: per-head QK norm and rope both need a
  * contiguous operand, which a fused [q|k|v, tokens] matrix does not give.
  * `out` is contiguous BF16 [q_heads*head_dim, tokens].
  *
- * `workspace` holds the score matrix and must be at least
+ * With `causal=true`, keys after the query position are excluded, including in windowed layers.
+ * `workspace` holds a query tile's scores and must be at least
  * `encoder_attention_workspace_bytes(q_heads, tokens)`. It is scratch: its
  * contents before and after the call mean nothing.
  *
@@ -50,9 +51,11 @@ namespace sinfer::ops {
  */
 void encoder_attention(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t window,
                        float scale, Tensor& out, void* workspace, std::size_t workspace_bytes,
-                       cudaStream_t stream);
+                       cudaStream_t stream, std::int32_t kv_heads = 1, bool causal = false);
 
-/// Scratch bytes `encoder_attention` needs for one sequence of `tokens`.
+inline constexpr std::int32_t kEncoderAttentionQueryTile = 256;
+
+/// Scratch bytes for one query tile; memory grows linearly in the sequence length.
 std::size_t encoder_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tokens);
 
 /// Creates this device's cuBLASLt handle and workspace; call before stream capture.

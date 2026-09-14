@@ -206,7 +206,8 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
 }
 
 void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
-                    Tensor* q, Tensor* k, cudaStream_t stream, int height_pairs = -1, int width_pairs = -1) {
+                    Tensor* q, Tensor* k, cudaStream_t stream, int height_pairs = -1, int width_pairs = -1,
+                    float frequency_scale = 1.0F) {
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
@@ -215,7 +216,7 @@ void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, f
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
         active_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
-        token_stride(q), token_stride(k), height_pairs, width_pairs);
+        token_stride(q), token_stride(k), height_pairs, width_pairs, frequency_scale);
 }
 
 } // namespace
@@ -228,12 +229,12 @@ void rope_interleaved_launch(const Tensor& positions, int rotary_dim, float thet
 }
 
 void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
-                 Tensor& q, Tensor& k, cudaStream_t stream) {
+                 Tensor& q, Tensor& k, cudaStream_t stream, float frequency_scale) {
     // The fixed kernels rotate every pair of their rotation, so they serve only a rotation
     // with no inert tail. A partial one goes to the generic kernel, which reads both numbers.
-    const bool whole = active_pairs == rotary_dim / 2;
+    const bool whole = active_pairs == rotary_dim / 2 && frequency_scale == 1.0F;
     if (!whole || !launch_fixed_pair(positions, rotary_dim, theta, q, k, stream)) {
-        launch_generic(positions, rotary_dim, active_pairs, theta, &q, &k, stream);
+        launch_generic(positions, rotary_dim, active_pairs, theta, &q, &k, stream, -1, -1, frequency_scale);
     }
     CUDA_CHECK(cudaGetLastError());
 }

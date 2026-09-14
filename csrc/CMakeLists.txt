@@ -1392,10 +1392,11 @@ set(SINFER_ZENDNN_DIR "" CACHE PATH "ZenDNN install prefix (AMD Zen)")
 set(SINFER_ONEDNN_DIR "" CACHE PATH "oneDNN install prefix (Intel; what OpenVINO's CPU plugin uses)")
 
 add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
-  ${SERVE_ROOT}/encoder/gemma_embedding.cpp
+  ${SERVE_ROOT}/encoder/text_embedding.cpp
   ${SERVE_ROOT}/encoder/gemma_tokenizer.cpp
+  ${SERVE_ROOT}/encoder/embedding_tokenizer.cpp
   ${SERVE_ROOT}/encoder/cpu/cpu_ops.cpp
-  ${SERVE_ROOT}/encoder/cpu/cpu_gemma_embedding.cpp
+  ${SERVE_ROOT}/encoder/cpu/cpu_text_embedding.cpp
 )
 sinfer_internal_includes(sinfer_encoder)
 find_package(OpenMP REQUIRED)

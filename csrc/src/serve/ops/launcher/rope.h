@@ -14,7 +14,7 @@ void rope_interleaved_launch(const Tensor& positions, int rotary_dim, float thet
                              cudaStream_t stream);
 
 void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
-                 Tensor& q, Tensor& k, cudaStream_t stream);
+                 Tensor& q, Tensor& k, cudaStream_t stream, float frequency_scale);
 
 void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                         Tensor& x, cudaStream_t stream);

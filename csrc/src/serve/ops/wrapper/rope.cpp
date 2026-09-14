@@ -159,7 +159,10 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 }
 
 void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta, Tensor& q,
-          Tensor& k, cudaStream_t stream) {
+          Tensor& k, cudaStream_t stream, float frequency_scale) {
+    if (!std::isfinite(frequency_scale) || frequency_scale <= 0.0F) {
+        throw std::invalid_argument("rope: frequency_scale must be finite and positive");
+    }
     require_common(positions, rotary_dim, theta);
     require_active_pairs(active_pairs, rotary_dim);
     if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
@@ -181,7 +184,7 @@ void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta
     if (q.data == nullptr || k.data == nullptr) {
         throw std::invalid_argument("rope: q/k data must be non-null");
     }
-    detail::rope_launch(positions, rotary_dim, active_pairs, theta, q, k, stream);
+    detail::rope_launch(positions, rotary_dim, active_pairs, theta, q, k, stream, frequency_scale);
 }
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream) {

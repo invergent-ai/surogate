@@ -325,8 +325,29 @@ priorities affect waiting requests.
 
 ## Embedding model, CPU and GPU
 
-Start an embeddings server with `--embed`. EmbeddingGemma can run on an NVIDIA GPU or on an
-AVX-512-capable CPU.
+Start an embeddings server with `--embed`. EmbeddingGemma and Harrier Q8_0 GGUF models can run
+on an NVIDIA GPU or on an AVX-512-capable CPU.
+
+| Model | Embedding dimensions | Maximum tokens |
+|---|---:|---:|
+| EmbeddingGemma 300M | 768 | 2,048 |
+| Harrier OSS v1 270M | 640 | 32,768 |
+| Harrier OSS v1 0.6B | 1,024 | 32,768 |
+| Harrier OSS v1 27B | 5,376 | 32,768 |
+
+For example, start Harrier with:
+
+```bash
+surogate serve --embed ./models/harrier-oss-v1-0.6B-Q8_0.gguf --device 0
+```
+
+Harrier returns normalized embeddings. For retrieval, include a task instruction in query
+inputs, such as `Instruct: Find passages that answer the question\nQuery: What is the capital of France?`.
+Send document inputs as plain text. Instructions are supplied by the client; see the
+[Harrier model card](https://huggingface.co/microsoft/harrier-oss-v1-0.6b) for other tasks.
+
+The 27B Q8_0 model needs roughly 29 GB for GPU weights plus memory for the input. If a long
+input exceeds available GPU memory, shorten it or use `--device cpu` with sufficient system RAM.
 
 ### On GPU
 

@@ -16,6 +16,8 @@
 // The only translation unit that includes this op's kernel header.
 // See docs/op-development.md §2.
 #include "ops/launcher/encoder_attention.h"
+#include "api/ops/encoder_attention.h"
+#include <algorithm>
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/kernel/encoder_softmax.cuh"
@@ -129,48 +131,50 @@ void encoder_attention_prewarm() { (void)state_for_current_device(); }
 
 void encoder_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                               std::int32_t window, float scale, Tensor& out, void* workspace,
-                              cudaStream_t stream) {
-    const auto tokens         = static_cast<std::int32_t>(q.ne[1]);
-    const auto head_dim       = static_cast<std::int32_t>(k.ne[0]);
-    const auto q_rows         = static_cast<std::int64_t>(q.ne[0]);
-    const auto q_heads        = static_cast<std::int32_t>(q_rows / head_dim);
-    const auto out_rows       = q_rows;
-    const std::int64_t matrix = static_cast<std::int64_t>(tokens) * tokens;
-
+                              cudaStream_t stream, std::int32_t kv_heads, bool causal) {
+    const auto tokens = static_cast<std::int32_t>(q.ne[1]);
+    const auto head_dim = static_cast<std::int32_t>(k.ne[0] / kv_heads);
+    const auto q_rows = static_cast<std::int64_t>(q.ne[0]);
+    const auto kv_rows = static_cast<std::int64_t>(k.ne[0]);
+    const auto q_heads = static_cast<std::int32_t>(q_rows / head_dim);
+    const int group = q_heads / kv_heads;
+    // Batch one query head from every KV group, then advance within each group.
+    // Multi-query attention can batch all Q heads with a zero K/V batch stride.
+    const int batches = kv_heads == 1 ? q_heads : kv_heads;
+    const int passes = kv_heads == 1 ? 1 : group;
+    const int q_stride = kv_heads == 1 ? head_dim : group * head_dim;
+    const int kv_stride = kv_heads == 1 ? 0 : head_dim;
     const auto* q_data = static_cast<const __nv_bfloat16*>(q.data);
     const auto* k_data = static_cast<const __nv_bfloat16*>(k.data);
     const auto* v_data = static_cast<const __nv_bfloat16*>(v.data);
-
-    // Scores first (FP32), probabilities after them (BF16), in one scratch block.
+    auto* out_data = static_cast<__nv_bfloat16*>(out.data);
     auto* scores = static_cast<float*>(workspace);
-    auto* probs  = reinterpret_cast<__nv_bfloat16*>(scores + static_cast<std::size_t>(q_heads) *
-                                                                 matrix);
-
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);
-
-    {
-        // s[key, query] = K^T Q. A is the shared key head, so its batch stride is
-        // zero; Q advances one head per batch element.
-        const Desc desc(CUBLAS_OP_T, CUBLAS_OP_N);
-        const Layout la(CUDA_R_16BF, head_dim, tokens, head_dim, q_heads, 0);
-        const Layout lb(CUDA_R_16BF, head_dim, tokens, q_rows, q_heads, head_dim);
-        const Layout lc(CUDA_R_32F, tokens, tokens, tokens, q_heads, matrix);
-        matmul(state, desc, k_data, la, q_data, lb, scores, lc, stream);
-    }
-
-    const dim3 grid(static_cast<unsigned int>(tokens), static_cast<unsigned int>(q_heads));
-    encoder_softmax_kernel<<<grid, kEncoderSoftmaxBlock, 0, stream>>>(scores, probs, tokens,
-                                                                     window, scale);
-    CUDA_CHECK(cudaGetLastError());
-
-    {
-        // out[dim, query] = V P. V is shared across heads; P advances one matrix.
-        const Desc desc(CUBLAS_OP_N, CUBLAS_OP_N);
-        const Layout la(CUDA_R_16BF, head_dim, tokens, head_dim, q_heads, 0);
-        const Layout lb(CUDA_R_16BF, tokens, tokens, tokens, q_heads, matrix);
-        const Layout lc(CUDA_R_16BF, head_dim, tokens, out_rows, q_heads, head_dim);
-        matmul(state, desc, v_data, la, probs, lb, out.data, lc, stream);
+    for (int first = 0; first < tokens; first += kEncoderAttentionQueryTile) {
+        const int width = std::min(kEncoderAttentionQueryTile, tokens - first);
+        const int key_first = window > 0 ? std::max(0, first - window + 1) : 0;
+        const int key_end = causal ? first + width
+            : window > 0 ? std::min(tokens, first + width - 1 + window) : tokens;
+        const int keys = key_end - key_first;
+        const std::int64_t matrix = static_cast<std::int64_t>(keys) * width;
+        auto* probs = reinterpret_cast<__nv_bfloat16*>(scores + batches * matrix);
+        const Desc score_desc(CUBLAS_OP_T, CUBLAS_OP_N);
+        const Desc value_desc(CUBLAS_OP_N, CUBLAS_OP_N);
+        const Layout key_layout(CUDA_R_16BF, head_dim, keys, kv_rows, batches, kv_stride);
+        const Layout query_layout(CUDA_R_16BF, head_dim, width, q_rows, batches, q_stride);
+        const Layout score_layout(CUDA_R_32F, keys, width, keys, batches, matrix);
+        const Layout prob_layout(CUDA_R_16BF, keys, width, keys, batches, matrix);
+        for (int pass = 0; pass < passes; ++pass) {
+            const auto offset = static_cast<std::int64_t>(first) * q_rows + pass * head_dim;
+            matmul(state, score_desc, k_data + key_first * kv_rows, key_layout,
+                   q_data + offset, query_layout, scores, score_layout, stream);
+            encoder_softmax_kernel<<<dim3(width, batches), kEncoderSoftmaxBlock, 0, stream>>>(
+                scores, probs, keys, width, first, key_first, window, scale, causal);
+            CUDA_CHECK(cudaGetLastError());
+            matmul(state, value_desc, v_data + key_first * kv_rows, key_layout,
+                   probs, prob_layout, out_data + offset, query_layout, stream);
+        }
     }
 }
 

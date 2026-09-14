@@ -55,9 +55,10 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
  *
  * The inert pairs are an exact identity, not an approximation: cos 1 and sin 0 leave both
  * halves bit-for-bit unchanged.
+ * `frequency_scale` multiplies the phase; 1/factor implements linear RoPE scaling.
  */
 void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta, Tensor& q,
-          Tensor& k, cudaStream_t stream);
+          Tensor& k, cudaStream_t stream, float frequency_scale = 1.0F);
 
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.

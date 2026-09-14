@@ -112,6 +112,10 @@ def load_frontend(frontend_dir: Path) -> dict[str, bytes]:
 def convert(gguf: str | Path, frontend_dir: str | Path | None, out_path: str | Path) -> Path:
     started = time.perf_counter()
     source = GgufSource(Path(gguf))
+    if source.kv("gemma-embedding.pooling_type") == 3:
+        source.close()
+        from surogate.serve.convert.harrier.convert import convert as convert_harrier
+        return convert_harrier(gguf, frontend_dir, out_path)
     config = inventory.config_from_gguf(source)
     geometry = recipe.geometry_from_config(config)
     objects = inventory.declared_objects(geometry)

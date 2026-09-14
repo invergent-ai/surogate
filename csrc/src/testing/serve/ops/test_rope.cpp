@@ -36,6 +36,7 @@ struct Geometry {
     /// remaining 192 are left exactly as they were.
     int active_pairs = 0;
     std::array<int, 3> sections{};
+    float frequency_scale = 1.0F;
 };
 
 /// The pairs a geometry actually rotates.
@@ -113,7 +114,7 @@ std::vector<double> rope_oracle(const std::vector<float>& input, const std::vect
                 const double phase =
                     static_cast<double>(
                         positions[static_cast<std::size_t>(axis) * geometry.tokens + token]) *
-                    frequency;
+                    frequency * geometry.frequency_scale;
                 const double cosine  = std::cos(phase);
                 const double sine    = std::sin(phase);
                 const std::size_t lo = dense_index(geometry.head_dim, heads, token, head, pair);
@@ -285,7 +286,7 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
                               geometry.sections, q_tensor, k_tensor, nullptr);
     } else {
     ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta,
-              q_tensor, k_tensor, nullptr);
+              q_tensor, k_tensor, nullptr, geometry.frequency_scale);
     }
     cuda_synchronize();
 
@@ -443,6 +444,10 @@ int main() {
     }
 
     int failures = 0;
+
+    Geometry harrier{"Harrier 27B scaled RoPE", 128, 128, 1, 13, 1.0e6F};
+    harrier.frequency_scale = 0.125F;
+    failures += run_pair_case(harrier, 32, 16, 32000);
 
     // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
     failures += run_pair_case({"27b text decode", 256, 64, 1, 1, kTextTheta}, 24, 4, 31);

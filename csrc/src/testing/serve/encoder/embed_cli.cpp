@@ -7,7 +7,7 @@
 //   sinfer_embed_cli --artifact model.sinfer --text "some text" [--print-ids]
 
 #include "core/device.h"
-#include "encoder/gemma_embedding.h"
+#include "encoder/text_embedding.h"
 
 #include <charconv>
 #include <cstdio>
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
         }
 
         sinfer::DeviceContext device(0);
-        auto model = sinfer::encoder::GemmaEmbedding::load(artifact, device);
+        auto model = sinfer::encoder::TextEmbedding::load(artifact, device);
         if (have_text) { tokens = model.tokenizer().encode(text); }
         if (print_ids) {
             std::printf("[");

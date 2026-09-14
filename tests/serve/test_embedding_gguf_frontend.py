@@ -58,7 +58,7 @@ def test_encoder_uses_gguf_without_sidecars_and_tracks_overrides(tmp_path, monke
     gguf = tmp_path / "model.gguf"
     gguf.write_bytes(b"weights fixture")
     monkeypatch.setenv("SUROGATE_SERVE_CACHE", str(tmp_path / "cache"))
-    monkeypatch.setattr(ingest, "_gguf_architecture", lambda _: "gemma-embedding")
+    monkeypatch.setattr(ingest, "_encoder_architecture", lambda _: "gemma-embedding")
     commands = []
 
     def convert(command, **kwargs):
@@ -90,7 +90,7 @@ def test_failed_conversion_does_not_leave_a_reusable_cache(tmp_path, monkeypatch
     gguf.write_bytes(b"weights fixture")
     cache = tmp_path / "cache"
     monkeypatch.setenv("SUROGATE_SERVE_CACHE", str(cache))
-    monkeypatch.setattr(ingest, "_gguf_architecture", lambda _: "gemma-embedding")
+    monkeypatch.setattr(ingest, "_encoder_architecture", lambda _: "gemma-embedding")
 
     def fail(command, **kwargs):
         Path(command[command.index("--out") + 1]).write_bytes(b"incomplete")

@@ -670,6 +670,8 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
 # frontend is a tokenizer and nothing else.
 
 ENCODER_TARGETS = {
+    "qwen3": ("qwen3_embedding", "surogate.serve.convert.harrier.convert", "Harrier Qwen3"),
+    "gemma3": ("gemma3_embedding", "surogate.serve.convert.harrier.convert", "Harrier Gemma3"),
     # gguf architecture string -> (cache key, converter module, display)
     "gemma-embedding": ("gemma_embedding",
                         "surogate.serve.convert.gemma_embedding.convert",
@@ -680,17 +682,15 @@ ENCODER_TARGETS = {
 ENCODER_FRONTEND_FILES = ("tokenizer.model", "tokenizer_config.json")
 
 
-def _gguf_architecture(path: Path) -> str | None:
-    """The GGUF's `general.architecture`, read through the same bridge the
-    generative path uses. Costs a full KV parse, so callers check the cache
-    first."""
+def _encoder_architecture(path: Path) -> str | None:
+    """Resolve the encoder family, including Gemma exports marked by their pooling mode."""
     from surogate.serve.gguf import bridge as serve_gguf
 
-    try:
-        reader = serve_gguf.open_gguf(path)
-        return serve_gguf.read_gguf_summary(path, reader)["architecture"]
-    except Exception:
-        return None
+    with serve_gguf.open_gguf(path) as reader:
+        architecture = reader.kv("general.architecture")
+        if architecture == "gemma-embedding" and reader.kv("gemma-embedding.pooling_type") == 3:
+            return "gemma3"
+        return architecture
 
 
 def _encoder_frontend(gguf_path: Path, frontend: str | None) -> Path | None:
@@ -722,11 +722,11 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
         raise SystemExit(
             f"surogate serve --embed: cannot interpret '{spec}'. The registered encoder "
             "converter is GGUF-native, so pass a .gguf file (or an already-converted "
-            "artifact).\n  Registered today: EmbeddingGemma (gemma-embedding)."
+            "artifact).\n  Registered today: EmbeddingGemma and Harrier (270M, 0.6B, 27B)."
         )
 
     gguf_path = Path(spec).expanduser().resolve()
-    architecture = _gguf_architecture(gguf_path)
+    architecture = _encoder_architecture(gguf_path)
     target = ENCODER_TARGETS.get(architecture or "")
     if target is None:
         raise SystemExit(

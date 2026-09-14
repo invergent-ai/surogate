@@ -121,6 +121,7 @@ struct TextGeometry {
     float swiglu_limit                = 0.0F;
     float rms_epsilon               = 0.0F;
     float rope_theta                = 0.0F;
+    float rope_frequency_scale      = 1.0F;
     /// What the embedding lookup is multiplied by before the first block, where a family
     /// scales it. Gemma's is `sqrt(hidden)` rounded to bf16 as the reference rounds it, which
     /// is 62.0 at hidden 3840 and 73.5 at 5376 -- so a target serving two sizes cannot compile

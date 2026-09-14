@@ -126,7 +126,7 @@ void rmsnorm(const float* x, const float* weight, float epsilon, bool unit_offse
 class RopeTable {
 public:
     RopeTable() = default;
-    RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta);
+    RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta, float frequency_scale = 1.0F);
 
     [[nodiscard]] const float* cosines(std::int32_t position) const noexcept;
     [[nodiscard]] const float* sines(std::int32_t position) const noexcept;
@@ -147,7 +147,8 @@ void rope(float* x, const std::int32_t* positions, std::int32_t head_dim, std::i
 /// the same BF16 x BF16 kernel the projections use. Scores and output stay FP32.
 void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v, float* out,
                std::int32_t q_heads, std::int32_t head_dim, std::int32_t tokens,
-               std::int32_t window, float scale, float* scratch, ThreadPool& pool);
+               std::int32_t window, float scale, float* scratch, ThreadPool& pool,
+               std::int32_t kv_heads = 1, bool causal = false);
 
 /// The gate projection with gelu_tanh and the gating multiply fused into it:
 /// out = gelu_tanh(w . x) * up. Returns false when no backend can fuse, leaving
@@ -162,6 +163,8 @@ void narrow(const float* x, std::uint16_t* out, std::int64_t count, ThreadPool& 
 
 /// out = gelu_tanh(gate) * up, elementwise.
 void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count,
+              ThreadPool& pool);
+void silu_mul(const float* gate, const float* up, float* out, std::int64_t count,
               ThreadPool& pool);
 
 /// x += y, elementwise.

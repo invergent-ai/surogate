@@ -6,7 +6,7 @@
 #include <api/targets/qwen4exp/package.h>
 #include <api/targets/glm5_next/package.h>
 #include "artifact_fixture.h"
-#include "encoder/gemma_embedding.h"
+#include "encoder/text_embedding.h"
 
 #include <cassert>
 #include <stdexcept>
@@ -45,7 +45,7 @@ void check_encoder() {
     };
     auto fixture = sinfer::test::artifact_fixture::write_fixture(directory, "checkpoint_encoder");
     const sinfer::artifact::Reader reader(fixture.path);
-    const auto config = sinfer::encoder::GemmaEmbeddingConfig::from_artifact(reader);
+    const auto config = sinfer::encoder::TextEmbeddingConfig::from_artifact(reader);
     assert(config.hidden == 384 && config.layers == 3 && config.head_dim == 64);
     assert(config.query_size() == 256 && config.intermediate == 768);
     assert(config.max_tokens == 4096 && config.rms_epsilon == 1e-5F);

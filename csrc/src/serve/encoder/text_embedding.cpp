@@ -1,5 +1,5 @@
 #include "encoder/embedding_input.h"
-#include "encoder/gemma_embedding.h"
+#include "encoder/text_embedding.h"
 
 #include "api/ops/cast.h"
 #include "api/ops/embedding.h"
@@ -13,8 +13,9 @@
 #include "api/ops/rmsnorm.h"
 #include "api/ops/rope.h"
 #include "api/ops/scale.h"
+#include "api/ops/silu_mul.h"
 #include "artifact/binder.h"
-#include "encoder/gemma_tokenizer.h"
+#include "encoder/embedding_tokenizer.h"
 #include "artifact/typed_binding.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
@@ -53,8 +54,8 @@ struct LayerWeights {
 
 } // namespace
 
-struct GemmaEmbedding::Impl {
-    GemmaEmbeddingConfig config;
+struct TextEmbedding::Impl {
+    TextEmbeddingConfig config;
     DeviceContext* device = nullptr;
 
     std::unique_ptr<artifact::Reader> reader;
@@ -68,10 +69,11 @@ struct GemmaEmbedding::Impl {
     // Scratch. Sized once for max_tokens and reused; an encoder request is one
     // forward, so nothing has to survive between calls.
     std::unique_ptr<DeviceArena> arena;
+    std::int32_t arena_tokens = 0;
     std::unique_ptr<DeviceBuffer> attention_workspace;
     std::size_t attention_workspace_bytes = 0;
     std::unique_ptr<DeviceBuffer> positions;
-    std::unique_ptr<GemmaTokenizer> tokenizer;
+    std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
         return artifact::materialized_tensor(materialized, handle, NumericFormat::BF16, {width});
@@ -83,28 +85,28 @@ struct GemmaEmbedding::Impl {
     }
 };
 
-GemmaEmbedding::GemmaEmbedding() : impl_(std::make_unique<Impl>()) {}
-GemmaEmbedding::~GemmaEmbedding()                                  = default;
-GemmaEmbedding::GemmaEmbedding(GemmaEmbedding&&) noexcept          = default;
-GemmaEmbedding& GemmaEmbedding::operator=(GemmaEmbedding&&) noexcept = default;
+TextEmbedding::TextEmbedding() : impl_(std::make_unique<Impl>()) {}
+TextEmbedding::~TextEmbedding()                                  = default;
+TextEmbedding::TextEmbedding(TextEmbedding&&) noexcept          = default;
+TextEmbedding& TextEmbedding::operator=(TextEmbedding&&) noexcept = default;
 
-const GemmaEmbeddingConfig& GemmaEmbedding::config() const noexcept { return impl_->config; }
+const TextEmbeddingConfig& TextEmbedding::config() const noexcept { return impl_->config; }
 
-const GemmaTokenizer& GemmaEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
+const EmbeddingTokenizer& TextEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
 
-std::uint64_t GemmaEmbedding::weight_bytes() const noexcept {
+std::uint64_t TextEmbedding::weight_bytes() const noexcept {
     return impl_->materialized.stats().device_capacity_bytes;
 }
 
-GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceContext& device) {
+TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceContext& device) {
     const ScopedDevice device_scope(device.device);
-    GemmaEmbedding model;
+    TextEmbedding model;
     Impl& impl = *model.impl_;
     impl.device = &device;
     impl.reader = std::make_unique<artifact::Reader>(path);
-    impl.config = GemmaEmbeddingConfig::from_artifact(*impl.reader);
+    impl.config = TextEmbeddingConfig::from_artifact(*impl.reader);
 
-    const GemmaEmbeddingConfig& config = impl.config;
+    const TextEmbeddingConfig& config = impl.config;
     const auto hidden       = static_cast<std::uint64_t>(config.hidden);
     const auto head_dim     = static_cast<std::uint64_t>(config.head_dim);
     const auto query_size   = static_cast<std::uint64_t>(config.query_size());
@@ -128,12 +130,12 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
                                                 {rows, columns});
         };
         weights.input_norm            = bind_norm("input_norm", hidden);
-        weights.post_attention_norm   = bind_norm("post_attention_norm", hidden);
+        if (config.gemma) { weights.post_attention_norm = bind_norm("post_attention_norm", hidden); }
         weights.pre_feedforward_norm  = bind_norm("pre_feedforward_norm", hidden);
-        weights.post_feedforward_norm = bind_norm("post_feedforward_norm", hidden);
+        if (config.gemma) { weights.post_feedforward_norm = bind_norm("post_feedforward_norm", hidden); }
         weights.query                 = bind_matrix("attention/query", query_size, hidden);
-        weights.key                   = bind_matrix("attention/key", head_dim, hidden);
-        weights.value                 = bind_matrix("attention/value", head_dim, hidden);
+        weights.key                   = bind_matrix("attention/key", config.kv_size(), hidden);
+        weights.value                 = bind_matrix("attention/value", config.kv_size(), hidden);
         weights.query_norm            = bind_norm("attention/query_norm", head_dim);
         weights.key_norm              = bind_norm("attention/key_norm", head_dim);
         weights.output                = bind_matrix("attention/output", hidden, query_size);
@@ -142,37 +144,15 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
         weights.down                  = bind_matrix("mlp/down", hidden, intermediate);
     }
     impl.final_norm     = artifact::bind_device_tensor(binder, "text/final_norm", bf, {hidden});
-    impl.embedding_head = artifact::bind_device_tensor(binder, "text/embedding_head", bf,
-                                                       {hidden, hidden});
-    const auto tokenizer_model = artifact::bind_raw_resource(binder, "frontend/tokenizer.model");
-    (void)artifact::bind_raw_resource(binder, "frontend/tokenizer_config.json");
-
+    if (config.mean_pooling) {
+        impl.embedding_head = artifact::bind_device_tensor(binder, "text/embedding_head", bf, {hidden, hidden});
+    }
+    for (const char* resource : {"frontend/tokenizer.model", "frontend/tokenizer.json",
+                                "frontend/tokenizer_config.json", "frontend/generation_config.json"}) {
+        if (impl.reader->find(resource)) { (void)artifact::bind_raw_resource(binder, resource); }
+    }
+    impl.tokenizer = std::make_unique<EmbeddingTokenizer>(EmbeddingTokenizer::from_artifact(*impl.reader));
     impl.materialized = artifact::materialize(*impl.reader, binder.finish(), device);
-    impl.tokenizer = std::make_unique<GemmaTokenizer>(GemmaTokenizer::from_serialized_proto(
-        impl.materialized.resource_bytes(tokenizer_model)));
-
-    // Scratch for the widest request. Named for what they hold rather than
-    // sized by trial: hidden-wide activations, one intermediate-wide pair for
-    // the MLP, and q/k/v.
-    const auto tokens  = static_cast<std::size_t>(config.max_batch_tokens);
-    const std::size_t bf16 = sizeof(std::uint16_t);
-    const std::size_t arena_bytes =
-        bf16 * tokens *
-            (3 * static_cast<std::size_t>(config.hidden) +      // x, h, attn
-             2 * static_cast<std::size_t>(config.intermediate) + // gate, up
-             2 * static_cast<std::size_t>(config.query_size()) + // query, attn_out
-             2 * static_cast<std::size_t>(config.head_dim)) +   // key, value
-        // One pooled FP32 column, pooled BF16 column and projected BF16 column
-        // per sequence. A batch can contain one sequence per token.
-        (sizeof(float) + bf16 * 2) * static_cast<std::size_t>(config.hidden) * tokens + (1u << 20);
-    impl.arena = std::make_unique<DeviceArena>(arena_bytes);
-
-    // Attention is per-sequence, so the score matrix is sized by the longest
-    // single sequence rather than by the batch.
-    impl.attention_workspace_bytes =
-        ops::encoder_attention_workspace_bytes(config.query_heads, config.max_tokens);
-    impl.attention_workspace = std::make_unique<DeviceBuffer>(impl.attention_workspace_bytes);
-    impl.positions = std::make_unique<DeviceBuffer>(tokens * sizeof(std::int32_t));
 
     ops::encoder_attention_prewarm();
     ops::detail::bf16_cublaslt_prewarm();
@@ -180,13 +160,13 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
     return model;
 }
 
-std::vector<float> GemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
+std::vector<float> TextEmbedding::embed(std::span<const std::int32_t> tokens) {
     std::vector<std::vector<std::int32_t>> one{
         std::vector<std::int32_t>(tokens.begin(), tokens.end())};
     return embed_batch(one).front();
 }
 
-std::vector<std::vector<float>> GemmaEmbedding::embed_batch(
+std::vector<std::vector<float>> TextEmbedding::embed_batch(
     const std::vector<std::vector<std::int32_t>>& sequences) {
     // The HTTP model worker is a different thread from the loader. CUDA device
     // selection is thread-local; bind it before allocating IDs or launching kernels.
@@ -220,10 +200,10 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_batch(
     return out;
 }
 
-std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
+std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     const std::vector<std::vector<std::int32_t>>& sequences) {
     Impl& impl                         = *impl_;
-    const GemmaEmbeddingConfig& config = impl.config;
+    const TextEmbeddingConfig& config = impl.config;
     if (sequences.empty()) { return {}; }
 
     std::vector<std::int32_t> flat;
@@ -255,6 +235,29 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
     const auto batch    = static_cast<std::int32_t>(sequences.size());
     cudaStream_t stream = impl.device->stream;
 
+    const auto longest = *std::max_element(lengths.begin(), lengths.end());
+    const auto attention_bytes = ops::encoder_attention_workspace_bytes(config.query_heads, longest);
+    if (total > impl.arena_tokens || attention_bytes > impl.attention_workspace_bytes) {
+        const auto capacity = std::max(total, impl.arena_tokens);
+        const auto scratch_bytes = std::max(attention_bytes, impl.attention_workspace_bytes);
+        const std::size_t arena_bytes = sizeof(std::uint16_t) * static_cast<std::size_t>(capacity) *
+            (7ULL * config.hidden + 2ULL * config.intermediate + 2ULL * config.query_size() +
+             2ULL * config.kv_size()) + (1u << 20);
+        // Release obsolete scratch before growing it. A long request must get a
+        // recoverable error if its working set cannot fit beside the model.
+        impl.arena.reset(); impl.positions.reset(); impl.attention_workspace.reset();
+        impl.arena_tokens = 0; impl.attention_workspace_bytes = 0;
+        std::size_t free = 0, bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &bytes));
+        if (arena_bytes + scratch_bytes + static_cast<std::size_t>(capacity) * 8 + (64u << 20) > free) {
+            throw std::runtime_error("embedding request does not fit GPU memory; shorten the input or use --device cpu");
+        }
+        impl.arena = std::make_unique<DeviceArena>(arena_bytes);
+        impl.positions = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(capacity) * sizeof(std::int32_t));
+        impl.attention_workspace = std::make_unique<DeviceBuffer>(scratch_bytes);
+        impl.arena_tokens = capacity;
+        impl.attention_workspace_bytes = scratch_bytes;
+    }
     DeviceArena& arena = *impl.arena;
     arena.reset();
 
@@ -272,8 +275,8 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
     Tensor h        = arena.alloc(DType::BF16, {config.hidden, total});
     Tensor attn     = arena.alloc(DType::BF16, {config.hidden, total});
     Tensor query    = arena.alloc(DType::BF16, {config.query_size(), total});
-    Tensor key      = arena.alloc(DType::BF16, {config.head_dim, total});
-    Tensor value    = arena.alloc(DType::BF16, {config.head_dim, total});
+    Tensor key      = arena.alloc(DType::BF16, {config.kv_size(), total});
+    Tensor value    = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor attn_out = arena.alloc(DType::BF16, {config.query_size(), total});
     Tensor gate     = arena.alloc(DType::BF16, {config.intermediate, total});
     Tensor up       = arena.alloc(DType::BF16, {config.intermediate, total});
@@ -295,26 +298,27 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
         // Every projection runs once over the whole batch: the sequences are
         // adjacent columns and a GEMM does not care where one ends.
         ops::rmsnorm(x, impl.norm(w.input_norm, config.hidden), config.rms_epsilon,
-                     /*unit_offset*/ true, h, stream);
+                     /*unit_offset*/ config.gemma, h, stream);
         ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
-                                    {impl.matrix(w.key, config.head_dim, config.hidden), key},
-                                    {impl.matrix(w.value, config.head_dim, config.hidden), value}}, nullptr, stream);
+                                    {impl.matrix(w.key, config.kv_size(), config.hidden), key},
+                                    {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
 
         // Per-head QK norm: each head's features are contiguous, so the
         // [head_dim, heads * tokens] view is exactly the rows rmsnorm reduces
         // over -- and it does not care about sequence boundaries either.
         Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * total});
-        Tensor key_heads(key.data, DType::BF16, {config.head_dim, total});
+        Tensor key_heads(key.data, DType::BF16, {config.head_dim, config.kv_heads * total});
         ops::rmsnorm(query_heads, impl.norm(w.query_norm, config.head_dim), config.rms_epsilon,
-                     true, query_heads, stream);
-        ops::rmsnorm(key_heads, impl.norm(w.key_norm, config.head_dim), config.rms_epsilon, true,
+                     config.gemma, query_heads, stream);
+        ops::rmsnorm(key_heads, impl.norm(w.key_norm, config.head_dim), config.rms_epsilon, config.gemma,
                      key_heads, stream);
 
         // rope reads its position per column, and positions restart per
         // sequence, so this too runs once for the batch.
         Tensor query_rope(query.data, DType::BF16, {config.head_dim, config.query_heads, total});
-        Tensor key_rope(key.data, DType::BF16, {config.head_dim, 1, total});
-        ops::rope(position_tensor, config.head_dim, theta, query_rope, key_rope, stream);
+        Tensor key_rope(key.data, DType::BF16, {config.head_dim, config.kv_heads, total});
+        ops::rope(position_tensor, config.head_dim, config.head_dim / 2, theta, query_rope, key_rope, stream,
+                  global ? config.rope_frequency_scale : 1.0F);
 
         // Attention is the one step that must not cross a boundary.
         for (std::int32_t index = 0; index < batch; ++index) {
@@ -326,29 +330,34 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
             Tensor out_slice          = attn_out.slice(1, offset, length);
             ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
                                    out_slice, impl.attention_workspace->p,
-                                   impl.attention_workspace_bytes, stream);
+                                   impl.attention_workspace_bytes, stream, config.kv_heads, !config.mean_pooling);
         }
 
         ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
                     stream);
-        ops::rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden), config.rms_epsilon,
-                     true, attn, stream);
+        if (config.gemma) {
+            ops::rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden), config.rms_epsilon,
+                         true, attn, stream);
+        }
         ops::residual_add(attn, x, stream); // x += attn
 
         // --- MLP, between the other two ------------------------------------
-        ops::rmsnorm(x, impl.norm(w.pre_feedforward_norm, config.hidden), config.rms_epsilon, true,
+        ops::rmsnorm(x, impl.norm(w.pre_feedforward_norm, config.hidden), config.rms_epsilon, config.gemma,
                      h, stream);
         ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
                                     {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
         // gelu_pytorch_tanh, per the checkpoint's hidden_activation.
-        ops::gelu_mul(gate, up, ops::GeluMode::Tanh, gate, stream);
+        if (config.gemma) { ops::gelu_mul(gate, up, ops::GeluMode::Tanh, gate, stream); }
+        else { ops::silu_mul(gate, up, gate, stream); }
         ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
-        ops::rmsnorm(attn, impl.norm(w.post_feedforward_norm, config.hidden), config.rms_epsilon,
-                     true, attn, stream);
+        if (config.gemma) {
+            ops::rmsnorm(attn, impl.norm(w.post_feedforward_norm, config.hidden), config.rms_epsilon,
+                         true, attn, stream);
+        }
         ops::residual_add(attn, x, stream);
     }
 
-    ops::rmsnorm(x, impl.norm(impl.final_norm, config.hidden), config.rms_epsilon, true, h,
+    ops::rmsnorm(x, impl.norm(impl.final_norm, config.hidden), config.rms_epsilon, config.gemma, h,
                  stream);
 
     // --- pool, project, normalise -------------------------------------------
@@ -362,20 +371,23 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
         const Tensor columns      = h.slice(1, offset, length);
         Tensor slot               = pooled_f32.slice(1, index, 1);
         Tensor slot_1d(slot.data, DType::FP32, {config.hidden});
-        ops::mean_pool(columns, length, /*accumulate*/ false, slot_1d, stream);
+        ops::mean_pool(config.mean_pooling ? columns : columns.slice(1, length - 1, 1),
+                       config.mean_pooling ? length : 1, false, slot_1d, stream);
     }
     ops::cast_fp32_to_bf16(pooled_f32, pooled, stream);
 
     // The head is one [hidden, hidden] matrix: the checkpoint's two Dense modules
     // composed at conversion, which they may be because both declare Identity.
     Tensor projected = arena.alloc(DType::BF16, {config.hidden, batch});
-    ops::detail::bf16_cublaslt_prepare(config.hidden, config.hidden, batch);
-    ops::detail::bf16_cublaslt_gemm(
-        artifact::materialized_weight(impl.materialized, impl.embedding_head, NumericFormat::BF16,
-                                      config.hidden, config.hidden),
-        pooled, projected, stream);
+    if (config.mean_pooling) {
+        ops::detail::bf16_cublaslt_prepare(config.hidden, config.hidden, batch);
+        ops::detail::bf16_cublaslt_gemm(
+            artifact::materialized_weight(impl.materialized, impl.embedding_head, NumericFormat::BF16,
+                                          config.hidden, config.hidden),
+            pooled, projected, stream);
+    } else { projected = pooled; }
     // l2norm reduces over ne[0], which is the hidden axis: one call for all of them.
-    ops::l2norm(projected, 1.0e-12F, projected, stream);
+    if (config.mean_pooling) { ops::l2norm(projected, 1.0e-12F, projected, stream); }
 
     const auto elements = static_cast<std::size_t>(config.hidden) * batch;
     std::vector<std::uint16_t> host(elements);
@@ -395,6 +407,12 @@ std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
             float value = 0.0F;
             std::memcpy(&value, &word, sizeof(value));
             vector[static_cast<std::size_t>(d)] = value;
+        }
+        if (!config.mean_pooling) {
+            double sum = 0.0;
+            for (float value : vector) { sum += static_cast<double>(value) * value; }
+            const double inverse = 1.0 / std::max(std::sqrt(sum), 1.0e-12);
+            for (float& value : vector) { value = static_cast<float>(value * inverse); }
         }
     }
     return out;

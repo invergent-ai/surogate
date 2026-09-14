@@ -33,6 +33,8 @@ struct Case {
     std::int32_t head_dim;
     std::int32_t tokens;
     std::int32_t window; // 0 = global
+    std::int32_t kv_heads = 1;
+    bool causal = false;
 };
 
 /// The op's contract, in double: softmax over the admitted band, then P V.
@@ -48,14 +50,14 @@ std::vector<double> oracle(const std::vector<float>& q, const std::vector<float>
             const std::int32_t lo =
                 shape.window > 0 ? std::max(0, query - shape.window + 1) : 0;
             const std::int32_t hi =
-                shape.window > 0 ? std::min(shape.tokens, query + shape.window) : shape.tokens;
+                shape.causal ? query + 1 : shape.window > 0 ? std::min(shape.tokens, query + shape.window) : shape.tokens;
 
             double maximum = -std::numeric_limits<double>::infinity();
             for (std::int32_t key = lo; key < hi; ++key) {
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < shape.head_dim; ++d) {
                     dot += static_cast<double>(q[query * out_rows + head * shape.head_dim + d]) *
-                           static_cast<double>(k[key * shape.head_dim + d]);
+                           static_cast<double>(k[(key * shape.kv_heads + head / (shape.q_heads / shape.kv_heads)) * shape.head_dim + d]);
                 }
                 probability[key] = dot * scale;
                 maximum          = std::max(maximum, probability[key]);
@@ -69,7 +71,7 @@ std::vector<double> oracle(const std::vector<float>& q, const std::vector<float>
                 double accumulated = 0.0;
                 for (std::int32_t key = lo; key < hi; ++key) {
                     accumulated += probability[key] *
-                                   static_cast<double>(v[key * shape.head_dim + d]);
+                                   static_cast<double>(v[(key * shape.kv_heads + head / (shape.q_heads / shape.kv_heads)) * shape.head_dim + d]);
                 }
                 out[static_cast<std::size_t>(query) * out_rows + head * shape.head_dim + d] =
                     accumulated / sum;
@@ -82,7 +84,7 @@ std::vector<double> oracle(const std::vector<float>& q, const std::vector<float>
 int run(const Case& shape, std::uint32_t seed) {
     const std::int64_t out_rows = static_cast<std::int64_t>(shape.q_heads) * shape.head_dim;
     const auto q_elements       = static_cast<std::size_t>(out_rows) * shape.tokens;
-    const auto kv_elements      = static_cast<std::size_t>(shape.head_dim) * shape.tokens;
+    const auto kv_elements      = static_cast<std::size_t>(shape.head_dim) * shape.kv_heads * shape.tokens;
     const auto out_elements     = q_elements;
     const float scale = 1.0F / std::sqrt(static_cast<float>(shape.head_dim));
 
@@ -107,14 +109,14 @@ int run(const Case& shape, std::uint32_t seed) {
     DeviceBuffer workspace(workspace_bytes);
 
     Tensor tq(device_q.p, DType::BF16, {out_rows, shape.tokens});
-    Tensor tk(device_k.p, DType::BF16, {shape.head_dim, shape.tokens});
-    Tensor tv(device_v.p, DType::BF16, {shape.head_dim, shape.tokens});
+    Tensor tk(device_k.p, DType::BF16, {shape.head_dim * shape.kv_heads, shape.tokens});
+    Tensor tv(device_v.p, DType::BF16, {shape.head_dim * shape.kv_heads, shape.tokens});
     Tensor output(device_out.p, DType::BF16, {out_rows, shape.tokens});
 
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     ops::encoder_attention(tq, tk, tv, shape.window, scale, output, workspace.p, workspace_bytes,
-                           stream);
+                           stream, shape.kv_heads, shape.causal);
     cuda_synchronize(stream);
     cuda_check(cudaStreamDestroy(stream), "stream destroy");
 
@@ -146,6 +148,13 @@ int main() {
     // More than one key head is not this op's shape, but more query heads is.
     failures += run({"8 heads t=128", 8, 128, 128, 0}, 14);
 
+    failures += run({"Harrier Qwen GQA causal", 16, 128, 273, 0, 8, true}, 21);
+    failures += run({"Harrier Gemma GQA window", 32, 128, 73, 17, 16, true}, 22);
+    failures += run({"causal window across tile", 4, 32, 513, 37, 2, true}, 23);
+    if (ops::encoder_attention_workspace_bytes(32, 32768) > (2ULL << 30)) {
+        std::cerr << "attention scratch grew quadratically\n";
+        ++failures;
+    }
     if (failures != 0) {
         std::cerr << "encoder_attention: " << failures << " case(s) failed\n";
         return 1;

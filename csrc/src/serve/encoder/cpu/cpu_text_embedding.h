@@ -1,8 +1,8 @@
 #pragma once
 
-// The EmbeddingGemma encoder on host cores.
+// Gemma and Qwen text embedding backbones on host cores.
 //
-// The same graph as the GPU path in encoder/gemma_embedding.cpp, over the
+// The same graph as the GPU path in encoder/text_embedding.cpp, over the
 // kernels in cpu/cpu_ops.h, reading the same artifact. It is a separate
 // implementation rather than a backend behind a virtual interface because the
 // two differ in more than their arithmetic: the GPU binds quantised `Weight`
@@ -15,8 +15,8 @@
 // quantised kernels would have to come back.
 
 #include "encoder/cpu/cpu_ops.h"
-#include "encoder/gemma_embedding.h" // GemmaEmbeddingConfig
-#include "encoder/gemma_tokenizer.h"
+#include "encoder/text_embedding.h" // TextEmbeddingConfig
+#include "encoder/embedding_tokenizer.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -26,30 +26,30 @@
 
 namespace sinfer::encoder::cpu {
 
-class CpuGemmaEmbedding {
+class CpuTextEmbedding {
 public:
     /// Reads the artifact and decodes every weight to FP32. `plan` defaults to
     /// the physical cores of one NUMA node; see ThreadPlan.
-    static CpuGemmaEmbedding load(const std::filesystem::path& artifact, ThreadPlan plan = {});
+    static CpuTextEmbedding load(const std::filesystem::path& artifact, ThreadPlan plan = {});
 
-    ~CpuGemmaEmbedding();
-    CpuGemmaEmbedding(CpuGemmaEmbedding&&) noexcept;
-    CpuGemmaEmbedding& operator=(CpuGemmaEmbedding&&) noexcept;
-    CpuGemmaEmbedding(const CpuGemmaEmbedding&)            = delete;
-    CpuGemmaEmbedding& operator=(const CpuGemmaEmbedding&) = delete;
+    ~CpuTextEmbedding();
+    CpuTextEmbedding(CpuTextEmbedding&&) noexcept;
+    CpuTextEmbedding& operator=(CpuTextEmbedding&&) noexcept;
+    CpuTextEmbedding(const CpuTextEmbedding&)            = delete;
+    CpuTextEmbedding& operator=(const CpuTextEmbedding&) = delete;
 
     [[nodiscard]] std::vector<float> embed(std::span<const std::int32_t> tokens);
     [[nodiscard]] std::vector<std::vector<float>> embed_batch(
         const std::vector<std::vector<std::int32_t>>& sequences);
 
-    [[nodiscard]] const GemmaEmbeddingConfig& config() const noexcept;
-    [[nodiscard]] const GemmaTokenizer& tokenizer() const noexcept;
+    [[nodiscard]] const TextEmbeddingConfig& config() const noexcept;
+    [[nodiscard]] const EmbeddingTokenizer& tokenizer() const noexcept;
     /// Bytes of host memory the decoded weights occupy.
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;
     [[nodiscard]] int threads() const noexcept;
 
 private:
-    CpuGemmaEmbedding();
+    CpuTextEmbedding();
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -736,7 +736,7 @@ void rmsnorm(const float* x, const float* weight, float epsilon, bool unit_offse
     });
 }
 
-RopeTable::RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta)
+RopeTable::RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta, float frequency_scale)
     : half_(head_dim / 2),
       cos_(static_cast<std::size_t>(max_tokens) * (head_dim / 2)),
       sin_(static_cast<std::size_t>(max_tokens) * (head_dim / 2)) {
@@ -745,7 +745,7 @@ RopeTable::RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta
             const double inverse =
                 std::pow(static_cast<double>(theta),
                          -2.0 * static_cast<double>(i) / static_cast<double>(head_dim));
-            const double angle = static_cast<double>(position) * inverse;
+            const double angle = static_cast<double>(position) * inverse * frequency_scale;
             const std::size_t at = static_cast<std::size_t>(position) * half_ + i;
             cos_[at] = static_cast<float>(std::cos(angle));
             sin_[at] = static_cast<float>(std::sin(angle));
@@ -879,16 +879,19 @@ std::size_t attention_scratch(std::int32_t q_heads, std::int32_t tokens) {
 
 void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v, float* out,
                std::int32_t q_heads, std::int32_t head_dim, std::int32_t tokens,
-               std::int32_t window, float scale, float* scratch, ThreadPool& pool) {
+               std::int32_t window, float scale, float* scratch, ThreadPool& pool,
+               std::int32_t kv_heads, bool causal) {
     pool.bind_current_thread();
 #if defined(SINFER_WITH_ONEDNN)
-    if (gemm_backend() == GemmBackend::OneDnn &&
+    if (kv_heads == 1 && !causal && scratch != nullptr && gemm_backend() == GemmBackend::OneDnn &&
         attention_onednn(q, k, v, out, q_heads, head_dim, tokens, window, scale, scratch, pool)) {
         return;
     }
 #endif
     (void)scratch; // the builtin path's per-query weights fit a thread-local buffer
     const std::int32_t query_rows = q_heads * head_dim;
+    const std::int32_t kv_rows = kv_heads * head_dim;
+    if (kv_heads <= 0 || q_heads % kv_heads) { throw std::invalid_argument("invalid encoder KV heads"); }
 
     // One (head, query) pair per unit of work. Each writes its own slice of the
     // output and reads nothing another unit writes, so the only shared state is
@@ -906,13 +909,13 @@ void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16
             const auto query = static_cast<std::int32_t>(unit % tokens);
 
             const std::int32_t lo = window > 0 ? std::max(0, query - window + 1) : 0;
-            const std::int32_t hi = window > 0 ? std::min(tokens, query + window) : tokens;
+            const std::int32_t hi = causal ? query + 1 : window > 0 ? std::min(tokens, query + window) : tokens;
             const std::uint16_t* q_row =
                 q + static_cast<std::int64_t>(query) * query_rows + head * head_dim;
 
             float maximum = -std::numeric_limits<float>::infinity();
             for (std::int32_t key = lo; key < hi; ++key) {
-                const std::uint16_t* k_col = k + static_cast<std::int64_t>(key) * head_dim;
+                const std::uint16_t* k_col = k + static_cast<std::int64_t>(key) * kv_rows + (head / (q_heads / kv_heads)) * head_dim;
                 const float dot            = dot_bf16(q_row, k_col, head_dim);
                 const float value                            = dot * scale;
                 weights[static_cast<std::size_t>(key - lo)]  = value;
@@ -931,7 +934,7 @@ void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16
             std::fill(target, target + head_dim, 0.0F);
             for (std::int32_t key = lo; key < hi; ++key) {
                 const float weight = weights[static_cast<std::size_t>(key - lo)] * inverse;
-                const std::uint16_t* v_col = v + static_cast<std::int64_t>(key) * head_dim;
+                const std::uint16_t* v_col = v + static_cast<std::int64_t>(key) * kv_rows + (head / (q_heads / kv_heads)) * head_dim;
                 for (std::int32_t d = 0; d < head_dim; ++d) { target[d] += weight * widen(v_col[d]); }
             }
         }
@@ -950,6 +953,14 @@ void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count
     // forward. Serially this was the largest single cost after the projections.
     pool.parallel_for(count, [&](std::int64_t begin, std::int64_t end) {
         for (std::int64_t i = begin; i < end; ++i) { out[i] = gelu_tanh(gate[i]) * up[i]; }
+    });
+}
+
+void silu_mul(const float* gate, const float* up, float* out, std::int64_t count, ThreadPool& pool) {
+    pool.parallel_for(count, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t i = begin; i < end; ++i) {
+            out[i] = (gate[i] / (1.0F + std::exp(-gate[i]))) * up[i];
+        }
     });
 }
 

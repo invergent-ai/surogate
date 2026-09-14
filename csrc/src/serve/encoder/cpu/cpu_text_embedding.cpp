@@ -1,5 +1,5 @@
 #include "encoder/embedding_input.h"
-#include "encoder/cpu/cpu_gemma_embedding.h"
+#include "encoder/cpu/cpu_text_embedding.h"
 
 #include "artifact/reader.h"
 
@@ -169,10 +169,10 @@ struct LayerWeights {
 
 } // namespace
 
-struct CpuGemmaEmbedding::Impl {
-    GemmaEmbeddingConfig config;
+struct CpuTextEmbedding::Impl {
+    TextEmbeddingConfig config;
     std::unique_ptr<ThreadPool> pool;
-    std::unique_ptr<GemmaTokenizer> tokenizer;
+    std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     std::vector<std::uint16_t> token_embedding, embedding_head;
     std::vector<float> final_norm;
@@ -190,25 +190,25 @@ struct CpuGemmaEmbedding::Impl {
     std::uint64_t bytes = 0;
 };
 
-CpuGemmaEmbedding::CpuGemmaEmbedding() : impl_(std::make_unique<Impl>()) {}
-CpuGemmaEmbedding::~CpuGemmaEmbedding()                                          = default;
-CpuGemmaEmbedding::CpuGemmaEmbedding(CpuGemmaEmbedding&&) noexcept               = default;
-CpuGemmaEmbedding& CpuGemmaEmbedding::operator=(CpuGemmaEmbedding&&) noexcept    = default;
+CpuTextEmbedding::CpuTextEmbedding() : impl_(std::make_unique<Impl>()) {}
+CpuTextEmbedding::~CpuTextEmbedding()                                          = default;
+CpuTextEmbedding::CpuTextEmbedding(CpuTextEmbedding&&) noexcept               = default;
+CpuTextEmbedding& CpuTextEmbedding::operator=(CpuTextEmbedding&&) noexcept    = default;
 
-const GemmaEmbeddingConfig& CpuGemmaEmbedding::config() const noexcept { return impl_->config; }
-const GemmaTokenizer& CpuGemmaEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
-std::uint64_t CpuGemmaEmbedding::weight_bytes() const noexcept { return impl_->bytes; }
-int CpuGemmaEmbedding::threads() const noexcept { return impl_->pool->threads(); }
+const TextEmbeddingConfig& CpuTextEmbedding::config() const noexcept { return impl_->config; }
+const EmbeddingTokenizer& CpuTextEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
+std::uint64_t CpuTextEmbedding::weight_bytes() const noexcept { return impl_->bytes; }
+int CpuTextEmbedding::threads() const noexcept { return impl_->pool->threads(); }
 
-CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, ThreadPlan plan) {
-    CpuGemmaEmbedding model;
+CpuTextEmbedding CpuTextEmbedding::load(const std::filesystem::path& path, ThreadPlan plan) {
+    CpuTextEmbedding model;
     Impl& impl = *model.impl_;
     if (plan.threads == 0 && plan.cpus.empty()) { plan = ThreadPlan::detect(); }
     impl.pool = std::make_unique<ThreadPool>(std::move(plan));
 
     const artifact::Reader reader(path);
-    impl.config = GemmaEmbeddingConfig::from_artifact(reader);
-    const GemmaEmbeddingConfig& config = impl.config;
+    impl.config = TextEmbeddingConfig::from_artifact(reader);
+    const TextEmbeddingConfig& config = impl.config;
 
     const auto checked_tensor = [&](const std::string& name, artifact::NumericFormat format,
                                     std::initializer_list<std::uint64_t> shape) {
@@ -236,11 +236,13 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
 
     impl.token_embedding = quantised("text/token_embedding", config.vocab, config.hidden);
     impl.final_norm      = dense("text/final_norm", static_cast<std::size_t>(config.hidden));
-    checked_tensor("text/embedding_head", artifact::NumericFormat::BF16,
-                   {static_cast<std::uint64_t>(config.hidden), static_cast<std::uint64_t>(config.hidden)});
-    impl.embedding_head =
-        raw_bf16(reader.payload("text/embedding_head").data,
-                 static_cast<std::size_t>(config.hidden) * config.hidden);
+    if (config.mean_pooling) {
+        checked_tensor("text/embedding_head", artifact::NumericFormat::BF16,
+                       {static_cast<std::uint64_t>(config.hidden), static_cast<std::uint64_t>(config.hidden)});
+        impl.embedding_head =
+            raw_bf16(reader.payload("text/embedding_head").data,
+                     static_cast<std::size_t>(config.hidden) * config.hidden);
+    }
 
     impl.layers.resize(static_cast<std::size_t>(config.layers));
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
@@ -254,14 +256,14 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
         const auto hidden = static_cast<std::size_t>(config.hidden);
         const auto head   = static_cast<std::size_t>(config.head_dim);
         w.input_norm            = norm("input_norm", hidden);
-        w.post_attention_norm   = norm("post_attention_norm", hidden);
+        if (config.gemma) { w.post_attention_norm = norm("post_attention_norm", hidden); }
         w.pre_feedforward_norm  = norm("pre_feedforward_norm", hidden);
-        w.post_feedforward_norm = norm("post_feedforward_norm", hidden);
+        if (config.gemma) { w.post_feedforward_norm = norm("post_feedforward_norm", hidden); }
         w.query_norm            = norm("attention/query_norm", head);
         w.key_norm              = norm("attention/key_norm", head);
         w.query  = matrix("attention/query", config.query_size(), config.hidden);
-        w.key    = matrix("attention/key", config.head_dim, config.hidden);
-        w.value  = matrix("attention/value", config.head_dim, config.hidden);
+        w.key    = matrix("attention/key", config.kv_size(), config.hidden);
+        w.value  = matrix("attention/value", config.kv_size(), config.hidden);
         w.output = matrix("attention/output", config.hidden, config.query_size());
         w.gate   = matrix("mlp/gate", config.intermediate, config.hidden);
         w.up     = matrix("mlp/up", config.intermediate, config.hidden);
@@ -269,19 +271,17 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
     }
 
     // Two bases, two tables, built once: the angles never depend on the data.
-    impl.rope_global = RopeTable(config.head_dim, config.max_tokens, config.rope_theta_global);
+    impl.rope_global = RopeTable(config.head_dim, config.max_tokens, config.rope_theta_global, config.rope_frequency_scale);
     impl.rope_local  = RopeTable(config.head_dim, config.max_tokens, config.rope_theta_local);
 
-    const auto tokenizer_bytes = reader.payload("frontend/tokenizer.model").data;
-    impl.tokenizer =
-        std::make_unique<GemmaTokenizer>(GemmaTokenizer::from_serialized_proto(tokenizer_bytes));
+    impl.tokenizer = std::make_unique<EmbeddingTokenizer>(EmbeddingTokenizer::from_artifact(reader));
 
     {
         // Touch every scratch page now rather than during the first request.
         const auto span         = static_cast<std::size_t>(config.max_tokens);
         const auto hidden       = static_cast<std::size_t>(config.hidden);
         const auto query_size   = static_cast<std::size_t>(config.query_size());
-        const auto head_dim     = static_cast<std::size_t>(config.head_dim);
+        const auto head_dim     = static_cast<std::size_t>(config.kv_size());
         const auto intermediate = static_cast<std::size_t>(config.intermediate);
         Impl::Scratch& scratch  = impl.scratch;
         scratch.x.assign(hidden * span, 0.0F);
@@ -293,7 +293,9 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
         scratch.attn_out.assign(query_size * span, 0.0F);
         scratch.gate.assign(intermediate * span, 0.0F);
         scratch.up.assign(intermediate * span, 0.0F);
-        scratch.scores.assign(attention_scratch(config.query_heads, config.max_tokens), 0.0F);
+        if (config.mean_pooling) {
+            scratch.scores.assign(attention_scratch(config.query_heads, config.max_tokens), 0.0F);
+        }
         scratch.h16.assign(hidden * span, 0);
         scratch.wide16.assign(std::max(query_size, intermediate) * span, 0);
         scratch.q16.assign(query_size * span, 0);
@@ -320,16 +322,16 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
     return model;
 }
 
-std::vector<float> CpuGemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
+std::vector<float> CpuTextEmbedding::embed(std::span<const std::int32_t> tokens) {
     std::vector<std::vector<std::int32_t>> one{
         std::vector<std::int32_t>(tokens.begin(), tokens.end())};
     return embed_batch(one).front();
 }
 
-std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
+std::vector<std::vector<float>> CpuTextEmbedding::embed_batch(
     const std::vector<std::vector<std::int32_t>>& sequences) {
     Impl& impl                         = *impl_;
-    const GemmaEmbeddingConfig& config = impl.config;
+    const TextEmbeddingConfig& config = impl.config;
     std::vector<std::vector<float>> out;
     out.reserve(sequences.size());
 
@@ -350,7 +352,7 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
 
         const auto hidden       = static_cast<std::size_t>(config.hidden);
         const auto query_size   = static_cast<std::size_t>(config.query_size());
-        const auto head_dim     = static_cast<std::size_t>(config.head_dim);
+        const auto head_dim     = static_cast<std::size_t>(config.kv_size());
         const auto intermediate = static_cast<std::size_t>(config.intermediate);
 
         const auto span   = static_cast<std::size_t>(tokens);
@@ -375,30 +377,30 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
             const std::int32_t window = global ? 0 : config.sliding_window;
 
             profile.begin();
-            rmsnorm(x.data(), w.input_norm.data(), config.rms_epsilon, true, h.data(),
+            rmsnorm(x.data(), w.input_norm.data(), config.rms_epsilon, config.gemma, h.data(),
                     config.hidden, tokens, *impl.pool);
             narrow(h.data(), h16.data(), static_cast<std::int64_t>(hidden * span), *impl.pool);
             profile.end("rmsnorm");
             profile.begin();
             gemm(w.query.data(), h16.data(), query.data(), config.query_size(), config.hidden,
                  tokens, *impl.pool);
-            gemm(w.key.data(), h16.data(), key.data(), config.head_dim, config.hidden, tokens,
+            gemm(w.key.data(), h16.data(), key.data(), config.kv_size(), config.hidden, tokens,
                  *impl.pool);
-            gemm(w.value.data(), h16.data(), value.data(), config.head_dim, config.hidden, tokens,
+            gemm(w.value.data(), h16.data(), value.data(), config.kv_size(), config.hidden, tokens,
                  *impl.pool);
             profile.end("gemm");
             profile.begin();
 
             // Per-head QK norm: heads are contiguous within a column, so the
             // whole buffer is heads * tokens rows of head_dim.
-            rmsnorm(query.data(), w.query_norm.data(), config.rms_epsilon, true, query.data(),
+            rmsnorm(query.data(), w.query_norm.data(), config.rms_epsilon, config.gemma, query.data(),
                     config.head_dim, config.query_heads * tokens, *impl.pool);
-            rmsnorm(key.data(), w.key_norm.data(), config.rms_epsilon, true, key.data(),
-                    config.head_dim, tokens, *impl.pool);
+            rmsnorm(key.data(), w.key_norm.data(), config.rms_epsilon, config.gemma, key.data(),
+                    config.head_dim, config.kv_heads * tokens, *impl.pool);
 
             rope(query.data(), positions.data(), config.head_dim, config.query_heads, tokens,
                  angles, *impl.pool);
-            rope(key.data(), positions.data(), config.head_dim, 1, tokens, angles, *impl.pool);
+            rope(key.data(), positions.data(), config.head_dim, config.kv_heads, tokens, angles, *impl.pool);
             profile.end("qknorm+rope");
             profile.begin();
 
@@ -409,7 +411,7 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
                    *impl.pool);
             attention(q16.data(), k16.data(), v16.data(), attn_out.data(), config.query_heads,
                       config.head_dim, tokens, window, config.attention_scale, scratch.data(),
-                      *impl.pool);
+                      *impl.pool, config.kv_heads, !config.mean_pooling);
             profile.end("attention");
             profile.begin();
 
@@ -417,11 +419,13 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
                    static_cast<std::int64_t>(query_size * span), *impl.pool);
             gemm(w.output.data(), wide16.data(), attn.data(), config.hidden,
                  config.query_size(), tokens, *impl.pool);
-            rmsnorm(attn.data(), w.post_attention_norm.data(), config.rms_epsilon, true,
-                    attn.data(), config.hidden, tokens, *impl.pool);
+            if (config.gemma) {
+                rmsnorm(attn.data(), w.post_attention_norm.data(), config.rms_epsilon, true,
+                        attn.data(), config.hidden, tokens, *impl.pool);
+            }
             add(attn.data(), x.data(), static_cast<std::int64_t>(hidden * span), *impl.pool);
 
-            rmsnorm(x.data(), w.pre_feedforward_norm.data(), config.rms_epsilon, true, h.data(),
+            rmsnorm(x.data(), w.pre_feedforward_norm.data(), config.rms_epsilon, config.gemma, h.data(),
                     config.hidden, tokens, *impl.pool);
             narrow(h.data(), h16.data(), static_cast<std::int64_t>(hidden * span), *impl.pool);
             gemm(w.up.data(), h16.data(), up.data(), config.intermediate, config.hidden, tokens,
@@ -430,12 +434,17 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
             profile.begin();
             // gelu(gate) * up rides the gate projection when a backend can fuse
             // it, which saves two passes over an [intermediate, tokens] buffer.
-            if (!gemm_gelu_mul(w.gate.data(), h16.data(), up.data(), gate.data(),
+            if (!config.gemma || !gemm_gelu_mul(w.gate.data(), h16.data(), up.data(), gate.data(),
                                config.intermediate, config.hidden, tokens, *impl.pool)) {
                 gemm(w.gate.data(), h16.data(), gate.data(), config.intermediate, config.hidden,
                      tokens, *impl.pool);
-                gelu_mul(gate.data(), up.data(), gate.data(),
-                         static_cast<std::int64_t>(intermediate * span), *impl.pool);
+                if (config.gemma) {
+                    gelu_mul(gate.data(), up.data(), gate.data(),
+                             static_cast<std::int64_t>(intermediate * span), *impl.pool);
+                } else {
+                    silu_mul(gate.data(), up.data(), gate.data(),
+                             static_cast<std::int64_t>(intermediate * span), *impl.pool);
+                }
             }
             profile.end("mlp_act");
             profile.begin();
@@ -443,17 +452,25 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
                    static_cast<std::int64_t>(intermediate * span), *impl.pool);
             gemm(w.down.data(), wide16.data(), attn.data(), config.hidden, config.intermediate,
                  tokens, *impl.pool);
-            rmsnorm(attn.data(), w.post_feedforward_norm.data(), config.rms_epsilon, true,
-                    attn.data(), config.hidden, tokens, *impl.pool);
+            if (config.gemma) {
+                rmsnorm(attn.data(), w.post_feedforward_norm.data(), config.rms_epsilon, true,
+                        attn.data(), config.hidden, tokens, *impl.pool);
+            }
             add(attn.data(), x.data(), static_cast<std::int64_t>(hidden * span), *impl.pool);
             profile.end("gemm");
         }
 
-        rmsnorm(x.data(), impl.final_norm.data(), config.rms_epsilon, true, h.data(),
+        rmsnorm(x.data(), impl.final_norm.data(), config.rms_epsilon, config.gemma, h.data(),
                 config.hidden, tokens, *impl.pool);
 
         std::vector<float> pooled(hidden);
-        mean_pool(h.data(), pooled.data(), config.hidden, tokens);
+        mean_pool(config.mean_pooling ? h.data() : h.data() + (tokens - 1) * hidden,
+                  pooled.data(), config.hidden, config.mean_pooling ? tokens : 1);
+        if (!config.mean_pooling) {
+            l2norm(pooled.data(), config.hidden, 1, 1.0e-12F);
+            out.push_back(std::move(pooled));
+            continue;
+        }
         std::vector<std::uint16_t> pooled16(hidden);
         narrow(pooled.data(), pooled16.data(), static_cast<std::int64_t>(hidden), *impl.pool);
         std::vector<float> projected(hidden);

@@ -133,12 +133,12 @@ int test_rmsnorm(cpu::ThreadPool& pool) {
 /// The window is symmetric, and a window wider than the sequence is no window at
 /// all. Both are properties the GPU op is tested for; a second implementation
 /// that disagrees would be worse than none.
-int test_attention(cpu::ThreadPool& pool) {
-    const std::int32_t heads = 3, head_dim = 256, tokens = 40;
+int test_attention(cpu::ThreadPool& pool, int kv_heads = 1, bool causal = false) {
+    const std::int32_t heads = kv_heads == 1 ? 3 : 4, head_dim = 256, tokens = 40;
     const auto raw_q =
         random_floats(static_cast<std::size_t>(heads) * head_dim * tokens, 5, -1.F, 1.F);
-    const auto raw_k = random_floats(static_cast<std::size_t>(head_dim) * tokens, 6, -1.F, 1.F);
-    const auto raw_v = random_floats(static_cast<std::size_t>(head_dim) * tokens, 7, -1.F, 1.F);
+    const auto raw_k = random_floats(static_cast<std::size_t>(head_dim) * kv_heads * tokens, 6, -1.F, 1.F);
+    const auto raw_v = random_floats(static_cast<std::size_t>(head_dim) * kv_heads * tokens, 7, -1.F, 1.F);
     std::vector<std::uint16_t> q(raw_q.size()), k(raw_k.size()), v(raw_v.size());
     for (std::size_t i = 0; i < raw_q.size(); ++i) { q[i] = to_bf16(raw_q[i]); }
     for (std::size_t i = 0; i < raw_k.size(); ++i) { k[i] = to_bf16(raw_k[i]); }
@@ -150,14 +150,14 @@ int test_attention(cpu::ThreadPool& pool) {
     for (const std::int32_t window : {0, 8, 1000}) {
         std::vector<float> out(static_cast<std::size_t>(heads) * head_dim * tokens);
         cpu::attention(q.data(), k.data(), v.data(), out.data(), heads, head_dim, tokens, window,
-                       scale, scratch.data(), pool);
+                       scale, scratch.data(), pool, kv_heads, causal);
 
         std::vector<double> want(out.size());
         const std::int32_t rows = heads * head_dim;
         for (std::int32_t head = 0; head < heads; ++head) {
             for (std::int32_t query = 0; query < tokens; ++query) {
                 const std::int32_t lo = window > 0 ? std::max(0, query - window + 1) : 0;
-                const std::int32_t hi = window > 0 ? std::min(tokens, query + window) : tokens;
+                const std::int32_t hi = causal ? query + 1 : window > 0 ? std::min(tokens, query + window) : tokens;
                 std::vector<double> weights(static_cast<std::size_t>(hi - lo));
                 double maximum = -1e300;
                 for (std::int32_t key = lo; key < hi; ++key) {
@@ -167,7 +167,7 @@ int test_attention(cpu::ThreadPool& pool) {
                                    q[static_cast<std::size_t>(query) * rows + head * head_dim +
                                      d])) *
                                static_cast<double>(
-                                   from_bf16(k[static_cast<std::size_t>(key) * head_dim + d]));
+                                   from_bf16(k[(static_cast<std::size_t>(key) * kv_heads + head / (heads / kv_heads)) * head_dim + d]));
                     }
                     weights[static_cast<std::size_t>(key - lo)] = dot * scale;
                     maximum = std::max(maximum, dot * scale);
@@ -181,7 +181,7 @@ int test_attention(cpu::ThreadPool& pool) {
                     double accumulated = 0.0;
                     for (std::int32_t key = lo; key < hi; ++key) {
                         accumulated += weights[static_cast<std::size_t>(key - lo)] *
-                                       from_bf16(v[static_cast<std::size_t>(key) * head_dim + d]);
+                                       from_bf16(v[(static_cast<std::size_t>(key) * kv_heads + head / (heads / kv_heads)) * head_dim + d]);
                     }
                     want[static_cast<std::size_t>(query) * rows + head * head_dim + d] =
                         accumulated / sum;
@@ -298,6 +298,7 @@ int main(int argc, char** argv) {
     failures += test_gemm(pool);
     failures += test_rmsnorm(pool);
     failures += test_attention(pool);
+    failures += test_attention(pool, 2, true);
     failures += test_mean_pool();
     failures += test_gelu_mul(pool);
     failures += test_l2norm();
