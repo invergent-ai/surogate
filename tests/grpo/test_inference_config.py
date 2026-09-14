@@ -166,3 +166,17 @@ def test_a_parser_can_be_named_without_opening_the_gate():
     argv = _argv({"model": "m", "tool_call_parser": "llama3_json"})
     assert _value(argv, "--tool-call-parser") == "llama3_json"
     assert "--enable-auto-tool-choice" not in argv
+
+
+def test_the_gate_without_a_parser_is_refused_before_launch():
+    """The engine refuses this pair, but only after execv, so the run would
+    show a server that never turns healthy instead of its error message."""
+    with pytest.raises(ValueError, match="turns parsing off"):
+        _argv({"model": "m", "enable_auto_tool_choice": True, "tool_call_parser": "none"})
+
+
+def test_an_unfamiliar_parser_name_is_left_to_the_engine():
+    """The parser registry grows between releases; a copy of it here would go
+    stale and refuse a name the shipped engine accepts."""
+    argv = _argv({"model": "m", "tool_call_parser": "muse_glimmer"})
+    assert _value(argv, "--tool-call-parser") == "muse_glimmer"

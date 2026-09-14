@@ -143,6 +143,16 @@ class GRPOInferenceConfig:
         self.max_num_seqs = cfg.get("max_num_seqs", self.max_num_seqs)
         self.enable_auto_tool_choice = cfg.get("enable_auto_tool_choice", self.enable_auto_tool_choice)
         self.tool_call_parser = cfg.get("tool_call_parser", self.tool_call_parser)
+        # The engine refuses this pair at startup, and it does so after execv,
+        # so the run would show a server that never turns healthy rather than
+        # the engine's own message. Only the two "off" spellings are checked:
+        # the parser registry grows between releases, so a copy of it here
+        # would go stale and reject a name the engine accepts.
+        if self.enable_auto_tool_choice and self.tool_call_parser in ("none", "off"):
+            raise ValueError(
+                "enable_auto_tool_choice needs a tool_call_parser; "
+                f"{self.tool_call_parser!r} turns parsing off"
+            )
         self.gpu_layers = _offload_count("gpu_layers", cfg.get("gpu_layers"), ("all",))
         self.host_moe_layers = _offload_count("host_moe_layers", cfg.get("host_moe_layers"), ("auto", "all"))
         self.expert_slots = _offload_count("expert_slots", cfg.get("expert_slots"))

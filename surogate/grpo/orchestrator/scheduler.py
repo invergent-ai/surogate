@@ -35,12 +35,19 @@ from surogate.grpo.utils.utils import (
 # outrun the first success of a cold start and kill a run whose dataset is
 # otherwise fine.
 #
-# Composes with, rather than replaces, ``EnvConfig.max_retries``: that is the
-# environment's own budget for one rollout call and is spent inside verifiers,
-# where this never sees it. The two multiply, so an env configured with
-# ``max_retries: 4`` costs up to 80 requests before its group is dropped. That
-# is deliberate -- this bounds groups, not requests -- but it is worth knowing
-# before raising either.
+# Sits above ``EnvConfig.max_retries``, which reaches a narrower set of
+# failures than its name suggests: ``maybe_retry`` retries only ``InfraError``
+# and ``InvalidModelResponseError``. A rejected request arrives as a plain
+# ``ModelError`` -- ``Client.get_response`` wraps every non-verifiers exception
+# into one -- which is in neither set, so for the failure this guard exists for
+# the budget is 16 requests and ``max_retries`` does not enter into it.
+#
+# It does compose, and multiply, for a sandbox or tunnel failure
+# (``InfraError``) and for an unusable model response. That is the case where
+# raising ``max_retries`` is the lever that helps, and it is worth reaching for:
+# a sandbox-backed tool environment riding out a provider blip is the most
+# plausible healthy run these thresholds would otherwise end. The default is 0,
+# so nothing multiplies until someone sets it.
 MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
 
 # ...but when groups keep dying with no rollout completing in between, the data
@@ -613,10 +620,17 @@ class Scheduler:
                     # rollout raise at once, reach the run-killing threshold in
                     # under a second and end a run that used to recover.
                     #
-                    # A storm of raises therefore still spins. That is the
-                    # behaviour this path has always had, and bounding it wants
-                    # the loop's own no-progress check rather than a third
-                    # counter -- see the batch-loop bug in bugs-training.
+                    # A storm of raises therefore still spins, which is the
+                    # behaviour this path has always had. Worth knowing how
+                    # wide it is: MultiTurnEnv.rollout converts only vf.Error
+                    # into state["error"], so a rubric raising a plain
+                    # ValueError, a tool raising outside vf.ToolError, or the
+                    # env subprocess dying (which arrives here as a raised
+                    # ServerError from the ZMQ client, and nothing health-checks
+                    # those processes) all land on this path. Those are not
+                    # transient, so bounding them wants the loop's own
+                    # no-progress check rather than a third counter -- see the
+                    # batch-loop bug in bugs-training.
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
@@ -694,6 +708,10 @@ class Scheduler:
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,
             "scheduler/cancelled_rollouts": self.cancelled_rollouts_count,
+            # Examples the guard discarded. Not cleared below with the
+            # per-step counters: it is a streak, and a run silently throwing
+            # away training data should stay visible after the step that did it.
+            "scheduler/dropped_groups": sum(self.dropped_groups_by_task.values()),
             "empty_rollouts/all": sum(self.empty_rollouts_by_task.values()) / max(total_rollouts, 1),
             "errored_rollouts/all": sum(self.errored_rollouts_by_task.values()) / max(total_rollouts, 1),
             "off_policy_level/all/max": self.max_off_policy_level,

@@ -79,6 +79,9 @@ class _StubScheduler(Scheduler):
         self.dropped_group_ids.append(group_id)
         return await super().drop_group(group_id)
 
+    async def _produce(self, group_id: int) -> dict:
+        return self._rollout(group_id)
+
     def _rollout(self, group_id: int) -> dict:
         raise NotImplementedError
 
@@ -94,14 +97,12 @@ class _StubScheduler(Scheduler):
         if group is None or group.rollouts_to_schedule <= 0:
             return
         group.rollouts_to_schedule -= 1
-        task = asyncio.create_task(_resolved(self._rollout(group_id)))
+        # Built inside the task, not at creation: a rollout that raises must
+        # raise where a real one does, out of `finished_task.result()`.
+        task = asyncio.create_task(self._produce(group_id))
         self.inflight_requests[task] = InflightRolloutInfo(
             off_policy_steps=0, client_config=None, task=self.TASK, group_id=group_id
         )
-
-
-async def _resolved(value: dict) -> dict:
-    return value
 
 
 class _PassThroughBuffer:
@@ -197,6 +198,89 @@ def test_one_unrunnable_example_is_dropped_and_the_batch_still_completes():
     assert len(rollouts) == scheduler.batch_size
     # Dropping it cost a bounded number of attempts, not an unbounded retry.
     assert scheduler.errored_rollouts_by_task[scheduler.TASK] == MAX_ROLLOUT_ATTEMPTS_PER_GROUP
+
+
+# ── A flaky group is not a poison one ─────────────────────────────────
+
+
+class _FlakyScheduler(_StubScheduler):
+    """Every group fails every other attempt, and succeeds in between.
+
+    The counter is "failures since this group last completed one", not
+    "failures ever". Without the reset on success a merely flaky group
+    accumulates toward the cap over its whole life and is eventually dropped
+    as poison -- and groups do live across steps, since ``prefetch_batches``
+    defaults to True and does not clear them at a batch boundary.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts_by_group: dict[int, int] = defaultdict(int)
+
+    # Four failures for every success. A group needs four successes to
+    # complete, so it accumulates exactly MAX_ROLLOUT_ATTEMPTS_PER_GROUP
+    # failures over its life while never reaching five in a row. Without the
+    # reset it is dropped as poison; with it, nothing is dropped.
+    _FAILURES_PER_SUCCESS = 4
+
+    def _rollout(self, group_id: int) -> dict:
+        self.attempts_by_group[group_id] += 1
+        if self.attempts_by_group[group_id] % (self._FAILURES_PER_SUCCESS + 1):
+            return {"trajectory": [], "error": {"error_chain_repr": "flaky"}}
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None, "example_id": group_id, "reward": 1.0,
+        }
+
+
+def test_a_group_that_fails_between_successes_is_never_dropped():
+    scheduler = _FlakyScheduler()
+
+    rollouts = _run_one_batch(scheduler)
+
+    assert scheduler.dropped_group_ids == []
+    assert len(rollouts) == scheduler.batch_size
+    # It failed enough times to be dropped had the failures been counted
+    # cumulatively; it just never failed MAX times in a row.
+    assert (
+        scheduler.errored_rollouts_by_task[scheduler.TASK]
+        >= MAX_ROLLOUT_ATTEMPTS_PER_GROUP
+    )
+
+
+# ── A raised rollout is dropped, but never kills the run ──────────────
+
+
+class _RaisingScheduler(_StubScheduler):
+    """Every rollout raises rather than returning an error.
+
+    That path drops its group on the first raise, with none of the per-group
+    headroom the errored path gets, so counting those drops toward the streak
+    let a brief transport outage end a run in under a second. It is therefore
+    deliberately uncounted, and the batch spins instead -- which is the
+    behaviour that path has always had.
+    """
+
+    def _rollout(self, group_id: int) -> dict:
+        raise RuntimeError("transport went away")
+
+
+def test_a_storm_of_raised_rollouts_does_not_fail_the_run():
+    scheduler = _RaisingScheduler()
+
+    async def go():
+        try:
+            # It never completes a batch; the point is which way it does not.
+            await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=2)
+        finally:
+            await scheduler.stop()
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(go())
+
+    # Far past MAX_CONSECUTIVE_DROPPED_GROUPS worth of drops, and still alive.
+    assert len(scheduler.dropped_group_ids) > MAX_CONSECUTIVE_DROPPED_GROUPS
+    assert scheduler.dropped_groups_by_task[scheduler.TASK] == 0
 
 
 # ── The streak resets on progress ─────────────────────────────────────
