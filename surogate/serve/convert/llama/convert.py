@@ -122,6 +122,8 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
 
     required = _REQUIRED_CONFIG
     if config.get("model_type") == "granite":
+        if config.get("quantization_config"):
+            raise ValueError("Granite safetensors serving requires unquantized weights; use the original checkpoint or a GGUF")
         # Granite 4.2 shares this dense stack and weight layout, but supplies
         # its own attention multiplier instead of Llama's inverse square root.
         required = {**required, "architectures": ["GraniteForCausalLM"],

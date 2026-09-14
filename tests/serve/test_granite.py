@@ -49,6 +49,7 @@ def test_granite_checkpoint_geometry(size):
     {"attention_multiplier": 0}, {"attention_multiplier": float("nan")},
     {"attention_multiplier": True}, {"residual_multiplier": 0.25},
     {"embedding_multiplier": 2}, {"logits_scaling": 8}, {"attention_bias": True},
+    {"quantization_config": {"quant_method": "compressed-tensors"}},
     {"mlp_bias": True}, {"rope_parameters": {"rope_type": "linear", "factor": 4}},
     {"rope_parameters": {"rope_type": "default", "rope_theta": 10_000}},
 ])
