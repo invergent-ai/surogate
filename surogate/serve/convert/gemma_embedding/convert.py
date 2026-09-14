@@ -18,7 +18,6 @@ Usage::
 
     python -m surogate.serve.convert.gemma_embedding.convert \\
         --gguf models/embeddinggemma-300M-Q8_0.gguf \\
-        --frontend ~/.cache/huggingface/hub/models--google--embeddinggemma-300m/snapshots/<sha> \\
         --out ~/work/models/sinfer/embeddinggemma_300m.sinfer
 """
 
@@ -110,7 +109,7 @@ def load_frontend(frontend_dir: Path) -> dict[str, bytes]:
     return resources
 
 
-def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path) -> Path:
+def convert(gguf: str | Path, frontend_dir: str | Path | None, out_path: str | Path) -> Path:
     started = time.perf_counter()
     source = GgufSource(Path(gguf))
     config = inventory.config_from_gguf(source)
@@ -118,7 +117,11 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path) ->
     objects = inventory.declared_objects(geometry)
     recipes = {item.object_name: item for item in recipe.build_recipes(geometry)}
     recipe.validate_recipe_coverage(tuple(recipes.values()), geometry)
-    resources = load_frontend(Path(frontend_dir))
+    if frontend_dir is None:
+        from .frontend import frontend_from_gguf
+        resources = frontend_from_gguf(source)
+    else:
+        resources = load_frontend(Path(frontend_dir))
 
     specs: list[TensorSpec | ResourceSpec] = inventory.tensor_specs(objects)
     specs += [
@@ -151,7 +154,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path) ->
         "model_id": MODEL_ID,
         "weights_id": WEIGHTS_ID,
         "gguf": str(gguf),
-        "frontend": str(frontend_dir),
+        "frontend": str(frontend_dir) if frontend_dir is not None else "gguf",
         "objects": len(objects),
         "repacked_exactly": repacked,
         "elapsed_seconds": time.perf_counter() - started,
@@ -183,7 +186,7 @@ def geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[s
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gguf", required=True)
-    parser.add_argument("--frontend", required=True, help="directory holding tokenizer.json")
+    parser.add_argument("--frontend", help="optional directory holding tokenizer.model and tokenizer_config.json")
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     convert(args.gguf, args.frontend, args.out)

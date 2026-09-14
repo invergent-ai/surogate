@@ -405,7 +405,7 @@ save only the answer. This mode uses `--max-context` instead of `--max-model-len
 ## `--embed`: encoder models
 
 ```bash
-surogate serve --embed <model.gguf> --frontend <hf-snapshot-dir> --device 0
+surogate serve --embed <model.gguf> --device 0
 ```
 
 | Flag | Default | Meaning |
@@ -414,9 +414,11 @@ surogate serve --embed <model.gguf> --frontend <hf-snapshot-dir> --device 0
 | `--port N` | 8413 | HTTP port |
 | `--device N\|cpu` | `0` | GPU number, or `cpu` |
 | `--served-model-name NAME` | model argument | Model name accepted by requests and listed by `/v1/models` |
-| `--frontend DIR` | beside the GGUF | Model directory containing `tokenizer.model` and `tokenizer_config.json` for preparation |
+| `--frontend DIR` | automatic | Optional tokenizer override containing `tokenizer.model` and `tokenizer_config.json` |
 
-`--frontend` is needed during preparation only; it can be omitted once the model is cached.
+EmbeddingGemma GGUF files include their tokenizer, so no separate download or `--frontend`
+is required. If both tokenizer files are beside the GGUF, they are used instead. An explicit
+`--frontend` takes precedence; keep it in the command when using a custom tokenizer.
 
 ### CPU environment
 

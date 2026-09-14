@@ -332,12 +332,11 @@ AVX-512-capable CPU.
 
 ```bash
 surogate serve --embed ~/models/embeddinggemma-300M-Q8_0.gguf \
-  --frontend ~/models/embeddinggemma-300m \
   --host 0.0.0.0 --port 8413 --device 0
 ```
 
-`--frontend` points at a Hugging Face model directory containing the tokenizer files. It is
-needed only during preparation and can be omitted once the model is cached.
+The GGUF includes its tokenizer. To use separate tokenizer files, pass `--frontend DIR`
+with a directory containing `tokenizer.model` and `tokenizer_config.json`.
 
 ### On CPU
 
@@ -347,7 +346,6 @@ Use `--device cpu`. On a machine with 16 physical cores in one NUMA node, for ex
 OMP_WAIT_POLICY=ACTIVE OMP_NUM_THREADS=16 \
 numactl --cpunodebind=0 --membind=0 \
   surogate serve --embed ~/models/embeddinggemma-300M-Q8_0.gguf \
-    --frontend ~/models/embeddinggemma-300m \
     --host 0.0.0.0 --port 8413 --device cpu
 ```
 

@@ -50,7 +50,7 @@ Common server options (full list: surogate serve --engine-help):
 (--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
 
 --embed serves an encoder model: --device N|cpu chooses the backend, and
---frontend DIR supplies the tokenizer when converting a .gguf. CPU serving wants
+--frontend DIR optionally overrides the tokenizer embedded in the GGUF. CPU serving wants
 OMP_WAIT_POLICY=ACTIVE and OMP_NUM_THREADS set to the physical cores of one NUMA
 node.
 

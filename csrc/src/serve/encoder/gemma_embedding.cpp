@@ -97,6 +97,7 @@ std::uint64_t GemmaEmbedding::weight_bytes() const noexcept {
 }
 
 GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceContext& device) {
+    const ScopedDevice device_scope(device.device);
     GemmaEmbedding model;
     Impl& impl = *model.impl_;
     impl.device = &device;
@@ -187,6 +188,9 @@ std::vector<float> GemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
 
 std::vector<std::vector<float>> GemmaEmbedding::embed_batch(
     const std::vector<std::vector<std::int32_t>>& sequences) {
+    // The HTTP model worker is a different thread from the loader. CUDA device
+    // selection is thread-local; bind it before allocating IDs or launching kernels.
+    const ScopedDevice device_scope(impl_->device->device);
     for (const auto& sequence : sequences) {
         validate_embedding_input(sequence, impl_->config.vocab, impl_->config.max_tokens);
     }

@@ -693,7 +693,7 @@ def _gguf_architecture(path: Path) -> str | None:
         return None
 
 
-def _encoder_frontend(gguf_path: Path, frontend: str | None) -> Path:
+def _encoder_frontend(gguf_path: Path, frontend: str | None) -> Path | None:
     """Where the tokenizer comes from, with a message instead of a stack trace."""
     if frontend is not None:
         directory = Path(frontend).expanduser().resolve()
@@ -706,12 +706,7 @@ def _encoder_frontend(gguf_path: Path, frontend: str | None) -> Path:
     beside = gguf_path.parent
     if all((beside / name).is_file() for name in ENCODER_FRONTEND_FILES):
         return beside
-    raise SystemExit(
-        "surogate serve --embed: this GGUF needs a tokenizer to convert, and none was found\n"
-        f"  beside it in {beside}.\n"
-        "  Pass --frontend DIR pointing at the model's Hugging Face snapshot (the directory\n"
-        f"  holding {' and '.join(ENCODER_FRONTEND_FILES)})."
-    )
+    return None  # The converter reads the GGUF's own vocabulary.
 
 
 def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
@@ -741,27 +736,45 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
         )
     key, module, display = target
 
-    fp = _gguf_fingerprint(gguf_path)
+    frontend_dir = _encoder_frontend(gguf_path, frontend)
+    fingerprint = hashlib.sha256(_gguf_fingerprint(gguf_path).encode())
+    if frontend_dir is None:
+        fingerprint.update(b":embedded-sentencepiece-v1")
+    else:
+        # Selecting or editing an external tokenizer must not reuse another
+        # tokenizer's cached artifact, even when the weights are identical.
+        for name in ENCODER_FRONTEND_FILES:
+            fingerprint.update(name.encode())
+            fingerprint.update((frontend_dir / name).read_bytes())
+    fp = fingerprint.hexdigest()[:24]
     out = cache_dir() / f"{key}-gguf-{fp}.sinfer"
     if reuse_cache and out.is_file() and out.stat().st_size > 0:
         echo(f"surogate serve: using cached encoder weights ({out.name})")
         return out
 
-    frontend_dir = _encoder_frontend(gguf_path, frontend)
     root = _sinfer_root()
     if root is None:
         raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     echo(f"surogate serve: converting {display} ({gguf_path.name}) -> {out.name}")
-    cmd = [sys.executable, "-m", module, "--gguf", str(gguf_path),
-           "--frontend", str(frontend_dir), "--out", str(out)]
+    tmp = out.with_suffix(".sinfer.partial")
+    cmd = [sys.executable, "-m", module, "--gguf", str(gguf_path), "--out", str(tmp)]
+    if frontend_dir is not None:
+        cmd += ["--frontend", str(frontend_dir)]
     if os.environ.get("SUROGATE_SERVE_DRY"):
         echo("  (dry run) " + " ".join(cmd))
         return out
-    result = subprocess.run(cmd, cwd=str(root), stdout=sys.stderr)
-    if result.returncode != 0 or not out.is_file():
-        raise SystemExit(f"surogate serve: encoder conversion failed ({display}).")
+    try:
+        result = subprocess.run(cmd, cwd=str(root), stdout=sys.stderr)
+        if result.returncode != 0 or not tmp.is_file():
+            raise SystemExit(f"surogate serve: encoder conversion failed ({display}).")
+        tmp.replace(out)
+        report = Path(str(tmp) + ".conversion.json")
+        if report.is_file():
+            report.replace(Path(str(out) + ".conversion.json"))
+    finally:
+        tmp.unlink(missing_ok=True)
     return out
 
 
