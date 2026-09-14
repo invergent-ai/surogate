@@ -74,6 +74,8 @@ TEXT_FLOAT_FIELDS = (
     "rope_frequency_scale",
     "embedding_scale",
     "logit_softcap",
+    "logit_scale",
+    "post_norm_epsilon",
     "sliding_rope_theta",
     "attention_scale",
     "gdn_scale",
@@ -84,6 +86,7 @@ TEXT_FLOAT_FIELDS = (
 )
 
 VISION_INT_FIELDS = (
+    "muse_glimmer",
     "gemma_version", "gemma_pad_token", "encoder_free", "clipped_linears", "standardize", "attention_mode", "max_image_tokens",
     "deepstack_layers",
     "siglip2",

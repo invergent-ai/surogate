@@ -9,11 +9,14 @@
 #include <cmath>
 #include <iomanip>
 #include <numeric>
+#include <limits>
 #include <sstream>
 
 namespace sinfer::family::frontend_internal {
 media::decode::Image resize_processor_image(const media::decode::Image&, int, int, bool,
                                             const PreparationControl&);
+
+media::decode::Image resize_muse_image(const media::decode::Image&, int, int, const PreparationControl&);
 
 namespace {
 using Image = media::decode::Image;
@@ -41,6 +44,28 @@ std::string role_name(ChatRole role) {
 }
 
 std::pair<int, int> image_size(const Image& image, const GemmaProcessorOptions& g, int tokens) {
+    if (g.muse_glimmer) {
+        const int side = g.patch * g.merge;
+        double nh = double(image.height) / side, nw = double(image.width) / side;
+        const double ratio = double(image.height) / image.width;
+        if (nh * nw > tokens) { nh = std::sqrt(tokens * ratio); nw = nh / ratio; }
+        int best_h = 1, best_w = 1, best_tokens = 0;
+        double best_error = std::numeric_limits<double>::infinity();
+        for (int h : {std::max(1,int(std::floor(nh))), std::max(1,int(std::ceil(nh)))}) {
+            for (int w : {std::max(1,int(std::floor(nw))), std::max(1,int(std::ceil(nw)))}) {
+                if (std::int64_t(h)*w > tokens) { continue; }
+                const double error = std::abs(double(h)/w-ratio);
+                if (error < best_error || (error == best_error && h*w > best_tokens)) {
+                    best_h=h; best_w=w; best_error=error; best_tokens=h*w;
+                }
+            }
+        }
+        if (!best_tokens) { // Extremely narrow images still respect the image budget.
+            if (ratio >= 1) { best_h=tokens; best_w=1; }
+            else { best_h=1; best_w=tokens; }
+        }
+        return {best_h*side,best_w*side};
+    }
     if (g.version == 3) { return {g.image_size, g.image_size}; }
     const int side = g.patch * g.merge;
     const double factor =
@@ -120,6 +145,9 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                 .checkpoint                 = [&] { check_preparation_control(control); }};
             std::vector<Image> frames;
             std::vector<double> times;
+            if (video && g.muse_glimmer) {
+                throw std::invalid_argument("Muse-Glimmer currently accepts images; native video input is not supported");
+            }
             if (video) {
                 auto decoded =
                     media::decode::decode_video(part.media.bytes, policy, options.video_fps,
@@ -162,8 +190,8 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                     auto media = cache.get_or_prepare(
                         key, control,
                         [&] {
-                            const auto image = resize_processor_image(source, height, width,
-                                                                            g.resample == 2, control);
+                            const auto image = g.muse_glimmer ? resize_muse_image(source,height,width,control) :
+                                resize_processor_image(source,height,width,g.resample == 2,control);
                             auto payload =
                                 cache.allocate_payload(patches * 3 * g.patch * g.patch, control);
                             std::size_t cursor = 0;
@@ -186,7 +214,7 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                                                 }
                                                 payload->patches[cursor++] = bf16(value);
                                             };
-                                            if (g.version == 3) {
+                                            if (g.version == 3 || g.muse_glimmer) {
                                                 for (int c = 0; c < 3; ++c)
                                                     for (int y = 0; y < g.patch; ++y)
                                                         for (int x = 0; x < g.patch; ++x) {

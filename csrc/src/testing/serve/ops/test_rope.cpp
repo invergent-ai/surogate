@@ -470,6 +470,7 @@ int main() {
     failures += run_single_case({"qsa indexer strided", 128, 64, 1, 7, kTextTheta}, 4, 8192, 16);
 
     failures += run_vision_packed_case();
+    failures += run_pair_case({"Muse vision", 96, 96, 2, 37, kVisionTheta}, 16, 16, 33);
     failures += run_pair_case({"qwen3-vl interleaved image", 128, 128, 3, 129, 5.0e6F, 0, {24,20,20}}, 16, 8, 4096);
     failures += run_pair_case({"qwen3-vl strided video", 128, 128, 3, 17, 5.0e6F, 0, {24,20,20}}, 32, 8, 262000, 16, 8);
     failures += run_pair_case({"configured interleaving", 128, 128, 3, 9, 700000.0F, 0, {32,17,15}}, 12, 4, 5000);

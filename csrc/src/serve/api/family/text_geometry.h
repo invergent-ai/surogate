@@ -130,6 +130,8 @@ struct TextGeometry {
     /// The bound logits are squashed to, `tanh(x / c) * c`, for a family that caps them.
     /// Gemma 4 caps at 30. Zero means no cap, which is every other family here.
     float logit_softcap             = 0.0F;
+    float logit_scale               = 1.0F;
+    float post_norm_epsilon         = 0.0F;
     /// The rope base the *windowed* layers rotate at, where a family rotates its two kinds of
     /// layer at different bases -- Gemma's windowed layers at 1e4 against 1e6 global, which is
     /// `rope_theta` above. Zero means one base for every layer.

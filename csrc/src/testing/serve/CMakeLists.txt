@@ -644,3 +644,5 @@ if(_sinfer_serve_test_targets)
 endif()
 
 sinfer_add_test(sinfer_gemma_vision_test SOURCES test_gemma_vision.cpp LIBRARIES sinfer_engine CUDA::cudart)
+
+sinfer_add_op_test(sinfer_muse_vision_ops_test SOURCES test_muse_vision_ops.cpp LIBRARIES sinfer_engine CUDA::cudart)

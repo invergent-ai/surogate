@@ -1,6 +1,10 @@
 #include "api/ops/lora_store.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "api/ops/linear.h"
+#include "api/ops/linear_bias.h"
+#include "api/ops/add_bias.h"
+#include "ops/linear/bf16/bf16_cublaslt.h"
+#include "core/device.h"
 
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
@@ -215,6 +219,33 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
     lora_auto_linear(w, x, out, stream);
+}
+
+void linear_bias(const Tensor& x, const Weight& w, const Tensor& bias, Tensor& out,
+                  cudaStream_t stream) {
+    validate_linear_semantics(x,w,out,LinearPolicy::A16Only);
+    if (bias.dtype != DType::BF16 || bias.ne[0] != w.n || bias.ne[1] != 1 ||
+        bias.ne[2] != 1 || bias.ne[3] != 1 || !bias.data || !bias.is_contiguous()) {
+        throw std::invalid_argument("linear_bias: bias must be contiguous BF16 [N]");
+    }
+    const auto overlaps = [](const void* a, std::size_t an, const void* b, std::size_t bn) {
+        const auto aa=reinterpret_cast<std::uintptr_t>(a), bb=reinterpret_cast<std::uintptr_t>(b);
+        return aa<=bb ? bb-aa<an : aa-bb<bn;
+    };
+    if (overlaps(x.data,x.bytes(),out.data,out.bytes()) ||
+        overlaps(bias.data,bias.bytes(),out.data,out.bytes()) ||
+        (w.qtype==QType::BF16_CTRL && overlaps(w.qdata,std::size_t(w.n)*w.k*2,out.data,out.bytes()))) {
+        throw std::invalid_argument("linear_bias: output must not alias an input");
+    }
+    if (w.qtype == QType::BF16_CTRL) {
+        CUDA_CHECK(cudaMemsetAsync(out.data,0,out.bytes(),stream));
+        add_bias(bias,out,stream);
+        detail::bf16_cublaslt_gemm_accumulate(w,x,out,stream);
+        lora_auto_linear(w,x,out,stream);
+    } else {
+        linear(x,w,out,stream);
+        add_bias(bias,out,stream);
+    }
 }
 
 void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,

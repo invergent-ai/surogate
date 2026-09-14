@@ -1535,6 +1535,7 @@ add_subdirectory(${SERVE_ROOT}/targets/glm5_next serve_t_glm5_next EXCLUDE_FROM_
 add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/spark2_5 serve_t_spark2_5 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma3 serve_t_gemma3 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/muse_glimmer serve_t_muse_glimmer EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma4 serve_t_gemma4 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma4_e serve_t_gemma4_e EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma4_moe serve_t_gemma4_moe EXCLUDE_FROM_ALL)

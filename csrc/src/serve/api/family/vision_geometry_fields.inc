@@ -1,4 +1,5 @@
 // Generated from surogate/serve/artifact/geometry.py. Do not edit.
+SINFER_GEOMETRY_INT(muse_glimmer)
 SINFER_GEOMETRY_INT(gemma_version)
 SINFER_GEOMETRY_INT(gemma_pad_token)
 SINFER_GEOMETRY_INT(encoder_free)

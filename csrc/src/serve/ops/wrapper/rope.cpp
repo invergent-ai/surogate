@@ -88,10 +88,11 @@ void require_positions_storage(const Tensor& positions) {
 void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
     if (axes == 2) {
         const bool supported = (head_dim == kVisionDim && rotary_dim == kVisionDim) ||
-                               (head_dim == kVisionDim64 && rotary_dim == kVisionDim64);
+                               (head_dim == kVisionDim64 && rotary_dim == kVisionDim64) ||
+                               (head_dim == 96 && rotary_dim == 96);
         if (!supported) {
             throw std::invalid_argument(
-                "rope: 2-D Vision mode requires head_dim=rotary_dim of 72 or 64");
+                "rope: 2-D Vision mode requires head_dim=rotary_dim of 64, 72 or 96");
         }
         return;
     }

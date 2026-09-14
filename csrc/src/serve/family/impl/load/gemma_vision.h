@@ -107,6 +107,51 @@ inline void bind_gemma_vision(artifact::Binder& binder, GemmaVisionPlan& out,
     }
 }
 
+inline void bind_muse_vision(artifact::Binder& binder, GemmaVisionPlan& out,
+                             const TextGeometry& text, bool enabled) {
+    if (!binder.has("vision/patch_embedding")) {
+        if (enabled) { throw std::invalid_argument("Muse-Glimmer image input requires its vision projector (--mmproj)"); }
+        return;
+    }
+    out.vision_geometry = VisionGeometry::resolved(binder.reader().vision_geometry());
+    const auto& g = out.vision_geometry;
+    if (!g.muse_glimmer || g.output_hidden != text.hidden) {
+        throw std::invalid_argument("Muse-Glimmer vision geometry disagrees with the decoder");
+    }
+    const auto place = enabled ? artifact::TensorPlacement::Device : artifact::TensorPlacement::ValidateOnly;
+    const auto linear = [&](const std::string& name, int rows, int cols) {
+        out.vision_linears[name] = {artifact::bind_linear(binder, "vision/" + name, rows, cols, place), rows, cols};
+    };
+    const auto tensor = [&](const std::string& name, std::initializer_list<std::uint64_t> shape) {
+        out.vision_tensors[name] = {artifact::bind_tensor(binder, "vision/" + name,
+            artifact::NumericFormat::BF16, shape, place), artifact::NumericFormat::BF16, shape};
+    };
+    const auto h = static_cast<std::uint64_t>(g.hidden);
+    linear("patch_embedding", g.hidden, g.patch_dim);
+    tensor("position_embedding", {static_cast<std::uint64_t>(g.position_embeddings), h});
+    for (const auto* name : {"pre_norm", "post_norm"}) {
+        tensor(std::string(name) + "/weight", {h});
+        tensor(std::string(name) + "/bias", {h});
+    }
+    linear("projector/0", g.projector_hidden, g.merger_hidden());
+    linear("projector/1", g.projector_hidden, g.projector_hidden);
+    linear("projector/2", g.output_hidden, g.projector_hidden);
+    for (int i = 0; i < g.layers; ++i) {
+        const auto p = "layers/" + std::to_string(i) + "/";
+        for (const auto* name : {"attention/query", "attention/key", "attention/value",
+                                 "attention/output", "mlp/fc1", "mlp/fc2"}) {
+            const std::string role(name);
+            const int rows = role == "mlp/fc1" ? g.intermediate : g.hidden;
+            linear(p + role, rows, role == "mlp/fc2" ? g.intermediate : g.hidden);
+            tensor(p + role + "_bias", {static_cast<std::uint64_t>(rows)});
+        }
+        for (const auto* name : {"norm1", "norm2"}) {
+            tensor(p + name + "/weight", {h});
+            tensor(p + name + "/bias", {h});
+        }
+    }
+}
+
 inline VisionWeights materialize_gemma_vision(const artifact::MaterializedArtifact& backing,
                                               const GemmaVisionPlan& plan) {
     VisionWeights result;

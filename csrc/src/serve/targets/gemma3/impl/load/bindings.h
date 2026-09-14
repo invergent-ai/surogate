@@ -77,6 +77,7 @@ struct AttentionPlan {
     WeightPlan query;
     WeightPlan key;
     WeightPlan value;
+    std::optional<WeightPlan> output_gate;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
     WeightPlan output;
@@ -145,6 +146,7 @@ struct AttentionProjectionPayload {
     Weight query;
     Weight key;
     Weight value;
+    Weight output_gate;
     /// Gemma's sandwich norm for the attention output. Carried here because this
     /// payload is the only per-layer object the family hands to a Variant leaf on
     /// the attention side; see `Variant::attention_output_projection`.

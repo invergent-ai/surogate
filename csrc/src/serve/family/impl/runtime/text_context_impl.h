@@ -847,6 +847,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 /// prefill tail -- and a cap missed on one of them is a model that answers differently
 /// depending on which route the round took.
 void apply_logit_softcap(const ModelConfig& cfg, Tensor& logits, cudaStream_t stream) {
+    if (cfg.logit_scale != 1.0F) { ops::scale(logits, cfg.logit_scale, stream); }
     if (cfg.logit_softcap > 0.0F) { ops::logit_softcap(logits, cfg.logit_softcap, stream); }
 }
 
@@ -1338,13 +1339,16 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         rope_for_op = rope_for_op.slice(1, 0, 1).view({T});
     }
     if constexpr (applies_rotary<Variant>()) {
-        const auto& g = weights_.geometry;
-        if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
-            ops::rope_interleaved(rope_for_op, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
-                                 {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
-        } else {
-        ops::rope(rope_for_op, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
-                  layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+        if (cfg_.layer_rotary_dim(layer) > 0) {
+            const auto& g = weights_.geometry;
+            if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
+                ops::rope_interleaved(rope_for_op, cfg_.layer_rotary_dim(layer),
+                                      layer_rope_theta(layer, g),
+                                      {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
+            } else {
+                ops::rope(rope_for_op, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
+                          layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+            }
         }
     }
     debug_probe<Variant>("q_post_rope", qn.view({layer_q_size, T}), cfg_.n_layers, s);
@@ -1784,7 +1788,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 template <class Arena>
 void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int32_t columns,
                           const Weight& head, std::int32_t vocab, std::int32_t token_domain,
-                          float logit_softcap, Arena& work, cudaStream_t stream) {
+                          float logit_softcap, float logit_scale, Arena& work, cudaStream_t stream) {
     static const char* path = std::getenv("SUROGATE_SERVE_NLL_DUMP");
     if (path == nullptr || columns < 2) { return; }
     // The token domain is the family's (the rows `ops::sample` scores); a smaller model of the
@@ -1815,6 +1819,7 @@ void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int3
         Tensor hidden        = hidden_all.slice(1, c0, n);
         Tensor slice         = logits.slice(1, 0, n);
         ops::linear(hidden, head, slice, stream);
+        if (logit_scale != 1.0F) { ops::scale(slice, logit_scale, stream); }
         if (logit_softcap > 0.0F) { ops::logit_softcap(slice, logit_softcap, stream); }
         Tensor targets = ids.slice(0, c0 + 1, n);
         Tensor out     = nll.slice(0, c0, n);
@@ -1827,6 +1832,7 @@ void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int3
         Tensor hidden  = hidden_all.slice(1, columns - 1, 1);
         Tensor slice   = logits.slice(1, 0, 1);
         ops::linear(hidden, head, slice, stream);
+        if (logit_scale != 1.0F) { ops::scale(slice, logit_scale, stream); }
         if (logit_softcap > 0.0F) { ops::logit_softcap(slice, logit_softcap, stream); }
         Tensor targets = ids.slice(0, columns - 1, 1);
         Tensor out     = nll.slice(0, columns - 1, 1);
@@ -2460,13 +2466,17 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     rope_all = rope_all.slice(1, 0, 1).view({total});
                 }
                 if constexpr (applies_rotary<Variant>()) {
-                    const auto& g = weights_.geometry;
-                    if (rope_all.ne[1] == 3 && g.mrope_temporal) {
-                        ops::rope_interleaved(rope_all, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
-                            {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
-                    } else {
-                        ops::rope(rope_all, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
-                                  layer_rope_theta(layer, g), qn, kn, s);
+                    if (cfg_.layer_rotary_dim(layer) > 0) {
+                        const auto& g = weights_.geometry;
+                        if (rope_all.ne[1] == 3 && g.mrope_temporal) {
+                            ops::rope_interleaved(
+                                rope_all, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
+                                {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
+                        } else {
+                            ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
+                                      cfg_.layer_rotary_pairs(layer), layer_rope_theta(layer, g),
+                                      qn, kn, s);
+                        }
                     }
                 }
                 // A windowed layer looks at fewer keys than the round is sized for;
@@ -2745,7 +2755,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     } else {
     Tensor xl = finish_prefill(xf, x, s);
     if (prefill_cols > 0) {
-        debug_next_token_nll(xl, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, work_, s);
+        debug_next_token_nll(xl, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, cfg_.logit_scale, work_, s);
     }
 
     if (batch > 0) {
@@ -2980,7 +2990,7 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
     Tensor xf = matrix_window(prefill_hidden_, bucket);
     if (stage_finishes()) {
         Tensor xl = finish_prefill(xf, x, s);
-        debug_next_token_nll(xl, ids_device, bucket, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, work_, s);
+        debug_next_token_nll(xl, ids_device, bucket, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, cfg_.logit_scale, work_, s);
     } else {
         stage_export(x, s);
     }
@@ -3138,9 +3148,11 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                                cudaMemcpyDeviceToDevice, s));
                 }
                 if constexpr (applies_rotary<Variant>()) {
-                    ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
-                              cfg_.layer_rotary_pairs(layer),
-                              layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+                    if (cfg_.layer_rotary_dim(layer) > 0) {
+                        ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
+                                  cfg_.layer_rotary_pairs(layer),
+                                  layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+                    }
                 }
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
@@ -3322,7 +3334,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         return;
     }
     Tensor xl = finish_prefill(xf, x, s);
-    debug_next_token_nll(xl, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, work_, s);
+    debug_next_token_nll(xl, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, cfg_.logit_scale, work_, s);
 
     if (batch == 0) { return; }
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
@@ -3734,7 +3746,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor xl = finish_prefill(xf, x, s);
                 stage_checksum("finish-output", stage_first_, stage_last_, xl.data, xl.ne[0],
                                xl.ne[1], s);
-                debug_next_token_nll(xl, ids_device, len, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, work_, s);
+                debug_next_token_nll(xl, ids_device, len, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), cfg_.logit_softcap, cfg_.logit_scale, work_, s);
             } else {
                 stage_export(x, s);
             }

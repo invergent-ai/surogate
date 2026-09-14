@@ -1,0 +1,90 @@
+{
+  "architecture": "MuseGlimmerForConditionalGeneration",
+  "date": "2026-09-14",
+  "source": "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF",
+  "revision": "faa5b025c584459c13febfa5c59883516710ae39",
+  "text_gguf": "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+  "projector_gguf": "mmproj-Muse-Glimmer-30B-BF16.gguf",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "pipeline_gpus": [
+      0,
+      1
+    ],
+    "topology": "Both pipeline GPUs on NUMA node 0, PCIe x16; CUDA_DEVICE_ORDER=PCI_BUS_ID",
+    "text_scoring_gpu": 6,
+    "vision_reference_gpu": 2,
+    "llama_reference_gpu": 4
+  },
+  "reference": {
+    "llama_cpp_commit": "163a40796f0ebaae246325f8d2e15028b413fa9d",
+    "transformers": "5.16.1",
+    "llama_sampling": "greedy, cache_prompt=false, id_slot=0"
+  },
+  "text": {
+    "matching_next_tokens": 8,
+    "reference_prompts": 8,
+    "long_prompt_lengths": [
+      2806,
+      2605
+    ],
+    "max_selected_logprob_difference": 0.06292915344238281,
+    "single_gpu_decode_prefill_logprob_tests_passed": 11,
+    "unicode_tokenizer_cases": 3
+  },
+  "vision": {
+    "reference": "Transformers MuseGlimmerVisionModel, original BF16 mmproj GGUF weights, same represented inputs",
+    "grids": [
+      {
+        "height": 6,
+        "width": 10,
+        "merged_tokens": 15,
+        "relative_l2": 0.071252,
+        "cosine": 0.9974564
+      },
+      {
+        "height": 34,
+        "width": 38,
+        "merged_tokens": 323,
+        "relative_l2": 0.035756,
+        "cosine": 0.9994499
+      }
+    ],
+    "repeated_encode_bitwise_identical": true,
+    "notes": "The 50 BF16 blocks accumulate rounding differences, particularly on the tiny random grid. Separate FP64 numerical tests cover attention, rotary calculations and biased projection; pixel shuffle is checked exactly."
+  },
+  "http_checks": [
+    "public launcher automatically discovers the matching mmproj",
+    "warm launch uses the prepared cache and preserves the user-specified model id",
+    "two-GPU text and image chat",
+    "red, blue and green image identification",
+    "four concurrent requests mixing images and text",
+    "auto ATEM tool call and tool-result continuation",
+    "streaming content, reasoning and tool calls without protocol markers",
+    "raw text completions"
+  ],
+  "automated": {
+    "native_suites": [
+      "family_frontend",
+      "output_parsers",
+      "tool_constraints",
+      "vision_attention",
+      "rope",
+      "muse_vision_ops"
+    ],
+    "python_passed": 98,
+    "python_skipped": 6,
+    "real_vision_passed": 2
+  },
+  "not_validated": [
+    "131072-token context",
+    "all text/projector quantization variants",
+    "adapter numerical parity",
+    "performance benchmarks"
+  ],
+  "unsupported": [
+    "native video input",
+    "separate DFlash drafter",
+    "required/named/strict tool constraints"
+  ]
+}

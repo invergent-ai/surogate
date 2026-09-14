@@ -120,19 +120,27 @@ double cubic(double x) {
     return 0.0;
 }
 
+double lanczos(double x) {
+    x = std::abs(x);
+    if (x >= 3.0) { return 0.0; }
+    if (x < 1.e-12) { return 1.0; }
+    const double v = 3.14159265358979323846 * x;
+    return (std::sin(v) / v) * (std::sin(v / 3.0) / (v / 3.0));
+}
+
 struct Coefficients {
     std::vector<int> starts;
     std::vector<int> offsets;
     std::vector<float> weights;
 };
 
-Coefficients coefficients(int input, int output, bool bilinear = false) {
+Coefficients coefficients(int input, int output, int resample = 3) {
     Coefficients out;
     out.starts.resize(static_cast<std::size_t>(output));
     out.offsets.resize(static_cast<std::size_t>(output + 1));
     const double scale    = static_cast<double>(input) / output;
     const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
-    const double support  = (bilinear ? 1.0 : 2.0) * (scale >= 1.0 ? scale : 1.0);
+    const double support  = (resample == 2 ? 1.0 : resample == 1 ? 3.0 : 2.0) * (scale >= 1.0 ? scale : 1.0);
     for (int dst = 0; dst < output; ++dst) {
         const double center = scale * (dst + 0.5);
         const int begin     = std::max(static_cast<int>(center - support + 0.5), 0);
@@ -142,7 +150,7 @@ Coefficients coefficients(int input, int output, bool bilinear = false) {
         double sum                                 = 0.0;
         for (int j = 0; j < size; ++j) {
             const double distance = (j + begin - center + 0.5) * invscale;
-            const double weight = bilinear ? std::max(0.0, 1.0 - std::abs(distance)) : cubic(distance);
+            const double weight = resample == 2 ? std::max(0.0, 1.0 - std::abs(distance)) : resample == 1 ? lanczos(distance) : cubic(distance);
             out.weights.push_back(static_cast<float>(weight));
             sum += weight;
         }
@@ -157,10 +165,10 @@ Coefficients coefficients(int input, int output, bool bilinear = false) {
 }
 
 media::decode::Image resize_bicubic(const media::decode::Image& input, Size size,
-                                    const PreparationControl& control, bool bilinear = false) {
+                                    const PreparationControl& control, int resample = 3) {
     if (input.width == size.w && input.height == size.h) { return input; }
-    const Coefficients horizontal = coefficients(input.width, size.w, bilinear);
-    const Coefficients vertical   = coefficients(input.height, size.h, bilinear);
+    const Coefficients horizontal = coefficients(input.width, size.w, resample);
+    const Coefficients vertical   = coefficients(input.height, size.h, resample);
     std::vector<std::uint8_t> temp(static_cast<std::size_t>(input.height) * size.w * 3);
     for (int y = 0; y < input.height; ++y) {
         if (y % 16 == 0) { check_preparation_control(control); }
@@ -630,7 +638,7 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         throw std::invalid_argument("processor budgets must be positive");
     }
     if (!media_cache_) { throw std::invalid_argument("processor media cache must not be null"); }
-    if (options_.gemma.version) {
+    if (options_.gemma.version || options_.gemma.muse_glimmer) {
         validate_special_token(tokenizer_, options_.gemma.image_token, options_.image_token_id);
         validate_special_token(tokenizer_, options_.gemma.video_token, options_.gemma.video_token_id);
         return;
@@ -657,7 +665,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   const PreparationControl& control,
                                   std::optional<RenderedChat> prepared_chat) const {
     check_preparation_control(control);
-    if (options_.gemma.version) {
+    if (options_.gemma.version || options_.gemma.muse_glimmer) {
         return process_gemma_vl(tokenizer_, options_, *media_cache_, std::move(messages),render_options,control);
     }
     if (options_.lfm2_vl) {
@@ -829,9 +837,14 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     return output;
 }
 
+media::decode::Image resize_muse_image(const media::decode::Image& image, int height, int width,
+                                       const PreparationControl& control) {
+    return resize_bicubic(image, {height,width}, control, 1);
+}
+
 media::decode::Image resize_processor_image(const media::decode::Image& image, int height, int width,
                                            bool bilinear, const PreparationControl& control) {
-    return resize_bicubic(image, {height, width}, control, bilinear);
+    return resize_bicubic(image, {height, width}, control, bilinear ? 2 : 3);
 }
 
 } // namespace sinfer::family::frontend_internal

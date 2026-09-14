@@ -28,6 +28,7 @@ _NORMAL, _UNKNOWN, _CONTROL, _USER_DEFINED, _UNUSED, _BYTE = 1, 2, 3, 4, 5, 6
 # upstream regex verbatim in a comment above its own case-folded rewrite.
 # A tuple preserves the order of multiple Split stages in tokenizer.json.
 _PRE_SPLIT_REGEX = {
+    "llama4": r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     # Granite 4.2 uses GPT-2's byte-level splitting without Unicode normalization.
     "granite-docling": r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
     "minicpm5": (
@@ -239,7 +240,7 @@ def extract_tokenizer_json(reader) -> dict:
         "truncation": None,
         "padding": None,
         "added_tokens": added,
-        "normalizer": None if overlapping_added_tokens or pre == "granite-docling" else {"type": "NFC"},
+        "normalizer": None if overlapping_added_tokens or pre in ("granite-docling", "llama4") else {"type": "NFC"},
         "pre_tokenizer": {
             "type": "Sequence",
             "pretokenizers": [

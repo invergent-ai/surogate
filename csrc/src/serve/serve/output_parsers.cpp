@@ -43,11 +43,12 @@ struct ToolCallName {
     ToolCallFormat format;
 };
 
-constexpr std::array<ToolCallName, 7> kToolCallNames{{
+constexpr std::array<ToolCallName, 8> kToolCallNames{{
     {"none", ToolCallFormat::None},
     {"off", ToolCallFormat::None},
     {"qwen3_xml", ToolCallFormat::QwenXml},
     {"hermes", ToolCallFormat::QwenXml},
+    {"muse_glimmer", ToolCallFormat::MuseAtem},
     {"spark25", ToolCallFormat::Spark25},
     {"llama3_json", ToolCallFormat::Llama3Json},
     {"llama4_json", ToolCallFormat::Llama3Json},
@@ -251,9 +252,12 @@ ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
     case ToolCallFormat::None:
         out.content = text;
         return out;
+    case ToolCallFormat::MuseAtem:
     case ToolCallFormat::QwenXml:
     case ToolCallFormat::Spark25: {
-        ParsedToolCallOutput parsed = format == ToolCallFormat::Spark25
+        ParsedToolCallOutput parsed = format == ToolCallFormat::MuseAtem
+            ? parse_muse_tool_call_output(text, max_tool_name_length, tools)
+            : format == ToolCallFormat::Spark25
             ? parse_spark_tool_call_output(text, max_tool_name_length, tools)
             : parse_qwen_tool_call_output(text, max_tool_name_length, tools);
         out.is_tool_call_response   = parsed.is_tool_call_response;

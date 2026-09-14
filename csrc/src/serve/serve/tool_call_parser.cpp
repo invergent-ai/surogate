@@ -301,6 +301,58 @@ ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text, std::
     return parse_tagged_tool_call_output(text, max_name, true, tools);
 }
 
+ParsedToolCallOutput parse_muse_tool_call_output(const std::string& text,
+    std::size_t max_name, const std::vector<ToolDefinition>& tools) {
+    constexpr std::string_view open = "<atem:function_calls>", close = "</atem:function_calls>";
+    const auto first = text.find(open);
+    if (first == std::string::npos) { return fallback(text); }
+    ParsedToolCallOutput out;
+    out.content = rtrim_ascii(std::string_view(text).substr(0,first));
+    std::size_t pos=first;
+    const auto attribute = [&](std::string_view tag, std::string& name) {
+        if (!starts_with_at(text,pos,tag)) { return false; }
+        pos += tag.size();
+        const auto end = text.find("\">",pos);
+        if (end == std::string::npos) { return false; }
+        name = text.substr(pos,end-pos); pos=end+2;
+        return !name.empty();
+    };
+    while (pos<text.size()) {
+        skip_ws(text,pos);
+        if (pos==text.size()) { break; }
+        if (!starts_with_at(text,pos,open)) {
+            out.content += text.substr(pos); break;
+        }
+        pos+=open.size();
+        std::size_t count=0;
+        for (;;) {
+            skip_ws(text,pos);
+            if (starts_with_at(text,pos,close)) { pos+=close.size(); break; }
+            std::string name;
+            if (!attribute("<atem:invoke name=\"",name) || !valid_function_name(name,max_name)) { return fallback(text); }
+            Json args=Json::object();
+            const auto schema=function_schema(name,tools);
+            for (;;) {
+                skip_ws(text,pos);
+                constexpr std::string_view end_invoke="</atem:invoke>", end_parameter="</atem:parameter>";
+                if (starts_with_at(text,pos,end_invoke)) { pos+=end_invoke.size(); break; }
+                std::string key;
+                if (!attribute("<atem:parameter name=\"",key) || args.contains(key)) { return fallback(text); }
+                const auto end=text.find(end_parameter,pos);
+                if (end==std::string::npos) { return fallback(text); }
+                // ATEM strings are literal parameter bodies, including boundary whitespace.
+                args[key]=argument_value(text.substr(pos,end-pos),schema,key);
+                pos=end+end_parameter.size();
+            }
+            out.tool_calls.push_back({.id=new_tool_call_id(),.name=name,.arguments_json=args.dump()});
+            ++count;
+        }
+        if (!count) { return fallback(text); }
+    }
+    out.is_tool_call_response=!out.tool_calls.empty();
+    return out;
+}
+
 std::string ToolCallStreamFilter::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     if (text.empty()) { return {}; }
@@ -309,7 +361,7 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
         return {};
     }
 
-    constexpr std::string_view kToolOpen = "<tool_call>";
+    const std::string_view kToolOpen = muse_tools_ ? "<atem:function_calls>" : "<tool_call>";
     pending_.append(text);
     std::size_t marker = pending_.find(kToolOpen);
     if (json_tools_) {

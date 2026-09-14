@@ -44,6 +44,29 @@ void test_reasoning_names() {
     check(threw, "an unknown reasoning parser is refused and names the supported ones");
 }
 
+void test_muse_tools() {
+    const std::string body = "<atem:function_calls>\n<atem:invoke name=\"weather\">"
+        "<atem:parameter name=\"city\"> Paris\n</atem:parameter>"
+        "<atem:parameter name=\"days\">2</atem:parameter></atem:invoke>\n"
+        "<atem:invoke name=\"clock\"></atem:invoke></atem:function_calls>";
+    const auto parsed = parse_tool_calls(ToolCallFormat::MuseAtem,body,64);
+    check(parsed.is_tool_call_response && parsed.tool_calls.size()==2,"Muse parallel ATEM invocations");
+    if (parsed.tool_calls.size()==2) {
+        check(Json::parse(parsed.tool_calls[0].arguments_json) == Json{{"city"," Paris\n"},{"days",2}},
+              "Muse preserves raw strings and parses numeric arguments");
+    }
+    for (std::size_t split=0;split<=body.size();++split) {
+        ToolCallStreamFilter filter(false,true);
+        auto visible=filter.feed(std::string_view(body).substr(0,split));
+        visible+=filter.feed(std::string_view(body).substr(split));
+        check(visible.empty() && filter.finish(true).empty(),"Muse tool tags leaked through split streaming");
+    }
+    const auto malformed=body.substr(0,body.size()-1);
+    const auto fallback=parse_tool_calls(ToolCallFormat::MuseAtem,malformed,64);
+    check(!fallback.is_tool_call_response && fallback.content==malformed,"Muse malformed call must remain visible");
+    check(parse_tool_call_format("muse_glimmer")==ToolCallFormat::MuseAtem,"Muse parser registry");
+}
+
 void test_tool_call_names() {
     check(parse_tool_call_format("hermes") == ToolCallFormat::QwenXml, "hermes shares the Qwen block");
     check(parse_tool_call_format("llama3_json") == ToolCallFormat::Llama3Json, "llama3_json");
@@ -222,6 +245,7 @@ void test_spark_tool_calls() {
 int main() {
     test_reasoning_names();
     test_tool_call_names();
+    test_muse_tools();
     test_reasoning_split();
     test_llama3_tool_calls();
     test_tool_call_dispatch();

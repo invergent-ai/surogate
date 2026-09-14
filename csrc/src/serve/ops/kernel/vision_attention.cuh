@@ -23,7 +23,7 @@ inline constexpr int kVisionAttentionHeadDim = 72;
 // wrong -- the scale was previously baked in as 1/sqrt(72).
 template <int D>
 inline constexpr float kVisionAttentionInvSqrtD =
-    D == 72 ? 0.11785113019775792073f : D == 64 ? 0.125f : 0.0f;
+    D == 96 ? 0.10206207261596575f : D == 72 ? 0.11785113019775792073f : D == 64 ? 0.125f : 0.0f;
 inline constexpr int kVisionAttentionHeads   = 16;
 inline constexpr int kVisionAttentionBr      = 64;
 inline constexpr int kVisionAttentionBc      = 64;

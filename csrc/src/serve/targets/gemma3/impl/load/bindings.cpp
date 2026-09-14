@@ -77,7 +77,7 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                    g.hidden);
     out.down = materialized_weight(materialized, plan.down, g.hidden,
                                    g.intermediate);
-    out.rms_epsilon = g.rms_epsilon;
+    out.rms_epsilon = g.post_norm_epsilon > 0 ? g.post_norm_epsilon : g.rms_epsilon;
     out.post_feedforward_norm =
         materialized_norm(materialized, plan.post_feedforward_norm, g.hidden);
     return out;
@@ -113,6 +113,10 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                              {g.kv_size(), g.hidden});
         target.attention.value = bind_weight(binder, prefix + "attention/value", weights,
                                              {g.kv_size(), g.hidden});
+        if (binder.reader().identity().architecture == "muse_glimmer") {
+            target.attention.output_gate = bind_weight(binder, prefix + "attention/gate", weights,
+                                                        {g.query_size(), g.hidden});
+        }
         // Per-head q/k norm over head_dim, as Qwen3 has and Llama does not. There
         // is no v norm -- that is Gemma 4's, and this checkpoint ships no such
         // tensor.
@@ -145,7 +149,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = (binder.has("vision/patch_embedding") ? family::bind_frontend_resources(binder) : family::bind_text_only_frontend_resources(binder));
     out.features     = features;
 
-    family::bind_gemma_vision(binder,out,g,features.vision);
+    if (binder.reader().identity().architecture == "muse_glimmer") {
+        family::bind_muse_vision(binder, out, g, features.vision);
+    } else {
+        family::bind_gemma_vision(binder, out, g, features.vision);
+    }
     if (features.speculative_enabled()) {
         // Gemma 3 ships no MTP block and the target declares no DFlash tower, so
         // there is nothing to draft with. Refusing here beats a missing-object
@@ -198,7 +206,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // Every layer of a dense decoder attends.
     runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
-    frontend = plan.vision_geometry.gemma_version ? family::take_frontend_resources(backing,plan.frontend)
+    frontend = (plan.vision_geometry.gemma_version || plan.vision_geometry.muse_glimmer) ? family::take_frontend_resources(backing,plan.frontend)
                                                   : family::take_text_only_frontend_resources(backing, plan.frontend);
     runtime.vision_geometry = plan.vision_geometry;
     if (plan.features.vision) { runtime.vision = family::materialize_gemma_vision(backing,plan); }
@@ -222,8 +230,12 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                          g.hidden),
             .post_attention_norm = materialized_norm(
                 backing, source.attention.post_attention_norm, g.hidden),
-            .rms_epsilon = g.rms_epsilon,
+            .rms_epsilon = g.post_norm_epsilon > 0 ? g.post_norm_epsilon : g.rms_epsilon,
         };
+        if (source.attention.output_gate) {
+            target.projection.output_gate = materialized_weight(backing, *source.attention.output_gate,
+                                                                 g.query_size(), g.hidden);
+        }
         target.query_norm =
             materialized_norm(backing, source.attention.query_norm, g.head_dim);
         target.key_norm =

@@ -235,8 +235,8 @@ void populate_score_texts(Engine& engine, GenerationOutcome& outcome) {
 
 class ServiceOutputSink final : public sinfer::OutputSink {
 public:
-    ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools)
-        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), tool_filter_(json_tools) {}
+    ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools, bool muse_tools)
+        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), tool_filter_(json_tools,muse_tools) {}
 
     void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
@@ -612,7 +612,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) {
         output_sink = std::make_unique<ServiceOutputSink>(*engine_, *sink, prepared.tool_capable,
-            options_.tool_call_format == ToolCallFormat::Llama3Json);
+            options_.tool_call_format == ToolCallFormat::Llama3Json,
+            options_.tool_call_format == ToolCallFormat::MuseAtem);
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;

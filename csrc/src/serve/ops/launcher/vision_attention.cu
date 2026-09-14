@@ -59,6 +59,9 @@ void vision_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
                              cudaStream_t stream, float scale) {
     switch (q.ne[0]) {
+    case 96:
+        vision_attention_launch_for<96>(q, k, v, cu_seqlens, tiles, out, stream, scale);
+        return;
     case 72:
         vision_attention_launch_for<72>(q, k, v, cu_seqlens, tiles, out, stream, scale);
         return;
@@ -66,7 +69,7 @@ void vision_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
         vision_attention_launch_for<64>(q, k, v, cu_seqlens, tiles, out, stream, scale);
         return;
     default:
-        throw std::invalid_argument("vision_attention: unsupported head dim (expected 64 or 72)");
+        throw std::invalid_argument("vision_attention: unsupported head dim (expected 64, 72 or 96)");
     }
 }
 
@@ -117,6 +120,9 @@ void vision_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
                                                std::int32_t segment_length, std::int32_t tile_size,
                                                Tensor& out, cudaStream_t stream, float scale) {
     switch (q.ne[0]) {
+    case 96:
+        vision_attention_uniform_launch_with_tile_for<96>(q, k, v, segment_length, tile_size, out, stream, scale);
+        return;
     case 72:
         vision_attention_uniform_launch_with_tile_for<72>(q, k, v, segment_length, tile_size, out,
                                                           stream, scale);
@@ -126,7 +132,7 @@ void vision_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
                                                           stream, scale);
         return;
     default:
-        throw std::invalid_argument("vision_attention: unsupported head dim (expected 64 or 72)");
+        throw std::invalid_argument("vision_attention: unsupported head dim (expected 64, 72 or 96)");
     }
 }
 

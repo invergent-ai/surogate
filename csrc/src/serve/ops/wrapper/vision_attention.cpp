@@ -36,7 +36,7 @@ Tensor allocate_workspace(Allocator& allocator, std::int32_t patches, std::int32
 
 void require_qkv(const Tensor& tensor, std::int32_t patches, const char* name) {
     const std::int32_t head_dim = static_cast<std::int32_t>(tensor.ne[0]);
-    if (tensor.dtype != DType::BF16 || (head_dim != kHeadDim && head_dim != kHeadDim64) ||
+    if (tensor.dtype != DType::BF16 || (head_dim != kHeadDim && head_dim != kHeadDim64 && head_dim != 96) ||
         tensor.ne[1] <= 0 || tensor.ne[2] != patches || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " shape");
     }

@@ -270,6 +270,8 @@ int main() {
     failures +=
         run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
 
+    failures += run_case<96, 16>({0, 64, 129, 199}, 613u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    failures += run_case<96, 16>({0, 68, 136}, 614u, StorageProfile::Contiguous, PublicEntry::UniformSegments);
     failures += run_case<64, 12>({0, 68, 136}, 303u, StorageProfile::InterleavedQkv,
                                   PublicEntry::UniformSegments);
     failures += run_case<64, 12>({0, 64, 129}, 304u, StorageProfile::InterleavedQkv,

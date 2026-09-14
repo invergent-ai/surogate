@@ -156,6 +156,7 @@ private:
 /// its own vocabulary -- is read instead, so the spelling belongs to the model rather than
 /// to this file.
 struct ReasoningSyntax {
+    bool muse_glimmer = false;
     std::string open  = "<think>";
     std::string close = "</think>";
     /// Whether the *model* writes the opening marker. Qwen's template opens the span in the

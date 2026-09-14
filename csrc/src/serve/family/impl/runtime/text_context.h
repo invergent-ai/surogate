@@ -63,6 +63,7 @@ struct ModelConfig {
     float attention_scale   = 0;
     float gdn_scale         = 0;
     float logit_softcap     = 0;
+    float logit_scale       = 1;
     int mtp_layers          = 0;
 
     std::array<std::uint64_t, 4> attention_mask{};
@@ -265,6 +266,7 @@ struct ModelConfig {
           attention_scale(geometry.attention_scale),
           gdn_scale(geometry.gdn_scale),
           logit_softcap(geometry.logit_softcap),
+          logit_scale(geometry.logit_scale),
           mtp_layers(geometry.mtp_layers) {
         if (!geometry.attention_schedule_declared || !geometry.windowed_schedule_declared) {
             throw std::invalid_argument("runtime geometry requires a declared layer schedule");

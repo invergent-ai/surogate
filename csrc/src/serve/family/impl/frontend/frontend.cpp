@@ -155,10 +155,11 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     }
     const Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
-    if (image.value("gemma_version", 0)) {
+    if (image.value("gemma_version", 0) || image.value("muse_glimmer", false)) {
         fi::ProcessorOptions options;
         auto& g = options.gemma;
         g.version = image.at("gemma_version").get<int>();
+        g.muse_glimmer = image.value("muse_glimmer", false);
         g.encoder_free = image.value("encoder_free", 0) != 0;
         options.image_token_id = image.at("image_token_id").get<int>();
         g.video_token_id = image.at("video_token_id").get<int>();
@@ -191,10 +192,10 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
             g.video_tokens = video.value("max_soft_tokens",70);
             options.video_min_frames = options.video_max_frames = video.value("num_frames",32);
         }
-        if ((g.version != 3 && g.version != 4) || g.patch <= 0 || g.patch > 64 ||
+        if ((!g.muse_glimmer && g.version != 3 && g.version != 4) || g.patch <= 0 || g.patch > 64 ||
             g.merge <= 0 || g.merge > 8 || g.position_embeddings <= 0 ||
-            g.image_tokens <= 0 || g.image_tokens > 1120 || g.video_tokens <= 0 || g.video_tokens > 1120 ||
-            g.resample < 2 || g.resample > 3 || g.min_crop_size <= 0 || g.max_crops < 2 || g.max_crops > 64 ||
+            g.image_tokens <= 0 || g.image_tokens > (g.muse_glimmer ? 4096 : 1120) || g.video_tokens <= 0 || g.video_tokens > 1120 ||
+            g.resample < (g.muse_glimmer ? 1 : 2) || g.resample > 3 || g.min_crop_size <= 0 || g.max_crops < 2 || g.max_crops > 64 ||
             !std::isfinite(g.crop_ratio) || g.crop_ratio < 1 || g.image_size <= 0 || g.image_size > 4096 ||
             !image.value("do_rescale",true) || !image.value("do_resize",true)) {
             throw std::invalid_argument("unsupported Gemma image processor configuration");
@@ -326,6 +327,13 @@ fi::ReasoningSyntax reasoning_syntax(const FrontendResources& resources) {
     }
     if (!config.is_object() || !config.contains("response_template")) { return syntax; }
     const Json& response = config.at("response_template");
+    if (response.is_object() && response.value("type", "") == "muse_glimmer") {
+        syntax.muse_glimmer = true;
+        syntax.model_opens = true;
+        syntax.open = " to=self<|message|>";
+        syntax.close = "<|eom|>";
+        return syntax;
+    }
     if (!response.is_object() || !response.contains("fields")) { return syntax; }
     const Json& fields = response.at("fields");
     if (!fields.is_object() || !fields.contains("thinking")) { return syntax; }
@@ -685,6 +693,7 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
 struct DecoderState {
     /// The markers this stream is being read against, from the artifact.
     fi::ReasoningSyntax reasoning;
+    bool muse_header = true;
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
@@ -779,9 +788,41 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
                  best_match);
 }
 
+void feed_muse_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
+                    PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
+    state.think_marker_pending.append(text);
+    auto& pending = state.think_marker_pending;
+    for (;;) {
+        if (state.muse_header) {
+            const auto end = pending.find("<|message|>");
+            if (end == std::string::npos) { return; }
+            const auto header = pending.substr(0,end);
+            const auto recipient = header.find("to=");
+            state.in_reasoning = recipient != std::string::npos && header.substr(recipient+3) == "self";
+            state.muse_header = false;
+            pending.erase(0,end+11);
+        }
+        const auto end = pending.find("<|eom|>");
+        const auto hold = end == std::string::npos ? longest_suffix_prefix(pending,"<|eom|>",true) : 0;
+        const auto safe = end == std::string::npos ? pending.size()-hold : end;
+        const auto channel = state.in_reasoning ? OutputChannel::Reasoning : OutputChannel::Content;
+        feed_channel(state,channel,std::string_view(pending).substr(0,safe),policy,emitted,committed_tokens,best_match);
+        pending.erase(0,safe);
+        if (end == std::string::npos) { return; }
+        close_channel(state,channel,emitted);
+        pending.erase(0,7);
+        state.muse_header = true;
+        state.in_reasoning = false;
+    }
+}
+
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
+    if (state.reasoning.muse_glimmer) {
+        feed_muse_text(state,text,policy,emitted,committed_tokens,best_match);
+        return;
+    }
     // Which marker ends the span the stream is in. A model that writes its own opener is
     // watched for one while in content; a model handed an open turn by its prompt is not, and
     // its opener never reaches the output, so for every family served before Gemma 4 this is
@@ -859,6 +900,10 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         // UTF-8 suffix; the logical token prefix remains exact.
         state.utf8_pending.clear();
         feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
+    }
+    if (state.reasoning.muse_glimmer && state.muse_header) {
+        // A budget may end inside a protocol header; headers are never user content.
+        state.think_marker_pending.clear();
     }
     if (state.in_reasoning) {
         // Content may still hold a stop-string prefix from before this thought.
@@ -1117,7 +1162,10 @@ public:
         state.in_reasoning = starts_in_reasoning && !output.raw && !output.structured;
         // The raw path publishes the stream as the model wrote it, markers included, so it
         // is given no pair to act on.
-        if (!output.raw && !output.structured) { state.reasoning = std::move(reasoning); }
+        if (!output.raw && !output.structured) {
+            if (reasoning.muse_glimmer) { preserve_special = true; state.in_reasoning = false; }
+            state.reasoning = std::move(reasoning);
+        }
         // `preview_state` is assigned from `state` wholesale before it is fed, so it inherits
         // both the pair and the channel without being told.
     }
@@ -1400,6 +1448,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    result.uses_chat_template = true;
     // A template with no reasoning turn never starts in one, whatever the request
     // asked for: its capabilities are what the artifact can actually do.
     bool opens_reasoning = options.add_generation_prompt && options.enable_thinking &&
@@ -1410,7 +1459,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::ProcessedInput processed;
         try {
             std::optional<fi::RenderedChat> rendered;
-            if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !impl_->processor.gemma.version) {
+            if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !(impl_->processor.gemma.version || impl_->processor.gemma.muse_glimmer)) {
                 rendered = impl_->render_chat(messages, options);
                 opens_reasoning = options.add_generation_prompt &&
                     fi::prompt_opens_reasoning(rendered->text, impl_->reasoning.open);
@@ -1419,7 +1468,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             media_options.template_variables = impl_->template_variables(options);
             processed = processor.process(std::move(messages), media_options, control,
                                           std::move(rendered));
-            if (impl_->tokenizer->renders_chat_template() && (impl_->processor.lfm2_vl || impl_->processor.gemma.version)) {
+            if (impl_->tokenizer->renders_chat_template() && (impl_->processor.lfm2_vl || impl_->processor.gemma.version || impl_->processor.gemma.muse_glimmer)) {
                 opens_reasoning = options.add_generation_prompt && fi::prompt_opens_reasoning(
                     impl_->tokenizer->decode(processed.input_ids),impl_->reasoning.open);
             }
@@ -1463,6 +1512,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User;
         fi::RenderedChat rendered;
         if (raw_single) {
+            result.uses_chat_template = false;
             rendered.text = messages.front().rendered_content();
         } else {
             rendered = impl_->render_chat(messages, options);
@@ -1571,7 +1621,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         std::optional<fi::RenderedChat> rendered;
-        if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !impl_->processor.gemma.version) {
+        if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !(impl_->processor.gemma.version || impl_->processor.gemma.muse_glimmer)) {
             rendered = impl_->render_chat(messages, options);
         }
         return checked_token_count(
@@ -1645,9 +1695,15 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    auto reasoning = impl_->reasoning;
+    if (reasoning.muse_glimmer && !prompt.data_->uses_chat_template) {
+        reasoning.muse_glimmer = false;
+        reasoning.model_opens = false;
+        reasoning.open.clear(); reasoning.close.clear();
+    }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
-        impl_->reasoning));
+        std::move(reasoning)));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

@@ -294,10 +294,23 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
                             break
                 except (ValueError, OSError):
                     continue
+    if architecture == "muse-glimmer" and include_vision:
+        if mmproj is not None:
+            vl = "muse_glimmer"
+        else:
+            for candidate in gguf_path.parent.glob("*mmproj*.gguf"):
+                try:
+                    with serve_gguf.open_gguf(candidate) as projector:
+                        if projector.kv("clip.projector_type") == "muse-glimmer":
+                            vl = "muse_glimmer"
+                            break
+                except (ValueError, OSError):
+                    continue
     if vl and include_vision:
         import importlib
-        converter_module = "surogate.serve.convert." + vl + ".gguf"
-        find_projector = importlib.import_module(converter_module).find_projector
+        converter_module = "surogate.serve.convert." + vl + (".convert" if vl == "muse_glimmer" else ".gguf")
+        finder_module = "surogate.serve.convert.muse_glimmer.vision" if vl == "muse_glimmer" else converter_module
+        find_projector = importlib.import_module(finder_module).find_projector
         from surogate.serve.convert.common.gguf_source import GgufSource
         try:
             projector = find_projector(gguf_path, mmproj)
@@ -356,14 +369,14 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
             "  Registered today: Qwen3.5/3.6/3.8 (dense and MoE), Qwen3.8-Flash-Next,\n"
-            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama, Granite 4.2, LFM2 and GLM-5-Next. A target reads its\n"
+            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama, Granite 4.2, Muse-Glimmer, LFM2 and GLM-5-Next. A target reads its\n"
             "  dimensions from the artifact, so what has to match is the architecture rather\n"
             "  than the size -- a family with no target here has none yet."
         )
 
     out = cache_dir() / f"{target_key}-gguf-{fp}.sinfer"
 
-    if target_key in ("qwen4exp", "glm5_next"):
+    if target_key in ("qwen4exp", "glm5_next", "muse_glimmer"):
         return _convert_gguf_native(root, gguf_path, out, target_key=target_key,
                                     mtp_path=mtp_path, reader=reader, echo=echo)
 

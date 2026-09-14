@@ -116,10 +116,11 @@ StandaloneVisionTower::StandaloneVisionTower(const std::filesystem::path& artifa
         throw std::runtime_error(artifact.string() + " declares no vision tower");
     }
     state_->geometry = VisionGeometry::resolved(state_->reader.vision_geometry());
-    if (state_->geometry.gemma_version) {
+    if (state_->geometry.gemma_version || state_->geometry.muse_glimmer) {
         GemmaVisionPlan plan;
         TextGeometry text{}; text.hidden = state_->geometry.output_hidden;
-        bind_gemma_vision(binder,plan,text,true);
+        if (state_->geometry.muse_glimmer) { bind_muse_vision(binder,plan,text,true); }
+        else { bind_gemma_vision(binder,plan,text,true); }
         binder.discard_unconsumed();
         state_->backing = artifact::materialize(state_->reader,binder.finish(),state_->device);
         state_->weights = materialize_gemma_vision(state_->backing,plan);

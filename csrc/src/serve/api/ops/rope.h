@@ -26,8 +26,8 @@ void rope_interleaved(const Tensor& positions, int rotary_dim, float theta,
  *   DFlash full-head domain head_dim=rotary_dim=128; phi=positions[t]*theta^(-2*i/rotary_dim).
  * - Text MRoPE: positions I32 [T,3], head_dim=256, rotary_dim=64; pair i uses axis i%3 with
  *   the same frequency as Text 1-D.
- * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=72; pairs 0..17 use axis 0 and pairs
- *   18..35 use axis 1, each with local frequency theta^(-2*(i%18)/36).
+ * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=D in {64,72,96}; pairs 0..D/4-1 use axis 0 and
+ *   pairs D/4..D/2-1 use axis 1, each with local frequency theta^(-2*(i%(D/4))/(D/2)).
  *
  * positions is contiguous and theta is positive and finite. Q/K tensors are BF16
  * [head_dim,heads,T] with positive head counts, contiguous head features and heads, and an optional

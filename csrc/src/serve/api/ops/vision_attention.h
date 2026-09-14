@@ -24,7 +24,7 @@ namespace sinfer::ops {
  *   score[j]    = dot(q[:,h,t], k[:,h,j]) / sqrt(D), begin <= j < end
  *   ideal[:,h,t] = sum_j softmax(score)[j] * v[:,h,j].
  *
- * q/k/v are BF16 [D,H,P], with D=64 or D=72 and H>0, with contiguous feature and head dimensions; token strides may be
+ * q/k/v are BF16 [D,H,P], with D=64, D=72 or D=96 and H>0, with contiguous feature and head dimensions; token strides may be
  * padded. out is contiguous BF16 [D,H,P]. cu_seqlens is contiguous I32 [S+1], begins at 0,
  * ends at P, and is strictly increasing. The oracle evaluates `ideal` naively in FP64 from the
  * represented inputs. The BF16 out is promoted and compared directly with that result; output

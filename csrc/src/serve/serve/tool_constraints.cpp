@@ -142,6 +142,9 @@ std::string make_tool_constraint(const GenerationRequest& request, ToolCallForma
     const bool required = forced || request.tool_choice.mode == ToolChoiceMode::Required;
     const bool strict = std::any_of(request.tools.begin(), request.tools.end(), [](const auto& tool) { return tool.strict; });
     if (!required && !strict) { return {}; }
+    if (format == ToolCallFormat::MuseAtem) {
+        throw ApiException({.message="Muse-Glimmer supports auto tool choice without strict schemas; required, named and strict tool constraints are not yet supported", .param="tool_choice"});
+    }
     if (format == ToolCallFormat::None) {
         throw ApiException({.message="constrained tool calls require an enabled tool parser", .param="tools"});
     }

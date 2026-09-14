@@ -338,7 +338,7 @@ the model's chat template.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--reasoning-parser NAME` | `qwen3` | Read reasoning in the model's output format; also accepts `deepseek_r1`, `glm4_moe`, `think`, or `none`/`off` |
-| `--tool-call-parser NAME` | `qwen3_xml` | Read tool calls; also accepts `hermes`, `spark25`, `llama3_json`, `llama4_json`, or `none`/`off` |
+| `--tool-call-parser NAME` | `qwen3_xml` | Read tool calls; also accepts `hermes`, `spark25`, `muse_glimmer`, `llama3_json`, `llama4_json`, or `none`/`off` |
 | `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
 | `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
 
@@ -380,6 +380,24 @@ LFM2-VL text weights use the same 8-bit serving format as LFM2; the other famili
 supported GGUF text quantization.
 Qwen3-VL image and video serving has been checked with the 2B and 30B-A3B GGUF checkpoints.
 The complete 235B-A22B checkpoint has not yet been tested.
+
+### Muse-Glimmer
+
+Muse-Glimmer-30B GGUF supports text and image chat. Download the text GGUF and its
+matching `mmproj` from [the model release](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF), then run:
+
+```bash
+surogate serve /models/Muse-Glimmer-30B-UD-Q4_K_XL.gguf \
+  --mmproj /models/mmproj-Muse-Glimmer-30B-BF16.gguf --vision \
+  --enable-auto-tool-choice --tool-call-parser muse_glimmer
+```
+
+Add `--devices 0,1` to split the model across two GPUs. Omit `--vision` for text-only
+serving. Reasoning is returned separately in `reasoning_content`.
+
+Native video input and the separate DFlash draft checkpoint are not supported yet.
+Tool calls support `auto` and `none`; required/named tool choice and strict tool schemas
+are not supported for Muse-Glimmer yet.
 
 ## `--generate`: one-shot
 

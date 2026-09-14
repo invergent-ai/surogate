@@ -87,6 +87,10 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         store.register_module(
             index, "o_proj",
             Binding{attention.output.qdata, 3, g.query_size(), g.hidden});
+        if (attention.projection.output_gate.qdata) {
+            store.register_module(index, "self_attn.gate_proj",
+                Binding{attention.projection.output_gate.qdata, 7, g.hidden, g.query_size()});
+        }
         family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden, g.intermediate);
     }
     family::bind_lora_globals(store, runtime);
@@ -133,6 +137,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
+
+const detail::LoadedModelData& Package::loaded_data(const LoadedModel& model) {
+    if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    return model.impl_->data;
+}
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }

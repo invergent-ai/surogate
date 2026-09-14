@@ -1551,6 +1551,48 @@ int test_reasoning_split(const Frontend& frontend) {
 
 // #102: a round may cross the model-opened reasoning boundary repeatedly,
 // including several markers inside one decoded token. Stops snapshot this output.
+int test_muse_output_headers() {
+    const std::string source=" to=self<|message|>thought<|eom|><|start|>assistant to=user<|message|>answer";
+    int failures=0;
+    for (std::size_t split=0;split<=source.size();++split) {
+        auto owned=resources();
+        auto tokenizer=nlohmann::json::parse(owned.tokenizer_json);
+        auto config=nlohmann::json::parse(owned.tokenizer_config_json);
+        config["response_template"]={{"type","muse_glimmer"}};
+        const auto pieces=std::vector<std::string>{source.substr(0,split),source.substr(split)};
+        std::vector<sinfer::TokenId> ids;
+        for (int i=0;i<2;++i) {
+            if (pieces[i].empty()) { continue; }
+            tokenizer["added_tokens"].push_back(added(100+i,pieces[i]));
+            config["added_tokens_decoder"][std::to_string(100+i)]=decoder_added(pieces[i]);
+            ids.push_back(100+i);
+        }
+        owned.tokenizer_json=tokenizer.dump(); owned.tokenizer_config_json=config.dump();
+        const auto frontend=FrontendFactory::create_component(owned,false);
+        sinfer::PromptInput input;
+        sinfer::ChatMessage message;
+        message.role=sinfer::ChatRole::User;
+        message.parts.push_back({.kind=sinfer::MessagePartKind::Text,.text="x"});
+        input.messages.push_back(std::move(message));
+        const auto prompt=frontend.prepare(std::move(input));
+        const auto raw_prompt=frontend.prepare_tokens({0});
+        auto raw=frontend.make_output_session(raw_prompt,{});
+        (void)raw.preview(std::array<sinfer::TokenId,1>{0},1,sinfer::FinishReason::OutputLimit);
+        failures+=check(channel_text(raw.commit_preview(),sinfer::OutputChannel::Content)=="x",
+                        "Muse raw completion was swallowed as a message header");
+        auto session=frontend.make_output_session(prompt,{});
+        std::string content, reasoning;
+        for (std::size_t i=0;i<ids.size();++i) {
+            (void)session.preview(std::span<const sinfer::TokenId>(&ids[i],1),ids.size()-i,sinfer::FinishReason::OutputLimit);
+            const auto output=session.commit_preview();
+            content+=channel_text(output,sinfer::OutputChannel::Content);
+            reasoning+=channel_text(output,sinfer::OutputChannel::Reasoning);
+        }
+        failures+=check(content=="answer" && reasoning=="thought","Muse split header or eom corrupted output channels");
+    }
+    return failures;
+}
+
 int test_interleaved_reasoning_round() {
     auto owned = resources();
     auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
@@ -2071,6 +2113,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_interleaved_reasoning_round();
+    failures += test_muse_output_headers();
     failures += test_terminal_reasoning_preserves_content_stop_prefix();
     failures += test_byte_level_bos();
     failures += test_utf8_and_hidden_eos(frontend);

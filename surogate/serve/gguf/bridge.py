@@ -832,6 +832,8 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "qwen3"
     if arch in ("llama", "granite") and hidden > 0 and layers > 0:
         return "llama"
+    if arch == "muse-glimmer" and hidden > 0 and layers > 0:
+        return "muse_glimmer"
     if arch == "lfm2" and hidden > 0 and layers > 0:
         return "lfm2"
     if arch == "lfm2moe" and hidden > 0 and layers > 0:

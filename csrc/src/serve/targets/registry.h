@@ -5,6 +5,7 @@
 #include "runtime/engine/pipeline_instance.h"
 #include "runtime/engine/request_memory.h"
 #include <api/targets/gemma3/package.h>
+#include <api/targets/muse_glimmer/package.h>
 #include <api/targets/gemma4/package.h>
 #include <api/targets/gemma4_e/package.h>
 #include <api/targets/gemma4_moe/package.h>
@@ -31,6 +32,7 @@ struct DeviceContext;
 namespace targets {
 
 using Gemma3          = gemma3_270m::Package;
+using MuseGlimmer     = muse_glimmer::Package;
 /// One architecture, both dense sizes: the 12B and the 31B.
 using Gemma4          = gemma4::Package;
 /// The E-series pair: per-layer input embeddings and shared key/value layers.
@@ -95,6 +97,8 @@ struct TargetInstance {
 
 using LoadedGemma3 = LoadedTarget<Gemma3>;
 using Gemma3Instance = TargetInstance<Gemma3>;
+using LoadedMuseGlimmer = LoadedTarget<MuseGlimmer>;
+using MuseGlimmerInstance = TargetInstance<MuseGlimmer>;
 using LoadedGemma4 = LoadedTarget<Gemma4>;
 using Gemma4Instance = TargetInstance<Gemma4>;
 using LoadedGemma4E = LoadedTarget<Gemma4E>;
@@ -122,6 +126,7 @@ using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
 
 
 using Gemma3Pipeline = runtime::PipelineInstance<Gemma3Instance>;
+using MuseGlimmerPipeline = runtime::PipelineInstance<MuseGlimmerInstance>;
 using Gemma4Pipeline = runtime::PipelineInstance<Gemma4Instance>;
 using Gemma4EPipeline = runtime::PipelineInstance<Gemma4EInstance>;
 using Gemma4MoePipeline = runtime::PipelineInstance<Gemma4MoeInstance>;
@@ -137,7 +142,8 @@ using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
 using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
 
 using ActiveTarget =
-    std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<Gemma4Instance>,
+    std::variant<std::unique_ptr<MuseGlimmerInstance>, std::unique_ptr<MuseGlimmerPipeline>,
+                 std::unique_ptr<Gemma3Instance>, std::unique_ptr<Gemma4Instance>,
                  std::unique_ptr<Gemma4EInstance>,
                  std::unique_ptr<Gemma4MoeInstance>,
                  std::unique_ptr<Glm5NextInstance>,

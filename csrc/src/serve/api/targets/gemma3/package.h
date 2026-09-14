@@ -36,6 +36,7 @@ struct Package;
 namespace detail {
 
 struct Variant;
+class LoadedModelData;
 
 /// The one export profile a Gemma 3 artifact carries today. The family's other
 /// targets also list NVFP4 and FP8 profiles; nothing quantises a Gemma 3
@@ -97,6 +98,7 @@ struct Package {
     [[nodiscard]] static family::TextGeometry declared_geometry(const artifact::Reader& reader);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
+    [[nodiscard]] static const detail::LoadedModelData& loaded_data(const LoadedModel& model);
 };
 
 } // namespace targets::gemma3_270m
