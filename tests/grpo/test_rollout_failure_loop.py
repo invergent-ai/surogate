@@ -48,6 +48,7 @@ class _StubScheduler(Scheduler):
         self.batch_size = 8
         self.token_batch_size = None
         self.rollouts_per_example = 4
+        self.max_inflight_rollouts = 4
         self.json_logging = False
         self.update_policy_task = None
         self.inflight_requests = {}
@@ -57,7 +58,6 @@ class _StubScheduler(Scheduler):
         self.deferred_group_scoring_tasks = set()
         self.checkpoint_ready = asyncio.Event()
         self.checkpoint_ready.set()
-        self.failed_attempts_by_group = defaultdict(int)
         self.dropped_groups_by_task = defaultdict(int)
         self.empty_rollouts_by_task = defaultdict(int)
         self.errored_rollouts_by_task = defaultdict(int)
@@ -82,23 +82,22 @@ class _StubScheduler(Scheduler):
     def _rollout(self, group_id: int) -> dict:
         raise NotImplementedError
 
-    async def _fill_inflight_requests(self) -> None:
-        while len(self.inflight_requests) < self.rollouts_per_example:
-            group_id = next(
-                (gid for gid, g in self.groups.items() if g.rollouts_to_schedule > 0), None
-            )
-            if group_id is None:
-                group_id = self.next_group_id
-                self.next_group_id += 1
-                self.groups[group_id] = GroupState(
-                    example={}, rollouts_to_schedule=self.rollouts_per_example
-                )
-            self.groups[group_id].rollouts_to_schedule -= 1
-            outcome = self._rollout(group_id)
-            task = asyncio.create_task(_resolved(outcome))
-            self.inflight_requests[task] = InflightRolloutInfo(
-                off_policy_steps=0, client_config=None, task=self.TASK, group_id=group_id
-            )
+    async def schedule_rollout(self, group_id: int) -> None:
+        """The one method that would need a client, an env and a rate limiter.
+
+        Overriding only this leaves the real ``_fill_inflight_requests`` and
+        ``_schedule_next_request`` in the loop, so the guard is exercised
+        against the scheduling code it ships beside -- including its capacity
+        rule, which an earlier copy of this stub got wrong.
+        """
+        group = self.groups.get(group_id)
+        if group is None or group.rollouts_to_schedule <= 0:
+            return
+        group.rollouts_to_schedule -= 1
+        task = asyncio.create_task(_resolved(self._rollout(group_id)))
+        self.inflight_requests[task] = InflightRolloutInfo(
+            off_policy_steps=0, client_config=None, task=self.TASK, group_id=group_id
+        )
 
 
 async def _resolved(value: dict) -> dict:
@@ -117,6 +116,9 @@ class _PassThroughBuffer:
 
     def update(self, rollouts: list[dict]) -> None:
         self.rollout_buffer.extend(rollouts)
+
+    def sample_examples(self, n: int) -> list[dict]:
+        return [{} for _ in range(n)]
 
     def sample_rollouts(self, n: int) -> list[dict]:
         n = min(n, len(self.rollout_buffer))
@@ -203,22 +205,21 @@ def test_one_unrunnable_example_is_dropped_and_the_batch_still_completes():
 def _bare_scheduler() -> Scheduler:
     """Carries only what ``_note_dropped_group`` reads."""
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.failed_attempts_by_group = defaultdict(int)
     scheduler.dropped_groups_by_task = defaultdict(int)
     return scheduler
 
 
 def test_a_completed_rollout_clears_the_dropped_group_streak():
+    """A run working through some bad rows still trains; only one where
+    nothing gets through in between is unrecoverable."""
     scheduler = _bare_scheduler()
+    group = GroupState(example={}, rollouts_to_schedule=0)
 
     for _ in range(MAX_CONSECUTIVE_DROPPED_GROUPS - 1):
         scheduler._note_dropped_group("flaky", "bad row")
-    asyncio.run(scheduler._note_rollout_outcome("flaky", 99, None))
+    asyncio.run(scheduler._note_rollout_outcome("flaky", 99, group, None))
 
-    # A run working through some bad rows still trains; only one where nothing
-    # gets through in between is unrecoverable.
-    for _ in range(MAX_CONSECUTIVE_DROPPED_GROUPS - 1):
-        scheduler._note_dropped_group("flaky", "bad row")
+    assert scheduler.dropped_groups_by_task["flaky"] == 0
 
 
 def test_one_broken_task_does_not_ride_on_another_s_dropped_groups():

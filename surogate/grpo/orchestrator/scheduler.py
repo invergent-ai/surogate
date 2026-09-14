@@ -34,6 +34,13 @@ from surogate.grpo.utils.utils import (
 # healthy rollout takes seconds, so a per-task counter lets a single poison row
 # outrun the first success of a cold start and kill a run whose dataset is
 # otherwise fine.
+#
+# Composes with, rather than replaces, ``EnvConfig.max_retries``: that is the
+# environment's own budget for one rollout call and is spent inside verifiers,
+# where this never sees it. The two multiply, so an env configured with
+# ``max_retries: 4`` costs up to 80 requests before its group is dropped. That
+# is deliberate -- this bounds groups, not requests -- but it is worth knowing
+# before raising either.
 MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
 
 # ...but when groups keep dying with no rollout completing in between, the data
@@ -76,6 +83,12 @@ class GroupState:
     rollouts_to_schedule: int
     completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
     pinned_client: vf.ClientConfig | None = None
+    # Failed rollouts since this group last had one complete. Lives here
+    # rather than in a dict on the scheduler so it is released with the
+    # group: ``drop_group``, the stale-group sweep and
+    # ``cancel_inflight_rollouts`` all discard groups without knowing
+    # about it, and a parallel dict leaked an entry on each of those.
+    failed_attempts: int = 0
 
 
 class Scheduler:
@@ -163,7 +176,6 @@ class Scheduler:
         # Deliberately not cleared in get_metrics() alongside the three
         # per-step counters below: these measure streaks, and a reset every
         # step would hide a task that fails every rollout of every step.
-        self.failed_attempts_by_group: dict[int, int] = defaultdict(int)
         self.dropped_groups_by_task: dict[str, int] = defaultdict(int)
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
@@ -250,7 +262,9 @@ class Scheduler:
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
-    async def _note_rollout_outcome(self, task: str, group_id: int, failure: str | None) -> bool:
+    async def _note_rollout_outcome(
+        self, task: str, group_id: int, group: GroupState, failure: str | None
+    ) -> bool:
         """Record a rollout's outcome and report whether its group survives.
 
         ``failure`` is why the rollout is being re-scheduled, or None when it
@@ -258,12 +272,12 @@ class Scheduler:
         stops treating it as live.
         """
         if failure is None:
-            self.failed_attempts_by_group.pop(group_id, None)
+            group.failed_attempts = 0
             self.dropped_groups_by_task[task] = 0
             return True
 
-        self.failed_attempts_by_group[group_id] += 1
-        if self.failed_attempts_by_group[group_id] < MAX_ROLLOUT_ATTEMPTS_PER_GROUP:
+        group.failed_attempts += 1
+        if group.failed_attempts < MAX_ROLLOUT_ATTEMPTS_PER_GROUP:
             return True
 
         self.logger.warning(
@@ -271,7 +285,6 @@ class Scheduler:
             f"failed rollouts: {failure}"
         )
         await self.drop_group(group_id)
-        self.failed_attempts_by_group.pop(group_id, None)
         self._note_dropped_group(task, failure)
         return False
 
@@ -574,7 +587,7 @@ class Scheduler:
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
                             f"{failure}"
                         )
-                    if not await self._note_rollout_outcome(task, group_id, failure):
+                    if not await self._note_rollout_outcome(task, group_id, group, failure):
                         continue
                     if failure is not None:
                         group.rollouts_to_schedule += 1
@@ -598,7 +611,6 @@ class Scheduler:
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
-                        self.failed_attempts_by_group.pop(group_id, None)
                         self._note_dropped_group(rollout_info.task, repr(e))
                     continue
 

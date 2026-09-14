@@ -120,7 +120,7 @@ class GRPOInferenceConfig:
     # that never calls one has no reason to carry. ``tool_call_parser`` is left
     # None so the engine's own default (``qwen3_xml``) stands unless a caller
     # names one; it takes vLLM's names, so ``hermes`` is the same format.
-    enable_auto_tool_choice: bool | None = False
+    enable_auto_tool_choice: bool = False
     tool_call_parser: str | None = None
     tp: int | None = 1
     dp: int | None = 1
