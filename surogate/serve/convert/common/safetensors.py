@@ -78,6 +78,20 @@ class ShardReader:
         self.model_dir = Path(model_dir)
         index = json.loads((self.model_dir / index_filename).read_text())
         self.weight_map: dict[str, str] = dict(index["weight_map"])
+        # Some releases (including Granite 4.2 3B) retain an index from a
+        # different sharding order. Read only the headers of the listed files
+        # to resolve their actual contents; never rewrite the source checkpoint.
+        actual: dict[str, str] = {}
+        for shard in sorted(set(self.weight_map.values())):
+            with safe_open(str(self.model_dir / shard), framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    if name in actual:
+                        raise ValueError(f"tensor {name!r} occurs in multiple checkpoint shards")
+                    actual[name] = shard
+        missing = self.weight_map.keys() - actual.keys()
+        if missing:
+            raise ValueError(f"checkpoint shards are missing indexed tensors: {sorted(missing)[:8]}")
+        self.weight_map = actual
         self._canonicalize_names()
         self._reset_handle()
 

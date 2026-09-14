@@ -98,6 +98,28 @@ The GGUF includes its tokenizer and chat template. Use `--no-thinking` for direc
 or set `"chat_template_kwargs": {"enable_thinking": false}` in an individual chat request.
 Set `enable_thinking` to `true` to request reasoning output.
 
+## Granite 4.2
+
+Serve IBM's 3B, 8B, or 30B text model from a Hugging Face repo or a local GGUF:
+
+```bash
+surogate serve ibm-granite/granite-4.2-3b --enable-auto-tool-choice
+surogate serve ~/models/granite-4.2-8b-Q4_K_M.gguf --enable-auto-tool-choice
+```
+
+The original BF16 safetensors checkpoints and GGUF quantizations are supported. GGUF files
+include their tokenizer and chat template. For the 30B model, choose a GGUF that fits your
+GPU or use `--devices 0,1` to spread it across two GPUs.
+
+Thinking is enabled by default. Use `--no-thinking` for direct answers, or pass
+`"chat_template_kwargs": {"enable_thinking": false}` in a request. For lighter reasoning,
+set `"chat_template_kwargs": {"reasoning_effort": "low"}`. Tool calls use the default
+`qwen3_xml` parser; no separate parser flag is needed.
+
+The published checkpoints declare a 131,072-token context. The default `--max-model-len auto`
+fits the available memory. See [IBM's model card](https://huggingface.co/ibm-granite/granite-4.2-3b)
+for prompting examples.
+
 ## Spark-X2.5
 
 Serve either [Spark-X2.5-1.7B](https://huggingface.co/XHToken/Spark-X2.5-1.7B) or

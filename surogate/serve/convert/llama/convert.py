@@ -36,6 +36,7 @@ from surogate.serve.convert.common.checkpoint import tokenizer_domain
 
 import argparse
 import json
+import math
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -119,7 +120,21 @@ def check_optional_members(
 def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, dict]:
     """Validate the checkpoint and summarize it for the conversion report."""
 
-    family_conversion.check_members("config", config, _REQUIRED_CONFIG)
+    required = _REQUIRED_CONFIG
+    if config.get("model_type") == "granite":
+        # Granite 4.2 shares this dense stack and weight layout, but supplies
+        # its own attention multiplier instead of Llama's inverse square root.
+        required = {**required, "architectures": ["GraniteForCausalLM"],
+                    "model_type": "granite", "embedding_multiplier": 1.0,
+                    "residual_multiplier": 1.0, "logits_scaling": 1.0}
+        scale = config.get("attention_multiplier")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+            raise ValueError("config.attention_multiplier must be finite and positive")
+        rope = config.get("rope_parameters")
+        if rope is not None and (not isinstance(rope, Mapping) or rope.get("rope_type", "default") != "default" or
+                                 rope.get("rope_theta", config.get("rope_theta")) != config.get("rope_theta")):
+            raise ValueError("Granite serving requires consistent default RoPE parameters")
+    family_conversion.check_members("config", config, required)
     check_optional_members("config", config, _OPTIONAL_CONFIG)
     geometry = recipe.geometry_from_config(config)
     # Any size of the family converts: the artifact states its own dimensions and the engine
@@ -242,7 +257,11 @@ def geometry_block(preflight: "ConversionPreflight", *, token_domain: int) -> di
     """Serialize the checkpoint's resolved dimensions and execution settings."""
     from surogate.serve.convert.common.checkpoint import dense_geometry
 
-    return dense_geometry(preflight.geometry, token_domain=token_domain)
+    geometry = dense_geometry(preflight.geometry, token_domain=token_domain)
+    config = preflight.geometry.declared.hf_config
+    if config.get("model_type") == "granite":
+        geometry["attention_scale"] = float(config["attention_multiplier"])
+    return geometry
 
 
 def build_object_plan(
@@ -361,7 +380,7 @@ def build_conversion_report(
     repo_root = Path(__file__).resolve().parents[4]
     return {
         "identity": {
-            "model_id": inventory.MODEL_ID,
+            "model_id": config_summary["model_type"],
             "weights_id": inventory.WEIGHTS_ID,
         },
         "target_key": inventory.TARGET_KEY,
@@ -466,7 +485,7 @@ def convert(
     with recipe.open_reader(model) as reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="llama"),
+            ArtifactIdentity(preflight.config_summary["model_type"], inventory.WEIGHTS_ID, architecture="llama"),
             preflight.object_plan.specs,
             geometry=geometry_block(preflight, token_domain=tokenizer_domain(model)),
             layer_types=["full_attention"] * geometry.layers,

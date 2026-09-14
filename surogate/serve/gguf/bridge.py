@@ -335,6 +335,15 @@ def synthesised_config(reader, arch: str) -> dict | None:
                 "sliding_window": None,
                 "use_sliding_window": False,
                 "max_window_layers": layers}
+    if arch == "granite":
+        if kv("rope.scaling.type", "none") not in ("none", "default") or not kv("rope.scaling.finetuned", True):
+            raise ValueError("Granite serving requires enabled default RoPE")
+        return {**common, "architectures": ["GraniteForCausalLM"], "model_type": "granite",
+                "hidden_act": "silu", "mlp_bias": False,
+                "attention_multiplier": float(kv("attention.scale", common["head_dim"] ** -0.5)),
+                "embedding_multiplier": float(kv("embedding_scale", 1.0)),
+                "residual_multiplier": float(kv("residual_scale", 1.0)),
+                "logits_scaling": float(kv("logit_scale", 1.0))}
     if arch == "llama":
         from surogate.serve.gguf.frontend import extract_generation_config
         return {**common, "architectures": ["LlamaForCausalLM"], "model_type": "llama",
@@ -498,7 +507,7 @@ def _has_export_transform(arch: str, hf_name: str) -> bool:
         return hf_name.endswith(".conv.conv.weight")
     if arch == "gemma3":
         return hf_name.endswith("norm.weight")
-    if arch == "llama":
+    if arch in ("llama", "granite"):
         return hf_name.endswith(("self_attn.q_proj.weight", "self_attn.k_proj.weight"))
     return False
 
@@ -531,7 +540,7 @@ def _invert_export_transform(arch: str, hf_name: str, tensor, heads: int, kv_hea
         if hf_name.endswith("norm.weight"):
             return tensor - 1.0
         return tensor
-    if arch == "llama":
+    if arch in ("llama", "granite"):
         if hf_name.endswith("self_attn.q_proj.weight"):
             return _unpermute(tensor, heads)
         if hf_name.endswith("self_attn.k_proj.weight"):
@@ -684,7 +693,14 @@ def build_hf_dir_from_gguf(
             }
         for name in list(candidates):
             if _has_export_transform(arch, name):
-                candidates.pop(name)
+                if arch == "granite":
+                    # Undo the inherited Llama Q/K row permutation as a gather,
+                    # preserving GGUF quantization instead of requantizing it.
+                    heads = export_heads if name.endswith("q_proj.weight") else export_kv_heads
+                    rows = candidates[name]["rows"]
+                    candidates[name]["row_perm"] = _unpermute(torch.arange(rows), heads).tolist()
+                else:
+                    candidates.pop(name)
         repack_sources = repack_planner(gguf_path, candidates)
         if set(repack_sources) - set(candidates):
             raise SystemExit("surogate serve: repack planner returned non-candidate sources.")
@@ -814,7 +830,7 @@ def gguf_target_key(gguf_path: Path, reader=None):
     # rather than compiling them, so what has to match is the architecture, not the size.
     if arch == "qwen3" and hidden > 0 and layers > 0:
         return "qwen3"
-    if arch == "llama" and hidden > 0 and layers > 0:
+    if arch in ("llama", "granite") and hidden > 0 and layers > 0:
         return "llama"
     if arch == "lfm2" and hidden > 0 and layers > 0:
         return "lfm2"

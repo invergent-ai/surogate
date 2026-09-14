@@ -190,7 +190,9 @@ def test_cached_scores_extend_and_upgrade(server, length):
         if count <= 5 or length == 1:
             assert done["result"]["prefix_cache_hit_tokens"] == len(prompt)
         else:
-            assert done["result"]["prefix_cache_hit_tokens"] == 0
+            # Dense prefix caches can retain the first token: it has no
+            # preceding-token score to upgrade. All scored tokens must replay.
+            assert done["result"]["prefix_cache_hit_tokens"] <= 1
         for i, token in enumerate(prompt[1:], 1):
             assert data[i][str(token)]["logprob"] == pytest.approx(first["prompt_logprobs"][i][str(token)]["logprob"], abs=0.02)
             assert max(1, count) <= len(data[i]) <= count + 1

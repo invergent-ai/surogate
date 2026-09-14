@@ -1,0 +1,35 @@
+{
+  "architecture": "GraniteForCausalLM",
+  "date": "2026-09-14",
+  "formats": [
+    "original BF16 safetensors",
+    "GGUF"
+  ],
+  "models": {
+    "granite-4.2-3b": {
+      "gguf": "ibm-granite/granite-4.2-3b-GGUF/granite-4.2-3b-Q8_0.gguf",
+      "gguf_reference": "llama.cpp b10665-ca3d5a3e1, identical GGUF",
+      "reference_prompts": 13,
+      "matching_next_tokens": 13,
+      "max_next_token_logprob_difference": 0.093658447265625,
+      "safetensors_reference": "Transformers GraniteForCausalLM, original IBM BF16 checkpoint",
+      "hf_reference_prompts": 8,
+      "hf_matching_next_tokens": 8,
+      "hf_max_selected_logprob_difference": 0.03334212303161621,
+      "tokenizer_parity_cases": 405,
+      "http_checks": [
+        "streaming",
+        "four concurrent requests",
+        "thinking",
+        "auto tool call",
+        "tool result follow-up"
+      ],
+      "single_gpu_logprob_tests_passed": 28,
+      "two_gpu_logprob_tests_passed": 28,
+      "two_gpu_devices": [
+        6,
+        7
+      ]
+    }
+  }
+}

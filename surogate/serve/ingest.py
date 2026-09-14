@@ -101,6 +101,9 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type == "llama" and hidden > 0 and layers > 0:
         return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama",
                                gguf_repack=True)
+    if model_type == "granite" and hidden > 0 and layers > 0:
+        return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Granite 4.2",
+                               gguf_repack=True)
     if model_type in ("gemma3", "gemma3_text") and hidden > 0 and layers > 0:
         return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3",
                                gguf_repack=True)
@@ -353,7 +356,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
             "  Registered today: Qwen3.5/3.6/3.8 (dense and MoE), Qwen3.8-Flash-Next,\n"
-            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama, LFM2 and GLM-5-Next. A target reads its\n"
+            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama, Granite 4.2, LFM2 and GLM-5-Next. A target reads its\n"
             "  dimensions from the artifact, so what has to match is the architecture rather\n"
             "  than the size -- a family with no target here has none yet."
         )
