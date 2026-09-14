@@ -178,5 +178,11 @@ def test_the_gate_without_a_parser_is_refused_before_launch():
 def test_an_unfamiliar_parser_name_is_left_to_the_engine():
     """The parser registry grows between releases; a copy of it here would go
     stale and refuse a name the shipped engine accepts."""
-    argv = _argv({"model": "m", "tool_call_parser": "muse_glimmer"})
+    # With the gate on, so the validation actually runs: without it the guard
+    # is never reached and widening it to a stale allowlist would go unnoticed.
+    argv = _argv({
+        "model": "m", "tool_call_parser": "muse_glimmer",
+        "enable_auto_tool_choice": True,
+    })
     assert _value(argv, "--tool-call-parser") == "muse_glimmer"
+    assert "--enable-auto-tool-choice" in argv

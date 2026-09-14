@@ -197,6 +197,11 @@ class Scheduler:
         # get_metrics() alongside the three counters below: resetting every
         # step would hide a task that fails every rollout of every step.
         self.dropped_groups_by_task: dict[str, int] = defaultdict(int)
+        # What the streak above cannot report. It is reset by any rollout that
+        # completes, so summing it answers "is a task failing right now", not
+        # "how much training data has this run thrown away" -- and the second
+        # is the question a dropped group raises.
+        self.total_dropped_groups = 0
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
@@ -311,6 +316,7 @@ class Scheduler:
     def _note_dropped_group(self, task: str, failure: str) -> None:
         """Count a dropped group; fail the run once dropping stops helping."""
         self.dropped_groups_by_task[task] += 1
+        self.total_dropped_groups += 1
         if self.dropped_groups_by_task[task] >= MAX_CONSECUTIVE_DROPPED_GROUPS:
             raise RolloutFailureLoop(
                 f"{task}: {MAX_CONSECUTIVE_DROPPED_GROUPS} groups dropped in a row with no rollout "
@@ -746,10 +752,11 @@ class Scheduler:
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,
             "scheduler/cancelled_rollouts": self.cancelled_rollouts_count,
-            # Examples the guard discarded. Not cleared below with the
-            # per-step counters: it is a streak, and a run silently throwing
-            # away training data should stay visible after the step that did it.
-            "scheduler/dropped_groups": sum(self.dropped_groups_by_task.values()),
+            # Examples the guard discarded, for the life of the run. Not the
+            # streak, which any completed rollout resets: a run dropping one
+            # group per step with successes in between would report 0 at every
+            # step, and be invisible in exactly the case worth seeing.
+            "scheduler/dropped_groups": self.total_dropped_groups,
             "empty_rollouts/all": sum(self.empty_rollouts_by_task.values()) / max(total_rollouts, 1),
             "errored_rollouts/all": sum(self.errored_rollouts_by_task.values()) / max(total_rollouts, 1),
             "off_policy_level/all/max": self.max_off_policy_level,

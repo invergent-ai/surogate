@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,6 +60,7 @@ class _StubScheduler(Scheduler):
         self.checkpoint_ready = asyncio.Event()
         self.checkpoint_ready.set()
         self.dropped_groups_by_task = defaultdict(int)
+        self.total_dropped_groups = 0
         self.empty_rollouts_by_task = defaultdict(int)
         self.errored_rollouts_by_task = defaultdict(int)
         self.total_rollouts_by_task = defaultdict(int)
@@ -286,11 +288,46 @@ def test_a_storm_of_raised_rollouts_does_not_fail_the_run():
 # ── The streak resets on progress ─────────────────────────────────────
 
 
+def _metrics(scheduler: Scheduler) -> dict:
+    """``get_metrics`` on a scheduler built only for the counter paths."""
+    scheduler.wait_for_ckpt_time = 0.0
+    scheduler.update_weights_time = 0.0
+    scheduler.step = 0
+    scheduler.ckpt_step = 0
+    scheduler.cancelled_rollouts_count = 0
+    scheduler.inflight_requests = {}
+    scheduler.groups = {}
+    scheduler.empty_rollouts_by_task = defaultdict(int)
+    scheduler.errored_rollouts_by_task = defaultdict(int)
+    scheduler.total_rollouts_by_task = defaultdict(int)
+    scheduler.inference_pool = SimpleNamespace(get_metrics=lambda: {})
+    return scheduler.get_metrics()
+
+
 def _bare_scheduler() -> Scheduler:
     """Carries only what ``_note_dropped_group`` reads."""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.dropped_groups_by_task = defaultdict(int)
+    scheduler.total_dropped_groups = 0
     return scheduler
+
+
+def test_the_dropped_group_gauge_survives_a_success():
+    """The streak answers "is this task failing now"; the gauge answers "how
+    much training data has this run thrown away". A run dropping a group per
+    step with successes in between reports 0 forever if they are the same
+    number."""
+    scheduler = _bare_scheduler()
+    group = GroupState(example={}, rollouts_to_schedule=0)
+
+    scheduler._note_dropped_group("flaky", "bad row")
+    asyncio.run(scheduler._note_rollout_outcome("flaky", 99, group, None))
+
+    assert scheduler.dropped_groups_by_task["flaky"] == 0
+
+    # Through get_metrics, because that is where the gauge was wrong: it read
+    # the streak, which this success has just zeroed.
+    assert _metrics(scheduler)["scheduler/dropped_groups"] == 1
 
 
 def test_a_completed_rollout_clears_the_dropped_group_streak():
