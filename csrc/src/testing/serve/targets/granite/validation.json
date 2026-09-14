@@ -30,6 +30,26 @@
         6,
         7
       ]
+    },
+    "granite-4.2-8b": {
+      "gguf": "ibm-granite/granite-4.2-8b-GGUF/granite-4.2-8b-Q4_K_M.gguf",
+      "gguf_reference": "llama.cpp b10665-ca3d5a3e1, identical GGUF",
+      "reference_prompts": 13,
+      "matching_next_tokens": 13,
+      "max_next_token_logprob_difference": 0.12202078104019165,
+      "tokenizer_parity_cases": 405,
+      "http_checks": [
+        "streaming",
+        "four concurrent requests",
+        "thinking",
+        "auto tool call",
+        "tool result follow-up"
+      ],
+      "two_gpu_logprob_tests_passed": 28,
+      "two_gpu_devices": [
+        6,
+        7
+      ]
     }
   }
 }
