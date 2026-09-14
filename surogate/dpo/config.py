@@ -85,6 +85,18 @@ class DPOTrainConfig(SFTConfig):
 
         super().__init__(cfg)
 
+        # DPO scores each pair against a frozen reference, which is these same
+        # resident weights with the adapter switched off (see the module docstring
+        # in dpo/trainer.py) -- which is why a DPO run fits in one model's worth of
+        # memory. A full fine-tune moves the base and leaves nothing to score
+        # against. Refused here rather than only in the UI: the CLI, a hand-written
+        # yaml and a direct config write all pass through this constructor.
+        if not self.lora:
+            raise ValueError(
+                "DPO requires `lora: true`: each pair is scored against the frozen "
+                "base. Use SFT to update every weight."
+            )
+
         for ds_cfg in self.datasets or []:
             if ds_cfg.type != SurogateDatasetType.preference:
                 raise ValueError(

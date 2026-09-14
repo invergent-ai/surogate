@@ -238,7 +238,7 @@ async def update_weights(
 
     With a LoRA adapter the server hot-loads it through /load_lora_adapter. A
     full-model update posts /update_weights, which the engine does not serve
-    yet; the 404 is logged and the update skipped rather than failing the step.
+    yet, so that path fails the run rather than continuing without it.
     """
     weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
 
@@ -252,8 +252,15 @@ async def update_weights(
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
-                    logger.warning("The route /update_weights does not exist. Skipping weight update.")
-                    return
+                    # Skipping this leaves the policy frozen at its initial weights
+                    # while the trainer keeps stepping and broadcasting: the run
+                    # completes, reports a loss curve, and every rollout after the
+                    # first came from a model that never changed.
+                    raise RuntimeError(
+                        "The rollout engine cannot reload full weights, so this "
+                        "run would train against a policy that never updates. "
+                        "Use lora: true."
+                    ) from e
                 raise
 
         await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
