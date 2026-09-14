@@ -6,13 +6,13 @@ from collections.abc import Awaitable, Callable
 from itertools import cycle
 from logging.handlers import QueueHandler
 from threading import Event, Thread
-from typing import Any
+from typing import Any, cast
 
 import verifiers as vf
 from verifiers.serve import EnvClient, ZMQEnvClient, ZMQEnvServer
 from verifiers.utils.serve_utils import get_free_port
 
-from surogate.grpo.utils.logger import InterceptHandler, ProgressTracker
+from surogate.grpo.utils.logger import InterceptHandler, ProgressTracker, get_logger
 
 DEFAULT_RETRIES = 0
 REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
@@ -277,6 +277,7 @@ async def generate(
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
     pbar_description: str = "Generating rollouts",
+    deferred_tasks: set[str] | None = None,
 ) -> list[vf.RolloutOutput]:
     """
     Wrapper for vf.Environment.generate().
@@ -284,6 +285,10 @@ async def generate(
     NOTE: Currently we cannot use vf.Environment.generate() directly because it does not support multiple clients.
 
     Asynchronously generates and scores a list of groups.
+
+    *deferred_tasks* names the tasks whose rubric scores a whole group, which run
+    with ``score_rollouts=False``. Their groups are scored here, as each completes;
+    without it every rollout comes back carrying its default reward.
     """
 
     if not clients and get_client is None:
@@ -310,8 +315,12 @@ async def generate(
             state_columns=state_columns,
             sampling_args=sampling_args,
         )
+        # Scored here, where the group still is one, and concurrently with the
+        # other groups' generation rather than after all of them. A group that
+        # could not be scored comes back empty and drops out of the flatten below.
+        scored = await score_group_best_effort(env, result, deferred_tasks or set())
         pbar.update(rollouts_per_example)
-        return result
+        return scored
 
     try:
         group_outputs_list: list[list[vf.RolloutOutput]] = await asyncio.gather(
@@ -453,6 +462,83 @@ def task_uses_group_scoring(env: vf.Environment, task_name: str) -> bool:
     """Check if a task's rubric contains any group-level reward functions."""
     rubric = env.get_env_for_name(task_name).rubric
     return any(rubric._is_group_func(func) for func in rubric._get_reward_funcs())
+
+
+def group_scoring_failed(group: list[vf.RolloutOutput]) -> bool:
+    """Whether a scored group is carrying a judge failure rather than a score.
+
+    A judge-backed rubric does not necessarily raise when its judge fails.
+    RULER's `swallow_exceptions` defaults to true, in which case it flags
+    `ruler_judge_failed` on every state and returns a reward of 0.0 for the whole
+    group. Returning normally with zeros is indistinguishable, downstream, from a
+    group the model genuinely scored zero on: exactly the confident zero this
+    whole path exists to stop reporting.
+    """
+    return any(
+        key.endswith("_judge_failed") and float(value) > 0.0
+        for rollout in group
+        for key, value in (rollout.get("metrics") or {}).items()
+    )
+
+
+async def score_group_best_effort(
+    env: vf.Environment,
+    group: list[vf.RolloutOutput],
+    deferred_tasks: set[str],
+) -> list[vf.RolloutOutput]:
+    """``score_group_if_deferred``, but an unscorable group is dropped, not reported.
+
+    Returns the group, or empty if it could not be scored. A caller aggregating
+    these wants nothing rather than zeros: a val mean dragged to zero by a failed
+    judge is indistinguishable from a model that has stopped learning, which is
+    the reading this metric invites and the reason this path exists.
+
+    Covers both shapes of failure, because a rubric can express it either way: a
+    raise (`swallow_exceptions: false`) and a returned zero with the failure
+    flagged in the metrics (the default).
+    """
+    if not deferred_tasks:
+        return group
+    try:
+        await score_group_if_deferred(env, group, deferred_tasks)
+        # Inside the `try`, not after it: this reads metric values written by every
+        # rubric in the group and coerces them, and a non-numeric one raising here
+        # would propagate through a `gather` with no `return_exceptions` and kill the
+        # run -- the exact failure this function exists to absorb.
+        failed = group_scoring_failed(group)
+    except Exception as e:
+        get_logger().warning(f"Scoring a validation group failed, dropping it: {e}")
+        return []
+    if failed:
+        get_logger().warning("A validation group's judge failed; dropping it rather than reporting 0.0.")
+        return []
+    return group
+
+
+async def score_group_if_deferred(
+    env: vf.Environment,
+    group: list[vf.RolloutOutput],
+    deferred_tasks: set[str],
+) -> None:
+    """Score one already-formed group whose env defers scoring, in place.
+
+    A group-level rubric ranks trajectories against each other, so rollouts for
+    these tasks are generated with ``score_rollouts=False`` and the group is
+    scored once complete. Any caller that generates and does not do this gets
+    rollouts still carrying their default reward, and every statistic over them
+    reads as a confident zero.
+
+    Takes a group rather than a batch on purpose: a batch has to be re-grouped,
+    and ``example_id`` is not unique within one, because the val buffer samples
+    with replacement. Two draws of the same example would merge into a single
+    judged group of the wrong size.
+    """
+    if not group or not deferred_tasks:
+        return
+    task = get_task(group[0])
+    if task not in deferred_tasks:
+        return
+    await env.get_env_for_name(task).rubric.score_group(cast(list[vf.State], group))
 
 
 def intercept_vf_logging(logger: str = "verifiers", level: str = "DEBUG", prefix: str | None = None):
