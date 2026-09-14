@@ -45,7 +45,7 @@ MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
 
 # ...but when groups keep dying with no rollout completing in between, the data
 # is not the problem. Observed 2026-09-03: vLLM rejected every rollout with a
-# 400 it would never accept — the same message 10,729 times in twenty minutes,
+# 400 it would never accept: the same message 10,729 times in twenty minutes,
 # ``(0/4 complete)`` never advancing, two GPUs held, and the run still
 # ``running`` with ``error`` null until a human cancelled it.
 #
@@ -53,7 +53,7 @@ MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
 # that is merely working through some bad rows, successes keep arriving between
 # the failures. Eight groups dying back to back with nothing getting through is
 # not a dataset shape. It can still be reached at a cold start by a dataset
-# that is mostly unrunnable — where failing is the right answer anyway.
+# that is mostly unrunnable, where failing is the right answer anyway.
 MAX_CONSECUTIVE_DROPPED_GROUPS = 8
 
 
@@ -61,7 +61,7 @@ class RolloutFailureLoop(RuntimeError):
     """Groups kept being dropped with no rollout completing in between.
 
     Its own type because ``generate_batch``'s rollout handling ends in a broad
-    ``except Exception`` that logs and carries on — the behaviour this exists
+    ``except Exception`` that logs and carries on, the behaviour this exists
     to stop, and which would otherwise swallow it.
     """
 

@@ -34,7 +34,7 @@ REJECTION = "ModelError() -> BadRequestError('Error code: 400 - tool choice requ
 class _StubScheduler(Scheduler):
     """A Scheduler with everything but the rollout loop stubbed out.
 
-    Real ``generate_batch``, real re-scheduling, real bookkeeping — only the
+    Real ``generate_batch``, real re-scheduling, real bookkeeping. Only the
     parts that would need an environment, a buffer and a live inference pool
     are replaced. The defect was in this wiring, not in a counter, so the
     guard is exercised through the loop it has to stop.
@@ -156,7 +156,7 @@ def test_a_rejected_task_fails_the_batch_instead_of_re_scheduling_forever():
     with pytest.raises(RolloutFailureLoop) as excinfo:
         _run_one_batch(scheduler)
 
-    # The server's own message is the diagnosis — it named the exact missing
+    # The server's own message is the diagnosis: it named the exact missing
     # flags. A bare "run failed" leaves the same mystery in a terminal state.
     assert REJECTION in str(excinfo.value)
     assert scheduler.TASK in str(excinfo.value)
