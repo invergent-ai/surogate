@@ -136,3 +136,40 @@ def test_offload_values_and_explicit_null_preserve_engine_semantics(tmp_path, se
 def test_invalid_offload_settings_fail_before_launch(name, value):
     with pytest.raises(ValueError, match=name):
         _argv({"model": "fixture", name: value})
+
+
+# ── Tool calling ──────────────────────────────────────────────────────
+#
+# A verifiers ToolEnv reads structured ``tool_calls`` back off the assistant
+# message to decide whether its loop is done. The engine only fills that field
+# for a ``tool_choice: auto`` request when the gate is open; without it the
+# request is refused and every rollout of such an environment fails, leaving
+# the run at zero rollouts holding its GPUs.
+
+
+def test_a_run_that_asks_for_tool_calling_gets_both_flags():
+    argv = _argv({
+        "model": "m", "enable_auto_tool_choice": True, "tool_call_parser": "hermes",
+    })
+    # vLLM's names are accepted: `hermes` and `qwen3_xml` are the same format.
+    assert _value(argv, "--tool-call-parser") == "hermes"
+    assert "--enable-auto-tool-choice" in argv
+    # The parser has to precede the gate: starting with the gate and no parser
+    # is refused.
+    assert argv.index("--tool-call-parser") < argv.index("--enable-auto-tool-choice")
+
+
+def test_a_run_that_never_calls_a_tool_is_launched_exactly_as_before():
+    """With the gate open the engine parses a tool call out of every
+    completion, which a run with no tools has no reason to carry."""
+    argv = _argv({"model": "m"})
+    assert "--enable-auto-tool-choice" not in argv
+    assert "--tool-call-parser" not in argv
+
+
+def test_a_parser_can_be_named_without_opening_the_gate():
+    """Naming a parser is not the same as permitting `auto`; a request may
+    still name a function explicitly."""
+    argv = _argv({"model": "m", "tool_call_parser": "llama3_json"})
+    assert _value(argv, "--tool-call-parser") == "llama3_json"
+    assert "--enable-auto-tool-choice" not in argv

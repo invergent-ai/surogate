@@ -80,6 +80,17 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
             argv += ["--max-loras", str(config.max_loras)]
         if config.max_lora_rank is not None:
             argv += ["--max-lora-rank", str(config.max_lora_rank)]
+    # Tool calling. The parser name goes first because the gate refuses to start
+    # without one, and the engine takes vLLM's names -- so the `hermes` an
+    # environment's config already asks for is the same format as `qwen3_xml`.
+    #
+    # Only passed when asked for. With the gate open the engine parses a tool
+    # call out of every completion, so a run whose environment never calls one
+    # is launched exactly as it was before.
+    if config.tool_call_parser:
+        argv += ["--tool-call-parser", str(config.tool_call_parser)]
+    if config.enable_auto_tool_choice:
+        argv += ["--enable-auto-tool-choice"]
     if config.seed is not None:
         argv += ["--seed", str(config.seed)]
 

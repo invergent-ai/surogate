@@ -108,6 +108,20 @@ class GRPOInferenceConfig:
     # also perturbs sampled logprobs, which feed GRPO's importance ratio -- measure
     # mismatch_kl before adopting.
     kv_cache_dtype: str | None = None
+    # Tool calling, the two flags the engine takes for it.
+    #
+    # A verifiers ToolEnv reads structured ``tool_calls`` back off the assistant
+    # message to decide whether its loop is done, and the engine only fills that
+    # field for a ``tool_choice: auto`` request when the gate is open -- without
+    # it the request is refused and every rollout of such an environment fails.
+    #
+    # Off by default, and only the environments that need it ask: with the gate
+    # open the engine parses a tool call out of every completion, which a run
+    # that never calls one has no reason to carry. ``tool_call_parser`` is left
+    # None so the engine's own default (``qwen3_xml``) stands unless a caller
+    # names one; it takes vLLM's names, so ``hermes`` is the same format.
+    enable_auto_tool_choice: bool | None = False
+    tool_call_parser: str | None = None
     tp: int | None = 1
     dp: int | None = 1
     enable_lora: bool | None = True
@@ -121,6 +135,8 @@ class GRPOInferenceConfig:
         self.model = cfg.get("model", self.model)
         self.max_model_len = cfg.get("max_model_len", self.max_model_len)
         self.max_num_seqs = cfg.get("max_num_seqs", self.max_num_seqs)
+        self.enable_auto_tool_choice = cfg.get("enable_auto_tool_choice", self.enable_auto_tool_choice)
+        self.tool_call_parser = cfg.get("tool_call_parser", self.tool_call_parser)
         self.gpu_layers = _offload_count("gpu_layers", cfg.get("gpu_layers"), ("all",))
         self.host_moe_layers = _offload_count("host_moe_layers", cfg.get("host_moe_layers"), ("auto", "all"))
         self.expert_slots = _offload_count("expert_slots", cfg.get("expert_slots"))
