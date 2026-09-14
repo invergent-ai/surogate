@@ -56,6 +56,12 @@ class GRPOInferenceConfig:
         port: Bind port.
         model: HuggingFace directory, hub id or GGUF the engine builds its artifact from.
         max_model_len: Maximum context length (`--max-model-len`).
+        enable_auto_tool_choice: Permit ``tool_choice: "auto"``. Required for a
+            tool-using environment, whose loop reads structured ``tool_calls``
+            back off the assistant message. Off by default.
+        tool_call_parser: How the model marks a tool call. Takes vLLM's names
+            (``hermes`` and ``qwen3_xml`` are the same format). Unset leaves the
+            engine's own default.
         max_num_seqs: Concurrency cap (`--max-num-seqs`).
         gpu_layers: Decoder layers kept on GPU; 0 offloads all, 'all' keeps all resident.
         host_moe_layers: MoE layers with experts in CPU RAM; a count, 'auto', or 'all'.
@@ -108,6 +114,20 @@ class GRPOInferenceConfig:
     # also perturbs sampled logprobs, which feed GRPO's importance ratio -- measure
     # mismatch_kl before adopting.
     kv_cache_dtype: str | None = None
+    # Tool calling, the two flags the engine takes for it.
+    #
+    # A verifiers ToolEnv reads structured ``tool_calls`` back off the assistant
+    # message to decide whether its loop is done, and the engine only fills that
+    # field for a ``tool_choice: auto`` request when the gate is open -- without
+    # it the request is refused and every rollout of such an environment fails.
+    #
+    # Off by default, and only the environments that need it ask: with the gate
+    # open the engine parses a tool call out of every completion, which a run
+    # that never calls one has no reason to carry. ``tool_call_parser`` is left
+    # None so the engine's own default (``qwen3_xml``) stands unless a caller
+    # names one; it takes vLLM's names, so ``hermes`` is the same format.
+    enable_auto_tool_choice: bool = False
+    tool_call_parser: str | None = None
     tp: int | None = 1
     dp: int | None = 1
     enable_lora: bool | None = True
@@ -121,6 +141,18 @@ class GRPOInferenceConfig:
         self.model = cfg.get("model", self.model)
         self.max_model_len = cfg.get("max_model_len", self.max_model_len)
         self.max_num_seqs = cfg.get("max_num_seqs", self.max_num_seqs)
+        self.enable_auto_tool_choice = cfg.get("enable_auto_tool_choice", self.enable_auto_tool_choice)
+        self.tool_call_parser = cfg.get("tool_call_parser", self.tool_call_parser)
+        # The engine refuses this pair at startup, and it does so after execv,
+        # so the run would show a server that never turns healthy rather than
+        # the engine's own message. Only the two "off" spellings are checked:
+        # the parser registry grows between releases, so a copy of it here
+        # would go stale and reject a name the engine accepts.
+        if self.enable_auto_tool_choice and self.tool_call_parser in ("none", "off"):
+            raise ValueError(
+                "enable_auto_tool_choice needs a tool_call_parser; "
+                f"{self.tool_call_parser!r} turns parsing off"
+            )
         self.gpu_layers = _offload_count("gpu_layers", cfg.get("gpu_layers"), ("all",))
         self.host_moe_layers = _offload_count("host_moe_layers", cfg.get("host_moe_layers"), ("auto", "all"))
         self.expert_slots = _offload_count("expert_slots", cfg.get("expert_slots"))

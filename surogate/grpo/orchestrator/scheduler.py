@@ -27,6 +27,52 @@ from surogate.grpo.utils.utils import (
 )
 
 
+# One example whose rollouts keep failing is a bad row, not a broken run: drop
+# the group and let the buffer supply another, the way the rollout-raised path
+# below already does. The group is the unit here, not the task: a rejected
+# request fails in milliseconds and is re-scheduled immediately, while a
+# healthy rollout takes seconds, so a per-task counter lets a single poison row
+# outrun the first success of a cold start and kill a run whose dataset is
+# otherwise fine.
+#
+# Sits above ``EnvConfig.max_retries``, which reaches a narrower set of
+# failures than its name suggests: ``maybe_retry`` retries only ``InfraError``
+# and ``InvalidModelResponseError``. A rejected request arrives as a plain
+# ``ModelError`` -- ``Client.get_response`` wraps every non-verifiers exception
+# into one -- which is in neither set, so for the failure this guard exists for
+# the budget is 16 requests and ``max_retries`` does not enter into it.
+#
+# It does compose, and multiply, for a sandbox or tunnel failure
+# (``InfraError``) and for an unusable model response. That is the case where
+# raising ``max_retries`` is the lever that helps, and it is worth reaching for:
+# a sandbox-backed tool environment riding out a provider blip is the most
+# plausible healthy run these thresholds would otherwise end. The default is 0,
+# so nothing multiplies until someone sets it.
+MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
+
+# ...but when groups keep dying with no rollout completing in between, the data
+# is not the problem. Observed 2026-09-03: vLLM rejected every rollout with a
+# 400 it would never accept: the same message 10,729 times in twenty minutes,
+# ``(0/4 complete)`` never advancing, two GPUs held, and the run still
+# ``running`` with ``error`` null until a human cancelled it.
+#
+# Eight, because the counter resets on any rollout that completes: in a run
+# that is merely working through some bad rows, successes keep arriving between
+# the failures. Eight groups dying back to back with nothing getting through is
+# not a dataset shape. It can still be reached at a cold start by a dataset
+# that is mostly unrunnable, where failing is the right answer anyway.
+MAX_CONSECUTIVE_DROPPED_GROUPS = 8
+
+
+class RolloutFailureLoop(RuntimeError):
+    """Groups kept being dropped with no rollout completing in between.
+
+    Its own type because ``generate_batch``'s rollout handling ends in a broad
+    ``except Exception`` that logs and carries on, the behaviour this exists
+    to stop, and which would otherwise swallow it.
+    """
+
+
 class InflightRolloutInfo(NamedTuple):
     """Metadata for an in-flight request."""
 
@@ -44,6 +90,12 @@ class GroupState:
     rollouts_to_schedule: int
     completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
     pinned_client: vf.ClientConfig | None = None
+    # Failed rollouts since this group last had one complete. Lives here
+    # rather than in a dict on the scheduler so it is released with the
+    # group: ``drop_group``, the stale-group sweep and
+    # ``cancel_inflight_rollouts`` all discard groups without knowing
+    # about it, and a parallel dict leaked an entry on each of those.
+    failed_attempts: int = 0
 
 
 class Scheduler:
@@ -128,6 +180,10 @@ class Scheduler:
         self.inflight_policy_update_task: asyncio.Task | None = None
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
+        # A streak, not a per-step tally, so it is not cleared in
+        # get_metrics() alongside the three counters below: resetting every
+        # step would hide a task that fails every rollout of every step.
+        self.dropped_groups_by_task: dict[str, int] = defaultdict(int)
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
@@ -212,6 +268,41 @@ class Scheduler:
             clients = self.inference_pool.clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
+
+    async def _note_rollout_outcome(
+        self, task: str, group_id: int, group: GroupState, failure: str | None
+    ) -> bool:
+        """Record a rollout's outcome and report whether its group survives.
+
+        ``failure`` is why the rollout is being re-scheduled, or None when it
+        completed. Returns False once the group has been dropped, so the caller
+        stops treating it as live.
+        """
+        if failure is None:
+            group.failed_attempts = 0
+            self.dropped_groups_by_task[task] = 0
+            return True
+
+        group.failed_attempts += 1
+        if group.failed_attempts < MAX_ROLLOUT_ATTEMPTS_PER_GROUP:
+            return True
+
+        self.logger.warning(
+            f"Dropping group {group_id} ({task}) after {MAX_ROLLOUT_ATTEMPTS_PER_GROUP} "
+            f"failed rollouts: {failure}"
+        )
+        await self.drop_group(group_id)
+        self._note_dropped_group(task, failure)
+        return False
+
+    def _note_dropped_group(self, task: str, failure: str) -> None:
+        """Count a dropped group; fail the run once dropping stops helping."""
+        self.dropped_groups_by_task[task] += 1
+        if self.dropped_groups_by_task[task] >= MAX_CONSECUTIVE_DROPPED_GROUPS:
+            raise RolloutFailureLoop(
+                f"{task}: {MAX_CONSECUTIVE_DROPPED_GROUPS} groups dropped in a row with no rollout "
+                f"completing in between, so re-scheduling cannot recover. Last failure: {failure}"
+            )
 
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it."""
@@ -487,23 +578,25 @@ class Scheduler:
 
                     task = rollout_info.task
                     self.total_rollouts_by_task[task] += 1
-                    should_reschedule = False
+                    failure: str | None = None
                     if len(rollout["trajectory"]) == 0:
                         self.empty_rollouts_by_task[task] += 1
-                        should_reschedule = True
+                        failure = "empty trajectory"
                         self.logger.warning(
                             f"Empty trajectory in group {group_id} ({task}), re-scheduling "
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
                         )
                     if rollout["error"] is not None:
                         self.errored_rollouts_by_task[task] += 1
-                        should_reschedule = True
+                        failure = rollout["error"]["error_chain_repr"]
                         self.logger.warning(
                             f"Rollout error in group {group_id} ({task}), re-scheduling "
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
-                            f"{rollout['error']['error_chain_repr']}"
+                            f"{failure}"
                         )
-                    if should_reschedule:
+                    if not await self._note_rollout_outcome(task, group_id, group, failure):
+                        continue
+                    if failure is not None:
                         group.rollouts_to_schedule += 1
                         continue
 
@@ -516,7 +609,28 @@ class Scheduler:
                     if group_id is not None:
                         await self.drop_group(group_id)
                     continue
+                except RolloutFailureLoop:
+                    raise
                 except Exception as e:
+                    # Dropped but deliberately NOT counted toward the streak.
+                    # This path has no per-group headroom -- it drops on the
+                    # first raise, where the errored path allows
+                    # MAX_ROLLOUT_ATTEMPTS_PER_GROUP -- so counting it let a
+                    # brief transport outage, which makes every in-flight
+                    # rollout raise at once, reach the run-killing threshold in
+                    # under a second and end a run that used to recover.
+                    #
+                    # A storm of raises therefore still spins, which is the
+                    # behaviour this path has always had. Worth knowing how
+                    # wide it is: MultiTurnEnv.rollout converts only vf.Error
+                    # into state["error"], so a rubric raising a plain
+                    # ValueError, a tool raising outside vf.ToolError, or the
+                    # env subprocess dying (which arrives here as a raised
+                    # ServerError from the ZMQ client, and nothing health-checks
+                    # those processes) all land on this path. Those are not
+                    # transient, so bounding them wants the loop's own
+                    # no-progress check rather than a third counter -- see the
+                    # batch-loop bug in bugs-training.
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
@@ -594,6 +708,10 @@ class Scheduler:
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,
             "scheduler/cancelled_rollouts": self.cancelled_rollouts_count,
+            # Examples the guard discarded. Not cleared below with the
+            # per-step counters: it is a streak, and a run silently throwing
+            # away training data should stay visible after the step that did it.
+            "scheduler/dropped_groups": sum(self.dropped_groups_by_task.values()),
             "empty_rollouts/all": sum(self.empty_rollouts_by_task.values()) / max(total_rollouts, 1),
             "errored_rollouts/all": sum(self.errored_rollouts_by_task.values()) / max(total_rollouts, 1),
             "off_policy_level/all/max": self.max_off_policy_level,
