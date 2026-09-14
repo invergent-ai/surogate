@@ -380,8 +380,21 @@ def synthesize_tokenizer_config(reader, arch: str) -> dict:
     return cfg
 
 
+def extract_sampling_defaults(reader) -> dict:
+    """Read optional GGUF sampling metadata without loading the vocabulary."""
+    settings = {}
+    for gguf_name, config_name in (
+        ("temp", "temperature"), ("top_k", "top_k"), ("top_p", "top_p"),
+        ("min_p", "min_p"), ("penalty_repeat", "repetition_penalty"),
+    ):
+        value = _field(reader, "general.sampling." + gguf_name)
+        if value is not None:
+            settings[config_name] = value
+    return settings
+
+
 def extract_generation_config(reader) -> dict:
-    """Carry declared stop, start and padding IDs into the serving frontend."""
+    """Carry declared sampling settings and stop/start/padding IDs into the frontend."""
     tokens = _field(reader, "tokenizer.ggml.tokens")
     if not isinstance(tokens, (list, tuple)) or not tokens:
         raise ValueError("GGUF must declare its tokenizer vocabulary")
@@ -412,7 +425,7 @@ def extract_generation_config(reader) -> dict:
         value = token_id(key)
         if value is not None:
             generation[name] = value
-    return generation
+    return {**generation, **extract_sampling_defaults(reader)}
 
 
 def write_frontend(reader, arch: str, out_dir: Path, *, echo=print) -> None:

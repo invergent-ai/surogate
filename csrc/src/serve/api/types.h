@@ -287,6 +287,7 @@ struct SamplingPreset {
     float min_p             = 0.0F;
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
+    float repetition_penalty = 1.0F;
 };
 
 struct ModelSamplingDefaults {
@@ -298,7 +299,7 @@ struct ModelSamplingDefaults {
     }
 };
 
-// Public request-side overrides. std::nullopt means "use the registered model/mode default";
+// Public request-side overrides. std::nullopt means "use the model/mode default";
 // explicit zero remains a real override (including temperature=0 for exact argmax).
 struct SamplingOverrides {
     std::optional<float> temperature;

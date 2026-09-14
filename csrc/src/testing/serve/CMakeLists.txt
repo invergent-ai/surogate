@@ -222,7 +222,7 @@ sinfer_add_test(sinfer_cuda_visibility_test
   LIBRARIES sinfer_product_cuda_visibility)
 sinfer_add_test(sinfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
-  LIBRARIES sinfer_engine)
+  LIBRARIES sinfer_engine sinfer_serve)
 sinfer_add_test(sinfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES sinfer_core)

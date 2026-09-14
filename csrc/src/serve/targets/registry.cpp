@@ -15,6 +15,7 @@
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/contract/sampling.h"
 #include "targets/qwen4exp/impl/config.h"
 
 #include <chrono>
@@ -269,7 +270,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     // The dimensions to plan and bind against: this target's compiled config with whatever
     // the artifact declares laid over it.
     const family::TextGeometry geometry            = Target::declared_geometry(reader);
-    const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(Target::model_id);
+    const auto generation = reader.payload("frontend/generation_config.json").data;
+    const ModelSamplingDefaults sampling_defaults = runtime::load_sampling_defaults(
+        Target::sampling_defaults(Target::model_id),
+        {reinterpret_cast<const char*>(generation.data()), generation.size()});
 
     if (options.host_moe_layers == EngineOptions::kHostMoeLayersAuto) {
         if (geometry.experts <= 0) {

@@ -165,7 +165,9 @@ def test_complete_gguf_conversion_preserves_weights(tmp_path, monkeypatch, quant
     # Even when generic native GGUF splitting is enabled, LFM retains its W8 profile.
     monkeypatch.setenv("SUROGATE_GGUF_SPLIT_HALVES", "1")
     path = tmp_path / "model.gguf"
-    stored = checkpoint(path, quantized=quantized, tied=tied)
+    stored = checkpoint(path, quantized=quantized, tied=tied, metadata={
+        "general.sampling.temp": 0.42, "general.sampling.top_k": 7,
+        "general.sampling.top_p": 0.91})
     model = build_hf_dir_from_gguf(
         path, "lfm2", tmp_path / "bridge",
         repack_planner=ingest._repack_planner(Path(__file__).resolve().parents[2], "lfm2"),
@@ -175,6 +177,11 @@ def test_complete_gguf_conversion_preserves_weights(tmp_path, monkeypatch, quant
     convert.convert(model, out, device="cpu", gguf_repack=repack if repack.exists() else None)
     with Artifact(out) as artifact:
         assert artifact.identity.architecture == "lfm2"
+        generation = json.loads(bytes(artifact.payload("frontend/generation_config.json")))
+        assert generation["temperature"] == pytest.approx(0.42)
+        assert generation["top_k"] == 7
+        assert generation["top_p"] == pytest.approx(0.91)
+        assert generation["eos_token_id"] == 4
         assert artifact.geometry["intermediate"] == 512
         assert artifact.layer_types == ["linear_attention", "full_attention", "linear_attention"]
         conv = stored["blk.0.shortconv.conv.weight"][2]

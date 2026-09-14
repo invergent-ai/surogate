@@ -580,9 +580,11 @@ def build_hf_dir_from_gguf(
     arch = reader.get_field("general.architecture").contents()
 
     # Frontend and configuration both come from this GGUF's metadata.
-    from surogate.serve.gguf.frontend import write_frontend
+    from surogate.serve.gguf.frontend import extract_generation_config, write_frontend
 
     write_frontend(reader, arch, work_dir, echo=echo)
+    (work_dir / "generation_config.json").write_text(
+        json.dumps(extract_generation_config(reader), indent=2), encoding="utf-8")
     derived = synthesised_config(reader, arch)
     if derived is None:
         raise SystemExit(f"surogate serve: architecture '{arch}' has no checkpoint config normalizer")

@@ -282,6 +282,12 @@ def test_generation_config_uses_declared_ids():
         def get_field(self, name):
             return None if name not in values else SimpleNamespace(contents=lambda: values[name])
     assert extract_generation_config(Reader()) == {"eos_token_id": [2, 3], "pad_token_id": 4}
+    values.update({"general.sampling.temp": 0.0, "general.sampling.top_k": 0,
+                   "general.sampling.top_p": 0.91, "general.sampling.min_p": 0.05,
+                   "general.sampling.penalty_repeat": 1.12})
+    assert extract_generation_config(Reader()) == {
+        "eos_token_id": [2, 3], "pad_token_id": 4, "temperature": 0.0, "top_k": 0,
+        "top_p": 0.91, "min_p": 0.05, "repetition_penalty": 1.12}
     values["tokenizer.ggml.eot_token_id"] = 5
     with pytest.raises(ValueError, match="outside its vocabulary"):
         extract_generation_config(Reader())
@@ -293,7 +299,9 @@ def test_native_frontend_comes_from_the_weight_source(tmp_path):
     values = {"general.architecture": "qwen4exp", "tokenizer.ggml.model": "gpt2",
               "tokenizer.ggml.pre": "qwen35", "tokenizer.ggml.tokens": ["a", "b", "stop"],
               "tokenizer.ggml.token_type": [1, 1, 3], "tokenizer.ggml.merges": [],
-              "tokenizer.ggml.eos_token_id": 2, "tokenizer.chat_template": "{{ messages }}"}
+              "tokenizer.ggml.eos_token_id": 2, "tokenizer.chat_template": "{{ messages }}",
+              "general.sampling.temp": 0.42, "general.sampling.top_k": 7,
+              "general.sampling.top_p": 0.91}
     class Reader:
         def kv(self, name):
             return values.get(name)
@@ -303,7 +311,8 @@ def test_native_frontend_comes_from_the_weight_source(tmp_path):
     tokenizer = json.loads((root / "tokenizer.json").read_text())
     assert tokenizer["model"]["vocab"] == {"a": 0, "b": 1}
     assert tokenizer["added_tokens"][0]["id"] == 2
-    assert json.loads((root / "generation_config.json").read_text()) == {"eos_token_id": 2}
+    assert json.loads((root / "generation_config.json").read_text()) == {
+        "eos_token_id": 2, "temperature": 0.42, "top_k": 7, "top_p": 0.91}
     assert (root / "chat_template.jinja").read_text() == "{{ messages }}"
 
 

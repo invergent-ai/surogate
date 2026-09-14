@@ -185,13 +185,18 @@ def resolve_hf_repo(repo_id: str) -> Path:
     return Path(path)
 
 
-def _gguf_fingerprint(path: Path, *extra: Path) -> str:
+def _gguf_fingerprint(path: Path, *extra: Path, generation_defaults: Mapping | None = None) -> str:
     def stamp(p: Path) -> str:
         st = p.stat()
         return f"{p.name}:{st.st_size}:{st.st_mtime_ns}"
 
     h = hashlib.sha256(f"serving-cache:{SERVING_CACHE_VERSION}:".encode())
     h.update(":".join(stamp(p) for p in (path, *extra)).encode())
+    # Older conversions discarded these fields. Only checkpoints carrying sampling
+    # metadata need a new artifact; unrelated caches remain reusable.
+    if generation_defaults:
+        h.update(b":generation-sampling-v1:")
+        h.update(json.dumps(generation_defaults, sort_keys=True, allow_nan=False).encode())
     return h.hexdigest()[:24]
 
 
@@ -255,9 +260,11 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
     (~2 bytes/param) are deleted after conversion.
     """
     from surogate.serve.gguf import bridge as serve_gguf
+    from surogate.serve.gguf.frontend import extract_sampling_defaults
 
     with serve_gguf.open_gguf(gguf_path) as source:
         architecture = source.kv("general.architecture")
+        generation_defaults = extract_sampling_defaults(source)
     vl = "qwen3_vl" if architecture in ("qwen3vl", "qwen3vlmoe") else None
     if architecture == "lfm2":
         if mmproj is not None:
@@ -293,7 +300,8 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
             projector = find_projector(gguf_path, mmproj)
             sources = GgufSource(gguf_path, extra=[projector])
             try:
-                fp = _gguf_fingerprint(sources.shards[0], *sources.shards[1:])
+                fp = _gguf_fingerprint(sources.shards[0], *sources.shards[1:],
+                                       generation_defaults=generation_defaults)
                 # GGUF-backed objects reference their source paths, so equal file stamps
                 # in different directories must never resolve to the same artifact.
                 fp = hashlib.sha256((fp + repr([str(p.resolve()) for p in sources.shards])).encode()).hexdigest()[:24]
@@ -326,11 +334,11 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
     if root is None:
         raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
 
-    # Warm start: the cache name embeds the (target-independent) fingerprint,
-    # so a hit returns without touching the GGUF — gguf-py's eager KV parse
-    # costs ~10s on a 250k-token vocabulary and must stay off this path.
+    # Warm start reads only the lightweight header and sampling fields above.
+    # A cache hit avoids decoding the full tokenizer vocabulary.
     mtp_path = _find_mtp_gguf(gguf_path)
-    fp = _gguf_fingerprint(gguf_path, *( (mtp_path,) if mtp_path is not None else () ))
+    fp = _gguf_fingerprint(gguf_path, *( (mtp_path,) if mtp_path is not None else () ),
+                           generation_defaults=generation_defaults)
     for cached in cache_dir().glob(f"*-gguf-{fp}.sinfer") if reuse_cache else ():
         if cached.is_file() and cached.stat().st_size > 0:
             echo(f"surogate serve: using cached engine weights ({cached.name})")

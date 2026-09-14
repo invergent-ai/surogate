@@ -305,8 +305,21 @@ and adapter name must be unique. The runtime load/unload endpoints accept `?mode
 
 ### Sampling defaults
 
-`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--frequency-penalty`,
-and `--seed` override the model's defaults. Request fields override individual server settings.
+For each sampling field, the precedence is:
+
+1. Explicit request parameter.
+2. Server CLI setting.
+3. The model's `generation_config.json`.
+4. Built-in family default.
+
+The generation config supplies `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
+`presence_penalty`, and `frequency_penalty`. Its values apply to both thinking modes; missing
+or `null` fields retain the family default for that mode. For GGUF models, the file's optional
+sampling metadata supplies the generation defaults. If neither source provides a field,
+the family default applies.
+
+`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, and `--frequency-penalty`
+set server defaults. `--seed` sets the random seed, which can also be overridden per request.
 `--greedy` always forces temperature zero, including when a request asks for another value.
 Requests also accept `repetition_penalty`.
 
