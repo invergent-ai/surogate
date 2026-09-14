@@ -80,8 +80,9 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
             argv += ["--max-loras", str(config.max_loras)]
         if config.max_lora_rank is not None:
             argv += ["--max-lora-rank", str(config.max_lora_rank)]
-    # Parser before gate: the engine refuses to start with the gate open and no
-    # parser named. See ``GRPOInferenceConfig`` for what these are for.
+    # See ``GRPOInferenceConfig`` for what these are for. Order is not
+    # significant -- the engine parses its flags in a loop, and its parser
+    # already defaults to ``qwen3_xml``, so the gate alone is valid.
     if config.tool_call_parser:
         argv += ["--tool-call-parser", config.tool_call_parser]
     if config.enable_auto_tool_choice:

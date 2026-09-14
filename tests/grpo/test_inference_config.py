@@ -150,9 +150,6 @@ def test_a_run_that_asks_for_tool_calling_gets_both_flags():
     })
     assert _value(argv, "--tool-call-parser") == "hermes"
     assert "--enable-auto-tool-choice" in argv
-    # The parser has to precede the gate: starting with the gate and no parser
-    # is refused.
-    assert argv.index("--tool-call-parser") < argv.index("--enable-auto-tool-choice")
 
 
 def test_a_run_that_never_calls_a_tool_is_launched_exactly_as_before():

@@ -56,6 +56,12 @@ class GRPOInferenceConfig:
         port: Bind port.
         model: HuggingFace directory, hub id or GGUF the engine builds its artifact from.
         max_model_len: Maximum context length (`--max-model-len`).
+        enable_auto_tool_choice: Permit ``tool_choice: "auto"``. Required for a
+            tool-using environment, whose loop reads structured ``tool_calls``
+            back off the assistant message. Off by default.
+        tool_call_parser: How the model marks a tool call. Takes vLLM's names
+            (``hermes`` and ``qwen3_xml`` are the same format). Unset leaves the
+            engine's own default.
         max_num_seqs: Concurrency cap (`--max-num-seqs`).
         gpu_layers: Decoder layers kept on GPU; 0 offloads all, 'all' keeps all resident.
         host_moe_layers: MoE layers with experts in CPU RAM; a count, 'auto', or 'all'.

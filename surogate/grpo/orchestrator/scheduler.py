@@ -173,8 +173,8 @@ class Scheduler:
         self.inflight_policy_update_task: asyncio.Task | None = None
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
-        # Deliberately not cleared in get_metrics() alongside the three
-        # per-step counters below: these measure streaks, and a reset every
+        # A streak, not a per-step tally, so it is not cleared in
+        # get_metrics() alongside the three counters below: resetting every
         # step would hide a task that fails every rollout of every step.
         self.dropped_groups_by_task: dict[str, int] = defaultdict(int)
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
@@ -605,13 +605,21 @@ class Scheduler:
                 except RolloutFailureLoop:
                     raise
                 except Exception as e:
-                    # A rollout that *raised* never reaches the accounting
-                    # above, so count the drop here too — otherwise a transport
-                    # failure storm spins exactly the way a rejection storm did.
+                    # Dropped but deliberately NOT counted toward the streak.
+                    # This path has no per-group headroom -- it drops on the
+                    # first raise, where the errored path allows
+                    # MAX_ROLLOUT_ATTEMPTS_PER_GROUP -- so counting it let a
+                    # brief transport outage, which makes every in-flight
+                    # rollout raise at once, reach the run-killing threshold in
+                    # under a second and end a run that used to recover.
+                    #
+                    # A storm of raises therefore still spins. That is the
+                    # behaviour this path has always had, and bounding it wants
+                    # the loop's own no-progress check rather than a third
+                    # counter -- see the batch-loop bug in bugs-training.
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
-                        self._note_dropped_group(rollout_info.task, repr(e))
                     continue
 
                 # Group is complete. Either dispatch deferred scoring (concurrent with
