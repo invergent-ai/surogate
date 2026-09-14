@@ -176,6 +176,14 @@ class Scheduler:
         self.checkpoint_ready = asyncio.Event()
         self.checkpoint_ready.set()
         self.update_weights_time, self.wait_for_ckpt_time = 0, 0
+        # A failed policy push, recorded by the push task's done-callback and
+        # re-raised by the orchestrator loop. It has to be remembered rather than
+        # simply raised: the push runs detached, and every route that awaits it
+        # discards what it raises (`safe_cancel` catches `BaseException`, and the
+        # orchestrator's cleanup gathers `stop()` with `return_exceptions=True`).
+        # A run whose policy can no longer be updated is training against a frozen
+        # policy, which must not report success.
+        self.policy_update_error: BaseException | None = None
         self.update_policy_task: asyncio.Task | None = None
         self.inflight_policy_update_task: asyncio.Task | None = None
         self.policy_update_lock = asyncio.Lock()
@@ -381,6 +389,11 @@ class Scheduler:
             await self.maybe_update_policy()
             await asyncio.sleep(1)
 
+    def raise_if_policy_update_failed(self) -> None:
+        """Re-raise a failed policy push. The orchestrator loop calls this."""
+        if self.policy_update_error is not None:
+            raise self.policy_update_error
+
     def _compute_next_ckpt_step(self) -> int:
         latest_ckpt_step = get_latest_ckpt_step(get_broadcast_dir(self.config.output_dir)) or 0
         async_away_ckpt_step = max(self.step - self.max_async_level, 0)
@@ -433,9 +446,31 @@ class Scheduler:
             def _clear_inflight_policy_update(done_task: asyncio.Task) -> None:
                 if self.inflight_policy_update_task is done_task:
                     self.inflight_policy_update_task = None
+                # Recorded here rather than around the `await` below, because that
+                # await is shielded: cancelling the loop at a batch boundary leaves
+                # this task running, so a push that fails afterwards is awaited by
+                # nobody. This callback is the one point every push reaches.
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    self.policy_update_error = done_task.exception()
+                    # `_apply_policy_update` clears `checkpoint_ready` before
+                    # waiting on the trainer and only sets it again on the success
+                    # path, so a failed push would otherwise leave `generate_batch`
+                    # blocked on it forever: the run hangs instead of failing, and
+                    # never reaches the check that would report it.
+                    self.checkpoint_ready.set()
 
             task.add_done_callback(_clear_inflight_policy_update)
             return task
+
+    async def drain_policy_update(self) -> None:
+        """Let an in-flight policy push finish so its outcome is recorded.
+
+        Teardown cancels this task, and a cancelled task records nothing, so a
+        push still running when the loop ends would be silently discarded.
+        """
+        task = self.inflight_policy_update_task
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
 
     async def maybe_update_policy(self):
         """Updates the policy to the latest available checkpoint. Aborts rollout requests that are older than the max retention steps."""

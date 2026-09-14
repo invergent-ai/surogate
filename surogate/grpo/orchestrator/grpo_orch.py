@@ -508,6 +508,12 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
             metrics_dump_file.flush()
 
         while True:
+            # A policy push that failed is a run training against a policy it can
+            # no longer update. Checked at the top so it covers the batch just
+            # generated; a push still in flight when the loop ends is drained and
+            # checked after it, below.
+            scheduler.raise_if_policy_update_failed()
+
             # Check if this run has been evicted by the trainer
             evicted_path = Path(config.output_dir) / "control" / "evicted.txt"
             if evicted_path.exists():
@@ -982,6 +988,12 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         if ckpt_manager is not None:
             logger.info("Writing final checkpoint")
             ckpt_manager.save(progress, buffer, step=progress.step)
+
+        # The loop-top check cannot see a push that started after the break, during
+        # the final evals: the cleanup below cancels it, and a cancelled task
+        # records nothing. Drain it here, while its outcome still counts.
+        await scheduler.drain_policy_update()
+        scheduler.raise_if_policy_update_failed()
 
     finally:
         # Failure and cancellation must also stop the environment workers;

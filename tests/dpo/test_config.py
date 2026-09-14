@@ -21,7 +21,7 @@ def _skip_model_loading(monkeypatch):
     monkeypatch.setattr(DPOTrainConfig, "__post_init__", fake_post_init)
 
 
-def _write(tmp_path, loss):
+def _write(tmp_path, loss, **overrides):
     p = tmp_path / "dpo.yaml"
     p.write_text(
         yaml.safe_dump(
@@ -34,6 +34,7 @@ def _write(tmp_path, loss):
                 "gpus": 1,
                 "loss": loss,
                 "datasets": [{"path": "x.jsonl", "type": "preference"}],
+                **overrides,
             }
         )
     )
@@ -127,3 +128,21 @@ def test_rejects_non_preference_dataset_type(tmp_path):
     )
     with pytest.raises(ValueError, match="must be 'type: preference'"):
         load_config(DPOTrainConfig, str(p))
+
+
+@pytest.mark.parametrize("lora", [False, None])
+def test_a_full_finetune_is_refused(tmp_path, lora):
+    """DPO scores each pair against the base model with the adapter disabled.
+
+    A full fine-tune moves that base, so there is no reference left, and the
+    trainer's final-artifact write is guarded on ``lora`` as well -- such a run
+    would train and then save nothing. ``None`` is covered because the field is
+    typed ``bool | None`` and a config can carry an explicit null.
+    """
+    with pytest.raises(ValueError, match="lora"):
+        load_config(DPOTrainConfig, _write(tmp_path, {"type": "dpo"}, lora=lora))
+
+
+def test_an_adapter_run_is_accepted(tmp_path):
+    cfg = load_config(DPOTrainConfig, _write(tmp_path, {"type": "dpo"}))
+    assert cfg.lora is True

@@ -106,8 +106,21 @@ class GRPOTrainConfig(SFTConfig):
         # trainable LoRA weights and their optimizer state stay full precision.
         #
         # Leaving master_dtype unset falls back to the model dtype (BF16). A full
-        # fine-tune that wants the old behaviour can set master_dtype: fp32 in its yaml.
-        if "gradient_dtype" not in cfg:
+        # fine-tune that wants fp32 must set BOTH master_dtype and gradient_dtype, as
+        # `examples/training/full-finetune.yaml` does -- since the gate below stops
+        # forcing fp32 gradients, setting master_dtype alone now pairs an fp32 master
+        # with BF16 gradients, which nothing exercises.
+        #
+        # All of that reasoning is about an adapter, so only apply it when there is
+        # one. The block above deliberately leaves `master_dtype` at the model dtype;
+        # pairing that BF16 master with fp32 gradients is what the backward rejects:
+        #   matmul_backward: weight-grad output tensor shape/dtype mismatch
+        # For a LoRA run the pair never arises, because the adapter carries its own
+        # dtype. For a full fine-tune it would, so leave `gradient_dtype` alone and
+        # let it follow the model dtype, exactly as SFT already does. fp32 gradients
+        # are not the problem in themselves -- `examples/training/full-finetune.yaml`
+        # runs them on a full fine-tune by asking for an fp32 master to match.
+        if "gradient_dtype" not in cfg and cfg.get("lora", True):
             cfg["gradient_dtype"] = "fp32"
 
         cfg["sample_packing"] = "false"
