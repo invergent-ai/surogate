@@ -22,7 +22,7 @@ constexpr int kKVHeads       = 8;
 constexpr int kPage          = 64;
 constexpr int kLogicalPages  = 3;
 constexpr int kPhysicalPages = 6;
-constexpr int kWindow        = 4096;
+int kWindow = 4096;
 
 std::size_t input_index(int d, int head, int token) {
     return static_cast<std::size_t>(d) +
@@ -231,7 +231,7 @@ int run_case(int tokens,
 template <typename CacheBits = std::uint16_t>
 int cyclic_graph_replay_case() {
     constexpr int tokens          = 16;
-    constexpr int first_position  = 2 * kWindow - 4;
+    const int first_position  = 2 * kWindow - 4;
     const std::size_t input_count = static_cast<std::size_t>(kHeadDim) * kKVHeads * tokens;
     const std::size_t cache_count = static_cast<std::size_t>(kHeadDim) * kWindow * kKVHeads;
     const auto host_k = prefix_inputs<CacheBits>(input_count, 0x11223344u);
@@ -506,6 +506,11 @@ int main() {
     failures += batch_selector_case<std::uint8_t>(true);
     failures += batch_selector_case<std::uint8_t>(false);
 
+    kWindow = 2048;
+    failures += run_case(16, 16, 2 * kWindow - 8, true, {}, 16);
+    failures += run_case<std::uint8_t>(16, 7, 3 * kWindow - 2, true);
+    failures += cyclic_graph_replay_case();
+    failures += batch_selector_case(true);
     if (failures != 0) {
         std::cerr << "kv_cache_append_prefix failures=" << failures << '\n';
         return 1;

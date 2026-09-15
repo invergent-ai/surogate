@@ -51,7 +51,8 @@ public:
 
     void publish(sinfer::OutputDelta delta) override {
         nb::gil_scoped_acquire gil;
-        callback_(delta.channel == sinfer::OutputChannel::Content ? "content" : "reasoning",
+        callback_(delta.channel == sinfer::OutputChannel::Reasoning ? "reasoning" :
+                  delta.channel == sinfer::OutputChannel::Tool ? "tool" : "content",
                   delta.text);
     }
 
@@ -114,6 +115,7 @@ public:
         nb::dict out;
         out["content"]              = result.content;
         out["reasoning"]            = result.reasoning;
+        out["tool_content"]         = result.tool_content;
         out["token_ids"]            = result.generated_token_ids;
         out["finish_reason"]        = finish_reason_name(result.finish_reason);
         out["prompt_tokens"]        = result.prompt.prompt_tokens;

@@ -41,6 +41,7 @@ Common server options (full list: surogate serve --engine-help):
                                  model, fp8 where linear-attention layers carry the stack)
   --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
+  --dflash-model PATH           separate Muse-Glimmer DFlash GGUF checkpoint
   --mmproj PATH                 matching vision projector for a supported vision GGUF
   --offload-vision               store image encoder/projector weights in system RAM
   --offload-embeddings           store token embeddings in system RAM
@@ -115,7 +116,7 @@ _SWITCH_OPTIONS = {
 
 def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool, str | None]:
     """Return mode, model, native options, cache policy and preparation resource."""
-    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend", "--mmproj"})
+    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend", "--mmproj", "--dflash-model"})
     switches = frozenset().union(*_SWITCH_OPTIONS.values(), {
         "--generate", "--embed", "--no-cache", "--engine-help", "--help", "-h",
     })
@@ -168,6 +169,11 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
             if not value:
                 raise ValueError("--mmproj needs a GGUF file")
             frontend = value
+            continue
+        if flag == "--dflash-model" and mode != "embed":
+            if not value:
+                raise ValueError("--dflash-model needs a GGUF file")
+            native.extend([flag, value])
             continue
         if flag not in _VALUE_OPTIONS[mode] | _SWITCH_OPTIONS[mode]:
             raise ValueError(f"{flag} is not supported in {mode} mode")
@@ -229,6 +235,26 @@ def maybe_exec_serve() -> None:
     if model is not None:
         from surogate.serve.ingest import ensure_encoder_weights, ensure_engine_weights
 
+        dflash_model = None
+        speculative = None
+        native = []
+        i = 0
+        while i < len(rest):
+            flag = rest[i]
+            takes_value = flag in _VALUE_OPTIONS[mode] or flag == "--dflash-model"
+            width = 2 if takes_value else 1
+            if flag == "--dflash-model":
+                if dflash_model is not None:
+                    raise SystemExit("surogate serve: --dflash-model may be specified only once")
+                dflash_model = rest[i + 1]
+            else:
+                native.extend(rest[i:i + width])
+                if flag == "--spec":
+                    speculative = rest[i + 1]
+            i += width
+        rest = native
+        if dflash_model is None and speculative == "dflash":
+            dflash_model = "auto"
         # Preparation follows the same logical CUDA device as the native runtime.
         # An explicit conversion override remains useful when CPU RAM is preferable.
         selected = {}
@@ -253,6 +279,8 @@ def maybe_exec_serve() -> None:
                 else:
                     if frontend is not None:
                         kwargs["mmproj"] = frontend
+                    if dflash_model is not None:
+                        kwargs["dflash_model"] = dflash_model
                     resolved = ensure_engine_weights(model, **kwargs)
         finally:
             if previous_conversion_device is None:

@@ -14,11 +14,14 @@ from tests.serve.test_qwen3_5_moe_checkpoint_config import _save, draft_config
 
 
 @pytest.mark.parametrize("vision", [False, True])
-def test_dense_drafter_round_trip_and_mismatch(tmp_path, monkeypatch, vision):
+@pytest.mark.parametrize("all_local", [False, True])
+def test_dense_drafter_round_trip_and_mismatch(tmp_path, monkeypatch, vision, all_local):
     config = config_for(vision=vision)
     config["mtp_num_hidden_layers"] = 0
     target = inventory.geometry_from_config(config, token_domain=500)
     draft = draft_config(target, targets=(0, 2))
+    if all_local:
+        draft["layer_types"][-1] = "sliding_attention"
     geometry = dflash.geometry_from_config(draft, target)
     specs, recipes = dflash.conversion_plan(geometry, target)
     model, auxiliary = tmp_path / "target", tmp_path / "drafter"

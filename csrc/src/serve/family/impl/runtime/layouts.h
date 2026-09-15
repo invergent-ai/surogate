@@ -25,13 +25,13 @@ using TensorLayout = TensorRegion;
 struct DFlashPersistentLayout {
     family::DFlashGeometry geometry;
     CyclicKVCacheLayout local;
-    family::PagedKVCacheLayout full;
+    std::optional<family::PagedKVCacheLayout> full;
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return local.payload_bytes() + full.payload_bytes();
+        return local.payload_bytes() + (full ? full->payload_bytes() : 0);
     }
 };
 

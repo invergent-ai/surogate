@@ -23,7 +23,7 @@ constexpr int kD       = 128;
 constexpr int kQHeads  = 32;
 constexpr int kKVHeads = 8;
 constexpr int kGroup   = 4;
-constexpr int kWindow  = 4096;
+int kWindow = 4096;
 constexpr float kScale = 0.08838834764831844055f;
 
 constexpr ReductionCriterion kSwaBf16Criterion{
@@ -399,6 +399,12 @@ int main() {
     failures += run_case<std::uint8_t>(16, 8194);
     failures += run_batch_case();
 
+    kWindow = 2048;
+    failures += run_case(1, 0);
+    failures += run_case(16, 2048, InputProfile::WindowBoundary);
+    failures += run_case(3, 4098);
+    failures += run_case<std::uint8_t>(16, 4098);
+    failures += run_batch_case();
     if (failures != 0) {
         std::cerr << "swa failures=" << failures << '\n';
         return 1;

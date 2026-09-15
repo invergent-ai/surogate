@@ -145,27 +145,32 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                 .checkpoint                 = [&] { check_preparation_control(control); }};
             std::vector<Image> frames;
             std::vector<double> times;
-            if (video && g.muse_glimmer) {
-                throw std::invalid_argument("Muse-Glimmer currently accepts images; native video input is not supported");
+            if (video && g.muse_glimmer && g.temporal_patch != 2) {
+                throw std::invalid_argument("rebuild the Muse GGUF conversion cache to enable temporal video input");
             }
             if (video) {
                 auto decoded =
                     media::decode::decode_video(part.media.bytes, policy, options.video_fps,
-                                                options.video_min_frames, options.video_max_frames);
+                                                options.video_min_frames, options.video_max_frames, g.muse_glimmer);
                 for (int i : decoded.indices) { times.push_back(i / decoded.fps); }
                 frames = std::move(decoded.frames);
             } else {
                 frames.push_back(media::decode::decode_image(part.media.bytes, policy));
             }
             const auto source_digest = sha256(part.media.bytes);
-            for (std::size_t frame = 0; frame < frames.size(); ++frame) {
+            if (video && g.muse_glimmer) { content += "<|vid_start|>"; }
+            const std::size_t step = video && g.muse_glimmer ? 2 : 1;
+            for (std::size_t frame = 0; frame < frames.size(); frame += step) {
                 if (video) {
                     std::ostringstream timestamp;
-                    timestamp << std::setfill('0') << std::setw(2) << int(times[frame] / 60) << ":"
+                    if (g.muse_glimmer) {
+                        if (frame) { content += "<|vid_frame_separator|>"; }
+                        timestamp << "Time: " << std::fixed << std::setprecision(1) << times[frame] << "s";
+                    } else timestamp << std::setfill('0') << std::setw(2) << int(times[frame] / 60) << ":"
                               << std::setw(2) << int(times[frame]) % 60 << " ";
                     content += timestamp.str();
                 }
-                const bool video_marker = video && g.version == 4;
+                const bool video_marker = video && (g.version == 4 || g.muse_glimmer);
                 const int budget        = video_marker ? g.video_tokens : g.image_tokens;
                 const auto append       = [&](const Image& source, std::size_t crop) {
                     const auto [height, width] = image_size(source, g, budget);
@@ -192,15 +197,16 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                         [&] {
                             const auto image = g.muse_glimmer ? resize_muse_image(source,height,width,control) :
                                 resize_processor_image(source,height,width,g.resample == 2,control);
-                            auto payload =
-                                cache.allocate_payload(patches * 3 * g.patch * g.patch, control);
+                            const auto next = video && g.muse_glimmer ?
+                                resize_muse_image(frames[std::min(frame+1, frames.size()-1)],height,width,control) : Image{};
+                            auto payload = cache.allocate_payload(patches * 3 * g.patch * g.patch * g.temporal_patch, control);
                             std::size_t cursor = 0;
                             for (int by = 0; by < height / (g.patch * g.merge); ++by) {
                                 check_preparation_control(control);
                                 for (int bx = 0; bx < width / (g.patch * g.merge); ++bx)
                                     for (int iy = 0; iy < g.merge; ++iy)
                                         for (int ix = 0; ix < g.merge; ++ix) {
-                                            const auto emit = [&](int y, int x, int c) {
+                                            const auto emit = [&](int y, int x, int c, int t = 0) {
                                                 const auto offset =
                                                     (std::size_t((by * g.merge + iy) * g.patch +
                                                                        y) *
@@ -208,18 +214,19 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                                                      (bx * g.merge + ix) * g.patch + x) *
                                                         3 +
                                                     c;
-                                                float value = image.rgb[offset] * (1.0F / 255.0F);
+                                                float value = ((t && video && g.muse_glimmer) ? next : image).rgb[offset] * (1.0F / 255.0F);
                                                 if (!g.encoder_free) {
                                                     value = 2.0F * (value - 0.5F);
                                                 }
                                                 payload->patches[cursor++] = bf16(value);
                                             };
                                             if (g.version == 3 || g.muse_glimmer) {
-                                                for (int c = 0; c < 3; ++c)
-                                                    for (int y = 0; y < g.patch; ++y)
-                                                        for (int x = 0; x < g.patch; ++x) {
-                                                            emit(y, x, c);
-                                                        }
+                                                for (int t = 0; t < g.temporal_patch; ++t)
+                                                    for (int c = 0; c < 3; ++c)
+                                                        for (int y = 0; y < g.patch; ++y)
+                                                            for (int x = 0; x < g.patch; ++x) {
+                                                                emit(y, x, c, t);
+                                                            }
                                             } else {
                                                 for (int y = 0; y < g.patch; ++y)
                                                     for (int x = 0; x < g.patch; ++x)
@@ -242,15 +249,15 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                     stats.raw_patches += patches;
                     stats.vision_tokens += tokens;
                     stats.attention_pairs += patches * patches;
-                    stats.patch_bytes += patches * 3 * g.patch * g.patch * 2;
+                    stats.patch_bytes += patches * 3 * g.patch * g.patch * 2 * g.temporal_patch;
                     out.vision_items.push_back(std::move(media.item));
                     out.media_payloads.push_back(std::move(media.payload));
                     if (g.version == 3) { content += "\n\n"; }
-                    content += g.boi_token;
+                    if (!(video && g.muse_glimmer)) { content += g.boi_token; }
                     for (std::uint64_t i = 0; i < tokens; ++i) {
                         content += video_marker ? g.video_token : g.image_token;
                     }
-                    content += g.eoi_token;
+                    if (!(video && g.muse_glimmer)) { content += g.eoi_token; }
                     if (g.version == 3) { content += "\n\n"; }
                 };
                 auto extras = g.version == 3 ? crops(frames[frame], g) : std::vector<Image>{};
@@ -263,8 +270,9 @@ ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptio
                         append(extras[i], i + 1);
                     }
                 }
-                if (video && frame + 1 < frames.size()) { content += " "; }
+                if (video && !g.muse_glimmer && frame + 1 < frames.size()) { content += " "; }
             }
+            if (video && g.muse_glimmer) { content += "<|vid_end|>"; }
             std::vector<std::uint8_t>().swap(part.media.bytes);
         }
         nlohmann::ordered_json item{{"role", role_name(message.role)}, {"content", content}};

@@ -330,6 +330,7 @@ struct ResolvedSamplingParameters {
 enum class OutputChannel : std::uint8_t {
     Content,
     Reasoning,
+    Tool,
 };
 
 struct StopString {
@@ -711,6 +712,7 @@ struct GenerationResult {
     std::vector<float> token_logprobs;
     std::string content;
     std::string reasoning;
+    std::string tool_content;
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::string stop_sequence;

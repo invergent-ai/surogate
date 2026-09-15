@@ -142,9 +142,6 @@ std::string make_tool_constraint(const GenerationRequest& request, ToolCallForma
     const bool required = forced || request.tool_choice.mode == ToolChoiceMode::Required;
     const bool strict = std::any_of(request.tools.begin(), request.tools.end(), [](const auto& tool) { return tool.strict; });
     if (!required && !strict) { return {}; }
-    if (format == ToolCallFormat::MuseAtem) {
-        throw ApiException({.message="Muse-Glimmer supports auto tool choice without strict schemas; required, named and strict tool constraints are not yet supported", .param="tool_choice"});
-    }
     if (format == ToolCallFormat::None) {
         throw ApiException({.message="constrained tool calls require an enabled tool parser", .param="tools"});
     }
@@ -163,7 +160,14 @@ std::string make_tool_constraint(const GenerationRequest& request, ToolCallForma
             }
         }
         const auto quoted = Json(tool.name).dump();
-        if (format == ToolCallFormat::QwenXml) {
+        if (format == ToolCallFormat::MuseAtem) {
+            for (const auto& newline : {std::string{}, std::string{"\n"}}) {
+                tags.push_back(tag(" to=" + tool.name + "<|message|><atem:function_calls>" + newline +
+                    "<atem:invoke name=\"" + tool.name + "\">" + newline,
+                    schema_format(schema, "muse_xml"), newline + "</atem:invoke>" + newline +
+                    "</atem:function_calls>"));
+            }
+        } else if (format == ToolCallFormat::QwenXml) {
             for (const auto& newline : {std::string{}, std::string{"\n"}}) {
                 tags.push_back(tag("<tool_call>" + newline + "{\"name\": " + quoted + ", \"arguments\": ",
                     schema_format(schema, "json"), "}" + newline + "</tool_call>"));
@@ -181,6 +185,30 @@ std::string make_tool_constraint(const GenerationRequest& request, ToolCallForma
                     schema_format(schema, "json"), "}"));
             }
         }
+    }
+    if (format == ToolCallFormat::MuseAtem) {
+        Json calls = {{"type", "tags_with_separator"}, {"tags", tags},
+                      {"separator", "<|eom|><|start|>assistant"}, {"at_least_one", true},
+                      {"stop_after_first", forced || !request.parallel_tool_calls}};
+        const auto free_message = [&](const std::string& recipient) {
+            return tag(" to=" + recipient + "<|message|>", Json{{"type", "any_text"},
+                {"excludes", Json::array({"<|eom|>", "<|start|>"})}}, "");
+        };
+        if (!required) {
+            // Auto can alternate calls, visible answers and reasoning. Like
+            // vLLM, parallel_tool_calls=false only filters the returned calls.
+            tags.push_back(free_message("user"));
+            tags.push_back(tag("<|message|>", Json{{"type", "any_text"},
+                {"excludes", Json::array({"<|eom|>", "<|start|>"})}}, ""));
+            if (thinking) { tags.push_back(free_message("self")); }
+            calls["tags"] = tags;
+            calls["stop_after_first"] = false;
+        } else if (thinking) {
+            Json reasoning = tag(" to=self<|message|>", Json{{"type", "any_text"},
+                {"excludes", Json::array({"<|eom|>", "<|start|>"})}}, "<|eom|><|start|>assistant");
+            calls = sequence(Json::array({Json{{"type", "optional"}, {"content", reasoning}}, calls}));
+        }
+        return Json{{"type", "structural_tag"}, {"format", calls}}.dump();
     }
     const bool llama = format == ToolCallFormat::Llama3Json;
     Json calls = {{"type", "tags_with_separator"}, {"tags", tags}, {"separator", llama ? "; " : "\n"},

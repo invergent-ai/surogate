@@ -160,6 +160,16 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
         auto& g = options.gemma;
         g.version = image.at("gemma_version").get<int>();
         g.muse_glimmer = image.value("muse_glimmer", false);
+        g.temporal_patch = image.value("temporal_patch_size", 1);
+        if (g.temporal_patch != 1 && (!g.muse_glimmer || g.temporal_patch != 2)) {
+            throw std::invalid_argument("unsupported temporal patch size");
+        }
+        if (g.muse_glimmer) {
+            g.video_tokens = 144;
+            options.video_fps = 2.0;
+            options.video_min_frames = 1;
+            options.video_max_frames = 96;
+        }
         g.encoder_free = image.value("encoder_free", 0) != 0;
         options.image_token_id = image.at("image_token_id").get<int>();
         g.video_token_id = image.at("video_token_id").get<int>();
@@ -611,7 +621,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
 }
 
 std::size_t channel_index(OutputChannel channel) noexcept {
-    return channel == OutputChannel::Reasoning ? 0 : 1;
+    return channel == OutputChannel::Reasoning ? 0 : channel == OutputChannel::Tool ? 2 : 1;
 }
 
 void append_delta(PublishedOutput& output, OutputChannel channel, std::string text) {
@@ -694,9 +704,10 @@ struct DecoderState {
     /// The markers this stream is being read against, from the artifact.
     fi::ReasoningSyntax reasoning;
     bool muse_header = true;
+    bool muse_tool = false;
     std::string utf8_pending;
     std::string think_marker_pending;
-    std::array<std::string, 2> stop_pending;
+    std::array<std::string, 3> stop_pending;
     std::optional<std::uint32_t> matched_stop_index;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
@@ -798,21 +809,28 @@ void feed_muse_text(DecoderState& state, std::string_view text, const StopPolicy
             if (end == std::string::npos) { return; }
             const auto header = pending.substr(0,end);
             const auto recipient = header.find("to=");
-            state.in_reasoning = recipient != std::string::npos && header.substr(recipient+3) == "self";
+            const auto name = recipient == std::string::npos ? std::string{} : header.substr(recipient+3);
+            state.in_reasoning = name == "self";
+            state.muse_tool = !name.empty() && name != "self" && name != "user";
             state.muse_header = false;
             pending.erase(0,end+11);
         }
-        const auto end = pending.find("<|eom|>");
-        const auto hold = end == std::string::npos ? longest_suffix_prefix(pending,"<|eom|>",true) : 0;
+        std::size_t end = std::string::npos, marker_size = 0, hold = 0;
+        for (const auto marker : {std::string_view{"<|eom|>"}, std::string_view{"<|eot|>"}, std::string_view{"<|start|>"}}) {
+            const auto found = pending.find(marker);
+            if (found < end) { end = found; marker_size = marker == "<|start|>" ? 0 : marker.size(); }
+            hold = std::max(hold, longest_suffix_prefix(pending,marker,true));
+        }
         const auto safe = end == std::string::npos ? pending.size()-hold : end;
-        const auto channel = state.in_reasoning ? OutputChannel::Reasoning : OutputChannel::Content;
+        const auto channel = state.in_reasoning ? OutputChannel::Reasoning :
+            state.muse_tool ? OutputChannel::Tool : OutputChannel::Content;
         feed_channel(state,channel,std::string_view(pending).substr(0,safe),policy,emitted,committed_tokens,best_match);
         pending.erase(0,safe);
         if (end == std::string::npos) { return; }
         close_channel(state,channel,emitted);
-        pending.erase(0,7);
+        pending.erase(0,marker_size);
         state.muse_header = true;
-        state.in_reasoning = false;
+        state.in_reasoning = state.muse_tool = false;
     }
 }
 
@@ -904,6 +922,12 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     if (state.reasoning.muse_glimmer && state.muse_header) {
         // A budget may end inside a protocol header; headers are never user content.
         state.think_marker_pending.clear();
+    }
+    if (state.reasoning.muse_glimmer && state.muse_tool) {
+        feed_channel(state, OutputChannel::Tool, state.think_marker_pending, policy, emitted,
+                     committed_tokens, nullptr);
+        state.think_marker_pending.clear();
+        close_channel(state, OutputChannel::Tool, emitted);
     }
     if (state.in_reasoning) {
         // Content may still hold a stop-string prefix from before this thought.

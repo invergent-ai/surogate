@@ -82,9 +82,137 @@
     "adapter numerical parity",
     "performance benchmarks"
   ],
-  "unsupported": [
-    "native video input",
-    "separate DFlash drafter",
-    "required/named/strict tool constraints"
-  ]
+  "unsupported": [],
+  "completion_validation": {
+    "date": "2026-09-15",
+    "drafter": {
+      "file": "dflash-kquant.gguf",
+      "source": "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF",
+      "revision": "faa5b025c584459c13febfa5c59883516710ae39",
+      "layers": 5,
+      "local_layers": 5,
+      "local_window": 2048,
+      "target_layers": [
+        1,
+        13,
+        25,
+        37,
+        49
+      ],
+      "mask_token": 201818,
+      "stored_matrices": "dequantized GGUF re-encoded as W8G32_F16S; target quantization unchanged",
+      "full_context_draft_cache_allocated": false
+    },
+    "temporal_projection": {
+      "source": "meta-models/Muse-Glimmer-30B",
+      "revision": "a4e59da52a7bc87ae7251dd5545c0dd437c44b68",
+      "shape": [
+        1536,
+        1176
+      ],
+      "dtype": "BF16",
+      "sha256": "b00e07d9ccf9be48df03586b0db521dbc8e030600474b52963bc783724b4218a",
+      "bytes": 3612672,
+      "folded_sum_matches_gguf_exactly": true,
+      "download": "bounded HTTP Range; status, range, length and SHA256 verified"
+    },
+    "vision_reference": [
+      {
+        "modality": "image",
+        "grid": [
+          6,
+          10
+        ],
+        "relative_l2": 0.075014,
+        "cosine": 0.9971818
+      },
+      {
+        "modality": "image",
+        "grid": [
+          34,
+          38
+        ],
+        "relative_l2": 0.042924,
+        "cosine": 0.9991627
+      },
+      {
+        "modality": "video_pair",
+        "grid": [
+          6,
+          10
+        ],
+        "relative_l2": 0.066224,
+        "cosine": 0.9978015
+      },
+      {
+        "modality": "video_pair",
+        "grid": [
+          24,
+          24
+        ],
+        "relative_l2": 0.043649,
+        "cosine": 0.9990239
+      }
+    ],
+    "video_sampling": "nine-frame 4 FPS fixture produces [0,2,5,8]; single-frame inputs pad by repeating their frame; temporal-major patch layout checked",
+    "http_configurations": [
+      {
+        "gpus": [
+          6
+        ],
+        "draft_tokens": 3,
+        "kv_dtype": "bf16",
+        "tests_passed": 9
+      },
+      {
+        "gpus": [
+          0,
+          1
+        ],
+        "draft_tokens": 15,
+        "kv_dtype": "bf16",
+        "tests_passed": 9,
+        "topology": "NUMA 0, PCIe x16 on both devices"
+      },
+      {
+        "gpus": [
+          2
+        ],
+        "draft_tokens": 15,
+        "kv_dtype": "fp8",
+        "tests_passed": 8,
+        "tests_skipped": 1,
+        "skip_reason": "no separate FP8 ordinary-decode reference configured"
+      }
+    ],
+    "http_checks": [
+      "required and named ATEM with nested strict arguments",
+      "strict auto permits direct answers and tool calls",
+      "SSE reasoning and tools without protocol leakage",
+      "concurrent image/video/text generation",
+      "greedy token IDs match ordinary target on single and physical two-GPU configurations",
+      "32 generated scores replayed at 64 and 2300-token prompts, with and without sampling",
+      "cached replay after intervening concurrent requests"
+    ],
+    "score_max_absolute_difference": 0.0,
+    "score_reference": "ordinary BF16 server on GPU 4, plus a fresh no-prefix-reuse server on GPU 5; cached and teacher-forced scores compared",
+    "regressions_fixed": [
+      "DFlash prefill checkpoint used stale decode lane instead of the current prefill lane",
+      "rewound dense prefix scored its first changed token from the old final hidden state; reproduced on old binary and passed after fix"
+    ],
+    "native_suites": [
+      "family_frontend",
+      "tool_constraints",
+      "output_parsers",
+      "tool_call_parser",
+      "media_decode",
+      "swa BF16/FP8 2048/4096 windows",
+      "kv_cache_append_prefix BF16/FP8 wrap and graph replay",
+      "bidirectional_gqa_attention"
+    ],
+    "python_unit_tests_passed": 90,
+    "real_vision_tests_passed": 4,
+    "conversion": "real text, BF16 projector and K-quant drafter; cold conversion, warm cache reuse, automatic companion discovery, and public two-GPU launcher tested; text-only and vision conversion without a drafter also checked",
+    "tool_reference": "local study/vllm MuseGlimmerToolParser: recipient scoping and exact registered doubled-name normalization; ATEM-native schema constraints added rather than imposing JSON framing"
+  }
 }

@@ -442,13 +442,14 @@ int count_frames(std::span<const std::uint8_t> input, const Policy& policy) {
 }
 
 std::vector<int> sample_indices(int total, double source_fps, double target_fps, int min_frames,
-                                int max_frames) {
+                                int max_frames, bool temporal_pairs) {
     if (total <= 0 || source_fps <= 0.0 || target_fps <= 0.0 || min_frames <= 0 ||
         max_frames < min_frames) {
         throw std::invalid_argument("invalid video sampling configuration");
     }
     int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
     count     = std::min({std::max(count, min_frames), max_frames, total});
+    if (temporal_pairs) { count = std::min(total, std::max(2, (count / 2) * 2)); }
     std::vector<int> indices(static_cast<std::size_t>(count));
     if (count == 1) {
         indices[0] = 0;
@@ -456,7 +457,7 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
     }
     for (int i = 0; i < count; ++i) {
         const double value                   = static_cast<double>(i) * (total - 1) / (count - 1);
-        indices[static_cast<std::size_t>(i)] = static_cast<int>(std::nearbyint(value));
+        indices[static_cast<std::size_t>(i)] = static_cast<int>(temporal_pairs ? std::floor(value) : std::nearbyint(value));
     }
     return indices;
 }
@@ -485,7 +486,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
 }
 
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
-                   int min_frames, int max_frames) {
+                   int min_frames, int max_frames, bool temporal_pairs) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
     Decoder probe(bytes, policy.max_decoded_pixels);
@@ -503,7 +504,7 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     if (total > policy.max_video_source_frames) {
         throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
     }
-    const std::vector<int> indices = sample_indices(total, fps, target_fps, min_frames, max_frames);
+    const std::vector<int> indices = sample_indices(total, fps, target_fps, min_frames, max_frames, temporal_pairs);
     const std::uint64_t coded_pixels =
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));

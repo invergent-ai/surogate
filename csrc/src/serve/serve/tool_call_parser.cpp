@@ -329,7 +329,17 @@ ParsedToolCallOutput parse_muse_tool_call_output(const std::string& text,
             skip_ws(text,pos);
             if (starts_with_at(text,pos,close)) { pos+=close.size(); break; }
             std::string name;
-            if (!attribute("<atem:invoke name=\"",name) || !valid_function_name(name,max_name)) { return fallback(text); }
+            if (!attribute("<atem:invoke name=\"",name)) { return fallback(text); }
+            // Muse's template advertises bare tools as name.*, and the model may
+            // emit name.name. Only collapse that exact registered doubled name.
+            if (std::none_of(tools.begin(), tools.end(), [&](const auto& tool) { return tool.name == name; })) {
+                for (const auto& tool : tools) {
+                    if (name == tool.name + "." + tool.name && tool.name.find('.') == std::string::npos) {
+                        name = tool.name; break;
+                    }
+                }
+            }
+            if (!valid_function_name(name,max_name)) { return fallback(text); }
             Json args=Json::object();
             const auto schema=function_schema(name,tools);
             for (;;) {

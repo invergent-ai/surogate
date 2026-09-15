@@ -1285,7 +1285,7 @@ int test_lfm2_image_preparation() {
 
 int test_gemma_media_preparation() {
     int failures = 0;
-    for (const int version : {3,4,5}) { // 5 exercises Gemma 4's encoder-free input.
+    for (const int version : {3,4,5,6}) { // 5 exercises Gemma 4's encoder-free input.
         const bool unified = version == 5;
         auto owned = resources("{% for message in messages %}{{ message.content }}{% endfor %}");
         auto tokenizer_json = nlohmann::json::parse(owned.tokenizer_json);
@@ -1295,7 +1295,7 @@ int test_gemma_media_preparation() {
         owned.tokenizer_json = tokenizer_json.dump();
         owned.tokenizer_config_json = tokenizer_config.dump();
         const int patch = unified ? 48 : 16;
-        const int merge = version == 3 ? 2 : unified ? 1 : 3;
+        const int merge = version == 3 || version == 6 ? 2 : unified ? 1 : 3;
         owned.preprocessor_config_json = nlohmann::json{
             {"gemma_version",version == 3 ? 3 : 4},{"encoder_free",int(unified)},
             {"image_token_id",248056},{"video_token_id",248057},
@@ -1305,6 +1305,20 @@ int test_gemma_media_preparation() {
             {"image_seq_length",4},{"resample",2},{"size",{{"height",64},{"width",64}}}
         }.dump();
         owned.video_preprocessor_config_json = R"({"max_soft_tokens":4,"num_frames":4})";
+        if (version == 6) {
+            auto config = nlohmann::json::parse(owned.preprocessor_config_json);
+            config["muse_glimmer"] = true; config["gemma_version"] = 0;
+            config["temporal_patch_size"] = 2; config["resample"] = 1;
+            owned.preprocessor_config_json = config.dump();
+            owned.video_preprocessor_config_json.clear();
+            for (const auto& token : {"<|vid_start|>","Time: 0.0s","<|vid_end|>"}) {
+                const int id = 70 + tokenizer_json["added_tokens"].size();
+                tokenizer_json["added_tokens"].push_back(added(id,token,false));
+                tokenizer_config["added_tokens_decoder"][std::to_string(id)] = decoder_added(token,false);
+            }
+            owned.tokenizer_json = tokenizer_json.dump();
+            owned.tokenizer_config_json = tokenizer_config.dump();
+        }
         const auto frontend = FrontendFactory::create_component(owned);
         for (const bool video : {false,true}) {
             auto input = image_input();
@@ -1317,8 +1331,15 @@ int test_gemma_media_preparation() {
             failures += check(data.token_ids.size() == count && data.prepare.vision_tokens == 4 && data.vision_items.size() == 1,
                 "Gemma media counts or timestamp expansion are wrong");
             const auto patches = data.media_payloads.front()->span();
-            failures += check(patches.size() == std::size_t(4*merge*merge*3*patch*patch),
+            failures += check(patches.size() == std::size_t(4*merge*merge*3*patch*patch*(version == 6 ? 2 : 1)),
                 "Gemma patch payload does not match encoder geometry");
+            if (version == 6) {
+                const std::size_t slab = 3 * patch * patch;
+                for (std::size_t at = 0; at < patches.size(); at += slab * 2) {
+                    failures += check(std::equal(patches.begin()+at, patches.begin()+at+slab,
+                        patches.begin()+at+slab), "Muse still images and odd video frames must duplicate the temporal slab");
+                }
+            }
             if (!video) {
                 failures += check(patches.front() == bf16_bits(unified ? 0.0F : -1.0F),
                     "Gemma image normalization is wrong");
@@ -1552,7 +1573,7 @@ int test_reasoning_split(const Frontend& frontend) {
 // #102: a round may cross the model-opened reasoning boundary repeatedly,
 // including several markers inside one decoded token. Stops snapshot this output.
 int test_muse_output_headers() {
-    const std::string source=" to=self<|message|>thought<|eom|><|start|>assistant to=user<|message|>answer";
+    const std::string source=" to=self<|message|>thought<atem:invoke>example</atem:invoke><|eom|><|start|>assistant to=weather<|message|>call<|eom|><|start|>assistant to=user<|message|>answer<atem:invoke>example</atem:invoke>";
     int failures=0;
     for (std::size_t split=0;split<=source.size();++split) {
         auto owned=resources();
@@ -1581,14 +1602,15 @@ int test_muse_output_headers() {
         failures+=check(channel_text(raw.commit_preview(),sinfer::OutputChannel::Content)=="x",
                         "Muse raw completion was swallowed as a message header");
         auto session=frontend.make_output_session(prompt,{});
-        std::string content, reasoning;
+        std::string content, reasoning, tools;
         for (std::size_t i=0;i<ids.size();++i) {
             (void)session.preview(std::span<const sinfer::TokenId>(&ids[i],1),ids.size()-i,sinfer::FinishReason::OutputLimit);
             const auto output=session.commit_preview();
+            tools+=channel_text(output,sinfer::OutputChannel::Tool);
             content+=channel_text(output,sinfer::OutputChannel::Content);
             reasoning+=channel_text(output,sinfer::OutputChannel::Reasoning);
         }
-        failures+=check(content=="answer" && reasoning=="thought","Muse split header or eom corrupted output channels");
+        failures+=check(content=="answer<atem:invoke>example</atem:invoke>" && reasoning=="thought<atem:invoke>example</atem:invoke>" && tools=="call","Muse split header or eom corrupted output channels");
     }
     return failures;
 }

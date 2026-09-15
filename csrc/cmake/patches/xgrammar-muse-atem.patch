@@ -1,0 +1,65 @@
+diff --git a/cpp/json_schema_converter.cc b/cpp/json_schema_converter.cc
+index eabcebb..fc29da9 100644
+--- a/cpp/json_schema_converter.cc
++++ b/cpp/json_schema_converter.cc
+@@ -4142,6 +4142,7 @@ std::optional<JSONFormat> JSONFormatFromString(const std::string& format) {
+       {"json", JSONFormat::kJSON},
+       {"qwen_xml", JSONFormat::kQwenXML},
+       {"minimax_xml", JSONFormat::kMiniMaxXML},
++      {"muse_xml", JSONFormat::kMuseXML},
+       {"deepseek_xml", JSONFormat::kDeepSeekXML},
+       {"glm_xml", JSONFormat::kGlmXML},
+       {"cohere_xml", JSONFormat::kCohereXML},
+@@ -4196,6 +4197,7 @@ Grammar JSONSchemaToGrammar(
+     }
+     case JSONFormat::kQwenXML:
+     case JSONFormat::kMiniMaxXML:
++    case JSONFormat::kMuseXML:
+     case JSONFormat::kDeepSeekXML:
+     case JSONFormat::kGlmXML:
+     case JSONFormat::kKimiK3XML: {
+@@ -4289,6 +4291,7 @@ std::string JSONSchemaToEBNF(
+     }
+     case JSONFormat::kQwenXML:
+     case JSONFormat::kMiniMaxXML:
++    case JSONFormat::kMuseXML:
+     case JSONFormat::kDeepSeekXML:
+     case JSONFormat::kGlmXML:
+     case JSONFormat::kKimiK3XML: {
+diff --git a/cpp/json_schema_converter.h b/cpp/json_schema_converter.h
+index 982f37b..6bd111d 100644
+--- a/cpp/json_schema_converter.h
++++ b/cpp/json_schema_converter.h
+@@ -201,6 +201,7 @@ enum class JSONFormat : int {
+   kGlmXML = 4,
+   kCohereXML = 5,
+   kKimiK3XML = 6,
++  kMuseXML = 7,
+ };
+ 
+ /*!
+diff --git a/cpp/json_schema_converter_ext.cc b/cpp/json_schema_converter_ext.cc
+index a14e5e0..8a97cbb 100644
+--- a/cpp/json_schema_converter_ext.cc
++++ b/cpp/json_schema_converter_ext.cc
+@@ -70,6 +70,7 @@ const std::unordered_map<JSONFormat, XMLToolCallingConverter::XMLWrapper>
+     XMLToolCallingConverter::kKeyWrapperMap = {
+         {JSONFormat::kQwenXML, {"<parameter=", ">", "", "</parameter>"}},
+         {JSONFormat::kMiniMaxXML, {"<parameter name=\"", "\">", "", "</parameter>"}},
++        {JSONFormat::kMuseXML, {"<atem:parameter name=\"", "\">", "", "</atem:parameter>"}},
+         {JSONFormat::kDeepSeekXML,
+          {"<｜DSML｜parameter name=\"",
+           "",
+diff --git a/cpp/structural_tag.cc b/cpp/structural_tag.cc
+index c965be0..f264a49 100644
+--- a/cpp/structural_tag.cc
++++ b/cpp/structural_tag.cc
+@@ -563,7 +563,7 @@ Result<JSONSchemaFormat, ISTError> StructuralTagParser::ParseJSONSchemaFormat(
+       style = it->second.get<std::string>();
+       if (style != "json" && style != "qwen_xml" && style != "minimax_xml" &&
+           style != "deepseek_xml" && style != "glm_xml" && style != "cohere_xml" &&
+-          style != "kimi_k3_xml") {
++          style != "kimi_k3_xml" && style != "muse_xml") {
+         return ResultErr<ISTError>(
+             "style must be \"json\", \"qwen_xml\", \"minimax_xml\", \"deepseek_xml\", "
+             "\"glm_xml\", \"cohere_xml\", or \"kimi_k3_xml\""

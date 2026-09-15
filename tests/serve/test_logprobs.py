@@ -216,3 +216,21 @@ def test_cached_scores_extend_and_upgrade(server, length):
     assert response.ok, response.text
     assert "2500" in response.json()["prompt_logprobs"][2]
     assert str(prompt[2]) not in response.json()["prompt_logprobs"][2]
+
+
+def test_divergent_prefix_score_uses_its_predecessor(server):
+    prefix = [100 + i % 20 for i in range(96)]
+    changed = 301
+    reference = chat(server, tokens=prefix, max_tokens=1, temperature=0,
+                     logit_bias={str(changed): 100}, logprobs=True, top_logprobs=3)
+    assert reference.ok, reference.text
+    assert reference.json()["choices"][0]["token_ids"] == [changed]
+    expected = scores(reference)[0]["logprob"]
+    # Retain a longer, different continuation. The common KV prefix can be
+    # reused, but its last hidden vector cannot score the first changed token.
+    old = chat(server, tokens=prefix + [201, 202, 203, 204], max_tokens=1, prompt_logprobs=3)
+    assert old.ok, old.text
+    replay = chat(server, tokens=prefix + [changed, 302], max_tokens=1, prompt_logprobs=3)
+    assert replay.ok, replay.text
+    actual = replay.json()["prompt_logprobs"][len(prefix)][str(changed)]["logprob"]
+    assert actual == pytest.approx(expected, abs=.12)

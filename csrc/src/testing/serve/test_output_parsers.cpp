@@ -61,6 +61,15 @@ void test_muse_tools() {
         visible+=filter.feed(std::string_view(body).substr(split));
         check(visible.empty() && filter.finish(true).empty(),"Muse tool tags leaked through split streaming");
     }
+    std::vector<ToolDefinition> registered{{.name="weather", .parameters_json=R"({"type":"object","properties":{"city":{"type":"string"}}})"}};
+    auto doubled = body;
+    doubled.replace(doubled.find("name=\"weather\""), 14, "name=\"weather.weather\"");
+    auto normalized = parse_tool_calls(ToolCallFormat::MuseAtem, doubled, 64, registered);
+    check(normalized.tool_calls.size() == 2 && normalized.tool_calls[0].name == "weather", "Muse doubled bare tool name must bind to its registered name");
+    auto unknown = body;
+    unknown.replace(unknown.find("name=\"weather\""), 14, "name=\"other.weather\"");
+    auto unchanged = parse_tool_calls(ToolCallFormat::MuseAtem, unknown, 64, registered);
+    check(unchanged.tool_calls.size() == 2 && unchanged.tool_calls[0].name == "other.weather", "Muse must not bind a different namespace by suffix");
     const auto malformed=body.substr(0,body.size()-1);
     const auto fallback=parse_tool_calls(ToolCallFormat::MuseAtem,malformed,64);
     check(!fallback.is_tool_call_response && fallback.content==malformed,"Muse malformed call must remain visible");

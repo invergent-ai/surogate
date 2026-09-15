@@ -13,7 +13,7 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 struct DFlashPersistentState {
     CyclicKVCache local;
     family::DecoderState& decoder;
-    family::PagedKVCache full;
+    std::optional<family::PagedKVCache> full;
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;

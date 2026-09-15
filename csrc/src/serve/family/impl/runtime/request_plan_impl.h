@@ -167,7 +167,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (speculative_backend == SpeculativeBackend::DFlash &&
+               cfg.dflash.local_layers < cfg.dflash.layers) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
     base->summary.admission = runtime::AdmissionResources{
@@ -346,10 +347,19 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
 
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
-        (!dflash || (!archived && (!sequence.kv || !sequence.kv->backend)) ||
+        (!dflash || (!archived && (!sequence.kv || (dflash->full && !sequence.kv->backend))) ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
+    }
+
+    // Dense KV can rewind to a shared prefix, but its retained final hidden
+    // belongs to the old end. Replay the predecessor of a changed token when
+    // its score is missing, rather than scoring it from that stale hidden.
+    if (base.prompt_logprobs >= 0 && plan->reuse == ReusePath::AppendAtFrontier &&
+        plan->reuse_base > 0 && plan->reuse_base < sequence.execution_frontier &&
+        plan->reusable_scores == plan->reuse_base) {
+        --plan->reuse_base;
     }
 
     // Missing scores before the retained frontier require prefill replay. Its

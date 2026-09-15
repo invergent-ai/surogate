@@ -186,6 +186,7 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 |---|---|
 | `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
 | `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and can be combined with `--vision` |
+| `--dflash-model PATH` | Matching separate Muse-Glimmer DFlash GGUF; see [Muse-Glimmer](#muse-glimmer) |
 | `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec`. With `--spec-adaptive`, sets the maximum |
 | `--spec-adaptive` | Adjust DFlash draft length to measured throughput. Can temporarily stop drafting and retry it later. Off by default |
 | `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
@@ -383,7 +384,7 @@ The complete 235B-A22B checkpoint has not yet been tested.
 
 ### Muse-Glimmer
 
-Muse-Glimmer-30B GGUF supports text and image chat. Download the text GGUF and its
+Muse-Glimmer-30B GGUF supports text, image, and video chat. Download the text GGUF and its
 matching `mmproj` from [the model release](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF), then run:
 
 ```bash
@@ -395,9 +396,23 @@ surogate serve /models/Muse-Glimmer-30B-UD-Q4_K_XL.gguf \
 Add `--devices 0,1` to split the model across two GPUs. Omit `--vision` for text-only
 serving. Reasoning is returned separately in `reasoning_content`.
 
-Native video input and the separate DFlash draft checkpoint are not supported yet.
-Tool calls support `auto` and `none`; required/named tool choice and strict tool schemas
-are not supported for Muse-Glimmer yet.
+Send videos using `video_url` in the chat API. The first conversion downloads a small
+video-weight file from the original model release; subsequent starts use the local cache.
+
+To enable the separate DFlash assistant, also download `dflash-kquant.gguf` from the
+same GGUF release and add:
+
+```bash
+--spec dflash --dflash-model /models/dflash-kquant.gguf --draft-tokens 15
+```
+
+With `--spec dflash`, the assistant is found automatically when it is the only DFlash
+GGUF beside the main model. DFlash works with text, images, video, and constrained
+tool calls on one or multiple GPUs. A smaller `--draft-tokens` value can improve speed
+when the assistant's suggestions are frequently rejected.
+
+Tools support `auto`, `none`, `required`, named tool choice, and strict argument schemas.
+The general [tool schema limits](api.md) also apply to Muse-Glimmer.
 
 ## `--generate`: one-shot
 

@@ -22,7 +22,7 @@ Image decode_image(std::span<const std::uint8_t> /*bytes*/, const Policy& /*poli
 }
 
 Video decode_video(std::span<const std::uint8_t> /*bytes*/, const Policy& /*policy*/,
-                   double /*target_fps*/, int /*min_frames*/, int /*max_frames*/) {
+                   double /*target_fps*/, int /*min_frames*/, int /*max_frames*/, bool /*temporal_pairs*/) {
     unavailable();
 }
 

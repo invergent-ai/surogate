@@ -63,7 +63,7 @@ struct PrefillContext {
     std::int32_t current_state_slot                         = 0;
     std::int32_t rewrite_checkpoint_state_slot              = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
-    const family::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    std::uint32_t lane = 0;
     PrefillGraphFamily* prefill_graphs                      = nullptr;
     /// The LoRA slot of the request being prefilled, -1 for the base model. Every
     /// column of a prefill chunk belongs to this one request, so the adapter is a

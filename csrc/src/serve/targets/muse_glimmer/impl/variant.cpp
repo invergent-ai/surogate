@@ -4,12 +4,15 @@
 #include "api/ops/rmsnorm.h"
 #include "api/ops/silu_mul.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/dflash_profiles.h"
 
 #define SINFER_FAMILY_VARIANT    ::sinfer::targets::muse_glimmer::detail::Variant
 #define SINFER_FAMILY_RUNTIME_NS muse_glimmer_runtime
 #include "family/impl/runtime/instantiate.h"
 
 namespace sinfer::targets::muse_glimmer::detail {
+std::vector<Variant::GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+    std::uint32_t window, std::uint32_t batch) { return family::dflash_graph_profiles(capacity, window, batch); }
 constexpr auto kPolicy = ops::LinearPolicy::A16Only;
 
 void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,

@@ -202,8 +202,8 @@ def validate_dflash_geometry(values, targets, text):
     for name in (*DFLASH_INT_FIELDS, *DFLASH_FLOAT_FIELDS):
         if name not in g or (name != "mask_token" and g[name] <= 0):
             raise ValueError(f"dflash_geometry.{name} is required and must be positive")
-    if not 2 <= g["layers"] <= 256 or g["local_layers"] != g["layers"] - 1:
-        raise ValueError("DFlash requires local layers followed by one full attention layer")
+    if not 2 <= g["layers"] <= 256 or g["local_layers"] not in (g["layers"] - 1, g["layers"]):
+        raise ValueError("DFlash requires local layers with at most one final full attention layer")
     if g["hidden"] != text.get("hidden") or g["mask_token"] >= text.get("output_rows", 0):
         raise ValueError("DFlash hidden width or mask token is incompatible with the target")
     if g["query_heads"] % g["kv_heads"] or g["head_dim"] % 2 or not 2 <= g["block_size"] <= 16:

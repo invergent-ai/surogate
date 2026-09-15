@@ -258,6 +258,9 @@ See [Devices](cli.md#devices) for the supported families. DFlash also supports p
 
 ### Preparing a DFlash pair
 
+For Muse-Glimmer GGUF, pass the separate assistant with `--dflash-model` when starting
+the server; see [Muse-Glimmer](cli.md#muse-glimmer). The preparation example below is for Qwen3.5.
+
 Use a drafter trained for the exact target checkpoint. For example,
 [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) has a matching
 [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) drafter.

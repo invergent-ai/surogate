@@ -53,6 +53,6 @@ struct Video {
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
-                   int min_frames, int max_frames);
+                   int min_frames, int max_frames, bool temporal_pairs = false);
 
 } // namespace sinfer::media::decode

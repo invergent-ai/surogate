@@ -21,6 +21,7 @@ struct Package : gemma3_270m::Package {
     static std::uint32_t maximum_context() noexcept { return 131072; }
 
     static ModelSamplingDefaults sampling_defaults(std::string_view model);
+    static family::TextGeometry declared_geometry(const artifact::Reader& reader);
     static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     static SequencePlanner
     make_sequence_planner(DeviceContext& device, const EngineOptions& options,

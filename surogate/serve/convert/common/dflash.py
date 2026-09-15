@@ -38,7 +38,7 @@ class Geometry:
 
     @property
     def local_layers(self):
-        return self.layers - 1
+        return self.layer_types.count("sliding_attention")
 
     def declaration(self, target):
         return replace(target.declared, section_config={
@@ -65,9 +65,9 @@ def geometry_from_config(config: Mapping, target) -> Geometry:
         raise ValueError("DFlash requires SiLU and attention without projection biases")
     layers = config["num_hidden_layers"]
     schedule = config.get("layer_types")
-    # The backend's cache organization supports a local stack ending in one full layer.
-    if layers < 2 or layers > 256 or schedule != ["sliding_attention"] * (layers - 1) + ["full_attention"]:
-        raise ValueError("DFlash requires local attention layers followed by one full attention layer")
+    # Local stacks may optionally end in one full-attention layer.
+    if layers < 2 or layers > 256 or schedule not in (["sliding_attention"] * layers, ["sliding_attention"] * (layers - 1) + ["full_attention"]):
+        raise ValueError("DFlash requires local attention layers with at most one final full attention layer")
     rope = config.get("rope_parameters")
     draft = config.get("dflash_config")
     if not isinstance(rope, Mapping) or not isinstance(draft, Mapping):

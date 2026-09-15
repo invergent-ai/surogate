@@ -5,7 +5,7 @@ import math
 from surogate.serve.convert.common.gguf_source import GgufSource
 
 
-def find_projector(model: Path, explicit=None) -> Path:
+def find_projector(model: Path, explicit=None, *, required=True) -> Path | None:
     candidates = [Path(explicit)] if explicit else sorted(Path(model).parent.glob('*mmproj*.gguf'))
     matches = []
     for candidate in candidates:
@@ -19,6 +19,8 @@ def find_projector(model: Path, explicit=None) -> Path:
         except (ValueError, OSError):
             if explicit:
                 raise
+    if not matches and not required and not explicit:
+        return None
     if len(matches) != 1:
         raise ValueError('Muse-Glimmer needs one matching vision projector; select it with --mmproj')
     return matches[0]

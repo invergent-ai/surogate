@@ -3,6 +3,14 @@
 #include "family/impl/runtime/target_support.h"
 
 namespace sinfer::targets::muse_glimmer {
+family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
+    auto g = family::TextGeometry::resolved_gemma3(reader.geometry(), reader.layer_types());
+    if (!reader.dflash_geometry().empty()) {
+        g.dflash = family::DFlashGeometry::resolved(reader.dflash_geometry(), reader.dflash_target_layers(),
+            g.hidden, g.layers, g.output_rows);
+    }
+    return g;
+}
 ModelSamplingDefaults Package::sampling_defaults(std::string_view) {
     ModelSamplingDefaults out;
     out.thinking     = {.temperature = 1.0F, .top_k = 64, .top_p = 0.95F};

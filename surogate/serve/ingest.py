@@ -254,7 +254,50 @@ def _find_mtp_gguf(gguf_path: Path) -> Path | None:
     return None
 
 
-def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, mmproj=None, include_vision=True) -> Path:
+def _ensure_muse_gguf(model, *, reuse_cache, echo, mmproj, include_vision, dflash_model):
+    from contextlib import closing
+    from surogate.serve.convert.common.gguf_source import GgufSource
+    from surogate.serve.convert.muse_glimmer.vision import find_projector
+    from surogate.serve.convert.muse_glimmer.dflash import find_drafter
+    try:
+        projector = None
+        if include_vision and (mmproj or list(model.parent.glob('*mmproj*.gguf'))):
+            projector = find_projector(model, mmproj, required=bool(mmproj))
+        draft = find_drafter(model, None if dflash_model == "auto" else dflash_model) if dflash_model else None
+        if dflash_model and not draft:
+            raise ValueError('Muse DFlash needs its assistant GGUF; provide --dflash-model PATH')
+        paths = [model, *([projector] if projector else []), *([draft] if draft else [])]
+        shards = []
+        for path in paths:
+            with closing(GgufSource(path)) as source:
+                shards.extend(source.shards)
+        stamps = [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in shards]
+        # Version the recovered temporal representation as well as every source.
+        fp = hashlib.sha256(repr(("muse-temporal-dflash-v1", stamps)).encode()).hexdigest()[:24]
+        out = cache_dir() / f"muse-glimmer-gguf-{fp}.sinfer"
+        if reuse_cache and out.is_file() and out.stat().st_size > 0:
+            echo(f"surogate serve: using cached engine weights ({out.name})")
+            return out
+        echo("surogate serve: preparing Muse-Glimmer weights" + (" and DFlash assistant" if draft else ""))
+        tmp = out.with_suffix('.sinfer.partial')
+        command = [sys.executable, '-m', 'surogate.serve.convert.muse_glimmer.convert',
+                   '--gguf', str(model), '--out', str(tmp)]
+        if projector: command += ['--mmproj', str(projector)]
+        if draft: command += ['--dflash-model', str(draft)]
+        try:
+            result = subprocess.run(command, cwd=_sinfer_root(), stdout=sys.stderr)
+            if result.returncode:
+                raise SystemExit(f'surogate serve: Muse-Glimmer conversion failed (exit {result.returncode})')
+            tmp.replace(out)
+            Path(str(tmp) + '.conversion.json').replace(Path(str(out) + '.conversion.json'))
+        finally:
+            tmp.unlink(missing_ok=True)
+        return out
+    except (ValueError, KeyError, OSError) as error:
+        raise SystemExit(f'surogate serve: {error}') from error
+
+
+def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, mmproj=None, include_vision=True, dflash_model=None) -> Path:
     """GGUF → temp HF dir (dequant BF16) → vendored converter → cached weights.
 
     v0 bridge (surogate/serve/gguf/bridge.py): correctness inherits the converter's
@@ -268,6 +311,11 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
     with serve_gguf.open_gguf(gguf_path) as source:
         architecture = source.kv("general.architecture")
         generation_defaults = extract_sampling_defaults(source)
+    if architecture == "muse-glimmer":
+        return _ensure_muse_gguf(gguf_path, reuse_cache=reuse_cache, echo=echo,
+                                 mmproj=mmproj, include_vision=include_vision, dflash_model=dflash_model)
+    if dflash_model not in (None, "auto"):
+        raise SystemExit("surogate serve: --dflash-model currently accepts Muse-Glimmer GGUF companions")
     vl = "qwen3_vl" if architecture in ("qwen3vl", "qwen3vlmoe") else None
     if architecture == "lfm2":
         if mmproj is not None:
@@ -294,23 +342,10 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
                             break
                 except (ValueError, OSError):
                     continue
-    if architecture == "muse-glimmer" and include_vision:
-        if mmproj is not None:
-            vl = "muse_glimmer"
-        else:
-            for candidate in gguf_path.parent.glob("*mmproj*.gguf"):
-                try:
-                    with serve_gguf.open_gguf(candidate) as projector:
-                        if projector.kv("clip.projector_type") == "muse-glimmer":
-                            vl = "muse_glimmer"
-                            break
-                except (ValueError, OSError):
-                    continue
     if vl and include_vision:
         import importlib
-        converter_module = "surogate.serve.convert." + vl + (".convert" if vl == "muse_glimmer" else ".gguf")
-        finder_module = "surogate.serve.convert.muse_glimmer.vision" if vl == "muse_glimmer" else converter_module
-        find_projector = importlib.import_module(finder_module).find_projector
+        converter_module = "surogate.serve.convert." + vl + ".gguf"
+        find_projector = importlib.import_module(converter_module).find_projector
         from surogate.serve.convert.common.gguf_source import GgufSource
         try:
             projector = find_projector(gguf_path, mmproj)
@@ -794,7 +829,7 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
     return out
 
 
-def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print, mmproj=None) -> Path:
+def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print, mmproj=None, dflash_model=None) -> Path:
     """Resolve `spec` (safetensors dir | HF repo id | GGUF | internal artifact)
     to an engine-loadable weights file, converting through the transparent
     cache when needed. Raises SystemExit with a clear message on refusal."""
@@ -802,12 +837,15 @@ def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print, mm
     if mmproj is not None and kind != "gguf":
         raise SystemExit("surogate serve: --mmproj requires a text GGUF as the model")
 
+    if dflash_model not in (None, "auto") and kind != "gguf":
+        raise SystemExit("surogate serve: --dflash-model requires a Muse-Glimmer GGUF model")
+
     if kind == "artifact":
         # Internal/dev passthrough (not a supported product input).
         return Path(spec)
 
     if kind == "gguf":
-        return _ensure_from_gguf(Path(spec).resolve(), reuse_cache=reuse_cache, echo=echo, mmproj=mmproj)
+        return _ensure_from_gguf(Path(spec).resolve(), reuse_cache=reuse_cache, echo=echo, mmproj=mmproj, dflash_model=dflash_model)
 
     if kind == "hf_repo_id":
         echo(f"surogate serve: resolving Hugging Face repo '{spec}'...")

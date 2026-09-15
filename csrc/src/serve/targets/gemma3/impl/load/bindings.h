@@ -1,5 +1,6 @@
 #pragma once
 #include "family/impl/load/gemma_vision.h"
+#include "family/impl/load/dflash.h"
 
 #include "family/impl/load/host_bank.h"
 
@@ -100,6 +101,7 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan : family::GemmaVisionPlan {
+    family::DFlashPlan dflash;
     family::HostBankPlan host_bank;
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.

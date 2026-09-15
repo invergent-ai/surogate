@@ -124,6 +124,19 @@ void test_issue_20_unaligned_jpeg() {
     expect_pixel(image, 150, 100, yellow, 4);
 }
 
+void test_temporal_pair_sampling() {
+    // Nine distinct frames at 4 FPS: Muse samples four frames, flooring linspace.
+    const auto encoded = decode_base64("R0lGODlhAgACAIEAAAAA/wAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAGQAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIEcAOMAAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIE4AMcAAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIFUAKsAAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIFwAI8AAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIGMAHMAAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIGoAFcAAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIHEADsAAAAAAAAAAAAIBgABCAQQEAAh+QQBGQABACwAAAAAAgACAIHgAB8AAAAAAAAAAAAIBgABCAQQEAA7");
+    const auto video = sinfer::media::decode::decode_video(encoded, {}, 2.0, 1, 96, true);
+    if (video.indices != std::vector<int>{0, 2, 5, 8} || video.frames.size() != 4 || video.fps != 4.0) {
+        throw std::runtime_error("temporal video frame sampling differs from the model processor");
+    }
+    const auto single = sinfer::media::decode::decode_video(decode_base64(issue_20_jpeg_base64), {}, 2.0, 1, 96, true);
+    if (single.indices != std::vector<int>{0} || single.frames.size() != 1) {
+        throw std::runtime_error("single-frame temporal video must remain available for pair padding");
+    }
+}
+
 // Also run this test under LeakSanitizer: each decoder must release custom IO
 // after success, constructor failure, and cancellation during frame decoding.
 void test_decode_cleanup_paths() {
@@ -159,6 +172,7 @@ int main() {
     try {
         test_issue_20_unaligned_jpeg();
         test_decode_cleanup_paths();
+        test_temporal_pair_sampling();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

@@ -3,6 +3,11 @@
 
 namespace sinfer::targets::muse_glimmer::detail {
 struct Variant : gemma3_270m::detail::Variant {
+    struct DFlashConfig { static constexpr bool supported = true; };
+    static constexpr bool supports_dflash = true;
+    static constexpr std::uint32_t maximum_dflash_draft_tokens = 15;
+    static std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
+        std::uint32_t draft_window, std::uint32_t batch_size = 1);
     static constexpr bool attention_output_gate    = true;
     static constexpr bool norm_unit_offset         = false;
     static constexpr bool one_dimensional_rope     = true;

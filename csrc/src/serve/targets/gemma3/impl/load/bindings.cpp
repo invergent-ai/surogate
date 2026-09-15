@@ -151,10 +151,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     if (binder.reader().identity().architecture == "muse_glimmer") {
         family::bind_muse_vision(binder, out, g, features.vision);
+        if (!binder.reader().dflash_geometry().empty()) {
+            out.geometry.dflash = family::DFlashGeometry::resolved(binder.reader().dflash_geometry(),
+                binder.reader().dflash_target_layers(), g.hidden, g.layers, g.output_rows);
+        }
+        out.dflash = family::bind_dflash(binder, g, features);
     } else {
         family::bind_gemma_vision(binder, out, g, features.vision);
     }
-    if (features.speculative_enabled()) {
+    if (features.mtp() || (features.dflash() && binder.reader().identity().architecture != "muse_glimmer")) {
         // Gemma 3 ships no MTP block and the target declares no DFlash tower, so
         // there is nothing to draft with. Refusing here beats a missing-object
         // failure twenty objects later.
@@ -213,6 +218,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
+    if (plan.features.dflash()) { runtime.dflash = family::materialize_dflash(plan.dflash, backing, g); }
 
     runtime.token_embedding = materialized_weight(backing, plan.token_embedding,
                                                   g.output_rows, g.hidden);

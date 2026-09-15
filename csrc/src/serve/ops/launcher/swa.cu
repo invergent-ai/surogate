@@ -80,7 +80,7 @@ const char* swa_route_name(SwaRoute route) {
     return "unknown";
 }
 
-template <typename CacheT>
+template <typename CacheT, int Window>
 void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                       const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
                       float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
@@ -97,7 +97,7 @@ void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& quer
             2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
         if (direct) {
             const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
-            swa_split_partial_kernel<Tokens, Warps, KeyBlock, true, CacheT>
+            swa_split_partial_kernel<Tokens, Warps, KeyBlock, true, CacheT, Window>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
@@ -116,7 +116,7 @@ void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& quer
         }
 
         const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
-        swa_split_partial_kernel<Tokens, Warps, KeyBlock, false, CacheT>
+        swa_split_partial_kernel<Tokens, Warps, KeyBlock, false, CacheT, Window>
             <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(query_k.data),
@@ -135,7 +135,7 @@ void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& quer
         constexpr int ReduceWarps = 1;
         constexpr int ReduceRows  = kBidirectionalGqaQHeads * Tokens;
         const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
-        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
+        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps, Window>
             <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
@@ -152,15 +152,17 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
                 Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
                 cudaStream_t stream) {
-    if (context.k.dtype == DType::FP8_E4M3FN) {
-        swa_launch_typed<std::uint8_t>(q, query_k, query_v, positions, valid_columns, lanes, scale,
-                                       context, plan, partial_acc, partial_m, partial_l, out,
-                                       stream);
-    } else {
-        swa_launch_typed<__nv_bfloat16>(q, query_k, query_v, positions, valid_columns, lanes, scale,
-                                        context, plan, partial_acc, partial_m, partial_l, out,
-                                        stream);
-    }
+    const auto launch = [&]<int Window>() {
+        if (context.k.dtype == DType::FP8_E4M3FN) {
+            swa_launch_typed<std::uint8_t, Window>(q, query_k, query_v, positions, valid_columns,
+                lanes, scale, context, plan, partial_acc, partial_m, partial_l, out, stream);
+        } else {
+            swa_launch_typed<__nv_bfloat16, Window>(q, query_k, query_v, positions, valid_columns,
+                lanes, scale, context, plan, partial_acc, partial_m, partial_l, out, stream);
+        }
+    };
+    if (context.capacity == 2048) { launch.template operator()<2048>(); }
+    else { launch.template operator()<4096>(); }
 }
 
 } // namespace sinfer::ops::detail

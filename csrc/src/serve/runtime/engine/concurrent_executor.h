@@ -383,6 +383,7 @@ private:
         bool prompt_scores_published = false;
         std::string content;
         std::string reasoning;
+        std::string tool_content;
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
@@ -448,7 +449,7 @@ private:
             std::lock_guard lock(request->mutex);
             for (OutputDelta& delta : output) {
                 std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
-                                                                              : request->content;
+                    : delta.channel == OutputChannel::Tool ? request->tool_content : request->content;
                 full += delta.text;
                 request->events.push_back(std::move(delta));
             }
@@ -541,6 +542,7 @@ private:
         result.token_logprobs          = std::move(request->generated_logprobs);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
+        result.tool_content            = std::move(request->tool_content);
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         if (reason == FinishReason::StopString) {

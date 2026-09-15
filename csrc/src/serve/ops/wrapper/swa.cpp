@@ -38,7 +38,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        (context.capacity != 2048 && context.capacity != kWindow) || context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }

@@ -12,8 +12,8 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize('height,width', [(6, 10), (34, 38)])
-def test_muse_checkpoint_vision(tmp_path, height, width):
+@pytest.mark.parametrize('height,width,video', [(6, 10, False), (34, 38, False), (6, 10, True), (24, 24, True)])
+def test_muse_checkpoint_vision(tmp_path, height, width, video):
     fixture = os.environ.get('SUROGATE_MUSE_FIXTURE')
     if not fixture:
         pytest.skip('set SUROGATE_MUSE_FIXTURE for real Muse-Glimmer vision validation')
@@ -26,7 +26,10 @@ def test_muse_checkpoint_vision(tmp_path, height, width):
     cfg = MuseGlimmerVisionConfig(**json.loads((fixture / 'config.json').read_text())['vision_config'])
     # The GGUF projector sums temporal slabs for still images. Its 2D patch matrix
     # is equivalent to the original temporal convolution on two identical frames.
-    cfg.patch_temporal = 1
+    temporal_file = fixture / 'temporal_patch.bin'
+    cfg.patch_temporal = 2 if temporal_file.is_file() else 1
+    if video and cfg.patch_temporal != 2:
+        pytest.skip('supply original temporal_patch.bin to validate distinct video frames')
     cfg._attn_implementation = 'sdpa'
     with torch.device('meta'):
         tower = MuseGlimmerVisionModel(cfg)
@@ -49,7 +52,9 @@ def test_muse_checkpoint_vision(tmp_path, height, width):
                                ('norm1', 'ln1'), ('norm2', 'ln2')]:
                     role = role.replace(hf, gg)
                 src = f'v.blk.{i}.{role}'
-            value = torch.from_numpy(source.float32(src).copy())
+            value = (torch.frombuffer(bytearray(temporal_file.read_bytes()), dtype=torch.bfloat16).float()
+                     if name == 'patch_embedder.patch_embedding.weight' and cfg.patch_temporal == 2
+                     else torch.from_numpy(source.float32(src).copy()))
             if '.attn.q_proj.' in name or '.attn.k_proj.' in name:
                 heads = cfg.num_attention_heads
                 value = value.reshape(heads, -1, 2, *value.shape[1:]).transpose(1, 2).reshape_as(value)
@@ -60,7 +65,10 @@ def test_muse_checkpoint_vision(tmp_path, height, width):
     tower.rotary_emb = MuseGlimmerVisionRotaryEmbedding(cfg).cuda()
     tower.eval()
     torch.manual_seed(851)
-    patches = (torch.rand(height * width, 3 * cfg.patch_size ** 2, device='cuda') * 2 - 1).bfloat16()
+    patches = (torch.rand(height * width, cfg.patch_temporal, 3 * cfg.patch_size ** 2, device='cuda') * 2 - 1).bfloat16()
+    if not video and cfg.patch_temporal == 2:
+        patches[:, 1] = patches[:, 0]
+    patches = patches.flatten(1)
     with torch.no_grad():
         result = tower(pixel_values=patches, grid_thw=torch.tensor([[1, height, width]], device='cuda'))
         expected = result.last_hidden_state
@@ -82,7 +90,7 @@ def test_muse_checkpoint_vision(tmp_path, height, width):
     assert actual.shape == expected.shape
     relative = (actual - expected).norm() / expected.norm()
     cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=0)
-    print(f'Muse vision {height}x{width}: relative L2={relative:.6f}, cosine={cosine:.7f}')
+    print(f'Muse {"video" if video else "image"} {height}x{width}: relative L2={relative:.6f}, cosine={cosine:.7f}')
     assert torch.isfinite(actual).all()
     # Fifty BF16 residual blocks amplify rounding on the deliberately tiny random
     # grid. Layer probes show gradual drift (0.003 L2 at layer 0, 0.089 at 49),

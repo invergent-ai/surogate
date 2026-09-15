@@ -56,7 +56,7 @@ def geometry(source):
                     "sliding_attention" if yes else "full_attention" for yes in windowed]
 
 
-def convert(gguf, frontend, output, mmproj=None):
+def convert(gguf, frontend, output, mmproj=None, dflash_model=None):
     source = GgufSource(Path(gguf), extra=[Path(mmproj)] if mmproj else [])
     try:
         g, layers = geometry(source)
@@ -112,6 +112,23 @@ def convert(gguf, frontend, output, mmproj=None):
             else:
                 runs = ((tensor.shard, tensor.offset, tensor.nbytes),)
             specs.append(TensorSpec(name, shape, fmt, layout, runs=runs))
+        dg, targets = {}, []
+        if dflash_model:
+            from .dflash import import_drafter
+            tokens = source.kv('tokenizer.ggml.tokens')
+            mask_name = '<|reserved_special_token_1818|>'
+            if mask_name not in tokens:
+                raise ValueError('Muse DFlash mask token is missing from the target vocabulary')
+            dg, targets, ds, dd = import_drafter(dflash_model, g, tokens.index(mask_name))
+            specs += ds
+            converted.update(dd)
+        if processor:
+            from .temporal import temporal_projection
+            patch = next(s for s in specs if s.name == 'vision/patch_embedding')
+            converted[patch.name] = temporal_projection(source.float32('v.patch_embd.weight').reshape(patch.shape))
+            specs[specs.index(patch)] = TensorSpec(patch.name, (vg['hidden'], vg['patch_dim'] * 2), 'BF16', 'contiguous-le-v1')
+            vg['patch_dim'] *= 2
+            processor['temporal_patch_size'] = 2
         front = Path(frontend) if frontend else Path(output).with_suffix(".frontend")
         if not frontend:
             write_frontend(source.readers[0], "muse-glimmer", front)
@@ -127,7 +144,8 @@ def convert(gguf, frontend, output, mmproj=None):
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         with ArtifactWriter(output, ArtifactIdentity("muse-glimmer", "groupwise-int", "muse_glimmer"),
                             specs, external=[(str(p.resolve()), p.stat().st_size) for p in source.shards],
-                            geometry=g, layer_types=layers, vision_geometry=vg) as writer:
+                            geometry=g, layer_types=layers, vision_geometry=vg,
+                            dflash_geometry=dg or None, dflash_target_layers=targets or None) as writer:
             for name, data in converted.items():
                 writer.write(name, data)
             for name, data in resources.items():
@@ -143,10 +161,11 @@ def main():
     p.add_argument("--gguf", required=True)
     p.add_argument("--frontend")
     p.add_argument("--mmproj")
+    p.add_argument("--dflash-model")
     p.add_argument("--out", required=True)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
-    convert(args.gguf, args.frontend, args.out, args.mmproj)
+    convert(args.gguf, args.frontend, args.out, args.mmproj, args.dflash_model)
 
 
 if __name__ == "__main__":

@@ -297,7 +297,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         checkpoint_ple.slot_count = 1;
         out.checkpoints.ple = plan_ngram_ple_state_pool(checkpoint_builder, checkpoint_ple);
     }
-    if (plan.speculative_backend != SpeculativeBackend::None) {
+    if (plan.speculative_backend != SpeculativeBackend::None && geometry_gdn_layers(plan.geometry) > 0) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
                          .layers          = geometry_gdn_layers(plan.geometry),
@@ -329,28 +329,30 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 checkpoint_builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
                 plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
                 1, draft_kv_dtype);
-            PagedKVPoolSpec full_pool{
-                .page_group_count      = plan.main_page_groups,
-                .logical_page_capacity = logical_pages,
-                .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                .plane_order           = PagedKVPlaneOrder::HeadMajor,
-                .planes =
-                    {
-                        {draft_kv_dtype, plan.geometry.dflash.head_dim,
-                         plan.geometry.dflash.kv_heads, 256},
-                        {draft_kv_dtype, plan.geometry.dflash.head_dim,
-                         plan.geometry.dflash.kv_heads, 256},
-                    },
-            };
-            dflash.full = family::PagedKVCacheLayout{
-                .pool        = plan_paged_kv_pool(builder, full_pool),
-                .layers      = 1,
-                .max_context = plan.capacity,
-                .kv_heads    = plan.geometry.dflash.kv_heads,
-                .head_dim    = plan.geometry.dflash.head_dim,
-                .dtype       = draft_kv_dtype,
-                .quant_group = 0,
-            };
+            if (plan.geometry.dflash.local_layers < plan.geometry.dflash.layers) {
+                PagedKVPoolSpec full_pool{
+                    .page_group_count      = plan.main_page_groups,
+                    .logical_page_capacity = logical_pages,
+                    .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
+                    .plane_order           = PagedKVPlaneOrder::HeadMajor,
+                    .planes =
+                        {
+                            {draft_kv_dtype, plan.geometry.dflash.head_dim,
+                             plan.geometry.dflash.kv_heads, 256},
+                            {draft_kv_dtype, plan.geometry.dflash.head_dim,
+                             plan.geometry.dflash.kv_heads, 256},
+                        },
+                };
+                dflash.full = family::PagedKVCacheLayout{
+                    .pool        = plan_paged_kv_pool(builder, full_pool),
+                    .layers      = 1,
+                    .max_context = plan.capacity,
+                    .kv_heads    = plan.geometry.dflash.kv_heads,
+                    .head_dim    = plan.geometry.dflash.head_dim,
+                    .dtype       = draft_kv_dtype,
+                    .quant_group = 0,
+                };
+            }
             const auto feature_columns = plan.pipeline_stage_last > 0
                 ? std::max(effective_prefill_chunk,
                     static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend) * (plan.draft_window + 1U)))

@@ -162,3 +162,35 @@ def test_public_model_id_preserves_original_argument(selector, model, alias, mon
 def test_invalid_projector_invocation(args):
     with pytest.raises(ValueError):
         serve._parse_invocation(args)
+
+
+@pytest.mark.parametrize("selector", [[], ["--generate"]])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_muse_drafter_is_preparation_only(selector, explicit, monkeypatch):
+    extra = ["--dflash-model=draft.gguf"] if explicit else []
+    monkeypatch.setattr(sys, "argv", ["surogate", "serve", *selector, "model.gguf",
+        "--spec", "dflash", *extra])
+    monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")
+    ingest = Mock()
+    ingest.ensure_engine_weights.return_value = Path("/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.ingest", ingest)
+    execute = Mock()
+    monkeypatch.setattr(serve.os, "execv", execute)
+    serve.maybe_exec_serve()
+    assert ingest.ensure_engine_weights.call_args.kwargs["dflash_model"] == ("draft.gguf" if explicit else "auto")
+    assert "--dflash-model" not in execute.call_args.args[1]
+    assert execute.call_args.args[1][2:4] == ["--spec", "dflash"]
+
+
+@pytest.mark.parametrize("literal", ["--dflash-model", "--spec"])
+def test_drafter_flag_like_prompt_is_not_consumed(literal, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["surogate", "serve", "--generate", "model.gguf", "--prompt", literal])
+    monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")
+    ingest = Mock()
+    ingest.ensure_engine_weights.return_value = Path("/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.ingest", ingest)
+    execute = Mock()
+    monkeypatch.setattr(serve.os, "execv", execute)
+    serve.maybe_exec_serve()
+    assert "dflash_model" not in ingest.ensure_engine_weights.call_args.kwargs
+    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--prompt", literal])

@@ -55,7 +55,7 @@ struct DFlashGeometry {
                 throw std::invalid_argument("missing or invalid dflash_geometry." + std::string(entry.name));
             }
         }
-        if (g.layers < 2 || g.layers > 256 || g.local_layers != g.layers - 1 ||
+        if (g.layers < 2 || g.layers > 256 || (g.local_layers != g.layers - 1 && g.local_layers != g.layers) ||
             g.hidden != target_hidden || g.mask_token >= target_vocab ||
             g.query_heads % g.kv_heads || g.head_dim % 2 || g.block_size < 2 || g.block_size > 16 ||
             g.feature_layers != targets.size() || targets.size() > g.target_feature_layers.size() ||

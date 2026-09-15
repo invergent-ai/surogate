@@ -10,10 +10,10 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope, const MixedTargetForward& mixed_target) {
-    if (frame.replay_records == nullptr) {
+    if (frame.replay_records == nullptr && !execution.model.gdn_layers.empty()) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
-    if (frame.ids.ne[0] == 1) {
+    if (frame.ids.ne[0] == 1 || execution.model.gdn_layers.empty()) {
         card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     } else {
         card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);

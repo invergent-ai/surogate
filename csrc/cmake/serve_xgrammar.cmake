@@ -7,6 +7,16 @@ FetchContent_Declare(surogate_xgrammar
   GIT_SUBMODULES 3rdparty/dlpack
   SOURCE_SUBDIR surogate-no-upstream-build)
 FetchContent_MakeAvailable(surogate_xgrammar)
+# Extend the pinned XML schema converter with Muse's namespaced parameter tags.
+# Apply on existing build trees too, and fail if the pinned source has drifted.
+set(muse_patch "${CMAKE_CURRENT_LIST_DIR}/patches/xgrammar-muse-atem.patch")
+execute_process(COMMAND git apply --reverse --check "${muse_patch}"
+  WORKING_DIRECTORY "${surogate_xgrammar_SOURCE_DIR}" RESULT_VARIABLE muse_applied
+  OUTPUT_QUIET ERROR_QUIET)
+if(NOT muse_applied EQUAL 0)
+  execute_process(COMMAND git apply "${muse_patch}"
+    WORKING_DIRECTORY "${surogate_xgrammar_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+endif()
 file(GLOB_RECURSE SUROGATE_XGRAMMAR_SOURCES CONFIGURE_DEPENDS
   "${surogate_xgrammar_SOURCE_DIR}/cpp/*.cc")
 list(FILTER SUROGATE_XGRAMMAR_SOURCES EXCLUDE REGEX "/tvm_ffi/")

@@ -370,7 +370,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             dflash_record_storage = replay_records;
         }
     }
-    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
+    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None && !model.gdn_layers.empty())) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
     if (plan.persistent.dflash) {
@@ -764,7 +764,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 sequence.mtp_kv_valid = mtp_base;
             } else if (speculative_backend == SpeculativeBackend::DFlash) {
-                if (!dflash || !sequence.kv->backend || sequence.dflash_context_frontier < base) {
+                if (!dflash || (dflash->full && !sequence.kv->backend) || sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
                 dflash->restore_rewrite_checkpoint(static_cast<std::int32_t>(sequence.lane),
@@ -991,7 +991,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         return;
     }
 
-    if (!replay_records) {
+    if (!replay_records && !model.gdn_layers.empty()) {
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
 
@@ -1044,7 +1044,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     }
     const auto tail_started = Clock::now();
     try {
-        if (anything_to_fold) {
+        if (anything_to_fold && replay_records) {
             ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
                                  std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                                  device.stream);
@@ -1340,13 +1340,13 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
 
 family::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return dflash->full ? &*dflash->full : nullptr; }
     return nullptr;
 }
 
 const family::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return dflash->full ? &*dflash->full : nullptr; }
     return nullptr;
 }
 
@@ -1425,7 +1425,7 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
 
         // Stage the controls at execution, after this pipeline stage becomes free.
         if (speculative_backend == SpeculativeBackend::DFlash) {
-            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
+            if (!dflash || !io.dflash_decode || (dflash->full && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
             // Admission can overlap an unconsumed round whose DMA still reads
@@ -1452,6 +1452,7 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && !dflash->full) { backend_tokens = 0; }
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
@@ -1481,6 +1482,7 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     if (!sequence.kv || main_tokens > capacity || backend_tokens > main_tokens) {
         throw std::logic_error("KV trim request is outside the sequence bundle");
     }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && !dflash->full) { backend_tokens = 0; }
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
@@ -1562,7 +1564,7 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
+        if (dflash->full) reserve_capture_rows(*dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
     }
     device.synchronize();
 
@@ -1616,7 +1618,7 @@ void ProgramImplCore::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
-        if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+        if (dflash && dflash->full) { zero_capture_pages(*dflash->full, dflash_capture_allocations, batch_size); }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
             decoder->reset_state_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
@@ -2203,15 +2205,15 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
-        if (!sequence.kv || !sequence.kv->backend || sequence.kv->text.bound_row() < 0 ||
-            sequence.kv->backend->bound_row() < 0 || end64 > capacity) {
+        if (!sequence.kv || sequence.kv->text.bound_row() < 0 ||
+            (dflash->full && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) || end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
         dflash_host_ingress->context_frontiers[row] =
             checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
-        dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+        dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
         dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(lane);
         materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
         minimum_count = std::min(minimum_count, counts[row]);
@@ -2311,7 +2313,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
                 : kNoRewriteCheckpointSlot,
             staged.initial_mtp_extent,
-            dflash_host_ingress,
+            sequence.lane,
             staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr,
             requests[sequence.lane].lora_slot};
         schedule_state.score_prompt = request.prompt_logprobs >= 0;
@@ -2334,7 +2336,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             Tensor lane                                  = io.dflash_decode->lanes.slice(0, 0, 1);
             Tensor row = io.dflash_decode->dflash_kv_table_rows.slice(0, 0, 1);
             set_device_i32(lane, static_cast<std::int32_t>(sequence.lane));
-            set_device_i32(row, sequence.kv->backend->bound_row());
+            set_device_i32(row, sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
         }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
@@ -2560,7 +2562,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
             if (speculative_backend == SpeculativeBackend::DFlash &&
-                (!dflash || !sequence.kv || !sequence.kv->backend ||
+                (!dflash || !sequence.kv || (dflash->full && !sequence.kv->backend) ||
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
@@ -3511,7 +3513,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                     Tensor row = io.backend_kv_table_row;
                     set_device_i32(count, processed);
                     set_device_i32(lane, lane_id);
-                    set_device_i32(row, sequence.kv->backend->bound_row());
+                    set_device_i32(row, sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
                     schedule::DFlashAppendContext context{{device, model, work, decoder->linear_attention,
                         replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
                         proposal_head, &decoder->ple, stage}, *dflash};
@@ -3926,7 +3928,7 @@ void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
     Tensor row = io.backend_kv_table_row;
     set_device_i32(count, static_cast<std::int32_t>(tokens));
     set_device_i32(lane_tensor, static_cast<std::int32_t>(lane));
-    set_device_i32(row, sequence.kv->backend->bound_row());
+    set_device_i32(row, sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
         replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
         proposal_head, &decoder->ple, stage}, *dflash};
@@ -4045,8 +4047,8 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
         const SequenceState& sequence = sequences[lane];
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
-            sequence.kv->text.bound_row() < 0 || sequence.kv->backend->bound_row() < 0 ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
+            (dflash->full && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
@@ -4111,7 +4113,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                     checked_i32(position, "DFlash batch RoPE position") + sequence.rope_delta;
             }
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
-            dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = staged_sampling(request, sequence);
             dflash_host_ingress->lora_slots[row] = request.lora_slot;

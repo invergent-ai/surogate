@@ -236,15 +236,15 @@ void populate_score_texts(Engine& engine, GenerationOutcome& outcome) {
 class ServiceOutputSink final : public sinfer::OutputSink {
 public:
     ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools, bool muse_tools)
-        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), tool_filter_(json_tools,muse_tools) {}
+        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), muse_tools_(muse_tools), tool_filter_(json_tools,muse_tools) {}
 
     void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         if (delta.channel == sinfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
-            std::string visible =
-                filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
+            std::string visible = (filter_tool_calls_ && (!muse_tools_ || delta.channel == OutputChannel::Tool))
+                ? tool_filter_.feed(delta.text) : std::move(delta.text);
             publish_content(visible);
         }
     }
@@ -259,7 +259,7 @@ public:
     }
 
     std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
+        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response || muse_tools_)); }
         return content_bytes_;
     }
 
@@ -273,6 +273,7 @@ private:
     Engine* engine_ = nullptr;
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
+    bool muse_tools_ = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
 };
@@ -667,10 +668,13 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
+    if (!prepared.tool_capable) { outcome.text += result.tool_content; }
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {
-        ParsedToolCalls parsed = parse_tool_calls(options_.tool_call_format, outcome.text,
+        ParsedToolCalls parsed = parse_tool_calls(options_.tool_call_format,
+            options_.tool_call_format == ToolCallFormat::MuseAtem ? result.tool_content : outcome.text,
                                                   prepared.tool_name_max_length, prepared.tools);
+        if (options_.tool_call_format == ToolCallFormat::MuseAtem) { parsed.content = outcome.text; }
         if (!prepared.parallel_tool_calls && parsed.tool_calls.size() > 1) { parsed.tool_calls.resize(1); }
         if ((outcome.finish_reason != sinfer::FinishReason::StopToken &&
              outcome.finish_reason != sinfer::FinishReason::StopString) ||

@@ -85,6 +85,7 @@ struct GemmaProcessorOptions {
     int version = 0, patch = 0, merge = 0, image_tokens = 0, video_tokens = 70;
     int image_size = 896, position_embeddings = 0, video_token_id = 0, resample = 2;
     bool muse_glimmer = false, encoder_free = false, pan_and_scan = false;
+    int temporal_patch = 1;
     int min_crop_size = 256, max_crops = 4;
     double crop_ratio = 1.2;
     std::string image_token, video_token, boi_token, eoi_token;
