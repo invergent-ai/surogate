@@ -303,26 +303,18 @@ def grpo_split(
         except Exception as e:
             logger.warning(f"Survivor reap failed during shutdown: {e}")
 
-        # Leave without running interpreter finalization -- on the clean path.
-        #
-        # The trainer is a daemon thread and may still be winding down -- the join
-        # above waits two seconds and then says so. If it holds the stderr buffer's
-        # lock when CPython finalizes, the interpreter aborts with
-        # `_enter_buffered_busy` and the process exits 134, so a run that finished
-        # every step and wrote every checkpoint reports itself as crashed. Every
-        # subprocess has been reaped by this point and the only work left is
-        # finalization itself, so flush what we own and go.
-        #
-        # An abort does not take this door: the raise below is what turns a dead
-        # component into a non-zero exit, and exiting 0 here would hide it.
-        if not abort.reason:
-            logging.shutdown()
-            for stream in (sys.stdout, sys.stderr):
-                try:
-                    stream.flush()
-                except Exception:
-                    pass
-            os._exit(0)
+        # Flush here rather than only on the clean path below. Every route out of
+        # this function either raises or calls `os._exit`, and a raise hands the
+        # process to interpreter finalization with the daemon trainer thread still
+        # winding down: if it holds the stderr buffer lock CPython aborts with
+        # `_enter_buffered_busy` (exit 134), taking the buffered traceback with it --
+        # precisely when there is a failure to explain. This does not close that
+        # race, it empties the buffers that would otherwise be lost to it.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
 
     # After teardown, not instead of it: the finally block above reaps the server
     # process trees, and exiting early would strand them holding GPUs. Raising
@@ -330,6 +322,26 @@ def grpo_split(
     # the run as failed rather than completed.
     if abort.reason:
         raise RuntimeError(f"GRPO pipeline aborted: {abort.reason}")
+
+    # Leave without running interpreter finalization -- on the clean path only.
+    #
+    # The trainer is a daemon thread and may still be winding down -- the join
+    # above waits two seconds and then says so. If it holds the stderr buffer's
+    # lock when CPython finalizes, the interpreter aborts with
+    # `_enter_buffered_busy` and the process exits 134, so a run that finished
+    # every step and wrote every checkpoint reports itself as crashed. Every
+    # subprocess has been reaped by this point and the buffers were flushed at the
+    # end of teardown, so the only work left is finalization itself: skip it.
+    #
+    # Below the `finally` rather than inside it, which is what makes "clean path
+    # only" true. `os._exit` terminates the process on the spot and discards
+    # whatever exception is unwinding through it: from inside the `finally` it ate
+    # every failure raised by the orchestrator or by the teardown above, made the
+    # `raise` in the handler dead code, and reported a dead run to ops as
+    # completed. Out here it is simply not reached unless the function falls
+    # through.
+    logging.shutdown()
+    os._exit(0)
 
 
 def _spawn_inference(

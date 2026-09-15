@@ -136,3 +136,53 @@ def test_offload_values_and_explicit_null_preserve_engine_semantics(tmp_path, se
 def test_invalid_offload_settings_fail_before_launch(name, value):
     with pytest.raises(ValueError, match=name):
         _argv({"model": "fixture", name: value})
+
+
+# ── Tool calling ──────────────────────────────────────────────────────
+#
+# Why these exist is recorded on the config fields; what is pinned here is that
+# they reach the engine command line, and in an order it accepts.
+
+
+def test_a_run_that_asks_for_tool_calling_gets_both_flags():
+    argv = _argv({
+        "model": "m", "enable_auto_tool_choice": True, "tool_call_parser": "hermes",
+    })
+    assert _value(argv, "--tool-call-parser") == "hermes"
+    assert "--enable-auto-tool-choice" in argv
+
+
+def test_a_run_that_never_calls_a_tool_is_launched_exactly_as_before():
+    """With the gate open the engine parses a tool call out of every
+    completion, which a run with no tools has no reason to carry."""
+    argv = _argv({"model": "m"})
+    assert "--enable-auto-tool-choice" not in argv
+    assert "--tool-call-parser" not in argv
+
+
+def test_a_parser_can_be_named_without_opening_the_gate():
+    """Naming a parser is not the same as permitting `auto`; a request may
+    still name a function explicitly."""
+    argv = _argv({"model": "m", "tool_call_parser": "llama3_json"})
+    assert _value(argv, "--tool-call-parser") == "llama3_json"
+    assert "--enable-auto-tool-choice" not in argv
+
+
+def test_the_gate_without_a_parser_is_refused_before_launch():
+    """The engine refuses this pair, but only after execv, so the run would
+    show a server that never turns healthy instead of its error message."""
+    with pytest.raises(ValueError, match="turns parsing off"):
+        _argv({"model": "m", "enable_auto_tool_choice": True, "tool_call_parser": "none"})
+
+
+def test_an_unfamiliar_parser_name_is_left_to_the_engine():
+    """The parser registry grows between releases; a copy of it here would go
+    stale and refuse a name the shipped engine accepts."""
+    # With the gate on, so the validation actually runs: without it the guard
+    # is never reached and widening it to a stale allowlist would go unnoticed.
+    argv = _argv({
+        "model": "m", "tool_call_parser": "muse_glimmer",
+        "enable_auto_tool_choice": True,
+    })
+    assert _value(argv, "--tool-call-parser") == "muse_glimmer"
+    assert "--enable-auto-tool-choice" in argv
