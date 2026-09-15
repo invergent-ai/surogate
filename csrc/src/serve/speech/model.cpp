@@ -126,17 +126,30 @@ Tensor Model::mel(const Tensor& samples) const {
     if (x.numel() < 1) return empty_features();
     auto pre = at::cat({x.slice(0, 0, 1), x.slice(0, 1) - 0.97 * x.slice(0, 0, -1)});
     // NeMo uses centered constant padding for both file and live features.
-    auto padded = at::constant_pad_nd(pre, {256, 256}, 0);
-    return mel_frames(padded).slice(2, 0, x.numel() / 160);
+    auto padded   = at::constant_pad_nd(pre, {256, 256}, 0);
+    auto features = mel_frames(padded).slice(2, 0, x.numel() / 160);
+    if (!streaming() && features.size(2)) {
+        auto mean     = features.sum(2, true) / features.size(2);
+        auto centered = features - mean;
+        auto std      = features.size(2) > 1
+                            ? at::sqrt(centered.pow(2).sum(2, true) / (features.size(2) - 1))
+                            : at::zeros_like(mean);
+        features      = centered / (std + 1e-5);
+    }
+    return features;
 }
 
 Tensor Model::encode(const Tensor& features, EncoderState* state) const {
+    if (state && !streaming())
+        throw std::invalid_argument("offline speech encoder cannot carry streaming state");
     auto x = features.transpose(1, 2).unsqueeze(1);
     for (int stage = 0; stage < 3; ++stage) {
-        int index     = stage == 0 ? 0 : stage == 1 ? 2 : 5;
-        std::string p = "encoder.pre_encode.conv." + std::to_string(index);
-        x = at::conv2d(at::constant_pad_nd(x, {2, 1, 2, 1}, 0), w_[p + ".weight"], w_[p + ".bias"],
-                       {2, 2}, at::IntArrayRef{0, 0}, {1, 1}, stage == 0 ? 1 : 256);
+        int index        = stage == 0 ? 0 : stage == 1 ? 2 : 5;
+        std::string p    = "encoder.pre_encode.conv." + std::to_string(index);
+        int padding_left = streaming() ? 2 : 1;
+        x                = at::conv2d(at::constant_pad_nd(x, {padding_left, 1, padding_left, 1}, 0),
+                                      w_[p + ".weight"], w_[p + ".bias"], {2, 2}, at::IntArrayRef{0, 0}, {1, 1},
+                       stage == 0 ? 1 : 256);
         if (stage) {
             p = "encoder.pre_encode.conv." + std::to_string(index + 1);
             x = at::conv2d(x, w_[p + ".weight"], w_[p + ".bias"]);
@@ -198,8 +211,9 @@ Tensor Model::encode(const Tensor& features, EncoderState* state) const {
                             a + "linear_out");
         auto c = p + "conv.";
         auto z = at::glu(conv(norm(x, p + "norm_conv").transpose(1, 2), c + "pointwise_conv1"), 1);
-        z      = state ? at::cat({state->convolution[layer], z}, 2)
-                       : at::constant_pad_nd(z, {kernel - 1, 0}, 0);
+        int conv_left = streaming() ? kernel - 1 : (kernel - 1) / 2;
+        z             = state ? at::cat({state->convolution[layer], z}, 2)
+                              : at::constant_pad_nd(z, {conv_left, kernel - 1 - conv_left}, 0);
         if (state) state->convolution[layer] = z.slice(2, -(kernel - 1)).clone();
         z = conv(z, c + "depthwise_conv", hidden);
         z = at::batch_norm(z, w_[c + "batch_norm.weight"], w_[c + "batch_norm.bias"],
@@ -275,6 +289,9 @@ std::string Model::tdt(const Tensor& encoded, PredictorState& state) const {
 }
 
 std::string Model::beam(const Tensor& log_probs) const {
+    const size_t beam_size = streaming() ? 64 : 32;
+    const float alpha      = streaming() ? 0.55f : 0.5f;
+    const float beta       = streaming() ? 1.75f : 2.0f;
     // NeMo beam_batch: expand the full vocabulary, prune, then recombine
     // identical collapsed transcripts with the same last frame label.
     auto cpu            = log_probs.squeeze(0).to(at::kCPU).contiguous();
@@ -324,11 +341,11 @@ std::string Model::beam(const Tensor& log_probs) const {
                 bool extend = token != vocab && token != beam[b].last;
                 if (extend && states[token] < 0) continue;
                 float score = beam[b].score + values[t * (vocab + 1) + token];
-                if (extend) score += 1.75f + 0.55f * scores[token];
+                if (extend) score += beta + alpha * scores[token];
                 candidates.push_back({score, b, token, extend ? states[token] : beam[b].state});
             }
         }
-        size_t count = std::min<size_t>(64, candidates.size());
+        size_t count = std::min(beam_size, candidates.size());
         std::partial_sort(candidates.begin(), candidates.begin() + count, candidates.end(),
                           [](auto& a, auto& b) { return a.score > b.score; });
         std::vector<Hyp> next;
@@ -358,7 +375,7 @@ std::string Model::beam(const Tensor& log_probs) const {
             state = backs[state];
             score = acc + final[state];
         }
-        h.score += 0.55f * score;
+        h.score += alpha * score;
         if (h.score > best) {
             best   = h.score;
             tokens = h.tokens;

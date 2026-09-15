@@ -54,6 +54,10 @@ public:
     std::string beam(const Tensor&) const;
     std::string text(const std::vector<int>& ids) const;
 
+    bool streaming() const {
+        return config["model"]["encoder"]["att_context_style"] == "chunked_limited";
+    }
+
     at::Device device() const { return device_; }
 
     Tensor empty_features() const {

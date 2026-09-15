@@ -1,6 +1,7 @@
 """Real speech-model HTTP checks; opt in with SUROGATE_STT_TEST_MODEL/AUDIO."""
 
 import io
+import json
 import os
 import socket
 import subprocess
@@ -79,6 +80,9 @@ def test_file_and_validation(server):
     r = client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()}, timeout=120)
     assert r.ok, r.text
     assert r.json()["text"].strip()
+    oracle = os.environ.get("SUROGATE_STT_TEST_ORACLE")
+    if oracle:
+        assert r.json()["text"] == json.loads(Path(oracle).read_text())["final"].strip()
     verbose = client.post(
         base + "/v1/audio/transcriptions",
         files={"file": audio.read_bytes()},
@@ -104,6 +108,11 @@ def test_streams_are_independent_and_packet_sizes_do_not_change_text(server):
     import soundfile as sf
 
     client, base, audio = server
+    if os.environ.get("SUROGATE_STT_TEST_OFFLINE"):
+        response = client.post(base + "/v1/audio/streams", timeout=10)
+        assert response.status_code == 400
+        assert "/v1/audio/transcriptions" in response.json()["error"]["message"]
+        return
     samples, rate = sf.read(audio, dtype="float32")
     assert rate == 16000
     # Include silence to check pause finalization and segment reset.
@@ -148,6 +157,19 @@ def test_streams_are_independent_and_packet_sizes_do_not_change_text(server):
 
 def test_cancel_malformed_chunks_and_short_tail(server):
     client, base, _ = server
+    if os.environ.get("SUROGATE_STT_TEST_OFFLINE"):
+        for length in (1, 80, 160, 255, 256, 319, 320, 511, 512):
+            wav = io.BytesIO()
+            with wave.open(wav, "wb") as f:
+                f.setnchannels(1)
+                f.setsampwidth(2)
+                f.setframerate(16000)
+                f.writeframes(b"\0\0" * length)
+            r = client.post(base + "/v1/audio/transcriptions", files={"file": wav.getvalue()}, timeout=120)
+            assert r.ok, (length, r.text)
+            if length < 320:
+                assert r.json()["text"] == ""
+        return
     ident = client.post(base + "/v1/audio/streams", timeout=10).json()["id"]
     url = base + "/v1/audio/streams/" + ident
     assert client.post(url, data=b"x", timeout=5).status_code == 400

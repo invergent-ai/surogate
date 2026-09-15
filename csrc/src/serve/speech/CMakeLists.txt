@@ -27,6 +27,10 @@ target_link_directories(sinfer_speech PUBLIC "${SPEECH_TORCH_ROOT}/lib")
 target_link_libraries(sinfer_speech PUBLIC torch_cpu c10 sentencepiece-static
     avformat avcodec avutil swresample ${CMAKE_DL_LIBS})
 add_executable(surogate-stt EXCLUDE_FROM_ALL server.cpp)
+add_executable(surogate-stt-lm EXCLUDE_FROM_ALL arpa.cpp)
+target_include_directories(surogate-stt-lm PRIVATE ${SINFER_JSON_INCLUDE})
+set_target_properties(surogate-stt-lm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_dependencies(surogate-stt surogate-stt-lm)
 target_include_directories(surogate-stt PRIVATE ${SUROGATE_VENDOR_DIR}/cpp-httplib)
 target_link_libraries(surogate-stt PRIVATE sinfer_speech)
 set_target_properties(surogate-stt PROPERTIES

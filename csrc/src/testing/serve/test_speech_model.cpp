@@ -41,6 +41,15 @@ int main(int argc, char** argv) {
             throw std::runtime_error("CTC+LM transcript disagrees with NeMo");
         EncoderState state;
         PredictorState predictor;
+        if (!model.streaming()) {
+            if (model.tdt(encoded, predictor) != expected["tdt"].get<std::string>())
+                throw std::runtime_error("offline TDT transcript disagrees with NeMo");
+            try {
+                model.encode(mel, &state);
+                throw std::runtime_error("offline encoder accepted streaming state");
+            } catch (const std::invalid_argument&) {
+            }
+        }
         for (size_t i = 0; i < expected["partials"].size(); ++i) {
             auto prefix = "chunk_" + std::to_string(i);
             auto x = model.encode(reference[prefix], &state);

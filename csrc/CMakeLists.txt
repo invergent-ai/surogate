@@ -1729,7 +1729,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 INSTALL_RPATH "${SINFER_LIB_RPATH}"
                 BUILD_WITH_INSTALL_RPATH OFF
                 INSTALL_RPATH_USE_LINK_PATH FALSE)
-            install(TARGETS surogate-stt RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
+            install(TARGETS surogate-stt surogate-stt-lm RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer sinfer-serve surogate-embed
                     RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
                     COMPONENT serve)
@@ -1746,7 +1746,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                         COMPONENT serve)
             endif()
         else()
-            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt sinfer_shared
+            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt surogate-stt-lm sinfer_shared
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib
                     COMPONENT serve)

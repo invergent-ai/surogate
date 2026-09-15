@@ -1,10 +1,23 @@
 # Romanian speech recognition
 
-Serve [`surogate/surogate-ro-110m-streaming`](https://huggingface.co/surogate/surogate-ro-110m-streaming)
-for Romanian transcription on a GPU or CPU. File uploads return completed transcripts.
-Live audio streams return partial transcripts and corrected final transcripts after a pause.
+Serve Romanian transcription on a GPU or CPU with either model:
 
-Install the speech preparation dependency, then start the server:
+| Model | Use |
+|---|---|
+| [`surogate/surogate-ro-110m-tdt-ctc`](https://huggingface.co/surogate/surogate-ro-110m-tdt-ctc) | Transcribe complete audio files |
+| [`surogate/surogate-ro-110m-streaming`](https://huggingface.co/surogate/surogate-ro-110m-streaming) | File transcription or live audio with partial and final transcripts |
+
+Start the non-streaming model:
+
+```bash
+surogate serve --stt surogate/surogate-ro-110m-tdt-ctc --device 0 --port 8080
+```
+
+It processes the complete recording before returning text and automatically uses
+the repository's Romanian language model. Live-audio requests return an error
+with instructions to use file transcription instead.
+
+For live audio, install the streaming dependency and start the streaming model:
 
 ```bash
 pip install 'silero-vad==6.2.1'
@@ -27,9 +40,16 @@ starts reuse them. `SUROGATE_SERVE_CACHE` changes the preparation cache location
 To use local files:
 
 ```bash
+surogate serve --stt /models/Ib_final.nemo \
+  --lm /models/ro_4gram.arpa --device cpu
+
 surogate serve --stt /models/Is_ctc_final_20260915.nemo \
   --lm /models/ro_4gram.nemo --device 0
 ```
+
+The matching language model can be a NeMo `.nemo` archive or a token-ID `.arpa`
+file. Preparation is automatic and cached. The non-streaming model does not
+need the `silero-vad` dependency.
 
 The served model ID is the model argument supplied at startup. `/v1/models`
 reports it; `--served-model-name` sets a deployment alias. `--api-key` enables
@@ -44,8 +64,9 @@ curl http://localhost:8080/v1/audio/transcriptions \
 
 The response is `{"text":"…"}`. WAV, FLAC, MP3, Ogg, M4A, AAC, and WebM audio
 are supported; stereo and other sample rates are converted automatically.
-Uploads are limited to 64 MiB and ten minutes. Longer recordings are divided
-at pauses, with a maximum segment length of 60 seconds.
+Uploads are limited to 64 MiB and ten minutes. The non-streaming model processes
+the entire file together; longer files need more memory. The streaming model
+divides recordings at pauses, with a maximum segment length of 60 seconds.
 
 Optional form fields:
 
@@ -61,7 +82,7 @@ return an error.
 
 ## Stream microphone audio
 
-Create a stream:
+Use the streaming model for this endpoint. Create a stream:
 
 ```bash
 curl -X POST http://localhost:8080/v1/audio/streams

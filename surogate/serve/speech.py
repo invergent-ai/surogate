@@ -4,14 +4,17 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
 
 from filelock import FileLock
 
-_MODEL = "surogate/surogate-ro-110m-streaming"
-_CHECKPOINT = "Is_ctc_final_20260915.nemo"
+_MODELS = {
+    "surogate/surogate-ro-110m-streaming": ("Is_ctc_final_20260915.nemo", "ro_4gram.nemo"),
+    "surogate/surogate-ro-110m-tdt-ctc": ("Ib_final.nemo", "ro_4gram.arpa"),
+}
 _VERSION = 1
 
 
@@ -44,10 +47,7 @@ def _validate(config):
     expected = {
         "subsampling": "dw_striding",
         "subsampling_factor": 8,
-        "causal_downsampling": True,
         "self_attention_model": "rel_pos",
-        "att_context_style": "chunked_limited",
-        "conv_context_size": "causal",
         "conv_norm_type": "batch_norm",
         "xscaling": False,
         "feat_in": 80,
@@ -59,11 +59,25 @@ def _validate(config):
             raise ValueError(f"unsupported speech encoder {key}: {encoder.get(key)!r}")
     if encoder.get("reduction") is not None or encoder.get("feat_out", -1) != -1:
         raise ValueError("speech encoder reduction/output projection is unsupported")
-    left, right = encoder["att_context_size"]
-    if left <= 0 or right < 0 or left % (right + 1):
-        raise ValueError("speech attention context must contain whole streaming chunks")
-    if config["preprocessor"].get("normalize") not in (None, "NA", False):
-        raise ValueError("speech serving requires unnormalized streaming features")
+    streaming = encoder.get("att_context_style") == "chunked_limited"
+    if streaming:
+        left, right = encoder["att_context_size"]
+        if left <= 0 or right < 0 or left % (right + 1):
+            raise ValueError("speech attention context must contain whole streaming chunks")
+        if encoder.get("causal_downsampling") is not True or encoder.get("conv_context_size") != "causal":
+            raise ValueError("streaming speech requires causal downsampling and convolution")
+        if config["preprocessor"].get("normalize") not in (None, "NA", False):
+            raise ValueError("streaming speech requires unnormalized features")
+    else:
+        if (
+            encoder.get("att_context_style") != "regular"
+            or encoder.get("att_context_size") != [-1, -1]
+            or encoder.get("causal_downsampling") is not False
+            or encoder.get("conv_context_size") is not None
+        ):
+            raise ValueError("offline speech requires full attention and symmetric convolution")
+        if config["preprocessor"].get("normalize") != "per_feature":
+            raise ValueError("offline speech requires per-feature normalization")
     if config["sample_rate"] != 16000 or config["decoder"]["prednet"]["pred_rnn_layers"] != 1:
         raise ValueError("speech serving requires 16 kHz audio and a one-layer TDT predictor")
     preprocessor = config["preprocessor"]
@@ -87,28 +101,51 @@ def ensure_speech_weights(model, *, lm=None, reuse_cache=True, echo=print):
     if not path.exists():
         from huggingface_hub import hf_hub_download
 
-        if model != _MODEL:
+        if model not in _MODELS:
             raise ValueError(f"unsupported speech repository {model!r}; provide a local .nemo checkpoint")
-        path = Path(hf_hub_download(model, _CHECKPOINT))
-        lm = lm or hf_hub_download(model, "ro_4gram.nemo")
+        checkpoint, language_model = _MODELS[model]
+        path = Path(hf_hub_download(model, checkpoint))
+        lm = lm or hf_hub_download(model, language_model)
     if path.is_dir():
-        lm = lm or str(path / "ro_4gram.nemo")
-        path = path / _CHECKPOINT
+        candidates = [path / checkpoint for checkpoint, _ in _MODELS.values() if (path / checkpoint).is_file()]
+        if len(candidates) != 1:
+            raise ValueError(
+                "model directory must contain exactly one supported speech checkpoint; otherwise provide its file path"
+            )
+        path = candidates[0]
     if lm is None:
-        candidate = path.parent / "ro_4gram.nemo"
-        if not candidate.is_file():
+        candidates = [path.parent / name for name in ("ro_4gram.nemo", "ro_4gram.arpa")]
+        candidates = [p for p in candidates if p.is_file()]
+        if not candidates:
             raise ValueError("provide the matching Romanian 4-gram archive with --lm PATH")
-        lm = candidate
+        lm = candidates[0]
     lm = Path(lm).expanduser().resolve(strict=True)
     path = path.resolve(strict=True)
+    # HF snapshots resolve to content-addressed blobs without file extensions.
+    # Recognize the actual format, including when --lm names such a blob.
+    with lm.open("rb") as source:
+        arpa = source.read(1024).lstrip().startswith(b"\\data\\")
     from importlib.util import find_spec
 
-    spec = find_spec("silero_vad")
-    if spec is None:
-        raise ValueError("speech preparation needs silero-vad: pip install silero-vad==6.2.1")
-    vad = Path(spec.origin).parent / "data" / "silero_vad.jit"
+    # Read the small configuration before deciding whether VAD is needed.
+    with tarfile.open(path) as archive:
+        import yaml
+
+        member = next((m for m in archive if m.isfile() and m.name.removeprefix("./") == "model_config.yaml"), None)
+        if member is None:
+            raise ValueError("NeMo archive lacks model_config.yaml")
+        config = yaml.safe_load(archive.extractfile(member))
+    _validate(config)
+    streaming = config["encoder"]["att_context_style"] == "chunked_limited"
+    vad = None
+    if streaming:
+        spec = find_spec("silero_vad")
+        if spec is None:
+            raise ValueError("streaming speech preparation needs silero-vad: pip install silero-vad==6.2.1")
+        vad = Path(spec.origin).parent / "data" / "silero_vad.jit"
     identity = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in (path, lm)]
-    identity.append(("vad", hashlib.sha256(vad.read_bytes()).hexdigest()))
+    if vad:
+        identity.append(("vad", hashlib.sha256(vad.read_bytes()).hexdigest()))
     key = hashlib.sha256(json.dumps([_VERSION, identity]).encode()).hexdigest()[:24]
     root = Path(os.environ.get("SUROGATE_SERVE_CACHE", Path.home() / ".cache/surogate/serve"))
     root.mkdir(parents=True, exist_ok=True)
@@ -128,20 +165,34 @@ def ensure_speech_weights(model, *, lm=None, reuse_cache=True, echo=print):
             save_file({k: v.contiguous() for k, v in weights.items()}, output / "acoustic.safetensors")
             del weights
             (output / "tokenizer.model").write_bytes(tokenizer)
-            lm_config, weights, _ = _archive(lm)
-            if lm_config["vocab_size"] != config["decoder"]["vocab_size"]:
-                raise ValueError("speech language-model vocabulary does not match the acoustic model")
-            keep = (
-                "arcs_weights",
-                "backoff_weights",
-                "final_weights",
-                "to_states",
-                "ilabels",
-                "backoff_to_states",
-                "start_end_arcs",
-            )
-            save_file({k: weights[k].contiguous() for k in keep}, output / "lm.safetensors")
-            shutil.copyfile(vad, output / "vad.jit")
+            if arpa:
+                from surogate.cli.serve import _resolve_binary
+
+                binary = _resolve_binary("stt")
+                converter = Path(binary).with_name("surogate-stt-lm") if binary else None
+                if converter is None or not converter.is_file():
+                    raise ValueError(
+                        "ARPA preparation needs surogate-stt-lm; rebuild with make serve-build or make serve-stt-build"
+                    )
+                subprocess.run([str(converter), str(lm), str(output), str(config["decoder"]["vocab_size"])], check=True)
+                lm_config = json.loads((output / "lm.json").read_text())
+                (output / "lm.json").unlink()
+            else:
+                lm_config, weights, _ = _archive(lm)
+                if lm_config["vocab_size"] != config["decoder"]["vocab_size"]:
+                    raise ValueError("speech language-model vocabulary does not match the acoustic model")
+                keep = (
+                    "arcs_weights",
+                    "backoff_weights",
+                    "final_weights",
+                    "to_states",
+                    "ilabels",
+                    "backoff_to_states",
+                    "start_end_arcs",
+                )
+                save_file({k: weights[k].contiguous() for k in keep}, output / "lm.safetensors")
+            if vad:
+                shutil.copyfile(vad, output / "vad.jit")
             serving_config = {
                 key: config[key] for key in ("sample_rate", "encoder", "decoder", "preprocessor", "model_defaults")
             }

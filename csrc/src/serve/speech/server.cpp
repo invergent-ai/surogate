@@ -127,8 +127,19 @@ int main(int argc, char** argv) {
             auto pcm = decode_audio(q.get_file_value("file").content);
             std::lock_guard lock(mutex);
             c10::InferenceMode guard;
-            Stream stream(model, artifact);
-            auto events = stream.accept(pcm, true);
+            std::vector<json> events;
+            if (model.streaming()) {
+                Stream stream(model, artifact);
+                events = stream.accept(pcm, true);
+            } else {
+                // Full-context features and attention see the complete file.
+                // In particular, do not run VAD or normalize separate chunks.
+                auto samples    = at::from_blob(pcm.data(), {int64_t(pcm.size())}, at::kFloat);
+                auto transcript = pcm.size() < 320
+                                      ? std::string()
+                                      : model.beam(model.ctc(model.encode(model.mel(samples))));
+                events.push_back({{"type", "final"}, {"text", transcript}});
+            }
             std::string text;
             for (auto& event : events)
                 if (event["type"] == "final") {
@@ -159,6 +170,10 @@ int main(int argc, char** argv) {
                     ++it;
         };
         server.Post("/v1/audio/streams", [&](const auto& q, auto& r) {
+            if (!model.streaming())
+                throw std::invalid_argument(
+                    "this model needs complete audio; use /v1/audio/transcriptions or serve the "
+                    "streaming sibling for live audio");
             if (!q.body.empty() && q.body != "{}")
                 throw std::invalid_argument("stream creation takes an empty body; send mono 16 kHz "
                                             "PCM16 to the returned stream");
