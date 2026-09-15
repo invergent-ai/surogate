@@ -83,6 +83,87 @@ the expected dimension and finite values.
 | 4 | 1 | 83.5 | 42,752 | 48.8 ms | 5,010 |
 | 4 | 8 | 245.9 | 125,884 | 99.2 ms | 1,844 |
 
+### EmbeddingGemma-300M Q8_0 on CPU (2026-09-15)
+
+Both servers used `models/embeddinggemma-300M-Q8_0.gguf`, 16 physical cores
+(`16-31`) and memory on NUMA node 1 of the dual EPYC 9124 host. GPUs were hidden.
+The client ran on CPU 0. Other CPU jobs were active during these measurements.
+The llama.cpp reference is the local native CPU build at `629b505528`.
+
+Inputs were identical natural-text token windows, including BOS/EOS, with 768-dimensional
+outputs. Startup and conversion are excluded; HTTP and JSON processing are included.
+Each case had three passes with four warmup requests. Short 32-token cases received
+three additional, longer passes after isolated pauses in the brief initial samples.
+All samples are retained. Throughput uses total tokens divided by total measured time;
+p50 uses all request latencies.
+
+One client:
+
+| Tokens/input | Inputs/request | llama.cpp p50 | Surogate p50 | Surogate throughput / llama.cpp |
+|---:|---:|---:|---:|---:|
+| 32 | 1 | 14.1 ms | **12.7 ms** | **1.11x** |
+| 128 | 1 | 64.4 ms | **34.8 ms** | **1.79x** |
+| 512 | 1 | 225.4 ms | **135.7 ms** | **1.69x** |
+| 2,048 | 1 | 909.5 ms | **573.6 ms** | **1.61x** |
+| 32 | 8 | 97.2 ms | **63.2 ms** | **1.42x** |
+| 512 | 8 | 1,679.9 ms | **1,055.8 ms** | **1.72x** |
+
+Four concurrent clients:
+
+| Tokens/input | Inputs/request | llama.cpp tokens/s | Surogate tokens/s | Ratio |
+|---:|---:|---:|---:|---:|
+| 32 | 1 | 2,171 | **2,504** | **1.15x** |
+| 512 | 1 | 2,477 | **3,536** | **1.43x** |
+| 512 | 8 | 2,438 | **3,624** | **1.49x** |
+
+There were **8,784 successful timed requests and zero failures**, including the original
+Surogate build used as a control. Observed process RSS ranged from **0.93–0.96 GiB** for
+Surogate and **0.57–4.73 GiB** for llama.cpp with the batch settings below. The smaller
+llama.cpp value is from short inputs; its larger value follows batched long inputs.
+
+Accuracy checks compared 22 text inputs and 16 token windows against llama.cpp. Minimum
+cosine similarity was **0.99715** overall and **0.99926** for the fixed-length windows
+through 2,048 tokens. This work also corrected EmbeddingGemma's local attention window;
+the original Surogate control used a wider window, so its before/after speed difference
+includes that correction. The final comparison above uses matching attention windows.
+
+The local ik_llama.cpp source and binary do not support `gemma-embedding`, so there is no
+ik_llama.cpp timing for this model.
+
+[Raw measurements, commands and accuracy checks](tools/bench/results/2026-09-15-embeddinggemma-cpu.json)
+and the [token corpus](tools/bench/results/2026-09-15-embeddinggemma-cpu-corpus.json) are retained.
+
+Run the servers **one at a time**:
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=16 OMP_WAIT_POLICY=ACTIVE \
+  numactl --physcpubind=16-31 --membind=1 \
+  .venv/bin/surogate serve models/embeddinggemma-300M-Q8_0.gguf \
+  --embed --device cpu --port 18413
+
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=16 OMP_WAIT_POLICY=ACTIVE \
+  numactl --physcpubind=16-31 --membind=1 \
+  study/llama.cpp-glm/build/bin/llama-server \
+  -m models/embeddinggemma-300M-Q8_0.gguf --embedding -ngl 0 --no-mmap \
+  -t 16 -tb 16 --cpu-range 16-31 --cpu-strict 1 \
+  --cpu-range-batch 16-31 --cpu-strict-batch 1 \
+  -c 65536 -b 4096 -ub 4096 -np 32 --pooling mean \
+  --host 127.0.0.1 --port 18414
+```
+
+Point the same client at each server, changing only the port:
+
+```bash
+numactl --physcpubind=0 --membind=0 .venv/bin/python \
+  -m surogate.serve.tools.bench.embeddings_bench \
+  --url http://127.0.0.1:18413 --tokens 512 --batch 8 --concurrency 4 \
+  --warmup 4 --requests 12 --bos-token-id 2 --eos-token-id 1 \
+  --token-corpus surogate/serve/tools/bench/results/2026-09-15-embeddinggemma-cpu-corpus.json
+```
+
+For 32-token inputs, use 512 requests for single-input requests and 128 requests for
+eight-input batches. Alternate engine order when repeating the comparison.
+
 ### Other files in `models/`
 
 | Input | Result |

@@ -163,3 +163,22 @@ def test_many_single_token_sequences(encoder, request):
             assert sum(v * v for v in actual) == pytest.approx(1.0, abs=1e-5)
             # BF16 projections select different kernels for a wide batch.
             assert sum(a * b for a, b in zip(actual, expected)) > 0.995
+
+
+def test_batch_preserves_sequence_boundaries(encoder, request):
+    if request.node.callspec.params["encoder"] != "cpu":
+        pytest.skip("CPU batch packing regression")
+    # Different lengths, query-tile tails, and more than one 2,048-token batch.
+    inputs = [[42, 71, 93], [137, 53] * 257 + [93], [71] * 1531, [42], [93] * 128]
+    expected = [vector(post(encoder, input=ids)) for ids in inputs]
+    for order in [list(range(len(inputs))), list(reversed(range(len(inputs))))]:
+        response = post(encoder, input=[inputs[i] for i in order])
+        assert response.ok, response.text
+        payload = response.json()
+        assert payload["usage"]["prompt_tokens"] == sum(map(len, inputs))
+        assert len(payload["data"]) == len(inputs)
+        for index, item in enumerate(payload["data"]):
+            assert item["index"] == index
+            actual = item["embedding"]
+            assert all(math.isfinite(value) for value in actual)
+            assert sum(a * b for a, b in zip(actual, expected[order[index]])) > 0.999

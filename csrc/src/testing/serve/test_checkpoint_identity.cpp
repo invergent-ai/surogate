@@ -51,6 +51,19 @@ void check_encoder() {
     assert(config.max_tokens == 4096 && config.rms_epsilon == 1e-5F);
     assert(config.attention_scale == 0.125F && config.rope_theta_local == 1234.0F);
     assert(!config.is_global(0) && config.is_global(1) && !config.is_global(2));
+    assert(config.mean_pooling && config.sliding_window == 65);
+
+    // The GGUF's span is converted only for the bidirectional EmbeddingGemma
+    // encoder. Harrier's causal Gemma/Qwen windows retain their full distance.
+    for (const auto* architecture : {"gemma_embedding", "gemma3_embedding", "qwen3_embedding"}) {
+        auto changed = directory;
+        changed["identity"]["architecture"] = architecture;
+        changed["geometry"]["sliding_window"] = 512;
+        auto window_fixture = sinfer::test::artifact_fixture::write_fixture(changed, "encoder_window");
+        const sinfer::artifact::Reader window_reader(window_fixture.path);
+        const auto resolved = sinfer::encoder::TextEmbeddingConfig::from_artifact(window_reader);
+        assert(resolved.sliding_window == (resolved.mean_pooling ? 257 : 512));
+    }
 }
 
 void check_glm() {

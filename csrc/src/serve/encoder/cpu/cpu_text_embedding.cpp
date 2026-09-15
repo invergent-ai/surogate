@@ -338,17 +338,19 @@ std::vector<std::vector<float>> CpuTextEmbedding::embed_batch(
     for (const auto& sequence : sequences) {
         validate_embedding_input(sequence, config.vocab, config.max_tokens);
     }
-    // One sequence per forward here, where the GPU concatenates a batch. On CPU
-    // the projections already saturate the cores with a single sequence -- the
-    // measured llama.cpp throughput is flat in concurrency for exactly this
-    // reason -- so concatenating would buy latency, not throughput.
-    for (const std::vector<std::int32_t>& sequence : sequences) {
-        const auto tokens = static_cast<std::int32_t>(sequence.size());
-        if (tokens <= 0) { throw std::invalid_argument("embed: a sequence is empty"); }
-        if (tokens > config.max_tokens) {
-            throw std::invalid_argument("embed: " + std::to_string(tokens) + " tokens exceeds " +
-                                        std::to_string(config.max_tokens));
+    // Share the projections across inputs while keeping attention and pooling
+    // within each sequence. Bound the combined input by the existing scratch.
+    for (std::size_t first = 0; first < sequences.size();) {
+        std::vector<std::int32_t> combined;
+        std::vector<std::int32_t> offsets{0};
+        std::size_t last = first;
+        while (last < sequences.size() &&
+               combined.size() + sequences[last].size() <= static_cast<std::size_t>(config.max_tokens)) {
+            combined.insert(combined.end(), sequences[last].begin(), sequences[last].end());
+            offsets.push_back(static_cast<std::int32_t>(combined.size()));
+            ++last;
         }
+        const auto tokens = static_cast<std::int32_t>(combined.size());
 
         const auto hidden       = static_cast<std::size_t>(config.hidden);
         const auto query_size   = static_cast<std::size_t>(config.query_size());
@@ -358,7 +360,11 @@ std::vector<std::vector<float>> CpuTextEmbedding::embed_batch(
         const auto span   = static_cast<std::size_t>(tokens);
         Impl::Scratch& sc = impl.scratch;
         auto& positions   = sc.positions;
-        for (std::int32_t i = 0; i < tokens; ++i) { positions[static_cast<std::size_t>(i)] = i; }
+        for (std::size_t item = 0; item + 1 < offsets.size(); ++item) {
+            for (auto i = offsets[item]; i < offsets[item + 1]; ++i) {
+                positions[static_cast<std::size_t>(i)] = i - offsets[item];
+            }
+        }
         auto &x = sc.x, &h = sc.h, &attn = sc.attn, &query = sc.query, &key = sc.key,
              &value = sc.value, &attn_out = sc.attn_out, &gate = sc.gate, &up = sc.up;
         auto &h16 = sc.h16, &wide16 = sc.wide16, &q16 = sc.q16, &k16 = sc.k16, &v16 = sc.v16;
@@ -366,7 +372,7 @@ std::vector<std::vector<float>> CpuTextEmbedding::embed_batch(
         Profile profile;
 
         // Qualified: the member `embed` would otherwise shadow the kernel.
-        cpu::embed(impl.token_embedding.data(), sequence.data(), x.data(), config.hidden, tokens,
+        cpu::embed(impl.token_embedding.data(), combined.data(), x.data(), config.hidden, tokens,
                    config.vocab);
         scale(x.data(), config.embedding_scale, static_cast<std::int64_t>(hidden * span));
 
@@ -409,9 +415,14 @@ std::vector<std::vector<float>> CpuTextEmbedding::embed_batch(
             narrow(key.data(), k16.data(), static_cast<std::int64_t>(head_dim * span), *impl.pool);
             narrow(value.data(), v16.data(), static_cast<std::int64_t>(head_dim * span),
                    *impl.pool);
-            attention(q16.data(), k16.data(), v16.data(), attn_out.data(), config.query_heads,
-                      config.head_dim, tokens, window, config.attention_scale, scratch.data(),
-                      *impl.pool, config.kv_heads, !config.mean_pooling);
+            for (std::size_t item = 0; item + 1 < offsets.size(); ++item) {
+                const auto offset = static_cast<std::size_t>(offsets[item]);
+                attention(q16.data() + offset * query_size, k16.data() + offset * head_dim,
+                          v16.data() + offset * head_dim, attn_out.data() + offset * query_size,
+                          config.query_heads, config.head_dim, offsets[item + 1] - offsets[item],
+                          window, config.attention_scale, scratch.data(), *impl.pool,
+                          config.kv_heads, !config.mean_pooling);
+            }
             profile.end("attention");
             profile.begin();
 
@@ -463,22 +474,26 @@ std::vector<std::vector<float>> CpuTextEmbedding::embed_batch(
         rmsnorm(x.data(), impl.final_norm.data(), config.rms_epsilon, config.gemma, h.data(),
                 config.hidden, tokens, *impl.pool);
 
-        std::vector<float> pooled(hidden);
-        mean_pool(config.mean_pooling ? h.data() : h.data() + (tokens - 1) * hidden,
-                  pooled.data(), config.hidden, config.mean_pooling ? tokens : 1);
-        if (!config.mean_pooling) {
-            l2norm(pooled.data(), config.hidden, 1, 1.0e-12F);
-            out.push_back(std::move(pooled));
-            continue;
+        for (std::size_t item = 0; item + 1 < offsets.size(); ++item) {
+            std::vector<float> pooled(hidden);
+            const auto start = config.mean_pooling ? offsets[item] : offsets[item + 1] - 1;
+            const auto count = config.mean_pooling ? offsets[item + 1] - offsets[item] : 1;
+            mean_pool(h.data() + static_cast<std::size_t>(start) * hidden, pooled.data(), config.hidden, count);
+            if (!config.mean_pooling) {
+                l2norm(pooled.data(), config.hidden, 1, 1.0e-12F);
+                out.push_back(std::move(pooled));
+                continue;
+            }
+            std::vector<std::uint16_t> pooled16(hidden);
+            narrow(pooled.data(), pooled16.data(), static_cast<std::int64_t>(hidden), *impl.pool);
+            std::vector<float> projected(hidden);
+            gemm(impl.embedding_head.data(), pooled16.data(), projected.data(), config.hidden,
+                 config.hidden, 1, *impl.pool);
+            l2norm(projected.data(), config.hidden, 1, 1.0e-12F);
+            out.push_back(std::move(projected));
         }
-        std::vector<std::uint16_t> pooled16(hidden);
-        narrow(pooled.data(), pooled16.data(), static_cast<std::int64_t>(hidden), *impl.pool);
-        std::vector<float> projected(hidden);
-        gemm(impl.embedding_head.data(), pooled16.data(), projected.data(), config.hidden,
-             config.hidden, 1, *impl.pool);
-        l2norm(projected.data(), config.hidden, 1, 1.0e-12F);
         profile.report();
-        out.push_back(std::move(projected));
+        first = last;
     }
     return out;
 }

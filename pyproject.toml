@@ -5,7 +5,7 @@ description = "Surogate LLMOps Toolkit"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE", "surogate/kernels/triton/fla_kda/LICENSE", "csrc/src/serve/family/impl/sglang-LICENSE"]
+license-files = ["LICENSE", "surogate/kernels/triton/fla_kda/LICENSE", "csrc/src/serve/family/impl/sglang-LICENSE", "csrc/src/serve/encoder/cpu/ik_llama-LICENSE"]
 authors = [
     { name = "Flavius Burca", email = "flavius@invergent.ai" }
 ]

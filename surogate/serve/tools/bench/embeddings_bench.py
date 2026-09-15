@@ -17,26 +17,31 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 
 
-def build_inputs(tokens: int, count: int) -> list[list[int]]:
+def build_inputs(tokens: int, count: int, corpus: Sequence[int] | None = None) -> list[list[int]]:
     """`count` distinct sequences of exactly `tokens` ids.
 
-    Token ids rather than text, and the OpenAI schema allows both. Sending ids
-    means the number measured is the model: two engines with different
-    tokenizers would otherwise be compared partly on their tokenizers, and this
-    engine's frontend cannot yet encode Gemma text at all.
+    Both engines receive identical token IDs, excluding tokenizer differences
+    from the fixed-length measurement.
 
     Ids are drawn from a band well clear of the byte-fallback and special ranges,
     so nothing here depends on a particular vocabulary beyond its size.
     """
+    if corpus is not None:
+        if not corpus or any(type(token) is not int or token < 0 for token in corpus):
+            raise ValueError("token corpus must be a nonempty array of nonnegative integer IDs")
+        return [[corpus[(index * 7919 + position) % len(corpus)] for position in range(tokens)]
+                for index in range(count)]
     pool_size = 200_000
     return [
         [2000 + ((index * 7919 + position * 31) % pool_size) for position in range(tokens)]
@@ -50,6 +55,7 @@ class Result:
     vectors: int = 0
     failures: int = 0
     dims: int = 0
+    elapsed: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def record(self, seconds: float, vectors: int, dims: int) -> None:
@@ -63,8 +69,11 @@ class Result:
             self.failures += 1
 
 
-def post(url: str, model: str, inputs: Sequence[Sequence[int]], timeout: float) -> tuple[int, int]:
-    body = json.dumps({"model": model, "input": [list(i) for i in inputs]}).encode()
+def post(url: str, model: str | None, inputs: Sequence[Sequence[int]], timeout: float) -> tuple[int, int]:
+    fields = {"input": [list(i) for i in inputs], "encoding_format": "float"}
+    if model is not None:
+        fields["model"] = model
+    body = json.dumps(fields).encode()
     request = urllib.request.Request(
         f"{url.rstrip('/')}/v1/embeddings",
         data=body,
@@ -73,10 +82,19 @@ def post(url: str, model: str, inputs: Sequence[Sequence[int]], timeout: float) 
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.load(response)
     data = payload["data"]
-    return len(data), len(data[0]["embedding"])
+    if len(data) != len(inputs) or not data:
+        raise ValueError("server returned the wrong number of embeddings")
+    dims = len(data[0]["embedding"])
+    for index, item in enumerate(data):
+        vector = item["embedding"]
+        if item["index"] != index or not dims or len(vector) != dims or not all(map(math.isfinite, vector)):
+            raise ValueError("server returned an invalid embedding")
+    if payload.get("usage", {}).get("prompt_tokens") != sum(map(len, inputs)):
+        raise ValueError("server processed a different token count")
+    return len(data), dims
 
 
-def run(url: str, model: str, texts: list[list[int]], batch: int, concurrency: int,
+def run(url: str, model: str | None, texts: list[list[int]], batch: int, concurrency: int,
         requests: int, timeout: float) -> Result:
     result = Result()
     counter = iter(range(requests))
@@ -92,7 +110,7 @@ def run(url: str, model: str, texts: list[list[int]], batch: int, concurrency: i
             start = time.perf_counter()
             try:
                 vectors, dims = post(url, model, chunk, timeout)
-            except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError):
+            except (urllib.error.URLError, OSError, KeyError, ValueError, TypeError):
                 result.fail()
                 continue
             result.record(time.perf_counter() - start, vectors, dims)
@@ -103,15 +121,18 @@ def run(url: str, model: str, texts: list[list[int]], batch: int, concurrency: i
         thread.start()
     for thread in threads:
         thread.join()
-    result.elapsed = time.perf_counter() - began  # type: ignore[attr-defined]
+    result.elapsed = time.perf_counter() - began
     return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
-    parser.add_argument("--model", default="embeddinggemma")
+    parser.add_argument("--model", help="served model ID; omit to use the running model")
     parser.add_argument("--tokens", type=int, default=512)
+    parser.add_argument("--token-corpus", type=Path, help="JSON array of token IDs; use natural text windows instead of synthetic IDs")
+    parser.add_argument("--bos-token-id", type=int, help="prepend this token within --tokens")
+    parser.add_argument("--eos-token-id", type=int, help="append this token within --tokens")
     parser.add_argument("--batch", type=int, default=8, help="sequences per request")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--requests", type=int, default=64)
@@ -119,12 +140,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
+    if min(args.tokens, args.batch, args.concurrency, args.requests, args.timeout) <= 0 or args.warmup < 0:
+        parser.error("tokens, batch, concurrency, requests and timeout must be positive; warmup must be nonnegative")
 
     pool = max(args.batch * 4, 32)
-    texts = build_inputs(args.tokens, pool)
+    corpus = json.loads(args.token_corpus.read_text()) if args.token_corpus else None
+    if corpus is not None and not isinstance(corpus, list):
+        parser.error("token corpus must be a JSON array")
+    prefix = [] if args.bos_token_id is None else [args.bos_token_id]
+    suffix = [] if args.eos_token_id is None else [args.eos_token_id]
+    inner_tokens = args.tokens - len(prefix) - len(suffix)
+    if inner_tokens < 0 or any(token < 0 for token in prefix + suffix):
+        parser.error("special token IDs must be nonnegative and fit within --tokens")
+    texts = [prefix + ids + suffix for ids in build_inputs(inner_tokens, pool, corpus)]
 
     if args.warmup:
-        run(args.url, args.model, texts, args.batch, args.concurrency, args.warmup, args.timeout)
+        warmup = run(args.url, args.model, texts, args.batch, args.concurrency, args.warmup, args.timeout)
+        if warmup.failures:
+            print(f"warmup failed: {warmup.failures} requests")
+            return 1
 
     result = run(args.url, args.model, texts, args.batch, args.concurrency,
                  args.requests, args.timeout)
@@ -133,10 +167,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     ordered = sorted(result.latencies)
-    elapsed = result.elapsed  # type: ignore[attr-defined]
+    elapsed = result.elapsed
     print(json.dumps({
         "label": args.label,
         "tokens": args.tokens,
+        "token_corpus": str(args.token_corpus) if args.token_corpus else None,
+        "bos_token_id": args.bos_token_id,
+        "eos_token_id": args.eos_token_id,
         "batch": args.batch,
         "concurrency": args.concurrency,
         "requests_ok": len(result.latencies),
@@ -151,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "p99": round(1000 * ordered[min(len(ordered) - 1, int(0.99 * len(ordered)))], 2),
         },
     }))
-    return 0
+    return int(result.failures != 0)
 
 
 if __name__ == "__main__":

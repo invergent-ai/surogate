@@ -1,4 +1,5 @@
 #include "encoder/cpu/cpu_ops.h"
+#include "encoder/cpu/cpu_math.h"
 
 #if defined(SINFER_WITH_ZENDNN)
 #include <zendnnl.hpp>
@@ -158,6 +159,11 @@ bool have_avx512() {
                             __builtin_cpu_supports("avx512dq");
     return yes;
 }
+
+bool have_avx512_bf16() {
+    static const bool yes = have_avx512() && __builtin_cpu_supports("avx512bf16");
+    return yes;
+}
 #endif
 
 inline float dot(const float* a, const float* b, std::int32_t n) {
@@ -216,6 +222,48 @@ float dot_bf16_avx512(const std::uint16_t* w, const std::uint16_t* x, std::int32
     return sum;
 }
 
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512bf16")))
+float dot_bf16_native(const std::uint16_t* w, const std::uint16_t* x, std::int32_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::int32_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(w + i),
+                              (__m512bh)_mm512_loadu_si512(x + i));
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; i < n; ++i) { sum += widen(w[i]) * widen(x[i]); }
+    return sum;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+void weighted_values_bf16(const float* weights, const std::uint16_t* v, float* out,
+                          std::int32_t keys, std::int32_t stride, std::int32_t dim,
+                          float inverse) {
+    std::int32_t d = 0;
+    for (; d + 64 <= dim; d += 64) {
+        __m512 a = _mm512_setzero_ps(), b = a, c = a, e = a;
+        for (std::int32_t key = 0; key < keys; ++key) {
+            const __m512 weight = _mm512_set1_ps(weights[key] * inverse);
+            const auto* row = v + static_cast<std::int64_t>(key) * stride + d;
+            a = _mm512_fmadd_ps(weight, widen16(row), a);
+            b = _mm512_fmadd_ps(weight, widen16(row + 16), b);
+            c = _mm512_fmadd_ps(weight, widen16(row + 32), c);
+            e = _mm512_fmadd_ps(weight, widen16(row + 48), e);
+        }
+        _mm512_storeu_ps(out + d, a);
+        _mm512_storeu_ps(out + d + 16, b);
+        _mm512_storeu_ps(out + d + 32, c);
+        _mm512_storeu_ps(out + d + 48, e);
+    }
+    for (; d < dim; ++d) {
+        float sum = 0.0F;
+        for (std::int32_t key = 0; key < keys; ++key) {
+            sum += weights[key] * inverse * widen(v[static_cast<std::int64_t>(key) * stride + d]);
+        }
+        out[d] = sum;
+    }
+}
+
 /// 4 BF16 weight rows x 4 BF16 token columns, accumulated in FP32 registers.
 ///
 /// A dot-product GEMM issues one FMA per two loads and pays a horizontal
@@ -269,14 +317,190 @@ void gemm_bf16_4x4_avx512(const std::uint16_t* w0, const std::uint16_t* w1,
         }
     }
 }
+
+// Two BF16 products per lane; FP32 accumulation and the same storage contract.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512bf16")))
+void gemm_bf16_4x4_native(const std::uint16_t* w0, const std::uint16_t* w1,
+                          const std::uint16_t* w2, const std::uint16_t* w3,
+                          const std::uint16_t* x0, const std::uint16_t* x1,
+                          const std::uint16_t* x2, const std::uint16_t* x3, std::int32_t k,
+                          float* out, std::int32_t out_stride) {
+    __m512 acc[4][4];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) { acc[r][c] = _mm512_setzero_ps(); }
+    }
+    std::int32_t i = 0;
+    for (; i + 32 <= k; i += 32) {
+        const __m512bh wv0 = (__m512bh)_mm512_loadu_si512(w0 + i);
+        const __m512bh wv1 = (__m512bh)_mm512_loadu_si512(w1 + i);
+        const __m512bh wv2 = (__m512bh)_mm512_loadu_si512(w2 + i);
+        const __m512bh wv3 = (__m512bh)_mm512_loadu_si512(w3 + i);
+        const __m512bh xv0 = (__m512bh)_mm512_loadu_si512(x0 + i);
+        const __m512bh xv1 = (__m512bh)_mm512_loadu_si512(x1 + i);
+        const __m512bh xv2 = (__m512bh)_mm512_loadu_si512(x2 + i);
+        const __m512bh xv3 = (__m512bh)_mm512_loadu_si512(x3 + i);
+        acc[0][0] = _mm512_dpbf16_ps(acc[0][0], wv0, xv0);
+        acc[0][1] = _mm512_dpbf16_ps(acc[0][1], wv0, xv1);
+        acc[0][2] = _mm512_dpbf16_ps(acc[0][2], wv0, xv2);
+        acc[0][3] = _mm512_dpbf16_ps(acc[0][3], wv0, xv3);
+        acc[1][0] = _mm512_dpbf16_ps(acc[1][0], wv1, xv0);
+        acc[1][1] = _mm512_dpbf16_ps(acc[1][1], wv1, xv1);
+        acc[1][2] = _mm512_dpbf16_ps(acc[1][2], wv1, xv2);
+        acc[1][3] = _mm512_dpbf16_ps(acc[1][3], wv1, xv3);
+        acc[2][0] = _mm512_dpbf16_ps(acc[2][0], wv2, xv0);
+        acc[2][1] = _mm512_dpbf16_ps(acc[2][1], wv2, xv1);
+        acc[2][2] = _mm512_dpbf16_ps(acc[2][2], wv2, xv2);
+        acc[2][3] = _mm512_dpbf16_ps(acc[2][3], wv2, xv3);
+        acc[3][0] = _mm512_dpbf16_ps(acc[3][0], wv3, xv0);
+        acc[3][1] = _mm512_dpbf16_ps(acc[3][1], wv3, xv1);
+        acc[3][2] = _mm512_dpbf16_ps(acc[3][2], wv3, xv2);
+        acc[3][3] = _mm512_dpbf16_ps(acc[3][3], wv3, xv3);
+    }
+    const std::uint16_t* w[4] = {w0, w1, w2, w3};
+    const std::uint16_t* x[4] = {x0, x1, x2, x3};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float sum = _mm512_reduce_add_ps(acc[r][c]);
+            for (std::int32_t t = i; t < k; ++t) { sum += widen(w[r][t]) * widen(x[c][t]); }
+            out[static_cast<std::int64_t>(c) * out_stride + r] = sum;
+        }
+    }
+}
 #endif
 
 inline float dot_bf16(const std::uint16_t* w, const std::uint16_t* x, std::int32_t n) {
 #if defined(__x86_64__)
+    if (have_avx512_bf16()) { return dot_bf16_native(w, x, n); }
     if (have_avx512()) { return dot_bf16_avx512(w, x, n); }
 #endif
     return dot_bf16_scalar(w, x, n);
 }
+
+#if defined(__x86_64__)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+void softmax_avx512(float* weights, std::int32_t count, float scale) {
+    const __m512 multiplier = _mm512_set1_ps(scale);
+    __m512 maximum = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    std::int32_t i = 0;
+    for (; i + 16 <= count; i += 16) {
+        maximum = _mm512_max_ps(maximum, _mm512_mul_ps(_mm512_loadu_ps(weights + i), multiplier));
+    }
+    float peak = _mm512_reduce_max_ps(maximum);
+    for (; i < count; ++i) { peak = std::max(peak, weights[i] * scale); }
+    maximum = _mm512_set1_ps(peak);
+    __m512 total = _mm512_setzero_ps();
+    i = 0;
+    for (; i + 16 <= count; i += 16) {
+        const __m512 value = exp_avx512(_mm512_sub_ps(
+            _mm512_mul_ps(_mm512_loadu_ps(weights + i), multiplier), maximum));
+        _mm512_storeu_ps(weights + i, value);
+        total = _mm512_add_ps(total, value);
+    }
+    float sum = _mm512_reduce_add_ps(total);
+    for (; i < count; ++i) { weights[i] = std::exp(weights[i] * scale - peak); sum += weights[i]; }
+    const float inverse = sum > 0.0F ? 1.0F / sum : 0.0F;
+    const __m512 normalizer = _mm512_set1_ps(inverse);
+    i = 0;
+    for (; i + 16 <= count; i += 16) {
+        _mm512_storeu_ps(weights + i, _mm512_mul_ps(_mm512_loadu_ps(weights + i), normalizer));
+    }
+    for (; i < count; ++i) { weights[i] *= inverse; }
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+void weighted_values_bf16_4(const float* weights, const std::uint16_t* v, float* out,
+                            std::int32_t keys, std::int32_t v_stride,
+                            std::int32_t out_stride, std::int32_t dim) {
+    // Four queries share each value load. Softmax weights and sums stay FP32.
+    std::int32_t d = 0;
+    for (; d + 16 <= dim; d += 16) {
+        __m512 a = _mm512_setzero_ps(), b = a, c = a, e = a;
+        for (std::int32_t key = 0; key < keys; ++key) {
+            const __m512 value = widen16(v + static_cast<std::int64_t>(key) * v_stride + d);
+            a = _mm512_fmadd_ps(_mm512_set1_ps(weights[key]), value, a);
+            b = _mm512_fmadd_ps(_mm512_set1_ps(weights[key + keys]), value, b);
+            c = _mm512_fmadd_ps(_mm512_set1_ps(weights[key + 2 * keys]), value, c);
+            e = _mm512_fmadd_ps(_mm512_set1_ps(weights[key + 3 * keys]), value, e);
+        }
+        _mm512_storeu_ps(out + d, a);
+        _mm512_storeu_ps(out + out_stride + d, b);
+        _mm512_storeu_ps(out + 2 * out_stride + d, c);
+        _mm512_storeu_ps(out + 3 * out_stride + d, e);
+    }
+    for (; d < dim; ++d) {
+        for (int query = 0; query < 4; ++query) {
+            float sum = 0.0F;
+            for (std::int32_t key = 0; key < keys; ++key) {
+                sum += weights[query * keys + key] *
+                       widen(v[static_cast<std::int64_t>(key) * v_stride + d]);
+            }
+            out[query * out_stride + d] = sum;
+        }
+    }
+}
+
+void attention_bf16_native(const std::uint16_t* q, const std::uint16_t* k,
+                            const std::uint16_t* v, float* out, std::int32_t heads,
+                            std::int32_t dim, std::int32_t tokens, std::int32_t window,
+                            float scale, ThreadPool& pool, std::int32_t kv_heads, bool causal) {
+    const std::int32_t q_stride = heads * dim, kv_stride = kv_heads * dim;
+    const std::int32_t blocks = (tokens + 3) / 4;
+    pool.parallel_for(static_cast<std::int64_t>(heads) * blocks,
+                      [&](std::int64_t begin, std::int64_t end) {
+        static thread_local std::vector<float> scores;
+        scores.resize(static_cast<std::size_t>(4) * tokens);
+        for (auto unit = begin; unit < end; ++unit) {
+            const auto head = static_cast<std::int32_t>(unit / blocks);
+            const auto query = static_cast<std::int32_t>(unit % blocks) * 4;
+            const auto count = std::min(4, tokens - query);
+            const auto lo = window > 0 ? std::max(0, query - window + 1) : 0;
+            const auto hi = causal ? query + count :
+                window > 0 ? std::min(tokens, query + count - 1 + window) : tokens;
+            const auto keys = hi - lo;
+            const auto* queries = q + static_cast<std::int64_t>(query) * q_stride + head * dim;
+            const auto* key_base = k + static_cast<std::int64_t>(lo) * kv_stride +
+                                  (head / (heads / kv_heads)) * dim;
+            const auto* value_base = v + static_cast<std::int64_t>(lo) * kv_stride +
+                                    (head / (heads / kv_heads)) * dim;
+            std::int32_t key = 0;
+            if (count == 4) {
+                for (; key + 4 <= keys; key += 4) {
+                    const auto* wk = key_base + static_cast<std::int64_t>(key) * kv_stride;
+                    gemm_bf16_4x4_native(wk, wk + kv_stride, wk + 2 * kv_stride,
+                        wk + 3 * kv_stride, queries, queries + q_stride,
+                        queries + 2 * q_stride, queries + 3 * q_stride, dim,
+                        scores.data() + key, keys);
+                }
+            }
+            for (; key < keys; ++key) {
+                for (std::int32_t row = 0; row < count; ++row) {
+                    scores[row * keys + key] = dot_bf16_native(queries + row * q_stride,
+                        key_base + static_cast<std::int64_t>(key) * kv_stride, dim);
+                }
+            }
+            for (std::int32_t row = 0; row < count; ++row) {
+                auto* weights = scores.data() + row * keys;
+                const auto first = (window > 0 ? std::max(0, query + row - window + 1) : 0) - lo;
+                const auto last = (causal ? query + row + 1 :
+                    window > 0 ? std::min(tokens, query + row + window) : tokens) - lo;
+                softmax_avx512(weights + first, last - first, scale);
+                std::fill(weights, weights + first, 0.0F);
+                std::fill(weights + last, weights + keys, 0.0F);
+            }
+            auto* target = out + static_cast<std::int64_t>(query) * q_stride + head * dim;
+            if (count == 4) {
+                weighted_values_bf16_4(scores.data(), value_base, target, keys,
+                                      kv_stride, q_stride, dim);
+            } else {
+                for (std::int32_t row = 0; row < count; ++row) {
+                    weighted_values_bf16(scores.data() + row * keys, value_base,
+                        target + row * q_stride, keys, kv_stride, dim, 1.0F);
+                }
+            }
+        }
+    });
+}
+#endif
 
 inline float gelu_tanh(float z) {
     constexpr float kSqrt2Pi = 0.79788456080286535588F;
@@ -664,7 +888,7 @@ void gemm(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32
                 const std::uint16_t* w3 = w + static_cast<std::int64_t>(row0 + 3) * k;
                 std::int32_t t  = 0;
                 for (; t + kBlock <= tokens; t += kBlock) {
-                    gemm_bf16_4x4_avx512(w0, w1, w2, w3, x + static_cast<std::int64_t>(t + 0) * k,
+                    (have_avx512_bf16() ? gemm_bf16_4x4_native : gemm_bf16_4x4_avx512)(w0, w1, w2, w3, x + static_cast<std::int64_t>(t + 0) * k,
                                     x + static_cast<std::int64_t>(t + 1) * k,
                                     x + static_cast<std::int64_t>(t + 2) * k,
                                     x + static_cast<std::int64_t>(t + 3) * k, k,
@@ -892,6 +1116,13 @@ void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16
     const std::int32_t query_rows = q_heads * head_dim;
     const std::int32_t kv_rows = kv_heads * head_dim;
     if (kv_heads <= 0 || q_heads % kv_heads) { throw std::invalid_argument("invalid encoder KV heads"); }
+#if defined(__x86_64__)
+    if (have_avx512_bf16()) {
+        attention_bf16_native(q, k, v, out, q_heads, head_dim, tokens, window, scale,
+                              pool, kv_heads, causal);
+        return;
+    }
+#endif
 
     // One (head, query) pair per unit of work. Each writes its own slice of the
     // output and reads nothing another unit writes, so the only shared state is
@@ -931,6 +1162,14 @@ void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16
             const float inverse = sum > 0.0F ? 1.0F / sum : 0.0F;
 
             float* target = out + static_cast<std::int64_t>(query) * query_rows + head * head_dim;
+#if defined(__x86_64__)
+            if (have_avx512()) {
+                weighted_values_bf16(weights.data(),
+                    v + static_cast<std::int64_t>(lo) * kv_rows + (head / (q_heads / kv_heads)) * head_dim,
+                    target, hi - lo, kv_rows, head_dim, inverse);
+                continue;
+            }
+#endif
             std::fill(target, target + head_dim, 0.0F);
             for (std::int32_t key = lo; key < hi; ++key) {
                 const float weight = weights[static_cast<std::size_t>(key - lo)] * inverse;

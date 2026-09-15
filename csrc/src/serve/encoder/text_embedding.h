@@ -84,7 +84,10 @@ struct TextEmbeddingConfig {
         config.max_tokens = g.max_context;
         config.max_batch_tokens = std::max(config.max_batch_tokens, config.max_tokens);
         config.rms_epsilon = g.rms_epsilon;
-        config.sliding_window = g.sliding_window;
+        // EmbeddingGemma stores the total bidirectional span in the checkpoint.
+        // Encoder kernels take an exclusive distance from the query instead.
+        config.sliding_window = config.mean_pooling && g.sliding_window > 0
+                                    ? g.sliding_window / 2 + 1 : g.sliding_window;
         config.rope_theta_global = g.rope_theta;
         config.rope_theta_local = gemma ? g.sliding_rope_theta : g.rope_theta;
         config.attention_scale = g.attention_scale;

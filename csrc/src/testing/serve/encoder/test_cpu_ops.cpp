@@ -77,11 +77,11 @@ float from_bf16(std::uint16_t bits) {
     return value;
 }
 
-int test_gemm(cpu::ThreadPool& pool) {
+int test_gemm(cpu::ThreadPool& pool, std::int32_t n = 1152, std::int32_t k = 768,
+              std::int32_t tokens = 37) {
     // Gemma's own shapes, and a token count that is not a multiple of anything.
     // The weight is BF16 as stored; the reference reads the same rounded values,
     // so the tolerance stays about arithmetic rather than storage.
-    const std::int32_t n = 1152, k = 768, tokens = 37;
     const std::vector<float> raw = random_floats(static_cast<std::size_t>(n) * k, 1, -0.3F, 0.3F);
     std::vector<std::uint16_t> w(raw.size());
     for (std::size_t i = 0; i < raw.size(); ++i) { w[i] = to_bf16(raw[i]); }
@@ -103,7 +103,8 @@ int test_gemm(cpu::ThreadPool& pool) {
             want[static_cast<std::size_t>(t) * n + row] = sum;
         }
     }
-    return check("gemm bf16 x bf16 [1152,768] x 37", out, want, 2e-5);
+    return check("gemm bf16 [" + std::to_string(n) + "," + std::to_string(k) + "] x " +
+                 std::to_string(tokens), out, want, 2e-5);
 }
 
 int test_rmsnorm(cpu::ThreadPool& pool) {
@@ -133,11 +134,12 @@ int test_rmsnorm(cpu::ThreadPool& pool) {
 /// The window is symmetric, and a window wider than the sequence is no window at
 /// all. Both are properties the GPU op is tested for; a second implementation
 /// that disagrees would be worse than none.
-int test_attention(cpu::ThreadPool& pool, int kv_heads = 1, bool causal = false) {
-    const std::int32_t heads = kv_heads == 1 ? 3 : 4, head_dim = 256, tokens = 40;
+int test_attention(cpu::ThreadPool& pool, int kv_heads = 1, bool causal = false,
+                   std::int32_t head_dim = 256, std::int32_t tokens = 40, float magnitude = 1.F) {
+    const std::int32_t heads = kv_heads == 1 ? 3 : 4;
     const auto raw_q =
-        random_floats(static_cast<std::size_t>(heads) * head_dim * tokens, 5, -1.F, 1.F);
-    const auto raw_k = random_floats(static_cast<std::size_t>(head_dim) * kv_heads * tokens, 6, -1.F, 1.F);
+        random_floats(static_cast<std::size_t>(heads) * head_dim * tokens, 5, -magnitude, magnitude);
+    const auto raw_k = random_floats(static_cast<std::size_t>(head_dim) * kv_heads * tokens, 6, -magnitude, magnitude);
     const auto raw_v = random_floats(static_cast<std::size_t>(head_dim) * kv_heads * tokens, 7, -1.F, 1.F);
     std::vector<std::uint16_t> q(raw_q.size()), k(raw_k.size()), v(raw_v.size());
     for (std::size_t i = 0; i < raw_q.size(); ++i) { q[i] = to_bf16(raw_q[i]); }
@@ -147,7 +149,7 @@ int test_attention(cpu::ThreadPool& pool, int kv_heads = 1, bool causal = false)
     std::vector<float> scratch(cpu::attention_scratch(heads, tokens));
 
     int failures = 0;
-    for (const std::int32_t window : {0, 8, 1000}) {
+    for (const std::int32_t window : {0, 1, 8, 1000}) {
         std::vector<float> out(static_cast<std::size_t>(heads) * head_dim * tokens);
         cpu::attention(q.data(), k.data(), v.data(), out.data(), heads, head_dim, tokens, window,
                        scale, scratch.data(), pool, kv_heads, causal);
@@ -296,9 +298,14 @@ int main(int argc, char** argv) {
     int failures = 0;
     failures += test_runner_thread();
     failures += test_gemm(pool);
+    failures += test_gemm(pool, 19, 35, 7);
+    failures += test_gemm(pool, 5, 17, 1);
     failures += test_rmsnorm(pool);
     failures += test_attention(pool);
     failures += test_attention(pool, 2, true);
+    failures += test_attention(pool, 1, false, 65, 7);
+    failures += test_attention(pool, 2, true, 33, 71, 6.F);
+    failures += test_attention(pool, 1, false, 32, 1);
     failures += test_mean_pool();
     failures += test_gelu_mul(pool);
     failures += test_l2norm();
