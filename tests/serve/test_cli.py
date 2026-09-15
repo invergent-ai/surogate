@@ -18,6 +18,7 @@ def test_native_option_inventory(mode):
         "server": "serve/serve_options.cpp",
         "generate": "cli/options.cpp",
         "embed": "encoder/options.h",
+        "stt": "speech/server.cpp",
     }[mode]
     native = set(re.findall(r'arg == "(-[^\"]+)"', path.read_text())) - {"--help", "-h"}
     assert native == serve._VALUE_OPTIONS[mode] | serve._SWITCH_OPTIONS[mode]
@@ -75,12 +76,15 @@ def test_execution_puts_resolved_model_first(mode, monkeypatch):
     ingest = Mock()
     ingest.ensure_engine_weights.return_value = ingest.ensure_encoder_weights.return_value = Path("/prepared.sinfer")
     monkeypatch.setitem(sys.modules, "surogate.serve.ingest", ingest)
+    speech = Mock()
+    speech.ensure_speech_weights.return_value = Path("/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.speech", speech)
     execute = Mock()
     monkeypatch.setattr(serve.os, "execv", execute)
     serve.maybe_exec_serve()
     identity = ["--served-model-name", "model"] if mode != "generate" else []
     execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--device", "1", *identity])
-    prepare = ingest.ensure_encoder_weights if mode == "embed" else ingest.ensure_engine_weights
+    prepare = speech.ensure_speech_weights if mode == "stt" else ingest.ensure_encoder_weights if mode == "embed" else ingest.ensure_engine_weights
     assert prepare.call_args.args == ("model",)
     assert prepare.call_args.kwargs["reuse_cache"] is False
 

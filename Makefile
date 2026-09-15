@@ -73,7 +73,7 @@ serve-configure:
 
 serve-build: serve-configure
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
-		--target surogate-engine-cli surogate-engine surogate-embed _surogate_serve
+		--target surogate-engine-cli surogate-engine surogate-embed surogate-stt _surogate_serve
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so surogate/ 2>/dev/null || true
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
 	# The module holds no device code of its own any more; libsinfer.so does, and
@@ -81,6 +81,16 @@ serve-build: serve-configure
 	# import error about a missing library.
 	cp -f $(SERVE_BUILD_DIR)/libsinfer.so surogate/ 2>/dev/null || true
 	cp -f $(SERVE_BUILD_DIR)/libsinfer.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
+
+# Speech-only build: needs a C++ compiler and FFmpeg development libraries,
+# without the CUDA toolkit. Uses the active Python environment's PyTorch.
+STT_PYTHON ?= $(abspath .venv/bin/python)
+serve-stt-build:
+	cmake -S csrc/src/serve/speech -B csrc/build-stt -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=$(STT_PYTHON)
+	cmake --build csrc/build-stt --parallel $(PARALLEL_JOBS) --target surogate-stt
+
+.PHONY: serve-stt-build
 
 # Build the engine *and* every registered test binary. The tests are excluded from `all`,
 # so naming the aggregate is what makes them exist; without it ctest reports "Not Run"

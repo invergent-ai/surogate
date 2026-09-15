@@ -18,6 +18,8 @@ surogate serve Qwen/Qwen3.6-27B --port 8080
 - **Several models across GPUs**, with per-model placement and optional sleep mode to free memory when a model is idle.
 - **Images and video** for supported vision models (`--vision`).
 - **Embeddings** on GPU or CPU through `surogate serve --embed`.
+- **Romanian speech recognition** with file uploads and live partial transcripts through
+  [`surogate serve --stt`](speech.md).
 
 See [Serving models](serving-models.md) for worked examples.
 
@@ -39,7 +41,7 @@ identify the model; it does not select a different model size or change its sett
 
 The served ID defaults to the model argument you supplied, preserving a repository ID or local
 path through preparation. Set `--served-model-name` to choose another ID. `/v1/models` lists
-the names accepted by the server. This applies to text-generation and embedding servers.
+the names accepted by the server. This applies to text-generation, embedding, and speech servers.
 
 The first start prepares the model and saves reusable files under `~/.cache/surogate/serve`.
 Later starts skip that preparation, but still need time to load the model. Set

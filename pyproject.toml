@@ -5,7 +5,7 @@ description = "Surogate LLMOps Toolkit"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE", "surogate/kernels/triton/fla_kda/LICENSE", "csrc/src/serve/family/impl/sglang-LICENSE", "csrc/src/serve/encoder/cpu/ik_llama-LICENSE"]
+license-files = ["LICENSE", "surogate/kernels/triton/fla_kda/LICENSE", "csrc/src/serve/family/impl/sglang-LICENSE", "csrc/src/serve/encoder/cpu/ik_llama-LICENSE", "csrc/src/serve/speech/NOTICE"]
 authors = [
     { name = "Flavius Burca", email = "flavius@invergent.ai" }
 ]
@@ -26,6 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 dependencies = [
+    "torch>=2.11",
     "transformers>=5.5.0",
     "huggingface-hub>=1.4.1",
     "sentencepiece>=0.2.0",
@@ -50,8 +51,11 @@ dependencies = [
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
+[project.optional-dependencies]
+speech = ["silero-vad==6.2.1"]
+
 [build-system]
-requires = ["scikit-build-core>=0.11", "nanobind"]
+requires = ["scikit-build-core>=0.11", "nanobind", "torch>=2.11"]
 build-backend = "scikit_build_core.build"
 
 [tool.setuptools_scm]
@@ -75,6 +79,7 @@ build.targets = [
     "sinfer",
     "sinfer-serve",
     "surogate-embed",
+    "surogate-stt",
     "_surogate_serve",
 ]
 # Install this project's own components and nothing else. Two reasons, both load-bearing:

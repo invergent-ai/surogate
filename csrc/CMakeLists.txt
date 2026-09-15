@@ -1440,6 +1440,7 @@ endif()
 # --embed` execs it, so it has to exist after `make serve-build` like the engine
 # does. Same source as the old serve_tests target, which is now gone.
 add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
+add_subdirectory(${SERVE_ROOT}/speech)
 target_include_directories(surogate-embed PRIVATE
   ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
 # Links sinfer_shared, with the other three products, once that target exists below.
@@ -1728,6 +1729,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 INSTALL_RPATH "${SINFER_LIB_RPATH}"
                 BUILD_WITH_INSTALL_RPATH OFF
                 INSTALL_RPATH_USE_LINK_PATH FALSE)
+            install(TARGETS surogate-stt RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer sinfer-serve surogate-embed
                     RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
                     COMPONENT serve)
@@ -1744,7 +1746,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                         COMPONENT serve)
             endif()
         else()
-            install(TARGETS sinfer sinfer-serve surogate-embed sinfer_shared
+            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt sinfer_shared
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib
                     COMPONENT serve)

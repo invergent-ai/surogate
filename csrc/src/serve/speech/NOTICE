@@ -1,0 +1,16 @@
+The FastConformer, TDT and n-gram decoding implementation follows the equations
+and streaming state conventions in NVIDIA NeMo, licensed under Apache-2.0:
+https://github.com/NVIDIA/NeMo
+Copyright (c) 2020-2026 NVIDIA CORPORATION. All rights reserved.
+
+Reference validation uses NeMo 3.0.0. Relevant modules are conformer_encoder,
+subsampling, conformer_modules, multi_head_attention, transducer_decoding/
+tdt_label_looping, ctc_batched_beam_decoding, and ngram_lm/ngram_lm_batched.
+
+Silero VAD is provided by the separately installed silero-vad package (MIT).
+Its weights are copied into the user's model cache during preparation.
+https://github.com/snakers4/silero-vad
+
+The surogate/surogate-ro-110m-streaming checkpoint is CC-BY-4.0:
+https://huggingface.co/surogate/surogate-ro-110m-streaming
+No acoustic, language-model, tokenizer, or VAD weights are bundled here.

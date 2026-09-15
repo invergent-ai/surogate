@@ -1,0 +1,41 @@
+# LibTorch is already a package dependency. The speech process runs C++ only;
+# NeMo is a validation reference, never an inference-time dependency.
+cmake_minimum_required(VERSION 3.25)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(SurogateSpeech LANGUAGES CXX)
+    set(CMAKE_CXX_STANDARD 20)
+    include(FetchContent)
+    FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz)
+    FetchContent_Declare(sentencepiece GIT_REPOSITORY https://github.com/google/sentencepiece.git GIT_TAG v0.2.1)
+    set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(json sentencepiece)
+    set(SINFER_JSON_INCLUDE "${json_SOURCE_DIR}/single_include")
+    get_filename_component(SUROGATE_VENDOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party" ABSOLUTE)
+    enable_testing()
+endif()
+find_package(Python COMPONENTS Interpreter REQUIRED)
+execute_process(COMMAND "${Python_EXECUTABLE}" -c
+    "import pathlib, torch; print(pathlib.Path(torch.__file__).parent)"
+    OUTPUT_VARIABLE SPEECH_TORCH_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+add_library(sinfer_speech STATIC EXCLUDE_FROM_ALL model.cpp audio.cpp)
+target_include_directories(sinfer_speech PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    "${SPEECH_TORCH_ROOT}/include" "${SPEECH_TORCH_ROOT}/include/torch/csrc/api/include"
+    ${SINFER_JSON_INCLUDE} ${sentencepiece_SOURCE_DIR}/src)
+target_link_directories(sinfer_speech PUBLIC "${SPEECH_TORCH_ROOT}/lib")
+target_link_libraries(sinfer_speech PUBLIC torch_cpu c10 sentencepiece-static
+    avformat avcodec avutil swresample ${CMAKE_DL_LIBS})
+add_executable(surogate-stt EXCLUDE_FROM_ALL server.cpp)
+target_include_directories(surogate-stt PRIVATE ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+target_link_libraries(surogate-stt PRIVATE sinfer_speech)
+set_target_properties(surogate-stt PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    INSTALL_RPATH "$ORIGIN/../../../torch/lib")
+if(SUROGATE_SERVE_TESTS)
+    add_executable(test_speech_model EXCLUDE_FROM_ALL ../../testing/serve/test_speech_model.cpp)
+    target_link_libraries(test_speech_model PRIVATE sinfer_speech)
+    set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS test_speech_model)
+    add_test(NAME speech_model COMMAND test_speech_model)
+    set_tests_properties(speech_model PROPERTIES SKIP_RETURN_CODE 77)
+endif()

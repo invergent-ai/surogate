@@ -18,6 +18,7 @@ _USAGE = """\
 usage: surogate serve <model> [engine options...]
        surogate serve --generate <model> --prompt "..." [options...]
        surogate serve --embed <model> [--frontend DIR] [options...]
+       surogate serve --stt <model> [--lm PATH] [--device N|cpu] [options...]
 
 <model> is a Hugging Face repo id, a local safetensors model directory, or a
 GGUF file. First use converts transparently into a local cache; after that,
@@ -55,6 +56,9 @@ Common server options (full list: surogate serve --engine-help):
 OMP_WAIT_POLICY=ACTIVE and OMP_NUM_THREADS set to the physical cores of one NUMA
 node.
 
+--stt serves Romanian speech recognition on GPU or CPU. Use --lm PATH with a
+local NeMo checkpoint. See docs/inference/speech.md for file uploads and live audio.
+
 From a source checkout, build the engine first with: make serve-build
 """
 
@@ -70,6 +74,7 @@ _MODES = {
     "server": ("surogate-engine", "SUROGATE_SERVE_BIN"),
     "generate": ("surogate-engine-cli", "SUROGATE_ENGINE_CLI_BIN"),
     "embed": ("surogate-embed", "SUROGATE_EMBED_BIN"),
+    "stt": ("surogate-stt", "SUROGATE_STT_BIN"),
 }
 
 # Arity is needed before preparing a model: an option value may itself start with
@@ -99,6 +104,7 @@ _VALUE_OPTIONS = {
         --reasoning-effort --stop-token-id --stop --reasoning-stop
     """.split()),
     "embed": frozenset("--host --port --device --served-model-name".split()),
+    "stt": frozenset("--host --port --device --served-model-name --api-key --max-num-seqs".split()),
 }
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""
@@ -111,14 +117,15 @@ _SWITCH_OPTIONS = {
         --raw-output --print-token-ids --prefill-warmup --no-cuda-graph
     """.split()),
     "embed": frozenset(),
+    "stt": frozenset(),
 }
 
 
 def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool, str | None]:
     """Return mode, model, native options, cache policy and preparation resource."""
-    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend", "--mmproj", "--dflash-model"})
+    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend", "--mmproj", "--dflash-model", "--lm"})
     switches = frozenset().union(*_SWITCH_OPTIONS.values(), {
-        "--generate", "--embed", "--no-cache", "--engine-help", "--help", "-h",
+        "--generate", "--embed", "--stt", "--no-cache", "--engine-help", "--help", "-h",
     })
     parsed: list[tuple[str, str | None]] = []
     models: list[str] = []
@@ -148,9 +155,9 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
             raise ValueError(f"unknown option: {flag}")
 
     flags = {flag for flag, _ in parsed}
-    if {"--generate", "--embed"} <= flags:
-        raise ValueError("--embed and --generate are different modes")
-    mode = "embed" if "--embed" in flags else "generate" if "--generate" in flags else "server"
+    if len(flags & {"--generate", "--embed", "--stt"}) > 1:
+        raise ValueError("--embed, --generate and --stt are different modes")
+    mode = "stt" if "--stt" in flags else "embed" if "--embed" in flags else "generate" if "--generate" in flags else "server"
     if flags & {"--engine-help", "--help", "-h"}:
         return mode, None, ["--help"], True, None
     if len(models) != 1 or not models[0]:
@@ -158,19 +165,22 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
     native: list[str] = []
     frontend = None
     for flag, value in parsed:
-        if flag in {"--generate", "--embed", "--no-cache"}:
+        if flag in {"--generate", "--embed", "--stt", "--no-cache"}:
+            continue
+        if flag == "--lm" and mode == "stt":
+            frontend = value
             continue
         if flag == "--frontend" and mode == "embed":
             if not value:
                 raise ValueError("--frontend needs a directory")
             frontend = value
             continue
-        if flag == "--mmproj" and mode != "embed":
+        if flag == "--mmproj" and mode in ("server", "generate"):
             if not value:
                 raise ValueError("--mmproj needs a GGUF file")
             frontend = value
             continue
-        if flag == "--dflash-model" and mode != "embed":
+        if flag == "--dflash-model" and mode in ("server", "generate"):
             if not value:
                 raise ValueError("--dflash-model needs a GGUF file")
             native.extend([flag, value])
@@ -199,6 +209,10 @@ def _resolve_binary(mode: str) -> str | None:
         cand = root / "csrc" / "build-serve" / name
         if cand.is_file():
             return str(cand)
+        if mode == "stt":
+            cand = root / "csrc" / "build-stt" / name
+            if cand.is_file():
+                return str(cand)
     cand = _INSTALLED_BIN_DIR / name
     if cand.is_file():
         return str(cand)
@@ -274,7 +288,10 @@ def maybe_exec_serve() -> None:
         kwargs = dict(reuse_cache=reuse_cache, echo=lambda m: print(m, file=sys.stderr))
         try:
             with redirect_stdout(sys.stderr):
-                if mode == "embed":
+                if mode == "stt":
+                    from surogate.serve.speech import ensure_speech_weights
+                    resolved = ensure_speech_weights(model, lm=frontend, **kwargs)
+                elif mode == "embed":
                     resolved = ensure_encoder_weights(model, frontend=frontend, **kwargs)
                 else:
                     if frontend is not None:
@@ -288,7 +305,7 @@ def maybe_exec_serve() -> None:
         # Keep the public identity from the user's original argument, before the
         # checkpoint is replaced by its prepared cache path (as vLLM does before
         # resolving/redirecting a model). An explicit deployment alias wins.
-        if mode in ("server", "embed") and "--served-model-name" not in selected:
+        if mode in ("server", "embed", "stt") and "--served-model-name" not in selected:
             rest.extend(["--served-model-name", model])
         rest = [str(resolved), *rest]
 
