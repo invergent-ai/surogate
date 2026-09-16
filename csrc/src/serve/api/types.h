@@ -347,6 +347,11 @@ struct StopPolicy {
 };
 
 class CompiledTokenConstraint;
+// An engine-local immutable GPU frontier, retained while the caller holds this key.
+struct GpuPrefixKey {
+    // Bound GPU state storage once, before the shared prefill starts.
+    std::uint32_t state_slots = 1;
+};
 
 struct ExecutionOptions {
     /// Empty means unconstrained output; otherwise a JSON Schema for the generated text.
@@ -360,6 +365,8 @@ struct ExecutionOptions {
     std::vector<TokenId> next_token_candidates;
     /// Publish the completed prefix for reuse by other lanes, subject to cache capacity.
     bool cache_prompt = false;
+    std::shared_ptr<const GpuPrefixKey> gpu_prefix;
+    std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
     /// Number of raw full-vocabulary alternatives to return, 0..20; -1 disables scoring.
     int prompt_logprobs = -1;
     int top_logprobs = -1;

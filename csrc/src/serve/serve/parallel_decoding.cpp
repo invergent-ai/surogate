@@ -116,23 +116,24 @@ ParallelDecodingPlan compile_parallel_plan(std::vector<ParallelField> fields,
             field.nodes[node].choice = static_cast<int>(choice);
         }
         std::vector<TokenId> suffix;
-        std::function<void(std::size_t)> visit = [&](std::size_t index) {
+        std::function<void(std::size_t, int)> visit = [&](std::size_t index, int parent) {
             auto& node = field.nodes[index];
             if (node.choice >= 0 && !node.children.empty()) invalid("choice token encoding is a prefix of another choice");
             if (node.children.size() > 1) {
                 if (plan.queries.size() >= 1024) invalid("schema requires more than 1024 branching decisions");
                 node.query = static_cast<int>(plan.queries.size());
-                ParallelQuery query{.suffix = suffix};
+                ParallelQuery query{.parent = parent, .suffix = suffix};
+                parent = node.query;
                 for (const auto& [id, child] : node.children) query.candidates.push_back(id);
                 plan.queries.push_back(std::move(query));
             }
             for (const auto& [id, child] : node.children) {
                 suffix.push_back(id);
-                visit(child);
+                visit(child, parent);
                 suffix.pop_back();
             }
         };
-        visit(0);
+        visit(0, -1);
     }
     return plan;
 }

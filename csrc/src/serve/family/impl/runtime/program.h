@@ -40,6 +40,8 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
 using PreparedPromptData    = family::PreparedPromptData;
 struct ArchivedSequence;
+struct GpuPrefix;
+struct GpuPrefixStorage;
 using RewriteCheckpointKind = family::RewriteCheckpointKind;
 using RewriteCheckpointSpec = family::RewriteCheckpointSpec;
 
@@ -79,6 +81,10 @@ struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     // in this token order, independent of sampling filters and penalties.
     std::vector<TokenId> next_token_candidates;
     bool cache_prompt = false;
+    bool target_only = false;
+    std::shared_ptr<const GpuPrefixKey> gpu_prefix;
+    std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
+    std::shared_ptr<SINFER_FAMILY_RUNTIME_NS::GpuPrefixStorage> gpu_storage;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     ops::SamplingConfig sampling;
@@ -108,6 +114,7 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     bool prepare_mtp = false;
     bool retain_prefix = true;
     std::shared_ptr<const SINFER_FAMILY_RUNTIME_NS::ArchivedSequence> archived;
+    std::shared_ptr<const SINFER_FAMILY_RUNTIME_NS::GpuPrefix> device_prefix;
     std::optional<SINFER_FAMILY_RUNTIME_NS::VisionPrefillPlan> vision;
     SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -117,6 +124,10 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     // in this token order, independent of sampling filters and penalties.
     std::vector<TokenId> next_token_candidates;
     bool cache_prompt = false;
+    bool target_only = false;
+    std::shared_ptr<const GpuPrefixKey> gpu_prefix;
+    std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
+    std::shared_ptr<SINFER_FAMILY_RUNTIME_NS::GpuPrefixStorage> gpu_storage;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     ops::SamplingConfig sampling;
@@ -239,6 +250,7 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     bool cacheable                = true;
+    bool target_only              = false;
     RewriteCheckpoint rewrite_checkpoint;
     void copy_metadata(const SequenceState& source) {
         execution_frontier = source.execution_frontier; ledger_frontier = source.ledger_frontier;
@@ -248,8 +260,28 @@ struct SequenceState {
         dflash_context_frontier = source.dflash_context_frontier;
         mtp_drafts = source.mtp_drafts; mtp_draft_count = source.mtp_draft_count;
         tail_hidden_valid = source.tail_hidden_valid; retained = source.retained;
-        cacheable = source.cacheable; rewrite_checkpoint = source.rewrite_checkpoint;
+        cacheable = source.cacheable; target_only = source.target_only;
+        rewrite_checkpoint = source.rewrite_checkpoint;
     }
+};
+
+struct GpuPrefixStorage {
+    DeviceArena memory;
+    std::size_t stride;
+    std::vector<std::uint32_t> free;
+    GpuPrefixStorage(std::size_t bytes, std::uint32_t count) : memory(bytes * count), stride(bytes) {
+        free.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) free.push_back(count - i - 1);
+    }
+};
+struct GpuPrefix {
+    std::weak_ptr<const GpuPrefixKey> key;
+    SequenceState state;
+    std::shared_ptr<SequenceKVBundle> pages;
+    std::shared_ptr<GpuPrefixStorage> storage;
+    std::uint32_t slot = 0;
+    std::vector<Tensor> current;
+    ~GpuPrefix() { if (storage) storage->free.push_back(slot); }
 };
 
 struct ArchivedSequence {
@@ -269,11 +301,17 @@ struct RequestControl {
     // in this token order, independent of sampling filters and penalties.
     std::vector<TokenId> next_token_candidates;
     bool cache_prompt = false;
+    bool target_only = false;
+    std::shared_ptr<const GpuPrefixKey> gpu_prefix;
+    std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
+    std::shared_ptr<GpuPrefixStorage> gpu_storage;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     std::vector<TokenScore> prompt_scores;
     std::vector<TokenScore> completion_scores;
     std::vector<float> next_token_logits;
+    TokenId readout_token = 0;
+    float readout_logprob = std::numeric_limits<float>::quiet_NaN();
     ops::SamplingConfig sampling_host;
     std::vector<float> logit_bias_host;
     std::unique_ptr<TokenConstraintState> constraint;
@@ -376,6 +414,7 @@ public:
     void score_prefill_hidden(std::uint32_t lane, const Tensor& hidden, int base);
     void append_completion_score(std::uint32_t lane, const RawTokenScores& score);
     void score_completion(std::uint32_t lane, const Tensor& logits, TokenId token);
+    void finish_readout_prefills(std::span<const std::uint32_t> lanes, runtime::MixedRoundResult& result);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -530,6 +569,9 @@ public:
     Tensor logit_bias;
     Tensor token_bitmask;
     std::unique_ptr<family::detail::SpeculativeConstraintRound> speculative_constraints;
+    // One stable readout workspace per program, reused by every field/branch.
+    DeviceArena candidate_readout_storage{256 * (sizeof(TokenId) + sizeof(float))};
+    std::array<float, 256> candidate_readout_host{};
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 
@@ -538,6 +580,11 @@ public:
     // Host snapshots retain complete continuation state without reserving another active
     // lane or increasing the GPU KV pool. Each pipeline stage has a bounded local cache.
     family::detail::RadixPrefixCache<ArchivedSequence> archived_prefixes{512ULL << 20};
+    std::unordered_map<const GpuPrefixKey*, std::shared_ptr<GpuPrefix>> gpu_prefixes;
+    void prune_gpu_prefixes();
+    void capture_gpu_prefix(SequenceState& sequence, const std::shared_ptr<const GpuPrefixKey>& key,
+                             const std::shared_ptr<GpuPrefixStorage>& storage);
+    void restore_gpu_prefix(SequenceState& sequence, const RequestPlanImpl& plan);
 
     DecodeGraphFamily ordinary_graphs;
     // Round chaining (PATCHES.md #32): the chained flavor of every ordinary
@@ -638,7 +685,7 @@ private:
         const SequenceState& sequence, const PreparedPromptData& prompt,
         const RequestBasePlan& base, bool archived = false);
     [[nodiscard]] std::vector<Tensor> prefix_state_tensors(const SequenceState& sequence,
-                                                          bool checkpoint) const;
+                                                          bool checkpoint, bool draft = true) const;
     void archive_sequence(const SequenceState& sequence);
     void restore_archived_sequence(SequenceState& sequence, const RequestPlanImpl& plan);
     void prepare_graphs();

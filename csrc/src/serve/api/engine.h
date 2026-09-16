@@ -117,6 +117,9 @@ public:
            std::chrono::steady_clock::time_point pending_deadline = {},
            std::shared_ptr<void> lifetime = {});
 
+    [[nodiscard]] std::vector<GenerationHandle> submit_batch(std::vector<PreparedPrompt> prompts,
+        std::vector<RequestOptions> options, std::chrono::steady_clock::time_point deadline = {},
+        std::shared_ptr<void> lifetime = {});
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});

@@ -209,26 +209,23 @@ __global__ void gather_logits_kernel(const __nv_bfloat16* logits, const TokenId*
 }
 
 std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const TokenId> tokens,
-                                            int domain, cudaStream_t stream) {
+                                            int domain, cudaStream_t stream, DeviceSpan scratch,
+                                            std::span<float> host) {
     if (logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
-        tokens.empty() || tokens.size() > 256 ||
+        tokens.empty() || tokens.size() > 256 || !scratch.data ||
+        scratch.bytes < tokens.size() * (sizeof(TokenId) + sizeof(float)) || host.size() < tokens.size() ||
         std::any_of(tokens.begin(), tokens.end(), [domain](auto id) { return id < 0 || id >= domain; })) {
         throw std::invalid_argument("invalid candidate logit readout");
     }
-    void* storage = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&storage, tokens.size() * (sizeof(TokenId) + sizeof(float)), stream));
-    auto* ids = static_cast<TokenId*>(storage);
+    auto* ids = static_cast<TokenId*>(scratch.data);
     auto* values = reinterpret_cast<float*>(ids + tokens.size());
-    std::vector<float> result(tokens.size());
-    try {
-        CUDA_CHECK(cudaMemcpyAsync(ids, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream));
-        gather_logits_kernel<<<1, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-                                                   ids, values, tokens.size());
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(result.data(), values, result.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    } catch (...) { cudaFreeAsync(storage, stream); throw; }
-    CUDA_CHECK(cudaFreeAsync(storage, stream));
-    return result;
+    CUDA_CHECK(cudaMemcpyAsync(ids, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream));
+    gather_logits_kernel<<<1, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
+                                               ids, values, tokens.size());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), values, tokens.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return {host.begin(), host.begin() + tokens.size()};
 }
+
 } // namespace sinfer::ops

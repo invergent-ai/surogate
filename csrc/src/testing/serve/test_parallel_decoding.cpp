@@ -71,6 +71,10 @@ int main() {
         {"number", {{"type", "integer"}, {"enum", {1, 10, 100}}}}
     }).dump()), bytes);
     assert(numbers.queries.size() == 2);
+    assert(numbers.queries[0].parent == -1);
+    assert(numbers.queries[1].parent == 0);
+    assert(std::equal(numbers.queries[0].suffix.begin(), numbers.queries[0].suffix.end(),
+                      numbers.queries[1].suffix.begin()));
     Json choices = Json::array();
     for (int i = 0; i < 256; ++i) choices.push_back(i);
     auto large = parse_parallel_schema(schema({{"x", {{"enum", choices}}}}).dump());

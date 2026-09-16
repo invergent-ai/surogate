@@ -1,5 +1,30 @@
 # Serving benchmarks
 
+## Parallel constrained decoding — 2026-09-16
+
+TinyLlama-1.1B Q5_K_M, one HTTP client, physical **GPU 7 (RTX 5090, PCIe x8,
+NUMA node 1, 400 W)**. Same model and launch settings before and after this change:
+`--max-model-len 2048 --kv-capacity 32768 --max-num-seqs 32 --no-thinking`.
+The baseline is `b3e440ae`. These are end-to-end classification latencies, including
+HTTP, tokenization, and JSON assembly; model loading is excluded. Each scenario uses
+one warmup followed by five measured requests with changing prompt text. All requests
+completed successfully. This small-model result does not establish large-model speedups.
+
+| Fields | Allowed values per field | Before median | After median | Speedup |
+|---:|---|---:|---:|---:|
+| 4 | Boolean | 81.4 ms | 33.3 ms | 2.44× |
+| 16 | Boolean | 167.1 ms | 67.6 ms | 2.47× |
+| 32 | Boolean | 338.8 ms | 107.8 ms | 3.14× |
+| 8 | Four strings with shared token prefixes | 163.5 ms | 54.7 ms | 2.99× |
+
+[Raw samples and configuration](tools/bench/results/2026-09-16-parallel-decoding.json).
+To reproduce against a running server:
+
+```bash
+.venv/bin/python surogate/serve/tools/bench/parallel_decoding_bench.py \
+  --url http://127.0.0.1:8000 --model YOUR_SERVED_MODEL --repeats 5
+```
+
 ## Local models — 2026-09-11
 
 Fresh **surogate** measurements of the models currently present in `models/`. The older

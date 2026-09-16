@@ -1047,8 +1047,9 @@ Tensor TextContext::lm_head_view(const Tensor& stored, cudaStream_t stream) {
 }
 
 void TextContext::logits_from_hidden(const Tensor& hidden, Tensor& logits) {
-    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), 1}, "cached hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, 1}, "cached hidden logits");
+    if (hidden.ne[1] <= 0) throw std::invalid_argument("cached hidden batch is empty");
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), hidden.ne[1]}, "cached hidden");
+    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, hidden.ne[1]}, "cached hidden logits");
     auto scope = work_.scope();
     ops::linear(lm_head_view(hidden, ctx_.stream), *lm_head_, logits, ctx_.stream);
     apply_logit_softcap(cfg_, logits, ctx_.stream);

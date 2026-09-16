@@ -258,6 +258,46 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
     return allocation;
 }
 
+PagedKVAllocation PagedKVPool::fork_prefix(std::shared_ptr<const PagedKVAllocation> source,
+    std::uint32_t tokens, std::uint32_t entitlement, cudaStream_t stream) {
+    const auto pages = pages_for_tokens(tokens);
+    const auto shared = tokens / kPagedKVPageSize;
+    if (!source || !source->belongs_to(*this) || !tokens || pages > source->mapped_page_count() ||
+        entitlement < pages || entitlement > logical_page_capacity()) {
+        throw std::invalid_argument("invalid GPU prefix fork");
+    }
+    if (!can_replace_entitlement(0, entitlement - shared)) { throw std::bad_alloc(); }
+    PagedKVAllocation out(*this, entitlement);
+    out.prefix_ = std::move(source);
+    out.borrowed_pages_ = shared;
+    add_entitlement(entitlement - shared);
+    out.page_ids_.insert(out.page_ids_.end(), out.prefix_->page_ids_.begin(),
+                         out.prefix_->page_ids_.begin() + shared);
+    out.materialize_pages(pages, stream);
+    if (pages > shared) {
+        copy_pages(out.prefix_->page_ids().subspan(shared, 1), out.page_ids().subspan(shared, 1), stream);
+    }
+    return out;
+}
+
+void PagedKVPool::copy_pages(std::span<const std::int32_t> source,
+                             std::span<const std::int32_t> destination, cudaStream_t stream) const {
+    if (source.size() != destination.size()) { throw std::invalid_argument("GPU page copy size mismatch"); }
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (source[i] < 0 || destination[i] < 0 || source[i] >= page_group_count() || destination[i] >= page_group_count()) {
+            throw std::out_of_range("GPU page copy outside pool");
+        }
+        for (const auto& plane : planes_) {
+            const bool major = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
+            const auto stride = plane.nb[major ? 3 : 2];
+            CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(plane.data) + destination[i] * stride,
+                major ? stride : plane.nb[3],
+                static_cast<const std::byte*>(plane.data) + source[i] * stride,
+                major ? stride : plane.nb[3], stride, major ? 1 : plane.ne[3], cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+}
+
 PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcept {
     // The per-round resync of the ledger: a can_reserve that admitted nothing left the
     // entitlement it asked for recorded until here.
@@ -524,8 +564,10 @@ PagedKVAllocation::PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entit
 PagedKVAllocation::~PagedKVAllocation() { release(); }
 
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
-    : pool_(other.pool_), page_ids_(std::move(other.page_ids_)),
+    : pool_(other.pool_), prefix_(std::move(other.prefix_)), borrowed_pages_(other.borrowed_pages_),
+      page_ids_(std::move(other.page_ids_)),
       page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_) {
+    other.borrowed_pages_   = 0;
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
     other.bound_row_        = -1;
@@ -535,9 +577,12 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     if (this == &other) { return *this; }
     release();
     pool_                   = other.pool_;
+    prefix_                 = std::move(other.prefix_);
+    borrowed_pages_         = other.borrowed_pages_;
     page_ids_               = std::move(other.page_ids_);
     page_entitlement_       = other.page_entitlement_;
     bound_row_              = other.bound_row_;
+    other.borrowed_pages_   = 0;
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
     other.bound_row_        = -1;
@@ -547,6 +592,10 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
 bool PagedKVAllocation::valid() const noexcept { return pool_ != nullptr; }
 
 std::uint32_t PagedKVAllocation::page_entitlement() const noexcept { return page_entitlement_; }
+
+std::uint32_t PagedKVAllocation::owned_entitlement() const noexcept {
+    return page_entitlement_ - borrowed_pages_;
+}
 
 std::uint32_t PagedKVAllocation::mapped_page_count() const noexcept {
     return static_cast<std::uint32_t>(page_ids_.size());
@@ -568,16 +617,16 @@ void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
     if (!valid() || pages < mapped_page_count()) {
         throw std::invalid_argument("Paged KV entitlement is smaller than mapped pages");
     }
-    if (!pool_->can_replace_entitlement(page_entitlement_, pages)) { throw std::bad_alloc(); }
+    if (!pool_->can_replace_entitlement(owned_entitlement(), pages - borrowed_pages_)) { throw std::bad_alloc(); }
     page_ids_.reserve(pages);
-    pool_->replace_entitlement(page_entitlement_, pages);
+    pool_->replace_entitlement(owned_entitlement(), pages - borrowed_pages_);
     page_entitlement_ = pages;
 }
 
 void PagedKVAllocation::cancel_unmapped_entitlement() noexcept {
     if (!valid()) { return; }
     const std::uint32_t mapped = mapped_page_count();
-    pool_->replace_entitlement(page_entitlement_, mapped);
+    pool_->replace_entitlement(owned_entitlement(), mapped - borrowed_pages_);
     page_entitlement_ = mapped;
 }
 
@@ -609,8 +658,8 @@ void PagedKVAllocation::materialize_tokens(std::uint32_t tokens, cudaStream_t st
 
 void PagedKVAllocation::trim_pages(std::uint32_t pages, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot trim an empty Paged KV allocation"); }
-    if (pages > mapped_page_count()) {
-        throw std::invalid_argument("Paged KV trim extent exceeds mapped pages");
+    if (pages > mapped_page_count() || pages < borrowed_pages_) {
+        throw std::invalid_argument("Paged KV trim extent exceeds mapped or immutable prefix pages");
     }
     if (pages == mapped_page_count()) { return; }
     const std::uint32_t trimmed = mapped_page_count() - pages;
@@ -672,8 +721,10 @@ Tensor PagedKVAllocation::block_table() const {
 void PagedKVAllocation::release() noexcept {
     if (!valid()) { return; }
     unbind_row();
-    pool_->return_pages(page_ids_);
-    pool_->replace_entitlement(page_entitlement_, 0);
+    pool_->return_pages(std::span<const std::int32_t>(page_ids_).subspan(borrowed_pages_));
+    pool_->replace_entitlement(owned_entitlement(), 0);
+    prefix_.reset();
+    borrowed_pages_ = 0;
     page_ids_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
@@ -703,7 +754,8 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
             throw std::invalid_argument("Paged KV resize must name a live allocation");
         }
         if (change.mapped_pages > change.allocation->mapped_page_count() ||
-            change.mapped_pages > change.page_entitlement) {
+            change.mapped_pages > change.page_entitlement ||
+            change.mapped_pages < change.allocation->borrowed_pages_) {
             throw std::invalid_argument("Paged KV resize extents are inconsistent");
         }
         for (std::size_t j = 0; j < i; ++j) {
@@ -712,8 +764,8 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
                 throw std::invalid_argument("Paged KV resize contains the same pool twice");
             }
         }
-        if (!change.allocation->pool_->can_replace_entitlement(change.allocation->page_entitlement_,
-                                                               change.page_entitlement)) {
+        if (!change.allocation->pool_->can_replace_entitlement(change.allocation->owned_entitlement(),
+                                                               change.page_entitlement - change.allocation->borrowed_pages_)) {
             throw std::bad_alloc();
         }
     }

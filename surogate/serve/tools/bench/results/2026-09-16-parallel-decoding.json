@@ -1,0 +1,123 @@
+{
+  "date": "2026-09-16",
+  "baseline_commit": "b3e440ae",
+  "candidate": "GPU-resident parallel classification (this change)",
+  "model": "tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf",
+  "hardware": {
+    "physical_gpu": 7,
+    "gpu": "NVIDIA RTX 5090 32 GB",
+    "pcie_width": "x8",
+    "numa_node": 1,
+    "power_limit_watts": 400
+  },
+  "server_options": [
+    "--max-model-len",
+    "2048",
+    "--kv-capacity",
+    "32768",
+    "--max-num-seqs",
+    "32",
+    "--no-thinking"
+  ],
+  "method": "Single HTTP client, same GPU, one warmup then five timed requests per scenario; prompt text changes each trial. Includes HTTP/tokenization/classification/JSON assembly; excludes loading.",
+  "before": [
+    {
+      "fields": 4,
+      "collisions": false,
+      "median_ms": 81.40208688564599,
+      "samples_ms": [
+        84.57069797441363,
+        84.79702286422253,
+        81.40170597471297,
+        80.41771710850298,
+        81.40208688564599
+      ]
+    },
+    {
+      "fields": 16,
+      "collisions": false,
+      "median_ms": 167.0652001630515,
+      "samples_ms": [
+        142.4902428407222,
+        143.52295105345547,
+        167.0652001630515,
+        168.77709282562137,
+        179.54535991884768
+      ]
+    },
+    {
+      "fields": 32,
+      "collisions": false,
+      "median_ms": 338.8396790251136,
+      "samples_ms": [
+        339.89489590749145,
+        337.02669804915786,
+        340.68387001752853,
+        338.10582500882447,
+        338.8396790251136
+      ]
+    },
+    {
+      "fields": 8,
+      "collisions": true,
+      "median_ms": 163.47417794167995,
+      "samples_ms": [
+        163.47417794167995,
+        161.2014069687575,
+        164.1803530510515,
+        159.91586609743536,
+        164.6795030683279
+      ]
+    }
+  ],
+  "after": [
+    {
+      "fields": 4,
+      "collisions": false,
+      "median_ms": 33.33694091998041,
+      "samples_ms": [
+        33.33694091998041,
+        33.64043380133808,
+        33.23290403932333,
+        33.70146290399134,
+        33.3340410143137
+      ]
+    },
+    {
+      "fields": 16,
+      "collisions": false,
+      "median_ms": 67.62892985716462,
+      "samples_ms": [
+        67.62892985716462,
+        68.62982781603932,
+        68.19782685488462,
+        67.51014292240143,
+        67.09053297527134
+      ]
+    },
+    {
+      "fields": 32,
+      "collisions": false,
+      "median_ms": 107.78834507800639,
+      "samples_ms": [
+        105.09413597173989,
+        107.78834507800639,
+        109.12267304956913,
+        108.54191682301462,
+        106.5715728327632
+      ]
+    },
+    {
+      "fields": 8,
+      "collisions": true,
+      "median_ms": 54.71504805609584,
+      "samples_ms": [
+        54.49548293836415,
+        55.61021692119539,
+        54.61511109024286,
+        55.072660092264414,
+        54.71504805609584
+      ]
+    }
+  ]
+}

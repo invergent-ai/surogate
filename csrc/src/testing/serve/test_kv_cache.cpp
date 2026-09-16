@@ -123,6 +123,60 @@ int expect_zeroed_pages(sinfer::PagedKVPool& pool, sinfer::PagedKVPlaneOrder ord
     return 1;
 }
 
+int check_prefix_forks(sinfer::PagedKVPlaneOrder order, cudaStream_t stream) {
+    auto plan = plan_paged_cache(12, 12, 4, {{sinfer::DType::I8, 64, 2},
+        {sinfer::DType::FP16, 1, 2}}, order);
+    sinfer::DeviceArena arena(plan.bytes);
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+    int failures = 0;
+    auto root = std::make_shared<sinfer::PagedKVAllocation>(pool.reserve(3));
+    root->materialize_pages(3, stream);
+    for (std::size_t i = 0; i < pool.plane_count(); ++i) {
+        const auto& plane = pool.plane(i);
+        std::vector<unsigned char> data(plane.bytes());
+        for (std::size_t j = 0; j < data.size(); ++j) data[j] = (j * 37 + j / 128) % 251;
+        CUDA_CHECK(cudaMemcpyAsync(plane.data, data.data(), data.size(), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    auto aligned = pool.fork_prefix(root, 128, 2, stream);
+    failures += expect_size(aligned.owned_entitlement(), 0, "aligned fork owns no pages");
+    failures += expect_page_ids(aligned.page_ids(), {0, 1}, "aligned fork shares page IDs");
+    auto child = std::make_shared<sinfer::PagedKVAllocation>(pool.fork_prefix(root, 129, 4, stream));
+    failures += expect_page_ids(child->page_ids(), {0, 1, 3}, "partial fork isolates last page");
+    failures += expect_size(pool.occupancy().pages_in_use, 4, "fork physical occupancy");
+    failures += expect_size(pool.occupancy().entitled_pages, 5, "fork charged entitlement");
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t i = 0; i < pool.plane_count(); ++i) {
+        const auto& plane = pool.plane(i);
+        std::vector<unsigned char> data(plane.bytes());
+        CUDA_CHECK(cudaMemcpy(data.data(), plane.data, data.size(), cudaMemcpyDeviceToHost));
+        const bool major = order == sinfer::PagedKVPlaneOrder::PageMajor;
+        const auto stride = plane.nb[major ? 3 : 2];
+        for (int head = 0; head < (major ? 1 : plane.ne[3]); ++head) {
+            const auto base = major ? 0 : head * plane.nb[3];
+            if (!std::equal(data.begin()+base+2*stride, data.begin()+base+3*stride,
+                            data.begin()+base+3*stride)) failures += fail("fork did not copy every cache plane");
+        }
+    }
+    // Nested forks pin their ancestors, but never charge borrowed pages twice.
+    auto nested = pool.fork_prefix(child, 192, 4, stream);
+    child.reset(); root.reset(); aligned = {};
+    failures += expect_page_ids(nested.page_ids(), {0, 1, 3}, "nested immutable pages survive owners");
+    nested.materialize_pages(4, stream);
+    failures += expect_size(pool.occupancy().pages_in_use, 5, "nested private extension");
+    bool refused = false;
+    try { nested.trim_pages(2, stream); } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) failures += fail("fork allowed trimming its immutable prefix");
+    nested.trim_pages(3, stream);
+    nested.cancel_unmapped_entitlement();
+    failures += expect_size(nested.owned_entitlement(), 0, "nested unused entitlement released");
+    auto moved = std::move(nested);
+    moved = {};
+    failures += expect_size(pool.occupancy().pages_in_use, 0, "fork tree releases physical pages");
+    failures += expect_size(pool.occupancy().entitled_pages, 0, "fork tree releases entitlement");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -139,6 +193,8 @@ int main() {
 
     int failures = 0;
     sinfer::DeviceContext ctx(0);
+    failures += check_prefix_forks(sinfer::PagedKVPlaneOrder::PageMajor, ctx.stream);
+    failures += check_prefix_forks(sinfer::PagedKVPlaneOrder::HeadMajor, ctx.stream);
 
     auto paged_plan = plan_paged_cache(10, 10, 2,
                                        {{sinfer::DType::I8, 64, 2},

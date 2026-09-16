@@ -44,6 +44,12 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     }
     resolved.execution.next_token_candidates = std::move(options.execution.next_token_candidates);
     resolved.execution.cache_prompt = options.execution.cache_prompt;
+    if ((options.execution.gpu_prefix || options.execution.save_gpu_prefix) &&
+        options.execution.requested_output_tokens != 1) {
+        throw std::invalid_argument("GPU prefix readout requires one output token");
+    }
+    resolved.execution.gpu_prefix = std::move(options.execution.gpu_prefix);
+    resolved.execution.save_gpu_prefix = std::move(options.execution.save_gpu_prefix);
     resolved.execution.prompt_logprobs = options.execution.prompt_logprobs;
     resolved.execution.top_logprobs = options.execution.top_logprobs;
     resolved.execution.lora_slot               = options.execution.lora_slot;
@@ -471,6 +477,26 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             }
         },
         impl_->executor);
+}
+
+std::vector<GenerationHandle> Engine::submit_batch(std::vector<PreparedPrompt> prompts,
+    std::vector<RequestOptions> options, std::chrono::steady_clock::time_point deadline,
+    std::shared_ptr<void> lifetime) {
+    if (!impl_ || prompts.empty() || prompts.size() != options.size())
+        throw std::invalid_argument("invalid generation batch");
+    return std::visit([&](auto& executor) -> std::vector<GenerationHandle> {
+        using T = std::remove_cvref_t<decltype(executor)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            throw std::logic_error("engine executor unavailable");
+        } else {
+            auto lock = executor->pause_execution();
+            std::vector<GenerationHandle> handles;
+            handles.reserve(prompts.size());
+            for (std::size_t i = 0; i < prompts.size(); ++i)
+                handles.push_back(submit(std::move(prompts[i]), std::move(options[i]), deadline, lifetime));
+            return handles;
+        }
+    }, impl_->executor);
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,

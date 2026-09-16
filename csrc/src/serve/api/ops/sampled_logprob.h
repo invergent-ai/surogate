@@ -3,6 +3,7 @@
 
 #include "api/ops/sampling.h"
 #include "core/tensor.h"
+#include "core/arena.h"
 
 #include <cstdint>
 
@@ -10,7 +11,8 @@
 
 namespace sinfer::ops {
 std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const TokenId> tokens,
-                                            int domain, cudaStream_t stream);
+                                            int domain, cudaStream_t stream, DeviceSpan scratch,
+                                            std::span<float> host);
 /// Asynchronous batched scoring into caller-owned device output. Columns are
 /// lane-major, with `width` verification positions per lane; counts can mask
 /// unlicensed speculative positions. All pointers remain valid through stream completion.

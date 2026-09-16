@@ -612,7 +612,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
             state->adapter = adapter.lifetime;
             request_options.execution.json_schema.clear();
             request_options.execution.requested_output_tokens = 1;
-            request_options.execution.cache_prompt = true;
+            request_options.execution.cache_prompt = false;
+            std::vector<bool> parents(state->plan.queries.size());
+            for (const auto& query : state->plan.queries) if (query.parent >= 0) parents[query.parent] = true;
+            const auto state_slots = 1U + static_cast<std::uint32_t>(std::count(parents.begin(), parents.end(), true));
+            request_options.execution.save_gpu_prefix = std::make_shared<GpuPrefixKey>(GpuPrefixKey{state_slots});
+            request_options.execution.allow_prefix_reuse = false;
             request_options.output.structured = true;
             auto& sampling = request_options.execution.sampling;
             sampling.top_k = 0;
@@ -623,7 +628,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
             sampling.repetition_penalty = 1;
             sampling.logit_bias.clear();
             state->options = request_options;
-            state->options.execution.cache_prompt = false;
+            state->options.execution.gpu_prefix = request_options.execution.save_gpu_prefix;
+            state->options.execution.save_gpu_prefix.reset();
+            state->options.execution.allow_prefix_reuse = true;
             prepared.parallel_decoding = std::move(state);
         }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
@@ -796,30 +803,55 @@ GenerationOutcome GenerationService::run_parallel(PreparedRequest& prepared, con
         std::vector<std::vector<float>> logits(state->plan.queries.size());
         // Keep work bounded and share the normal scheduler with other requests.
         // A one-lane engine runs the same finite-choice computation serially.
-        const auto width = std::max<std::size_t>(1, std::min<std::size_t>(8, options_.max_concurrency));
+        const auto width = std::max<std::size_t>(1, std::min<std::size_t>(64, options_.max_concurrency));
         state->options.execution.sampling.temperature = prepared.sampling.temperature;
-        for (std::size_t start = 0; start < state->plan.queries.size(); start += width) {
-            std::vector<GenerationHandle> pending;
-            const auto end = std::min(start + width, state->plan.queries.size());
-            for (std::size_t i = start; i < end; ++i) {
+        std::vector<std::vector<std::size_t>> children(logits.size());
+        std::vector<std::size_t> remaining(logits.size());
+        std::vector<std::shared_ptr<const GpuPrefixKey>> keys(logits.size());
+        std::vector<std::size_t> ready;
+        for (std::size_t i = 0; i < logits.size(); ++i) {
+            const int parent = state->plan.queries[i].parent;
+            if (parent < 0) ready.push_back(i);
+            else { children[parent].push_back(i); ++remaining[parent]; }
+        }
+        for (std::size_t start = 0; start < ready.size();) {
+            const auto end = std::min(start + width, ready.size());
+            std::vector<PreparedPrompt> prompts;
+            std::vector<RequestOptions> options;
+            for (std::size_t j = start; j < end; ++j) {
                 check();
+                const auto i = ready[j];
                 const auto& query = state->plan.queries[i];
                 auto tokens = state->prefix;
                 tokens.insert(tokens.end(), query.suffix.begin(), query.suffix.end());
-                auto options = state->options;
-                options.execution.next_token_candidates = query.candidates;
-                pending.push_back(engine_->submit(engine_->prepare_tokens(std::move(tokens)),
-                    std::move(options), deadline, state->adapter));
-                outcome.prompt_tokens += static_cast<int>(query.suffix.size());
+                auto opt = state->options;
+                opt.execution.next_token_candidates = query.candidates;
+                if (query.parent >= 0) opt.execution.gpu_prefix = keys[query.parent];
+                if (!children[i].empty()) {
+                    keys[i] = std::make_shared<GpuPrefixKey>();
+                    opt.execution.save_gpu_prefix = keys[i];
+                }
+                prompts.push_back(engine_->prepare_tokens(std::move(tokens)));
+                options.push_back(std::move(opt));
+                const auto prefix_suffix = query.parent >= 0 ? state->plan.queries[query.parent].suffix.size() : 0;
+                outcome.prompt_tokens += static_cast<int>(query.suffix.size() - prefix_suffix);
             }
-            for (std::size_t i = start; i < end; ++i) {
-                const auto result = pending[i - start].wait(nullptr, cancellation);
+            const auto batch_started = Clock::now();
+            auto pending = engine_->submit_batch(std::move(prompts), std::move(options), deadline, state->adapter);
+            for (std::size_t j = start; j < end; ++j) {
+                const auto i = ready[j];
+                const auto result = pending[j - start].wait(nullptr, cancellation);
                 check();
                 if (result.finish_reason == FinishReason::Cancelled)
                     throw RequestError(RequestErrorKind::Cancelled, "parallel decoding was cancelled");
                 logits[i] = result.next_token_logits;
-                outcome.metrics.prefill_seconds += result.timings.prefill_seconds;
+                ready.insert(ready.end(), children[i].begin(), children[i].end());
+                const auto parent = state->plan.queries[i].parent;
+                if (parent >= 0 && --remaining[parent] == 0) keys[parent].reset();
             }
+            // Concurrent rows report overlapping time. Count the wave once.
+            outcome.metrics.prefill_seconds += std::chrono::duration<double>(Clock::now() - batch_started).count();
+            start = end;
         }
         check();
         auto classified = resolve_parallel_plan(state->plan, logits, prepared.sampling.temperature);

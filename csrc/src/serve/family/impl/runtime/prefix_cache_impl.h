@@ -5,7 +5,7 @@
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
 std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& sequence,
-                                                         bool checkpoint) const {
+                                                         bool checkpoint, bool draft) const {
     const auto slot = checkpoint
         ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
         : LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
@@ -29,7 +29,7 @@ std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& s
     }
     const Tensor hidden = checkpoint ? sequence.rewrite_checkpoint_hidden : sequence.tail_hidden;
     if (hidden.data) { tensors.push_back(hidden); }
-    if (dflash) {
+    if (dflash && draft) {
         auto& local = checkpoint ? decoder->checkpoint_dflash(sequence.lane) : dflash->local;
         for (std::uint32_t layer = 0; layer < local.layer_count(); ++layer) {
             const auto view = local.layer_view(layer);
@@ -81,7 +81,7 @@ void upload_prefix_state(const std::vector<std::vector<std::byte>>& image,
 } // namespace
 
 void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
-    if (!sequence.retained || !sequence.cacheable || !sequence.kv || sequence.ledger.empty()) { return; }
+    if (sequence.target_only || !sequence.retained || !sequence.cacheable || !sequence.kv || sequence.ledger.empty()) { return; }
     try {
         std::vector<std::uint32_t> boundaries;
         const auto append = reusable_append_frontier(sequence);
@@ -143,6 +143,68 @@ void ProgramImplCore::restore_archived_sequence(SequenceState& sequence, const R
         }
     }
     device.synchronize();
+    ++checkpoint_revisions[sequence.lane];
+}
+
+
+void ProgramImplCore::prune_gpu_prefixes() {
+    // All mutation and destruction happens on the engine worker, between rounds.
+    for (auto it = gpu_prefixes.begin(); it != gpu_prefixes.end();) {
+        if (it->second->key.expired()) it = gpu_prefixes.erase(it);
+        else ++it;
+    }
+}
+
+void ProgramImplCore::capture_gpu_prefix(SequenceState& sequence,
+                                        const std::shared_ptr<const GpuPrefixKey>& key,
+                                        const std::shared_ptr<GpuPrefixStorage>& storage) {
+    if (!key || !sequence.kv || !sequence.tail_hidden_valid) {
+        throw std::logic_error("GPU prefix capture has no completed frontier");
+    }
+    if (gpu_prefixes.contains(key.get())) { throw std::invalid_argument("GPU prefix key was already captured"); }
+    auto image = std::make_shared<GpuPrefix>();
+    image->key = key;
+    image->state.copy_metadata(sequence);
+    image->state.rewrite_checkpoint = {};
+    const auto tensors = prefix_state_tensors(sequence, false, false);
+    if (!storage || storage->free.empty()) throw std::logic_error("unreserved GPU prefix state");
+    image->storage = storage;
+    image->slot = storage->free.back();
+    storage->free.pop_back();
+    DeviceArena frame(DeviceSpan{static_cast<std::byte*>(storage->memory.base()) + image->slot * storage->stride,
+                                 storage->stride});
+    for (const auto& tensor : tensors) {
+        if (!tensor.is_contiguous()) throw std::logic_error("noncontiguous GPU prefix state");
+        auto memory = frame.alloc_bytes(tensor.bytes());
+        auto copy = tensor;
+        copy.data = memory.data;
+        image->current.push_back(copy);
+        CUDA_CHECK(cudaMemcpyAsync(copy.data, tensor.data, tensor.bytes(), cudaMemcpyDeviceToDevice, device.stream));
+    }
+    device.synchronize();
+    image->pages = std::make_shared<SequenceKVBundle>(std::move(*sequence.kv));
+    sequence.kv.reset();
+    sequence.retained = false;
+    gpu_prefixes.emplace(key.get(), std::move(image));
+}
+
+void ProgramImplCore::restore_gpu_prefix(SequenceState& sequence, const RequestPlanImpl& plan) {
+    const auto image = plan.device_prefix;
+    clear_lane(sequence, requests[sequence.lane]);
+    sequence.copy_metadata(image->state);
+    SequenceKVBundle bundle;
+    auto owner = std::shared_ptr<const PagedKVAllocation>(image->pages, &image->pages->text);
+    bundle.text = decoder->text_kv.pool().fork_prefix(std::move(owner), plan.reuse_base,
+                                                     plan.text_kv_page_entitlement, device.stream);
+    sequence.kv.emplace(std::move(bundle));
+    const auto tensors = prefix_state_tensors(sequence, false, false);
+    if (tensors.size() != image->current.size()) throw std::logic_error("GPU prefix state layout changed");
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (!tensors[i].is_contiguous() || tensors[i].bytes() != image->current[i].bytes())
+            throw std::logic_error("GPU prefix state geometry changed");
+        CUDA_CHECK(cudaMemcpyAsync(tensors[i].data, image->current[i].data, tensors[i].bytes(),
+                                   cudaMemcpyDeviceToDevice, device.stream));
+    }
     ++checkpoint_revisions[sequence.lane];
 }
 

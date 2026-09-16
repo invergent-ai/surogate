@@ -1071,7 +1071,10 @@ private:
 
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
-                throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
+                (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
+                    RequestErrorKind::Overloaded, "insufficient KV capacity while GPU prefixes are retained")));
+                control_progress = true;
+                continue;
             }
             if (!protection_) {
                 protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
@@ -1220,6 +1223,10 @@ private:
                 if (owner == nullptr || owner->decode_ready) { continue; }
                 if (lone_lane == max_concurrency_) { lone_lane = candidate; }
                 if (!program.mixed_round_supported(candidate, meta.membership.size)) { continue; }
+                if (meta.staged_count > 0) {
+                    const auto scoring = [](const auto& r) { return bool(r->options.execution.gpu_prefix || r->options.execution.save_gpu_prefix); };
+                    if (scoring(owner) != scoring(slots_[meta.staged[0]])) continue;
+                }
                 meta.staged[meta.staged_count++] = candidate;
             }
             // Pipeline groups already divide the available prompts. A group may never reach
@@ -1282,7 +1289,7 @@ private:
                 break;
             case std::remove_reference_t<decltype(program)>::FlightKind::Mixed:
                 process_decode_round(meta.membership, result.mixed.round);
-                ++cumulative_stats_.decode_rounds;
+                if (!meta.membership.empty()) ++cumulative_stats_.decode_rounds;
                 seg_timer_.mixed_rounds += 1;
                 for (std::size_t i = 0; i < result.mixed.prefill_count && i < meta.staged_count; ++i) {
                     const auto owner = slots_[meta.staged[i]];
@@ -1406,6 +1413,8 @@ private:
             if (!instance_.program->mixed_round_supported(candidate, membership.size)) { continue; }
             const auto& owner = slots_[candidate];
             if (owner == nullptr || owner->decode_ready) { continue; }
+            const auto scoring = [](const auto& r) { return bool(r->options.execution.gpu_prefix || r->options.execution.save_gpu_prefix); };
+            if (scoring(owner) != scoring(request)) continue;
             staged[staged_count++] = candidate;
         }
         if (staged_count == 0) { throw std::logic_error("mixed round has no advanceable prefill"); }
@@ -1413,7 +1422,7 @@ private:
             std::span<const std::uint32_t>(staged.data(), staged_count), lanes,
             membership.budget_span());
         process_decode_round(membership, mixed.round);
-        ++cumulative_stats_.decode_rounds;
+        if (!membership.empty()) ++cumulative_stats_.decode_rounds;
         // Resolve each staged prompt against its own result. resolve_prefill_step can retire a
         // lane and edit prefill_lanes_, so the lanes were captured before the round ran.
         for (std::size_t i = 0; i < mixed.prefill_count && i < staged_count; ++i) {
@@ -1704,7 +1713,10 @@ private:
                         continue;
                     }
                     deferred_mixed_rounds_ = 0;
-                    if (!membership.empty() &&
+                    const auto& first_prefill = slots_[prefill_lanes_.front()];
+                    const bool field_batch = membership.empty() && prefill_lanes_.size() > 1 &&
+                        first_prefill && first_prefill->options.execution.gpu_prefix;
+                    if ((!membership.empty() || field_batch) &&
                         instance_.program->mixed_round_supported(prefill_lanes_.front(), membership.size)) {
                         const auto t_mixed = Clock::now();
                         last_round_ = LastRound{"mixed",

@@ -157,3 +157,9 @@ def test_regular_json_after_classification(server):
     value = json.loads(result["choices"][0]["message"]["content"])
     assert set(value) == {"done"} and type(value["done"]) is bool
     assert "parallel_decoding" not in result
+
+
+def test_sixty_four_fields(server):
+    payload = body({f"f{i}": {"type": "boolean"} for i in range(64)})
+    payload["max_tokens"] = 1024
+    validate(ask(server, payload), payload)

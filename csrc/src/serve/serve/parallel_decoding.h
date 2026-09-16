@@ -21,6 +21,7 @@ struct ParallelField {
     std::vector<Node> nodes{1};
 };
 struct ParallelQuery {
+    int parent = -1;
     std::vector<TokenId> suffix;
     std::vector<TokenId> candidates;
 };

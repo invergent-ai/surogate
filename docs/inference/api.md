@@ -292,7 +292,10 @@ required. Use an instruction-tuned model suited to your classification task.
 
 With the OpenAI Python client, pass the opt-in through
 `extra_body={"parallel_decoding": True}`. Start the server with `--max-num-seqs 4` or higher
-to evaluate fields concurrently. A server with one sequence slot also accepts these requests.
+to evaluate fields concurrently. The shared conversation is processed once; each field then
+continues from it. Increasing the sequence limit allows more fields to run together, up to 64.
+A server with one sequence slot also accepts these requests. Classification needs GPU cache
+space for the shared conversation and the field continuations.
 Speedups depend on the model, prompt length, number of fields, and available memory; benchmark
 your workload.
 

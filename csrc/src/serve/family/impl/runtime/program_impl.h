@@ -517,15 +517,15 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
                                 std::uint32_t new_pages) {
         return pool.can_replace_entitlement(old_pages, new_pages);
     };
-    const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
+    const std::uint32_t old_text = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages)) {
         return false;
     }
     const family::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    if (backend == nullptr) { return plan.summary().admission.backend_kv_pages == 0; }
     const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, plan.impl_->backend_kv_page_entitlement);
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->owned_entitlement() : 0;
+    return can_replace(backend->pool(), old_backend, plan.summary().admission.backend_kv_pages);
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
@@ -546,9 +546,9 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t reclaimable_backend = 0;
     for (std::uint32_t other = 0; other < max_concurrency; ++other) {
         if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
-        reclaimable_text += sequences[other].kv->text.page_entitlement();
+        reclaimable_text += sequences[other].kv->text.owned_entitlement();
         if (sequences[other].kv->backend) {
-            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
+            reclaimable_backend += sequences[other].kv->backend->owned_entitlement();
         }
     }
 
@@ -564,18 +564,18 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     };
 
     const SequenceState& sequence = sequences[lane];
-    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.impl_->text_kv_page_entitlement)) {
+                     plan.summary().admission.main_kv_pages)) {
         return false;
     }
 
     const family::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    if (backend == nullptr) { return plan.summary().admission.backend_kv_pages == 0; }
     const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->owned_entitlement() : 0;
     return can_replace(backend->pool(), old_backend, reclaimable_backend,
-                       plan.impl_->backend_kv_page_entitlement);
+                       plan.summary().admission.backend_kv_pages);
 }
 
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
@@ -633,7 +633,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         is_rewrite_checkpoint_restore(request_plan.reuse)) {
         archive_sequence(sequence);
     }
-    if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
+    if (request_plan.device_prefix) { restore_gpu_prefix(sequence, request_plan); }
+    else if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
+    sequence.target_only = request_plan.target_only;
+    request.target_only = request_plan.target_only;
+    request.gpu_prefix = request_plan.gpu_prefix;
+    request.save_gpu_prefix = request_plan.save_gpu_prefix;
+    request.gpu_storage = request_plan.gpu_storage;
     sequence.cacheable = request_plan.retain_prefix;
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
@@ -696,7 +702,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
-        speculative_backend == SpeculativeBackend::Mtp
+        !request_plan.target_only && speculative_backend == SpeculativeBackend::Mtp
             && !request_plan.constraint ? std::min({draft_window,
                         request_plan.summary.effective_output_tokens > 1
                             ? request_plan.summary.effective_output_tokens - 2
@@ -736,13 +742,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (sequence.text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than the append frontier");
             }
-            if (speculative_backend == SpeculativeBackend::Mtp) {
+            if (!request_plan.target_only && speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
                 if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
                     throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (speculative_backend == SpeculativeBackend::DFlash &&
+            } else if (!request_plan.target_only && speculative_backend == SpeculativeBackend::DFlash &&
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
@@ -756,14 +762,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
             }
             sequence.text_kv_valid = base;
-            if (speculative_backend == SpeculativeBackend::Mtp) {
+            if (!request_plan.target_only && speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
                 if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
                     throw std::logic_error(
                         "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            } else if (!request_plan.target_only && speculative_backend == SpeculativeBackend::DFlash) {
                 if (!dflash || (dflash->full && !sequence.kv->backend) || sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
@@ -787,10 +793,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
-            speculative_backend == SpeculativeBackend::Mtp
+            !request_plan.target_only && speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
+            : !request_plan.target_only && speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         request.prompt_logprobs = request_plan.prompt_logprobs;
@@ -826,7 +832,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         // begin and its first chunk, so the chunk started from the other prompt's recurrent
         // state — the "capital of France in a primes answer" blends, and (through an eager
         // mixed continuation reading the lane slot instead) the invalid-UTF-8 crashes.
-        const bool prefill_uses_graph = prefill_graphs.has_value() && !request_plan.vision &&
+        const bool prefill_uses_graph = !request_plan.target_only && prefill_graphs.has_value() && !request_plan.vision &&
                                         !request_plan.prepare_mtp && !prompt.has_media() &&
                                         base < prompt_tokens;
 
@@ -919,7 +925,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         // admission shares a stage's boundary buffers with whatever round is in
         // flight there. Bridged MTP reuse keeps the classic order.
         if (defer_first_chunk &&
-            ((pipeline_stage() && speculative_backend == SpeculativeBackend::DFlash) ||
+            ((pipeline_stage() && !request_plan.target_only && speculative_backend == SpeculativeBackend::DFlash) ||
              (staged.mtp_bridge == MtpBridgeMode::None && staged.cursor < staged.prompt_tokens))) {
             return runtime::PrefillStepResult{
                 .summary = runtime::BeginSummary{.prompt_tokens        = staged.prompt_tokens,
@@ -1209,6 +1215,7 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 
 void ProgramImplCore::evict_archived_prefixes() noexcept {
     archived_prefixes.clear();
+    prune_gpu_prefixes();
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
@@ -1312,11 +1319,89 @@ void ProgramImplCore::score_completion(std::uint32_t lane, const Tensor& logits,
     auto& request = requests[lane];
     if (stage_holds_head() && !request.next_token_candidates.empty()) {
         request.next_token_logits = ops::gather_candidate_logits(
-            logits, request.next_token_candidates, cfg.token_domain, device.stream);
+            logits, request.next_token_candidates, cfg.token_domain, device.stream,
+            DeviceSpan{candidate_readout_storage.base(), candidate_readout_storage.capacity()}, candidate_readout_host);
     }
     if (stage_holds_head() && request.top_logprobs >= 0) {
         request.completion_scores.push_back(ops::score_logprobs(
             logits, token, cfg.token_domain, request.top_logprobs, device.stream));
+    }
+}
+
+void ProgramImplCore::finish_readout_prefills(std::span<const std::uint32_t> lanes,
+                                               runtime::MixedRoundResult& result) {
+    const auto started = Clock::now();
+    std::vector<std::size_t> ready;
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        const auto& r = requests[lanes[i]];
+        if (r.target_only && r.prefill && r.prefill->cursor == r.prefill->prompt_tokens &&
+            !r.next_token_candidates.empty()) ready.push_back(i);
+    }
+    while (!ready.empty()) {
+        const auto adapter_slot = requests[lanes[ready.front()]].lora_slot;
+        std::vector<std::size_t> group;
+        auto hidden_frame = io.ordinary ? io.ordinary->hidden : io.dflash_decode->target_hidden.view(
+            {io.dflash_decode->target_hidden.ne[0], io.dflash_decode->target_hidden.ne[1] * io.dflash_decode->target_hidden.ne[2]});
+        auto logits_frame = io.ordinary ? io.ordinary->logits : io.dflash_decode->target_logits.view(
+            {io.dflash_decode->target_logits.ne[0], io.dflash_decode->target_logits.ne[1] * io.dflash_decode->target_logits.ne[2]});
+        const auto cap = static_cast<std::size_t>(hidden_frame.ne[1]);
+        for (auto it = ready.begin(); it != ready.end() && group.size() < cap;) {
+            if (requests[lanes[*it]].lora_slot == adapter_slot) {
+                group.push_back(*it); it = ready.erase(it);
+            } else ++it;
+        }
+        if (group.empty()) throw std::logic_error("readout batch has no head capacity");
+        if (stage_holds_head()) {
+            const auto n = static_cast<int>(group.size());
+            auto hidden = hidden_frame.slice(1, 0, n);
+            auto logits = logits_frame.slice(1, 0, n);
+            for (int row = 0; row < n; ++row) {
+                const auto& source = sequences[lanes[group[row]]].tail_hidden;
+                auto destination = hidden.slice(1, row, 1);
+                CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(), cudaMemcpyDeviceToDevice, device.stream));
+            }
+            work.reset();
+            schedule::TextContext card(device, model, work, {}, decoder->linear_attention, io,
+                                       prefill_hidden, prefill_chunk, 0);
+            card.set_stage(stage);
+            const auto previous = ops::lora_current_round();
+            const bool adapter = ops::lora_active();
+            if (adapter) {
+                auto& store = ops::lora_store_for_current_device();
+                ops::LoraRound round;
+                round.uniform = true;
+                round.scratch = store.scratch(n);
+                store.write_uniform_slot(adapter_slot, device.stream);
+                round.uniform_cell = store.uniform_cell();
+                ops::lora_set_round(round);
+            }
+            try { card.logits_from_hidden(hidden, logits); }
+            catch (...) { if (adapter) ops::lora_set_round(previous); throw; }
+            if (adapter) ops::lora_set_round(previous);
+            for (int row = 0; row < n; ++row) {
+                const auto lane = lanes[group[row]];
+                score_completion(lane, logits.slice(1, row, 1), requests[lane].next_token_candidates.front());
+            }
+        }
+        for (const auto index : group) {
+            const auto lane = lanes[index];
+            auto& sequence = sequences[lane];
+            auto& request = requests[lane];
+            const auto tokens = request.prefill->prompt_tokens;
+            request.readout_token = request.next_token_candidates.front();
+            sequence.ledger.push_back(request.readout_token);
+            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+            request.timings.prefill_seconds = request.prefill->elapsed_seconds +
+                std::chrono::duration<double>(Clock::now() - started).count();
+            request.prefill.reset();
+            request.prompt_tokens = tokens;
+            request.pending = PendingCandidate{.kind=PendingKind::Begin, .prompt_tokens=tokens, .produced=1};
+            request.lifecycle = Lifecycle::Pending;
+            result.prefills[index].complete = true;
+            result.prefills[index].round = runtime::GeneratedRound{
+                .tokens = std::span<const TokenId>(&request.readout_token, 1),
+                .logprobs = std::span<const float>(&request.readout_logprob, 1)};
+        }
     }
 }
 
@@ -1330,6 +1415,9 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    request.gpu_prefix.reset();
+    request.save_gpu_prefix.reset();
+    request.gpu_storage.reset();
     decoder->release_checkpoint(sequence.lane);
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
@@ -1361,6 +1449,7 @@ const family::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
 }
 
 std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) const noexcept {
+    if (sequence.target_only) { return 0; }
     if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         return sequence.dflash_context_frontier;
@@ -1371,7 +1460,7 @@ std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) c
 void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                                           std::uint32_t backend_pages) {
     if (sequence.kv) { throw std::logic_error("sequence already owns a KV allocation bundle"); }
-    if (text_pages == 0 || (backend_kv_cache() == nullptr) != (backend_pages == 0)) {
+    if (text_pages == 0 || (backend_pages != 0 && backend_kv_cache() == nullptr)) {
         throw std::invalid_argument("KV allocation entitlement does not match the active backend");
     }
 
@@ -1381,7 +1470,7 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         .pool             = &decoder->text_kv.pool(),
         .page_entitlement = text_pages,
     };
-    if (family::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+    if (family::PagedKVCache* backend = backend_kv_cache(); backend != nullptr && backend_pages != 0) {
         reservations[count++] = PagedKVReservation{
             .pool             = &backend->pool(),
             .page_entitlement = backend_pages,
@@ -1434,7 +1523,7 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
 
         // Stage the controls at execution, after this pipeline stage becomes free.
-        if (speculative_backend == SpeculativeBackend::DFlash) {
+        if (!sequence.target_only && speculative_backend == SpeculativeBackend::DFlash) {
             if (!dflash || !io.dflash_decode || (dflash->full && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
@@ -1512,6 +1601,7 @@ family::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequ
 }
 
 family::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
+    if (sequence.target_only) return {};
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
     if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend) {
         throw std::logic_error("sequence has no MTP KV allocation");
@@ -2308,8 +2398,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
-            decoder->mtp_cache(),
-            dflash ? &*dflash : nullptr,
+            request.target_only ? nullptr : decoder->mtp_cache(),
+            dflash && !request.target_only ? &*dflash : nullptr,
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
@@ -2390,7 +2480,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
-            if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (!request.target_only && speculative_backend == SpeculativeBackend::DFlash) {
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             schedule::PrefillChunkResult result;
@@ -2455,7 +2545,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-            if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (!request.target_only && speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
 
@@ -2555,7 +2645,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.mtp_draft_count = proposed_extent;
             std::copy_n(initial_drafts.begin(), proposed_extent, sequence.mtp_drafts.begin());
-        } else if (speculative_backend == SpeculativeBackend::DFlash &&
+        } else if (!request.target_only && speculative_backend == SpeculativeBackend::DFlash &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
@@ -2567,11 +2657,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (frontier == 0 || frontier > prompt_tokens || sequence.text_kv_valid < frontier) {
                 throw std::logic_error("rewrite checkpoint was not materialized by Text prefill");
             }
-            if (speculative_backend == SpeculativeBackend::Mtp &&
+            if (!request.target_only && speculative_backend == SpeculativeBackend::Mtp &&
                 (!staged.prepare_mtp || sequence.mtp_kv_valid < frontier - 1)) {
                 throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
-            if (speculative_backend == SpeculativeBackend::DFlash &&
+            if (!request.target_only && speculative_backend == SpeculativeBackend::DFlash &&
                 (!dflash || !sequence.kv || (dflash->full && !sequence.kv->backend) ||
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
@@ -2865,6 +2955,7 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
     const RequestControl& request = requests[prefill_lane];
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return false; }
     const RequestControl::Prefill& staged = *request.prefill;
+    if (request.target_only && decode_rows > 0) return false;
     if (prefill_chunk <= decode_rows * (speculative_backend == SpeculativeBackend::DFlash ? draft_window + 1 : 1)) {
         return false;
     }
@@ -2885,6 +2976,7 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
         staged.cursor >= staged.prompt_tokens || staged.prompt.token_ids.empty()) {
         return false;
     }
+    if (request.target_only) return true;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         // Under the draft head a mixed round takes the whole prompt and aligns the head over
         // every column but the last, which pairs with the token not yet sampled; the prompt
@@ -2910,10 +3002,11 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         mixed_in_flight_.id = handle.id;
         return handle;
     }
-    const bool flash = speculative_backend == SpeculativeBackend::DFlash;
+    const bool target_only = !prefill_lanes.empty() && requests.at(prefill_lanes.front()).target_only;
+    const bool flash = speculative_backend == SpeculativeBackend::DFlash && !target_only;
     const auto verify_width = verify ? static_cast<std::uint32_t>(verify->ids.ne[0]) : 1U;
     const auto decode_columns = static_cast<std::uint32_t>(lanes.size()) * verify_width;
-    const bool head = speculative_backend == SpeculativeBackend::Mtp;
+    const bool head = speculative_backend == SpeculativeBackend::Mtp && !target_only;
     if (lanes.size() > batch_capacity ||
         budgets.size() != lanes.size() ||
         prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills ||
@@ -3030,8 +3123,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             ordinary_host_ingress->lora_slots[pad]         = ordinary_host_ingress->lora_slots[0];
         }
         family::OrdinaryDecodeState ordinary;
-        if (!flash) { ordinary = *io.ordinary; }
-        if (!flash) { CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
+        if (!flash && !target_only) { ordinary = *io.ordinary; }
+        if (!flash && !target_only) { CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
                                    sizeof(family::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    device.stream)); }
 
@@ -3110,7 +3203,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                                    decoder->linear_attention, io, prefill_hidden, prefill_chunk,
                                    staged.cursor,
                                    head ? mtp_kv_view(prefill_sequence) : family::PagedKVCacheView{},
-                                   &decoder->text_kv, decoder->mtp_cache());
+                                   &decoder->text_kv, target_only ? nullptr : decoder->mtp_cache());
         card.set_ple_state(&decoder->ple);
         card.set_stage(stage);
         card.set_sampling(static_cast<const ops::SamplingConfig*>(
@@ -3148,7 +3241,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         }
 
         schedule::TextContext::MixedDecodeSlice slice;
-        if (!flash) {
+        if (!flash && !target_only) {
             slice.ids                = ordinary.tokens.slice(0, 0, rows);
             slice.lora_slots         = ordinary.lora_slots.slice(0, 0, rows);
             slice.cache_positions    = ordinary.cache_positions.slice(0, 0, rows);
@@ -3418,14 +3511,14 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
     SequenceState& prefill_sequence  = sequences[prefill_lane];
     RequestControl& prefill_request  = requests[prefill_lane];
     try {
-        const bool flash = speculative_backend == SpeculativeBackend::DFlash;
+        const bool flash = speculative_backend == SpeculativeBackend::DFlash && !prefill_request.target_only;
         runtime::BatchedGeneratedRound flash_round;
         if (flash && !lanes.empty()) { flash_round = consume_dflash_round(handle); }
         else { device.synchronize(); }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         round_trace_state(decoder->linear_attention, device.stream, "post-round");
-        const bool head = speculative_backend == SpeculativeBackend::Mtp;
+        const bool head = speculative_backend == SpeculativeBackend::Mtp && !prefill_request.target_only;
         for (std::size_t row = 0; !flash && row < lanes.size(); ++row) {
             append_completion_score(lanes[row], ordinary_host_egress->scores[row]);
         }
@@ -3495,7 +3588,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
         }
 
         runtime::MixedRoundResult result;
-        if (!flash) { result.round = runtime::BatchedGeneratedRound{
+        if (!flash && !lanes.empty()) { result.round = runtime::BatchedGeneratedRound{
             .tokens   = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
                                                lanes.size()),
             .logprobs = std::span<const float>(ordinary_host_egress->sampled_logprobs.data(),
@@ -3583,6 +3676,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             requests[lane_id].prefill->elapsed_seconds += seconds;
             column += processed;
         }
+        if (prefill_request.target_only) finish_readout_prefills(prefill_lanes.first(result.prefill_count), result);
         return result;
     } catch (...) {
         try {
@@ -3916,6 +4010,9 @@ void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> l
 void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
     std::span<const std::byte> packet, std::uint32_t tokens, std::int32_t mixed_base) {
     if (!stage.features || tokens == 0) { return; }
+    // Classifier frontiers contain only target-model state. Pipeline packets
+    // keep the model's fixed stride, but their draft feature columns are unused.
+    if (lane < max_concurrency && requests[lane].target_only) { return; }
     if (lane >= max_concurrency || tokens > static_cast<std::uint32_t>(dflash->prefill_positions.ne[0]) ||
         packet.size() < static_cast<std::size_t>(tokens) * stage.column_bytes) {
         throw std::invalid_argument("DFlash prefill feature transfer is out of bounds");
@@ -4385,7 +4482,17 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     request.pending   = {};
     // Publish a reusable frontier before the field requests are admitted. Each
     // pipeline stage archives its own KV and recurrent state here.
+    if (terminal && request.target_only && !request.save_gpu_prefix) {
+        sequence.kv.reset();
+        sequence.retained = false;
+    }
     if (terminal && request.cache_prompt) { archive_sequence(sequence); }
+    if (terminal && request.save_gpu_prefix) { capture_gpu_prefix(sequence, request.save_gpu_prefix, request.gpu_storage); }
+    if (terminal) {
+        request.gpu_prefix.reset();
+        request.save_gpu_prefix.reset();
+        request.gpu_storage.reset();
+    }
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
@@ -4404,7 +4511,31 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.sequence.capacity_bytes += snapshot_bytes;
     out.sequence.used_bytes += snapshot_bytes;
     out.sequence.peak_used_bytes += decoder->checkpoint_peak_bytes();
+    // A classifier's snapshots and admitted requests share one state arena.
+    auto add_state = [&](const GpuPrefixStorage* storage) {
+        out.sequence.capacity_bytes += storage->memory.capacity();
+        out.sequence.used_bytes += storage->memory.capacity();
+        out.sequence.peak_used_bytes += storage->memory.capacity();
+    };
+    for (auto it = gpu_prefixes.begin(); it != gpu_prefixes.end(); ++it) {
+        const auto* storage = it->second->storage.get();
+        const bool counted = std::any_of(gpu_prefixes.begin(), it,
+            [&](const auto& entry) { return entry.second->storage.get() == storage; });
+        if (!counted) add_state(storage);
+    }
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const auto* storage = requests[i].gpu_storage.get();
+        if (!storage) continue;
+        const bool captured = std::any_of(gpu_prefixes.begin(), gpu_prefixes.end(),
+            [&](const auto& entry) { return entry.second->storage.get() == storage; });
+        const bool counted = std::any_of(requests.begin(), requests.begin() + i,
+            [&](const auto& request) { return request.gpu_storage.get() == storage; });
+        if (!captured && !counted) add_state(storage);
+    }
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
+    out.workspace.capacity_bytes += candidate_readout_storage.capacity();
+    out.workspace.used_bytes += candidate_readout_storage.capacity();
+    out.workspace.peak_used_bytes += candidate_readout_storage.capacity();
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;

@@ -28,6 +28,8 @@ struct ResolvedExecutionOptions {
     // in this token order, independent of sampling filters and penalties.
     std::vector<TokenId> next_token_candidates;
     bool cache_prompt = false;
+    std::shared_ptr<const GpuPrefixKey> gpu_prefix;
+    std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     bool allow_prefix_reuse               = true;
@@ -113,7 +115,7 @@ struct RoundBudget {
 
 // A mixed round advances prompt chunks alongside ordinary decode or speculative
 // verification. Decode rows use BatchedGeneratedRound's counts and stride. `prefills[i]` belongs to the i-th lane the caller passed in.
-inline constexpr std::size_t kMaximumMixedPrefills = 8;
+inline constexpr std::size_t kMaximumMixedPrefills = 64;
 
 struct MixedRoundResult {
     std::array<PrefillStepResult, kMaximumMixedPrefills> prefills{};

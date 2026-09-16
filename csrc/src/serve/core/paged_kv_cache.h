@@ -189,6 +189,12 @@ public:
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
+    // Full prefix pages remain owned by source. The incomplete boundary page is
+    // private, copied device-to-device before any suffix writes can reach it.
+    [[nodiscard]] PagedKVAllocation fork_prefix(std::shared_ptr<const PagedKVAllocation> source,
+        std::uint32_t tokens, std::uint32_t page_entitlement, cudaStream_t stream);
+    void copy_pages(std::span<const std::int32_t> source, std::span<const std::int32_t> destination,
+                    cudaStream_t stream) const;
 
     /// Occupancy snapshot. `granule_bytes` is the mapping quantum a demand-mapped pool would
     /// use per plane (the CUDA VMM minimum allocation granularity). Allocation-free, so callers
@@ -249,6 +255,8 @@ public:
 
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] std::uint32_t page_entitlement() const noexcept;
+    [[nodiscard]] std::uint32_t owned_entitlement() const noexcept;
+    [[nodiscard]] std::uint32_t borrowed_pages() const noexcept { return borrowed_pages_; }
     [[nodiscard]] std::uint32_t mapped_page_count() const noexcept;
     [[nodiscard]] std::uint32_t mapped_token_capacity() const noexcept;
     [[nodiscard]] std::int32_t bound_row() const noexcept;
@@ -281,6 +289,8 @@ private:
                        cudaStream_t stream) const;
 
     PagedKVPool* pool_ = nullptr;
+    std::shared_ptr<const PagedKVAllocation> prefix_;
+    std::uint32_t borrowed_pages_ = 0;
     std::vector<std::int32_t> page_ids_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;

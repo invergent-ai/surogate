@@ -138,6 +138,33 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     }
     base->next_token_candidates = options.next_token_candidates;
     base->cache_prompt = options.cache_prompt;
+    base->gpu_prefix = options.gpu_prefix;
+    base->save_gpu_prefix = options.save_gpu_prefix;
+    base->target_only = bool(options.gpu_prefix || options.save_gpu_prefix);
+    if (base->target_only && (prompt.has_media() || options.requested_output_tokens != 1)) {
+        throw std::invalid_argument("GPU prefix readout requires one-token text requests");
+    }
+    prune_gpu_prefixes();
+    if (base->target_only) {
+        if (options.gpu_prefix) {
+            const auto found = gpu_prefixes.find(options.gpu_prefix.get());
+            if (found == gpu_prefixes.end()) throw std::invalid_argument("GPU prefix is unavailable in this engine");
+            base->gpu_storage = found->second->storage;
+        } else {
+            const auto slots = options.save_gpu_prefix->state_slots;
+            if (slots == 0 || slots > 1025) throw std::invalid_argument("GPU prefix state capacity must be in [1,1025]");
+            std::size_t bytes = 0;
+            for (const auto& t : prefix_state_tensors(sequences.front(), false, false))
+                bytes = (bytes + 255) / 256 * 256 + t.bytes();
+            bytes = (bytes + 255) / 256 * 256;
+            try { base->gpu_storage = std::make_shared<GpuPrefixStorage>(bytes, slots); }
+            catch (const std::exception&) {
+                throw RequestError(RequestErrorKind::Overloaded, "not enough GPU memory for parallel classification states");
+            }
+        }
+        if (options.save_gpu_prefix && base->gpu_storage->free.empty())
+            throw RequestError(RequestErrorKind::Overloaded, "GPU prefix state capacity exhausted");
+    }
     base->prompt_logprobs = options.prompt_logprobs;
     base->top_logprobs = options.top_logprobs;
     base->allow_prefix_reuse = options.allow_prefix_reuse;
@@ -178,6 +205,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                cfg.dflash.local_layers < cfg.dflash.layers) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
+    if (base->target_only) { base->backend_kv_page_entitlement = 0; }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,
         .main_kv_pages    = base->text_kv_page_entitlement,
@@ -244,7 +272,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    const PreparedPromptData& prompt,
                                                    const RequestBasePlan& base_plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (base_plan.impl_->gpu_prefix) {
+        const auto it = gpu_prefixes.find(base_plan.impl_->gpu_prefix.get());
+        if (it == gpu_prefixes.end()) throw std::invalid_argument("GPU prefix is unavailable in this engine");
+        auto plan = plan_request_for_sequence(lane, it->second->state, prompt, base_plan);
+        plan.impl_->device_prefix = it->second;
+        return plan;
+    }
     auto resident = plan_request_for_sequence(lane, sequences[lane], prompt, base_plan);
+    if (base_plan.impl_->target_only) return resident;
     if (base_plan.impl_->allow_prefix_reuse && prompt.identity.reusable) {
         auto saved = archived_prefixes.match(prompt.token_ids, [&](const ArchivedSequence& value) {
             return plan_request_for_sequence(lane, value.state, prompt, base_plan, true)
@@ -279,6 +315,10 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->retain_prefix               = base.allow_prefix_reuse && prompt.identity.reusable;
     plan->next_token_candidates = base.next_token_candidates;
     plan->cache_prompt = base.cache_prompt;
+    plan->target_only = base.target_only;
+    plan->gpu_prefix = base.gpu_prefix;
+    plan->save_gpu_prefix = base.save_gpu_prefix;
+    plan->gpu_storage = base.gpu_storage;
     plan->prompt_logprobs = base.prompt_logprobs;
     plan->top_logprobs = base.top_logprobs;
     plan->sampling                    = base.sampling;
@@ -290,7 +330,22 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->min_tokens                  = base.min_tokens;
     plan->stop_barrier_count          = base.stop_barrier_count;
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained && !sequence.cached_scores.empty()) {
+    if (base.target_only) {
+        if (base.gpu_prefix) {
+            const auto frontier = sequence.execution_frontier;
+            if (!sequence.target_only || !sequence.tail_hidden_valid || frontier > prompt.token_ids.size() ||
+                !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, frontier, base.lora_slot)) {
+                throw std::invalid_argument("request does not extend its GPU prefix with the same adapter");
+            }
+            plan->reuse = ReusePath::AppendAtFrontier;
+            plan->reuse_base = frontier;
+            plan->summary.reusable_prompt_tokens = frontier;
+            plan->summary.admission.main_kv_pages -= frontier / kPagedKVPageSize;
+        }
+        plan->summary.service_work_quanta = projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, 0);
+        return RequestPlan(std::move(plan));
+    }
+    if (!sequence.target_only && base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained && !sequence.cached_scores.empty()) {
         const auto limit = std::min({prompt.token_ids.size(), sequence.ledger.size(), sequence.cached_scores.size()});
         const auto needed = std::min(cfg.token_domain, std::max(0, base.prompt_logprobs));
         std::uint32_t count = 1;
@@ -301,7 +356,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         }
     }
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
+    if (!sequence.target_only && base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         auto append_frontier = reusable_append_frontier(sequence);
         if (speculative_backend == SpeculativeBackend::None &&
             decoder->linear_attention.layer_count() == 0 && decoder->ple.empty()) {
