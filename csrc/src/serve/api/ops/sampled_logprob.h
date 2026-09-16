@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 
 namespace sinfer::ops {
+std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const TokenId> tokens,
+                                            int domain, cudaStream_t stream);
 /// Asynchronous batched scoring into caller-owned device output. Columns are
 /// lane-major, with `width` verification positions per lane; counts can mask
 /// unlicensed speculative positions. All pointers remain valid through stream completion.

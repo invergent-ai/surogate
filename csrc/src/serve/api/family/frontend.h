@@ -171,6 +171,8 @@ public:
         const std::string& schema) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_tool_constraint(
         const std::string& structural_tag) const;
+    /// Encode a continuation fragment without adding BOS or interpreting special tokens.
+    [[nodiscard]] std::vector<TokenId> encode_fragment(std::string_view text) const;
     [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;
 
 private:

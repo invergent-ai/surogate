@@ -838,6 +838,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     id, model, created, outcome.text, outcome.reasoning,
                     finish_reason_wire(outcome.finish_reason), usage, detail);
             }
+            if (!outcome.parallel_decoding_details.empty()) {
+                auto payload = nlohmann::json::parse(response_body);
+                payload["parallel_decoding"] = nlohmann::json::parse(outcome.parallel_decoding_details);
+                response_body = payload.dump();
+            }
             set_owned_content(res, std::move(response_body), prepared.lifetime);
         } catch (const std::exception& e) {
             log_request_error(log_context, e.what());
@@ -950,7 +955,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                                              include_usage, outcome.parallel_decoding_details));
                 }
                 if (include_usage) {
                     const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};

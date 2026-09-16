@@ -171,6 +171,7 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 
 struct GenerationRequest {
     std::string json_schema;
+    bool parallel_decoding = false;
     std::string model;
     /// A `/v1/completions` prompt, served exactly as written with no chat template. Set for a
     /// completion request and empty for a chat one; the two are the same request otherwise, so

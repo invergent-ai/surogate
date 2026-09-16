@@ -97,6 +97,8 @@ public:
     /// minimum length bars exactly these until it is reached.
     [[nodiscard]] std::vector<TokenId> default_stop_tokens() const;
 
+    /// Encode a continuation fragment without adding BOS or interpreting special tokens.
+    [[nodiscard]] std::vector<TokenId> encode_fragment(std::string_view text) const;
     /// The text of each token id, one string per id -- what an OpenAI `logprobs`
     /// entry names beside its number.
     [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;

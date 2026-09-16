@@ -64,6 +64,7 @@ management requests to select the model.
 | `logit_bias` | Map token-id strings to biases in `[-100,100]`; applies to greedy and sampled generation |
 | `tools`, `tool_choice` | Function tools only; `none`, `auto`, `required`, or a named function object. Automatic choice requires `--enable-auto-tool-choice` |
 | `response_format` | `text`, `json_object`, or `json_schema`; see [Structured output](#structured-output) |
+| `parallel_decoding` | Opt into independent boolean/enum classification on JSON-schema chat requests; see [Parallel constrained decoding](#parallel-constrained-decoding) |
 | `parallel_tool_calls` | Defaults to `true`; `false` returns at most one tool call |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; the loaded template must support the requested value |
 | `chat_template_kwargs.enable_thinking` | Per-request thinking toggle; also accepted as top-level `enable_thinking` |
@@ -255,6 +256,69 @@ place `name`, `strict`, and `schema` directly inside the format object:
 
 Use `"text": {"format": {"type": "json_object"}}` when any JSON object is sufficient.
 Both formats work with streaming and non-streaming requests.
+
+### Parallel constrained decoding
+
+Set `parallel_decoding: true` on `/v1/chat/completions` to classify several independent fields
+from the same conversation. Each field receives its highest-probability allowed value, and
+`choices[0].message.content` contains the assembled JSON object. No separate checkpoint is
+required. Use an instruction-tuned model suited to your classification task.
+
+```json
+{
+  "model": "my-model",
+  "messages": [{"role": "user", "content": "Our production server is down. Please help immediately."}],
+  "parallel_decoding": true,
+  "temperature": 1,
+  "max_tokens": 128,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "triage",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "urgent": {"type": "boolean", "description": "Does this need immediate attention?"},
+          "category": {"type": "string", "enum": ["outage", "billing", "other"]}
+        },
+        "required": ["urgent", "category"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+With the OpenAI Python client, pass the opt-in through
+`extra_body={"parallel_decoding": True}`. Start the server with `--max-num-seqs 4` or higher
+to evaluate fields concurrently. A server with one sequence slot also accepts these requests.
+Speedups depend on the model, prompt length, number of fields, and available memory; benchmark
+your workload.
+
+The response also includes `parallel_decoding.fields`. Each field contains its selected
+`value` and a `probabilities` array of `{ "value": ..., "probability": ... }` entries.
+Probabilities sum to one over that field's allowed choices. They describe the model's
+constrained choice distribution, not calibrated confidence or a guarantee of correctness.
+Multi-token choices, including choices that share prefixes, are supported.
+
+Fields are evaluated independently. Use ordinary structured output when one field should depend
+on another. This mode accepts a flat object with 1–64 required properties, each a boolean or an
+enum of up to 256 distinct scalar values. Set `additionalProperties: false`. Nested objects,
+arrays, optional fields, references, and other schema constraints return HTTP `400`. Very long
+choices or large combined schemas can exceed the request limit; shorten them or split the request.
+
+Classification always chooses the highest-probability value. `temperature` follows the normal
+request/CLI/model default precedence and controls the choice probabilities; zero uses unscaled
+probabilities. Sampling filters and repetition penalties are not used. Explicit non-neutral
+filters, penalties, or `logit_bias` return HTTP `400`. Custom stops, tool calls, media, explicit
+token prompts, and token-level logprobs/IDs are unavailable in this mode. Give `max_tokens`
+enough room for any allowed result; an insufficient budget returns HTTP `400`.
+
+With `stream: true`, the complete JSON is delivered after classification finishes, followed by
+field probabilities on the final chunk. Usage counts the shared prompt once plus field-query
+suffixes, and counts the returned JSON as completion tokens. Ordinary JSON-schema requests
+keep their existing behavior when the opt-in is absent or false.
 
 ### Streaming shape
 

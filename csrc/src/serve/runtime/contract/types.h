@@ -24,6 +24,10 @@ struct ResolvedExecutionOptions {
     std::shared_ptr<const CompiledTokenConstraint> constraint;
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
+    // One-step readout for finite-choice classification. Values are raw logits,
+    // in this token order, independent of sampling filters and penalties.
+    std::vector<TokenId> next_token_candidates;
+    bool cache_prompt = false;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     bool allow_prefix_reuse               = true;

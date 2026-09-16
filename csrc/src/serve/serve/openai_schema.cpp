@@ -639,6 +639,9 @@ std::string parse_completion_prompt(const Json& body) {
 }
 
 void reject_unsupported_completion_features(const Json& body) {
+    if (body.contains("parallel_decoding") && body["parallel_decoding"] != false) {
+        bad_request("parallel_decoding is only available on chat completions", "parallel_decoding");
+    }
     // Each of these changes what the response means, so answering without them would be
     // answering a different question than the one asked.
     for (const char* key : {"echo", "suffix", "best_of"}) {
@@ -685,6 +688,11 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     require_object(body);
     GenerationRequest out;
     parse_output_features(body, out);
+    out.parallel_decoding = get_bool(body, "parallel_decoding", false);
+    if (out.parallel_decoding && (!body.contains("response_format") ||
+        !body["response_format"].is_object() || body["response_format"].value("type", "") != "json_schema")) {
+        bad_request("parallel_decoding requires response_format.type=json_schema", "parallel_decoding");
+    }
     if (!body.contains("model") || !body.at("model").is_string() ||
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
@@ -871,11 +879,12 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
 
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
-                                  bool include_usage) {
+                                  bool include_usage, const std::string& parallel_decoding_details) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array(
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
     if (include_usage) { payload["usage"] = nullptr; }
+    if (!parallel_decoding_details.empty()) payload["parallel_decoding"] = Json::parse(parallel_decoding_details);
     return sse_event(payload);
 }
 

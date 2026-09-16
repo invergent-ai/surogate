@@ -1587,9 +1587,21 @@ std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint
         if (tokenizer.default_stop_token_ids().empty()) {
             throw std::invalid_argument("JSON constraints require a tokenizer with an end-of-sequence token");
         }
+        std::function<std::vector<TokenId>(std::string_view)> encode =
+            [tokenizer = impl_->tokenizer](std::string_view text) {
+                return tokenizer->encode(text, {.parse_added_tokens=false, .add_bos=false});
+            };
+        // Grammar continuations must round-trip byte for byte. SentencePiece
+        // tokenizers may prepend a dummy space even without BOS; pretending this
+        // is a canonical continuation encoder makes llguidance's forced-prefix
+        // accounting underflow. Its byte-trie tokenizer is safe for those models.
+        for (std::string_view probe : {"{", "true", "\n\"x\"", " x"}) {
+            std::string decoded;
+            for (auto id : encode(probe)) { decoded += vocab.at(id); }
+            if (decoded != probe) { encode = {}; break; }
+        }
         impl_->constraint_compiler = std::make_unique<JsonConstraintCompiler>(
-            std::move(vocab), tokenizer.default_stop_token_ids(),
-            [tokenizer = impl_->tokenizer](std::string_view text) { return tokenizer->encode(text); });
+            std::move(vocab), tokenizer.default_stop_token_ids(), std::move(encode));
     }
     return impl_->constraint_compiler->compile(schema);
 }
@@ -1680,6 +1692,10 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 }
 
 bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template; }
+
+std::vector<TokenId> Frontend::encode_fragment(std::string_view text) const {
+    return impl_->tokenizer->encode(text, {.parse_added_tokens=false, .add_bos=false});
+}
 
 PreparedPrompt Frontend::prepare_text(std::string_view text, bool allow_prefix_identity) const {
     const auto start = Clock::now();

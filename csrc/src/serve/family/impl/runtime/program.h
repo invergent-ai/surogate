@@ -75,6 +75,10 @@ namespace sinfer::family::detail {
 template <>
 struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     runtime::RequestPlanSummary summary;
+    // One-step readout for finite-choice classification. Values are raw logits,
+    // in this token order, independent of sampling filters and penalties.
+    std::vector<TokenId> next_token_candidates;
+    bool cache_prompt = false;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     ops::SamplingConfig sampling;
@@ -109,6 +113,10 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<family::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     std::uint32_t reusable_scores = 0;
+    // One-step readout for finite-choice classification. Values are raw logits,
+    // in this token order, independent of sampling filters and penalties.
+    std::vector<TokenId> next_token_candidates;
+    bool cache_prompt = false;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     ops::SamplingConfig sampling;
@@ -257,10 +265,15 @@ struct RequestControl {
     PendingCandidate pending;
     /// Valid while `pending.kind == Speculative`: the round's decision for this lane.
     SpeculativeOutcome outcome;
+    // One-step readout for finite-choice classification. Values are raw logits,
+    // in this token order, independent of sampling filters and penalties.
+    std::vector<TokenId> next_token_candidates;
+    bool cache_prompt = false;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     std::vector<TokenScore> prompt_scores;
     std::vector<TokenScore> completion_scores;
+    std::vector<float> next_token_logits;
     ops::SamplingConfig sampling_host;
     std::vector<float> logit_bias_host;
     std::unique_ptr<TokenConstraintState> constraint;

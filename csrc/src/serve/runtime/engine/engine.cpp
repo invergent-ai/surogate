@@ -39,6 +39,11 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     }
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    if (!options.execution.next_token_candidates.empty() && options.execution.requested_output_tokens != 1) {
+        throw std::invalid_argument("candidate readout requires exactly one output token");
+    }
+    resolved.execution.next_token_candidates = std::move(options.execution.next_token_candidates);
+    resolved.execution.cache_prompt = options.execution.cache_prompt;
     resolved.execution.prompt_logprobs = options.execution.prompt_logprobs;
     resolved.execution.top_logprobs = options.execution.top_logprobs;
     resolved.execution.lora_slot               = options.execution.lora_slot;
@@ -339,6 +344,13 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                 info, preparation, SamplingMode::Thinking, std::move(prepared)));
         },
         impl_->active);
+}
+
+std::vector<TokenId> Engine::encode_fragment(std::string_view text) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit([&](const auto& target) {
+        return target->loaded->frontend.encode_fragment(text);
+    }, impl_->active);
 }
 
 std::vector<std::string> Engine::token_texts(std::span<const TokenId> ids) const {

@@ -199,4 +199,36 @@ TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int t
                          cudaStream_t stream) {
     return score_logprobs_batch(logits, std::span<const TokenId>(&token, 1), domain, top_k, stream).front();
 }
+
+namespace {
+__global__ void gather_logits_kernel(const __nv_bfloat16* logits, const TokenId* ids,
+                                      float* values, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) values[i] = __bfloat162float(logits[ids[i]]);
+}
+}
+
+std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const TokenId> tokens,
+                                            int domain, cudaStream_t stream) {
+    if (logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
+        tokens.empty() || tokens.size() > 256 ||
+        std::any_of(tokens.begin(), tokens.end(), [domain](auto id) { return id < 0 || id >= domain; })) {
+        throw std::invalid_argument("invalid candidate logit readout");
+    }
+    void* storage = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&storage, tokens.size() * (sizeof(TokenId) + sizeof(float)), stream));
+    auto* ids = static_cast<TokenId*>(storage);
+    auto* values = reinterpret_cast<float*>(ids + tokens.size());
+    std::vector<float> result(tokens.size());
+    try {
+        CUDA_CHECK(cudaMemcpyAsync(ids, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream));
+        gather_logits_kernel<<<1, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
+                                                   ids, values, tokens.size());
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(result.data(), values, result.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } catch (...) { cudaFreeAsync(storage, stream); throw; }
+    CUDA_CHECK(cudaFreeAsync(storage, stream));
+    return result;
+}
 } // namespace sinfer::ops

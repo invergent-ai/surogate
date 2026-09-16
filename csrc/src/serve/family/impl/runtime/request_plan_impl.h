@@ -131,6 +131,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling.top_logprobs = options.top_logprobs;
     base->logit_bias                     = options.sampling.logit_bias;
     base->constraint                     = options.constraint;
+    if (options.next_token_candidates.size() > 256 ||
+        std::any_of(options.next_token_candidates.begin(), options.next_token_candidates.end(),
+                    [&](TokenId id) { return id < 0 || id >= cfg.token_domain; })) {
+        throw std::invalid_argument("invalid candidate token readout");
+    }
+    base->next_token_candidates = options.next_token_candidates;
+    base->cache_prompt = options.cache_prompt;
     base->prompt_logprobs = options.prompt_logprobs;
     base->top_logprobs = options.top_logprobs;
     base->allow_prefix_reuse = options.allow_prefix_reuse;
@@ -270,6 +277,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
     plan->retain_prefix               = base.allow_prefix_reuse && prompt.identity.reusable;
+    plan->next_token_candidates = base.next_token_candidates;
+    plan->cache_prompt = base.cache_prompt;
     plan->prompt_logprobs = base.prompt_logprobs;
     plan->top_logprobs = base.top_logprobs;
     plan->sampling                    = base.sampling;

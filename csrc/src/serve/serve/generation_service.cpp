@@ -10,6 +10,7 @@
 #include "serve/tool_call_parser.h"
 #include "serve/tool_constraints.h"
 #include "serve/translate.h"
+#include "serve/parallel_decoding.h"
 
 #include <algorithm>
 #include <chrono>
@@ -444,9 +445,26 @@ std::shared_ptr<RequestLifetime> GenerationService::begin_request(
     return lifetime;
 }
 
-PreparedRequest GenerationService::prepare(const GenerationRequest& request,
+PreparedRequest GenerationService::prepare(const GenerationRequest& original,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare) const {
+    std::optional<GenerationRequest> classification_request;
+    std::vector<ParallelField> parallel_fields;
+    if (original.parallel_decoding) {
+        classification_request = original;
+        auto& request = *classification_request;
+        validate_parallel_request(request);
+        parallel_fields = parse_parallel_schema(request.json_schema);
+        ChatTurn instruction;
+        instruction.role = ChatRole::User;
+        ContentPart text;
+        text.text = "Classify the conversation above according to this JSON schema. "
+                    "Evaluate each property independently using its description and allowed values. "
+                    "Complete only the requested JSON property, without explanations. Schema: " + request.json_schema;
+        instruction.content.push_back(std::move(text));
+        request.messages.push_back(std::move(instruction));
+    }
+    const auto& request = classification_request ? *classification_request : original;
     validate_token_media(request);
     // A base model has no chat template, so there is no turn structure to render this into.
     // Refused here rather than in each handler: every chat-shaped endpoint arrives through
@@ -499,8 +517,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.tool_capable                  = request.uses_tools();
     prepared.tools                         = request.tools;
     prepared.tool_name_max_length          = request.tool_name_max_length;
-    const ResolvedPromptSemantics semantics =
+    ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
+    if (request.parallel_decoding) { semantics.enable_thinking = false; }
     request_options.execution.structural_tag = make_tool_constraint(request, options_.tool_call_format, semantics.enable_thinking);
     prepared.constrained_tools = !request_options.execution.structural_tag.empty();
     prepared.tool_choice = request.tool_choice;
@@ -565,6 +584,48 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         // actually sees, which is the thing a trainer must score against and is not
         // reliably reproducible by re-rendering the messages.
         if (request.return_token_ids) { prepared.prompt_token_ids = prompt.token_ids(); }
+        if (request.parallel_decoding) {
+            auto state = std::make_shared<ParallelDecodingRequest>();
+            state->plan = compile_parallel_plan(std::move(parallel_fields),
+                [&](std::string_view text) { return engine_->encode_fragment(text); });
+            state->prefix = prompt.token_ids();
+            for (const auto& query : state->plan.queries) {
+                if (state->prefix.size() + query.suffix.size() + 1 > engine_->options().max_context) {
+                    throw ApiException({.message="parallel_decoding field exceeds the model context limit", .param="response_format"});
+                }
+            }
+            state->max_tokens = request.max_tokens > 0 ? request.max_tokens : options_.default_max_tokens;
+            // Reserve a conservative bound before doing GPU work: every possible
+            // assembled result fits the client's requested completion budget.
+            std::size_t bound = engine_->encode_fragment("{}").size();
+            for (const auto& field : state->plan.fields) {
+                std::size_t longest = 0;
+                for (const auto& value : field.values)
+                    longest = std::max(longest, engine_->encode_fragment(
+                        nlohmann::json(field.name).dump() + ":" + value.dump() + ",").size());
+                bound += longest;
+            }
+            if (bound > state->max_tokens) {
+                throw ApiException({.message="max_tokens is too small for all parallel_decoding choices (need at least " +
+                    std::to_string(bound) + ")", .param="max_tokens"});
+            }
+            state->adapter = adapter.lifetime;
+            request_options.execution.json_schema.clear();
+            request_options.execution.requested_output_tokens = 1;
+            request_options.execution.cache_prompt = true;
+            request_options.output.structured = true;
+            auto& sampling = request_options.execution.sampling;
+            sampling.top_k = 0;
+            sampling.top_p = 1;
+            sampling.min_p = 0;
+            sampling.presence_penalty = 0;
+            sampling.frequency_penalty = 0;
+            sampling.repetition_penalty = 1;
+            sampling.logit_bias.clear();
+            state->options = request_options;
+            state->options.execution.cache_prompt = false;
+            prepared.parallel_decoding = std::move(state);
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               prepared.lifetime->deadline, std::move(adapter.lifetime));
         prepared.sampling   = prepared.generation.resolved_sampling();
@@ -610,6 +671,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
 
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
+    if (prepared.parallel_decoding) { return run_parallel(prepared, sink, is_cancelled); }
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) {
         output_sink = std::make_unique<ServiceOutputSink>(*engine_, *sink, prepared.tool_capable,
@@ -708,6 +770,72 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     finalize_output_text(outcome, options_.reasoning_format,
         output_sink ? std::optional(output_sink->finish(is_tool_call_response)) : std::nullopt);
     return outcome;
+}
+
+GenerationOutcome GenerationService::run_parallel(PreparedRequest& prepared, const StreamSink* sink,
+    const std::function<bool()>& external_cancelled) {
+    auto state = std::move(prepared.parallel_decoding);
+    const auto cancelled = [&] {
+        return (external_cancelled && external_cancelled()) ||
+               (sink && sink->is_cancelled && sink->is_cancelled());
+    };
+    const auto deadline = prepared.lifetime->deadline;
+    const CancellationView cancellation([&] { return cancelled() || Clock::now() >= deadline; });
+    const auto check = [&] { check_preparation_control(deadline, cancelled); };
+    GenerationOutcome outcome;
+    try {
+        check();
+        const auto warm = prepared.generation.wait(nullptr, cancellation);
+        check();
+        if (warm.finish_reason == FinishReason::Cancelled)
+            throw RequestError(RequestErrorKind::Cancelled, "parallel decoding was cancelled");
+        outcome.prompt_tokens = prepared.prompt_tokens;
+        outcome.metrics.prefix_cache_hit_tokens = warm.reused_prompt_tokens;
+        outcome.metrics.prefix_reuse_path = warm.prefix_reuse_path;
+        outcome.metrics.prefill_seconds = warm.timings.prefill_seconds;
+        std::vector<std::vector<float>> logits(state->plan.queries.size());
+        // Keep work bounded and share the normal scheduler with other requests.
+        // A one-lane engine runs the same finite-choice computation serially.
+        const auto width = std::max<std::size_t>(1, std::min<std::size_t>(8, options_.max_concurrency));
+        state->options.execution.sampling.temperature = prepared.sampling.temperature;
+        for (std::size_t start = 0; start < state->plan.queries.size(); start += width) {
+            std::vector<GenerationHandle> pending;
+            const auto end = std::min(start + width, state->plan.queries.size());
+            for (std::size_t i = start; i < end; ++i) {
+                check();
+                const auto& query = state->plan.queries[i];
+                auto tokens = state->prefix;
+                tokens.insert(tokens.end(), query.suffix.begin(), query.suffix.end());
+                auto options = state->options;
+                options.execution.next_token_candidates = query.candidates;
+                pending.push_back(engine_->submit(engine_->prepare_tokens(std::move(tokens)),
+                    std::move(options), deadline, state->adapter));
+                outcome.prompt_tokens += static_cast<int>(query.suffix.size());
+            }
+            for (std::size_t i = start; i < end; ++i) {
+                const auto result = pending[i - start].wait(nullptr, cancellation);
+                check();
+                if (result.finish_reason == FinishReason::Cancelled)
+                    throw RequestError(RequestErrorKind::Cancelled, "parallel decoding was cancelled");
+                logits[i] = result.next_token_logits;
+                outcome.metrics.prefill_seconds += result.timings.prefill_seconds;
+            }
+        }
+        check();
+        auto classified = resolve_parallel_plan(state->plan, logits, prepared.sampling.temperature);
+        outcome.text = classified.content.dump();
+        outcome.completion_tokens = static_cast<int>(engine_->encode_fragment(outcome.text).size());
+        if (std::size_t(outcome.completion_tokens) > state->max_tokens)
+            throw ApiException({.message="assembled parallel_decoding result exceeds max_tokens", .param="max_tokens"});
+        outcome.parallel_decoding_details = nlohmann::json{
+            {"fields", classified.fields}, {"temperature", prepared.sampling.temperature}}.dump();
+        outcome.finish_reason = FinishReason::StopToken;
+        outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+        outcome.metrics.total_seconds = std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        outcome.metrics.ttft_seconds = outcome.metrics.total_seconds;
+        if (sink && sink->on_content) sink->on_content(outcome.text);
+        return outcome;
+    } catch (const RequestError& exception) { throw_request_error(exception); }
 }
 
 std::vector<sinfer::TokenId> GenerationService::tokenize(const GenerationRequest& request,

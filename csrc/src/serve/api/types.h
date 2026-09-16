@@ -355,6 +355,11 @@ struct ExecutionOptions {
     std::string structural_tag;
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
+    /// One-step readout for 1..256 candidate tokens; requires requested_output_tokens=1.
+    /// Values are raw logits in this order, independent of sampling filters and penalties.
+    std::vector<TokenId> next_token_candidates;
+    /// Publish the completed prefix for reuse by other lanes, subject to cache capacity.
+    bool cache_prompt = false;
     /// Number of raw full-vocabulary alternatives to return, 0..20; -1 disables scoring.
     int prompt_logprobs = -1;
     int top_logprobs = -1;
@@ -701,6 +706,7 @@ enum class PrefixReusePath : std::uint8_t {
 };
 
 struct GenerationResult {
+    std::vector<float> next_token_logits;
     std::vector<TokenScore> prompt_logprobs;
     std::vector<TokenScore> completion_logprobs;
     PromptSummary prompt;

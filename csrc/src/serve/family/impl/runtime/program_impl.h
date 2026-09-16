@@ -795,6 +795,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         request.prompt_logprobs = request_plan.prompt_logprobs;
         request.top_logprobs = request_plan.top_logprobs;
+        request.next_token_candidates = request_plan.next_token_candidates;
+        request.next_token_logits.clear();
+        request.cache_prompt = request_plan.cache_prompt;
         request.completion_scores.clear();
         request.constraint = request_plan.constraint ? request_plan.constraint->create_state() : nullptr;
         request.constraint_frontier = prompt_tokens;
@@ -1228,6 +1231,7 @@ TokenScoreDelta ProgramImplCore::logprob_delta(std::uint32_t lane, std::size_t f
 
 void ProgramImplCore::collect_logprobs(std::uint32_t lane, GenerationResult& result) {
     if (lane >= max_concurrency) return;
+    result.next_token_logits = requests[lane].next_token_logits;
     result.prompt_logprobs = requests[lane].prompt_scores;
     result.completion_logprobs = requests[lane].completion_scores;
     result.completion_logprobs.resize(std::min(result.completion_logprobs.size(), result.generated_token_ids.size()));
@@ -1253,13 +1257,15 @@ void ProgramImplCore::cache_logprobs(std::uint32_t lane, const GenerationResult&
 
 std::function<void(const Tensor&, int, bool)> ProgramImplCore::score_observer(std::uint32_t lane) {
     auto& request = requests[lane];
-    if (!stage_holds_head() || (request.prompt_logprobs < 0 && request.top_logprobs < 0)) return {};
+    if (!stage_holds_head() || (request.prompt_logprobs < 0 && request.top_logprobs < 0 && request.next_token_candidates.empty())) return {};
     return [this, lane](const Tensor& logits, int position, bool generated) {
         auto& request = requests[lane];
-        if (generated && request.top_logprobs >= 0) {
-            TokenId token;
-            CUDA_CHECK(cudaMemcpyAsync(&token, io.token.data, sizeof(token), cudaMemcpyDeviceToHost, device.stream));
-            device.synchronize();
+        if (generated && (request.top_logprobs >= 0 || !request.next_token_candidates.empty())) {
+            TokenId token = 0;
+            if (request.top_logprobs >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(&token, io.token.data, sizeof(token), cudaMemcpyDeviceToHost, device.stream));
+                device.synchronize();
+            }
             score_completion(lane, logits, token);
         } else if (!generated && request.prompt_logprobs >= 0 && request.prefill) {
             const auto& prompt = request.prefill->prompt.token_ids;
@@ -1304,6 +1310,10 @@ void ProgramImplCore::append_completion_score(std::uint32_t lane, const RawToken
 
 void ProgramImplCore::score_completion(std::uint32_t lane, const Tensor& logits, TokenId token) {
     auto& request = requests[lane];
+    if (stage_holds_head() && !request.next_token_candidates.empty()) {
+        request.next_token_logits = ops::gather_candidate_logits(
+            logits, request.next_token_candidates, cfg.token_domain, device.stream);
+    }
     if (stage_holds_head() && request.top_logprobs >= 0) {
         request.completion_scores.push_back(ops::score_logprobs(
             logits, token, cfg.token_domain, request.top_logprobs, device.stream));
@@ -4373,6 +4383,9 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};
+    // Publish a reusable frontier before the field requests are admitted. Each
+    // pipeline stage archives its own KV and recurrent state here.
+    if (terminal && request.cache_prompt) { archive_sequence(sequence); }
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

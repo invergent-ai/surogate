@@ -1568,6 +1568,7 @@ if(SINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/translate.cpp
     ${SERVE_ROOT}/serve/console_log.cpp
     ${SERVE_ROOT}/serve/generation_service.cpp
+    ${SERVE_ROOT}/serve/parallel_decoding.cpp
     ${SERVE_ROOT}/serve/model_scheduler.cpp
     ${SERVE_ROOT}/serve/request_log.cpp
     ${SERVE_ROOT}/serve/http_server.cpp

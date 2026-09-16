@@ -634,6 +634,17 @@ sinfer_add_test(sinfer_tool_constraints_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_tool_constraints_test PRIVATE -UNDEBUG)
 
+
+sinfer_add_test(sinfer_parallel_decoding_test
+  SOURCES test_parallel_decoding.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_parallel_decoding_test PRIVATE -UNDEBUG -fno-fast-math)
+
+sinfer_add_test(sinfer_candidate_readout_test
+  SOURCES test_candidate_readout.cpp
+  LIBRARIES sinfer_engine)
+target_compile_options(sinfer_candidate_readout_test PRIVATE -UNDEBUG -fno-fast-math)
+
 # The aggregate: `cmake --build <dir> --target serve-tests` builds every registered test,
 # and `ctest` then has a binary for each of them.
 get_property(_sinfer_serve_test_targets GLOBAL PROPERTY SINFER_SERVE_TEST_TARGETS)

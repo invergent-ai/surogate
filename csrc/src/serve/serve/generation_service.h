@@ -23,6 +23,7 @@
 
 namespace sinfer::serve {
 
+struct ParallelDecodingRequest;
 struct RequestLifetime;
 struct RequestCapacity;
 // Runs after reserving ingress capacity; wake and preparation share this control.
@@ -49,6 +50,7 @@ struct GenerationMetrics {
 };
 
 struct GenerationOutcome {
+    std::string parallel_decoding_details;
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
@@ -89,6 +91,7 @@ ApiError request_error_to_api_error(const sinfer::RequestError& exception);
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    std::shared_ptr<ParallelDecodingRequest> parallel_decoding;
     sinfer::GenerationHandle generation;
     sinfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
@@ -201,6 +204,8 @@ public:
     [[nodiscard]] std::vector<int> devices() const override { return engine_->devices(); }
 
 private:
+    GenerationOutcome run_parallel(PreparedRequest& prepared, const StreamSink* sink,
+                                    const std::function<bool()>& is_cancelled);
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
     [[nodiscard]] std::shared_ptr<RequestLifetime> begin_request(
         const std::function<bool()>& is_cancelled, const PreparationGate& before_prepare) const;
