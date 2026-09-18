@@ -20,6 +20,8 @@ surogate serve Qwen/Qwen3.6-27B --port 8080
 - **Embeddings** on GPU or CPU through `surogate serve --embed`.
 - **Romanian speech recognition** with file uploads and live partial transcripts through
   [`surogate serve --stt`](speech.md).
+- **Romanian speech generation on CPU**, with named and cloned voices through
+  [`surogate serve --tts`](tts.md).
 
 See [Serving models](serving-models.md) for worked examples.
 

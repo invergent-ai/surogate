@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #include "model.h"
 #include "audio.h"
-#include <httplib.h>
+#include "../serve/audio_http.h"
 #include <ATen/Parallel.h>
 #include <chrono>
 #include <iostream>
@@ -11,30 +11,23 @@
 
 namespace {
 using namespace sinfer::speech;
-const char* usage = "surogate-stt MODEL [--host HOST] [--port PORT] [--device N|cpu]\n"
-                    "  --served-model-name NAME   public model ID\n"
-                    "  --api-key KEY             authenticate requests\n"
-                    "  --max-num-seqs N          live streams (default 8)\n"
-                    "surogate serve --stt MODEL --lm PATH prepares a local NeMo checkpoint.\n";
+const char* usage =
+    "surogate-stt MODEL [--host HOST] [--port PORT] [--device N|cpu]\n"
+    "  --cpu-kernels auto|optimized|reference   CPU kernel selection (default auto)\n"
+    "  --threads N               CPU compute threads (default 4)\n"
+    "  --served-model-name NAME   public model ID\n"
+    "  --api-key KEY             authenticate requests\n"
+    "  --max-num-seqs N          live streams (default 8)\n"
+    "surogate serve --stt MODEL --lm PATH prepares a local NeMo checkpoint.\n";
 
-void response(httplib::Response& r, const json& body, int code = 200) {
-    r.status = code;
-    r.set_content(body.dump(), "application/json");
-}
-
-void error(httplib::Response& r, const std::string& message, int code) {
-    response(
-        r,
-        {{"error",
-          {{"message", message}, {"type", code < 500 ? "invalid_request_error" : "server_error"}}}},
-        code);
-}
+using sinfer::serve::audio::response;
+using sinfer::serve::audio::error;
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        std::string artifact, host = "127.0.0.1", device = "0", name, key;
-        int port = 8080, limit = 8;
+        std::string artifact, host = "127.0.0.1", device = "0", name, key, kernels = "auto";
+        int port = 8080, limit = 8, threads = 4;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
@@ -47,7 +40,15 @@ int main(int argc, char** argv) {
             };
             if (arg == "--host")
                 host = value();
-            else if (arg == "--port")
+            else if (arg == "--cpu-kernels")
+                kernels = value();
+            else if (arg == "--threads") {
+                auto text   = value();
+                size_t used = 0;
+                threads     = std::stoi(text, &used);
+                if (used != text.size())
+                    throw std::invalid_argument("--threads must be an integer");
+            } else if (arg == "--port")
                 port = std::stoi(value());
             else if (arg == "--device")
                 device = value();
@@ -62,15 +63,24 @@ int main(int argc, char** argv) {
             else
                 throw std::invalid_argument("unknown option: " + arg);
         }
-        if (artifact.empty() || port < 1 || port > 65535 || limit < 1 || limit > 128)
+        if (artifact.empty() || port < 1 || port > 65535 || limit < 1 || limit > 128 ||
+            threads < 1 || threads > 256)
             throw std::invalid_argument(usage);
         if (name.empty()) name = artifact;
-        at::set_num_threads(4);
+        at::set_num_threads(threads);
         at::set_num_interop_threads(1);
         at::globalContext().setAllowTF32CuBLAS(false);
         at::globalContext().setAllowTF32CuDNN(false);
         c10::InferenceMode inference;
-        Model model(artifact, device);
+        if (kernels != "auto" && kernels != "optimized" && kernels != "reference")
+            throw std::invalid_argument("--cpu-kernels must be auto, optimized or reference");
+        auto mode = kernels == "reference"   ? CpuKernels::Reference
+                    : kernels == "optimized" ? CpuKernels::Optimized
+                                             : CpuKernels::Auto;
+        Model model(artifact, device, mode);
+        if (device == "cpu")
+            std::cerr << "STT CPU kernels: " << (model.optimized_cpu() ? "oneDNN" : "reference")
+                      << "; threads=" << threads << '\n';
         std::mutex mutex;
 
         struct Session {
@@ -81,25 +91,7 @@ int main(int argc, char** argv) {
         std::map<std::string, Session> sessions;
         std::random_device random;
         httplib::Server server;
-        server.set_payload_max_length(64 * 1024 * 1024);
-        server.set_read_timeout(60);
-        server.set_pre_routing_handler([&](const httplib::Request& q, httplib::Response& r) {
-            if (!key.empty() && q.get_header_value("Authorization") != "Bearer " + key) {
-                error(r, "invalid API key", 401);
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            return httplib::Server::HandlerResponse::Unhandled;
-        });
-        server.set_exception_handler([](const auto&, auto& r, std::exception_ptr exception) {
-            try {
-                std::rethrow_exception(exception);
-            } catch (const std::invalid_argument& e) {
-                error(r, e.what(), 400);
-            } catch (const std::exception& e) {
-                std::cerr << "speech request: " << e.what() << '\n';
-                error(r, "speech inference failed", 500);
-            }
-        });
+        sinfer::serve::audio::configure(server, key, 64 * 1024 * 1024);
         server.Get("/health", [](const auto&, auto& r) { response(r, {{"status", "ok"}}); });
         server.Get("/v1/models", [&](const auto&, auto& r) {
             response(
@@ -126,6 +118,8 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("response_format must be json, text or verbose_json");
             auto pcm = decode_audio(q.get_file_value("file").content);
             std::lock_guard lock(mutex);
+            // OpenMP/MKL thread settings belong to the HTTP worker thread.
+            at::set_num_threads(threads);
             c10::InferenceMode guard;
             std::vector<json> events;
             if (model.streaming()) {
@@ -178,6 +172,8 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("stream creation takes an empty body; send mono 16 kHz "
                                             "PCM16 to the returned stream");
             std::lock_guard lock(mutex);
+            // OpenMP/MKL thread settings belong to the HTTP worker thread.
+            at::set_num_threads(threads);
             c10::InferenceMode guard;
             prune();
             if (sessions.size() >= size_t(limit)) {
@@ -209,6 +205,8 @@ int main(int argc, char** argv) {
                 pcm[i] = static_cast<int16_t>(u) / 32768.f;
             }
             std::lock_guard lock(mutex);
+            // OpenMP/MKL thread settings belong to the HTTP worker thread.
+            at::set_num_threads(threads);
             c10::InferenceMode guard;
             prune();
             auto it = sessions.find(q.matches[1]);

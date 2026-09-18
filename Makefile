@@ -73,7 +73,7 @@ serve-configure:
 
 serve-build: serve-configure
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
-		--target surogate-engine-cli surogate-engine surogate-embed surogate-stt _surogate_serve
+		--target surogate-engine-cli surogate-engine surogate-embed surogate-stt surogate-tts _surogate_serve
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so surogate/ 2>/dev/null || true
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
 	# The module holds no device code of its own any more; libsinfer.so does, and
@@ -90,7 +90,12 @@ serve-stt-build:
 		-DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=$(STT_PYTHON)
 	cmake --build csrc/build-stt --parallel $(PARALLEL_JOBS) --target surogate-stt
 
-.PHONY: serve-stt-build
+# TTS-only build: C++20 and ICU development libraries, without Torch or CUDA.
+serve-tts-build:
+	cmake -S csrc/src/serve/tts -B csrc/build-tts -G Ninja -DCMAKE_BUILD_TYPE=Release
+	cmake --build csrc/build-tts --parallel $(PARALLEL_JOBS) --target surogate-tts test_tts_frontend
+
+.PHONY: serve-stt-build serve-tts-build
 
 # Build the engine *and* every registered test binary. The tests are excluded from `all`,
 # so naming the aggregate is what makes them exist; without it ctest reports "Not Run"

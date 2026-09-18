@@ -1,0 +1,28 @@
+{
+  "_name_or_path": "/home/patrick/t5/byt5-small",
+  "architectures": [
+    "T5ForConditionalGeneration"
+  ],
+  "d_ff": 3584,
+  "d_kv": 64,
+  "d_model": 1472,
+  "decoder_start_token_id": 0,
+  "dropout_rate": 0.1,
+  "eos_token_id": 1,
+  "feed_forward_proj": "gated-gelu",
+  "gradient_checkpointing": false,
+  "initializer_factor": 1.0,
+  "is_encoder_decoder": true,
+  "layer_norm_epsilon": 1e-06,
+  "model_type": "t5",
+  "num_decoder_layers": 4,
+  "num_heads": 6,
+  "num_layers": 12,
+  "pad_token_id": 0,
+  "relative_attention_num_buckets": 32,
+  "tie_word_embeddings": false,
+  "tokenizer_class": "ByT5Tokenizer",
+  "transformers_version": "4.7.0.dev0",
+  "use_cache": true,
+  "vocab_size": 384
+}

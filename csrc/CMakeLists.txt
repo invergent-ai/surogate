@@ -1441,6 +1441,7 @@ endif()
 # does. Same source as the old serve_tests target, which is now gone.
 add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
 add_subdirectory(${SERVE_ROOT}/speech)
+add_subdirectory(${SERVE_ROOT}/tts)
 target_include_directories(surogate-embed PRIVATE
   ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
 # Links sinfer_shared, with the other three products, once that target exists below.
@@ -1730,10 +1731,11 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 INSTALL_RPATH "${SINFER_LIB_RPATH}"
                 BUILD_WITH_INSTALL_RPATH OFF
                 INSTALL_RPATH_USE_LINK_PATH FALSE)
-            install(TARGETS surogate-stt surogate-stt-lm RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
+            install(TARGETS surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer sinfer-serve surogate-embed
                     RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
                     COMPONENT serve)
+            install(TARGETS sinfer_tts_bridge LIBRARY DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer_shared
                     LIBRARY DESTINATION surogate
                     COMPONENT serve)
@@ -1747,7 +1749,8 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                         COMPONENT serve)
             endif()
         else()
-            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt surogate-stt-lm sinfer_shared
+            install(TARGETS sinfer_tts_bridge LIBRARY DESTINATION bin COMPONENT serve)
+            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker sinfer_shared
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib
                     COMPONENT serve)

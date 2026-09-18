@@ -13,6 +13,8 @@ namespace sinfer::speech {
 using at::Tensor;
 using json = nlohmann::json;
 
+enum class CpuKernels { Auto, Optimized, Reference };
+
 class Weights {
     struct Mapping;
     std::shared_ptr<Mapping> mapping_;
@@ -38,6 +40,8 @@ class Model {
     at::Device device_;
     Weights w_, lm_;
     sentencepiece::SentencePieceProcessor tokenizer_;
+    mutable std::map<std::string, Tensor> packed_linear_;
+    bool cpu_optimized_ = false;
     Tensor linear(const Tensor&, const std::string&, bool bias = true) const;
     Tensor norm(const Tensor&, const std::string&) const;
     Tensor conv(const Tensor&, const std::string&, int groups = 1) const;
@@ -45,7 +49,11 @@ class Model {
 public:
     json config;
     int hidden, heads, layers, left, right, kernel, vocab;
-    Model(const std::string& directory, const std::string& device);
+    Model(const std::string& directory, const std::string& device,
+          CpuKernels kernels = CpuKernels::Auto);
+
+    bool optimized_cpu() const { return cpu_optimized_; }
+
     Tensor mel(const Tensor& samples) const;
     Tensor mel_frames(const Tensor& emphasized) const;
     Tensor encode(const Tensor& features, EncoderState* state = nullptr) const;

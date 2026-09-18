@@ -1,8 +1,8 @@
 """The launcher must preserve native arguments before it prepares any weights."""
 
 import re
-import sys
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -19,6 +19,7 @@ def test_native_option_inventory(mode):
         "generate": "cli/options.cpp",
         "embed": "encoder/options.h",
         "stt": "speech/server.cpp",
+        "tts": "tts/server.cpp",
     }[mode]
     native = set(re.findall(r'arg == "(-[^\"]+)"', path.read_text())) - {"--help", "-h"}
     assert native == serve._VALUE_OPTIONS[mode] | serve._SWITCH_OPTIONS[mode]
@@ -33,6 +34,27 @@ def test_native_help_describes_every_option(mode):
     assert result.returncode == 0, result.stderr
     for flag in serve._VALUE_OPTIONS[mode] | serve._SWITCH_OPTIONS[mode]:
         assert flag in result.stdout, flag
+
+
+@pytest.mark.parametrize("mode,flag,values", [
+    ("stt", "--threads", ["0", "-1", "257", "four", "4oops"]),
+    ("tts", "--threads", ["0", "-1", "257", "four", "4oops"]),
+    ("tts", "--codec-threads", ["-1", "257", "four", "4oops"]),
+    ("stt", "--cpu-kernels", ["missing"]),
+    ("tts", "--cpu-kernels", ["missing"]),
+])
+def test_invalid_cpu_compute_options_fail_before_model_load(mode, flag, values):
+    binary = serve._resolve_binary(mode)
+    if binary is None:
+        pytest.skip("native serving binaries are not built")
+    for value in values:
+        result = subprocess.run(
+            [binary, "/nonexistent-model", "--device", "cpu", flag, value],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode != 0
+        assert "cannot read speech weights" not in result.stderr
+        assert "voices.json" not in result.stderr
 
 
 @pytest.mark.parametrize("mode", serve._MODES)
@@ -79,12 +101,15 @@ def test_execution_puts_resolved_model_first(mode, monkeypatch):
     speech = Mock()
     speech.ensure_speech_weights.return_value = Path("/prepared.sinfer")
     monkeypatch.setitem(sys.modules, "surogate.serve.speech", speech)
+    tts = Mock()
+    tts.prepare_bundle.return_value.root = Path("/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.tts.assets", tts)
     execute = Mock()
     monkeypatch.setattr(serve.os, "execv", execute)
     serve.maybe_exec_serve()
     identity = ["--served-model-name", "model"] if mode != "generate" else []
     execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--device", "1", *identity])
-    prepare = speech.ensure_speech_weights if mode == "stt" else ingest.ensure_encoder_weights if mode == "embed" else ingest.ensure_engine_weights
+    prepare = tts.prepare_bundle if mode == "tts" else speech.ensure_speech_weights if mode == "stt" else ingest.ensure_encoder_weights if mode == "embed" else ingest.ensure_engine_weights
     assert prepare.call_args.args == ("model",)
     assert prepare.call_args.kwargs["reuse_cache"] is False
 

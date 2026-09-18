@@ -1,5 +1,7 @@
 # Romanian speech recognition
 
+For speech generation with named voices on CPU, see [Romanian text-to-speech](tts.md).
+
 Serve Romanian transcription on a GPU or CPU with either model:
 
 | Model | Use |
@@ -31,6 +33,28 @@ compiler, FFmpeg development libraries, and PyTorch in the active environment;
 set `STT_PYTHON=/path/to/python` to choose that environment.
 Installed wheels include the speech server. For a private
 Hugging Face repository, authenticate with `hf auth login` or set `HF_TOKEN`.
+
+### CPU compute options
+
+`--threads N` sets CPU compute threads (default 4, range 1–256). The setting
+also applies inside HTTP inference workers; it is independent of the number
+of HTTP connections or streaming sessions.
+
+```bash
+surogate serve --stt surogate/surogate-ro-110m-tdt-ctc --device cpu --threads 4
+```
+
+The optional `--cpu-kernels optimized` path uses LibTorch's oneDNN linear
+kernels with cached weight layouts and channels-last frontend convolutions.
+It retains FP32 and the original SiLU activation. It requires a oneDNN-enabled
+LibTorch build and additional memory for the cached weight layouts.
+
+This path is **experimental and opt-in**: CTC and TDT transcripts matched the
+reference for all 903 Romanian control recordings, but some intermediate
+tensors exceeded the existing numerical tolerances. `--cpu-kernels auto`
+(the default) and `--cpu-kernels reference` retain the original CPU path.
+LibTorch remains the STT runtime dependency. See the
+[CPU kernel validation report](cpu-kernels.md) for measurements and limitations.
 
 The first start downloads the selected acoustic checkpoint and its Romanian
 language model, then prepares reusable files under `~/.cache/surogate/serve`.

@@ -1,0 +1,44 @@
+[
+  {
+    "id": "001",
+    "voice": "Doina",
+    "input": "Bună, ce faci? Eu tocmai am ajuns acasă și încerc să-mi dau seama ce să mănânc.",
+    "seed": 9,
+    "sha256": "72fc2280ef9256a0637d67a9e5a78983324354a1e61e45d9a9c01e717e274206"
+  },
+  {
+    "id": "293",
+    "voice": "Doina",
+    "input": "Bună seara. Acestea sunt principalele știri ale zilei. În București, traficul este aglomerat în această după-amiază, după ce un accident a blocat temporar două benzi de circulație. Potrivit autorităților, nu au fost raportate victime. În economie, moneda euro este cotată astăzi la 5 lei și 7 bani.",
+    "seed": 301,
+    "sha256": "6c11deef3899ac17cad5d9b5791190983ba4e43892f6c8378954687df2b3a1c5"
+  },
+  {
+    "id": "001",
+    "voice": "Tudor",
+    "input": "Bună, ce faci? Eu tocmai am ajuns acasă și încerc să-mi dau seama ce să mănânc.",
+    "seed": 9,
+    "sha256": "75c8d92d8d2d8b684f34cc6e46ac2f47c652bd6e18e5542ddc8f5f4a37e58d8e"
+  },
+  {
+    "id": "293",
+    "voice": "Tudor",
+    "input": "Bună seara. Acestea sunt principalele știri ale zilei. În București, traficul este aglomerat în această după-amiază, după ce un accident a blocat temporar două benzi de circulație. Potrivit autorităților, nu au fost raportate victime. În economie, moneda euro este cotată astăzi la 5 lei și 7 bani.",
+    "seed": 301,
+    "sha256": "d3e80f904bcab3de748a0c0825ed5c00467e227d4404c41173a6189c0ece2511"
+  },
+  {
+    "id": "001",
+    "voice": "Radu",
+    "input": "Bună, ce faci? Eu tocmai am ajuns acasă și încerc să-mi dau seama ce să mănânc.",
+    "seed": 9,
+    "sha256": "018c5b37b7fd93b5726151e926820799832eec3d8ffe1e30a220d4f59d7baa21"
+  },
+  {
+    "id": "293",
+    "voice": "Radu",
+    "input": "Bună seara. Acestea sunt principalele știri ale zilei. În București, traficul este aglomerat în această după-amiază, după ce un accident a blocat temporar două benzi de circulație. Potrivit autorităților, nu au fost raportate victime. În economie, moneda euro este cotată astăzi la 5 lei și 7 bani.",
+    "seed": 301,
+    "sha256": "5807ca8a57b03bb0e4c024a196d31e811f9b898dc38fb9174837b0a2e63658dd"
+  }
+]

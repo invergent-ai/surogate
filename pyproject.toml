@@ -80,6 +80,7 @@ build.targets = [
     "sinfer-serve",
     "surogate-embed",
     "surogate-stt",
+    "surogate-tts",
     "_surogate_serve",
 ]
 # Install this project's own components and nothing else. Two reasons, both load-bearing:

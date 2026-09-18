@@ -37,7 +37,7 @@ ENV UV_HTTP_TIMEOUT=600
 # engine requires CUDA 13.1, so the cu128 wheel is built without one.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl libdw-dev python3-dev build-essential rsync wget netcat-openbsd gcc patch pciutils fuse3 openssh-server sudo openssh-server git \
-       libavformat60 libavcodec60 libavutil58 libswscale7 libnuma1 \
+       libavformat60 libavcodec60 libavutil58 libswscale7 libnuma1 libicu74 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN echo "${CUDA_LIB_ROOT}/cu13/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \

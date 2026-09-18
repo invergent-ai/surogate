@@ -1,0 +1,1991 @@
+{
+  "source": "invergent-ai/training_tts, native_cpu_runtime_v1/full_inputs.json; corpus SHA256 7faa24d037061edafca453bc722514f37238c3596c0b1407032232e18b003dc0",
+  "rows": [
+    {
+      "id": "001",
+      "input": "Bună, ce faci? Eu tocmai am ajuns acasă și încerc să-mi dau seama ce să mănânc.",
+      "chunks_sha256": "d6420a12a644bd7812597f8dd0de7306f9cc5d702ce22a624a48991b508849ca",
+      "language": "ro"
+    },
+    {
+      "id": "002",
+      "input": "Stai puțin, nu înțeleg. Vrei să plecăm acum sau peste vreo douăzeci de minute?",
+      "chunks_sha256": "fe0e4e94bf28de11798fa71fd084e35ee709933c2d468a2490011684d8a410ab",
+      "language": "ro"
+    },
+    {
+      "id": "003",
+      "input": "Da, sigur că pot să te ajut. Spune-mi doar exact de ce ai nevoie.",
+      "chunks_sha256": "6e0f1011f5d1c411f7d19d575434622308a5cc10ae22861ea9d000c3c87cd83a",
+      "language": "ro"
+    },
+    {
+      "id": "004",
+      "input": "M-am trezit la șapte, am băut o cafea, apoi am plecat direct la serviciu.",
+      "chunks_sha256": "6235c3a63894917bcf6d5f0a787670cdb528f606a7a40a5f75331df076d54818",
+      "language": "ro"
+    },
+    {
+      "id": "005",
+      "input": "Nu știu dacă e o idee bună, dar, sincer, cred că merită să încercăm.",
+      "chunks_sha256": "f994095220baea28137bfa1e6df7182129f7835965e86cfe6c8f6313faa109be",
+      "language": "ro"
+    },
+    {
+      "id": "006",
+      "input": "Apropo, ai văzut mesajul pe care ți l-am trimis ieri seară?",
+      "chunks_sha256": "e9f5bce4f3f41704cf114723c943c13f1654c11b973c37d3e6060ef0265781ba",
+      "language": "ro"
+    },
+    {
+      "id": "007",
+      "input": "Nu-i nimic, se mai întâmplă. Rezolvăm noi cumva.",
+      "chunks_sha256": "3e5b3aa222381d58da3ce206b10318b353e5e22afb471a0fce9f8d8e155ad857",
+      "language": "ro"
+    },
+    {
+      "id": "008",
+      "input": "Păi... da. Adică, nu chiar. E puțin mai complicat decât pare.",
+      "chunks_sha256": "7c3792de5b0cb82fb3e2abb91a497c7bda921f174cd93054cc9a0a0263fda16a",
+      "language": "ro"
+    },
+    {
+      "id": "009",
+      "input": "Ăăă... stai să mă gândesc puțin.",
+      "chunks_sha256": "83f2b4961095baab36d587f0a128515155d479374305f834ce927aeefeede3e5",
+      "language": "ro"
+    },
+    {
+      "id": "010",
+      "input": "Hmm... nu sunt sigur.",
+      "chunks_sha256": "7c6fcf2171a036abf86101dfef93f2464f92bd48b7a6d4170abf79b51b88c633",
+      "language": "ro"
+    },
+    {
+      "id": "011",
+      "input": "Păi, sincer să fiu, nu prea știu ce să spun.",
+      "chunks_sha256": "cc9d4994e7b608b3976caab920468c8dc04cc56b7b3c04213f6038b778aafc6c",
+      "language": "ro"
+    },
+    {
+      "id": "012",
+      "input": "Adică... înțelegi ce vreau să spun, nu?",
+      "chunks_sha256": "80feca671cbba669602817e50ffed0b566a0080117b997726e4a23764ab029db",
+      "language": "ro"
+    },
+    {
+      "id": "013",
+      "input": "Mda... cred că ai dreptate.",
+      "chunks_sha256": "2b57d64929c0f90122b765762f6ef99093183f71a937660496633b87ca399c7e",
+      "language": "ro"
+    },
+    {
+      "id": "014",
+      "input": "Aaa, da, da, acum mi-am amintit!",
+      "chunks_sha256": "99fa1f57d54d21667fa805fabb41f098f99adbd64470c46abc40b0951cbc01ec",
+      "language": "ro"
+    },
+    {
+      "id": "015",
+      "input": "Ei bine... să vedem ce putem face.",
+      "chunks_sha256": "2c4f30541d85cdae0d2afcd02c8cbc064bb7e34e2e5ea4220b5bb12be7602375",
+      "language": "ro"
+    },
+    {
+      "id": "016",
+      "input": "Uite... nu vreau să te mint.",
+      "chunks_sha256": "9f0bbaa573cb6ff901034c106c8db1ea1d321d153ce241181d036be01ebb4af2",
+      "language": "ro"
+    },
+    {
+      "id": "017",
+      "input": "Deci... practic, problema e aici.",
+      "chunks_sha256": "83df1d7dadf53a9fda0d5f09545979339a5e2b7831e9803c69c95bf261ad76e5",
+      "language": "ro"
+    },
+    {
+      "id": "018",
+      "input": "Știi ce? Lasă. Vorbim mai târziu.",
+      "chunks_sha256": "e954f5a152db228b1d0ea18dd1a726e335a64166527b80856dfd762e8e495359",
+      "language": "ro"
+    },
+    {
+      "id": "019",
+      "input": "Ha!",
+      "chunks_sha256": "491463b44279d831d07e23a1bf2045035b7ad29a003961099d50931339a60f5b",
+      "language": "ro"
+    },
+    {
+      "id": "020",
+      "input": "Haha!",
+      "chunks_sha256": "d8f24e901348b64425f066ac191491ff45cfc37f3c6a303e3b75bb74d08f5c90",
+      "language": "ro"
+    },
+    {
+      "id": "021",
+      "input": "Hahaha!",
+      "chunks_sha256": "2d4778624de858499607860caf7c6163d19c5ba6ed352b5b3c71de8163c69753",
+      "language": "ro"
+    },
+    {
+      "id": "022",
+      "input": "Hahahaha, nu pot să cred!",
+      "chunks_sha256": "1f7136a1556f0c07f378eef244135448aea5e6b1bac4f9c953467c1aa21bf232",
+      "language": "ro"
+    },
+    {
+      "id": "023",
+      "input": "Ha-ha-ha! Doamne, cât de stupid a fost!",
+      "chunks_sha256": "4c4f32804352326e525ef17965b7cae576ea68b736b3770b585feb62cbef941f",
+      "language": "ro"
+    },
+    {
+      "id": "024",
+      "input": "Mmm... hahaha... scuze, nu trebuia să râd.",
+      "chunks_sha256": "b91dbd4c7e0f896a83ff91118c548465aa2adf340d2e17e7cf7114b8055966fb",
+      "language": "ro"
+    },
+    {
+      "id": "025",
+      "input": "[râde] Nu, serios, chiar ai făcut asta?",
+      "chunks_sha256": "96a342618afae91693e1a0d191bde4f505d0c20069566c72c310e410dfe8a0ce",
+      "language": "ro"
+    },
+    {
+      "id": "026",
+      "input": "[chicotește] Bine, bine, recunosc, ai avut dreptate.",
+      "chunks_sha256": "2f1007f1c3ac2bfd7fbde4cf2ea6761bb7939c74eb6533a27f4df172b7d04643",
+      "language": "ro"
+    },
+    {
+      "id": "027",
+      "input": "Hahaha! Mă doare burta!",
+      "chunks_sha256": "37a64bc3c6aa307080f724c30422a86e08eb4977da22f11148420109824a4d71",
+      "language": "ro"
+    },
+    {
+      "id": "028",
+      "input": "Nu mai pot... hahahaha!",
+      "chunks_sha256": "b07d2db8af3c173e069cec316b9ce713f06db8824653f2dabee16c6eda169380",
+      "language": "ro"
+    },
+    {
+      "id": "029",
+      "input": "*râde* Asta e probabil cea mai proastă idee pe care am auzit-o vreodată.",
+      "chunks_sha256": "2585cba657f2c4d1a357a59d34583af06404f3ddf20f37a2fe5fc6e874c39266",
+      "language": "ro"
+    },
+    {
+      "id": "030",
+      "input": "Hahaha... oh, Doamne... stai puțin să-mi revin.",
+      "chunks_sha256": "319c9606c69da03ec718943df000effaa8d7ec53a2fcd3b38a50247c63ee74f9",
+      "language": "ro"
+    },
+    {
+      "id": "031",
+      "input": "Of... ce zi lungă.",
+      "chunks_sha256": "1376b12400221638a73fcb29b29d5317a4fd12c380926ac8cb80f97ee32052fa",
+      "language": "ro"
+    },
+    {
+      "id": "032",
+      "input": "Pfff... nu-mi vine să cred.",
+      "chunks_sha256": "eec84caa89e03075b71b5db9ecdf890249cff3e272737a955233bfc5eed527be",
+      "language": "ro"
+    },
+    {
+      "id": "033",
+      "input": "Aaaah... în sfârșit!",
+      "chunks_sha256": "cf5ba402d14d0eebb25bc57f790d4130517f87783c714e81ccf318d1fce8e5f8",
+      "language": "ro"
+    },
+    {
+      "id": "034",
+      "input": "Hmm.",
+      "chunks_sha256": "18b248eb6461a261c86554bb7518dbc12aadb13827673021b3901810df1f9381",
+      "language": "ro"
+    },
+    {
+      "id": "035",
+      "input": "Mmm... da, e foarte bun.",
+      "chunks_sha256": "aaccd3725d3503f0e9ecaa35488582c1dd3cc4eb4b8381215db7e7ed8e04b650",
+      "language": "ro"
+    },
+    {
+      "id": "036",
+      "input": "Ăăă...",
+      "chunks_sha256": "4b50bf1d8ee95839c90188f9174543fc8cdf56d57e2ea39ab034a89b9fffc8fb",
+      "language": "ro"
+    },
+    {
+      "id": "037",
+      "input": "Hâc! Hâc! Scuze.",
+      "chunks_sha256": "cd01f88bbe20e92836f7e7963c177c9f2b394a50704981d9ea4fccdd6b36fac9",
+      "language": "ro"
+    },
+    {
+      "id": "038",
+      "input": "Ahem... bună ziua tuturor.",
+      "chunks_sha256": "4761df7ff11fe624236bec3c4165c77f090a0e3c8cb98cf07ef341a16c57afe5",
+      "language": "ro"
+    },
+    {
+      "id": "039",
+      "input": "Pffft... aproape că am vărsat cafeaua.",
+      "chunks_sha256": "7ba51ba73be7b401af3e12f8df66c66cf8fc56b2de34e357fa360477ea460e93",
+      "language": "ro"
+    },
+    {
+      "id": "040",
+      "input": "Ah!",
+      "chunks_sha256": "704704887b6a88cfe08356c09916f0cb3fd50d20c7751c91d1791a9c8c1c3ba3",
+      "language": "ro"
+    },
+    {
+      "id": "041",
+      "input": "Ouch! Asta chiar a durut.",
+      "chunks_sha256": "b1c2e23db933b300b486fb451bc3882bc1a16410868285a76e79048f746079a2",
+      "language": "ro"
+    },
+    {
+      "id": "042",
+      "input": "Uff... am ajuns.",
+      "chunks_sha256": "401c00b21a7e2951d80d261dfa7586452774c9b3c99f778c2244409bc454fffe",
+      "language": "ro"
+    },
+    {
+      "id": "043",
+      "input": "Nu pot să cred! Am reușit!",
+      "chunks_sha256": "86a15fdf03ff9dc077b08d4d0e4e894dbb34f6991b0309d731ee0f713dae0667",
+      "language": "ro"
+    },
+    {
+      "id": "044",
+      "input": "Da! Da! Da! În sfârșit!",
+      "chunks_sha256": "47bab74d7c9d843b73eb8f5e32d3a040879f4fad4d0bd008624e854aef23cc93",
+      "language": "ro"
+    },
+    {
+      "id": "045",
+      "input": "Sunt atât de fericit încât nici nu știu ce să spun.",
+      "chunks_sha256": "889c687888d712ddd3a4c358f67ec2b0b2dd30a4178c9ea69ced567b658ddb3a",
+      "language": "ro"
+    },
+    {
+      "id": "046",
+      "input": "Doamne, e minunat! Chiar nu mă așteptam la asta.",
+      "chunks_sha256": "83eb406896887aa48b3bb9a291d758723e020fe7b97bfbfbe96c4c979c5383bc",
+      "language": "ro"
+    },
+    {
+      "id": "047",
+      "input": "Am primit vestea și am început să zâmbesc instant.",
+      "chunks_sha256": "80e5d0ec844479d80979f811f461a4d19f20beb98ed98beb6acea807b7c36a18",
+      "language": "ro"
+    },
+    {
+      "id": "048",
+      "input": "Astăzi e una dintre cele mai bune zile din viața mea.",
+      "chunks_sha256": "15fc2f952fab71e22631a8221db29059b5e553abae57afbbac232852ef001baa",
+      "language": "ro"
+    },
+    {
+      "id": "049",
+      "input": "Nu știu ce să mai spun... pur și simplu mă doare.",
+      "chunks_sha256": "bfe48a7b0b50fc861383e642e837105128f93ab8773d79fda96061df116fa7a1",
+      "language": "ro"
+    },
+    {
+      "id": "050",
+      "input": "Credeam că lucrurile vor fi diferite.",
+      "chunks_sha256": "ef1179c5eaeca14a8e5732873d56fe3da0f67fbf5dd322b5daa700f78960d0cc",
+      "language": "ro"
+    },
+    {
+      "id": "051",
+      "input": "Mi-aș fi dorit să mai avem puțin timp.",
+      "chunks_sha256": "df75423543adccf5f1f462273ab563b0736b32350d943638c793a72f0b3f4f19",
+      "language": "ro"
+    },
+    {
+      "id": "052",
+      "input": "E trist când realizezi că unele lucruri nu se mai pot întoarce.",
+      "chunks_sha256": "07806cea27843f9f68638cef6eaaeeb2310a8edb6c19c1ad1727ce6196c9607e",
+      "language": "ro"
+    },
+    {
+      "id": "053",
+      "input": "Nu vreau să plec, dar cred că trebuie.",
+      "chunks_sha256": "0f3ca463b4d0c347f480e368fa06216a02de7cec67235ded8c2a88d13d6fd976",
+      "language": "ro"
+    },
+    {
+      "id": "054",
+      "input": "Ajunge! M-am săturat să repet același lucru.",
+      "chunks_sha256": "f41a066dedb01db6be127b4afe02ae5cd4eb12c48e4c0f8545c7c7f303ac0a67",
+      "language": "ro"
+    },
+    {
+      "id": "055",
+      "input": "Nu, nu este în regulă. Știi foarte bine că nu este în regulă.",
+      "chunks_sha256": "ac9bf52e4b69471502ed68f684a3954afdb16c4bad054caa3452c40c4a581ed8",
+      "language": "ro"
+    },
+    {
+      "id": "056",
+      "input": "Cum ai putut să faci asta fără să-mi spui?",
+      "chunks_sha256": "1136a485a1431e5e5722b2d920d51e83da8bfd1660b49101d95b8c5238c7f4c2",
+      "language": "ro"
+    },
+    {
+      "id": "057",
+      "input": "Ți-am spus de trei ori să nu faci asta!",
+      "chunks_sha256": "452ee14bbbd4f5a8e0980ca97bc9fccd90e2943384e3e232a0264ffe12433a4e",
+      "language": "ro"
+    },
+    {
+      "id": "058",
+      "input": "Nu mai ridica vocea la mine.",
+      "chunks_sha256": "0d3564d745b34766b0444cdfa74573f59e03c9ce7d6155db72d48c48396dd421",
+      "language": "ro"
+    },
+    {
+      "id": "059",
+      "input": "Stai... ai auzit și tu zgomotul ăla?",
+      "chunks_sha256": "b03537163977a5a6000dd8bb88448fee653909cced059365712622cc4c162d98",
+      "language": "ro"
+    },
+    {
+      "id": "060",
+      "input": "Nu te mișca. Cred că e cineva acolo.",
+      "chunks_sha256": "9d40fbba863a3b1450a30d8f0a905908177f8fc3e8ad6968c70d09c295028cba",
+      "language": "ro"
+    },
+    {
+      "id": "061",
+      "input": "Respiră încet. Totul va fi bine.",
+      "chunks_sha256": "d064033c3f911d996f88702050f25a394df53d71edc43506bf6eb3eee4748541",
+      "language": "ro"
+    },
+    {
+      "id": "062",
+      "input": "Nu știu unde suntem și telefonul nu mai are semnal.",
+      "chunks_sha256": "3bdefc05b8b0a88906dbeb96801ea1cbe9caea850f464656247e3eb7e3940229",
+      "language": "ro"
+    },
+    {
+      "id": "063",
+      "input": "Așteaptă... cred că aud pași.",
+      "chunks_sha256": "60a158f52c4869028ac94a021bd948fdfe3d08134cf17636afb0fa6f0c50d41e",
+      "language": "ro"
+    },
+    {
+      "id": "064",
+      "input": "Trebuie să plecăm. Acum.",
+      "chunks_sha256": "78995690ff754360b4dfcb5d1cfab2f95fd2851b9ee5e635e1303c36067279ff",
+      "language": "ro"
+    },
+    {
+      "id": "065",
+      "input": "Ce?! Serios?",
+      "chunks_sha256": "eebd4621cbecbb57183364faba1b6a92dd54ec9d0f97ce802fe16620707a1689",
+      "language": "ro"
+    },
+    {
+      "id": "066",
+      "input": "Stai, stai, stai... ce ai spus?",
+      "chunks_sha256": "c66f979325db1f3ec1c79eafeedf77097255c5459823b8358252d8449505e584",
+      "language": "ro"
+    },
+    {
+      "id": "067",
+      "input": "Nu pot să cred că ai făcut asta!",
+      "chunks_sha256": "65b779a7720965c22e35183189abcd32c4a1b3d3d17cc78e5a88ad67d898839f",
+      "language": "ro"
+    },
+    {
+      "id": "068",
+      "input": "Poftim?! Nu mă așteptam deloc.",
+      "chunks_sha256": "68701f5476291cae78cfeeee78fddef292165a9fee1ec8c9d03d9c5924388749",
+      "language": "ro"
+    },
+    {
+      "id": "069",
+      "input": "Vai! De unde ai apărut?",
+      "chunks_sha256": "a1649d26c5b54bc34f05454af875df46dc43e8728653510287d39679bc00e947",
+      "language": "ro"
+    },
+    {
+      "id": "070",
+      "input": "Șșș... vorbește mai încet.",
+      "chunks_sha256": "7c8e0f8a6007351c2399c111e294b68a15764aa7d7925e33b0ef74c50162adf0",
+      "language": "ro"
+    },
+    {
+      "id": "071",
+      "input": "Nu spune nimănui, bine?",
+      "chunks_sha256": "4c724ec296fa00abc8419f49c5471fb5e20abd743da69f4931a23babbbb3ba34",
+      "language": "ro"
+    },
+    {
+      "id": "072",
+      "input": "Cred că doarme. Hai să plecăm încet.",
+      "chunks_sha256": "3047e2f664d95db1763979577651f5ddc4e1db442ec4605290a8a38b7691d1ba",
+      "language": "ro"
+    },
+    {
+      "id": "073",
+      "input": "Vino aici... am ceva să-ți spun.",
+      "chunks_sha256": "44e54f9fafc79bf9ca2be66d1a829716c74707c986beaaa2f3bc30888e323fc7",
+      "language": "ro"
+    },
+    {
+      "id": "074",
+      "input": "Nu vreau să ne audă nimeni.",
+      "chunks_sha256": "7a88fde21658ba694d47710b2bcbec4a7f32dcbe923edf4dfeb53e0f297bf670",
+      "language": "ro"
+    },
+    {
+      "id": "075",
+      "input": "Hei! Așteaptă-mă!",
+      "chunks_sha256": "96d03af303b4998376a456243259ffb47fd1e00b574e34cbdec88a90c8ef2e46",
+      "language": "ro"
+    },
+    {
+      "id": "076",
+      "input": "OPREȘTE-TE!",
+      "chunks_sha256": "35b6b994945ea2c52ee9d3aef656d59c8270c29450baa9eaea322634a9f12591",
+      "language": "ro"
+    },
+    {
+      "id": "077",
+      "input": "Nu pleca!",
+      "chunks_sha256": "a9699f89c057e469960bcd246ce66baec91b01ce08df7cc73403e64c270ba125",
+      "language": "ro"
+    },
+    {
+      "id": "078",
+      "input": "Atenție! Vine trenul!",
+      "chunks_sha256": "48cafc28b5aad339ec82619451abbd3399e85de2bccf0de4da373c4f2e3c89e9",
+      "language": "ro"
+    },
+    {
+      "id": "079",
+      "input": "Mă auzi?! Sunt aici!",
+      "chunks_sha256": "365e6ec173703094576831efc9a6a4095f23c08ee1478ef02c2f493be98c2f2a",
+      "language": "ro"
+    },
+    {
+      "id": "080",
+      "input": "Unde mergem?",
+      "chunks_sha256": "9b8b2725f9f444f85ed77fdabc1bd3042138e1b1e4a01a9981e4e24068fad557",
+      "language": "ro"
+    },
+    {
+      "id": "081",
+      "input": "Cât costă?",
+      "chunks_sha256": "ad869312f528a6f11ec45136db72e38fa16aa04b23e673eb8956117ac05c4f19",
+      "language": "ro"
+    },
+    {
+      "id": "082",
+      "input": "La ce oră începe?",
+      "chunks_sha256": "add456dd60af9fcbe81eb4983cd135d7e18d2277774d02d6ae150ee89128861f",
+      "language": "ro"
+    },
+    {
+      "id": "083",
+      "input": "De ce ai făcut asta?",
+      "chunks_sha256": "56d9b4df670dbeeaaf4da4d4d47559ae4399c3484e701798274174cb823292a3",
+      "language": "ro"
+    },
+    {
+      "id": "084",
+      "input": "Chiar crezi că este o idee bună?",
+      "chunks_sha256": "47876aae0d07ab7f3326454de99632250258ee9a18caac3bd84f290a3c06ca0a",
+      "language": "ro"
+    },
+    {
+      "id": "085",
+      "input": "Cine ți-a spus asta?",
+      "chunks_sha256": "757ce4062d20fe45f30b0d6b5f29a76892bd5d182d2c5cda1a90192affc26963",
+      "language": "ro"
+    },
+    {
+      "id": "086",
+      "input": "Ce se întâmplă dacă apăs aici?",
+      "chunks_sha256": "5c8edba7300b977bdeb3e0152e2eb060c3163edc222ccadc497048e1ae28825b",
+      "language": "ro"
+    },
+    {
+      "id": "087",
+      "input": "Și acum ce facem?",
+      "chunks_sha256": "bea3f006493dbf2932672f046c57cfd87c5ca1e4973ca7494ab0c67d31d38c57",
+      "language": "ro"
+    },
+    {
+      "id": "088",
+      "input": "Ai mâncat?",
+      "chunks_sha256": "699e3a48c9e32f5e92d244ebedba059026c052db23ebb9d8505d038592153c4c",
+      "language": "ro"
+    },
+    {
+      "id": "089",
+      "input": "Vii cu noi sau rămâi aici?",
+      "chunks_sha256": "3284c3b1401550bba8ca2077296442ebd4b42441c3460a3ea85d1cb5b5da8cc7",
+      "language": "ro"
+    },
+    {
+      "id": "090",
+      "input": "Ce frumos!",
+      "chunks_sha256": "8c360d745154b9270c624e7ce8006ecece36da4fcdd210a8ce68c8f5eedcfa9a",
+      "language": "ro"
+    },
+    {
+      "id": "091",
+      "input": "Ce nebunie!",
+      "chunks_sha256": "c89858dc501d025c137ff8fb18df4aee678b903118067f5539fe9429a204bb5d",
+      "language": "ro"
+    },
+    {
+      "id": "092",
+      "input": "Incredibil!",
+      "chunks_sha256": "0a02e4fba4adf86d274a3335087d4010440329b8978adf703df7eeaaa712e265",
+      "language": "ro"
+    },
+    {
+      "id": "093",
+      "input": "Perfect!",
+      "chunks_sha256": "04374e24655004b04bc7f41bd4c3dea1dbb7b2ec6c4d39e62b316fd168ea169c",
+      "language": "ro"
+    },
+    {
+      "id": "094",
+      "input": "Extraordinar!",
+      "chunks_sha256": "e88b4c2d92d4afa5e177c65e23e71c5b852223e16508a4652c6c0367d1ad0f1e",
+      "language": "ro"
+    },
+    {
+      "id": "095",
+      "input": "Nu se poate!",
+      "chunks_sha256": "401db04df9229ddc70bfe9e5250b325a270d0924d7a23664d9aa32ea98093204",
+      "language": "ro"
+    },
+    {
+      "id": "096",
+      "input": "Asta-i culmea!",
+      "chunks_sha256": "bcc9eb863184fe75042e12ae2ec33193082b2693467bb1048f1061dc864b2f74",
+      "language": "ro"
+    },
+    {
+      "id": "097",
+      "input": "Doamne!",
+      "chunks_sha256": "fc380b6231420746490aab702e2a931ec4c8b7d227b818e89a440d627d924ede",
+      "language": "ro"
+    },
+    {
+      "id": "098",
+      "input": "Am douăzeci și trei de mere.",
+      "chunks_sha256": "2d3b63631e9c7cc912beed494ba33a8901efbd44c22891c7c27b71f8b298dadd",
+      "language": "ro"
+    },
+    {
+      "id": "099",
+      "input": "În cameră sunt o sută patruzeci și șapte de persoane.",
+      "chunks_sha256": "c5024d638fccfe752dd7f12c5f00468d00955617f4078bc3bff6e00cfe79b342",
+      "language": "ro"
+    },
+    {
+      "id": "100",
+      "input": "Am economisit două mii cinci sute de lei.",
+      "chunks_sha256": "0f70b0895f3f1ed029b07857d8e46b7024e1dfe36ac698989315ef79c7e22e9f",
+      "language": "ro"
+    },
+    {
+      "id": "101",
+      "input": "Orașul are aproximativ un milion opt sute de mii de locuitori.",
+      "chunks_sha256": "d163699f59743d2e109c7576d7487c9486cad4c098848956940441c6578acc27",
+      "language": "ro"
+    },
+    {
+      "id": "102",
+      "input": "Au fost procesate trei milioane patru sute douăzeci și șapte de mii de cereri.",
+      "chunks_sha256": "bb5d613b791660d79ea97ea4180b66cb182c0c2d6cf2720ab1f1f3ff2a6cfc18",
+      "language": "ro"
+    },
+    {
+      "id": "103",
+      "input": "1, 11, 111, 1.111, 11.111, 111.111, 1.111.111.",
+      "chunks_sha256": "24f23b535efecd94a496aecdc868e60bb104afe155b1b51b9a8254ac713ef62d",
+      "language": "ro"
+    },
+    {
+      "id": "104",
+      "input": "27, 72, 207, 270, 2.027 și 20.702.",
+      "chunks_sha256": "61a0651393999fe1f40f6c8c1d1ee86b98e19e6892b969b9cf6d3c6c8fdc6ab1",
+      "language": "ro"
+    },
+    {
+      "id": "105",
+      "input": "99, 999, 9.999, 99.999 și 999.999.",
+      "chunks_sha256": "268e9071509b34dd1a8726fd83ee05ba3b1bda74ea379c81b8a40ac4972b664f",
+      "language": "ro"
+    },
+    {
+      "id": "106",
+      "input": "1.234.567,89 lei.",
+      "chunks_sha256": "3a3640639aa723109ec9bb4ac695f6d1946aef82b639886b1ec9191d00d65837",
+      "language": "ro"
+    },
+    {
+      "id": "107",
+      "input": "0,5 litri.",
+      "chunks_sha256": "70ddf7a7ca50f9e5482ddc5eaafd3e5622dbbaafeae9cd8bb73f1ace3a7f98c9",
+      "language": "ro"
+    },
+    {
+      "id": "108",
+      "input": "0,01%.",
+      "chunks_sha256": "58eea127e58f5f5055c7be73f0dda257492f1031e822408e313a76289bc6ebe6",
+      "language": "ro"
+    },
+    {
+      "id": "109",
+      "input": "99,99%.",
+      "chunks_sha256": "1d5143d78860f1a1df788a2e50a83581f6a0d848266c1a1395b6f4ca55da3b85",
+      "language": "ro"
+    },
+    {
+      "id": "110",
+      "input": "Produsul costă 49 de lei și 99 de bani.",
+      "chunks_sha256": "f7c556f6aa537e443ed121ce2f2ccae276fd19316e8cd69705479536ca7f7e20",
+      "language": "ro"
+    },
+    {
+      "id": "111",
+      "input": "Am plătit 1.250 de lei.",
+      "chunks_sha256": "42c9b1a013cb6c1a9f437b0ae377d8e6abc153a11e7c5df5bf91bb56166dd1c0",
+      "language": "ro"
+    },
+    {
+      "id": "112",
+      "input": "Prețul inițial era de 2.499 de lei, dar acum este redus la 1.799 de lei.",
+      "chunks_sha256": "bb398064c0eba9ca94c21a97d905c0ca907e8754be7cbb7f11e7c8f8822357ab",
+      "language": "ro"
+    },
+    {
+      "id": "113",
+      "input": "Abonamentul costă 9,99 euro pe lună.",
+      "chunks_sha256": "b57b117929d0b9876728d97d309c53e5afbbdeef471477e9013bc2563fb2d9db",
+      "language": "ro"
+    },
+    {
+      "id": "114",
+      "input": "Factura totală este de 347,50 lei.",
+      "chunks_sha256": "f5ed95c1fff4541865db763871710ce2c8a128beefc83439d88a40136afcee86",
+      "language": "ro"
+    },
+    {
+      "id": "115",
+      "input": "Ai primit o reducere de 15%.",
+      "chunks_sha256": "f9232ce9f50e2e643b416242f72c435c114c928cfe84023ebb057726c7d3d38a",
+      "language": "ro"
+    },
+    {
+      "id": "116",
+      "input": "Astăzi este 27 august 2026.",
+      "chunks_sha256": "c468edcdeac3e2f666487dd045cddbc833390d8fbce5827b31d072f7e27f09aa",
+      "language": "ro"
+    },
+    {
+      "id": "117",
+      "input": "M-am născut pe 14 februarie 2000.",
+      "chunks_sha256": "8c03989aff436fde3a2cfc0c68c8480cee8239a4b022dc4c9ebe468ead65b5cb",
+      "language": "ro"
+    },
+    {
+      "id": "118",
+      "input": "Ne vedem luni, 31 august.",
+      "chunks_sha256": "f942ed873c42102d72e74c8c69bc6eb45d7d5506ba8700eb921bfa40c1ed227f",
+      "language": "ro"
+    },
+    {
+      "id": "119",
+      "input": "Evenimentul are loc între 3 și 7 septembrie 2026.",
+      "chunks_sha256": "ba350a86264629783254c33faae15ace40eadba4f5e54d2618789a8c092f19e6",
+      "language": "ro"
+    },
+    {
+      "id": "120",
+      "input": "Primul ianuarie este întotdeauna o zi interesantă.",
+      "chunks_sha256": "1d7a6653a0ad573ae6c95d42508dfde6a4d4ae9d9b7ecc3f22d4dbdddbd305ce",
+      "language": "ro"
+    },
+    {
+      "id": "121",
+      "input": "Pe 24 ianuarie sărbătorim Unirea Principatelor Române.",
+      "chunks_sha256": "4435b8107ceee311acb566b2d0326a9767196b8cbb67ec5bfc7f8d1bd75d7fa8",
+      "language": "ro"
+    },
+    {
+      "id": "122",
+      "input": "Este ora unu și douăzeci și cinci.",
+      "chunks_sha256": "73f4c38b05323e72751d55a84e65ab27490dff202ff61b47359c608d91528343",
+      "language": "ro"
+    },
+    {
+      "id": "123",
+      "input": "Ne vedem la ora șapte și jumătate.",
+      "chunks_sha256": "78d4ea65b7bfdc750a6acef6aa5c7dfae725cabddba7f42e8c4d0b18e0315335",
+      "language": "ro"
+    },
+    {
+      "id": "124",
+      "input": "Trenul pleacă la paisprezece și treizeci și cinci.",
+      "chunks_sha256": "30f71bd2764d41340ce9a859b45da31ca710809188830519293f74a25303bb96",
+      "language": "ro"
+    },
+    {
+      "id": "125",
+      "input": "Am așteptat două ore și patruzeci și șapte de minute.",
+      "chunks_sha256": "7747080dcb6c30697487f3803b4963b078cda8abc748a8fa9e644f153442da5b",
+      "language": "ro"
+    },
+    {
+      "id": "126",
+      "input": "Ajung în aproximativ cinci minute.",
+      "chunks_sha256": "d452115c0c03da7b8680f2cd15faded541c612d3af24916af0f1fa4610112a40",
+      "language": "ro"
+    },
+    {
+      "id": "127",
+      "input": "Ne auzim peste o jumătate de oră.",
+      "chunks_sha256": "e94ee89e792db300888ab7ce8cf0a9181f631d5705e57054337c7fa80a3c587b",
+      "language": "ro"
+    },
+    {
+      "id": "128",
+      "input": "Ne vedem mâine la 07:30, iar ședința se termină la 09:15.",
+      "chunks_sha256": "6d2fd7c58a67e177c67b0f3ead78131b40d5fd02d20c1787ed5a4864a71afd0d",
+      "language": "ro"
+    },
+    {
+      "id": "129",
+      "input": "Numărul meu este zero șapte două trei, patru cinci șase, șapte opt nouă.",
+      "chunks_sha256": "c021f7d213b88191d8521484eb9052d7efc44f2c29c7a5d6db923ced1135664e",
+      "language": "ro"
+    },
+    {
+      "id": "130",
+      "input": "Codul este 482917.",
+      "chunks_sha256": "25c2c8221184aa17cb6c99e46f91eaee5a9aab49cd92d9311167cea336fc36d1",
+      "language": "ro"
+    },
+    {
+      "id": "131",
+      "input": "Introdu codul 7-4-9-2-1.",
+      "chunks_sha256": "356c1271c6429bdca102389f2d56dcf06a308cf47bfce88cabdb8bde85a6b7ce",
+      "language": "ro"
+    },
+    {
+      "id": "132",
+      "input": "Numărul comenzii este RO-284719-X.",
+      "chunks_sha256": "bca9042e036944e335ae53020bcdfdcd216348f858d218f7b8a1c50e68d069de",
+      "language": "ro"
+    },
+    {
+      "id": "133",
+      "input": "Codul de verificare este 391 847.",
+      "chunks_sha256": "a53fcc51b04e731b3353bca1091f96542c3d130acc223075d88484069c601d56",
+      "language": "ro"
+    },
+    {
+      "id": "134",
+      "input": "Sună la +40 723 456 789, iar dacă nu răspunde, la +40 744 111 222.",
+      "chunks_sha256": "51ee26831e4d68b72fea7d1c9a805e72d2050719dbf34c0bb1609d005dbdac04",
+      "language": "ro"
+    },
+    {
+      "id": "135",
+      "input": "Locuiesc pe strada Mihai Eminescu, numărul 24.",
+      "chunks_sha256": "3a450c6a057b91b6d76ffa8783d424e463fd2dc3022decdf8679327e5066db6f",
+      "language": "ro"
+    },
+    {
+      "id": "136",
+      "input": "Ne vedem pe Șoseaua București-Ploiești, numărul 15.",
+      "chunks_sha256": "b3869afb2debcee18ac1bb15748628a4b57f9445e54d404448ad9415ed7af609",
+      "language": "ro"
+    },
+    {
+      "id": "137",
+      "input": "Adresa este Strada Victoriei 42, București.",
+      "chunks_sha256": "d0031441dd500f9f10fc1fbbdf196efefb254ca2e9c2214f5870b005e18a67e0",
+      "language": "ro"
+    },
+    {
+      "id": "138",
+      "input": "Apartamentul este la etajul șase, numărul 24.",
+      "chunks_sha256": "7db4b80e7000dc80ca4bc0817ae859976d2cde682d159acbdee030b01cba9ee1",
+      "language": "ro"
+    },
+    {
+      "id": "139",
+      "input": "Biroul s-a mutat pe bd. Unirii nr. 24, et. 3, ap. 12, într-un spațiu de 80 mp construit în sec. XX.",
+      "chunks_sha256": "303f7f87132ced48aaaedafc685de8c5d24a9a0fe9d9ba5e3de0d39c018dcc21",
+      "language": "ro"
+    },
+    {
+      "id": "140",
+      "input": "București, Brașov, Cluj-Napoca, Iași, Constanța, Sibiu, Craiova, Oradea și Timișoara.",
+      "chunks_sha256": "caa3dad42514592169c6dcfd203f7683007ab2658eec6583f50e03348307583e",
+      "language": "ro"
+    },
+    {
+      "id": "141",
+      "input": "Am mers din București până la Brașov, apoi am continuat spre Sibiu.",
+      "chunks_sha256": "038e3382e3c752e053a99cbd4a3be94d5b86210fe91184973a31e07b261e2017",
+      "language": "ro"
+    },
+    {
+      "id": "142",
+      "input": "Delta Dunării este unul dintre cele mai interesante locuri din România.",
+      "chunks_sha256": "d110f6a5a291f28be7f250f6340106595bfabd01eb5aba70ee2a3a53cdb5d1c2",
+      "language": "ro"
+    },
+    {
+      "id": "143",
+      "input": "Am traversat Carpații și am ajuns în Transilvania.",
+      "chunks_sha256": "ea62dc65abaee00f4536ab35c966a3ee9d6bb6a95930808155152ff93ddb1d1d",
+      "language": "ro"
+    },
+    {
+      "id": "144",
+      "input": "Din Târgu Jiu am plecat spre Râmnicu Vâlcea, apoi spre Drobeta-Turnu Severin.",
+      "chunks_sha256": "473379e24f2a1bbd20fcf8012811ce92ef3bee0c0361091aa3276dc04611a002",
+      "language": "ro"
+    },
+    {
+      "id": "145",
+      "input": "Șase sași în șase saci.",
+      "chunks_sha256": "681c69be2d4145218d3ee239112049466c9b00315eb28263ad153b59bb012422",
+      "language": "ro"
+    },
+    {
+      "id": "146",
+      "input": "Șapte șoareci șuierau și șopteau sub șură.",
+      "chunks_sha256": "e4fdcdb2e477c363f9cef607a47b969773543aee8c1422c81ce2cbbe26f1efce",
+      "language": "ro"
+    },
+    {
+      "id": "147",
+      "input": "Țăranul ține țapul în țarc.",
+      "chunks_sha256": "2f83f92158ec37f98e08955e7736f9be213b541628912a5fb93370e2ca6e217c",
+      "language": "ro"
+    },
+    {
+      "id": "148",
+      "input": "Cinci ciocârlii cântă ciripituri ciudate.",
+      "chunks_sha256": "f83ab43092e78c34979deb6615b99fd3a35c8113e12409764e7d6394318b463b",
+      "language": "ro"
+    },
+    {
+      "id": "149",
+      "input": "George și Gheorghe gătesc ghiveci și gogoși.",
+      "chunks_sha256": "8dd88166dc13790da1a17487171534db408bd6e24cd0945892438b7e141b4cc9",
+      "language": "ro"
+    },
+    {
+      "id": "150",
+      "input": "Ceaiul este fierbinte, iar ceașca este foarte mică.",
+      "chunks_sha256": "19a0b86524a68c14ce5a3faa4063e275b3f6df85be2310371fcf72e3bb31ae53",
+      "language": "ro"
+    },
+    {
+      "id": "151",
+      "input": "Chiar crezi că această chestiune chiar contează?",
+      "chunks_sha256": "bb0ce815dd7a0c407948028bd262ad8eeb3b9da8f77b64f28c12a84bf5d27839",
+      "language": "ro"
+    },
+    {
+      "id": "152",
+      "input": "ă â î ș ț",
+      "chunks_sha256": "ace1bb21f85edef817b2f8c0dce15b9f414a441e1341032e1926c614ced21ec4",
+      "language": "ro"
+    },
+    {
+      "id": "153",
+      "input": "Ă, Â, Î, Ș, Ț.",
+      "chunks_sha256": "b3ed2c950806ffef7f1ffaea6cc2782c8eff28ad08e79d5fe8ad4a46518da790",
+      "language": "ro"
+    },
+    {
+      "id": "154",
+      "input": "fată, mână, pâine, câine, țară, școală, înțelegere, știință.",
+      "chunks_sha256": "b2fc48ebf8a4b5630b8b89ea210f325b5a63d3445659bf63f3ed8a145db273d7",
+      "language": "ro"
+    },
+    {
+      "id": "155",
+      "input": "În România, diacriticele schimbă uneori complet aspectul și pronunția unui cuvânt.",
+      "chunks_sha256": "49467e7763110764544577c7775f8574ee995b0aac23602d43cfc7c3ba77a45d",
+      "language": "ro"
+    },
+    {
+      "id": "156",
+      "input": "Într-o zi însorită, ţăranul înţelept a înţeles că şarpele stătea în iarbă şi tăcea.",
+      "chunks_sha256": "e618da73b9fd5befd054f75c80c5e8beb938e04284f283426f528c525b4b6345",
+      "language": "ro"
+    },
+    {
+      "id": "157",
+      "input": "Sunt student la ASE.",
+      "chunks_sha256": "1caccb233cb62feb84ea703d2197262ff7b8f4315bc86eadf9e578c8fef29570",
+      "language": "ro"
+    },
+    {
+      "id": "158",
+      "input": "Lucrez în domeniul IT.",
+      "chunks_sha256": "48043174ea554c7618272f3b4e4538284196727c272c4e52cc2c530240051dd8",
+      "language": "ro"
+    },
+    {
+      "id": "159",
+      "input": "Am trimis documentele către ANAF.",
+      "chunks_sha256": "77bdf34e7a3b2063992de09d728872ac00dedcaf30734fa97fe8e321c33c6d80",
+      "language": "ro"
+    },
+    {
+      "id": "160",
+      "input": "Am primit un mesaj de la ANAF și unul de la CNAS.",
+      "chunks_sha256": "d41611cc45081e362b9857ac23aa1ceefb65f3b0d83dc473626feef28715a842",
+      "language": "ro"
+    },
+    {
+      "id": "161",
+      "input": "UE, SUA, NATO și ONU au apărut în aceeași știre.",
+      "chunks_sha256": "08457c32f8b313928a0166467618eb79407e35e983f56cc125b5b52e89353373",
+      "language": "ro"
+    },
+    {
+      "id": "162",
+      "input": "Departamentul HR mi-a trimis contractul.",
+      "chunks_sha256": "9c14f7cf525bc1441d304955a62e89c6a15e9a2811929553a01f9cb2668f21b7",
+      "language": "ro"
+    },
+    {
+      "id": "163",
+      "input": "Am nevoie de un document PDF și de o versiune DOCX.",
+      "chunks_sha256": "a5e185c47ec078a7b86265e035ee1e378d1938744d31ce8b6ea1c2379c0c7e5b",
+      "language": "ro"
+    },
+    {
+      "id": "164",
+      "input": "Firma SRL cu CUI 12345678 este plătitoare de TVA și are contul deschis la BCR.",
+      "chunks_sha256": "9aa482e5c1f4cc583bb76a9f6da68cb6975fa85a5d9fba7976a9dda815261123",
+      "language": "ro"
+    },
+    {
+      "id": "165",
+      "input": "Intră pe www.exemplu.ro și apasă pe butonul «Autentificare».",
+      "chunks_sha256": "8a006b7e285b6b91a8282d62d146e70fed5da07161ae0310c61dfcfdd3fedfa3",
+      "language": "ro"
+    },
+    {
+      "id": "166",
+      "input": "Adresa mea de email este test, arroba, exemplu, punct, ro.",
+      "chunks_sha256": "b618966ff82638671d1a47e74d75d513662dd763791923cfae309ea55a2a7556",
+      "language": "ro"
+    },
+    {
+      "id": "167",
+      "input": "Site-ul folosește HTTPS și autentificare în doi pași.",
+      "chunks_sha256": "9149a825fe3ceae5669b049c2fdd4f259004be1b25eb9247ffceb3ea249fb714",
+      "language": "ro"
+    },
+    {
+      "id": "168",
+      "input": "API-ul returnează un răspuns JSON.",
+      "chunks_sha256": "7327fb797847354847173e8174417100b775726ba28a7960be6f5e7b34f7185b",
+      "language": "ro"
+    },
+    {
+      "id": "169",
+      "input": "Serverul rulează pe Linux și folosește Python.",
+      "chunks_sha256": "6a5d7e7ced59bdd9d600d5754326e8ccdb2f427149d4a4c55cba611fcb96827c",
+      "language": "ro"
+    },
+    {
+      "id": "170",
+      "input": "Linkul era https://exemplu.ro/confirmare?id=482917, iar codul meu este 739204.",
+      "chunks_sha256": "d290aef277a18869691e3bf30cc5802bd270a966afb0b6e729f06544a87384bb",
+      "language": "ro"
+    },
+    {
+      "id": "171",
+      "input": "Am terminat meeting-ul și acum trebuie să fac follow-up.",
+      "chunks_sha256": "8a7e2b5271514a199fbbf2ae59c8bf125482d42d3947ef2b660ac671c43ab869",
+      "language": "ro"
+    },
+    {
+      "id": "172",
+      "input": "Poți să-mi dai un quick update?",
+      "chunks_sha256": "e95aecba477c8152e9684131c41e89af29123fcd518ce1c457890c4178d937b6",
+      "language": "ro"
+    },
+    {
+      "id": "173",
+      "input": "Am făcut deploy-ul aseară, dar avem o problemă cu serverul.",
+      "chunks_sha256": "1b84206735d0568d28f5d3465d65eb4f2f2821ea34408676bf6af9e14eed6209",
+      "language": "ro"
+    },
+    {
+      "id": "174",
+      "input": "Asta nu este un bug, este un feature.",
+      "chunks_sha256": "ab22230b32132720549436cec5eaeb6000e2d2f2cad9a9972024a5070d12f26a",
+      "language": "ro"
+    },
+    {
+      "id": "175",
+      "input": "Hai să facem un quick call și rezolvăm.",
+      "chunks_sha256": "cc56bd6981878dc10f1aeea06d4e2e5abf412246c8008a41e7f7cc681d596170",
+      "language": "ro"
+    },
+    {
+      "id": "176",
+      "input": "Am verificat dashboard-ul și toate metrics arată bine.",
+      "chunks_sha256": "4d0853d5aae2d976e5b53903bc7fdd3d17b14f8a36d607daba4b0b59dcdd1f12",
+      "language": "ro"
+    },
+    {
+      "id": "177",
+      "input": "Am nevoie de un feedback sincer.",
+      "chunks_sha256": "063d053fcd66d54264ae8baf595817b55e7fabd9d06516018122e59b57f054f3",
+      "language": "ro"
+    },
+    {
+      "id": "178",
+      "input": "Avem nevoie de un deadline clar.",
+      "chunks_sha256": "5f5880b3fd0a8b8dd74592c925ad0bf5dd46021abf0cab01fdecf561f0727ed6",
+      "language": "ro"
+    },
+    {
+      "id": "179",
+      "input": "Facem un update mâine dimineață.",
+      "chunks_sha256": "3d7d4eaf857855346f592d724b261b6c22673a3650869f37b1ee4da3943bb8a5",
+      "language": "ro"
+    },
+    {
+      "id": "180",
+      "input": "Am trimis un reminder.",
+      "chunks_sha256": "48e6b2333466ab6c24098f79a49663b777c5e59c2b75179061d89356acccdb01",
+      "language": "ro"
+    },
+    {
+      "id": "181",
+      "input": "Trebuie să facem un backup.",
+      "chunks_sha256": "941cc702145b9b602d42738823ae0fcfc2f47d6cc8172471a9725619b73dad4a",
+      "language": "ro"
+    },
+    {
+      "id": "182",
+      "input": "Am uitat parola pentru contul meu.",
+      "chunks_sha256": "8cbc7f7d0e9941c3d4e32108245e00fbb160207547d99fc52d03d311a2cde608",
+      "language": "ro"
+    },
+    {
+      "id": "183",
+      "input": "Aplicația are un onboarding foarte simplu.",
+      "chunks_sha256": "5ec3572cf1e82334c344d3a893c2c82382038c60c05b80dfa88b6701f6d02789",
+      "language": "ro"
+    },
+    {
+      "id": "184",
+      "input": "Am făcut un update la dashboard și am trimis link-ul pe email, dar backup-ul a eșuat.",
+      "chunks_sha256": "867a800273d2d5f0bdff958552aa482c8011b749b37b7e20ac82dd9bab05b5c3",
+      "language": "ro"
+    },
+    {
+      "id": "185",
+      "input": "Bonjour, comment allez-vous?",
+      "chunks_sha256": "8a2974d77de0e73f7fc698fd2cf525f7debde914fc496dcf8e99eb69c02df861",
+      "language": "fr"
+    },
+    {
+      "id": "186",
+      "input": "Merci beaucoup pentru ajutor.",
+      "chunks_sha256": "acab0f5ce51e9645b33c5770a4303ad7915a6bb41bebde9e1bbe2b50a280ae26",
+      "language": "fr"
+    },
+    {
+      "id": "187",
+      "input": "C'est la vie.",
+      "chunks_sha256": "541c11ada7d74beb734b42d54c9c26148cc3e5b84a6e633aaf0028e7a07a3759",
+      "language": "fr"
+    },
+    {
+      "id": "188",
+      "input": "Je ne sais pas.",
+      "chunks_sha256": "e88b9ab4fba987950f15ace48c5d38492abd4b109f523fdb85b90056d162345e",
+      "language": "fr"
+    },
+    {
+      "id": "189",
+      "input": "Au revoir și pe mâine.",
+      "chunks_sha256": "a63d4e66f1a7b9e1be861962fa5e21a6203dfa886edf7e5d8e608a9239e7a6ad",
+      "language": "fr"
+    },
+    {
+      "id": "190",
+      "input": "Ciao, come stai?",
+      "chunks_sha256": "8ba99409269ac06c26ab1b4f2e689f195a65a849b58cfe306cbcd97c0e5a70b4",
+      "language": "it"
+    },
+    {
+      "id": "191",
+      "input": "Grazie mille!",
+      "chunks_sha256": "44d6db4e735eda201812ceec76c76d0a509d17fb3d485a1ea2dd21171b799e80",
+      "language": "it"
+    },
+    {
+      "id": "192",
+      "input": "Buona sera!",
+      "chunks_sha256": "9c4a35944dc4f2394b8c926cb9b864da63c534300c850c6dd65c4557794ce918",
+      "language": "it"
+    },
+    {
+      "id": "193",
+      "input": "Mamma mia, ce zi!",
+      "chunks_sha256": "6a05045a51fa1aef7255eaf762ec9c531adad4a9f7f53370c287ccc65e2b7680",
+      "language": "it"
+    },
+    {
+      "id": "194",
+      "input": "Andiamo!",
+      "chunks_sha256": "0625ae02e09161e9f6212386fd35d452414e8cf614aa003b732de0b93732f1ed",
+      "language": "it"
+    },
+    {
+      "id": "195",
+      "input": "Hola, ¿cómo estás?",
+      "chunks_sha256": "5c0dc32cc26c4bef0e3bb63164452aa28fda0691e4688dfe968ff486597235e2",
+      "language": "es"
+    },
+    {
+      "id": "196",
+      "input": "Muchas gracias pentru ajutor.",
+      "chunks_sha256": "3208e9fd838b0eaff5fae4a7c5510f1c0ba76e00757eb3142558db5d6dd36fbf",
+      "language": "es"
+    },
+    {
+      "id": "197",
+      "input": "Buenos días!",
+      "chunks_sha256": "ae5a34727ab59dd37b9de20175fe4225311413e8d16e1e4502151693773f6d61",
+      "language": "es"
+    },
+    {
+      "id": "198",
+      "input": "No entiendo.",
+      "chunks_sha256": "947d21eb194bdee1ba0d752d4f473b6ca71708bc5a13a992a877ba203e3379b5",
+      "language": "es"
+    },
+    {
+      "id": "199",
+      "input": "Vamos, tenemos que plecăm acum.",
+      "chunks_sha256": "d315deb1a1eb83af94aeebf00c42fc6f74fa6faa84cc2bfc7673fa89f8499141",
+      "language": "es"
+    },
+    {
+      "id": "200",
+      "input": "Guten Morgen!",
+      "chunks_sha256": "183fa0858d8611087129a98e0c7e51c1b5a291e390d6fe79a036ebfe91877e65",
+      "language": "de"
+    },
+    {
+      "id": "201",
+      "input": "Danke schön!",
+      "chunks_sha256": "aca57dcb33770deeeaa4b0945888556e02ecd02ef0c1c8fb0472596225c2cd18",
+      "language": "de"
+    },
+    {
+      "id": "202",
+      "input": "Wie geht es dir?",
+      "chunks_sha256": "eaf3b3881a4350643314d57d7755f8c73fb91d1fb8184ecfda28461ccd57df79",
+      "language": "de"
+    },
+    {
+      "id": "203",
+      "input": "Ich weiß nicht.",
+      "chunks_sha256": "784845aca895d15997700c83c314b9b8f9e463310e47b87a872117c4e21cbe3c",
+      "language": "de"
+    },
+    {
+      "id": "204",
+      "input": "Das ist unglaublich!",
+      "chunks_sha256": "d6efb565953b2038ef2f178aa3f5825831ae5ab4d9fbf4b892297f03b29f7db1",
+      "language": "de"
+    },
+    {
+      "id": "205",
+      "input": "Γεια σου, τι κάνεις;",
+      "chunks_sha256": "519cc5546fe6ee6bedeeaa0cecc0efefbc8811389e4ce7f7731de78250600196",
+      "language": "el"
+    },
+    {
+      "id": "206",
+      "input": "Καλημέρα!",
+      "chunks_sha256": "47cd4d5ca0b5c7720699b4e4214340850325e2c58d685ab8bcbedebd2826504b",
+      "language": "el"
+    },
+    {
+      "id": "207",
+      "input": "Ευχαριστώ πολύ.",
+      "chunks_sha256": "662b0ee16c352e6aab18decedefd4a529a0993d696c3777ffb13b8e42d855793",
+      "language": "el"
+    },
+    {
+      "id": "208",
+      "input": "Δεν καταλαβαίνω.",
+      "chunks_sha256": "f487454d6d86e68d7e7a36f59ead368a43834164864367c9ae3e3f951459aeb0",
+      "language": "el"
+    },
+    {
+      "id": "209",
+      "input": "Πάμε!",
+      "chunks_sha256": "a33deff8737fd4a73b1f179b1f64bf989371ce8a1faef7cd1a101be7a0c898ca",
+      "language": "el"
+    },
+    {
+      "id": "210",
+      "input": "こんにちは、元気ですか？",
+      "chunks_sha256": "523ee2ae6e906b09852188d35fc0abb2c7650808663b774b79900347e2628fc5",
+      "language": "ja"
+    },
+    {
+      "id": "211",
+      "input": "ありがとう！",
+      "chunks_sha256": "c57c6a1886554e5b075effd7122a63b7faa8d6d3a73608ca88baeeefd766eadf",
+      "language": "ja"
+    },
+    {
+      "id": "212",
+      "input": "おはようございます。",
+      "chunks_sha256": "f587e865fd46019ee5ffd2cda0d8e8861bb6a2fe72606dcac8dc4c99920db693",
+      "language": "ja"
+    },
+    {
+      "id": "213",
+      "input": "すみません。",
+      "chunks_sha256": "c4ff9b1c97f0ca028fb77d5e385e0cbe0ef4cbd44640eb9931e12b15a10d7b39",
+      "language": "ja"
+    },
+    {
+      "id": "214",
+      "input": "また明日。",
+      "chunks_sha256": "d25578eb9f1a8c8addb443f2e4c8a64615f1c6b87e5f4a224f7b6da83acf2bf7",
+      "language": "ja"
+    },
+    {
+      "id": "215",
+      "input": "Am vorbit cu Jean-Pierre despre proiect.",
+      "chunks_sha256": "fb85ec467f0339176798df22a58a9ffe4ff3f6293d212c76d12628c93581b8de",
+      "language": "ro"
+    },
+    {
+      "id": "216",
+      "input": "Maria Fernández locuiește în Madrid.",
+      "chunks_sha256": "5006c8bb5240a39602816e9c8725739006f0e71d474001cb94a413b771e11f2d",
+      "language": "ro"
+    },
+    {
+      "id": "217",
+      "input": "Johann Wolfgang von Goethe a fost un scriitor german.",
+      "chunks_sha256": "0f4da89b9d7f4836bfc281804054e68fd81782e2c56a4585ceaa32c908cd7ef6",
+      "language": "ro"
+    },
+    {
+      "id": "218",
+      "input": "Numele lui este François-Xavier.",
+      "chunks_sha256": "30eff7f3620339837c33722c2b4324e4615d0afae32b63e578356d9a37b8ed2e",
+      "language": "ro"
+    },
+    {
+      "id": "219",
+      "input": "Yuki Tanaka va ajunge mâine.",
+      "chunks_sha256": "203b615c4a91fe4129526b4ddbec3beb73d3c6331daa5f360943b2ff310b46d5",
+      "language": "ro"
+    },
+    {
+      "id": "220",
+      "input": "Filmele cu John Wayne se dădeau duminica după-amiaza, pe vremea aceea.",
+      "chunks_sha256": "2a87f0391d6ffa1e048adf78a41fc26f4e3e0d936cf9dc608b0aed981f87fa7f",
+      "language": "ro"
+    },
+    {
+      "id": "221",
+      "input": "Doamna Ghiorghiță din Târgu Jiu a vorbit cu domnul Șerban de la Mioveni.",
+      "chunks_sha256": "c8408d7891aa25791c745cf3e9460746b26a86e2fed4d1387ccad5ecf6613f55",
+      "language": "ro"
+    },
+    {
+      "id": "222",
+      "input": "Ștefan cel Mare, Mihai Viteazul și Alexandru Ioan Cuza.",
+      "chunks_sha256": "31addfec6aad955d73c466b30e75bcae4c4973e103614eca10fe06b4c1a44c2e",
+      "language": "ro"
+    },
+    {
+      "id": "223",
+      "input": "Anca Ionescu-Vlădescu și Gheorghiță Pârvulescu au semnat contractul.",
+      "chunks_sha256": "878b8b3b0f5627b6b64cad031a5d1264805e951b3b35b5db3a95217c82cac062",
+      "language": "ro"
+    },
+    {
+      "id": "224",
+      "input": "Am cumpărat telefonul de pe Amazon.",
+      "chunks_sha256": "82533bf6dc8d71e5e885ff6356a60404947e0db509417cae699e7c73af87de9a",
+      "language": "ro"
+    },
+    {
+      "id": "225",
+      "input": "Folosesc un MacBook Pro.",
+      "chunks_sha256": "2e757f9fa579369ae4ed29842180e25b337c5780f842154d427ce49a4571ad2a",
+      "language": "ro"
+    },
+    {
+      "id": "226",
+      "input": "Aplicația este găzduită pe Vercel.",
+      "chunks_sha256": "f815b7cc56df281ff12dabebda1bff59aa9489a21133a7b768622c79f6e61404",
+      "language": "ro"
+    },
+    {
+      "id": "227",
+      "input": "Am trimis mesajul pe WhatsApp.",
+      "chunks_sha256": "a5318bacd384b917e40369d7ff67b5740ddc9ee12c0adc2d3ef9a9abfbf00119",
+      "language": "ro"
+    },
+    {
+      "id": "228",
+      "input": "Videoclipul este pe YouTube.",
+      "chunks_sha256": "6f67d4401397d964d27e7481056ad6a23870abe4f1e19cdc749d24e818af102a",
+      "language": "ro"
+    },
+    {
+      "id": "229",
+      "input": "Am comandat produsul de la IKEA și l-am plătit cu Revolut.",
+      "chunks_sha256": "021d04f167dcf734f589710a5e1dc244616bf496b0b06a7d3a483c081dbba014",
+      "language": "ro"
+    },
+    {
+      "id": "230",
+      "input": "AI, API, CPU, GPU, RAM, SSD, USB, HTTP, HTTPS, JSON, XML, SQL, HTML și CSS.",
+      "chunks_sha256": "36930372f4f191b55d68e0e5308377e777c4e911492fb756cdf61c0679f80c8b",
+      "language": "ro"
+    },
+    {
+      "id": "231",
+      "input": "Modelul AI rulează pe GPU și folosește aproximativ 16 GB de VRAM.",
+      "chunks_sha256": "13b33167bb58c27791ed35f59ed0a3bc79d01d12f96f4871860fbd4dcdcede20",
+      "language": "ro"
+    },
+    {
+      "id": "232",
+      "input": "API-ul HTTP returnează JSON.",
+      "chunks_sha256": "83d6d00d417df32145751edecb6ad050d441720a3083440078307c18eda68ce1",
+      "language": "ro"
+    },
+    {
+      "id": "233",
+      "input": "Serios?!",
+      "chunks_sha256": "46f23accf38191556b4dfbd2a8b9e14702d6524981c2a09bcc8eaa1019d6dcd3",
+      "language": "ro"
+    },
+    {
+      "id": "234",
+      "input": "Ce?!",
+      "chunks_sha256": "45e97d4160f69e29ba9dcf8bad9fb00f4bf6313f9dbcb2c37b3e9f23e54e5942",
+      "language": "ro"
+    },
+    {
+      "id": "235",
+      "input": "Nu... nu... nu!",
+      "chunks_sha256": "9bc5c674283811b4753a3cc62b156be1013d71639c3d8ccc5ca13fb4215d01dd",
+      "language": "ro"
+    },
+    {
+      "id": "236",
+      "input": "Așteaptă — ce?",
+      "chunks_sha256": "01ee1a514d271dee5158ed17189c9083003de0c3551a545535e7cd0efdf8abf4",
+      "language": "ro"
+    },
+    {
+      "id": "237",
+      "input": "Bine. Atunci... hai.",
+      "chunks_sha256": "3a1376aefab02670ed89e5e1d6e134c906564b5649ce0de01108e10c729b173b",
+      "language": "ro"
+    },
+    {
+      "id": "238",
+      "input": "Tu ai făcut asta?!",
+      "chunks_sha256": "5085109c5097de67fbd00f29aff0f24f94b0d7e805c2f4c027f5fd575def3a75",
+      "language": "ro"
+    },
+    {
+      "id": "239",
+      "input": "«Nu pleca», mi-a spus ea.",
+      "chunks_sha256": "56f0b522b00eca25613b73eb3387dcc08c7a07b916e1764bf3e11e0eb5253c2b",
+      "language": "ro"
+    },
+    {
+      "id": "240",
+      "input": "El a răspuns: «Nu știu.»",
+      "chunks_sha256": "c487ad5b0afaa2e3b79cd096aaedfea0a492e15423f7c7999f4676146e41a0d3",
+      "language": "ro"
+    },
+    {
+      "id": "241",
+      "input": "Deci... asta este? Atât?",
+      "chunks_sha256": "73191772658dc8c76685bc47f5d26529d3c72ac2f6e8ef5094976c3fed540f36",
+      "language": "ro"
+    },
+    {
+      "id": "242",
+      "input": "Deci... dacă am înțeles bine, tu vrei să plecăm acum? Acum?!",
+      "chunks_sha256": "1971fbdca50fc8a121a33bff124ba7bcf30d95dc5347ed502fdc23b895dc1555",
+      "language": "ro"
+    },
+    {
+      "id": "243",
+      "input": "Temperatura este de 23°C (aproximativ 73°F).",
+      "chunks_sha256": "bcfa6ec71f16bd4c8b8a347f0351c4b27374f80b0911cadc076ba93e96ae5cd1",
+      "language": "ro"
+    },
+    {
+      "id": "244",
+      "input": "Reducerea este de 20% (adică 100 de lei).",
+      "chunks_sha256": "faaeb5725695889b6812cf760fec00c97174980491572a4d83c16d4a9c548254",
+      "language": "ro"
+    },
+    {
+      "id": "245",
+      "input": "Rezultatul este pozitiv (+), nu negativ (-).",
+      "chunks_sha256": "620c64ba576b33d2f521c1b3c10434d01ba6822c16c406953c1b341722a461a7",
+      "language": "ro"
+    },
+    {
+      "id": "246",
+      "input": "Scorul final este 9/10.",
+      "chunks_sha256": "50bad6a9fac0cd2b968a8c212124e44f8b9bd1e81af4666c9541daec02ad2d06",
+      "language": "ro"
+    },
+    {
+      "id": "247",
+      "input": "Formula este x = y + 2.",
+      "chunks_sha256": "17923370f41b6af467992a9f3d2e5c8201a398df403c3ec9e15c6365ae88babd",
+      "language": "ro"
+    },
+    {
+      "id": "248",
+      "input": "Am nevoie de trei lucruri: pâine, lapte și cafea.",
+      "chunks_sha256": "bfaeb812779d9f7182efbf0e1a9940bad913354cceac3175dffaec03dcb3bccd",
+      "language": "ro"
+    },
+    {
+      "id": "249",
+      "input": "Pentru proiect avem nevoie de un designer, un programator, un tester și un manager.",
+      "chunks_sha256": "34bdcae75bdd37206a1d9314f33f900459d3cf0e05e862bc43cdd7e45e5d3650",
+      "language": "ro"
+    },
+    {
+      "id": "250",
+      "input": "Planul este simplu: unu, analizăm problema; doi, construim soluția; trei, o testăm; patru, o lansăm.",
+      "chunks_sha256": "3102e8b949e32da9819657d34ecfb1b1efa9c60f1b9c6b72b41a0be8e52ff556",
+      "language": "ro"
+    },
+    {
+      "id": "251",
+      "input": "Ridică telefonul, deschide aplicația și apasă pe butonul albastru.",
+      "chunks_sha256": "a8cc7d5d9dd5a7874b11fdb84a0390a0da1ba5e66320b43fe2fcbc5c44dd1f59",
+      "language": "ro"
+    },
+    {
+      "id": "252",
+      "input": "Mai întâi conectează cablul USB. Apoi pornește calculatorul.",
+      "chunks_sha256": "13c75b47efb245f130e69f6f1d25d89afffb529c2f55535e5c08f031146a2f49",
+      "language": "ro"
+    },
+    {
+      "id": "253",
+      "input": "Nu apăsa butonul până când lumina verde nu se aprinde.",
+      "chunks_sha256": "d6353999a1e19857fb3500b57fd7be5a35f342f6af8649cc14bf504c61929b8b",
+      "language": "ro"
+    },
+    {
+      "id": "254",
+      "input": "Citește cu atenție instrucțiunile înainte să continui.",
+      "chunks_sha256": "afb894af5ac28120a7b5e31edd07f85c5052915fa13560a3956b78228ccb1f46",
+      "language": "ro"
+    },
+    {
+      "id": "255",
+      "input": "Bună ziua! Cu ce vă pot ajuta?",
+      "chunks_sha256": "3fcd9d1dbcd427b2c3816d635efeeff90370a73522dc53eb016e4284f5b9f897",
+      "language": "ro"
+    },
+    {
+      "id": "256",
+      "input": "Îmi pare rău pentru inconvenient.",
+      "chunks_sha256": "db77180e055043d05bbb69b6b1e1cf37468ff701cf0ce16f95ffdc4cb87f8a42",
+      "language": "ro"
+    },
+    {
+      "id": "257",
+      "input": "Haideți să verificăm împreună situația.",
+      "chunks_sha256": "5a68143739771bf5a1615523919c3a5646aaab34dde35fa3f716452345a730c8",
+      "language": "ro"
+    },
+    {
+      "id": "258",
+      "input": "Văd că plata a fost procesată cu succes.",
+      "chunks_sha256": "d7c6861870e297f9fec84a8ab76b15d20cbd76bb7557e8a9597b7f1aaff1bcb3",
+      "language": "ro"
+    },
+    {
+      "id": "259",
+      "input": "Comanda dumneavoastră va fi livrată mâine.",
+      "chunks_sha256": "14ce40028b9e89ec8162db52f48b2fbd7e14dff78505798f7736ba486a91baca",
+      "language": "ro"
+    },
+    {
+      "id": "260",
+      "input": "Dacă mai aveți întrebări, vă stau la dispoziție.",
+      "chunks_sha256": "fd2ebcdab46072a0c128c2213c0a9f6bf3e5bf0ca1157ab606b4cbfc6bcf165a",
+      "language": "ro"
+    },
+    {
+      "id": "261",
+      "input": "Sigur. Pot să te ajut cu asta.",
+      "chunks_sha256": "a9f7e6a99b26cdcb5d35825023e457fef667c640617ea6effc7735ff1419a371",
+      "language": "ro"
+    },
+    {
+      "id": "262",
+      "input": "Am înțeles. Vrei să modificăm doar ultima parte?",
+      "chunks_sha256": "2257a5b4aace6d99373fb39ed4984754823cc1473e815b19d5ee5aa4c5f3c936",
+      "language": "ro"
+    },
+    {
+      "id": "263",
+      "input": "Bine. Înainte să continui, am nevoie de încă o informație.",
+      "chunks_sha256": "39b046d436b06b5786aa4e163984e81f9c730b6b703f2102faabfc445df69ca4",
+      "language": "ro"
+    },
+    {
+      "id": "264",
+      "input": "Am verificat datele și pare că totul este în regulă.",
+      "chunks_sha256": "400d292fb0b4cc8891ec467711a91fcd534e903edef77db9a4116411b4c0b525",
+      "language": "ro"
+    },
+    {
+      "id": "265",
+      "input": "Nu sunt sigur că această informație este corectă, așa că ar fi bine să o verificăm.",
+      "chunks_sha256": "8055bcb6eefacd67a7567ce8c41667fd3bfa84ece9eb3821bbdd61a3b908fa87",
+      "language": "ro"
+    },
+    {
+      "id": "266",
+      "input": "Bună ziua. Ce simptome aveți?",
+      "chunks_sha256": "7eff69de85ba6a5b33836c797bf913c021b674e90dfc4f3091e78a99f86a08ab",
+      "language": "ro"
+    },
+    {
+      "id": "267",
+      "input": "Am febră de aproximativ treizeci și opt de grade și jumătate.",
+      "chunks_sha256": "18ae1d7c07a7686949c0bf9e8f12696fff6fc8bbbed082a887ead07360413f56",
+      "language": "ro"
+    },
+    {
+      "id": "268",
+      "input": "De când au început simptomele?",
+      "chunks_sha256": "311277bdbd53826e68676d22f3bee7df6df1efb56d1a9a7dede5f1b1edf5ea85",
+      "language": "ro"
+    },
+    {
+      "id": "269",
+      "input": "Mă doare capul și am o ușoară senzație de amețeală.",
+      "chunks_sha256": "006c284ab159b4e5a433b547180e88476cbe5b2985dd9ee816f2c33658c73b3d",
+      "language": "ro"
+    },
+    {
+      "id": "270",
+      "input": "Vă rog să inspirați adânc și să expirați încet.",
+      "chunks_sha256": "e865fe3196216ec5809686f5414a83a54c9fd6a211af6a37fac265c905cf1e67",
+      "language": "ro"
+    },
+    {
+      "id": "271",
+      "input": "Alo, 112? Am nevoie de ajutor.",
+      "chunks_sha256": "465bdfe8e00bf83c1526b2165ccf9b35ee9a393d69f3f6181f06148994b8ed61",
+      "language": "ro"
+    },
+    {
+      "id": "272",
+      "input": "Este o persoană rănită și are nevoie de o ambulanță.",
+      "chunks_sha256": "bb8a2e70541bfead1231af81f18d496d06f812ce3eeedf6bc8c0ed8b8bcf762c",
+      "language": "ro"
+    },
+    {
+      "id": "273",
+      "input": "Rămâneți calm și spuneți-mi exact unde vă aflați.",
+      "chunks_sha256": "3e93d609843875dcf05c31aec3e0e97272fd3374dbbbe39f18c2121fc0b14286",
+      "language": "ro"
+    },
+    {
+      "id": "274",
+      "input": "Strada este blocată, dar putem ajunge până la intersecția următoare.",
+      "chunks_sha256": "97b288684cbd0c1b1d35131671633e2412cf5a98a8b51b4de47e3b10b96e4f66",
+      "language": "ro"
+    },
+    {
+      "id": "275",
+      "input": "Sigur, pentru că exact asta îmi lipsea astăzi.",
+      "chunks_sha256": "50ddfd04652f4bac268e038989072b9f810a3eb0abbc878347c8dcc50ac30da1",
+      "language": "ro"
+    },
+    {
+      "id": "276",
+      "input": "Da, minunat. Absolut minunat.",
+      "chunks_sha256": "480b33cb52bc0c2d131ff9c0bae3c4b427c6d09ae7486adb1c0e5e4b70e98f9f",
+      "language": "ro"
+    },
+    {
+      "id": "277",
+      "input": "Perfect. Ce poate merge prost?",
+      "chunks_sha256": "790bae4970b80a56ddcdceb530afde1f6d3c68499b6b0a718135042c57a35f55",
+      "language": "ro"
+    },
+    {
+      "id": "278",
+      "input": "Bravo. Chiar nu știu cum ai reușit.",
+      "chunks_sha256": "bfc3e54fcfbf4f2a7cd89feaf7aba4518123718727e834026f83f6ed8e8dee29",
+      "language": "ro"
+    },
+    {
+      "id": "279",
+      "input": "Frate, ce faci?",
+      "chunks_sha256": "f2a0515153970b59b5c57baef2dab065c537fad3736df6234b57be4ea112a4f2",
+      "language": "ro"
+    },
+    {
+      "id": "280",
+      "input": "Hai, mă, serios?",
+      "chunks_sha256": "28679c9eae8673ba439a59f47b048b02db6a57a5ea3d6c1ada77a11ed4914880",
+      "language": "ro"
+    },
+    {
+      "id": "281",
+      "input": "Nu-mi vine să cred, bă!",
+      "chunks_sha256": "a0515fb52807ea9fe44f53be5ad5f94cb2f2cd92b466a8c15ad49d41f19fd257",
+      "language": "ro"
+    },
+    {
+      "id": "282",
+      "input": "Lasă, că rezolvăm.",
+      "chunks_sha256": "62a3e05491c33614a6e179bf69ede5131865464a4262aaf405f58096d65bf44e",
+      "language": "ro"
+    },
+    {
+      "id": "283",
+      "input": "E super tare.",
+      "chunks_sha256": "d3b3a5996b64b6be9dd47384736d5004d27b5b81e4af87ee9cefce4e22eb7ee7",
+      "language": "ro"
+    },
+    {
+      "id": "284",
+      "input": "Ce mișto!",
+      "chunks_sha256": "364fcca84a55f4e835b5a9bd0560699efad03c3b29870671426b256c3b93159c",
+      "language": "ro"
+    },
+    {
+      "id": "285",
+      "input": "N-am chef azi.",
+      "chunks_sha256": "a76eb346301fa97bf4182c2e8aa39476d0999bbef37801f677864d8fbc381162",
+      "language": "ro"
+    },
+    {
+      "id": "286",
+      "input": "Stai chill.",
+      "chunks_sha256": "1b7b7deb745f0d94534837f33454c03d4eb98c03f07dff1f95e83b3f0141020f",
+      "language": "ro"
+    },
+    {
+      "id": "287",
+      "input": "Vă mulțumesc pentru timpul acordat și pentru disponibilitatea de a discuta această problemă.",
+      "chunks_sha256": "2e4cb71a890e05effef8b8288b221f709f92263b62a00759492875d06f1f34a5",
+      "language": "ro"
+    },
+    {
+      "id": "288",
+      "input": "În conformitate cu prevederile contractuale, solicităm transmiterea documentelor până la data de 15 septembrie.",
+      "chunks_sha256": "ae9b82e5afaebb14d285f77a72c4468a16324916028faedc11be90aff74fc2c6",
+      "language": "ro"
+    },
+    {
+      "id": "289",
+      "input": "Vă informăm că cererea dumneavoastră a fost înregistrată și va fi analizată în cel mai scurt timp posibil.",
+      "chunks_sha256": "81cbd42b105ff994cdeb223cdc13ae28504d0f6a70c65283f26f1e38efa6f2a2",
+      "language": "ro"
+    },
+    {
+      "id": "290",
+      "input": "Bun, deci trebuie să plecăm acum, să luăm trenul de la două și treizeci, să ajungem înainte de trei, să luăm biletele și să nu uităm bagajele, pentru că ultima dată exact asta am uitat.",
+      "chunks_sha256": "4e914b8e03c8d0876793a1cdac54a609be701a5e506297de13e0d9a5dc44883c",
+      "language": "ro"
+    },
+    {
+      "id": "291",
+      "input": "Inspiră încet... și expiră. Închide ochii. Lasă umerii să se relaxeze. Nu trebuie să te grăbești. Pentru următoarele câteva secunde, nu trebuie să faci nimic.",
+      "chunks_sha256": "4496c66deb0997114c9b1804032b3c174fee30bf2cc08f2affe66184355cb932",
+      "language": "ro"
+    },
+    {
+      "id": "292",
+      "input": "Ai nevoie de internet rapid, simplu și fără complicații? Descoperă noul nostru abonament, disponibil acum la doar 39 de lei și 99 de bani pe lună. Activează-l astăzi și primești primele trei luni cu 50% reducere!",
+      "chunks_sha256": "867734fdcdab5ba0cfb5a0cbfea2b5e9f6aa359f87d0c5548414aa58e958d6c1",
+      "language": "ro"
+    },
+    {
+      "id": "293",
+      "input": "Bună seara. Acestea sunt principalele știri ale zilei. În București, traficul este aglomerat în această după-amiază, după ce un accident a blocat temporar două benzi de circulație. Potrivit autorităților, nu au fost raportate victime. În economie, moneda euro este cotată astăzi la 5 lei și 7 bani.",
+      "chunks_sha256": "75f171ea6f71593a691ea1477d089d46ba4800a412e15ce2b211fe14068212ba",
+      "language": "ro"
+    },
+    {
+      "id": "294",
+      "input": "În fiecare primăvară, milioane de păsări traversează Europa în căutarea unor zone mai calde. Unele dintre ele parcurg mii de kilometri, folosindu-se de poziția soarelui, de câmpul magnetic al Pământului și de reperele naturale pentru a-și găsi drumul.",
+      "chunks_sha256": "b5ed762e8650eaa4cdd6267605bd1b32f21d104258365fecd206c86f291c1cce",
+      "language": "ro"
+    },
+    {
+      "id": "295",
+      "input": "Când am intrat în cameră, Andrei m-a privit și a spus: — Unde ai fost? — Afară. — Afară unde? — Nu contează. A făcut o pauză, apoi a început să râdă. — Tu chiar nu poți să fii serios nici măcar cinci minute, nu-i așa? — Ba da. — Când? — Nu știu. Te anunț.",
+      "chunks_sha256": "8f0f427528198999fc7b13c8850800133786b9fe8ae8520cfe2fa427d97b76a4",
+      "language": "ro"
+    },
+    {
+      "id": "296",
+      "input": "— Pleci? — Da. — Și nu te mai întorci? A făcut o pauză lungă. — Nu știu. — Asta nu este un răspuns. — Știu.",
+      "chunks_sha256": "c00e2daaabb8c0fc849d0136f43e5928caa7e42f4f935cb7d3e7e60ea0901156",
+      "language": "ro"
+    },
+    {
+      "id": "297",
+      "input": "Ieri dimineață m-am trezit mult mai devreme decât de obicei. Afară ploua, era frig și, pentru câteva secunde, am luat în calcul să mă întorc în pat. Totuși, aveam un tren la ora opt și jumătate, așa că m-am ridicat, mi-am făcut rapid o cafea și am ieșit din casă. Când am ajuns la gară, trenul tocmai intra în stație. Am alergat până la peron, am urcat în ultimul moment și, când m-am așezat, mi-am dat seama că îmi uitasem portofelul acasă. Am râs singur câteva secunde. Evident, nu mai puteam coborî.",
+      "chunks_sha256": "8650b5c150b28b22ab021089103242d49c11c145469191d41e4c0b994d7408ba",
+      "language": "ro"
+    },
+    {
+      "id": "298",
+      "input": "Pe 14 februarie 2027, la ora 18:45, am primit un mesaj în care scria că am câștigat 25.000 de euro. Am crezut că este o glumă. Apoi am verificat din nou. Nu era o glumă. Doamne!",
+      "chunks_sha256": "946af0af5240f5760e94c6ebf03ccca639eeedac6f1c9834449ed72b6230c8a0",
+      "language": "ro"
+    },
+    {
+      "id": "299",
+      "input": "Bună! Dacă mă auzi clar, înseamnă că testul a început. Astăzi este joi, 27 august 2026, ora 13:45, iar temperatura de afară este de aproximativ 28°C. Am 1.250 de lei în portofel, 49,99 euro în cont și, dintr-un motiv pe care nici eu nu-l înțeleg, trei telefoane în buzunar. Apropo... hahaha! Nu, nu sunt trei telefoane. Era doar unul, iar celelalte două erau în geantă. Acum trebuie să plec din București spre Brașov, apoi spre Sibiu și, dacă totul merge bine, poate ajung până la Cluj-Napoca. Trenul pleacă la 14:35. Dacă îl pierd, următorul este la 16:10.",
+      "chunks_sha256": "c6c1d28efe7cb8150099fff005c4d84eb46f26ed43a38c1dd2ce65de6b3c3338",
+      "language": "ro"
+    },
+    {
+      "id": "300",
+      "input": "Deci, ascultă-mă cu atenție: mâine, 28 august, la ora 07:30, trebuie să fiu la adresa Strada Mihai Eminescu, numărul 42, apartamentul 17. Am primit confirmarea pe WhatsApp, dar linkul era ceva de genul https://exemplu.ro/confirmare?id=482917. Codul meu este 739204. Nu, stai — 739024. Aaaah, nu! Stai puțin... Da. 739204. Perfect. Și apoi trebuie să sun la +40 723 456 789. Persoana cu care trebuie să vorbesc se numește François-Xavier. El mi-a zis: «Bonjour, ne vedem mâine.» Eu i-am răspuns: «Sigur, merci beaucoup!» Hahaha. Doamne.",
+      "chunks_sha256": "0e73e8afa3c617a12607a6b3b77f6958eec1274d2b79c1f237e5611b2972cfcd",
+      "language": "ro"
+    },
+    {
+      "id": "301",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "302",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "303",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "304",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "305",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "306",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "307",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "308",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "309",
+      "input": "Trenul pleacă în cinci minute și nu am ajuns încă la gară.",
+      "chunks_sha256": "10e53ac686bd1371af273645e78c8203386e845d6adc2c83bdecf8d86b088a8a",
+      "language": "ro"
+    },
+    {
+      "id": "310",
+      "input": "În temeiul art. 5 alin. (1) lit. a) din Legea concurenței nr. 21/1996, republicată, Consiliul Concurenței a dispus declanșarea unei investigații.",
+      "chunks_sha256": "089a7b93eec13eae2881415a29857f414c7d5756f2383ac7bd571f29cfb91a7c",
+      "language": "ro"
+    },
+    {
+      "id": "311",
+      "input": "Prin Decizia nr. 47 din 12 martie 2026, autoritatea a aplicat o amendă de 3.847.250 de lei, reprezentând 2,7% din cifra de afaceri.",
+      "chunks_sha256": "781d3810c302ebbcc72f4a3cae92df27707f9e824cdeb1c98ddb439da34004d9",
+      "language": "ro"
+    },
+    {
+      "id": "312",
+      "input": "Practica anticoncurențială constă într-un acord orizontal de fixare a prețurilor între întreprinderile implicate pe piața relevantă.",
+      "chunks_sha256": "a5479dabb48b8c45856e1657c6b13b3906be491293d606019a0a5fa3865103c6",
+      "language": "ro"
+    },
+    {
+      "id": "313",
+      "input": "Termenul de contestare este de 30 de zile de la comunicare, conform art. 49 alin. (2).",
+      "chunks_sha256": "b16e66456e42381bfb440daece225e07a2c275ad6a290352e408c51882c4a780",
+      "language": "ro"
+    },
+    {
+      "id": "314",
+      "input": "Analiza a vizat perioada cuprinsă între 1 ianuarie 2023 și 31 decembrie 2025, pe piața distribuției de produse farmaceutice.",
+      "chunks_sha256": "deb2efcb1f6037785174890a143e82aa8f2df1cee16aaae3e5aa0a6a4fb8c0af",
+      "language": "ro"
+    },
+    {
+      "id": "315",
+      "input": "Cota de piață cumulată a părților depășește pragul de 40%, ceea ce ridică prezumția de poziție dominantă.",
+      "chunks_sha256": "2534f47fd1151c6263fb4bda63cf67ad635fae812879bf4f7a72ba910f450885",
+      "language": "ro"
+    },
+    {
+      "id": "316",
+      "input": "Întreprinderea a beneficiat de politica de clemență și i s-a redus amenda cu cincizeci la sută.",
+      "chunks_sha256": "1ab26b64d323be9c11d975edfb692dd873516fc03f507f7fc1943484ef53bef8",
+      "language": "ro"
+    },
+    {
+      "id": "317",
+      "input": "Regulamentul UE nr. 1/2003 privind punerea în aplicare a normelor de concurență prevăzute la articolele 81 și 82 din tratat.",
+      "chunks_sha256": "4b327208a2e76f9317528e5c6bd70616a8709d06b266916d014f47df3d198d01",
+      "language": "ro"
+    },
+    {
+      "id": "318",
+      "input": "Bună ziua! Soldul disponibil în contul curent este de 12.480,35 lei, iar ultima operațiune a fost pe 26 august.",
+      "chunks_sha256": "8630ac70faedf886481775fe9a0d755b02dffe8c66b4b2eba576582ba73a8555",
+      "language": "ro"
+    },
+    {
+      "id": "319",
+      "input": "Pentru a confirma plata, vă rog să spuneți codul primit prin mesaj. Aveți la dispoziție două minute.",
+      "chunks_sha256": "bcbf1072104685945e94bb16073c96187962d796771786c7d4c04a2a98821158",
+      "language": "ro"
+    },
+    {
+      "id": "320",
+      "input": "Rata lunară este de 1.247 de lei, cu o dobândă anuală efectivă de 8,45%, iar scadența este pe data de cinci a fiecărei luni.",
+      "chunks_sha256": "6a32f5248f1a2d1f200e82d4a6d6f1fbdefa80073a39596a7f973d75a0382340",
+      "language": "ro"
+    },
+    {
+      "id": "321",
+      "input": "Din motive de securitate, apelul este înregistrat. Doriți să continuați?",
+      "chunks_sha256": "927d39ce1e2d709c56f93e974a06b12a6eb19c0668c6eddf532e7666eed7d713",
+      "language": "ro"
+    },
+    {
+      "id": "322",
+      "input": "Comisionul de administrare cont, extrasul de cont și ordinul de plată programată apar în lista de operațiuni.",
+      "chunks_sha256": "82809e81e8c6458b51c703f478d742fc3a574ae54af6490e4d72d8b299d64c0d",
+      "language": "ro"
+    },
+    {
+      "id": "323",
+      "input": "Cardul dumneavoastră se termină în 4729 și expiră în luna noiembrie 2027.",
+      "chunks_sha256": "2c8d43759b6062d5c2d0d3312e5e7a7e5ae0b52891efac4fbf32560fd893b4ba",
+      "language": "ro"
+    },
+    {
+      "id": "324",
+      "input": "Am înregistrat solicitarea de opoziție card. Veți primi confirmarea în cel mult treizeci de minute.",
+      "chunks_sha256": "9cd2235ab3b1d18698f77c3d8ccfec240536f3e20314c02eca511f890206a326",
+      "language": "ro"
+    },
+    {
+      "id": "325",
+      "input": "Transferul în valoare de 5.000 de lei către IBAN-ul RO49 AAAA 1B31 0075 9384 0000 a fost inițiat.",
+      "chunks_sha256": "527f79b4c302c2265fed0db279adbc0666d01b710cb0ba28d876a0b30438015d",
+      "language": "ro"
+    },
+    {
+      "id": "326",
+      "input": "Sigur, mă uit acum în sistem. Îmi dai te rog numărul comenzii?",
+      "chunks_sha256": "bfa3b3ab253a75fd5e2df7b99dd69c0b8e61ffccc2edac70e142c53958514dc6",
+      "language": "ro"
+    },
+    {
+      "id": "327",
+      "input": "Am găsit trei rezultate. Vrei să ți le citesc pe toate sau doar pe primul?",
+      "chunks_sha256": "6759d30a139f711e928022e65e35cfcf3969fe579418e8315dc00416e2fc235b",
+      "language": "ro"
+    },
+    {
+      "id": "328",
+      "input": "Nu sunt sigur că am înțeles corect. Poți să reformulezi?",
+      "chunks_sha256": "3a17d7706c76e51b18f32e3fd2a52ad7b37b99517d690851ea536c3a4bc8d173",
+      "language": "ro"
+    },
+    {
+      "id": "329",
+      "input": "Am trimis documentul pe email. Ar trebui să ajungă în câteva secunde.",
+      "chunks_sha256": "0e80136ecf9d9a42cbfb7de686df2add5787deaab18eaba7d043613bc59c00ac",
+      "language": "ro"
+    },
+    {
+      "id": "330",
+      "input": "Mi-ai zis mai devreme că vrei livrare în București. Rămâne așa?",
+      "chunks_sha256": "a27e03ab7dd3e26459d5e1a9bf2900c1f4fa727c1e277f22ef8908d41c30f12e",
+      "language": "ro"
+    },
+    {
+      "id": "331",
+      "input": "Perfect. Am notat. Mai pot să te ajut cu altceva?",
+      "chunks_sha256": "01e25629d959c809aedb95c17e84229d3ff548966157a8ff3127e4f41daf4727",
+      "language": "ro"
+    }
+  ]
+}

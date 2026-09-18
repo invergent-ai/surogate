@@ -2,6 +2,7 @@
 // FastConformer and TDT equations follow NVIDIA NeMo (Apache-2.0); see NOTICE.
 #include "model.h"
 #include <ATen/TensorIndexing.h>
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -82,9 +83,18 @@ static at::Device select_device(const std::string& device) {
     return at::Device("cuda:" + device);
 }
 
-Model::Model(const std::string& dir, const std::string& device)
+Model::Model(const std::string& dir, const std::string& device, CpuKernels kernels)
     : device_(select_device(device)), w_(dir + "/acoustic.safetensors", device_),
       lm_(dir + "/lm.safetensors", at::kCPU) {
+    bool available =
+        device_.is_cpu() && at::hasMKLDNN() &&
+        c10::Dispatcher::singleton().findSchema({"mkldnn::_linear_pointwise", ""}).has_value();
+    if (kernels == CpuKernels::Optimized && !available)
+        throw std::invalid_argument(
+            "Optimized CPU kernels require --device cpu and a oneDNN-enabled LibTorch build");
+    // Explicit opt-in until this backend also meets the reference tensor gate.
+    // Transcript parity alone does not establish intermediate numerical parity.
+    cpu_optimized_ = kernels == CpuKernels::Optimized && available;
     std::ifstream f(dir + "/speech.json");
     f >> config;
     if (config.at("version") != 1) throw std::runtime_error("unsupported speech artifact version");
@@ -101,6 +111,20 @@ Model::Model(const std::string& dir, const std::string& device)
 }
 
 Tensor Model::linear(const Tensor& x, const std::string& p, bool bias) const {
+    if (cpu_optimized_) {
+        auto& weight = packed_linear_[p];
+        if (!weight.defined()) weight = w_[p + ".weight"].to_mkldnn();
+        static auto op =
+            c10::Dispatcher::singleton().findSchemaOrThrow("mkldnn::_linear_pointwise", "");
+        c10::List<std::optional<at::Scalar>> scalars;
+        std::vector<c10::IValue> stack{
+            x,      weight,  bias ? c10::IValue(w_[p + ".bias"]) : c10::IValue(),
+            "none", scalars, c10::IValue()};
+        op.callBoxed(&stack);
+        // Keep the original SiLU implementation; its rounding is closer to the
+        // reference than oneDNN's fused approximation on low-energy inputs.
+        return std::move(stack.back()).toTensor();
+    }
     return at::linear(x, w_[p + ".weight"],
                       bias ? std::optional<Tensor>(w_[p + ".bias"]) : std::nullopt);
 }
@@ -143,6 +167,7 @@ Tensor Model::encode(const Tensor& features, EncoderState* state) const {
     if (state && !streaming())
         throw std::invalid_argument("offline speech encoder cannot carry streaming state");
     auto x = features.transpose(1, 2).unsqueeze(1);
+    if (cpu_optimized_) x = x.contiguous(at::MemoryFormat::ChannelsLast);
     for (int stage = 0; stage < 3; ++stage) {
         int index        = stage == 0 ? 0 : stage == 1 ? 2 : 5;
         std::string p    = "encoder.pre_encode.conv." + std::to_string(index);

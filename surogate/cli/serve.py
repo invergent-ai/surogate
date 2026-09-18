@@ -19,6 +19,7 @@ usage: surogate serve <model> [engine options...]
        surogate serve --generate <model> --prompt "..." [options...]
        surogate serve --embed <model> [--frontend DIR] [options...]
        surogate serve --stt <model> [--lm PATH] [--device N|cpu] [options...]
+       surogate serve --tts <model> [--voice NAME] [--device cpu] [options...]
 
 <model> is a Hugging Face repo id, a local safetensors model directory, or a
 GGUF file. First use converts transparently into a local cache; after that,
@@ -59,6 +60,9 @@ node.
 --stt serves Romanian speech recognition on GPU or CPU. Use --lm PATH with a
 local NeMo checkpoint. See docs/inference/speech.md for file uploads and live audio.
 
+--tts serves Romanian speech generation on CPU with named voices. Build with
+`make serve-tts-build` from source. See docs/inference/tts.md.
+
 From a source checkout, build the engine first with: make serve-build
 """
 
@@ -75,6 +79,7 @@ _MODES = {
     "generate": ("surogate-engine-cli", "SUROGATE_ENGINE_CLI_BIN"),
     "embed": ("surogate-embed", "SUROGATE_EMBED_BIN"),
     "stt": ("surogate-stt", "SUROGATE_STT_BIN"),
+    "tts": ("surogate-tts", "SUROGATE_TTS_BIN"),
 }
 
 # Arity is needed before preparing a model: an option value may itself start with
@@ -104,7 +109,8 @@ _VALUE_OPTIONS = {
         --reasoning-effort --stop-token-id --stop --reasoning-stop
     """.split()),
     "embed": frozenset("--host --port --device --served-model-name".split()),
-    "stt": frozenset("--host --port --device --served-model-name --api-key --max-num-seqs".split()),
+    "stt": frozenset("--host --port --device --served-model-name --api-key --max-num-seqs --threads --cpu-kernels".split()),
+    "tts": frozenset("--host --port --device --served-model-name --api-key --voice --max-pending-requests --request-timeout --threads --codec-threads --cpu-kernels".split()),
 }
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""
@@ -118,6 +124,7 @@ _SWITCH_OPTIONS = {
     """.split()),
     "embed": frozenset(),
     "stt": frozenset(),
+    "tts": frozenset(),
 }
 
 
@@ -125,7 +132,7 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
     """Return mode, model, native options, cache policy and preparation resource."""
     values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend", "--mmproj", "--dflash-model", "--lm"})
     switches = frozenset().union(*_SWITCH_OPTIONS.values(), {
-        "--generate", "--embed", "--stt", "--no-cache", "--engine-help", "--help", "-h",
+        "--generate", "--embed", "--stt", "--tts", "--no-cache", "--engine-help", "--help", "-h",
     })
     parsed: list[tuple[str, str | None]] = []
     models: list[str] = []
@@ -155,9 +162,9 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
             raise ValueError(f"unknown option: {flag}")
 
     flags = {flag for flag, _ in parsed}
-    if len(flags & {"--generate", "--embed", "--stt"}) > 1:
-        raise ValueError("--embed, --generate and --stt are different modes")
-    mode = "stt" if "--stt" in flags else "embed" if "--embed" in flags else "generate" if "--generate" in flags else "server"
+    if len(flags & {"--generate", "--embed", "--stt", "--tts"}) > 1:
+        raise ValueError("--embed, --generate, --stt and --tts are different modes")
+    mode = next((name for name in ("tts", "stt", "embed", "generate") if f"--{name}" in flags), "server")
     if flags & {"--engine-help", "--help", "-h"}:
         return mode, None, ["--help"], True, None
     if len(models) != 1 or not models[0]:
@@ -165,7 +172,7 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
     native: list[str] = []
     frontend = None
     for flag, value in parsed:
-        if flag in {"--generate", "--embed", "--stt", "--no-cache"}:
+        if flag in {"--generate", "--embed", "--stt", "--tts", "--no-cache"}:
             continue
         if flag == "--lm" and mode == "stt":
             frontend = value
@@ -209,8 +216,8 @@ def _resolve_binary(mode: str) -> str | None:
         cand = root / "csrc" / "build-serve" / name
         if cand.is_file():
             return str(cand)
-        if mode == "stt":
-            cand = root / "csrc" / "build-stt" / name
+        if mode in ("stt", "tts"):
+            cand = root / "csrc" / f"build-{mode}" / name
             if cand.is_file():
                 return str(cand)
     cand = _INSTALLED_BIN_DIR / name
@@ -220,7 +227,7 @@ def _resolve_binary(mode: str) -> str | None:
 
 
 def maybe_exec_serve() -> None:
-    """If invoked as `surogate serve ...`, exec the engine binary (never returns)."""
+    """Prepare assets, then replace Python with the selected native engine."""
     argv = sys.argv
     if len(argv) < 2 or argv[1] != "serve":
         return
@@ -241,10 +248,21 @@ def maybe_exec_serve() -> None:
         name = _MODES[mode][0]
         sys.stderr.write(
             f"surogate serve: the serving engine is not built ({name} not found).\n"
-            "Build it first:  make serve-build   (or `make build-all` for trainer and engine)\n"
+            f"Build it first:  {'make serve-tts-build' if mode == 'tts' else 'make serve-build'}\n"
             "An installed wheel ships it; a source tree builds it into csrc/build-serve.\n"
         )
         sys.exit(127)
+
+    if mode == "tts":
+        if model is not None:
+            from surogate.serve.tts.assets import prepare_bundle
+
+            bundle = prepare_bundle(model, reuse_cache=reuse_cache, echo=lambda m: print(m, file=sys.stderr))
+            if "--served-model-name" not in rest[::2]:
+                rest.extend(["--served-model-name", model])
+            rest = [str(bundle.root), *rest]
+        os.execv(binary, [binary, *rest])
+        return
 
     if model is not None:
         from surogate.serve.ingest import ensure_encoder_weights, ensure_engine_weights
