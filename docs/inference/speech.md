@@ -44,17 +44,23 @@ of HTTP connections or streaming sessions.
 surogate serve --stt surogate/surogate-ro-110m-tdt-ctc --device cpu --threads 4
 ```
 
-The optional `--cpu-kernels optimized` path uses LibTorch's oneDNN linear
-kernels with cached weight layouts and channels-last frontend convolutions.
-It retains FP32 and the original SiLU activation. It requires a oneDNN-enabled
-LibTorch build and additional memory for the cached weight layouts.
+`--cpu-kernels auto` (the default) enables the optimized FP32 path on CPU
+with an MKL-enabled LibTorch build. It combines attention projections, caches
+bounded position projections, removes a relative-attention padding copy, and
+reuses packed feed-forward weights for recurring shapes. Language-model
+backoff scores are also cached within each request. Changing clip lengths use
+ordinary GEMM until a shape recurs, avoiding repeated packing overhead.
 
-This path is **experimental and opt-in**: CTC and TDT transcripts matched the
-reference for all 903 Romanian control recordings, but some intermediate
-tensors exceeded the existing numerical tolerances. `--cpu-kernels auto`
-(the default) and `--cpu-kernels reference` retain the original CPU path.
-LibTorch remains the STT runtime dependency. See the
-[CPU kernel validation report](cpu-kernels.md) for measurements and limitations.
+`--cpu-kernels reference` selects the original implementation for comparisons.
+`--cpu-kernels optimized` requires CPU and MKL support; `auto` falls back to the
+reference path if unavailable. LibTorch remains the runtime dependency. Model
+precision, decoding rules and scores are unchanged.
+
+The current path replaces the earlier experimental oneDNN linear rewrite. It
+passed exact encoder/CTC tensor comparisons and both decoder transcript checks
+on all 903 Romanian control recordings, plus streaming and boundary cases.
+See [STT CPU kernel measurements](stt-cpu-kernels.md) for latency, cache behavior
+and validation scope.
 
 The first start downloads the selected acoustic checkpoint and its Romanian
 language model, then prepares reusable files under `~/.cache/surogate/serve`.

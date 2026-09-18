@@ -4,6 +4,7 @@
 #include "audio.h"
 #include <ATen/Parallel.h>
 #include <torch/csrc/autograd/profiler_kineto.h>
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -32,6 +33,44 @@ int main(int argc, char** argv) {
                 auto ms = [](auto begin, auto end) {
                     return std::chrono::duration<double, std::milli>(end - begin).count();
                 };
+                if (std::getenv("SUROGATE_CPU_STREAMING")) {
+                    if (!model.streaming()) throw std::runtime_error("Streaming timing needs a streaming model");
+                    auto begin = now();
+                    Stream stream(model, argv[1]);
+                    auto ready = now();
+                    std::vector<double> chunks;
+                    json events = json::array();
+                    constexpr size_t packet_samples = 2560;  // 160 ms of mono 16 kHz audio.
+                    for (size_t offset = 0; offset < pcm.size(); offset += packet_samples) {
+                        auto packet_begin = now();
+                        auto part = stream.accept(
+                            {pcm.begin() + offset, pcm.begin() + std::min(pcm.size(), offset + packet_samples)});
+                        chunks.push_back(ms(packet_begin, now()));
+                        for (auto& event : part)
+                            events.push_back(std::move(event));
+                    }
+                    auto final_begin = now();
+                    for (auto& event : stream.accept({}, true))
+                        events.push_back(std::move(event));
+                    auto end = now();
+                    std::sort(chunks.begin(), chunks.end());
+                    json transcripts = json::array();
+                    for (auto& event : events)
+                        transcripts.push_back({{"type", event.at("type")}, {"text", event.at("text")}});
+                    std::cout << json{{"audio", argv[i]},
+                                      {"audio_s", pcm.size() / 16000.},
+                                      {"repeat", repeat},
+                                      {"threads", std::stoi(argv[2])},
+                                      {"stream_init_ms", ms(begin, ready)},
+                                      {"total_ms", ms(ready, end)},
+                                      {"finalize_ms", ms(final_begin, end)},
+                                      {"max_packet_ms", chunks.empty() ? 0 : chunks.back()},
+                                      {"median_packet_ms", chunks.empty() ? 0 : chunks[chunks.size() / 2]},
+                                      {"transcripts", transcripts}}
+                                     .dump()
+                              << std::endl;
+                    continue;
+                }
                 const char* profile = std::getenv("SUROGATE_CPU_PROFILE");
                 if (profile && repeat == 1) {
                     using namespace torch::autograd::profiler;

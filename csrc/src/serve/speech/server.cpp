@@ -79,7 +79,8 @@ int main(int argc, char** argv) {
                                              : CpuKernels::Auto;
         Model model(artifact, device, mode);
         if (device == "cpu")
-            std::cerr << "STT CPU kernels: " << (model.optimized_cpu() ? "oneDNN" : "reference")
+            std::cerr << "STT CPU kernels: "
+                      << (model.optimized_cpu() ? "optimized FP32" : "reference")
                       << "; threads=" << threads << '\n';
         std::mutex mutex;
 

@@ -1,9 +1,11 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #pragma once
+#include "cpu_ops.h"
 #include <ATen/ATen.h>
 #include <nlohmann/json.hpp>
 #include <sentencepiece_processor.h>
 #include <torch/script.h>
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -40,11 +42,22 @@ class Model {
     at::Device device_;
     Weights w_, lm_;
     sentencepiece::SentencePieceProcessor tokenizer_;
-    mutable std::map<std::string, Tensor> packed_linear_;
+
+    struct AttentionCache {
+        Tensor weight, bias;
+        std::array<Tensor, 2> positions;
+    };
+
+    mutable std::vector<AttentionCache> attention_cache_;
+    mutable std::map<std::string, cpu::PackedLinear> packed_linear_;
+    mutable std::array<int64_t, 2> position_lengths_{0, 0};
     bool cpu_optimized_ = false;
     Tensor linear(const Tensor&, const std::string&, bool bias = true) const;
     Tensor norm(const Tensor&, const std::string&) const;
     Tensor conv(const Tensor&, const std::string&, int groups = 1) const;
+    std::array<Tensor, 3> project_attention(const Tensor& query, const Tensor& kv,
+                                            const std::string& prefix, int layer,
+                                            bool streaming) const;
     std::pair<Tensor, Tensor> predict(int, const Tensor&, const Tensor&) const;
 public:
     json config;

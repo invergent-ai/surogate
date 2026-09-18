@@ -11,12 +11,13 @@ guarantee for an otherwise idle production host.
 | Service | Default (`auto`) | Explicit `optimized` |
 |---|---|---|
 | TTS | AVX-512 backend when available; otherwise the package backend | Requires the compatible AVX-512 backend |
-| STT | Original LibTorch CPU path | Experimental oneDNN linear kernels and channels-last frontend convolutions |
+| STT | Optimized FP32 path with MKL; reference fallback otherwise | Requires CPU and MKL support |
 
 TTS reuses FP32 vectors across projection outputs and FP16 conversions across
 2×3 codec matrix tiles. It preserves the original accumulation order, including
-scalar tails for irregular convolution dimensions. STT keeps FP32 and uses
-cached oneDNN weight layouts; it retains the original SiLU activation.
+scalar tails for irregular convolution dimensions. The current STT path uses
+MKL weight packing, combined attention projections and bounded caches; see
+[STT CPU kernel measurements](stt-cpu-kernels.md).
 
 ## TTS measurements
 
@@ -63,7 +64,10 @@ The native model package is pinned to HF revision
 Surogate's matrix kernels. The worker checks CPU features and runtime ABI
 fingerprints before loading it.
 
-## STT numerical qualification
+## Initial STT oneDNN experiment (superseded)
+
+The following records the earlier candidate, which has been replaced by the
+exact FP32 path described in [STT CPU kernel measurements](stt-cpu-kernels.md).
 
 With four threads and affinity to physical cores on the other socket, warm
 stage measurements gave the following median total latency. Each value uses
@@ -93,7 +97,7 @@ Intermediate tensors are not identical. In that run:
 Sixteen recordings exceeded the existing per-element tensor tolerances;
 thirteen exceeded the additional relative-RMS threshold of `1e-5`.
 The numerical qualification therefore **did not pass**. These thresholds
-were retained, and the faster STT path remains opt-in. Identical transcripts
+were retained, and that candidate was kept opt-in until replaced. Identical transcripts
 on these recordings do not prove identical behavior on all future audio.
 
 The Python serving suite passed 644 tests (218 skipped). The existing native
@@ -123,7 +127,7 @@ fixture targets the pinned released voices; custom exports need their own
 `--cases` JSON with `id`, `voice`, `input`, `seed` and reference WAV `sha256`.
 
 For STT, `speech-cpu-bench MODEL THREADS REPEATS AUDIO...` reports mel, encoder,
-CTC and language-model decoding times. It selects the experimental backend;
+CTC and language-model decoding times. It selects the optimized backend;
 set `SUROGATE_CPU_REFERENCE=1` for the original kernels. Repeat zero is the
 cold request for each recording. `test_speech_cpu_kernels MODEL CASES REPORT`
 performs the numerical and transcript comparison; its cases JSON contains

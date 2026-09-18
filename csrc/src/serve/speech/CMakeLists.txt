@@ -22,7 +22,7 @@ execute_process(COMMAND "${Python_EXECUTABLE}" -c
     "import pathlib, torch; print(pathlib.Path(torch.__file__).parent)"
     OUTPUT_VARIABLE SPEECH_TORCH_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY)
-add_library(sinfer_speech STATIC EXCLUDE_FROM_ALL model.cpp audio.cpp)
+add_library(sinfer_speech STATIC EXCLUDE_FROM_ALL model.cpp audio.cpp cpu_ops.cpp)
 target_include_directories(sinfer_speech PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
     "${SPEECH_TORCH_ROOT}/include" "${SPEECH_TORCH_ROOT}/include/torch/csrc/api/include"
     ${SINFER_JSON_INCLUDE} ${sentencepiece_SOURCE_DIR}/src)
@@ -40,6 +40,11 @@ set_target_properties(surogate-stt PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     INSTALL_RPATH "$ORIGIN/../../../torch/lib")
 if(SUROGATE_SERVE_TESTS)
+    add_executable(test_speech_cpu_ops EXCLUDE_FROM_ALL ../../testing/serve/test_speech_cpu_ops.cpp)
+    target_link_libraries(test_speech_cpu_ops PRIVATE sinfer_speech)
+    set_target_properties(test_speech_cpu_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS test_speech_cpu_ops)
+    add_test(NAME speech_cpu_ops COMMAND test_speech_cpu_ops)
     add_executable(test_speech_model EXCLUDE_FROM_ALL ../../testing/serve/test_speech_model.cpp)
     target_link_libraries(test_speech_model PRIVATE sinfer_speech)
     set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS test_speech_model)

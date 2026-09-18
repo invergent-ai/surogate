@@ -2,7 +2,6 @@
 // FastConformer and TDT equations follow NVIDIA NeMo (Apache-2.0); see NOTICE.
 #include "model.h"
 #include <ATen/TensorIndexing.h>
-#include <ATen/core/dispatch/Dispatcher.h>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -10,6 +9,7 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <unordered_map>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -86,15 +86,11 @@ static at::Device select_device(const std::string& device) {
 Model::Model(const std::string& dir, const std::string& device, CpuKernels kernels)
     : device_(select_device(device)), w_(dir + "/acoustic.safetensors", device_),
       lm_(dir + "/lm.safetensors", at::kCPU) {
-    bool available =
-        device_.is_cpu() && at::hasMKLDNN() &&
-        c10::Dispatcher::singleton().findSchema({"mkldnn::_linear_pointwise", ""}).has_value();
+    bool available = device_.is_cpu() && at::hasMKL();
     if (kernels == CpuKernels::Optimized && !available)
         throw std::invalid_argument(
-            "Optimized CPU kernels require --device cpu and a oneDNN-enabled LibTorch build");
-    // Explicit opt-in until this backend also meets the reference tensor gate.
-    // Transcript parity alone does not establish intermediate numerical parity.
-    cpu_optimized_ = kernels == CpuKernels::Optimized && available;
+            "Optimized CPU kernels require --device cpu and an MKL-enabled LibTorch build");
+    cpu_optimized_ = kernels != CpuKernels::Reference && available;
     std::ifstream f(dir + "/speech.json");
     f >> config;
     if (config.at("version") != 1) throw std::runtime_error("unsupported speech artifact version");
@@ -102,6 +98,7 @@ Model::Model(const std::string& dir, const std::string& device, CpuKernels kerne
     hidden = e.at("d_model");
     heads  = e.at("n_heads");
     layers = e.at("n_layers");
+    attention_cache_.resize(layers);
     left   = e.at("att_context_size")[0];
     right  = e.at("att_context_size")[1];
     kernel = e.at("conv_kernel_size");
@@ -111,22 +108,37 @@ Model::Model(const std::string& dir, const std::string& device, CpuKernels kerne
 }
 
 Tensor Model::linear(const Tensor& x, const std::string& p, bool bias) const {
-    if (cpu_optimized_) {
-        auto& weight = packed_linear_[p];
-        if (!weight.defined()) weight = w_[p + ".weight"].to_mkldnn();
-        static auto op =
-            c10::Dispatcher::singleton().findSchemaOrThrow("mkldnn::_linear_pointwise", "");
-        c10::List<std::optional<at::Scalar>> scalars;
-        std::vector<c10::IValue> stack{
-            x,      weight,  bias ? c10::IValue(w_[p + ".bias"]) : c10::IValue(),
-            "none", scalars, c10::IValue()};
-        op.callBoxed(&stack);
-        // Keep the original SiLU implementation; its rounding is closer to the
-        // reference than oneDNN's fused approximation on low-energy inputs.
-        return std::move(stack.back()).toTensor();
-    }
+    if (cpu_optimized_ && p.find("feed_forward") != std::string::npos && p.ends_with("linear2"))
+        return packed_linear_[p].run(x, w_[p + ".weight"],
+                                     bias ? std::optional<Tensor>(w_[p + ".bias"]) : std::nullopt);
     return at::linear(x, w_[p + ".weight"],
                       bias ? std::optional<Tensor>(w_[p + ".bias"]) : std::nullopt);
+}
+
+std::array<Tensor, 3> Model::project_attention(const Tensor& query, const Tensor& kv,
+                                               const std::string& p, int layer,
+                                               bool streaming) const {
+    // MKL's single-row GEMV takes a different reduction path after concatenation.
+    // Preserve the original calls for that boundary case.
+    if (!cpu_optimized_ || kv.size(1) == 1)
+        return {linear(query, p + "linear_q"), linear(kv, p + "linear_k"),
+                linear(kv, p + "linear_v")};
+    auto& cache = attention_cache_[layer];
+    if (!cache.weight.defined()) {
+        cache.weight = at::cat(
+            {w_[p + "linear_q.weight"], w_[p + "linear_k.weight"], w_[p + "linear_v.weight"]});
+        cache.bias =
+            at::cat({w_[p + "linear_q.bias"], w_[p + "linear_k.bias"], w_[p + "linear_v.bias"]});
+    }
+    if (streaming) {
+        auto both = at::linear(kv, cache.weight.narrow(0, hidden, 2 * hidden),
+                               cache.bias.narrow(0, hidden, 2 * hidden));
+        return {linear(query, p + "linear_q"), both.narrow(2, 0, hidden),
+                both.narrow(2, hidden, hidden)};
+    }
+    auto all = at::linear(query, cache.weight, cache.bias);
+    return {all.narrow(2, 0, hidden), all.narrow(2, hidden, hidden),
+            all.narrow(2, 2 * hidden, hidden)};
 }
 
 Tensor Model::norm(const Tensor& x, const std::string& p) const {
@@ -167,7 +179,6 @@ Tensor Model::encode(const Tensor& features, EncoderState* state) const {
     if (state && !streaming())
         throw std::invalid_argument("offline speech encoder cannot carry streaming state");
     auto x = features.transpose(1, 2).unsqueeze(1);
-    if (cpu_optimized_) x = x.contiguous(at::MemoryFormat::ChannelsLast);
     for (int stage = 0; stage < 3; ++stage) {
         int index        = stage == 0 ? 0 : stage == 1 ? 2 : 5;
         std::string p    = "encoder.pre_encode.conv." + std::to_string(index);
@@ -179,7 +190,7 @@ Tensor Model::encode(const Tensor& features, EncoderState* state) const {
             p = "encoder.pre_encode.conv." + std::to_string(index + 1);
             x = at::conv2d(x, w_[p + ".weight"], w_[p + ".bias"]);
         }
-        x = at::relu(x);
+        x = cpu_optimized_ ? at::relu_(x) : at::relu(x);
     }
     x = linear(x.transpose(1, 2).contiguous().flatten(2), "encoder.pre_encode.out");
     if (state && state->step) x = x.slice(1, 2);
@@ -190,6 +201,15 @@ Tensor Model::encode(const Tensor& features, EncoderState* state) const {
     auto frequency = at::exp(at::arange(0, hidden, 2, options) * (-std::log(10000.) / hidden));
     auto angles    = positions * frequency;
     auto pos       = at::stack({at::sin(angles), at::cos(angles)}, -1).flatten(1).unsqueeze(0);
+    // Keep separate bounded caches for full segments and streaming chunks.
+    // Long recordings still work without retaining large positional tensors.
+    const int position_slot = state ? 1 : 0;
+    const bool cache_positions =
+        cpu_optimized_ && (2 * length - 1) * hidden * sizeof(float) * layers <= 32 * 1024 * 1024;
+    if (cpu_optimized_ && position_lengths_[position_slot] != length) {
+        for (auto& cache : attention_cache_) cache.positions[position_slot] = Tensor();
+        position_lengths_[position_slot] = length;
+    }
     Tensor mask;
     if (state) {
         auto indices = at::arange(length, options.dtype(at::kLong));
@@ -214,18 +234,28 @@ Tensor Model::encode(const Tensor& features, EncoderState* state) const {
         auto query = norm(x, p + "norm_self_att");
         auto kv    = state ? at::cat({state->attention[layer], query}, 1) : query;
         if (state) state->attention[layer] = kv.slice(1, -left).clone();
-        auto a    = p + "self_attn.";
-        auto q    = linear(query, a + "linear_q").view({1, qlen, heads, dim});
-        auto k    = linear(kv, a + "linear_k").view({1, length, heads, dim}).transpose(1, 2);
-        auto v    = linear(kv, a + "linear_v").view({1, length, heads, dim}).transpose(1, 2);
-        auto pe   = linear(pos, a + "linear_pos", false).view({1, -1, heads, dim}).transpose(1, 2);
+        auto a                = p + "self_attn.";
+        auto projected        = project_attention(query, kv, a, layer, state != nullptr);
+        auto q                = projected[0].view({1, qlen, heads, dim});
+        auto k                = projected[1].view({1, length, heads, dim}).transpose(1, 2);
+        auto v                = projected[2].view({1, length, heads, dim}).transpose(1, 2);
+        auto& cached_position = attention_cache_[layer].positions[position_slot];
+        auto pe =
+            cache_positions && cached_position.defined()
+                ? cached_position
+                : linear(pos, a + "linear_pos", false).view({1, -1, heads, dim}).transpose(1, 2);
+        if (cache_positions && !cached_position.defined()) cached_position = pe;
         auto bd   = at::matmul((q + w_[a + "pos_bias_v"]).transpose(1, 2), pe.transpose(-2, -1));
         auto plen = bd.size(-1);
-        bd        = at::constant_pad_nd(bd, {1, 0}, 0)
-                 .view({1, heads, -1, qlen})
-                 .slice(2, 1)
-                 .reshape({1, heads, qlen, plen})
-                 .slice(3, 0, length);
+        if (cpu_optimized_) {
+            bd = cpu::relative_shift(bd, length);
+        } else {
+            bd = at::constant_pad_nd(bd, {1, 0}, 0)
+                     .view({1, heads, -1, qlen})
+                     .slice(2, 1)
+                     .reshape({1, heads, qlen, plen})
+                     .slice(3, 0, length);
+        }
         auto scores =
             (at::matmul((q + w_[a + "pos_bias_u"]).transpose(1, 2), k.transpose(-2, -1)) + bd) /
             std::sqrt(double(dim));
@@ -343,31 +373,58 @@ std::string Model::beam(const Tensor& log_probs) const {
     std::vector<Hyp> beam{{0, config["lm"].value("separate_bos_state", true) ? 1 : 0, -1, {}}};
     std::vector<float> scores(vocab);
     std::vector<int> states(vocab);
+    auto resolve_lm = [&](int current, std::vector<int>& row_states,
+                          std::vector<float>& row_scores) {
+        std::fill(row_states.begin(), row_states.end(), -1);
+        float accumulated = 0;
+        for (int order = 0; order <= config["lm"]["max_order"].get<int>(); ++order) {
+            for (int j = bounds[2 * current]; j < bounds[2 * current + 1]; ++j) {
+                int token = labels[j];
+                if (token >= 0 && token < vocab && row_states[token] < 0) {
+                    row_states[token] = targets[j];
+                    row_scores[token] = accumulated + arcs[j];
+                }
+            }
+            if (current == 0) break;
+            accumulated += backoff[current];
+            current = backs[current];
+        }
+    };
+
+    struct LmRow {
+        std::vector<int> states;
+        std::vector<float> scores;
+    };
+
+    // Blank frames and competing hypotheses repeatedly visit the same LM state.
+    // Cache its immutable backoff expansion within this request, with a fixed cap.
+    std::unordered_map<int, LmRow> lm_rows;
     for (int t = 0; t < cpu.size(0); ++t) {
         std::vector<Candidate> candidates;
         candidates.reserve(beam.size() * (vocab + 1));
         for (int b = 0; b < int(beam.size()); ++b) {
-            std::fill(states.begin(), states.end(), -1);
-            int current       = beam[b].state;
-            float accumulated = 0;
-            for (int order = 0; order <= config["lm"]["max_order"].get<int>(); ++order) {
-                for (int j = bounds[2 * current]; j < bounds[2 * current + 1]; ++j) {
-                    int token = labels[j];
-                    if (token >= 0 && token < vocab && states[token] < 0) {
-                        states[token] = targets[j];
-                        scores[token] = accumulated + arcs[j];
-                    }
+            const std::vector<int>* row_states   = &states;
+            const std::vector<float>* row_scores = &scores;
+            if (cpu_optimized_) {
+                auto found = lm_rows.find(beam[b].state);
+                if (found == lm_rows.end()) {
+                    if (lm_rows.size() >= beam_size * 4) lm_rows.clear();
+                    LmRow row{std::vector<int>(vocab), std::vector<float>(vocab)};
+                    resolve_lm(beam[b].state, row.states, row.scores);
+                    found = lm_rows.emplace(beam[b].state, std::move(row)).first;
                 }
-                if (current == 0) break;
-                accumulated += backoff[current];
-                current = backs[current];
+                row_states = &found->second.states;
+                row_scores = &found->second.scores;
+            } else {
+                resolve_lm(beam[b].state, states, scores);
             }
             for (int token = 0; token <= vocab; ++token) {
                 bool extend = token != vocab && token != beam[b].last;
-                if (extend && states[token] < 0) continue;
+                if (extend && (*row_states)[token] < 0) continue;
                 float score = beam[b].score + values[t * (vocab + 1) + token];
-                if (extend) score += beta + alpha * scores[token];
-                candidates.push_back({score, b, token, extend ? states[token] : beam[b].state});
+                if (extend) score += beta + alpha * (*row_scores)[token];
+                candidates.push_back(
+                    {score, b, token, extend ? (*row_states)[token] : beam[b].state});
             }
         }
         size_t count = std::min(beam_size, candidates.size());
