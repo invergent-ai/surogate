@@ -803,6 +803,98 @@ __global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits,
 
 constexpr int KD_MAX_TOPK_SMEM = 1024;
 
+template<class T>
+__global__ void candidate_ce_forward_kernel(const T* logits, float* losses, const int* targets,
+                                           const int* ids, int* valid, int* correct,
+                                           int BT, int P, int K, float softcap) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= BT || targets[row] == -100) return;
+    const int64_t offset = static_cast<int64_t>(row) * P;
+    const int64_t base = static_cast<int64_t>(row) * K;
+    float maximum = -INFINITY, sum = 0.0f;
+    int chosen = -1;
+    for (int k = 0; k < K; ++k) {
+        const int id = ids[base + k];
+        if (id < 0) continue;
+        const float value = maybe_softcap_value(float(logits[offset + id]), softcap);
+        if (value > maximum) { maximum = value; chosen = id; }
+    }
+    for (int k = 0; k < K; ++k) {
+        const int id = ids[base + k];
+        if (id >= 0) sum += expf(maybe_softcap_value(float(logits[offset + id]), softcap) - maximum);
+    }
+    losses[row] += maximum + logf(sum) - maybe_softcap_value(float(logits[offset + targets[row]]), softcap);
+    if (valid) atomicAdd(valid, 1);
+    if (correct && chosen == targets[row]) atomicAdd(correct, 1);
+}
+
+void candidate_cross_entropy_forward(const float* logits, float* losses, const int* targets,
+                                     const int* ids, int* valid, int* correct,
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream) {
+    candidate_ce_forward_kernel<<<(BT+127)/128,128,0,stream>>>(logits,losses,targets,ids,valid,correct,BT,P,K,softcap);
+    CUDA_CHECK(cudaGetLastError());
+}
+void candidate_cross_entropy_forward(const nv_bfloat16* logits, float* losses, const int* targets,
+                                     const int* ids, int* valid, int* correct,
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream) {
+    candidate_ce_forward_kernel<<<(BT+127)/128,128,0,stream>>>(logits,losses,targets,ids,valid,correct,BT,P,K,softcap);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Exact hard-label CE on a supplied candidate set. IDs are validated on the host;
+// -1 pads variable-size sets. Preserve candidate logits before zeroing an aliased
+// dense gradient buffer. Non-candidate logits have exactly zero derivative.
+template <class floatX>
+__global__ void candidate_cross_entropy_backward_kernel(floatX* dlogits,
+                                                        const floatX* logits,
+                                                        const float* full_lse,
+                                                        const float* dloss,
+                                                        const int* targets,
+                                                        int BT, int V, int P,
+                                                        float softcap,
+                                                        KdBackwardArgs args) {
+    const int row = blockIdx.x;
+    if (row >= BT) return;
+    const int gold = targets[row];
+    const int64_t offset = static_cast<int64_t>(row) * P;
+    if (gold == -100) {
+        for (int j = threadIdx.x; j < V; j += blockDim.x) dlogits[offset + j] = floatX(0.0f);
+        return;
+    }
+    __shared__ float values[KD_MAX_TOPK_SMEM];
+    __shared__ float candidate_lse;
+    const int64_t base = static_cast<int64_t>(row) * args.K;
+    for (int k = threadIdx.x; k < args.K; k += blockDim.x) {
+        const int id = args.ids[base + k];
+        values[k] = id >= 0 ? maybe_softcap_value(float(logits[offset + id]), softcap) : -INFINITY;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float maximum = -INFINITY, sum = 0.0f, gold_value = 0.0f;
+        for (int k = 0; k < args.K; ++k) maximum = fmaxf(maximum, values[k]);
+        for (int k = 0; k < args.K; ++k) {
+            sum += expf(values[k] - maximum);
+            if (args.ids[base + k] == gold) gold_value = values[k];
+        }
+        candidate_lse = maximum + logf(sum);
+        if (args.kd_loss_accum) atomicAdd(args.kd_loss_accum, candidate_lse - gold_value);
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < V; j += blockDim.x) dlogits[offset + j] = floatX(0.0f);
+    __syncthreads();
+    const float scale = dloss ? dloss[row] : 1.0f;
+    for (int k = threadIdx.x; k < args.K; k += blockDim.x) {
+        const int id = args.ids[base + k];
+        if (id < 0) continue;
+        float grad = (expf(values[k] - candidate_lse) - float(id == gold)) * scale;
+        if (softcap > 0.0f) {
+            const float y = values[k] / softcap;
+            grad *= 1.0f - y * y;
+        }
+        dlogits[offset + id] = floatX(grad);
+    }
+}
+
 template <class floatX>
 __global__ void kd_cross_entropy_backward_kernel(floatX* dlogits,
                                                  const floatX* logits,
@@ -1220,7 +1312,10 @@ static void fused_cross_entropy_backward_imp(Type* dlogits,
                                              const KdBackwardArgs* kd) {
     const int block_size = 256;
     const int grid_size = BT;
-    if (kd && kd->ids) {
+    if (kd && kd->candidate_only) {
+        candidate_cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(
+            dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, *kd);
+    } else if (kd && kd->ids) {
         validate_kd_args(kd);
         kd_cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
                                                                                logits,
@@ -1373,7 +1468,10 @@ static void chunked_cross_entropy_backward_imp(Type* dlogits,
     const int block_size = 256;
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
     dim3 grid(BT, n_blocks);
-    if (kd && kd->ids) {
+    if (kd && kd->candidate_only) {
+        candidate_cross_entropy_backward_kernel<<<BT, block_size, 0, stream>>>(
+            dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, *kd);
+    } else if (kd && kd->ids) {
         validate_kd_args(kd);
         kd_chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
                                                                                   logits,

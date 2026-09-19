@@ -25,6 +25,7 @@ def _make_config(**extra) -> SFTConfig:
 def test_defaults():
     d = DistillationConfig()
     assert d.teacher_model is None
+    assert d.candidate_only is False
     assert d.top_k == 32
     assert d.temperature == 1.0
     assert d.kd_weight == 0.5
@@ -35,6 +36,25 @@ def test_defaults():
     assert d.teacher_api_key_var == "VLLM_API_KEY"
     assert d.teacher_api_concurrency == 8
     assert d.teacher_api_timeout == 1200
+
+
+def test_candidate_mode_has_explicit_hard_label_contract():
+    c = _make_config(eval_steps=0, distillation={"candidate_only": True, "top_k": 8,
+                                                "kd_weight": 1., "ce_weight": 0.})
+    c._validate_distillation_config()
+    assert c.distillation.candidate_only
+    c.distillation.temperature = 2.
+    with pytest.raises(ValueError, match="candidate_only"):
+        c._validate_distillation_config()
+
+
+def test_candidate_mode_rejects_teacher_capture_before_io():
+    from surogate.distill.capture import run_capture
+
+    c = _make_config(eval_steps=0, distillation={"candidate_only": True, "top_k": 8,
+                                                "kd_weight": 1., "ce_weight": 0.})
+    with pytest.raises(ValueError, match="supplied answer-token IDs"):
+        run_capture(c, ["must-not-be-opened.bin"], "unused")
 
 
 def test_api_fields_dict_parsing():

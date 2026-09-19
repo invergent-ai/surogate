@@ -1527,6 +1527,7 @@ constexpr int CROSS_ENTROPY_BACKWARD_CHUNK_SIZE = 4096;
 /// per row (pass the tau=1 logsumexp when tau == 1). `kd_loss_accum` (may be
 /// null) accumulates tau^2 * KL(q || p_tau) over valid tokens via atomicAdd.
 struct KdBackwardArgs {
+    bool candidate_only = false;    ///< Hard-label CE normalized only over ids; q is ignored.
     const int* ids = nullptr;        ///< [BT, K] teacher top-K token ids
     const float* q = nullptr;        ///< [BT, K] renormalized teacher probs at tau
     const float* lse_tau = nullptr;  ///< [BT] logsumexp of logits/tau
@@ -1537,6 +1538,13 @@ struct KdBackwardArgs {
     float* kd_loss_accum = nullptr;  ///< [1] scalar accumulator for the KD loss metric
     int K = 0;                       ///< top-K entries per token
 };
+
+void candidate_cross_entropy_forward(const float* logits, float* losses, const int* targets,
+                                     const int* ids, int* valid, int* correct,
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream);
+void candidate_cross_entropy_forward(const nv_bfloat16* logits, float* losses, const int* targets,
+                                     const int* ids, int* valid, int* correct,
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream);
 
 /// Renormalize per-token teacher top-K logprobs into a probability
 /// distribution at temperature tau: q_k = softmax(logprobs_k * inv_tau).

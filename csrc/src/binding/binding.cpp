@@ -2285,7 +2285,8 @@ NB_MODULE(_surogate, m) {
                int top_k,
                float temperature,
                float kd_weight,
-               float ce_weight) {
+               float ce_weight,
+               bool candidate_only) {
                 // Pin the arrays to the trainer's geometry: py_train slices per
                 // GPU with the trainer's B/T, so self-consistent-but-wrong
                 // shapes would read out of bounds on the host.
@@ -2322,7 +2323,8 @@ NB_MODULE(_surogate, m) {
                                       top_k,
                                       temperature,
                                       kd_weight,
-                                      ce_weight);
+                                      ce_weight,
+                                      candidate_only);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -2333,6 +2335,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("temperature") = 1.0f,
             nb::arg("kd_weight") = 0.5f,
             nb::arg("ce_weight") = 0.5f,
+            nb::arg("candidate_only") = false,
             "Run one knowledge-distillation training micro-step.\n\n"
             "Standard SFT forward/backward with a top-K teacher signal injected into the\n"
             "fused LM-head loss: total = ce_weight*CE + kd_weight*tau^2*KL(teacher||student).\n"

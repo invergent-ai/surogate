@@ -442,6 +442,11 @@ def run_capture(
     device: str = "cuda:0",
 ) -> None:
     dist = config.distillation
+    if getattr(dist, "candidate_only", False):
+        raise ValueError(
+            "candidate_only sidecars must contain the supplied answer-token IDs; "
+            "teacher top-k capture cannot construct them."
+        )
     logger.warning(
         "distill-capture assumes the student and teacher share a tokenizer: the sidecar stores "
         "teacher-vocab token ids against the student's token stream. Cross-tokenizer "

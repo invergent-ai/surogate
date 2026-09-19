@@ -395,7 +395,8 @@ public:
                       int top_k,
                       float temperature,
                       float kd_weight,
-                      float ce_weight);
+                      float ce_weight,
+                      bool candidate_only = false);
 
     // Mean KD loss per valid token accumulated since the last call (rank-0
     // local, mirroring get_grpo_native_metrics). Consumes the accumulator on

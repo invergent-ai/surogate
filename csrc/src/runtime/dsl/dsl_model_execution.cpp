@@ -1774,6 +1774,7 @@ void DslModel::step_with_kd(Tensor inputs,
         request.kd_temperature = kd_config.temperature;
         request.kd_weight = kd_config.kd_weight;
         request.kd_ce_weight = kd_config.ce_weight;
+        request.kd_candidate_only = kd_config.candidate_only;
     };
 
     // make_forward_request keeps initialize_loss_buffers = (micro_step == 0)

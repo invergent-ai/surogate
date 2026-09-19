@@ -144,6 +144,7 @@ public:
         mKdTemperature = request ? request->kd_temperature : 1.0f;
         mKdWeight = request ? request->kd_weight : 0.0f;
         mKdCeWeight = request ? request->kd_ce_weight : 1.0f;
+        mKdCandidateOnly = request ? request->kd_candidate_only : false;
     }
 
     /// True when a knowledge-distillation teacher signal is attached to the
@@ -833,6 +834,7 @@ private:
     float mKdTemperature = 1.0f;
     float mKdWeight = 0.0f;
     float mKdCeWeight = 1.0f;
+    bool mKdCandidateOnly = false;
 
     // --- LM-head row-compaction state (shared across forward/backward) ---
     // Lazily allocated owned device buffers, shared between dispatch_fused_lm_head_loss_compact

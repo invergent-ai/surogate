@@ -57,6 +57,9 @@ class DistillationConfig:
     Args:
         teacher_model: Teacher model id or path (capture-time only). With
             teacher_api_base set, this is the served model name.
+        candidate_only: Use hard-label cross-entropy over the sidecar token IDs
+            instead of distillation. Sidecar logprobs are ignored. Requires
+            temperature=1, kd_weight=1, ce_weight=0, no teacher, and eval_steps=0.
         top_k: Number of teacher logprobs stored per token (1..1024).
         temperature: Distillation temperature tau (> 0).
         kd_weight: Weight of the KD (KL) term.
@@ -77,6 +80,7 @@ class DistillationConfig:
     """
 
     teacher_model: str | None = None  # capture-time only
+    candidate_only: bool = False  # Hard-label candidate CE; reuses sidecar IDs, no teacher.
     top_k: int = 32
     temperature: float = 1.0
     kd_weight: float = 0.5
@@ -648,6 +652,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 ce_weight = distillation_cfg.get("ce_weight", None)
                 self.distillation = DistillationConfig(
                     teacher_model=distillation_cfg.get("teacher_model", None),
+                    candidate_only=bool(distillation_cfg.get("candidate_only", False)),
                     top_k=int(distillation_cfg.get("top_k", 32)),
                     temperature=float(distillation_cfg.get("temperature", 1.0)),
                     kd_weight=float(distillation_cfg.get("kd_weight", 0.5)),
@@ -829,6 +834,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 )
         if d.ce_weight < 0:
             raise ValueError(f"distillation.ce_weight must be >= 0, got {d.ce_weight}.")
+        if d.candidate_only:
+            if d.temperature != 1.0 or d.kd_weight != 1.0 or d.ce_weight != 0.0:
+                raise ValueError("candidate_only requires temperature=1, kd_weight=1, ce_weight=0")
+            if d.top_k < 2 or d.teacher_model or d.teacher_api_base:
+                raise ValueError("candidate_only requires at least two candidate slots and no teacher")
+            if self.eval_steps != 0:
+                raise ValueError("candidate_only requires eval_steps=0; evaluate candidate loss separately")
         if d.teacher_batch_size < 1:
             raise ValueError(f"distillation.teacher_batch_size must be >= 1, got {d.teacher_batch_size}.")
         if d.teacher_api_concurrency < 1:

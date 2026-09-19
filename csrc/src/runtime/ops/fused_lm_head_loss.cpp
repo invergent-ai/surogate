@@ -451,7 +451,19 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
             logsumexp = &logsumexp_view;
         }
 
-        if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+        if (mKdCandidateOnly) {
+            const auto* ids = mKdTopkIdsGpu + token_offset * static_cast<long>(mKdTopK);
+            auto candidate_forward = [&](auto* typed_logits) {
+                candidate_cross_entropy_forward(typed_logits, loss_slice.get<float>(), tgt_slice.get<int>(),
+                    ids, mRunState.ValidTokenCount.get<int>(),
+                    op.attrs.compute_accuracy ? mRunState.CorrectCount.get<int>() : nullptr,
+                    static_cast<int>(nano_batch_size), V, P, mKdTopK,
+                    fuse_softcap_forward ? op.attrs.softcap : 0.0f, mRunState.MainStream);
+            };
+            if (logits.DType == ETensorDType::BF16) candidate_forward(logits.get<nv_bfloat16>());
+            else if (logits.DType == ETensorDType::FP32) candidate_forward(logits.get<float>());
+            else throw std::runtime_error("candidate_only: unsupported logit dtype");
+        } else if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
             if (!mRunState.scratch().cross_entropy_chunk_logsumexp.Data) {
                 throw std::runtime_error("fused_lm_head_loss: chunk logsumexp buffer is not allocated");
             }
@@ -686,6 +698,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             kd_args.tau_sq = mKdTemperature * mKdTemperature;
             kd_args.kd_loss_accum = mKdLossAccumGpu;
             kd_args.K = mKdTopK;
+            kd_args.candidate_only = mKdCandidateOnly;
             const bool tau_is_one = std::fabs(mKdTemperature - 1.0f) < 1e-6f;
             if (tau_is_one && logsumexp) {
                 kd_args.lse_tau = logsumexp->get<float>();

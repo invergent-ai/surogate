@@ -111,6 +111,7 @@ struct ExecutionRequest {
     float kd_temperature = 1.0f;
     float kd_weight = 0.0f;
     float kd_ce_weight = 1.0f;
+    bool kd_candidate_only = false;
 
     [[nodiscard]] const RuntimeBinding* find_binding(const std::string& name) const {
         for (const auto& binding : bindings) {

@@ -98,6 +98,7 @@ struct DpoNativeMetrics {
 /// Configuration for the offline knowledge-distillation step.
 /// Total loss: ce_weight * CE + kd_weight * tau^2 * KL(teacher_topk || student).
 struct KdLossConfig {
+    bool candidate_only = false;
     int top_k = 32;
     float temperature = 1.0f;
     float kd_weight = 0.5f;

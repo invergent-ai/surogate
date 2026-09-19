@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -1249,7 +1250,7 @@ class SurogateTrainerWrapper:
 
         # Preload first batch (eager path only)
         if not use_full_step_graphs:
-            self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+            self._load_training_microbatch(in_tokens, out_tokens, pos_ids)
 
         # Auto LR reduction guard
         loss_guard = LossGuard(self.lr_schedule, logger) if self.config.auto_lr_reduction else None
@@ -1298,7 +1299,7 @@ class SurogateTrainerWrapper:
             if not self.train_loader.has_next(_batches_per_step):
                 self.train_loader.advance_epoch()
                 if not use_full_step_graphs:
-                    self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                    self._load_training_microbatch(in_tokens, out_tokens, pos_ids)
 
             # Periodic evaluation (before training step)
             if (
@@ -1335,7 +1336,7 @@ class SurogateTrainerWrapper:
                 # Full-step training loads every micro-batch below, so doing it
                 # here would silently consume and skip one train batch per eval.
                 if not use_full_step_graphs:
-                    self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                    self._load_training_microbatch(in_tokens, out_tokens, pos_ids)
 
             # Periodic checkpointing (before training step)
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
@@ -1376,7 +1377,7 @@ class SurogateTrainerWrapper:
                 for micro_step in range(self.config.gradient_accumulation_steps):
                     if not self.train_loader.has_next():
                         self.train_loader.advance_epoch()
-                    self.train_loader.load_batch(
+                    self._load_training_microbatch(
                         in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], kd_ids, kd_logprobs
                     )
                     self.trainer.step_with_kd(
@@ -1389,6 +1390,9 @@ class SurogateTrainerWrapper:
                         temperature=self.config.distillation.temperature,
                         kd_weight=self.config.distillation.kd_weight,
                         ce_weight=self.config.distillation.ce_weight,
+                        # Ordinary KD remains compatible with installed builds
+                        # that predate the optional candidate-only extension.
+                        **({"candidate_only": True} if self.config.distillation.candidate_only else {}),
                     )
             elif self._dispatch_pp:
                 # Fill all gpus*bsz*_dpp_chunks rows = M microbatches. The loader yields one
@@ -1399,7 +1403,7 @@ class SurogateTrainerWrapper:
                         self.train_loader.advance_epoch()
                     start = c * chunk
                     end = start + chunk
-                    self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+                    self._load_training_microbatch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
             elif use_full_step_graphs:
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
                 for micro_step in range(self.config.gradient_accumulation_steps):
@@ -1407,12 +1411,12 @@ class SurogateTrainerWrapper:
                         self.train_loader.advance_epoch()
                     start = micro_step * chunk
                     end = start + chunk
-                    self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+                    self._load_training_microbatch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
             else:
                 for micro_step in range(self.config.gradient_accumulation_steps):
                     self.trainer.step(in_tokens, out_tokens, pos_ids)
                     if self.train_loader.has_next():
-                        self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                        self._load_training_microbatch(in_tokens, out_tokens, pos_ids)
 
             # Log GPU utilization
             if self.config.log_gpu_util > 0 and step % self.config.log_gpu_util == 0:
@@ -1802,6 +1806,15 @@ class SurogateTrainerWrapper:
                     stat["tensors"],
                     stat["nan"],
                 )
+
+    def _load_training_microbatch(self, inputs, targets, positions, *sidecars):
+        """Preserve native batch geometry and optionally audit consumed input rows."""
+        self.train_loader.load_batch(inputs, targets, positions, *sidecars)
+        if os.environ.get("SUROGATE_AUDIT_TRAIN_BATCHES") == "1":
+            record = {"epoch": self.train_loader.epoch(),
+                      "rows": [hashlib.sha256(row.tobytes()).hexdigest() for row in inputs]}
+            with (Path(self.config.output_dir) / "batch-audit.jsonl").open("a") as audit:
+                audit.write(json.dumps(record) + "\n")
 
     def run_evaluation(
         self, in_tokens: np.ndarray, out_tokens: np.ndarray, pos_ids: np.ndarray | None, max_steps: int
