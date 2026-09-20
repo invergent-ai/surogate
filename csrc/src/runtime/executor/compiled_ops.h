@@ -145,6 +145,7 @@ public:
         mKdWeight = request ? request->kd_weight : 0.0f;
         mKdCeWeight = request ? request->kd_ce_weight : 1.0f;
         mKdCandidateOnly = request ? request->kd_candidate_only : false;
+        mKdCandidateObjective = request ? request->kd_candidate_objective : CandidateObjective::CrossEntropy;
     }
 
     /// True when a knowledge-distillation teacher signal is attached to the
@@ -835,6 +836,7 @@ private:
     float mKdWeight = 0.0f;
     float mKdCeWeight = 1.0f;
     bool mKdCandidateOnly = false;
+    CandidateObjective mKdCandidateObjective = CandidateObjective::CrossEntropy;
 
     // --- LM-head row-compaction state (shared across forward/backward) ---
     // Lazily allocated owned device buffers, shared between dispatch_fused_lm_head_loss_compact

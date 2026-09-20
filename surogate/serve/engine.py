@@ -104,5 +104,24 @@ class Engine:
             on_delta=on_delta,
         )
 
+    def score_tokens(
+        self,
+        input_ids: list[int] | tuple[int, ...],
+        candidate_token_ids: list[int] | tuple[int, ...],
+        *,
+        allow_prefix_reuse: bool = False,
+    ) -> dict:
+        """Return raw next-token logits for exact supplied candidate token IDs.
+
+        No chat rendering or tokenization. The native scheduler's synthetic
+        completion token is deliberately excluded from this result.
+        """
+        from .candidate_readout import score_tokens
+
+        return score_tokens(
+            self._engine, input_ids, candidate_token_ids,
+            allow_prefix_reuse=allow_prefix_reuse,
+        )
+
     def memory_summary(self) -> dict:
         return self._engine.memory_summary()

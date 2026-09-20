@@ -57,9 +57,14 @@ class DistillationConfig:
     Args:
         teacher_model: Teacher model id or path (capture-time only). With
             teacher_api_base set, this is the served model name.
-        candidate_only: Use hard-label cross-entropy over the sidecar token IDs
+        candidate_only: Use a hard-label objective over the sidecar token IDs
             instead of distillation. Sidecar logprobs are ignored. Requires
             temperature=1, kd_weight=1, ce_weight=0, no teacher, and eval_steps=0.
+        candidate_objective: cross_entropy (legacy default), brier (multiclass sum),
+            or rps (normalized ordered score). Brier/RPS require LoRA fp8_hybrid,
+            and 2..255 non-padding candidates per supervised row. RPS uses sidecar
+            order as semantic ordinal order; use only homogeneous ordinal batches.
+            All three use gold-token one-hot targets, ignoring sidecar logprobs.
         top_k: Number of teacher logprobs stored per token (1..1024).
         temperature: Distillation temperature tau (> 0).
         kd_weight: Weight of the KD (KL) term.
@@ -80,7 +85,8 @@ class DistillationConfig:
     """
 
     teacher_model: str | None = None  # capture-time only
-    candidate_only: bool = False  # Hard-label candidate CE; reuses sidecar IDs, no teacher.
+    candidate_only: bool = False  # Hard gold-token targets over supplied IDs, no teacher.
+    candidate_objective: str = "cross_entropy"  # cross_entropy, brier, or ordered normalized rps.
     top_k: int = 32
     temperature: float = 1.0
     kd_weight: float = 0.5
@@ -653,6 +659,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 self.distillation = DistillationConfig(
                     teacher_model=distillation_cfg.get("teacher_model", None),
                     candidate_only=bool(distillation_cfg.get("candidate_only", False)),
+                    candidate_objective=distillation_cfg.get("candidate_objective", "cross_entropy"),
                     top_k=int(distillation_cfg.get("top_k", 32)),
                     temperature=float(distillation_cfg.get("temperature", 1.0)),
                     kd_weight=float(distillation_cfg.get("kd_weight", 0.5)),
@@ -834,6 +841,15 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 )
         if d.ce_weight < 0:
             raise ValueError(f"distillation.ce_weight must be >= 0, got {d.ce_weight}.")
+        if d.candidate_objective not in ("cross_entropy", "brier", "rps"):
+            raise ValueError("distillation.candidate_objective must be cross_entropy, brier, or rps")
+        if d.candidate_objective != "cross_entropy":
+            if not d.candidate_only:
+                raise ValueError("candidate_objective brier/rps requires candidate_only=True")
+            if not self.lora or self.recipe != "fp8_hybrid":
+                raise ValueError("candidate_objective brier/rps requires LoRA and recipe=fp8_hybrid")
+            if (self.ep_size or 1) != 1:
+                raise ValueError("candidate_objective brier/rps does not support expert parallelism")
         if d.candidate_only:
             if d.temperature != 1.0 or d.kd_weight != 1.0 or d.ce_weight != 0.0:
                 raise ValueError("candidate_only requires temperature=1, kd_weight=1, ce_weight=0")

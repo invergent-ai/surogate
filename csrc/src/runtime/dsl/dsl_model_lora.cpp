@@ -464,6 +464,12 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     // Final: norm = amax * sqrt(prescaled_sum), with token scaling and clipping
     const bool capturing = internal::stream_is_capturing(stream);
     const int* token_count = mUseTokenScale ? rs.ValidTokenCount.template get<int>() : nullptr;
+    // Dense/data-parallel LoRA uses all_reduce_avg, whereas ValidTokenCount is
+    // globally summed. Undo that averaging before the global token denominator.
+    // The same scale feeds both reported norm and optimizer gradient scaling.
+    // EP has distinct dense/expert reduction groups; leave that path unchanged.
+    const float reduction_scale = mUseTokenScale && !comm.ep_enabled()
+        ? static_cast<float>(std::max(1, comm.world_size())) : 1.0f;
     global_norm_sqrt_prescaled(buf.template get<float>(),
                                capturing ? nullptr : rs.NormHost,
                                grad_clip,
@@ -471,7 +477,8 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
                                total_tokens,
                                amax_ptr,
                                rs.DeviceProp,
-                               stream);
+                               stream,
+                               reduction_scale);
     internal::record_event_if_not_capturing(rs.NormDone, stream);
 }
 

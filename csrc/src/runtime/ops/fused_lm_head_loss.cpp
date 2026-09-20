@@ -458,7 +458,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
                     ids, mRunState.ValidTokenCount.get<int>(),
                     op.attrs.compute_accuracy ? mRunState.CorrectCount.get<int>() : nullptr,
                     static_cast<int>(nano_batch_size), V, P, mKdTopK,
-                    fuse_softcap_forward ? op.attrs.softcap : 0.0f, mRunState.MainStream);
+                    fuse_softcap_forward ? op.attrs.softcap : 0.0f, mRunState.MainStream, mKdCandidateObjective);
             };
             if (logits.DType == ETensorDType::BF16) candidate_forward(logits.get<nv_bfloat16>());
             else if (logits.DType == ETensorDType::FP32) candidate_forward(logits.get<float>());
@@ -699,6 +699,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             kd_args.kd_loss_accum = mKdLossAccumGpu;
             kd_args.K = mKdTopK;
             kd_args.candidate_only = mKdCandidateOnly;
+            kd_args.candidate_objective = mKdCandidateObjective;
             const bool tau_is_one = std::fabs(mKdTemperature - 1.0f) < 1e-6f;
             if (tau_is_one && logsumexp) {
                 kd_args.lse_tau = logsumexp->get<float>();

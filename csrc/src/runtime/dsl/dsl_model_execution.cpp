@@ -1698,6 +1698,10 @@ void DslModel::step_with_kd(Tensor inputs,
     if (!mExecutor) {
         throw std::logic_error("DslModel::step_with_kd called before allocate_run_state()");
     }
+    validate_candidate_objective(kd_config.candidate_objective);
+    if (!kd_config.candidate_only && kd_config.candidate_objective != CandidateObjective::CrossEntropy) {
+        throw std::invalid_argument("step_with_kd: proper candidate objective requires candidate_only");
+    }
     if (!kd_ids_cpu || !kd_logprobs_cpu) {
         throw std::invalid_argument("step_with_kd requires teacher top-K ids and logprobs");
     }
@@ -1775,6 +1779,7 @@ void DslModel::step_with_kd(Tensor inputs,
         request.kd_weight = kd_config.kd_weight;
         request.kd_ce_weight = kd_config.ce_weight;
         request.kd_candidate_only = kd_config.candidate_only;
+        request.kd_candidate_objective = kd_config.candidate_objective;
     };
 
     // make_forward_request keeps initialize_loss_buffers = (micro_step == 0)

@@ -396,7 +396,8 @@ public:
                       float temperature,
                       float kd_weight,
                       float ce_weight,
-                      bool candidate_only = false);
+                      bool candidate_only = false,
+                      const std::string& candidate_objective = "cross_entropy");
 
     // Mean KD loss per valid token accumulated since the last call (rank-0
     // local, mirroring get_grpo_native_metrics). Consumes the accumulator on

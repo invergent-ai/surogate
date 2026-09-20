@@ -312,18 +312,19 @@ __global__ void global_norm_sqrt_prescaled_kernel(float* out,
                                                   float grad_clip,
                                                   const int* valid_token_count,
                                                   float total_tokens,
-                                                  const float* amax_device) {
+                                                  const float* amax_device,
+                                                  float reduction_scale) {
     (void)total_tokens;
 
     float n_squared_prescaled = out[0];
     float amax = *amax_device;
     float norm = amax * std::sqrt(n_squared_prescaled);
 
-    float token_scale = 1.0f;
+    float token_scale = reduction_scale;
     if (valid_token_count) {
         int valid = *valid_token_count;
         if (valid > 0) {
-            token_scale = 1.0f / static_cast<float>(valid);
+            token_scale = reduction_scale / static_cast<float>(valid);
         }
     }
 
@@ -548,14 +549,16 @@ void global_norm_sqrt_prescaled(float* out,
                                 float total_tokens,
                                 const float* amax_device,
                                 const cudaDeviceProp& dp,
-                                cudaStream_t stream) {
+                                cudaStream_t stream,
+                                float reduction_scale) {
     (void)dp;
     global_norm_sqrt_prescaled_kernel<<<1, 1, 0, stream>>>(out,
                                                            out_cpu,
                                                            grad_clip,
                                                            valid_token_count,
                                                            total_tokens,
-                                                           amax_device);
+                                                           amax_device,
+                                                           reduction_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 

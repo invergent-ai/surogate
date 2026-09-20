@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_RUNTIME_EXECUTOR_EXECUTION_REQUEST_H
 #define SUROGATE_SRC_RUNTIME_EXECUTOR_EXECUTION_REQUEST_H
 
+#include "kernels/candidate_objective.h"
+
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -112,6 +114,7 @@ struct ExecutionRequest {
     float kd_weight = 0.0f;
     float kd_ce_weight = 1.0f;
     bool kd_candidate_only = false;
+    CandidateObjective kd_candidate_objective = CandidateObjective::CrossEntropy;
 
     [[nodiscard]] const RuntimeBinding* find_binding(const std::string& name) const {
         for (const auto& binding : bindings) {

@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_DSL_DSL_MODEL_H
 #define SUROGATE_SRC_DSL_DSL_MODEL_H
 
+#include "kernels/candidate_objective.h"
+
 #include <memory>
 #include <optional>
 #include <cstdint>
@@ -99,6 +101,7 @@ struct DpoNativeMetrics {
 /// Total loss: ce_weight * CE + kd_weight * tau^2 * KL(teacher_topk || student).
 struct KdLossConfig {
     bool candidate_only = false;
+    CandidateObjective candidate_objective = CandidateObjective::CrossEntropy;
     int top_k = 32;
     float temperature = 1.0f;
     float kd_weight = 0.5f;

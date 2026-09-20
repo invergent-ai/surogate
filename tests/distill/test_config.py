@@ -190,3 +190,51 @@ def test_cuda_graphs_untouched_without_distillation():
     c.model_info = SimpleNamespace(quant_info=None)
     c.create_runtime_config()
     assert c.use_cuda_graphs is True
+
+
+@pytest.mark.parametrize("objective", ["cross_entropy", "brier", "rps"])
+def test_candidate_objective_parses_explicit_hard_gold_contract(objective):
+    config = _make_config(lora=True, recipe="fp8_hybrid", eval_steps=0,
+                         distillation={"candidate_only": True, "candidate_objective": objective,
+                                       "top_k": 512, "kd_weight": 1., "ce_weight": 0.})
+    config._validate_distillation_config()
+    assert config.distillation.candidate_objective == objective
+    # Slots may include interspersed padding. Native preflight enforces <=255
+    # actual non-padding candidates for the two new proper objectives.
+    assert config.distillation.top_k == 512
+
+
+@pytest.mark.parametrize("objective", ["unknown", "forward_kl", "reverse_kl", "", None, 1])
+def test_candidate_objective_rejects_unsupported_semantics(objective):
+    config = _make_config(distillation={"candidate_objective": objective})
+    with pytest.raises(ValueError, match="candidate_objective"):
+        config._validate_distillation_config()
+
+
+@pytest.mark.parametrize("override", [{"candidate_only": False}, {"lora": False}, {"recipe": "bf16"}, {"recipe": "nvfp4"}])
+def test_new_candidate_objective_requires_explicit_lora_fp8(override):
+    kwargs = dict(lora=True, recipe="fp8_hybrid", eval_steps=0)
+    distillation = dict(candidate_only=True, candidate_objective="brier", kd_weight=1., ce_weight=0.)
+    if "candidate_only" in override:
+        distillation.update(override)
+    else:
+        kwargs.update(override)
+    config = _make_config(**kwargs, distillation=distillation)
+    with pytest.raises(ValueError, match="candidate_objective"):
+        config._validate_distillation_config()
+
+
+def test_legacy_candidate_ce_default_preserves_old_recipe_contract():
+    config = _make_config(recipe="bf16", eval_steps=0,
+                         distillation={"candidate_only": True, "kd_weight": 1., "ce_weight": 0.})
+    config._validate_distillation_config()
+    assert config.distillation.candidate_objective == "cross_entropy"
+
+
+@pytest.mark.parametrize("objective", ["brier", "rps"])
+def test_proper_candidates_reject_expert_parallelism_before_dispatch(objective):
+    config = _make_config(lora=True, recipe="fp8_hybrid", eval_steps=0, ep_size=2,
+                         distillation={"candidate_only": True, "candidate_objective": objective,
+                                       "kd_weight": 1., "ce_weight": 0.})
+    with pytest.raises(ValueError, match="expert parallelism"):
+        config._validate_distillation_config()

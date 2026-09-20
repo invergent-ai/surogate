@@ -2286,7 +2286,8 @@ NB_MODULE(_surogate, m) {
                float temperature,
                float kd_weight,
                float ce_weight,
-               bool candidate_only) {
+               bool candidate_only,
+               const std::string& candidate_objective) {
                 // Pin the arrays to the trainer's geometry: py_train slices per
                 // GPU with the trainer's B/T, so self-consistent-but-wrong
                 // shapes would read out of bounds on the host.
@@ -2324,7 +2325,7 @@ NB_MODULE(_surogate, m) {
                                       temperature,
                                       kd_weight,
                                       ce_weight,
-                                      candidate_only);
+                                      candidate_only, candidate_objective);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -2336,11 +2337,14 @@ NB_MODULE(_surogate, m) {
             nb::arg("kd_weight") = 0.5f,
             nb::arg("ce_weight") = 0.5f,
             nb::arg("candidate_only") = false,
+            nb::arg("candidate_objective") = "cross_entropy",
             "Run one knowledge-distillation training micro-step.\n\n"
             "Standard SFT forward/backward with a top-K teacher signal injected into the\n"
             "fused LM-head loss: total = ce_weight*CE + kd_weight*tau^2*KL(teacher||student).\n"
             "kd_ids/kd_logprobs are [rows, seq_len, top_k] arrays with row i aligned with\n"
             "targets[i] (the teacher's next-token distribution at input position i).\n"
+            "candidate_only uses gold-token targets; candidate_objective is cross_entropy (default), brier, or rps.\n"
+            "RPS follows non-padding candidate order. Brier/RPS require LoRA fp8_hybrid.\n"
             "Call update_with_config() after grad_accum micro-steps, then get_kd_loss().")
         .def(
             "get_kd_loss",

@@ -4021,36 +4021,26 @@ void MultiGPUPyTrainer::step_with_kd(const std::int32_t* inputs,
                                      float temperature,
                                      float kd_weight,
                                      float ce_weight,
-                                     bool candidate_only) {
+                                     bool candidate_only,
+                                     const std::string& candidate_objective) {
+    const auto objective = parse_candidate_objective(candidate_objective);
+    if (objective != CandidateObjective::CrossEntropy &&
+        (!candidate_only || !mLoRAConfig.has_value() || !mOptions.TrainingRecipe ||
+         !mOptions.TrainingRecipe->is_fp8_hybrid())) {
+        throw std::invalid_argument("candidate_objective brier/rps requires candidate_only, LoRA, and fp8_hybrid");
+    }
+    if (objective != CandidateObjective::CrossEntropy && mOptions.EPSize > 1) {
+        throw std::invalid_argument("candidate_objective brier/rps does not support expert parallelism");
+    }
     // Validate every rank's candidate rows before starting any worker/collective.
     if (candidate_only) {
         if (top_k < 2 || top_k > 1024 || temperature != 1.0f || kd_weight != 1.0f || ce_weight != 0.0f) {
             throw std::invalid_argument("candidate_only requires K in [2,1024], temperature=1, kd_weight=1, ce_weight=0");
         }
         const std::size_t rows = mContexts.size() * static_cast<std::size_t>(B) * T;
-        for (std::size_t row = 0; row < rows; ++row) {
-            if (targets[row] == -100) continue;
-            int count = 0;
-            bool gold_found = false;
-            for (int k = 0; k < top_k; ++k) {
-                const int id = kd_ids[row * top_k + k];
-                if (id == -1) continue;
-                if (id < 0 || id >= mConfig->VocabSize) {
-                    throw std::invalid_argument("candidate_only: candidate token outside vocabulary");
-                }
-                for (int prior = 0; prior < k; ++prior) {
-                    if (kd_ids[row * top_k + prior] == id) {
-                        throw std::invalid_argument("candidate_only: duplicate candidate token");
-                    }
-                }
-                ++count;
-                gold_found = gold_found || id == targets[row];
-            }
-            if (count < 2 || !gold_found) {
-                throw std::invalid_argument("candidate_only: each supervised row needs two candidates including gold");
-            }
-        }
+        validate_candidate_rows(targets, kd_ids, rows, top_k, mConfig->VocabSize, objective);
     }
+
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -4084,6 +4074,7 @@ void MultiGPUPyTrainer::step_with_kd(const std::int32_t* inputs,
 
     const dsl::KdLossConfig kd_config{
         .candidate_only = candidate_only,
+        .candidate_objective = objective,
         .top_k = top_k,
         .temperature = temperature,
         .kd_weight = kd_weight,

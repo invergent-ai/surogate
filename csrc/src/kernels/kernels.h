@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_KERNELS_KERNELS_H
 #define SUROGATE_SRC_KERNELS_KERNELS_H
 
+#include "kernels/candidate_objective.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -1527,7 +1529,8 @@ constexpr int CROSS_ENTROPY_BACKWARD_CHUNK_SIZE = 4096;
 /// per row (pass the tau=1 logsumexp when tau == 1). `kd_loss_accum` (may be
 /// null) accumulates tau^2 * KL(q || p_tau) over valid tokens via atomicAdd.
 struct KdBackwardArgs {
-    bool candidate_only = false;    ///< Hard-label CE normalized only over ids; q is ignored.
+    bool candidate_only = false;    ///< Hard gold-token objective only over ids; q is ignored.
+    CandidateObjective candidate_objective = CandidateObjective::CrossEntropy;
     const int* ids = nullptr;        ///< [BT, K] teacher top-K token ids
     const float* q = nullptr;        ///< [BT, K] renormalized teacher probs at tau
     const float* lse_tau = nullptr;  ///< [BT] logsumexp of logits/tau
@@ -1541,10 +1544,12 @@ struct KdBackwardArgs {
 
 void candidate_cross_entropy_forward(const float* logits, float* losses, const int* targets,
                                      const int* ids, int* valid, int* correct,
-                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream);
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream,
+                                     CandidateObjective objective = CandidateObjective::CrossEntropy);
 void candidate_cross_entropy_forward(const nv_bfloat16* logits, float* losses, const int* targets,
                                      const int* ids, int* valid, int* correct,
-                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream);
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream,
+                                     CandidateObjective objective = CandidateObjective::CrossEntropy);
 
 /// Renormalize per-token teacher top-K logprobs into a probability
 /// distribution at temperature tau: q_k = softmax(logprobs_k * inv_tau).
@@ -1918,7 +1923,8 @@ void global_norm_sqrt_prescaled(float* out,
                                 float total_tokens,
                                 const float* amax_device,
                                 const cudaDeviceProp& dp,
-                                cudaStream_t stream);
+                                cudaStream_t stream,
+                                float reduction_scale = 1.0f);
 
 // Multi-tensor fused norm (reduces kernel launches from O(N) to O(1)).
 // dtype_flags: 0=FP32, 1=BF16 per tensor.

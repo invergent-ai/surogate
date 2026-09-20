@@ -17,11 +17,14 @@
 #include "api/engine.h"
 #include "product/prompt_input/prompt_input.h"
 
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -41,6 +44,37 @@ const char* finish_reason_name(sinfer::FinishReason reason) {
     case sinfer::FinishReason::Cancelled: return "cancelled";
     }
     return "unknown";
+}
+
+// Raw-token scoring must not silently coerce floats or booleans into token IDs.
+std::vector<sinfer::TokenId> read_token_ids(nb::handle value, const char* name,
+                                         bool candidates) {
+    if (!PyList_Check(value.ptr()) && !PyTuple_Check(value.ptr())) {
+        throw std::invalid_argument(std::string(name) + " must be a list or tuple of integers");
+    }
+    const auto sequence = nb::borrow<nb::sequence>(value);
+    const auto count = nb::len(sequence);
+    if (count == 0 || (candidates && count > 256)) {
+        throw std::invalid_argument(std::string(name) + " must be nonempty (at most 256 candidates)");
+    }
+    std::vector<sinfer::TokenId> ids;
+    ids.reserve(count);
+    std::unordered_set<sinfer::TokenId> unique;
+    for (nb::handle item : sequence) {
+        if (!PyLong_CheckExact(item.ptr())) {
+            throw std::invalid_argument(std::string(name) + " requires integer IDs, not booleans or floats");
+        }
+        const auto wide = nb::cast<std::int64_t>(item);
+        if (wide < 0 || wide > std::numeric_limits<sinfer::TokenId>::max()) {
+            throw std::invalid_argument(std::string(name) + " ID is outside nonnegative int32 range");
+        }
+        const auto id = static_cast<sinfer::TokenId>(wide);
+        if (candidates && !unique.insert(id).second) {
+            throw std::invalid_argument("candidate_token_ids must be distinct");
+        }
+        ids.push_back(id);
+    }
+    return ids;
 }
 
 // Streams deltas into a Python callable; the engine publishes from its own
@@ -130,6 +164,52 @@ public:
         return out;
     }
 
+    nb::dict score_tokens(nb::handle input, nb::handle candidates, bool allow_prefix_reuse) {
+        auto input_ids = read_token_ids(input, "input_ids", false);
+        const auto candidate_ids = read_token_ids(candidates, "candidate_token_ids", true);
+        const auto prompt_count = input_ids.size();
+        sinfer::RequestOptions request;
+        request.execution.requested_output_tokens = 1;
+        request.execution.next_token_candidates = candidate_ids;
+        request.execution.allow_prefix_reuse = allow_prefix_reuse;
+        request.execution.cache_prompt = false;
+        request.stop.include_model_defaults = false;
+        // target_only is selected by a GPU prefix key, not by candidate IDs.
+        // Its ephemeral state storage avoids an autoregressive continuation;
+        // release the key with this call so unrelated requests cannot inherit it.
+        request.execution.save_gpu_prefix = std::make_shared<sinfer::GpuPrefixKey>();
+        const auto result = [&] {
+            nb::gil_scoped_release release;
+            auto prompt = engine().prepare_tokens(std::move(input_ids), allow_prefix_reuse);
+            return engine().generate(std::move(prompt), std::move(request));
+        }();
+        if (result.next_token_logits.size() != candidate_ids.size() ||
+            result.prompt.prompt_tokens != prompt_count ||
+            (!allow_prefix_reuse && result.reused_prompt_tokens != 0)) {
+            throw std::runtime_error("candidate readout returned mismatched counts or reused a disabled prefix");
+        }
+        for (const float value : result.next_token_logits) {
+            if (!std::isfinite(value)) throw std::runtime_error("candidate readout returned nonfinite logits");
+        }
+        nb::dict out;
+        out["protocol"] = "native-candidate-readout-v1";
+        out["candidate_token_ids"] = candidate_ids;
+        out["next_token_logits"] = result.next_token_logits;
+        out["prompt_tokens"] = result.prompt.prompt_tokens;
+        out["reused_prompt_tokens"] = result.reused_prompt_tokens;
+        out["finish_reason"] = finish_reason_name(result.finish_reason);
+        nb::dict timings;
+        timings["prepare_seconds"] = result.timings.prepare_seconds;
+        timings["first_token_seconds"] = result.timings.first_token_seconds;
+        timings["prefill_seconds"] = result.timings.prefill_seconds;
+        timings["decode_seconds"] = result.timings.decode_seconds;
+        timings["total_seconds"] = result.timings.total_seconds;
+        out["timings"] = timings;
+        // The scheduler internally emits candidates.front() as a synthetic
+        // completion. Never expose it (or decoded content) as a scored decision.
+        return out;
+    }
+
     nb::dict memory_summary() const {
         const sinfer::MemorySummary memory = engine().memory_summary();
         nb::dict out;
@@ -170,5 +250,7 @@ NB_MODULE(_surogate_serve, m) {
              nb::arg("top_p") = nb::none(), nb::arg("top_k") = nb::none(),
              nb::arg("min_p") = nb::none(), nb::arg("seed") = nb::none(),
              nb::arg("stop") = std::vector<std::string>{}, nb::arg("on_delta") = nb::none())
+        .def("score_tokens", &PyEngine::score_tokens, nb::arg("input_ids"),
+             nb::arg("candidate_token_ids"), nb::arg("allow_prefix_reuse").noconvert() = false)
         .def("memory_summary", &PyEngine::memory_summary);
 }

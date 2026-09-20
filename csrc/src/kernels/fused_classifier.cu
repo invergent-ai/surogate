@@ -806,16 +806,17 @@ constexpr int KD_MAX_TOPK_SMEM = 1024;
 template<class T>
 __global__ void candidate_ce_forward_kernel(const T* logits, float* losses, const int* targets,
                                            const int* ids, int* valid, int* correct,
-                                           int BT, int P, int K, float softcap) {
+                                           int BT, int P, int K, float softcap, CandidateObjective objective) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= BT || targets[row] == -100) return;
     const int64_t offset = static_cast<int64_t>(row) * P;
     const int64_t base = static_cast<int64_t>(row) * K;
     float maximum = -INFINITY, sum = 0.0f;
-    int chosen = -1;
+    int chosen = -1, count = 0;
     for (int k = 0; k < K; ++k) {
         const int id = ids[base + k];
         if (id < 0) continue;
+        ++count;
         const float value = maybe_softcap_value(float(logits[offset + id]), softcap);
         if (value > maximum) { maximum = value; chosen = id; }
     }
@@ -823,25 +824,45 @@ __global__ void candidate_ce_forward_kernel(const T* logits, float* losses, cons
         const int id = ids[base + k];
         if (id >= 0) sum += expf(maybe_softcap_value(float(logits[offset + id]), softcap) - maximum);
     }
-    losses[row] += maximum + logf(sum) - maybe_softcap_value(float(logits[offset + targets[row]]), softcap);
+    if (objective == CandidateObjective::CrossEntropy) {
+        losses[row] += maximum + logf(sum) - maybe_softcap_value(float(logits[offset + targets[row]]), softcap);
+    } else {
+        float loss = 0.0f, cdf_difference = 0.0f;
+        int seen = 0;
+        for (int k = 0; k < K; ++k) {
+            const int id = ids[base + k];
+            if (id < 0) continue;
+            const float probability = expf(maybe_softcap_value(float(logits[offset + id]), softcap) - maximum) / sum;
+            const float difference = probability - float(id == targets[row]);
+            if (objective == CandidateObjective::Brier) {
+                loss += difference * difference;
+            } else {
+                cdf_difference += difference;
+                if (++seen < count) loss += cdf_difference * cdf_difference;
+            }
+        }
+        losses[row] += objective == CandidateObjective::Rps ? loss / float(count - 1) : loss;
+    }
     if (valid) atomicAdd(valid, 1);
     if (correct && chosen == targets[row]) atomicAdd(correct, 1);
 }
 
 void candidate_cross_entropy_forward(const float* logits, float* losses, const int* targets,
                                      const int* ids, int* valid, int* correct,
-                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream) {
-    candidate_ce_forward_kernel<<<(BT+127)/128,128,0,stream>>>(logits,losses,targets,ids,valid,correct,BT,P,K,softcap);
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream, CandidateObjective objective) {
+    validate_candidate_objective(objective);
+    candidate_ce_forward_kernel<<<(BT+127)/128,128,0,stream>>>(logits,losses,targets,ids,valid,correct,BT,P,K,softcap,objective);
     CUDA_CHECK(cudaGetLastError());
 }
 void candidate_cross_entropy_forward(const nv_bfloat16* logits, float* losses, const int* targets,
                                      const int* ids, int* valid, int* correct,
-                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream) {
-    candidate_ce_forward_kernel<<<(BT+127)/128,128,0,stream>>>(logits,losses,targets,ids,valid,correct,BT,P,K,softcap);
+                                     int BT, int V, int P, int K, float softcap, cudaStream_t stream, CandidateObjective objective) {
+    validate_candidate_objective(objective);
+    candidate_ce_forward_kernel<<<(BT+127)/128,128,0,stream>>>(logits,losses,targets,ids,valid,correct,BT,P,K,softcap,objective);
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Exact hard-label CE on a supplied candidate set. IDs are validated on the host;
+// Exact hard-label CE/Brier/RPS on a supplied set. IDs are validated on the host;
 // -1 pads variable-size sets. Preserve candidate logits before zeroing an aliased
 // dense gradient buffer. Non-candidate logits have exactly zero derivative.
 template <class floatX>
@@ -863,6 +884,8 @@ __global__ void candidate_cross_entropy_backward_kernel(floatX* dlogits,
     }
     __shared__ float values[KD_MAX_TOPK_SMEM];
     __shared__ float candidate_lse;
+    __shared__ float probability_derivative[KD_MAX_TOPK_SMEM];
+    __shared__ float derivative_mean;
     const int64_t base = static_cast<int64_t>(row) * args.K;
     for (int k = threadIdx.x; k < args.K; k += blockDim.x) {
         const int id = args.ids[base + k];
@@ -877,7 +900,45 @@ __global__ void candidate_cross_entropy_backward_kernel(floatX* dlogits,
             if (args.ids[base + k] == gold) gold_value = values[k];
         }
         candidate_lse = maximum + logf(sum);
-        if (args.kd_loss_accum) atomicAdd(args.kd_loss_accum, candidate_lse - gold_value);
+        if (args.candidate_objective == CandidateObjective::CrossEntropy) {
+            if (args.kd_loss_accum) atomicAdd(args.kd_loss_accum, candidate_lse - gold_value);
+        } else {
+            int count = 0, seen = 0;
+            for (int k = 0; k < args.K; ++k) count += args.ids[base + k] >= 0;
+            float loss = 0.0f, cdf_difference = 0.0f;
+            for (int k = 0; k < args.K; ++k) {
+                const int id = args.ids[base + k];
+                probability_derivative[k] = 0.0f;
+                if (id < 0) continue;
+                const float probability = expf(values[k] - candidate_lse);
+                const float difference = probability - float(id == gold);
+                if (args.candidate_objective == CandidateObjective::Brier) {
+                    loss += difference * difference;
+                    probability_derivative[k] = 2.0f * difference;
+                } else {
+                    cdf_difference += difference;
+                    if (++seen < count) {
+                        loss += cdf_difference * cdf_difference / float(count - 1);
+                        probability_derivative[k] = 2.0f * cdf_difference / float(count - 1);
+                    }
+                }
+            }
+            if (args.candidate_objective == CandidateObjective::Rps) {
+                float reverse_cdf = 0.0f;
+                for (int k = args.K - 1; k >= 0; --k) {
+                    if (args.ids[base + k] < 0) continue;
+                    reverse_cdf += probability_derivative[k];
+                    probability_derivative[k] = reverse_cdf;
+                }
+            }
+            derivative_mean = 0.0f;
+            for (int k = 0; k < args.K; ++k) {
+                if (args.ids[base + k] >= 0) {
+                    derivative_mean += expf(values[k] - candidate_lse) * probability_derivative[k];
+                }
+            }
+            if (args.kd_loss_accum) atomicAdd(args.kd_loss_accum, loss);
+        }
     }
     __syncthreads();
     for (int j = threadIdx.x; j < V; j += blockDim.x) dlogits[offset + j] = floatX(0.0f);
@@ -886,7 +947,10 @@ __global__ void candidate_cross_entropy_backward_kernel(floatX* dlogits,
     for (int k = threadIdx.x; k < args.K; k += blockDim.x) {
         const int id = args.ids[base + k];
         if (id < 0) continue;
-        float grad = (expf(values[k] - candidate_lse) - float(id == gold)) * scale;
+        const float probability = expf(values[k] - candidate_lse);
+        float grad = args.candidate_objective == CandidateObjective::CrossEntropy
+            ? (probability - float(id == gold)) * scale
+            : probability * (probability_derivative[k] - derivative_mean) * scale;
         if (softcap > 0.0f) {
             const float y = values[k] / softcap;
             grad *= 1.0f - y * y;
@@ -1313,6 +1377,10 @@ static void fused_cross_entropy_backward_imp(Type* dlogits,
     const int block_size = 256;
     const int grid_size = BT;
     if (kd && kd->candidate_only) {
+        validate_candidate_objective(kd->candidate_objective);
+        if (!kd->ids || kd->K < 2 || kd->K > KD_MAX_TOPK_SMEM) {
+            throw std::invalid_argument("candidate_only: invalid candidate buffer/slot count");
+        }
         candidate_cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(
             dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, *kd);
     } else if (kd && kd->ids) {
@@ -1469,6 +1537,10 @@ static void chunked_cross_entropy_backward_imp(Type* dlogits,
     const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
     dim3 grid(BT, n_blocks);
     if (kd && kd->candidate_only) {
+        validate_candidate_objective(kd->candidate_objective);
+        if (!kd->ids || kd->K < 2 || kd->K > KD_MAX_TOPK_SMEM) {
+            throw std::invalid_argument("candidate_only: invalid candidate buffer/slot count");
+        }
         candidate_cross_entropy_backward_kernel<<<BT, block_size, 0, stream>>>(
             dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, *kd);
     } else if (kd && kd->ids) {
