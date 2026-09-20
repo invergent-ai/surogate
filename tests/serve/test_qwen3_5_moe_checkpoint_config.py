@@ -181,7 +181,7 @@ def test_routed_nvfp4_preserves_codes_and_each_experts_calibration():
         routed.build_gate_up(data, 0, g)
 
 
-def test_compressed_shared_experts_require_explicit_requantization():
+def _shared_expert_fixture():
     from types import SimpleNamespace
     from surogate.serve.convert.qwen3_5_moe.exports.compressed_tensors_source import CompressedTensorsSource
     g = inv.geometry_from_config(config_for(), token_domain=500)
@@ -190,9 +190,64 @@ def test_compressed_shared_experts_require_explicit_requantization():
     recipes = {r.object_name: r for r in recipe.build_recipes(g) if r.object_name in names}
     source = object.__new__(CompressedTensorsSource)
     source.logical = {name: s.shape for name, s in source_requirements(tuple(recipes.values())).items()}
+    source.stored_module = {}
     source.resolved = SimpleNamespace(modules={})
-    with pytest.raises(ValueError, match="--shared-expert w8"):
+    return source, specs, names, recipes
+
+
+def test_compressed_shared_experts_are_requantized_to_w8_by_default():
+    source, specs, names, recipes = _shared_expert_fixture()
+    for choice in ({}, {"shared_expert": "auto"}, {"shared_expert": "w8"}):
+        plan = source.plan(specs, recipes, **choice)
+        assert {s.name for s in plan.specs} == names
+        assert all(obj.requantize_to == inv.W8 for obj in plan.objects.values())
+        # the MTP block's shared expert keeps its own path; only the text core is planned here
+        assert plan.covered == {n for n in names if n.startswith("text/")}
+        assert plan.shared_expert == "w8"
+    with pytest.raises(ValueError, match="as-stored cannot be served"):
         source.plan(specs, recipes, shared_expert="as-stored")
-    plan = source.plan(specs, recipes, shared_expert="w8")
-    assert {s.name for s in plan.specs} == names
-    assert all(obj.requantize_to == inv.W8 for obj in plan.objects.values())
+    with pytest.raises(ValueError, match="must be one of"):
+        source.plan(specs, recipes, shared_expert="bf16")
+
+
+def test_compressed_shared_experts_missing_from_export_is_an_error():
+    source, specs, names, recipes = _shared_expert_fixture()
+    source.logical = {}  # an export whose shared expert cannot be found under either dialect
+    with pytest.raises(ValueError, match="not found in the compressed-tensors export"):
+        source.plan(specs, recipes)
+
+
+def test_compressed_source_folds_nested_text_tower_names(monkeypatch, tmp_path):
+    """Official Qwen3.5/3.6 exports nest the text tower under model.language_model.; the
+    recipes speak the flat dialect, so the planner must answer flat names from nested files."""
+    from types import SimpleNamespace
+    from surogate.serve.convert.qwen3_5_moe.exports import compressed_tensors_source as cts
+    stored = {
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight_packed": (16, 4),
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight_scale": (16, 1),
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight_global_scale": (1,),
+        "model.language_model.layers.0.mlp.gate.weight": (4, 8),
+        "lm_head.weight": (500, 8),
+    }
+    quantized = SimpleNamespace(scheme=SimpleNamespace(weights=object()))
+    plain = SimpleNamespace(scheme=None)
+    resolved = SimpleNamespace(modules={
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj": quantized,
+        "model.language_model.layers.0.mlp.gate": plain,
+        "lm_head": plain,
+    })
+    monkeypatch.setattr(cts, "read_tensor_shapes", lambda model_dir: stored)
+    monkeypatch.setattr(cts, "resolve_checkpoint", lambda model_dir: resolved)
+    source = cts.CompressedTensorsSource(tmp_path)
+    assert source.logical["model.layers.0.mlp.shared_expert.gate_proj.weight"] == (16, 8)
+    assert source.logical["model.layers.0.mlp.gate.weight"] == (4, 8)
+    assert source.logical["lm_head.weight"] == (500, 8)
+    assert source.is_quantized("model.layers.0.mlp.shared_expert.gate_proj.weight")
+    assert not source.is_quantized("model.layers.0.mlp.gate.weight")
+    assert (source.module_as_stored("model.layers.0.mlp.shared_expert.gate_proj.weight")
+            == "model.language_model.layers.0.mlp.shared_expert.gate_proj")
+    # an export spelling one tensor both ways is ambiguous and stays as stored
+    both = dict(stored); both["model.layers.0.mlp.gate.weight"] = (4, 8)
+    monkeypatch.setattr(cts, "read_tensor_shapes", lambda model_dir: both)
+    ambiguous = cts.CompressedTensorsSource(tmp_path)
+    assert "model.language_model.layers.0.mlp.gate.weight" in ambiguous.logical

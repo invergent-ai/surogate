@@ -72,11 +72,20 @@ SEGMENT_NAMES: Mapping[str, tuple[str, ...]] = {
 INPUT_DIVISOR_SUFFIX = "/input_scale_divisor"
 
 #: The shared expert's objects. The MoE kernels compute the shared expert inside their
-#: bodies and admit W8 only, so until they take NVFP4 the converter can, on request,
-#: requantise these to the W8 the base converter would have produced -- the one place the
-#: export's format is not kept, opted into explicitly, and recorded in the report.
+#: bodies and admit W8 only, so until they take NVFP4 the converter requantises these to
+#: the W8 the base converter would have produced -- the one place the export's format is
+#: not kept. ``auto`` (the default, what ``surogate serve`` uses) does so whenever the
+#: inventory asks for W8 there; ``w8`` is the same, spelled explicitly; ``as-stored``
+#: refuses instead, for the day the kernels take NVFP4. The effective choice is recorded
+#: in the plan and the report.
 SHARED_EXPERT_SUFFIXES = ("moe/shared_gate_up", "moe/shared_down")
-SHARED_EXPERT_CHOICES = ("as-stored", "w8")
+SHARED_EXPERT_CHOICES = ("auto", "as-stored", "w8")
+
+#: The VL-style nesting official Qwen3.5/3.6 exports use for the text tower. The recipes
+#: address sources in the flat dialect (``model.layers...``), as ShardReader does
+#: (PATCHES.md #16); this planner folds the same way so that a nested export plans
+#: exactly like a flat one.
+NESTED_TEXT_PREFIX = "model.language_model."
 
 
 @dataclass(frozen=True)
@@ -111,11 +120,27 @@ class SourcePlan:
     #: The inventory's original object names this plan took over, so a preflight
     #: knows which recipes it no longer needs to find sources for.
     covered: frozenset[str]
+    #: What became of the shared expert: "w8" (requantised) or "as-stored".
+    shared_expert: str = "as-stored"
 
 
 def _module_of(logical: str) -> str:
     assert logical.endswith(".weight"), logical
     return logical[: -len(".weight")]
+
+
+def _fold(name: str) -> str:
+    """The flat spelling of one stored name (``model.language_model.x`` -> ``model.x``)."""
+    if name.startswith(NESTED_TEXT_PREFIX):
+        return "model." + name[len(NESTED_TEXT_PREFIX):]
+    return name
+
+
+def _nested_and_flat_both_present(stored: Mapping[str, object]) -> bool:
+    """An export that spells one tensor both ways is ambiguous; keep names as stored."""
+    return any(
+        name.startswith(NESTED_TEXT_PREFIX) and _fold(name) in stored for name in stored
+    )
 
 
 class CompressedTensorsSource:
@@ -128,16 +153,31 @@ class CompressedTensorsSource:
             raise ValueError(f"{self.model_dir}: not a compressed-tensors checkpoint")
         self.resolved = resolved
         stored = read_tensor_shapes(self.model_dir)
-        # logical shapes under the recipe's names; a packed source is [n, k/2] on disk
+        # logical shapes under the recipe's names; a packed source is [n, k/2] on disk.
+        # Names are folded to the flat dialect the recipes speak; `self.stored_module`
+        # remembers the module name the file (and the resolved quantization) uses.
         self.logical: dict[str, tuple[int, ...]] = {}
+        self.stored_module: dict[str, str] = {}
+        ambiguous = _nested_and_flat_both_present(stored)
         for name, shape in stored.items():
             if name.endswith("." + PACKED_WEIGHT):
-                self.logical[name[: -len(PACKED_WEIGHT)] + "weight"] = (shape[0], shape[1] * 2)
+                logical = name[: -len(PACKED_WEIGHT)] + "weight"
+                folded = logical if ambiguous else _fold(logical)
+                self.logical[folded] = (shape[0], shape[1] * 2)
+                self.stored_module[_module_of(folded)] = _module_of(logical)
             elif name.endswith(".weight"):
-                self.logical.setdefault(name, tuple(shape))
+                folded = name if ambiguous else _fold(name)
+                if folded not in self.logical:
+                    self.logical[folded] = tuple(shape)
+                    self.stored_module[_module_of(folded)] = _module_of(name)
+
+    def module_as_stored(self, logical: str) -> str:
+        """The file's module name for a recipe-spelled logical tensor."""
+        module = _module_of(logical)
+        return self.stored_module.get(module, module)
 
     def is_quantized(self, logical: str) -> bool:
-        item = self.resolved.modules.get(_module_of(logical))
+        item = self.resolved.modules.get(self.module_as_stored(logical))
         return item is not None and item.scheme is not None and item.scheme.weights is not None
 
     # -- planning --------------------------------------------------------------
@@ -147,7 +187,7 @@ class CompressedTensorsSource:
         specs: Sequence[TensorSpec],
         recipes_by_name: Mapping[str, TensorRecipe],
         *,
-        shared_expert: str = "as-stored",
+        shared_expert: str = "auto",
     ) -> SourcePlan:
         """Rewrite the text-core specs: formats from the export, parents split.
 
@@ -155,35 +195,44 @@ class CompressedTensorsSource:
         this module's business; a fused parent listed in SEGMENT_NAMES becomes
         one object per segment, any other Linear-derived object keeps its name
         and takes the file's format. Everything else passes through untouched.
-        ``shared_expert="w8"`` keeps the shared expert's inventory objects as
-        they are and requantises them from the stored halves (see
-        SHARED_EXPERT_SUFFIXES).
+        The shared expert's inventory objects keep their names and are
+        requantised to W8 from the stored halves (see SHARED_EXPERT_SUFFIXES)
+        under ``shared_expert="auto"`` (the default) or ``"w8"``;
+        ``"as-stored"`` refuses while the MoE kernels admit W8 only.
         """
 
         if shared_expert not in SHARED_EXPERT_CHOICES:
             raise ValueError(f"shared_expert must be one of {SHARED_EXPERT_CHOICES}")
+        requantise_shared = shared_expert in ("auto", "w8")
         out: list[TensorSpec] = []
         objects: dict[str, ObjectSource] = {}
         covered: set[str] = set()
+        effective = "as-stored"
         for spec in specs:
             recipe = recipes_by_name.get(spec.name)
             suffix = _text_core_suffix(spec.name)
             if recipe is None or suffix is None:
                 out.append(spec)
                 continue
-            if suffix in SHARED_EXPERT_SUFFIXES and shared_expert != "w8":
+            if suffix in SHARED_EXPERT_SUFFIXES and not requantise_shared:
                 raise ValueError(
                     f"{spec.name}: serving currently requires W8 shared experts; "
-                    "pass --shared-expert w8 to explicitly convert these matrices"
+                    "--shared-expert as-stored cannot be served until the MoE kernels take NVFP4"
                 )
             program = evaluate_rows(recipe.expression, self.logical, None)
             if program is None:
+                if suffix in SHARED_EXPERT_SUFFIXES:
+                    raise ValueError(
+                        f"{spec.name}: the shared expert's sources were not found in the "
+                        "compressed-tensors export under either name dialect"
+                    )
                 out.append(spec)
                 continue
             segments = program.segments()
-            if shared_expert == "w8" and suffix in SHARED_EXPERT_SUFFIXES:
+            if requantise_shared and suffix in SHARED_EXPERT_SUFFIXES:
                 if spec.format != W8:
                     raise ValueError(f"{spec.name}: expected a W8 inventory object, got {spec.format}")
+                effective = "w8"
                 (source, rows), *rest = segments
                 objects[spec.name] = ObjectSource(
                     spec.name, source, rows, program.k, self.is_quantized(source),
@@ -209,7 +258,7 @@ class CompressedTensorsSource:
                 covered.add(spec.name)
             else:
                 out.append(spec)  # a multi-source BF16 parent the engine reads fused
-        return SourcePlan(tuple(out), objects, self.resolved, frozenset(covered))
+        return SourcePlan(tuple(out), objects, self.resolved, frozenset(covered), effective)
 
     def _emit(
         self,
@@ -240,7 +289,7 @@ class CompressedTensorsSource:
     ) -> bytes:
         if name.endswith(INPUT_DIVISOR_SUFFIX):
             item = objects[name[: -len(INPUT_DIVISOR_SUFFIX)]]
-            word = reader.get(_module_of(item.source) + ".input_global_scale")
+            word = reader.get(self.module_as_stored(item.source) + ".input_global_scale")
             return _fp32_word(word, item.source + " input_global_scale")
         item = objects[name]
         if item.requantize_to is not None:
@@ -250,14 +299,14 @@ class CompressedTensorsSource:
             for source, rows in item.segments():
                 index = torch.from_numpy(np.ascontiguousarray(rows))
                 if self.is_quantized(source):
-                    parts.append(_dequantize_nvfp4(reader, _module_of(source), index))
+                    parts.append(_dequantize_nvfp4(reader, self.module_as_stored(source), index))
                 else:
                     parts.append(reader.get(source).index_select(0, index).to(torch.bfloat16))
             fused = torch.cat(parts, dim=0).contiguous()
             layout = ROW_SPLIT_LAYOUT if item.requantize_to == W8 else CONTIGUOUS_LAYOUT
             spec = TensorSpec(name, (item.n, item.k), item.requantize_to, layout)
             return encode_tensor_payload(fused, spec, device)
-        module = _module_of(item.source)
+        module = self.module_as_stored(item.source)
         rows = torch.from_numpy(np.ascontiguousarray(item.rows))
         if not item.quantized:
             weight = reader.get(item.source)
@@ -329,6 +378,9 @@ def _text_core_suffix(name: str) -> str | None:
 
 __all__ = [
     "INPUT_DIVISOR_SUFFIX",
+    "NESTED_TEXT_PREFIX",
+    "SHARED_EXPERT_CHOICES",
+    "SHARED_EXPERT_SUFFIXES",
     "SEGMENT_NAMES",
     "WEIGHTS_ID",
     "CompressedTensorsSource",

@@ -96,7 +96,7 @@ def preflight_conversion(
     model_dir: str | Path,
     dflash_model_dir: str | Path | None,
     routed_nvfp4_dir: str | Path | None = None,
-    *, shared_expert: str = "as-stored", covered: tuple[str, ...] = (),
+    *, shared_expert: str = "auto", covered: tuple[str, ...] = (),
     object_specs=None, geometry: inventory.Geometry | None = None, dflash_geometry=None,
 ) -> ConversionPreflight:
     model = Path(model_dir)
@@ -280,7 +280,7 @@ def convert(
     *,
     device: str | torch.device = "cuda",
     routed_nvfp4_dir: str | Path | None = None,
-    shared_expert: str = "as-stored",
+    shared_expert: str = "auto",
     gguf_repack: str | Path | None = None,
     mtp: bool = True,
     vision: bool = True,
@@ -544,6 +544,12 @@ def convert(
         weights_id=compressed_tensors_source.WEIGHTS_ID if preflight.compressed_plan is not None
                    else routed_nvfp4.WEIGHTS_ID if preflight.routed_nvfp4_dir else inventory.WEIGHTS_ID,
     )
+    if preflight.compressed_plan is not None:
+        report["quantization"]["compressed_tensors"] = {
+            "shared_expert": preflight.compressed_plan.shared_expert,
+            "shared_expert_requested": shared_expert,
+            "text_core_objects_from_export": len(preflight.compressed_plan.objects),
+        }
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
@@ -581,11 +587,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--shared-expert",
         choices=compressed_tensors_source.SHARED_EXPERT_CHOICES,
-        default="as-stored",
+        default="auto",
         help=(
-            "compressed-tensors sources only: keep the shared expert in the format the export "
-            "stored (default), or requantise it to W8 for the MoE kernels, which admit W8 only "
-            "until they take NVFP4 -- the one place the export's format is not kept"
+            "compressed-tensors sources only: the MoE kernels admit W8 shared experts only, so "
+            "'auto' (default; what surogate serve uses) and 'w8' requantise the shared expert "
+            "to W8 from the stored NVFP4 or BF16 halves -- the one place the export's format "
+            "is not kept, recorded in the report -- while 'as-stored' refuses until the kernels "
+            "take NVFP4"
         ),
     )
     args = parser.parse_args(argv)
