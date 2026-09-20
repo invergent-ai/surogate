@@ -1372,7 +1372,7 @@ class RayDistributedTrainer:
                 if loss_guard is not None:
                     loss_guard.step(avg_loss, avg_norm, step)
                 plateau_detector.step(avg_loss, step)
-                phase = phase_detector.step(avg_loss, step)
+                phase = phase_detector.step(avg_loss, step, grad_norm=avg_norm)
                 gradient_tracker.step(avg_norm, step)
                 train_logger.set_phase(phase.value)
 

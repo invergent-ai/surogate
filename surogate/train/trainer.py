@@ -752,7 +752,11 @@ class SurogateTrainerWrapper:
 
             # Log allocator stats
             for idx in range(self.config.gpus):
-                alloc_info = self.trainer.get_allocator_info(idx)
+                try:
+                    alloc_info = self.trainer.get_allocator_info(idx)
+                except UnicodeDecodeError as exc:
+                    logger.warning(f"Skipping allocator diagnostics for GPU {idx}: invalid UTF-8 segment name ({exc})")
+                    continue
                 train_logger.log_allocator(alloc_info)
 
             # Calculate expected time per token for speed-of-light estimation
@@ -1065,7 +1069,7 @@ class SurogateTrainerWrapper:
             if loss_guard is not None:
                 loss_guard.step(result["loss"], result["norm"], step)
             plateau_detector.step(result["loss"], step)
-            phase = phase_detector.step(result["loss"], step)
+            phase = phase_detector.step(result["loss"], step, grad_norm=result["norm"])
             gradient_tracker.step(result["norm"], step)
             train_logger.set_phase(phase.value)
 
@@ -1393,6 +1397,11 @@ class SurogateTrainerWrapper:
                         # Ordinary KD remains compatible with installed builds
                         # that predate the optional candidate-only extension.
                         **({"candidate_only": True} if self.config.distillation.candidate_only else {}),
+                        **(
+                            {"candidate_objective": self.config.distillation.candidate_objective}
+                            if self.config.distillation.candidate_objective != "cross_entropy"
+                            else {}
+                        ),
                     )
             elif self._dispatch_pp:
                 # Fill all gpus*bsz*_dpp_chunks rows = M microbatches. The loader yields one
@@ -1499,7 +1508,7 @@ class SurogateTrainerWrapper:
             if loss_guard is not None:
                 loss_guard.step(result["loss"], result["norm"], step)
             plateau_detector.step(result["loss"], step)
-            phase = phase_detector.step(result["loss"], step)
+            phase = phase_detector.step(result["loss"], step, grad_norm=result["norm"])
             gradient_tracker.step(result["norm"], step)
             train_logger.set_phase(phase.value)
 
