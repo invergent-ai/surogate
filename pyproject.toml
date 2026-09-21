@@ -15,7 +15,6 @@ maintainers = [
 urls = { "Homepage" = "https://surogate.ai", "Repository" = "https://github.com/invergent-ai/surogate", "Issues" = "https://github.com/invergent-ai/surogate/issues" }
 keywords = ["machine learning", "large language model"]
 classifiers = [
-    "Environment :: GPU :: NVIDIA CUDA :: 12",
     "Environment :: GPU :: NVIDIA CUDA :: 13",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",

@@ -20,46 +20,35 @@ jobs:
     timeout-minutes: 360
 
     strategy:
-      fail-fast: false
       matrix:
         include:
-          # `archs` is the *trainer's* architecture set (CUDAARCHS), and it is the only place
-          # one exists: csrc/CMakeLists.txt declares a floor (SUROGATE_MIN_CUDA_ARCH 89) and,
-          # left alone, probes nvidia-smi and builds for the one card it finds. So this list is
-          # what the published wheels can run on, and nothing else has an opinion.
+          # One wheel. The engine needs CUDA 13.0 or newer -- 12.8 and 12.9 cap a block's static
+          # shared memory at 48 KB and refuse the W8 and NVFP4 GEMM families for sm_120a -- and a
+          # package that serves is the product, so there is no CUDA 12 wheel to build.
+          #
+          # `archs` is the *trainer's* architecture set (CUDAARCHS), and it is the only place one
+          # exists: csrc/CMakeLists.txt declares a floor (SUROGATE_MIN_CUDA_ARCH 89) and, left
+          # alone, probes nvidia-smi and builds for the one card it finds. So this list is what
+          # the published wheel can train on, and nothing else has an opinion.
           #
           # Three architectures, each with a claim on it. sm_89 is Ada -- the 4090, L4, L40.
           # sm_90a is Hopper, which the README's headline benchmark is measured on (53,900
           # tok/s on one H100). sm_120a is the RTX 50 series and the RTX PRO 6000. Datacenter
           # Blackwell -- sm_100a (B200) and sm_103a (B300) -- is not here: no code path, no
-          # benchmark and no config asks for it, and carrying it cost a whole third wheel,
-          # since sm_103a is the one thing CUDA 12.8 cannot compile.
+          # benchmark and no config asks for it.
           #
           # The serve engine keeps its own list, `SUROGATE_SERVE_CUDA_ARCHS`, narrower still at
           # sm_89 and sm_120a -- one binary for the 4090, the 5090 and the RTX PRO 6000. It is
           # left at its default here and checked in the wheel afterwards; restating it in the
           # workflow would only be a second place to be wrong.
           #
-          # `serve` says whether this wheel carries the engine. Both do: the engine's floor is
-          # CUDA 12.8, the first toolkit with sm_120a (SUROGATE_REQUIRE_SERVE turns a missing
-          # engine into a failed build rather than a quiet trainer-only wheel).
-          #
-          # Two wheels, not three. A binary built against 12.8 runs on any 12.x runtime -- CUDA
-          # minor version compatibility -- and nothing here links torch, so there is no ABI
-          # tying a wheel to one toolkit. cu128 covers the whole 12.x line, and anyone
-          # whose driver predates CUDA 13, which is why it is not folded into cu130 as well.
-          #
           # The toolkit comes from NVIDIA's apt repository for Ubuntu 24.04 rather than a
           # nvidia/cuda container: a job container starts before any step can free the
           # runner's disk, and the devel images are 7-10 GB on their own.
-          - cuda_version: "12.8"
-            wheel_tag: "cu128"
-            archs: "89;90a;120a"
-            serve: true
           - cuda_version: "13.1"
             wheel_tag: "cu130"
             archs: "89;90a;120a"
-            serve: true
+
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_C_COMPILER: gcc-13
@@ -78,16 +67,9 @@ jobs:
       CUDACXX: /usr/local/cuda-${{ matrix.cuda_version }}/bin/nvcc
       CCACHE_CUDA_PATHS: /usr/local/cuda-${{ matrix.cuda_version }}
       CCACHE_MAXSIZE: 3G
-      # pyproject asks for the engine unconditionally; a toolkit older than 13.1 cannot give it
-      # one, and that is a fact about the toolkit rather than a broken build host. The define
-      # merges with pyproject's (scikit-build-core merges dict settings, env winning per key).
-      SKBUILD_CMAKE_DEFINE: SUROGATE_REQUIRE_SERVE=${{ matrix.serve && 'ON' || 'OFF' }};SUROGATE_BUILD_SERVE=${{ matrix.serve && 'ON' || 'OFF' }}
-      # pyproject also names the serve products in `build.targets` and `install.components`, and
-      # a target CMake never defined fails `cmake --build`. Lists do not merge: a non-empty value
-      # here replaces pyproject's, an empty one leaves it alone. So the trainer-only wheel says
-      # exactly what it builds, and the serving wheel takes pyproject's full list.
-      SKBUILD_BUILD_TARGETS: ${{ matrix.serve && '' || '_surogate;llama-quantize' }}
-      SKBUILD_INSTALL_COMPONENTS: ${{ matrix.serve && '' || 'surogate;quantizer' }}
+      # A wheel without an engine in it is not this package: a missing FFmpeg, libcurl or
+      # toolkit must fail the build rather than quietly produce a trainer-only wheel.
+      SKBUILD_CMAKE_DEFINE: SUROGATE_REQUIRE_SERVE=ON
       UV_NO_SYNC: 1
 
     steps:
@@ -174,7 +156,6 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Install Rust for structured output
-        if: matrix.serve
         run: |
           if ! command -v rustup >/dev/null; then
             wget -qO /tmp/surogate-rustup.sh https://sh.rustup.rs
@@ -242,7 +223,6 @@ jobs:
       # An install-rule or component mistake produces a wheel that builds, installs, imports --
       # and has no engine in it. The only way to know is to look inside the artifact.
       - name: The wheel carries the engine, for both architectures
-        if: matrix.serve
         run: |
           set -euo pipefail
           check="${TMPDIR}/wheel-check"

@@ -27,7 +27,7 @@ ifneq ($(wildcard $(PIP_NCCL)/lib/libnccl.so.2),)
 NCCL_CMAKE_FLAGS := -DNCCL_INCLUDE_DIR=$(PIP_NCCL)/include -DNCCL_LIB_DIR=$(PIP_NCCL)/lib
 endif
 
-.PHONY: all build build-all export-checkpoint wheel wheel-cu128 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
+.PHONY: all build build-all export-checkpoint wheel wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
 
 # Default target
 all: build
@@ -175,7 +175,7 @@ serve-check: serve-test-py serve-test
 .PHONY: test-py test-py-slow grpo-test serve-configure serve-build serve-test-build serve-test serve-test-py serve-check quantizer
 
 # Internal helper: build + repair wheel for a given CUDA tag
-# Usage: $(call build_wheel,cu128)
+# Usage: $(call build_wheel,cu130)
 define build_wheel
 	cp pyproject.toml pyproject.toml.bak && \
 	trap 'mv -f pyproject.toml.bak pyproject.toml' EXIT INT TERM; \
@@ -184,24 +184,23 @@ define build_wheel
 	uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
 		-w dist/repaired/ \
 		--exclude libcuda.so.1 \
-		--exclude libcudart.so.12 \
 		--exclude libcudart.so.13 \
 		--exclude libcudnn.so.9 \
 		--exclude libcufile.so.0 \
 		--exclude libnccl.so.2 \
-		--exclude libcublas.so.12 \
 		--exclude libcublas.so.13 \
-		--exclude libcublasLt.so.12 \
 		--exclude libcublasLt.so.13 \
-		--exclude libnvidia-ml.so.1 && \
+		--exclude libnvidia-ml.so.1 \
+		--exclude libcupti.so.13 \
+		--exclude libnvrtc.so.13 \
+		--exclude libtorch_cpu.so \
+		--exclude libtorch.so \
+		--exclude libc10.so && \
 	mv dist/repaired/*.whl dist/ && \
 	rm -rf dist/repaired/ dist/*linux_x86_64*.whl
 	@echo "Wheel ready in dist/:"
 	@ls -lh dist/*.whl
 endef
-
-wheel-cu128:
-	$(call build_wheel,cu128)
 
 wheel-cu130:
 	$(call build_wheel,cu130)

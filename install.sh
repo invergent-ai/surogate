@@ -74,26 +74,15 @@ if [ -n "$INSTALLED_VERSION" ]; then
     echo "Currently installed surogate version: $INSTALLED_VERSION"
 fi
 
-# --- CUDA version-specific install functions ---
-# Each function installs the appropriate packages for its CUDA version.
+# --- Install the CUDA 13 packages this wheel needs ---
+# One wheel, because the serving engine needs CUDA 13.0 or newer: the 12.x toolkits cap a
+# block's static shared memory at 48 KB and cannot assemble the engine's W8 and NVFP4 GEMM
+# kernels for the RTX line. torch comes straight from PyPI, whose Linux build is CUDA 13.
 
-install_cu128_deps() {
-    local version="$1"
-    echo "Installing packages for CUDA 12.8+..."
-    echo "Note: the CUDA 12 wheel trains only. The native serving engine needs CUDA 13.1, so"
-    echo "      'surogate serve' and GRPO rollouts need a CUDA 13 driver and the cu130 wheel."
-    pip install "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
-    install_surogate_wheel "$version" "cu128"
-    pip install "nvidia-cuda-runtime-cu12==12.8.90" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.8.93" "nvidia-cudnn-cu12==9.19.0.56"
-}
-
-# One branch for the whole 12.x line. A binary built against 12.8 runs on any 12.x runtime
-# under CUDA minor version compatibility, and nothing in the wheel links torch, so no ABI ties
-# it to a toolkit.
 install_cu130_deps() {
     local version="$1"
-    echo "Installing packages for CUDA 13+..."
-    pip install "torch==2.11.0+cu130" "torchvision==0.26.0+cu130" "torchaudio==2.11.0+cu130" --index-url https://download.pytorch.org/whl/cu130
+    echo "Installing packages for CUDA 13..."
+    pip install "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0"
     install_surogate_wheel "$version" "cu130"
     pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115"
 }
@@ -141,7 +130,7 @@ install_surogate_wheel() {
     if [ -n "$INSTALLED_VERSION" ]; then
         echo "Upgrading surogate from $INSTALLED_VERSION to $version..."
         # Reinstall the package, not the environment: a plain --reinstall re-resolves every
-        # dependency, and the cu128 torch pin only exists on the PyTorch index.
+        # dependency, which a wheel upgrade has no reason to disturb.
         uv pip install --reinstall-package surogate "$wheel_path"
     else
         echo "Installing surogate..."
@@ -168,9 +157,17 @@ if [ -z "$CUDA_VERSION" ]; then
 fi
 
 CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1)
-CUDA_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
 
 echo "Detected CUDA version: $CUDA_VERSION"
+
+# Fail here rather than after a download: the serving engine cannot be built by a CUDA 12
+# toolkit (it caps a block's static shared memory at 48 KB and rejects the engine's W8 and
+# NVFP4 kernels for the RTX line), so there is no CUDA 12 package to fall back to.
+if [[ "$CUDA_MAJOR" -lt 13 ]]; then
+    echo "Error: surogate needs CUDA 13.0 or newer; this host reports CUDA $CUDA_VERSION."
+    echo "Update the NVIDIA driver to a 580 series or newer release and run this installer again."
+    exit 1
+fi
 
 # --- Resolve target version ---
 
@@ -191,16 +188,9 @@ else
     echo "Latest version: $VERSION"
 fi
 
-# --- Dispatch to the right install function ---
+# --- Install ---
 
-if [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    install_cu130_deps "$VERSION"
-elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
-    install_cu128_deps "$VERSION"
-else
-    echo "Error: CUDA $CUDA_VERSION is not compatible with Surogate. Aborting."
-    exit 1
-fi
+install_cu130_deps "$VERSION"
 
 # --- Verify the install before calling it one ---
 # Two questions the download cannot answer: does the package import with its extension, and
@@ -235,16 +225,13 @@ if problems:
 VERIFY
     ) || { echo "Error: $report"; exit 1; }
     if [ -n "$report" ]; then
-        if [ "$CUDA_MAJOR" -ge 13 ]; then
-            echo "Error: the serving engine is not whole on this host:"
-            echo "$report" | sed 's/^/  /'
-            echo "The wheel carries its own FFmpeg, numa and ICU; it relies on the system for glib and the"
-            echo "X11 client libraries, which a minimal server image may lack. On Ubuntu/Debian:"
-            echo "  sudo apt-get install -y libglib2.0-0t64 libx11-6 libxext6 libxrender1"
-            echo "then re-run this installer."
-            exit 1
-        fi
-        echo "(no serving engine in the CUDA 12 wheel; training commands are ready)"
+        echo "Error: the serving engine is not whole on this host:"
+        echo "$report" | sed 's/^/  /'
+        echo "The wheel carries its own FFmpeg, numa and ICU; it relies on the system for glib and the"
+        echo "X11 client libraries, which a minimal server image may lack. On Ubuntu/Debian:"
+        echo "  sudo apt-get install -y libglib2.0-0t64 libx11-6 libxext6 libxrender1"
+        echo "then re-run this installer."
+        exit 1
     else
         echo "Serving engine verified: surogate serve can start on this host."
     fi

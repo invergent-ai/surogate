@@ -834,15 +834,16 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
 endif()
 
 if(SUROGATE_BUILD_SERVE)
-    # 12.8 is the first toolkit that knows sm_120a, and everything else the engine reaches for
-    # (the cuBLASLt NVFP4 block-scale modes, cuda_fp4.h, batched memcpy, the nvcc flag the
-    # Marlin kernels need) is in it. The floor used to be 13.1, the toolkit on the dev host,
-    # without an API behind it.
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+    # 13.0 is the first toolkit whose ptxas will assemble this engine for sm_120a. The W8 and
+    # NVFP4 GEMM families declare 49-97 KB of static shared memory per block (185 kernels across
+    # ten translation units); CUDA 12.8 and 12.9 cap a static block at 48 KB and reject them
+    # ("uses too much shared data (0x12000 bytes, 0xc000 max)"), while 13.0 and 13.1 accept
+    # them. The floor was 13.1 before, which was simply the version on the build host.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
         if(SUROGATE_REQUIRE_SERVE)
-            message(FATAL_ERROR "serve: requires CUDA >= 12.8, found ${CMAKE_CUDA_COMPILER_VERSION}.")
+            message(FATAL_ERROR "serve: requires CUDA >= 13.0, found ${CMAKE_CUDA_COMPILER_VERSION}.")
         else()
-            message(STATUS "serve: requires CUDA >= 12.8; targets disabled")
+            message(STATUS "serve: requires CUDA >= 13.0; targets disabled")
         endif()
     else()
         enable_language(C)  # utf8proc
