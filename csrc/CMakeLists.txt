@@ -834,11 +834,15 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
 endif()
 
 if(SUROGATE_BUILD_SERVE)
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+    # 12.8 is the first toolkit that knows sm_120a, and everything else the engine reaches for
+    # (the cuBLASLt NVFP4 block-scale modes, cuda_fp4.h, batched memcpy, the nvcc flag the
+    # Marlin kernels need) is in it. The floor used to be 13.1, the toolkit on the dev host,
+    # without an API behind it.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
         if(SUROGATE_REQUIRE_SERVE)
-            message(FATAL_ERROR "serve: requires CUDA >= 13.1, found ${CMAKE_CUDA_COMPILER_VERSION}.")
+            message(FATAL_ERROR "serve: requires CUDA >= 12.8, found ${CMAKE_CUDA_COMPILER_VERSION}.")
         else()
-            message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
+            message(STATUS "serve: requires CUDA >= 12.8; targets disabled")
         endif()
     else()
         enable_language(C)  # utf8proc

@@ -40,9 +40,9 @@ jobs:
           # left at its default here and checked in the wheel afterwards; restating it in the
           # workflow would only be a second place to be wrong.
           #
-          # `serve` says whether this toolkit can build the engine at all: it needs CUDA 13.1,
-          # so the older wheel is trainer-only and says so rather than dropping the engine
-          # quietly (SUROGATE_REQUIRE_SERVE turns a missing engine into a failed build).
+          # `serve` says whether this wheel carries the engine. Both do: the engine's floor is
+          # CUDA 12.8, the first toolkit with sm_120a (SUROGATE_REQUIRE_SERVE turns a missing
+          # engine into a failed build rather than a quiet trainer-only wheel).
           #
           # Two wheels, not three. A binary built against 12.8 runs on any 12.x runtime -- CUDA
           # minor version compatibility -- and nothing here links torch, so there is no ABI
@@ -55,7 +55,7 @@ jobs:
           - cuda_version: "12.8"
             wheel_tag: "cu128"
             archs: "89;90a;120a"
-            serve: false
+            serve: true
           - cuda_version: "13.1"
             wheel_tag: "cu130"
             archs: "89;90a;120a"
@@ -228,7 +228,9 @@ jobs:
             --exclude libcublasLt.so.12 \
             --exclude libcublasLt.so.13 \
             --exclude libnvidia-ml.so.1 \
+            --exclude libcupti.so.12 \
             --exclude libcupti.so.13 \
+            --exclude libnvrtc.so.12 \
             --exclude libnvrtc.so.13 \
             --exclude libtorch_cpu.so \
             --exclude libtorch.so \
