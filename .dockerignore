@@ -14,3 +14,15 @@ dist/
 study/
 .pytest_cache/
 tests/
+csrc/build*/
+wheelhouse/
+models/
+output/
+outputs/
+tmp/
+regression_baselines/
+benchmarks/
+environments/
+jackalope/node_modules/
+*.log
+.env

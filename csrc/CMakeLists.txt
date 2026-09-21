@@ -1630,7 +1630,13 @@ target_include_directories(sinfer_shared PUBLIC ${SERVE_ROOT})
 # runtime themselves. They used to inherit that from whichever archive they linked
 # (sinfer_encoder -> sinfer_core -> CUDA::cudart); the archives are private to the
 # shared library now, so the requirement lives here.
-target_link_libraries(sinfer_shared PUBLIC CUDA::cudart)
+#
+# The driver is here for the executables' sake. libsinfer.so calls it (cuMemCreate and the
+# rest), and an executable linking the library must resolve those references at its own link
+# time. A host with a driver resolves them through libcuda.so.1; a build container has none,
+# only the toolkit's stub, and CUDA::cuda_driver is what puts that stub on the products' link
+# line. Without it the wheel build fails at the first executable, on every CI runner.
+target_link_libraries(sinfer_shared PUBLIC CUDA::cudart CUDA::cuda_driver)
 
 # Each archive goes in whole exactly once. CMake's WHOLE_ARCHIVE link feature cannot
 # do that here: most of these archives are reached again through another's

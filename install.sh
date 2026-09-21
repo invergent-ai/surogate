@@ -66,12 +66,11 @@ fi
 source "$VENV_DIR/bin/activate"
 echo "Virtual environment activated: $VENV_DIR"
 
-# Check if surogate is already installed and get current version
-INSTALLED_VERSION=""
-if python -c "import surogate" 2>/dev/null; then
-    INSTALLED_VERSION=$(python -c "import surogate; print(surogate.__version__)" 2>/dev/null || echo "")
-    # Strip any CUDA suffix from version for comparison (e.g., "0.0.1+cu128" -> "0.0.1")
-    INSTALLED_VERSION_BASE="${INSTALLED_VERSION%%+*}"
+# Check if surogate is already installed and get current version. The package metadata is the
+# authority: `surogate.__version__` does not exist (the package's __init__ is empty), so asking
+# for it reported every install as a fresh one.
+INSTALLED_VERSION=$(python -c "from importlib.metadata import version; print(version('surogate'))" 2>/dev/null || true)
+if [ -n "$INSTALLED_VERSION" ]; then
     echo "Currently installed surogate version: $INSTALLED_VERSION"
 fi
 
@@ -81,6 +80,8 @@ fi
 install_cu128_deps() {
     local version="$1"
     echo "Installing packages for CUDA 12.8+..."
+    echo "Note: the CUDA 12 wheel trains only. The native serving engine needs CUDA 13.1, so"
+    echo "      'surogate serve' and GRPO rollouts need a CUDA 13 driver and the cu130 wheel."
     pip install "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
     install_surogate_wheel "$version" "cu128"
     pip install "nvidia-cuda-runtime-cu12==12.8.90" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.8.93" "nvidia-cudnn-cu12==9.19.0.56"
@@ -139,7 +140,9 @@ install_surogate_wheel() {
 
     if [ -n "$INSTALLED_VERSION" ]; then
         echo "Upgrading surogate from $INSTALLED_VERSION to $version..."
-        uv pip install --reinstall "$wheel_path"
+        # Reinstall the package, not the environment: a plain --reinstall re-resolves every
+        # dependency, and the cu128 torch pin only exists on the PyTorch index.
+        uv pip install --reinstall-package surogate "$wheel_path"
     else
         echo "Installing surogate..."
         uv pip install "$wheel_path"
@@ -198,6 +201,55 @@ else
     echo "Error: CUDA $CUDA_VERSION is not compatible with Surogate. Aborting."
     exit 1
 fi
+
+# --- Verify the install before calling it one ---
+# Two questions the download cannot answer: does the package import with its extension, and
+# can the serving engine start on this host. `ldd` asks the second without a GPU; the driver
+# (libcuda.so.1) is the one permitted miss, since a headless install host may not have it.
+verify_install() {
+    local report
+    report=$(python - <<'VERIFY'
+import subprocess, sys
+try:
+    import surogate._surogate  # noqa: F401  (the training extension)
+except ImportError as error:
+    # The extension links the driver; a host with the toolkit but no driver (an image build,
+    # a login node) cannot load it, and that is not a broken install.
+    if "libcuda.so.1" not in str(error):
+        sys.exit(f"the training extension does not import: {error}")
+    print("no CUDA driver on this host; skipped the import check", file=sys.stderr)
+from surogate.cli.serve import _resolve_binary
+DRIVER = "libcuda.so.1"
+problems = []
+for mode in ("server", "generate", "embed"):
+    path = _resolve_binary(mode)
+    if path is None:
+        problems.append(f"{mode}: no engine binary")
+        continue
+    ldd = subprocess.run(["ldd", path], capture_output=True, text=True).stdout
+    missing = [ln.split("=>")[0].strip() for ln in ldd.splitlines() if "not found" in ln and DRIVER not in ln]
+    if missing:
+        problems.append(f"{mode}: {path} cannot load " + ", ".join(missing))
+if problems:
+    print("\n".join(problems))
+VERIFY
+    ) || { echo "Error: $report"; exit 1; }
+    if [ -n "$report" ]; then
+        if [ "$CUDA_MAJOR" -ge 13 ]; then
+            echo "Error: the serving engine is not whole on this host:"
+            echo "$report" | sed 's/^/  /'
+            echo "The wheel carries its own FFmpeg, numa and ICU; it relies on the system for glib and the"
+            echo "X11 client libraries, which a minimal server image may lack. On Ubuntu/Debian:"
+            echo "  sudo apt-get install -y libglib2.0-0t64 libx11-6 libxext6 libxrender1"
+            echo "then re-run this installer."
+            exit 1
+        fi
+        echo "(no serving engine in the CUDA 12 wheel; training commands are ready)"
+    else
+        echo "Serving engine verified: surogate serve can start on this host."
+    fi
+}
+verify_install
 
 echo ""
 if [ -n "$INSTALLED_VERSION" ]; then

@@ -180,7 +180,11 @@ pip install https://github.com/invergent-ai/surogate/releases/latest/download/su
 ```
 
 A CUDA 12 host needs the installer: PyPI publishes one Linux torch and it is a CUDA 13
-build, so a 12.x runtime has to take its torch from the PyTorch index.
+build, so a 12.x runtime has to take its torch from the PyTorch index. The CUDA 12 wheel
+trains only: the native serving engine needs CUDA 13.1, so `surogate serve` and GRPO
+rollouts want a CUDA 13 driver and the cu130 wheel. The engine carries its own FFmpeg, numa
+and ICU; it expects the system's glib and X11 client libraries, which a minimal server image
+may lack (Ubuntu: `libglib2.0-0t64 libx11-6 libxext6 libxrender1`). The installer checks.
 
 ### Serve a model
 

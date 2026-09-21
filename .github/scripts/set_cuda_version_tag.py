@@ -36,6 +36,10 @@ CUDA_DEPS = {
         "nvidia-cuda-runtime>=13,<14",
         "nvidia-cublas>=13,<14",
         "nvidia-cufile>=1.15,<2",
+        # The trainer extension links these two as well (ldd _surogate.abi3.so). torch's own
+        # pins bring them today; naming them keeps the wheel honest about what it loads.
+        "nvidia-cudnn-cu13>=9,<10",
+        "nvidia-nccl-cu13>=2,<3",
     ],
 }
 

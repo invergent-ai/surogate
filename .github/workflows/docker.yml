@@ -57,10 +57,13 @@ jobs:
             echo "build=false" >> $GITHUB_OUTPUT
           fi
 
+      # After a wheel build, check out the commit that built the wheels, so the Dockerfile
+      # matches the release; a manual run takes the branch it was started from.
       - name: Checkout code
         if: steps.should_build.outputs.build == 'true'
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -80,19 +83,25 @@ jobs:
         if: steps.should_build.outputs.build == 'true'
         id: version
         run: |
+          # The version is the release tag that built the wheels. For a workflow_run trigger
+          # that tag is the run's head_branch (a tag push reports the tag there), which is exact
+          # even when the tag is not on main's history; the nearest v* tag is only the fallback.
+          TRIGGER_REF="${{ github.event.workflow_run.head_branch }}"
           if [[ -n "${{ inputs.version }}" ]]; then
             VERSION="${{ inputs.version }}"
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          elif [[ "$TRIGGER_REF" == v* ]]; then
+            VERSION="${TRIGGER_REF#v}"
+            echo "Using the tag that built the wheels: ${VERSION}"
           else
-            # Get latest tag
             git fetch --tags
             LATEST_TAG=$(git describe --tags --abbrev=0 --match='v*' 2>/dev/null || echo "v0.0.1")
             VERSION="${LATEST_TAG#v}"
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
             echo "Using latest tag: ${VERSION}"
           fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Docker metadata
+        if: steps.should_build.outputs.build == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -101,6 +110,23 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest-${{ matrix.wheel_tag }}
             type=sha
+
+      # Every image gets its CUDA-suffixed tags. The bare version tag and `latest` name one
+      # image, and it is the one with the engine in it: two matrix entries pushing the same
+      # bare tag made it whichever job finished last, so `surogate:1.4.8` could be the
+      # trainer-only image.
+      - name: Image tags
+        if: steps.should_build.outputs.build == 'true'
+        id: tags
+        run: |
+          image="ghcr.io/invergent-ai/surogate"
+          version="${{ steps.version.outputs.version }}"
+          tags="${image}:${version}-${{ matrix.wheel_tag }}"$'\n'"${image}:latest-${{ matrix.wheel_tag }}"
+          if [ "${{ matrix.serve }}" = "true" ]; then
+            tags="${tags}"$'\n'"${image}:${version}"$'\n'"${image}:latest"
+          fi
+          { echo "tags<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "$tags"
 
       - name: Build and push Docker image
         if: steps.should_build.outputs.build == 'true'
@@ -111,10 +137,7 @@ jobs:
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.version.outputs.version }}
-          tags: |
-            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
-            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}
-            ghcr.io/invergent-ai/surogate:latest-${{ matrix.wheel_tag }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.wheel_tag }}
           cache-to: type=gha,mode=max,scope=${{ matrix.wheel_tag }}

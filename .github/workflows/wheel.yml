@@ -61,8 +61,15 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 8
       CUDAARCHS: ${{ matrix.archs }}
       # pyproject asks for the engine unconditionally; a toolkit older than 13.1 cannot give it
-      # one, and that is a fact about the toolkit rather than a broken build host.
-      SKBUILD_CMAKE_DEFINE: SUROGATE_REQUIRE_SERVE=${{ matrix.serve && 'ON' || 'OFF' }}
+      # one, and that is a fact about the toolkit rather than a broken build host. The define
+      # merges with pyproject's (scikit-build-core merges dict settings, env winning per key).
+      SKBUILD_CMAKE_DEFINE: SUROGATE_REQUIRE_SERVE=${{ matrix.serve && 'ON' || 'OFF' }};SUROGATE_BUILD_SERVE=${{ matrix.serve && 'ON' || 'OFF' }}
+      # pyproject also names the serve products in `build.targets` and `install.components`, and
+      # a target CMake never defined fails `cmake --build`. Lists do not merge: a non-empty value
+      # here replaces pyproject's, an empty one leaves it alone. So the trainer-only wheel says
+      # exactly what it builds, and the serving wheel takes pyproject's full list.
+      SKBUILD_BUILD_TARGETS: ${{ matrix.serve && '' || '_surogate;llama-quantize' }}
+      SKBUILD_INSTALL_COMPONENTS: ${{ matrix.serve && '' || 'surogate;quantizer' }}
       UV_NO_SYNC: 1
       CCACHE_DIR: /ccache
       CCACHE_MAXSIZE: 10G
@@ -77,7 +84,8 @@ jobs:
         run: |
           apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
           git wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev libdw-dev libelf-dev libicu-dev patch libnccl2 libnccl-dev \
-          g++-13
+          g++-13 \
+          pkg-config libcurl4-openssl-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libnuma-dev
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -114,6 +122,13 @@ jobs:
       - name: Show ccache stats
         run: ccache --show-stats
 
+      # auditwheel vendors every shared library the wheel's ELF files load and the manylinux
+      # policy does not promise, and patches their RPATHs to find the copies. What is excluded
+      # arrives another way and must stay excluded: the CUDA driver and the CUDA runtime libraries
+      # come from the driver and the nvidia-* wheels the RPATHs already point at; libtorch is
+      # surogate-stt's, from the torch wheel the package pins, reached through its own RPATH.
+      # Vendoring a second libtorch would double the wheel and fail here anyway, since the build's
+      # isolated environment is gone by the time this step runs.
       - name: Repair wheel
         run: |
           uv run --no-project --with auditwheel --with patchelf auditwheel repair wheelhouse/*.whl \
@@ -128,7 +143,12 @@ jobs:
             --exclude libcublas.so.13 \
             --exclude libcublasLt.so.12 \
             --exclude libcublasLt.so.13 \
-            --exclude libnvidia-ml.so.1
+            --exclude libnvidia-ml.so.1 \
+            --exclude libcupti.so.13 \
+            --exclude libnvrtc.so.13 \
+            --exclude libtorch_cpu.so \
+            --exclude libtorch.so \
+            --exclude libc10.so
           mv repaired/*.whl wheelhouse/
           rm -f wheelhouse/*linux_x86_64*.whl
           ls -lh wheelhouse/
@@ -144,6 +164,10 @@ jobs:
           for f in surogate/serve/_bin/surogate-engine \
                    surogate/serve/_bin/surogate-engine-cli \
                    surogate/serve/_bin/surogate-embed \
+                   surogate/serve/_bin/surogate-stt \
+                   surogate/serve/_bin/surogate-stt-lm \
+                   surogate/serve/_bin/surogate-tts \
+                   surogate/serve/_bin/surogate-tts-worker \
                    surogate/libsinfer.so \
                    surogate/serve/_llama_cpp/bin/llama-quantize; do
             if [ ! -f "/tmp/wheel-check/$f" ]; then
@@ -156,6 +180,23 @@ jobs:
           for arch in sm_89 sm_120a; do
             if ! grep -q "$arch" /tmp/wheel-cubins.txt; then
               echo "::error::the wheel's engine has no $arch cubins — it does not serve the whole RTX line"
+              exit 1
+            fi
+          done
+          rm -rf /tmp/wheel-check
+
+      # Both wheels train, and the trainer's device code lives in libsurogate-common.so (the
+      # extension module is a thin binding). CUDAARCHS above is the promise; this is the check.
+      - name: The wheel trains on Ada, Hopper and Blackwell
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/wheel-check && mkdir -p /tmp/wheel-check
+          python3 -m zipfile -e wheelhouse/*.whl /tmp/wheel-check
+          cuobjdump -lelf /tmp/wheel-check/surogate/libsurogate-common.so \
+            | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | tee /tmp/trainer-cubins.txt
+          for arch in sm_89 sm_90a sm_120a; do
+            if ! grep -q "$arch" /tmp/trainer-cubins.txt; then
+              echo "::error::the trainer has no $arch cubins"
               exit 1
             fi
           done
@@ -188,8 +229,9 @@ jobs:
           set -euo pipefail
           current="${GITHUB_REF_NAME}"
 
-          # previous tag before the current one (works well for semver-like vX.Y.Z tags)
-          prev="$(git describe --tags --abbrev=0 "${current}^" 2>/dev/null || true)"
+          # previous release tag before the current one. --match keeps the jackalope release
+          # channel's tags (jackalope-latest, jackalope-vX.Y.Z) out of the changelog range.
+          prev="$(git describe --tags --abbrev=0 --match 'v*' "${current}^" 2>/dev/null || true)"
 
           echo "current=$current" >> "$GITHUB_OUTPUT"
           echo "prev=$prev" >> "$GITHUB_OUTPUT"
