@@ -16,17 +16,20 @@ jobs:
     # redirects the job to another label -- `ubuntu-24.04`, say -- without editing this file,
     # for when the box is busy or offline.
     runs-on: ${{ vars.SUROGATE_WHEEL_RUNNER || 'self-hosted' }}
-    # The runner is a shared training host: a training run holds ~180 GB and a vLLM container
-    # ~160 GB, leaving ~160 GB for everything else. The build container gets a hard memory limit
-    # so a compile can never take the host down: an uncapped build at 20 jobs invoked the OOM
-    # killer on 2026-09-21 and killed a nine-hour training run. Inside the cgroup the kernel
-    # kills the build, which fails the job; outside it, nothing else on the host is touched.
-    # 60 GB holds 8 jobs at one nvcc thread each (NVCC_THREADS below) with room for the
-    # libsinfer.so link; nvcc's default of 8 threads compiles the three architectures at once
-    # and triples the per-job footprint.
+    # The runner is a shared training host, so the build container gets a hard memory limit: an
+    # uncapped build at 20 jobs invoked the OOM killer on 2026-09-21 and killed a nine-hour
+    # training run. Inside the cgroup the kernel kills the build, which fails the job; outside
+    # it, nothing else on the host is touched.
+    #
+    # The budget is measured, not guessed. The CUTLASS FP4 translation units dominate it at
+    # roughly 8 GB of cicc per job, so a build needs about `jobs x 8 GB`: 20 jobs took more than
+    # the 160 GB the host had free that morning, and 12 jobs inside a 60 GB cap hit the limit and
+    # had `matmul_cutlass_fp4_sm100.cu` killed under it. 8 jobs peak near 64 GB, which is why the
+    # cap is 96 GB -- room for the peak and for the libsinfer.so link, and still well under what
+    # a training run on this host needs.
     container:
       image: ${{ matrix.cuda_build_image }}
-      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache --memory 60g --memory-swap 60g
+      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache --memory 96g --memory-swap 96g
 
     strategy:
       matrix:
@@ -63,11 +66,11 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-      # Twelve jobs at one nvcc thread each peaks near 40 GB, inside the container's 60 GB
-      # limit with room for the libsinfer.so link. nvcc's default of 8 threads compiles the
-      # architectures of a translation unit at once and triples the per-job footprint
-      # (csrc/CMakeLists.txt reads NVCC_THREADS into SUROGATE_NVCC_THREADS).
-      CMAKE_BUILD_PARALLEL_LEVEL: 12
+      # See the container's memory limit above for where 8 comes from. NVCC_THREADS keeps each
+      # job compiling one architecture at a time; nvcc's default of 8 threads does all three at
+      # once and triples the per-job footprint (csrc/CMakeLists.txt reads it into
+      # SUROGATE_NVCC_THREADS).
+      CMAKE_BUILD_PARALLEL_LEVEL: 8
       NVCC_THREADS: 1
       CUDAARCHS: ${{ matrix.archs }}
       # A wheel without an engine in it is not this package: a missing FFmpeg, libcurl or
