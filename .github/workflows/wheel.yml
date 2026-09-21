@@ -9,14 +9,17 @@ jobs:
   wheel:
     name: Build wheel (CUDA ${{ matrix.cuda_version }})
     runs-on: self-hosted
-    # The runner is a shared training host. The build container gets a hard memory limit so a
-    # compile can never take the host down: an uncapped build at 20 jobs invoked the OOM killer
-    # on 2026-09-21 and killed a nine-hour training run, and 8 jobs with nvcc's 8 threads per
-    # translation unit still peaks in the tens of GB. Inside the cgroup the kernel kills the
-    # build, which fails the job; outside it, nothing else on the host is touched.
+    # The runner is a shared training host: a training run holds ~180 GB and a vLLM container
+    # ~160 GB, leaving ~160 GB for everything else. The build container gets a hard memory limit
+    # so a compile can never take the host down: an uncapped build at 20 jobs invoked the OOM
+    # killer on 2026-09-21 and killed a nine-hour training run. Inside the cgroup the kernel
+    # kills the build, which fails the job; outside it, nothing else on the host is touched.
+    # 60 GB holds 8 jobs at one nvcc thread each (NVCC_THREADS below) with room for the
+    # libsinfer.so link; nvcc's default of 8 threads compiles the three architectures at once
+    # and triples the per-job footprint.
     container:
       image: ${{ matrix.cuda_build_image }}
-      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache --memory 100g --memory-swap 100g
+      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache --memory 60g --memory-swap 60g
 
     strategy:
       matrix:
@@ -64,6 +67,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
       CMAKE_BUILD_PARALLEL_LEVEL: 8
+      # csrc/CMakeLists.txt reads this into SUROGATE_NVCC_THREADS (default 8). See the container
+      # memory limit above.
+      NVCC_THREADS: 1
       CUDAARCHS: ${{ matrix.archs }}
       # pyproject asks for the engine unconditionally; a toolkit older than 13.1 cannot give it
       # one, and that is a fact about the toolkit rather than a broken build host. The define
