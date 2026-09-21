@@ -84,6 +84,11 @@ jobs:
     defaults:
       run:
         working-directory: ${{ github.workspace }}
+        # Steps inside a container run under `sh` (dash) unless told otherwise, and the checks
+        # below open with `set -euo pipefail`, which dash rejects: `set: Illegal option -o
+        # pipefail`, exit 2, before the check has looked at anything. It failed that way the
+        # first time this workflow ran with those checks in it.
+        shell: bash
 
     steps:
       - name: Install System Dependencies
