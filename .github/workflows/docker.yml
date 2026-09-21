@@ -21,7 +21,9 @@ jobs:
   docker:
     name: Build Docker image (CUDA ${{ matrix.wheel_tag }})
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # After a wheel build, only when that build was for a release tag: a manual wheel run
+    # (workflow_dispatch on a branch) publishes nothing, so there is nothing to put in an image.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')) }}
     permissions:
       contents: read
       packages: write
