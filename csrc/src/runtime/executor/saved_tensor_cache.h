@@ -23,6 +23,8 @@
 
 #include <cstddef>
 #include <functional>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -181,6 +183,7 @@ public:
     /// D2H completes before any overwrite. Enables seq scaling: saved tensors
     /// dominate step VRAM (~6.8 GB at seq 256 on Laguna-S, linear in tokens).
     void offload_layer(int layer_idx, cudaStream_t stream) {
+        size_t moved_bytes=0,moved_count=0;
         const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
         for (auto& [key, buf] : mBuffers) {
             if (buf == nullptr || is_arena_backed(key) || key.rfind(prefix, 0) != 0) continue;
@@ -192,16 +195,19 @@ public:
                 hm.capacity = bytes;
             }
             CUDA_CHECK(cudaMemcpyAsync(hm.ptr, buf, bytes, cudaMemcpyDeviceToHost, stream));
+            moved_bytes+=bytes;++moved_count;
             hm.bytes = bytes;
             hm.valid = true;
             mPool.push_back({buf, bytes});
             buf = nullptr;
         }
+        if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] offload layer=%d moved=%zu bytes=%zu remaining_count=%d remaining_bytes=%zu\n",layer_idx,moved_count,moved_bytes,count(),total_plain_bytes());
     }
 
     /// Restore layer `layer_idx`'s offloaded buffers to the device (called at
     /// backward layer start, before any of the layer's ops read them).
     void restore_layer(int layer_idx, cudaStream_t stream) {
+        size_t moved_bytes=0,moved_count=0;
         const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
         for (auto& [key, hm] : mHostMirror) {
             if (!hm.valid || key.rfind(prefix, 0) != 0) continue;
@@ -218,11 +224,63 @@ public:
                 CUDA_CHECK(cudaMalloc(&dev, bytes));
             }
             CUDA_CHECK(cudaMemcpyAsync(dev, hm.ptr, hm.bytes, cudaMemcpyHostToDevice, stream));
+            moved_bytes+=hm.bytes;++moved_count;
             mBuffers[key] = dev;
             mSizes[key] = bytes;
             mArenaBacked[key] = false;
             hm.valid = false;
         }
+        if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] restore layer=%d moved=%zu bytes=%zu remaining_count=%d remaining_bytes=%zu\n",layer_idx,moved_count,moved_bytes,count(),total_plain_bytes());
+    }
+
+    // Only call after the graph has consumed every declared use of this layer.
+    // Pool reuse follows the same MainStream ordering as offload_layer/acquire.
+    // Future-dependent layers are NOT passed here; their device/host state is retained.
+    std::size_t retire_layer(int layer_idx) {
+        const std::string prefix="blocks["+std::to_string(layer_idx)+"].";
+        std::size_t retired=0;
+        for(auto& [key,buf]:mBuffers) {
+            if(key.rfind(prefix,0)!=0 || is_arena_backed(key)) continue;
+            if(buf) { retired+=mSizes[key]; mPool.push_back({buf,mSizes[key]}); buf=nullptr; }
+            if(auto it=mHostMirror.find(key);it!=mHostMirror.end()) it->second.valid=false;
+        }
+        return retired;
+    }
+    // Exact compiled producer key, retired only after all owning-layer uses.
+    std::size_t retire_key(const std::string& key) {
+        auto it=mBuffers.find(key);
+        if(it==mBuffers.end() || is_arena_backed(key)) return 0;
+        std::size_t bytes=0;
+        if(it->second) { bytes=mSizes[key]; mPool.push_back({it->second,bytes}); it->second=nullptr; }
+        if(auto host=mHostMirror.find(key);host!=mHostMirror.end()) host->second.valid=false;
+        return bytes;
+    }
+    struct Residency { std::size_t resident=0, host_valid=0, host_allocated=0, arena=0; };
+    Residency layer_residency(int layer_idx) const {
+        Residency r; const std::string prefix="blocks["+std::to_string(layer_idx)+"].";
+        for(const auto& [key,buf]:mBuffers) if(key.rfind(prefix,0)==0 && buf) {
+            if(is_arena_backed(key)) r.arena+=size_of(key); else r.resident+=size_of(key);
+        }
+        for(const auto& [key,hm]:mHostMirror) if(key.rfind(prefix,0)==0) {
+            r.host_allocated+=hm.capacity; if(hm.valid) r.host_valid+=hm.bytes;
+        }
+        return r;
+    }
+
+    void trace_inventory(int device, int layer, const char* phase) const {
+        if(!std::getenv("JEV_CACHE_INVENTORY_TRACE")) return;
+        std::size_t active=0,unscoped=0,pool=0,largest=0;
+        for(const auto& [key,buf]:mBuffers) {
+            if(buf && !is_arena_backed(key)) {
+                active+=size_of(key); if(key.rfind("blocks[",0)!=0) unscoped+=size_of(key);
+                std::fprintf(stderr,"[cache-entry] device=%d layer=%d phase=%s bytes=%zu key=%s\n",device,layer,phase,size_of(key),key.c_str());
+            }
+        }
+        for(const auto& [ptr,bytes]:mPool) { pool+=bytes;largest=std::max(largest,bytes);
+            std::fprintf(stderr,"[cache-pool] device=%d layer=%d phase=%s bytes=%zu\n",device,layer,phase,bytes);
+        }
+        std::size_t free=0,total=0;CUDA_CHECK(cudaMemGetInfo(&free,&total));
+        std::fprintf(stderr,"[cache-inventory] device=%d layer=%d phase=%s active=%zu unscoped=%zu pooled=%zu pool_count=%zu largest=%zu free=%zu total=%zu\n",device,layer,phase,active,unscoped,pool,mPool.size(),largest,free,total);
     }
 
     /// Bump offset into the (caller-owned) arena, for arena allocators that pack many

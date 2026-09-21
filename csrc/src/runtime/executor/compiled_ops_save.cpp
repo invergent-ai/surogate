@@ -223,6 +223,9 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
 
 void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list,
                                                          const CompiledGraph* capture_graph) {
+    if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] preallocate_enter device=%d offload=%d capture=%d backward=%d count=%d bytes=%zu\n",mRunState.DeviceId,int(mOptions.OffloadSavedTensors),int(mCapturing),int(mInBackwardPass),mSavedCache.count(),mSavedCache.total_plain_bytes());
+    struct TracePrealloc {SavedTensorCache&c;int d;~TracePrealloc(){if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] preallocate_exit device=%d count=%d bytes=%zu\n",d,c.count(),c.total_plain_bytes());}} trace_prealloc{mSavedCache,mRunState.DeviceId};
+
     // Only needed when recompute is enabled or MoE tensors require persistence.
     if (!mSaved) {
         return;

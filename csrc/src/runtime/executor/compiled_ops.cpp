@@ -401,6 +401,7 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
       mEpStates(mEpStrategy->ep_states()),
       mLLEPStates(mEpStrategy->llep_states()),
       mEPLayerMeta(mEpStrategy->layer_meta()) {
+    if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] ctor device=%d offload=%d recompute=%d graphs=%d\n",mRunState.DeviceId,int(mOptions.OffloadSavedTensors),int(mOptions.recompute_enabled()),int(mOptions.UseCudaGraphs));
     mSchemaHookDispatchEnabled = schema_hook_dispatch_enabled();
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
@@ -1013,10 +1014,13 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
+    if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] layer_start device=%d layer=%d offload=%d capture=%d backward=%d cache_count=%d cache_bytes=%zu\n",mRunState.DeviceId,layer_idx,int(mOptions.OffloadSavedTensors),int(mCapturing),int(mInBackwardPass),mSavedCache.count(),mSavedCache.total_plain_bytes());
     // Saved-tensor offload: bring this layer's offloaded saves back before any
     // of its backward/replay ops read them (stream-ordered on MainStream).
     if (mOptions.OffloadSavedTensors && !mCapturing && mInBackwardPass) {
+        mSavedCache.trace_inventory(mRunState.DeviceId,layer_idx,"before_restore");
         mSavedCache.restore_layer(layer_idx, mRunState.MainStream);
+        mSavedCache.trace_inventory(mRunState.DeviceId,layer_idx,"after_restore");
     }
     BeforeConsumeHookPayload before_consume_payload;
     before_consume_payload.weight_manager = mWeightManager;
@@ -1081,6 +1085,7 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
+    if(std::getenv("JEV_SAVED_OFFLOAD_TRACE"))std::fprintf(stderr,"[saved-trace] layer_end device=%d layer=%d offload=%d capture=%d backward=%d cache_count=%d cache_bytes=%zu\n",mRunState.DeviceId,layer_idx,int(mOptions.OffloadSavedTensors),int(mCapturing),int(mInBackwardPass),mSavedCache.count(),mSavedCache.total_plain_bytes());
     // Saved-tensor offload: after the forward layer completes, its saves are
     // final — move them to pinned host and recycle the device buffers.
     if (mOptions.OffloadSavedTensors && !mCapturing && !mInBackwardPass) {

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/ops/matmul_backward_policy.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/nvfp4_stream_layout.h"
 #include "recipes/nvfp4/nvfp4_recipe.h"
@@ -815,7 +816,12 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         used_recipe = true;
     }
 
-    const bool disable_qkv_recipe_bwd = is_qkv_op && skip_weight_grad && (mConfig.NumExperts > 0);
+    // The legacy frozen-MoE QKV fallback is valid for unquantized weights.
+    // Offloaded FP8-hybrid masters are streamed as scaled E4M3, so they
+    // must retain the recipe's scaled E4M3 x E5M2 dgrad dispatch.
+    const bool disable_qkv_recipe_bwd = disable_frozen_moe_qkv_recipe(
+        is_qkv_op, skip_weight_grad, mConfig.NumExperts, b.DType,
+        mRecipe && mRecipe->uses_fp8_hybrid_backward());
     if (!used_recipe && mRecipe && mode == EMMTranspose::NT && a.Sizes[0] == mB * mT && allow_quant &&
         !disable_qkv_recipe_bwd) {
         Tensor dA_tmp{};

@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/ops/moe_output_view.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <sstream>
@@ -24,16 +25,11 @@ void CompiledExecutor::dispatch_moe_unpermute(const CompiledOp& op) {
     const int total_tokens = num_tokens * top_k;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
 
-    // MoE output shape is dynamic: [num_tokens, hidden_size]
-    // Use the preallocated mlp_down buffer to avoid stack allocation issues.
-    // The mlp_down buffer has shape (B, T, C) which equals [num_tokens, hidden_size]
-    // when viewed as 2D. This buffer survives layer boundary cleanup.
-    int layer_idx = mCurrentLayer >= 0 ? mCurrentLayer : 0;
-    Tensor* mlp_down_ptr = executor_tid_slot(layer_idx, TensorSlot::BlockMLPDown);
-    if (!mlp_down_ptr) {
-        throw std::runtime_error("moe_unpermute: mlp_down slot unavailable for layer " + std::to_string(layer_idx));
-    }
-    Tensor out = view_tensor(*mlp_down_ptr, {static_cast<long>(num_tokens), static_cast<long>(hidden_size)});
+    // Honor the declared graph output and its liveness allocation. Reusing
+    // BlockMLPDown unconditionally overwrites Gemma's parallel dense branch
+    // input before its post-MLP normalization backward can consume it.
+    Tensor out = declared_moe_output_view(ensure_output_tensor(op.outputs[0]),
+                                         num_tokens, hidden_size, expert_out.DType);
 
     if (expert_out.DType == ETensorDType::BF16) {
         if (routing_weights.DType == ETensorDType::FP32) {

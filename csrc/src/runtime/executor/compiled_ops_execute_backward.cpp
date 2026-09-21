@@ -1,3 +1,4 @@
+#include "saved_cache_lifetime.h"
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -1085,6 +1086,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // 2767-2895. Idempotent via last_layer_restored - safe to call multiple
     // times for the same layer. `idx` is the op index that triggered the
     // cleanup (used by BwdCrossLayer persist to decide which tids survive).
+    const auto saved_cache_last_use = saved_cache_last_backward_use(graph, mConfig.NumLayers);
+    const auto backward_scratch_owners = backward_dqkv_cache_owners(graph);
     auto bwd_layer_end_cleanup = [&](int L, std::size_t idx, bool capturing = false) {
         if (L < 0 || L == last_layer_restored) return;
 
@@ -1185,6 +1188,28 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
         }
 
+        if(mOptions.OffloadSavedTensors && !capturing) {
+            mSavedCache.trace_inventory(mRunState.DeviceId,L,"before_retire");
+            for(const auto& [key,owner]:backward_scratch_owners) {
+                if(!saved_cache_layer_dead(saved_cache_last_use,owner,idx)) continue;
+                const auto bytes=mSavedCache.retire_key(key);
+                if(bytes && std::getenv("JEV_SAVED_LIFETIME_TRACE"))
+                    std::fprintf(stderr,"[scratch-lifetime] device=%d consumed=%d owner=%d idx=%zu last=%lld retired=%zu key=%s\n",mRunState.DeviceId,L,owner,idx,saved_cache_last_use[owner],bytes,key.c_str());
+            }
+
+            for(int owner=0;owner<mConfig.NumLayers;++owner) {
+                const auto before=mSavedCache.layer_residency(owner);
+                const bool dead=saved_cache_layer_dead(saved_cache_last_use,owner,idx);
+                const std::size_t retired=dead ? mSavedCache.retire_layer(owner) : 0;
+                if(std::getenv("JEV_SAVED_LIFETIME_TRACE") && (before.resident || owner==L)) {
+                    const auto after=mSavedCache.layer_residency(owner);
+                    std::fprintf(stderr,"[saved-lifetime] consumed=%d idx=%zu owner=%d last=%lld future=%d resident_before=%zu retired=%zu resident_after=%zu host_valid=%zu host_allocated=%zu arena=%zu\n",
+                        L,idx,owner,saved_cache_last_use[owner],!dead,before.resident,retired,after.resident,after.host_valid,after.host_allocated,after.arena);
+                }
+            }
+        }
+
+        if(mOptions.OffloadSavedTensors && !capturing) mSavedCache.trace_inventory(mRunState.DeviceId,L,"after_retire");
         mRunState.Stack.restore(initial_checkpoint);
         mTemps.clear();
         prune_stack_tensors(L);

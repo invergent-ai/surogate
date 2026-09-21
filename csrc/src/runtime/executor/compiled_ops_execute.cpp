@@ -6,6 +6,7 @@
 // compiled_ops_execute_backward.cpp.
 
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/executor/replay_saved_scope.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include "runtime/ep/ep_strategy.h"
@@ -482,6 +483,12 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             return false;
         };
 
+        const auto current_backward_saved=replay_backward_saved_dependencies(saved_graph,layer_idx);
+        const bool complete_scope=saved_graph && layer_idx>=0 &&
+            std::size_t(layer_idx)<saved_graph->layer_start_indices.size() &&
+            std::size_t(layer_idx)<saved_graph->layer_end_indices.size() &&
+            saved_graph->layer_start_indices[layer_idx]!=SIZE_MAX;
+        std::size_t trace_current_bytes=0,trace_other_bytes=0,trace_global_bytes=0,trace_current_count=0,trace_other_count=0,trace_global_count=0;
         for (auto& [name, tensor] : *mSaved) {
             if (!tensor.Data) continue;
             const bool stack_backed = mRunState.Stack.owns(tensor.Data);
@@ -495,6 +502,21 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             // before backward consumes the saved value.
             const std::size_t bytes = tensor.bytes();
             if (bytes == 0) continue;
+            int saved_owner=-1;std::string saved_field;parse_block_param(name,saved_owner,saved_field);
+            int saved_tid=fwd_graph.find_tensor_id(name);
+            if(saved_tid<0){auto it=fwd_graph.ssa_base_to_id.find(name);if(it!=fwd_graph.ssa_base_to_id.end())saved_tid=it->second;}
+            const bool produced=produced_ids.count(saved_tid)!=0;
+            const bool required=current_backward_saved.count(name)!=0;
+            // Other blocks retain their original saved entry / offload mirror.
+            // Their storage is restored or regenerated when they are consumed;
+            // copying it now both defeats layer-local residency and may read a
+            // stale recycled device pointer. Keep explicit cross-block reads.
+            if(!replay_saved_copy_required(saved_owner,layer_idx,produced,required,complete_scope)) {
+                if(std::getenv("JEV_REPLAY_SCOPE_TRACE"))std::fprintf(stderr,"[replay-scope] skip device=%d replay=%d owner=%d bytes=%zu produced=%d required=%d name=%s\n",mRunState.DeviceId,layer_idx,saved_owner,bytes,int(produced),int(required),name.c_str());
+                continue;
+            }
+            if(saved_owner==layer_idx){trace_current_bytes+=bytes;++trace_current_count;}else if(saved_owner>=0){trace_other_bytes+=bytes;++trace_other_count;}else{trace_global_bytes+=bytes;++trace_global_count;}
+            if(std::getenv("JEV_REPLAY_SCOPE_TRACE"))std::fprintf(stderr,"[replay-scope] copy device=%d replay=%d owner=%d bytes=%zu stack=%d temp=%d slot=%d produced=%d required=%d name=%s\n",mRunState.DeviceId,layer_idx,saved_owner,bytes,int(stack_backed),int(temp_backed),int(slot_requires_persist),int(produced),int(required),name.c_str());
             // Prefer the replay-persist arena (stable pointer across CUDA graph
             // captures/replays). Fall back to cudaMallocAsync for over-size
             // requests — arena-exhausted fallback keeps the legacy semantics
@@ -509,6 +531,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
             CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             tensor.Data = persistent;
         }
+
+        if(std::getenv("JEV_REPLAY_SCOPE_TRACE"))std::fprintf(stderr,"[replay-scope] summary device=%d replay=%d current_count=%zu current_bytes=%zu other_count=%zu other_bytes=%zu global_count=%zu global_bytes=%zu\n",mRunState.DeviceId,layer_idx,trace_current_count,trace_current_bytes,trace_other_count,trace_other_bytes,trace_global_count,trace_global_bytes);
 
         // rstd / ln / attn_out / h_out slots live on the Stack. The
         // save-capture loop above copies live .Data into mSaved; without

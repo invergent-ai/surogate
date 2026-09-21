@@ -1,4 +1,6 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/ops/norm_replay_policy.h"
+#include "runtime/ops/jev_boundary_diagnostic.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
 
 #include <algorithm>
@@ -85,6 +87,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     const bool is_hybrid_norm =
         (fwd_layer_idx >= 0 && fwd_layer_idx < static_cast<int>(mConfig.NumLayers) &&
          mConfig.architecture == modules::ArchitectureType::Hybrid && fwd_field == "norm_weight");
+
+    const bool declared_ln1 = op.outputs.size() >= 3 &&
+        is_block_input_norm(op.outputs[1].slot, op.outputs[2].slot);
+    const bool declared_ln2 = op.outputs.size() >= 3 &&
+        is_block_mlp_norm(op.outputs[1].slot, op.outputs[2].slot);
 
     // Bind residual_out directly to canonical buffer when possible, so the kernel
     // writes there without a post-kernel D2D copy.
@@ -238,7 +245,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
         // per-layer residual from ResidualManager as the residual input, with a zero "input"
         // so the kernel computes: residual_out = stored_res + 0 = stored_res, y = rmsnorm(stored_res).
         // This applies to both standard LN1 (dense models) and hybrid norm (Nemotron-H).
-        if (mInReplay && !is_ln2_fwd && fwd_layer_idx >= 0) {
+        if (mInReplay && declared_ln1 && !is_ln2_fwd && fwd_layer_idx >= 0) {
             Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
             if (stored_res_ffn.Data) {
                 // Use stored residual as residual_in, zero out input
@@ -279,11 +286,14 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
         copy_outputs_back();
     }
 
+    if (jev_diagnostic::enabled() && fwd_layer_idx >= 26)
+        jev_diagnostic::rms_before(residual_out,weight,rstd,nullptr,nullptr,fwd_layer_idx,op.outputs[2].name,op.inputs[2].name,mRunState.DeviceId,mRunState.MainStream,op.attrs.eps,mInBackwardPass);
+
     // Pre-quantize normalized output into FP8 buffer for the downstream matmul.
     // LN1 output → QKV matmul input (fp8_quants.ln1)
     // LN2 output → MLPUp matmul input (fp8_quants.ln2)
     if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() && !mRunState.has_fp8_delayed_scaling() &&
-        fwd_layer_idx >= 0) {
+        fwd_layer_idx >= 0 && (declared_ln1 || declared_ln2)) {
         auto& quants = mRunState.fp8_forward_quants();
         Tensor* fp8_buf = nullptr;
         DslRunState::FP8BufferReady flag = DslRunState::FP8Ready_None;
@@ -613,6 +623,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         }
     };
 
+    auto diagnostic=jev_diagnostic::rms_before(kernel_residual_out,kernel_weight,*rstd_ptr,&kernel_d_y,&kernel_d_residual,jev_diagnostic::layer_from_name(op.inputs[3].name,op.attrs.layer_idx),op.inputs[4].name,op.inputs[3].name,mRunState.DeviceId,mRunState.MainStream,op.attrs.eps,mInBackwardPass);
+
     if (mixed_weight_grad) {
         // Compute d_input in BF16 and weight grad separately in FP32.
         Tensor tmp_dw =
@@ -659,6 +671,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                          skip_weight_grad);
     }
     copy_bwd_outputs_back();
+    jev_diagnostic::rms_after(diagnostic,kernel_d_input,mRunState.DeviceId,mRunState.MainStream);
 
     // Register d_input in mTensors for both graph outputs. Both outputs carry the same
     // gradient (add backward is identity for both inputs). Using store_tensor ensures

@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/ops/jev_boundary_diagnostic.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -63,6 +64,8 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         mTemps.push_back(out);
     }
 
+    const bool diagnostic_scalar = op.inputs[1].name.find("layer_scalar") != std::string::npos;
+    auto diagnostic = diagnostic_scalar ? jev_diagnostic::scalar_before(*big,*small,mRunState.MainStream) : jev_diagnostic::ScalarSnapshot{};
     if (!broadcast) {
         // Standard element-wise multiply
         const long n = static_cast<long>(a.nelem());
@@ -131,6 +134,7 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
             throw std::runtime_error("dispatch_mul broadcast: unsupported dtype");
         }
     }
+    if (diagnostic_scalar) jev_diagnostic::scalar_after(diagnostic,out,jev_diagnostic::layer_from_name(op.inputs[1].name,op.attrs.layer_idx),mRunState.DeviceId,mRunState.MainStream,false,mInBackwardPass);
     store_tensor(op.outputs[0], out);
 }
 
@@ -253,6 +257,9 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         int d_small_idx = 1 - big_input_idx;
         Tensor d_big = allocate_like(static_cast<std::size_t>(d_big_idx), *big);
         const long n = static_cast<long>(big->nelem());
+        const bool diagnostic_scalar = op.inputs[2].name.find("layer_scalar") != std::string::npos;
+        auto diagnostic = diagnostic_scalar ? jev_diagnostic::scalar_before(d_out,*small,mRunState.MainStream) : jev_diagnostic::ScalarSnapshot{};
+
         if (d_out.DType == ETensorDType::BF16) {
             scale_rows(d_big.get<nv_bfloat16>(),
                        d_out.get<nv_bfloat16>(),
@@ -277,6 +284,7 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         } else {
             throw std::runtime_error("dispatch_mul_backward scalar: unsupported dtype");
         }
+        if (diagnostic_scalar) jev_diagnostic::scalar_after(diagnostic,d_big,jev_diagnostic::layer_from_name(op.inputs[2].name,op.attrs.layer_idx),mRunState.DeviceId,mRunState.MainStream,true,mInBackwardPass);
         if (op.outputs.size() > static_cast<std::size_t>(d_big_idx) && !op.outputs[d_big_idx].name.empty())
             store_tensor(op.outputs[d_big_idx], d_big);
         // d_scalar: skip for frozen layer_scalar (gradient output is usually empty)

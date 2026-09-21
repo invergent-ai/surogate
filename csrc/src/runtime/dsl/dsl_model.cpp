@@ -30,6 +30,7 @@
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/per_layer_dims.h"
+#include "runtime/lora/lora_attention_geometry.h"
 #include "kernels/kernels.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
@@ -1419,29 +1420,36 @@ DslModel::DslModel(const PretrainedConfig& config,
         wm.per_layer_dims = mRuntimeConfig.per_layer_dims;
         wm.layer_has_dense_mlp = mRuntimeConfig.layer_has_dense_mlp;
         wm.layer_has_moe = mRuntimeConfig.layer_has_moe;
-        if (mModelConfig.ModelTypeName == "glm5_next") {
-            wm.attention_shapes.resize(mModelConfig.NumLayers);
+        // Allocate from the same per-parameter declarations used by dispatch.
+        // This covers variable KV heads, gated Q projections, native fused QKV,
+        // and K=V/shared-KV layers without inventing absent projection adapters.
+        wm.attention_shapes.resize(mModelConfig.NumLayers);
+        const bool glm_attention_names = mModelConfig.ModelTypeName == "glm5_next";
+        if (glm_attention_names) {
             wm.tensor_prefix = "base_model.model.model.language_model.layers";
             wm.attention_names.resize(mModelConfig.NumLayers);
-            ShapeEnv env = make_shape_env(*mModule, 1, 1);
-            augment_shape_env(env, mModule->config);
-            for (const auto& [name, info] : mModule->forward->params) {
-                int layer = -1;
-                std::string field;
-                if (!parse_block_param(name, layer, field) || info.shape.size() != 2 || layer < 0 ||
-                    layer >= mModelConfig.NumLayers)
-                    continue;
-                auto shape = resolve_shape(info.shape, env);
-                for (const auto& target : info.lora_targets) {
-                    const std::string names = "qkvo";
-                    const auto i = target.name.size() == 1 ? names.find(target.name) : std::string::npos;
-                    if (i == std::string::npos || target.grouped) continue;
+        }
+        ShapeEnv lora_env = make_shape_env(*mModule, 1, 1);
+        augment_shape_env(lora_env, mModule->config);
+        for (const auto& [name, info] : mModule->forward->params) {
+            int layer = -1;
+            std::string field;
+            if (!parse_block_param(name, layer, field) || layer < 0 ||
+                layer >= mModelConfig.NumLayers)
+                continue;
+            for (const auto& target : info.lora_targets) {
+                const int i = modules::attention_target_index(target.name, target.grouped);
+                if (i < 0) continue;
+                if (info.shape.size() != 2)
+                    throw std::invalid_argument("Attention LoRA parameter must have rank 2: " + name);
+                const auto shape = resolve_shape(info.shape, lora_env);
+                modules::record_attention_geometry(wm.attention_shapes[layer], i,
+                    shape[1], shape[0], target.offset, target.size, name);
+                if (glm_attention_names) {
                     wm.attention_names[layer][i] =
                         field.rfind("mla_", 0) == 0
                             ? std::array<std::string, 4>{"q_b_proj", "kv_b_proj", "", "o_proj"}[i]
                             : std::array<std::string, 4>{"q_proj", "k_proj", "v_proj", "o_proj"}[i];
-                    wm.attention_shapes[layer][i] = {static_cast<int>(shape[1]),
-                                                     target.size > 0 ? target.size : static_cast<int>(shape[0])};
                 }
             }
         }

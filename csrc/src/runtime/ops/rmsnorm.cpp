@@ -1,4 +1,5 @@
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/ops/jev_boundary_diagnostic.h"
 
 #include <stdexcept>
 #include <vector>
@@ -47,9 +48,12 @@ void CompiledExecutor::dispatch_rmsnorm(const CompiledOp& op) {
     }
 
     y = view_tensor(y, std::vector<long>(x.Sizes.begin(), x.Sizes.begin() + x.Rank));
+    std::vector<double> diagnostic_forward_x;
+    if (jev_diagnostic::enabled() && jev_diagnostic::layer_from_name(op.inputs[1].name,op.attrs.layer_idx) >= 26) diagnostic_forward_x=jev_diagnostic::read(x,mRunState.MainStream);
     rmsnorm_forward(y, rstd, x, weight, /*abs_max_ptr=*/nullptr, eps, total_rows, 1, C, mRunState.MainStream);
     store_tensor(op.outputs[0], y);
     store_tensor(op.outputs[1], rstd);
+    if (!diagnostic_forward_x.empty()) jev_diagnostic::rms_before(x,weight,rstd,nullptr,nullptr,jev_diagnostic::layer_from_name(op.inputs[1].name,op.attrs.layer_idx),op.outputs[1].name,op.inputs[1].name,mRunState.DeviceId,mRunState.MainStream,eps,mInBackwardPass,&diagnostic_forward_x);
 }
 
 // Backward: d_x = rmsnorm_backward(d_out, x, weight, rstd)
@@ -116,6 +120,7 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
     mTemps.push_back(zero_dresidual);
     cudaMemsetAsync(zero_dresidual.Data, 0, zero_dresidual.bytes(), mRunState.MainStream);
 
+    auto diagnostic=jev_diagnostic::rms_before(x,weight,rstd,&d_out,nullptr,jev_diagnostic::layer_from_name(op.inputs[3].name,op.attrs.layer_idx),op.inputs[3].name,weight_name,mRunState.DeviceId,mRunState.MainStream,op.attrs.eps,mInBackwardPass);
     rmsnorm_backward(d_x,
                      d_weight_buf,
                      scratch,
@@ -130,6 +135,7 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
                      C,
                      mRunState.DeviceProp,
                      mRunState.MainStream);
+    jev_diagnostic::rms_after(diagnostic,d_x,mRunState.DeviceId,mRunState.MainStream);
     store_tensor(op.outputs[0], d_x);
 }
 

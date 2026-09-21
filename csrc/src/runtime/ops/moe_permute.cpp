@@ -1,6 +1,7 @@
 #include "runtime/executor/compiled_ops.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -120,6 +121,21 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
             std::this_thread::yield();
         }
         std::memcpy(mMoEExpertOffsetsData.data(), mMoEOffsetsPinned, off_bytes);
+        // Private diagnostic: observe the host offsets already copied above.
+        // No new device synchronization or changes to routing/gradient buffers.
+        if (const char* directory = std::getenv("JEV_GEMMA_ROUTING_DIAGNOSTIC")) {
+            std::ofstream log(std::string(directory) + "/routing-gpu" +
+                              std::to_string(mRunState.DeviceId) + ".jsonl", std::ios::app);
+            log << "{\"layer\":" << layer_idx_any << ",\"backward_recompute\":"
+                << (mInBackwardPass ? "true" : "false") << ",\"counts\":[";
+            for (int e = 0; e < num_experts; ++e) {
+                if (e) log << ',';
+                log << mMoEExpertOffsetsData[e + 1] - mMoEExpertOffsetsData[e];
+            }
+            log << "]}\n";
+            if (!log) throw std::runtime_error("Failed owned routing diagnostic write");
+        }
+
 
         // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
         if (offsets_key >= 0) {

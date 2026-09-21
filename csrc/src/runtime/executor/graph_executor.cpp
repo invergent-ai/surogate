@@ -1660,7 +1660,12 @@ void GraphExecutor::execute_forward(long B,
         // capture, and pre-allocating the WHOLE graph's saves here would defeat the
         // per-stage residency (it allocated all num_layers worth -> OOM under recompute:false).
         mCompiledExecutor->set_dimensions(B, T);
-        mCompiledExecutor->prepare_saved_buffers_for_capture(save_list, mCompiledForward.get());
+        // Explicit saved-tensor offload needs layer-local residency. Eager
+        // preallocation of every layer defeats it before the first offload
+        // hook can run. Genuine graph capture retains its preallocation above.
+        if (!mOptions.OffloadSavedTensors) {
+            mCompiledExecutor->prepare_saved_buffers_for_capture(save_list, mCompiledForward.get());
+        }
 
         // Prime FP4 weight caches on first call. This covers split-attention mode
         // (sample_packing + CUDA graphs) where use_graphs is false but we still need
