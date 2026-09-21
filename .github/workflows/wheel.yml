@@ -9,9 +9,14 @@ jobs:
   wheel:
     name: Build wheel (CUDA ${{ matrix.cuda_version }})
     runs-on: self-hosted
+    # The runner is a shared training host. The build container gets a hard memory limit so a
+    # compile can never take the host down: an uncapped build at 20 jobs invoked the OOM killer
+    # on 2026-09-21 and killed a nine-hour training run, and 8 jobs with nvcc's 8 threads per
+    # translation unit still peaks in the tens of GB. Inside the cgroup the kernel kills the
+    # build, which fails the job; outside it, nothing else on the host is touched.
     container:
       image: ${{ matrix.cuda_build_image }}
-      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache
+      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache --memory 100g --memory-swap 100g
 
     strategy:
       matrix:
