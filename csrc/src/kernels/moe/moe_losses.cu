@@ -543,6 +543,205 @@ __global__ void moe_routing_stats_from_logits_kernel(float* __restrict__ stats,
     }
 }
 
+// Same statistics as moe_routing_stats_from_logits_kernel, computed one warp per
+// token with coalesced logit reads and register-resident per-lane expert
+// accumulators (lane owns experts lane, lane+32, ...). The thread-per-token
+// version read every row with a 128-element stride between threads and took
+// ~8.8 ms per MoE layer call at 4k-token microbatches (22.8 % of an H200
+// training step, profile of 2026-09-21). This is a monitoring path: the values
+// feed the log line and the reported aux/z losses, never a gradient.
+template <typename T, int kExpertsPerLane>
+__global__ void __launch_bounds__(1024)
+    moe_routing_stats_from_logits_warp_kernel(float* __restrict__ stats,
+                                              const T* __restrict__ routing_logits,
+                                              const int* __restrict__ expert_indices,
+                                              int num_tokens,
+                                              int num_experts,
+                                              int top_k,
+                                              float aux_loss_coef,
+                                              float z_loss_coef) {
+    extern __shared__ float smem[];
+    float* expert_counts = smem;
+    float* expert_probs = smem + num_experts;
+    float* router_entropy = smem + 2 * num_experts;
+    float* router_confidence = smem + 2 * num_experts + 1;
+    float* router_z_loss = smem + 2 * num_experts + 2;
+
+    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        expert_counts[e] = 0.0f;
+        expert_probs[e] = 0.0f;
+    }
+    if (threadIdx.x == 0) {
+        *router_entropy = 0.0f;
+        *router_confidence = 0.0f;
+        *router_z_loss = 0.0f;
+    }
+    __syncthreads();
+
+    const int total_assignments = num_tokens * top_k;
+    for (int i = threadIdx.x; i < total_assignments; i += blockDim.x) {
+        int expert_id = expert_indices[i];
+        if (expert_id >= 0 && expert_id < num_experts) {
+            atomicAdd(&expert_counts[expert_id], 1.0f);
+        }
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
+    const float inv_tokens = (num_tokens > 0) ? (1.0f / static_cast<float>(num_tokens)) : 0.0f;
+    const float entropy_denom = (num_experts > 1) ? logf(static_cast<float>(num_experts)) : 1.0f;
+    const float z_scale = z_loss_coef / fmaxf(static_cast<float>(num_tokens), 1.0f);
+
+    float lane_probs[kExpertsPerLane];
+#pragma unroll
+    for (int k = 0; k < kExpertsPerLane; ++k)
+        lane_probs[k] = 0.0f;
+    float lane_entropy = 0.0f, lane_confidence = 0.0f, lane_z = 0.0f;
+
+    for (int t = warp; t < num_tokens; t += num_warps) {
+        const T* row = routing_logits + static_cast<long>(t) * num_experts;
+        float v[kExpertsPerLane];
+        float max_logit = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < kExpertsPerLane; ++k) {
+            const int e = lane + 32 * k;
+            v[k] = (e < num_experts) ? static_cast<float>(row[e]) : -INFINITY;
+            max_logit = fmaxf(max_logit, v[k]);
+        }
+        max_logit = warpReduceMax(max_logit);
+        float denom = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kExpertsPerLane; ++k) {
+            const int e = lane + 32 * k;
+            if (e < num_experts) denom += expf(v[k] - max_logit);
+        }
+        denom = warpReduceSum(denom);
+        denom = fmaxf(denom, 1e-20f);
+        const float logsumexp = max_logit + logf(denom);
+        float entropy = 0.0f;
+        float max_prob = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kExpertsPerLane; ++k) {
+            const int e = lane + 32 * k;
+            if (e < num_experts) {
+                const float prob = expf(v[k] - max_logit) / denom;
+                if (prob > 0.0f) {
+                    entropy -= prob * logf(prob);
+                }
+                max_prob = fmaxf(max_prob, prob);
+                lane_probs[k] += prob * inv_tokens;
+            }
+        }
+        entropy = warpReduceSum(entropy);
+        max_prob = warpReduceMax(max_prob);
+        if (lane == 0) {
+            lane_entropy += entropy / entropy_denom;
+            lane_confidence += max_prob;
+            lane_z += z_scale * logsumexp * logsumexp;
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < kExpertsPerLane; ++k) {
+        const int e = lane + 32 * k;
+        if (e < num_experts) atomicAdd(&expert_probs[e], lane_probs[k]);
+    }
+    if (lane == 0) {
+        atomicAdd(router_entropy, lane_entropy);
+        atomicAdd(router_confidence, lane_confidence);
+        atomicAdd(router_z_loss, lane_z);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float aux_loss = 0.0f;
+        float max_count = 0.0f;
+        float min_active_count = static_cast<float>(total_assignments + 1);
+        float count_sq_sum = 0.0f;
+        const float mean_count = static_cast<float>(total_assignments) / num_experts;
+        int active_experts = 0;
+
+        for (int e = 0; e < num_experts; e++) {
+            const float fraction = expert_counts[e] / total_assignments;
+            aux_loss += fraction * expert_probs[e];
+            if (expert_counts[e] > max_count) max_count = expert_counts[e];
+            count_sq_sum += expert_counts[e] * expert_counts[e];
+            if (expert_counts[e] > 0.0f) {
+                min_active_count = fminf(min_active_count, expert_counts[e]);
+                active_experts++;
+            }
+        }
+        aux_loss *= num_experts * aux_loss_coef;
+
+        const float utilization = static_cast<float>(active_experts) / num_experts;
+        const float load_imbalance = (mean_count > 0.0f) ? (max_count / mean_count) : 0.0f;
+        const float count_sq_mean = count_sq_sum / num_experts;
+        const float variance = fmaxf(count_sq_mean - mean_count * mean_count, 0.0f);
+        const float load_cv = (mean_count > 0.0f) ? (sqrtf(variance) / mean_count) : 0.0f;
+        const float total = static_cast<float>(total_assignments);
+        const float max_expert_fraction = (total > 0.0f) ? (max_count / total) : 0.0f;
+        const float min_active_expert_fraction =
+            (active_experts > 0 && total > 0.0f) ? (min_active_count / total) : 0.0f;
+        const float avg_router_entropy = (num_tokens > 0) ? (*router_entropy / num_tokens) : 0.0f;
+        const float avg_router_confidence = (num_tokens > 0) ? (*router_confidence / num_tokens) : 0.0f;
+
+        atomicAdd(&stats[0], aux_loss);
+        atomicAdd(&stats[1], *router_z_loss);
+        atomicAdd(&stats[2], utilization);
+        atomicAdd(&stats[3], load_imbalance);
+        atomicAdd(&stats[4], 1.0f);
+        atomicAdd(&stats[5], static_cast<float>(active_experts));
+        atomicAdd(&stats[6], max_expert_fraction);
+        atomicAdd(&stats[7], min_active_expert_fraction);
+        atomicAdd(&stats[8], load_cv);
+        atomicAdd(&stats[9], avg_router_entropy);
+        atomicAdd(&stats[10], avg_router_confidence);
+    }
+}
+
+template <typename T>
+static void launch_routing_stats_from_logits(float* stats,
+                                             const T* routing_logits,
+                                             const int* expert_indices,
+                                             int num_tokens,
+                                             int num_experts,
+                                             int top_k,
+                                             float aux_loss_coef,
+                                             float z_loss_coef,
+                                             cudaStream_t stream) {
+    const int shared_mem = (2 * num_experts + 3) * sizeof(float);
+    constexpr int kWarpBlock = 1024;
+    if (num_experts <= 32 * 4) {
+        moe_routing_stats_from_logits_warp_kernel<T, 4><<<1, kWarpBlock, shared_mem, stream>>>(stats,
+                                                                                               routing_logits,
+                                                                                               expert_indices,
+                                                                                               num_tokens,
+                                                                                               num_experts,
+                                                                                               top_k,
+                                                                                               aux_loss_coef,
+                                                                                               z_loss_coef);
+    } else if (num_experts <= 32 * 16) {
+        moe_routing_stats_from_logits_warp_kernel<T, 16><<<1, kWarpBlock, shared_mem, stream>>>(stats,
+                                                                                                routing_logits,
+                                                                                                expert_indices,
+                                                                                                num_tokens,
+                                                                                                num_experts,
+                                                                                                top_k,
+                                                                                                aux_loss_coef,
+                                                                                                z_loss_coef);
+    } else {
+        moe_routing_stats_from_logits_kernel<T><<<1, 256, shared_mem, stream>>>(stats,
+                                                                                routing_logits,
+                                                                                expert_indices,
+                                                                                num_tokens,
+                                                                                num_experts,
+                                                                                top_k,
+                                                                                aux_loss_coef,
+                                                                                z_loss_coef);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void moe_compute_routing_stats_from_logits(float* stats,
                                            const nv_bfloat16* routing_logits,
                                            const int* expert_indices,
@@ -552,16 +751,15 @@ void moe_compute_routing_stats_from_logits(float* stats,
                                            float aux_loss_coef,
                                            float z_loss_coef,
                                            cudaStream_t stream) {
-    int block_size = 256;
-    int shared_mem = (2 * num_experts + 3) * sizeof(float);
-    moe_routing_stats_from_logits_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(stats,
-                                                                                             routing_logits,
-                                                                                             expert_indices,
-                                                                                             num_tokens,
-                                                                                             num_experts,
-                                                                                             top_k,
-                                                                                             aux_loss_coef,
-                                                                                             z_loss_coef);
+    launch_routing_stats_from_logits<nv_bfloat16>(stats,
+                                                  routing_logits,
+                                                  expert_indices,
+                                                  num_tokens,
+                                                  num_experts,
+                                                  top_k,
+                                                  aux_loss_coef,
+                                                  z_loss_coef,
+                                                  stream);
 }
 
 void moe_compute_routing_stats_from_logits(float* stats,
@@ -573,16 +771,15 @@ void moe_compute_routing_stats_from_logits(float* stats,
                                            float aux_loss_coef,
                                            float z_loss_coef,
                                            cudaStream_t stream) {
-    int block_size = 256;
-    int shared_mem = (2 * num_experts + 3) * sizeof(float);
-    moe_routing_stats_from_logits_kernel<float><<<1, block_size, shared_mem, stream>>>(stats,
-                                                                                       routing_logits,
-                                                                                       expert_indices,
-                                                                                       num_tokens,
-                                                                                       num_experts,
-                                                                                       top_k,
-                                                                                       aux_loss_coef,
-                                                                                       z_loss_coef);
+    launch_routing_stats_from_logits<float>(stats,
+                                            routing_logits,
+                                            expert_indices,
+                                            num_tokens,
+                                            num_experts,
+                                            top_k,
+                                            aux_loss_coef,
+                                            z_loss_coef,
+                                            stream);
 }
 
 __global__ void moe_expert_fractions_kernel(float* __restrict__ expert_fractions,

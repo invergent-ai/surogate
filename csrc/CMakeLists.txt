@@ -813,6 +813,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/distributed/test-nccl.cpp
         src/testing/kernels/test-dpo-dloss.cu
         src/testing/kernels/test-candidate-ce.cu
+        src/testing/kernels/test-moe-indices.cu
         src/testing/kernels/test-chunked-attention.cu
         src/testing/kernels/test-spark-numerics.cu
         src/testing/kernels/test-qwen35-shared.cu

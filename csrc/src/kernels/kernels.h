@@ -3609,6 +3609,20 @@ void moe_build_indices(int* gather_indices,
                        int num_experts,
                        cudaStream_t stream);
 
+/// @brief Single-thread reference construction: the exact ordering moe_build_indices reproduces.
+void moe_build_indices_serial(int* gather_indices,
+                              int* scatter_indices,
+                              const int* expert_indices,
+                              const int* expert_offsets,
+                              int* expert_positions,
+                              int num_tokens,
+                              int top_k,
+                              int num_experts,
+                              cudaStream_t stream);
+
+/// @brief Sort scratch bytes the parallel construction needs for `total_assignments` keys.
+std::size_t moe_build_indices_workspace_bytes(int total_assignments);
+
 /// @brief Remap expert indices from global to compact indices for selective dequantization.
 /// Transforms expert_indices from global range [0, num_total_experts) to compact range
 /// [0, num_active_experts) using the provided mapping table.

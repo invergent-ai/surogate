@@ -340,6 +340,112 @@ void moe_compute_expert_offsets(int* expert_offsets, const int* expert_counts, i
     CUDA_CHECK(cudaGetLastError());
 }
 
+void moe_build_indices_serial(int* gather_indices,
+                              int* scatter_indices,
+                              const int* expert_indices,
+                              const int* expert_offsets,
+                              int* expert_positions,
+                              int num_tokens,
+                              int top_k,
+                              int num_experts,
+                              cudaStream_t stream) {
+    int total = num_tokens * top_k;
+    if (total == 0) return;  // No tokens to index
+
+    // Single-thread reference: strictly increasing assignment order per expert.
+    moe_compute_gather_indices_deterministic_kernel<<<1, 1, 0, stream>>>(gather_indices,
+                                                                         scatter_indices,
+                                                                         expert_indices,
+                                                                         expert_offsets,
+                                                                         expert_positions,
+                                                                         total,
+                                                                         num_experts);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
+// Parallel deterministic gather/scatter index construction.
+//
+// The single-thread kernel above defines the reference ordering: expert-major
+// (by the exclusive prefix `expert_offsets`), assignment-index-minor. A radix
+// sort of the composite key `(expert_id << idx_bits) | idx` reproduces exactly
+// that order (keys are unique, so the result is a total order independent of
+// scheduling). Invalid expert ids get the key expert `num_experts`, sort after
+// every valid assignment and are skipped: their gather slots stay zero and
+// their scatter slots stay -1, as with the serial kernel. The single-thread
+// version took ~5 ms per MoE layer call at 4k-token microbatches (12.6 % of an
+// H200 training step, profile of 2026-09-21); the sort takes tens of
+// microseconds.
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void moe_encode_index_keys_kernel(unsigned int* __restrict__ keys,
+                                             const int* __restrict__ expert_indices,
+                                             int total_assignments,
+                                             int num_experts,
+                                             int idx_bits) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_assignments) return;
+    int e = expert_indices[idx];
+    if (e < 0 || e >= num_experts) e = num_experts;  // invalid assignments sort last
+    keys[idx] = (static_cast<unsigned int>(e) << idx_bits) | static_cast<unsigned int>(idx);
+}
+
+__global__ void moe_decode_sorted_keys_kernel(int* __restrict__ gather_indices,
+                                              const unsigned int* __restrict__ sorted_keys,
+                                              int total_assignments,
+                                              int idx_bits) {
+    const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= total_assignments) return;
+    gather_indices[pos] = static_cast<int>(sorted_keys[pos] & ((1u << idx_bits) - 1u));
+}
+
+// Every assignment index appears exactly once in gather, so this rewrites every
+// scatter slot and no sort key survives in the scatter buffer.
+__global__ void moe_scatter_from_gather_kernel(int* __restrict__ gather_indices,
+                                               int* __restrict__ scatter_indices,
+                                               const int* __restrict__ expert_offsets,
+                                               int* __restrict__ expert_positions,
+                                               int total_assignments,
+                                               int num_experts) {
+    const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos < num_experts) {
+        expert_positions[pos] += expert_offsets[pos + 1] - expert_offsets[pos];
+    }
+    if (pos >= total_assignments) return;
+    const int valid = expert_offsets[num_experts];
+    const int idx = gather_indices[pos];
+    if (pos < valid) {
+        scatter_indices[idx] = pos;
+    } else {
+        scatter_indices[idx] = -1;  // invalid assignment: the caller's 0xFF initialisation
+        gather_indices[pos] = 0;    // the caller's zero fill, as the serial kernel leaves it
+    }
+}
+
+int moe_bits_for(int count) {
+    int bits = 1;
+    while ((1 << bits) < count)
+        ++bits;
+    return bits;
+}
+
+}  // namespace
+
+std::size_t moe_build_indices_workspace_bytes(int total_assignments) {
+    if (total_assignments <= 0) return 0;
+    std::size_t bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(nullptr,
+                                              bytes,
+                                              static_cast<const unsigned int*>(nullptr),
+                                              static_cast<unsigned int*>(nullptr),
+                                              total_assignments,
+                                              0,
+                                              32,
+                                              cudaStream_t{}));
+    return bytes;
+}
+
 void moe_build_indices(int* gather_indices,
                        int* scatter_indices,
                        const int* expert_indices,
@@ -349,18 +455,55 @@ void moe_build_indices(int* gather_indices,
                        int top_k,
                        int num_experts,
                        cudaStream_t stream) {
-    int total = num_tokens * top_k;
+    const int total = num_tokens * top_k;
     if (total == 0) return;  // No tokens to index
 
-    // Use deterministic index construction so EP replicas observe identical
-    // per-expert token ordering across devices/ranks.
-    moe_compute_gather_indices_deterministic_kernel<<<1, 1, 0, stream>>>(gather_indices,
-                                                                         scatter_indices,
-                                                                         expert_indices,
-                                                                         expert_offsets,
-                                                                         expert_positions,
-                                                                         total,
-                                                                         num_experts);
+    const int idx_bits = moe_bits_for(total);
+    const int expert_bits = moe_bits_for(num_experts + 1);
+    if (num_experts <= 0 || idx_bits + expert_bits > 32) {
+        // Composite keys do not fit in 32 bits: keep the exact single-thread reference.
+        moe_build_indices_serial(gather_indices,
+                                 scatter_indices,
+                                 expert_indices,
+                                 expert_offsets,
+                                 expert_positions,
+                                 num_tokens,
+                                 top_k,
+                                 num_experts,
+                                 stream);
+        return;
+    }
+
+    // gather holds the encoded keys and scatter receives the sorted keys; both
+    // buffers are fully rewritten with their final contents by the decode kernels.
+    unsigned int* keys_in = reinterpret_cast<unsigned int*>(gather_indices);
+    unsigned int* keys_out = reinterpret_cast<unsigned int*>(scatter_indices);
+    constexpr int kBlock = 256;
+    const int grid = (total + kBlock - 1) / kBlock;
+    moe_encode_index_keys_kernel<<<grid, kBlock, 0, stream>>>(keys_in, expert_indices, total, num_experts, idx_bits);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Sort scratch is stream-ordered, like the executor's own over-size fallback
+    // (compiled_ops_execute.cpp): no process-lifetime state, nothing that can
+    // outlive a trainer restart, and the runtime's stack arena (sized by the
+    // graph compiler's plan, which does not know about this scratch) is untouched.
+    std::size_t temp_bytes = moe_build_indices_workspace_bytes(total);
+    void* temp = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&temp, temp_bytes, stream));
+    const cudaError_t sorted =
+        cub::DeviceRadixSort::SortKeys(temp, temp_bytes, keys_in, keys_out, total, 0, idx_bits + expert_bits, stream);
+    CUDA_CHECK(cudaFreeAsync(temp, stream));
+    CUDA_CHECK(sorted);
+
+    moe_decode_sorted_keys_kernel<<<grid, kBlock, 0, stream>>>(gather_indices, keys_out, total, idx_bits);
+    CUDA_CHECK(cudaGetLastError());
+    const int grid_scatter = (std::max(total, num_experts) + kBlock - 1) / kBlock;
+    moe_scatter_from_gather_kernel<<<grid_scatter, kBlock, 0, stream>>>(gather_indices,
+                                                                        scatter_indices,
+                                                                        expert_offsets,
+                                                                        expert_positions,
+                                                                        total,
+                                                                        num_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
