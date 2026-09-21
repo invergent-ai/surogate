@@ -768,10 +768,10 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
 /// Launch a GGML prefill codec on the route its format has. `Int8` is a template parameter so
 /// the discarded branch is never instantiated: the int8 tensor-core kernels ask a codec for
 /// scale groups and code unpacking that only the three hand codecs have.
-template <class Codec, bool Int8, class I8Launch, class Bf16Launch>
+template <class Codec, class Int8Codec, bool Int8, class I8Launch, class Bf16Launch>
 inline void launch_ggml_prefill_codec(I8Launch& i8, Bf16Launch& bf16, bool int8_route) {
     if constexpr (Int8) {
-        if (int8_route) { i8.template operator()<Codec>(); }
+        if (int8_route) { i8.template operator()<Int8Codec>(); }
         else { bf16.template operator()<Codec>(); }
     } else {
         (void)i8;
@@ -788,8 +788,7 @@ sparse_moe_prefill_ggml_gate_up_kernel(
     const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
     const std::uint8_t* __restrict__ blocks, __nv_bfloat16* __restrict__ activation) {
     constexpr int ExpertThreads = ExpertWarps * 32;
-    constexpr int BlocksPerRow  = kHidden / ggml::QK_K;
-    constexpr int TileUnits     = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    constexpr int TileUnits     = Codec::kTileBytes / Codec::kStageUnit;
     constexpr int HeaderUnits =
         Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
@@ -835,8 +834,8 @@ sparse_moe_prefill_ggml_gate_up_kernel(
                    (local_row >= kExpertBM / 2 ? kIntermediate : 0);
         };
         auto row_base = [&](int local_row) {
-            return blocks + static_cast<std::int64_t>(global_row(local_row)) * BlocksPerRow *
-                                Codec::kBlockBytes;
+            return blocks +
+                   static_cast<std::int64_t>(global_row(local_row)) * Codec::row_bytes(kHidden);
         };
 
         auto stage_inputs = [&](int stage, int kt) {
@@ -977,8 +976,7 @@ sparse_moe_prefill_ggml_down_kernel(
     const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
     const std::uint8_t* __restrict__ blocks, __nv_bfloat16* __restrict__ output) {
     constexpr int ExpertThreads = ExpertWarps * 32;
-    constexpr int BlocksPerRow  = kIntermediate / ggml::QK_K;
-    constexpr int TileUnits     = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    constexpr int TileUnits     = Codec::kTileBytes / Codec::kStageUnit;
     constexpr int HeaderUnits =
         Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
@@ -1018,7 +1016,7 @@ sparse_moe_prefill_ggml_down_kernel(
         auto row_base = [&](int local_row) {
             const int global_row = block * kHidden + row0 + local_row;
             return blocks +
-                   static_cast<std::int64_t>(global_row) * BlocksPerRow * Codec::kBlockBytes;
+                   static_cast<std::int64_t>(global_row) * Codec::row_bytes(kIntermediate);
         };
 
         auto stage_inputs = [&](int stage, int kt) {
@@ -1165,7 +1163,6 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
     const std::uint8_t* __restrict__ blocks, __nv_bfloat16* __restrict__ activation) {
-    constexpr int BlocksPerRow = kHidden / ggml::QK_K;
     constexpr int WarpCols     = ExpertBN / ExpertWarps;
     __shared__ ggml::GgmlI8Smem<Codec, ExpertBN> sm;
 
@@ -1193,7 +1190,7 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
             const int logical = logical0 + (local_row & (kExpertBM / 2 - 1));
             const int row     = block * (2 * kIntermediate) + logical +
                                 (local_row >= kExpertBM / 2 ? kIntermediate : 0);
-            return blocks + static_cast<std::int64_t>(row) * BlocksPerRow * Codec::kBlockBytes;
+            return blocks + static_cast<std::int64_t>(row) * Codec::row_bytes(kHidden);
         };
         auto act_row = [&](int local_col) {
             return static_cast<std::int64_t>(column_token[begin + column_base + local_col]);
@@ -1201,7 +1198,7 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
         float acc[4][4];
         // Every geometry that shares this body instantiates it; only those whose rows are whole
         // superblocks may run it, and their dispatch guards the launch.
-        if constexpr (kHidden % ggml::QK_K != 0) { return; }
+        if constexpr (kHidden % Codec::kKMultiple != 0) { return; }
         ggml::ggml_i8_tile<Codec, ExpertWarps, ExpertBN>(sm, row_base, act_row, codes, ds, cols,
                                                           kHidden, acc);
 
@@ -1240,7 +1237,6 @@ sparse_moe_prefill_ggml_i8_down_kernel(
     const int* __restrict__ route_job_columns, const int* __restrict__ slot_of_expert,
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ blocks,
     __nv_bfloat16* __restrict__ output) {
-    constexpr int BlocksPerRow = kIntermediate / ggml::QK_K;
     constexpr int WarpCols     = ExpertBN / ExpertWarps;
     __shared__ ggml::GgmlI8Smem<Codec, ExpertBN> sm;
 
@@ -1267,13 +1263,13 @@ sparse_moe_prefill_ggml_i8_down_kernel(
         auto row_base = [&](int local_row) {
             const int global_row = block * kHidden + row0 + local_row;
             return blocks +
-                   static_cast<std::int64_t>(global_row) * BlocksPerRow * Codec::kBlockBytes;
+                   static_cast<std::int64_t>(global_row) * Codec::row_bytes(kIntermediate);
         };
         auto act_row = [&](int local_col) {
             return static_cast<std::int64_t>(begin + column_base + local_col);
         };
         float acc[4][4];
-        if constexpr (kIntermediate % ggml::QK_K != 0) { return; }
+        if constexpr (kIntermediate % Codec::kKMultiple != 0) { return; }
         ggml::ggml_i8_tile<Codec, ExpertWarps, ExpertBN>(sm, row_base, act_row, codes, ds, cols,
                                                           kIntermediate, acc);
 
@@ -2039,14 +2035,16 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
                         routed_gate_scales, routed_activation);
             }
         } else if (ggml::is_ggml_qtype(weights.routed_gate_up.qtype)) {
-            // A K-quant row is a whole number of 256-value superblocks. Every geometry that
-            // serves one satisfies this; the guard keeps the kernel from being instantiated for
-            // the others, which share this body.
-            if constexpr (kHidden % ggml::QK_K != 0 || kIntermediate % ggml::QK_K != 0) {
-                throw std::invalid_argument(
-                    "sparse_moe prefill: this geometry's rows are not whole superblocks");
-            } else {
+            // The gate/up GEMM reduces over `kHidden`, which has to be a whole number of the
+            // codec's own blocks -- a 256-value superblock for a K-quant, a 64-wide tile for a
+            // plain 32-value format. Asked of the codec rather than of the geometry, because
+            // the two answers differ: Gemma 4's hidden 2,816 is eleven superblocks while its
+            // 704-wide experts are not a whole number of any.
             const auto launch_ggml_gate_up = [&]<class Codec>() {
+                if constexpr (kHidden % Codec::kKMultiple != 0) {
+                    throw std::invalid_argument(
+                        "sparse_moe prefill: hidden is not a whole number of this codec's blocks");
+                } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_gate_up_kernel<Codec, 8, 64>
                         <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
@@ -2060,8 +2058,13 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
                             weights.slot_of_expert, route_job_count, routed_gate_codes,
                             routed_activation);
                 }
+                }
             };
             const auto launch_i8_gate_up = [&]<class Codec>() {
+                if constexpr (kHidden % Codec::kKMultiple != 0) {
+                    throw std::invalid_argument(
+                        "sparse_moe prefill: hidden is not a whole number of this codec's blocks");
+                } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 8, 64>
                         <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
@@ -2075,6 +2078,7 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
                             route_job_columns, weights.slot_of_expert, route_job_count,
                             routed_gate_codes, routed_activation);
                 }
+                }
             };
             const bool int8_route = plan.routed_int8;
             // One case per stored format, from the one list: the codec trait names the hand codec
@@ -2083,6 +2087,7 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
 #define SINFER_GATE_UP_CASE(NAME)                                                                  \
             case QType::NAME:                                                                      \
                 launch_ggml_prefill_codec<ggml::PrefillCodecFor<ggml::GgmlType::NAME>::Codec,     \
+                                          ggml::PrefillCodecFor<ggml::GgmlType::NAME>::Int8Codec, \
                                           ggml::PrefillCodecFor<ggml::GgmlType::NAME>::kInt8Route>( \
                     launch_i8_gate_up, launch_ggml_gate_up, int8_route);                                                       \
                 break;
@@ -2090,7 +2095,6 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
 #undef SINFER_GATE_UP_CASE
             default:
                 throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
-            }
             }
         } else if (weights.routed_gate_up.qtype == QType::W8G32_F16S) {
             sparse_moe_prefill_w8_gate_up_kernel<true>
@@ -2181,11 +2185,15 @@ if constexpr (kHasShared) {
         SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_DOWN_CASE)
 #undef SINFER_GGML_DOWN_CASE
         {
-            if constexpr (kHidden % ggml::QK_K != 0 || kIntermediate % ggml::QK_K != 0) {
-                throw std::invalid_argument(
-                    "sparse_moe prefill: this geometry's rows are not whole superblocks");
-            } else {
+            // The down GEMM reduces over `kIntermediate`, and the same question is put to the
+            // codec: 704 is not a whole superblock, which is exactly why `llama-quantize` left
+            // this tensor in Q8_0, and Q8_0's blocks are 32 values so eleven 64-wide tiles
+            // cover it exactly.
             const auto launch_ggml_down = [&]<class Codec>() {
+                if constexpr (kIntermediate % Codec::kKMultiple != 0) {
+                    throw std::invalid_argument("sparse_moe prefill: the expert width is not a "
+                                                "whole number of this codec's blocks");
+                } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_down_kernel<Codec, 8, 64>
                         <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
@@ -2197,8 +2205,13 @@ if constexpr (kHasShared) {
                             routed_activation, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
                 }
+                }
             };
             const auto launch_i8_down = [&]<class Codec>() {
+                if constexpr (kIntermediate % Codec::kKMultiple != 0) {
+                    throw std::invalid_argument("sparse_moe prefill: the expert width is not a "
+                                                "whole number of this codec's blocks");
+                } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_i8_down_kernel<Codec, 8, 64>
                         <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
@@ -2210,12 +2223,14 @@ if constexpr (kHasShared) {
                             mid_codes, mid_ds, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
                 }
+                }
             };
             const bool int8_route = plan.routed_int8;
             switch (weights.routed_down.qtype) {
 #define SINFER_DOWN_CASE(NAME)                                                                  \
             case QType::NAME:                                                                      \
                 launch_ggml_prefill_codec<ggml::PrefillCodecFor<ggml::GgmlType::NAME>::Codec,     \
+                                          ggml::PrefillCodecFor<ggml::GgmlType::NAME>::Int8Codec, \
                                           ggml::PrefillCodecFor<ggml::GgmlType::NAME>::kInt8Route>( \
                     launch_i8_down, launch_ggml_down, int8_route);                                                       \
                 break;
@@ -2223,7 +2238,6 @@ if constexpr (kHasShared) {
 #undef SINFER_DOWN_CASE
             default:
                 throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
-            }
             }
             break;
         }

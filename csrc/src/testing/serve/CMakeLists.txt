@@ -508,6 +508,17 @@ sinfer_add_op_test(sinfer_manifold_hyper_connection_test
 sinfer_add_op_test(sinfer_sparse_moe_test
     SOURCES ops/test_sparse_moe.cpp
     LIBRARIES sinfer_ops)
+# The routed GGML pair a Gemma 4 GGUF actually holds -- a K-quant gate/up beside a Q8_0 down --
+# against the small-T slices that served it before it had prefill kernels. Registered twice so
+# both prefill routes are covered: the default int8 tensor-core one and, with the veto set, the
+# BF16-activation one, which is the tighter comparison.
+sinfer_add_op_test(sinfer_sparse_moe_ggml_prefill_test
+    SOURCES ops/test_sparse_moe_ggml_prefill.cpp
+    LIBRARIES sinfer_ops)
+add_test(NAME sinfer_sparse_moe_ggml_prefill_bf16_test
+    COMMAND sinfer_sparse_moe_ggml_prefill_test)
+set_tests_properties(sinfer_sparse_moe_ggml_prefill_bf16_test PROPERTIES
+    SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_INT8=0")
 add_test(NAME sinfer_sparse_moe_nvfp4_small_t_test COMMAND sinfer_sparse_moe_test --nvfp4-small-t)
 set_tests_properties(sinfer_sparse_moe_nvfp4_small_t_test PROPERTIES
     SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_TRTLLM_MIN=16")

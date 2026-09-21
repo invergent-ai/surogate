@@ -47,7 +47,14 @@ __device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const std::ui
     if constexpr (Codec::kCpAsync) {
         const std::uint8_t* src = row_base + Codec::chunk_offset(tile, unit);
         if constexpr (Codec::kCover) { src = align_down16(src); }
-        cp_async<16, Cache::cg>(dst + 16 * unit, src);
+        if constexpr (Codec::kStageUnit == 16) {
+            cp_async<16, Cache::cg>(dst + 16 * unit, src);
+        } else {
+            // A format whose blocks are not sixteen-byte aligned stages in narrower units.
+            // `cp.async.cg` is defined only for a sixteen-byte copy, so these take the `ca`
+            // path -- which is what a four-byte copy wants anyway, being smaller than a sector.
+            cp_async<Codec::kStageUnit, Cache::ca>(dst + Codec::kStageUnit * unit, src);
+        }
     } else {
         const auto* src = reinterpret_cast<const std::uint16_t*>(
             row_base + Codec::chunk_offset(tile, unit / 8));
@@ -124,10 +131,16 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
     static_assert(WarpCols == 8, "one n8 fragment per warp");
     static_assert((ExpertBM == 16 || ExpertBM == 32 || ExpertBM == 64) && kI8BK == 64 && kI8Stages == 2);
-    // K is a whole number of superblocks; the caller's dispatch guarantees it.
+    // K is a whole number of the codec's kKMultiple: 256 for the superblock codecs, 64 for a
+    // 32-value block format such as Q8_0. The caller's dispatch guarantees it.
     {
-    constexpr int TileUnits   = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    constexpr int TileUnits   = Codec::kTileBytes / Codec::kStageUnit;
     constexpr int HeaderUnits = Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
+    // A codec's scale table is indexed by the 32- (or 16-) value group's position inside the
+    // run one refresh covers, so its group count is that run's worth of groups and no more.
+    static_assert(Codec::kScaleGroups ==
+                      (Codec::kScaleWidth == 32 ? 2 : 4) * Codec::kScaleTiles,
+                  "scale groups must cover exactly the tiles between two refreshes");
     const int KTiles          = K / kI8BK;
     using Scale               = typename GgmlI8Smem<Codec, ExpertBN, ExpertBM>::Scale;
 
@@ -178,16 +191,20 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
             stage_ggml_tile<Codec>(&sm.Cr[stage][row * Codec::kTileStride], row_base(row), kt,
                                    unit);
         }
-        if (kt % kTilesPerBlock == 0) {
-            const int slot = (kt / kTilesPerBlock) & 1;
-            for (int item = tid; item < ExpertBM * HeaderUnits; item += ExpertThreads) {
-                const int row  = item / HeaderUnits;
-                const int unit = item - row * HeaderUnits;
-                stage_ggml_header<Codec>(&sm.Hdr[slot][row * Codec::kHeaderStride],
-                                         row_base(row), kt, unit, KTiles);
-                if constexpr (Codec::kCover) {
-                    if (unit == 0) {
-                        sm.Off[slot][row] = static_cast<std::uint8_t>(cover_offset<Codec>(row_base(row), kt));
+        // A format whose scales travel inside the tile has no header to stage.
+        if constexpr (Codec::kHeaderBytes > 0) {
+            if (kt % kTilesPerBlock == 0) {
+                const int slot = (kt / kTilesPerBlock) & 1;
+                for (int item = tid; item < ExpertBM * HeaderUnits; item += ExpertThreads) {
+                    const int row  = item / HeaderUnits;
+                    const int unit = item - row * HeaderUnits;
+                    stage_ggml_header<Codec>(&sm.Hdr[slot][row * Codec::kHeaderStride],
+                                             row_base(row), kt, unit, KTiles);
+                    if constexpr (Codec::kCover) {
+                        if (unit == 0) {
+                            sm.Off[slot][row] =
+                                static_cast<std::uint8_t>(cover_offset<Codec>(row_base(row), kt));
+                        }
                     }
                 }
             }
@@ -205,14 +222,21 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
         const int stage = kt & 1;
         const int tib   = kt % kTilesPerBlock;
         const int slot  = (kt / kTilesPerBlock) & 1;
+        // Tiles between two scale refreshes, and the tile's position in that run. A K-quant
+        // refreshes per superblock, because one staged header holds every sub-scale of one;
+        // a format that carries its scales inside the tile refreshes every tile.
+        const int stib  = kt % Codec::kScaleTiles;
         cp_wait<kI8Stages - 1>();
         __syncthreads();
-        if (tib == 0) {
+        if (stib == 0) {
             for (int item = tid; item < Codec::kScaleGroups * ExpertBM; item += ExpertThreads) {
                 const int row     = item & (ExpertBM - 1);
                 const int idx     = item / ExpertBM;
                 const int off     = Codec::kCover ? sm.Off[slot][row] : 0;
-                const float2 pair = Codec::scale_pair(&sm.Hdr[slot][row * Codec::kHeaderStride] + off, idx);
+                const std::uint8_t* scales = Codec::kScalesInTile
+                                                 ? &sm.Cr[stage][row * Codec::kTileStride]
+                                                 : &sm.Hdr[slot][row * Codec::kHeaderStride];
+                const float2 pair = Codec::scale_pair(scales + off, idx);
                 if constexpr (Codec::kHasMin) {
                     sm.Sc[slot][idx * ExpertBM + row] = pair;
                 } else {
@@ -310,7 +334,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
                     if constexpr (Codec::kScaleWidth == 32) {
                         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                         mma_s8(d0, d1, d2, d3, a[0], a[1], a[2], a[3], b0, b1);
-                        const int idx = 2 * tib + g;
+                        const int idx = 2 * stib + g;
                         apply(idx % 2, d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
                               sm.Sc[slot][idx * ExpertBM + r1]);
                     } else {
@@ -318,7 +342,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
                         for (int h = 0; h < 2; ++h) {
                             int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                             mma_s8_k16(d0, d1, d2, d3, a[2 * h], a[2 * h + 1], h ? b1 : b0);
-                            const int idx = 4 * tib + 2 * g + h;
+                            const int idx = 4 * stib + 2 * g + h;
                             apply(idx % 2, d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
                                   sm.Sc[slot][idx * ExpertBM + r1]);
                         }
