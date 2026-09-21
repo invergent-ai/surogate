@@ -542,6 +542,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe/moe_grouped_gemm_backward.cu
     src/kernels/moe/moe_grouped_gemm_core.cu
     src/kernels/moe/moe_grouped_gemm_expert.cu
+    src/kernels/moe/moe_lora_grouped.cu
     src/kernels/moe/moe_losses.cu
     src/kernels/moe/moe_routing_activation.cu
     src/kernels/moe/moe_topk.cu
@@ -814,6 +815,8 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/kernels/test-dpo-dloss.cu
         src/testing/kernels/test-candidate-ce.cu
         src/testing/kernels/test-moe-indices.cu
+        src/testing/kernels/test-moe-lora-grouped.cu
+        src/testing/kernels/test-mem-eff-splits.cu
         src/testing/kernels/test-chunked-attention.cu
         src/testing/kernels/test-spark-numerics.cu
         src/testing/kernels/test-qwen35-shared.cu

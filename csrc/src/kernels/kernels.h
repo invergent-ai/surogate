@@ -4703,4 +4703,78 @@ bool lora_accum_b_small_rank_bf16(Tensor& output,
                                   float scaling,
                                   cudaStream_t stream);
 
+// ----------------------------------------------------------------------------
+// Fused grouped LoRA for routed experts (moe/moe_lora_grouped.cu)
+// ----------------------------------------------------------------------------
+
+/// @brief Fused expert-LoRA switch: true unless SUROGATE_FUSED_EXPERT_LORA=0 (read once).
+bool moe_lora_grouped_enabled();
+
+/// @brief Fused rank-r LoRA forward over all experts in one launch.
+/// Tokens are permuted into expert-contiguous order; for every row t of expert e
+///   out[t, :] = (accumulate ? out[t, :] : 0) + scaling * (x[t, :] . A_e^T) . B_e^T
+/// The rank-r intermediate stays in fp32 and the scaling is applied once, in fp32.
+/// @param A LoRA A, [num_experts, rank, in_features] bf16, contiguous.
+/// @param B LoRA B, [num_experts, out_features, rank] bf16, contiguous.
+/// @param expert_offsets Device prefix sums (num_experts + 1).
+/// @param host_offsets Optional host copy of @p expert_offsets; it only sizes the grid.
+/// @param tile_tokens Tokens per CTA (32..256, multiple of 32); 0 chooses automatically.
+/// @return false, launching nothing, when the shape is unsupported (rank not in {8, 16, 32},
+///         in/out not multiples of 8, pointers not 16-byte aligned); the caller falls back.
+bool moe_lora_grouped_forward_bf16(nv_bfloat16* out,
+                                   const nv_bfloat16* x,
+                                   const nv_bfloat16* A,
+                                   const nv_bfloat16* B,
+                                   const int* expert_offsets,
+                                   const int* host_offsets,
+                                   int num_experts,
+                                   int total_tokens,
+                                   int in_features,
+                                   int out_features,
+                                   int rank,
+                                   float scaling,
+                                   bool accumulate,
+                                   cudaStream_t stream,
+                                   int tile_tokens = 0);
+
+/// @brief Workspace (in floats) that moe_lora_grouped_backward_bf16 needs for the same arguments.
+std::size_t moe_lora_grouped_backward_workspace_floats(const int* host_offsets,
+                                                       int num_experts,
+                                                       int total_tokens,
+                                                       int in_features,
+                                                       int out_features,
+                                                       int rank,
+                                                       int tile_tokens = 0);
+
+/// @brief Fused rank-r LoRA backward: a tile kernel plus a fixed-order reduce (two launches).
+///   dx[t, :] = (dx_accumulate ? dx[t, :] : 0) + scaling * (d_out[t, :] . B_e) . A_e
+///   dA_e = (grad_accumulate ? dA_e : 0) + scaling * (d_out_e . B_e)^T . x_e
+///   dB_e = (grad_accumulate ? dB_e : 0) + scaling * d_out_e^T . (x_e . A_e^T)
+/// Pass dA = dB = nullptr to skip the weight gradients (dx only, one launch).
+/// Experts without tokens are left untouched, as by the cuBLAS grouped path.
+/// Deterministic: no atomics; per-tile partials are summed in tile order.
+/// @param workspace fp32 buffer of moe_lora_grouped_backward_workspace_floats() floats (16-byte aligned).
+/// @return false, launching nothing, when the shape or workspace is unsupported.
+bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
+                                    nv_bfloat16* dA,
+                                    nv_bfloat16* dB,
+                                    const nv_bfloat16* d_out,
+                                    const nv_bfloat16* x,
+                                    const nv_bfloat16* A,
+                                    const nv_bfloat16* B,
+                                    const int* expert_offsets,
+                                    const int* host_offsets,
+                                    int num_experts,
+                                    int total_tokens,
+                                    int in_features,
+                                    int out_features,
+                                    int rank,
+                                    float scaling,
+                                    bool dx_accumulate,
+                                    bool grad_accumulate,
+                                    float* workspace,
+                                    std::size_t workspace_floats,
+                                    cudaStream_t stream,
+                                    int tile_tokens = 0);
+
 #endif  //SUROGATE_SRC_KERNELS_KERNELS_H

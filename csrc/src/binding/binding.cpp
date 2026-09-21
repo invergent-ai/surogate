@@ -1487,14 +1487,20 @@ NB_MODULE(_surogate, m) {
              &MultiGPUPyTrainer::load_checkpoint,
              nb::arg("path"),
              nb::arg("step"),
+             nb::arg("loader").none() = nb::none(),
              "Load a checkpoint.\n\n"
-             "Parameters:\n- path: Checkpoint directory.\n- step: Step number to load.")
+             "Parameters:\n- path: Checkpoint directory.\n- step: Step number to load.\n"
+             "- loader: optional DataLoader whose position is restored from the checkpoint\n"
+             "  (checkpoints written without a loader leave it untouched).")
         .def("save_checkpoint",
              &MultiGPUPyTrainer::save_checkpoint,
              nb::arg("path"),
              nb::arg("step"),
+             nb::arg("loader").none() = nb::none(),
              "Save a checkpoint.\n\n"
-             "Parameters:\n- path: Checkpoint directory.\n- step: Step number to save.")
+             "Parameters:\n- path: Checkpoint directory.\n- step: Step number to save.\n"
+             "- loader: optional DataLoader whose position (seed, epoch, file_index, chunk_index)\n"
+             "  is written to checkpoint.json so a resume continues from the same rows.")
         .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
@@ -3374,6 +3380,8 @@ NB_MODULE(_surogate, m) {
              "every token file (matching token count and `expected_k`) and raises otherwise.")
         .def_prop_ro("has_kd", &DataLoader::has_kd, "True if KD sidecar loading is enabled.")
         .def("epoch", &DataLoader::epoch, "Return the current epoch number (0-based).")
+        .def("file_index", &DataLoader::file_index, "Return the index into the shuffled file list.")
+        .def("chunk_index", &DataLoader::chunk_index, "Return the rank-local next chunk index within the current file.")
         .def("progress", &DataLoader::progress, "Return progress within the current epoch (percent).")
         .def("advance_epoch", &DataLoader::advance_epoch, "Advance to the next epoch and reshuffle chunk order.")
         .def("has_next",

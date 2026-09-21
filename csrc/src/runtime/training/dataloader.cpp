@@ -618,6 +618,15 @@ void DataLoader::load_batch(Tensor& inputs, Tensor& targets, Tensor* position_id
  * @param chunk_index Rank-local chunk index within the current file (will be offset by @c mRank internally).
  */
 void DataLoader::set_state(std::uint64_t seed, std::int32_t epoch, std::int32_t file_index, std::int32_t chunk_index) {
+    // Validate before mutating anything: the file count does not depend on the shuffle,
+    // so a bad checkpoint entry leaves the loader exactly as it was.
+    if (file_index < 0 || file_index >= static_cast<std::int32_t>(mShuffledFiles.size())) {
+        throw std::runtime_error(
+            fmt::format("set_state: file_index {} out of range [0, {})", file_index, mShuffledFiles.size()));
+    }
+    if (chunk_index < 0) {
+        throw std::runtime_error(fmt::format("set_state: chunk_index {} must not be negative", chunk_index));
+    }
     mSeed = seed;
     mEpoch = epoch;
     // Recompute all derived state exactly as advance_epoch/advance_file do:
@@ -626,10 +635,6 @@ void DataLoader::set_state(std::uint64_t seed, std::int32_t epoch, std::int32_t 
     // otherwise reads use the previously-open file's bytes with the restored
     // file's metadata.
     shuffle_files();
-    if (file_index < 0 || file_index >= static_cast<std::int32_t>(mShuffledFiles.size())) {
-        throw std::runtime_error(
-            fmt::format("set_state: file_index {} out of range [0, {})", file_index, mShuffledFiles.size()));
-    }
     mFileIndex = file_index;
     const std::string& file_name = mShuffledFiles.at(mFileIndex)->FileName;
     mTokenFile = std::ifstream(file_name, std::ios::binary);

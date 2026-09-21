@@ -17,7 +17,10 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace dsl {
@@ -183,6 +186,53 @@ void mem_eff_forward_with_scratch(AttentionParams& p, const MemEffScratchAllocat
                                                          T,
                                                          p.stream);
     }
+}
+
+// Key-split count for the backward grid (num_splits_key, num_heads, num_batches).
+// One split per (batch, head) is bitwise deterministic but launches only
+// num_batches * Hq CTAs: 32 for Gemma4's global layers at two sequences, which
+// left an H200 at ~5 % occupancy and 73 ms per call (profile of 2026-09-21).
+// Each split owns a disjoint key range, so for the causal masks used in training
+// dK/dV stay bitwise identical to the single split (the non-causal path rotates
+// the query start per split and would only be equal within rounding, so it keeps
+// one split); only the fp32 dQ tile accumulation across splits happens in
+// lock-arrival order, the same class of non-determinism as the flash backend's
+// default dq_accum path. Measured on an H200 (2026-09-22, Gemma4 26B-A4B,
+// fp8_hybrid): two identical runs with splits differ from step 0 in gradient
+// norm (6.8460 vs 6.8767) and from step 2 in loss, while one split is bitwise
+// reproducible run to run — the engine routes packed sliding-window attention
+// through the deterministic path for the same reason (see flash_attention.cpp).
+// The default therefore stays at one split. SUROGATE_MEM_EFF_KEY_SPLITS=<n>
+// forces a count (bounded by the number of key blocks) and
+// SUROGATE_MEM_EFF_KEY_SPLITS=auto picks about two CTAs per SM; both are
+// opt-in, non-deterministic, and -8.7 % per update on the H200 at two
+// sequences. `deterministic_bwd` and non-causal masks always keep one split.
+int mem_eff_backward_key_splits(const AttentionParams& p, int num_keys, int num_batches, int Hq) {
+    constexpr int kKeyBlock = 64;         // kBlockSizeJ of the compiled backward kernel
+    constexpr int kSplitsLimit = 0x7fff;  // the kernel stores num_splits_key as int16_t
+    if (p.deterministic_bwd || !p.causal) return 1;
+    const int max_splits = std::max(1, std::min(kSplitsLimit, (num_keys + kKeyBlock - 1) / kKeyBlock));
+    const char* env = std::getenv("SUROGATE_MEM_EFF_KEY_SPLITS");
+    if (env == nullptr) return 1;  // default: bitwise reproducible backward
+    if (std::strcmp(env, "auto") != 0) {
+        const int forced = std::atoi(env);
+        return forced >= 1 ? std::min(forced, max_splits) : 1;
+    }
+    static int cached_device = -1;
+    static int cached_sms = 0;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 1;
+    if (device != cached_device) {
+        int sms = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) {
+            return 1;
+        }
+        cached_device = device;
+        cached_sms = sms;
+    }
+    const int ctas_per_split = std::max(1, num_batches * Hq);
+    const int wanted = (2 * cached_sms + ctas_per_split - 1) / ctas_per_split;  // about two CTAs per SM
+    return std::max(1, std::min(wanted, max_splits));
 }
 
 void mem_eff_backward_with_scratch(AttentionParams& p, const MemEffScratchAllocator& allocate) {
@@ -416,14 +466,15 @@ void mem_eff_backward_with_scratch(AttentionParams& p, const MemEffScratchAlloca
     args.causal = p.causal;
     args.window_size = std::max(p.window_size, 0);
     args.softmax_scale = p.softmax_scale > 0.0f ? p.softmax_scale : (1.0f / std::sqrt(static_cast<float>(Hs)));
-    args.num_splits_key = 1;
+    args.num_splits_key = mem_eff_backward_key_splits(p, max_seqlen, num_batches, Hq);
     args.stream = p.stream;
 
     const std::size_t ws_bytes = surogate::mem_eff::backward_workspace_bytes(args);
     if (ws_bytes > 0) {
         args.workspace_ptr = reinterpret_cast<float*>(allocate(ws_bytes));
         if (surogate::mem_eff::backward_workspace_needs_zero(args)) {
-            cudaMemsetAsync(args.workspace_ptr, 0, ws_bytes, p.stream);
+            // Load-bearing with key splits: the dQ tile locks and arrival counters live here.
+            CUDA_CHECK(cudaMemsetAsync(args.workspace_ptr, 0, ws_bytes, p.stream));
         }
     }
 

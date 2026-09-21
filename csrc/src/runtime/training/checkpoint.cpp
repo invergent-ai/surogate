@@ -219,7 +219,9 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
 
     model.set_rng_state(meta_data["run"]["rng"].get<std::vector<std::byte>>());
 
-    if (loader) {
+    // Checkpoints written without a loader (older runs) carry no "data-loader" entry;
+    // the caller decides how to report that. With one, the loader resumes at the saved rows.
+    if (loader && meta_data.contains("data-loader")) {
         const auto& dl = meta_data["data-loader"];
         loader->set_state(dl["seed"].get<std::uint64_t>(),
                           dl["epoch"].get<int>(),

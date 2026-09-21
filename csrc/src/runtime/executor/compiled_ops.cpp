@@ -445,6 +445,10 @@ CompiledExecutor::~CompiledExecutor() {
         mReplayPersistCapacity = 0;
         mReplayPersistOffset = 0;
     }
+    for (std::byte* retired : mRetiredMemEffScratchArenas) {
+        cudaFree(retired);
+    }
+    mRetiredMemEffScratchArenas.clear();
     if (mMemEffScratchArena) {
         cudaFree(mMemEffScratchArena);
         mMemEffScratchArena = nullptr;
@@ -665,6 +669,20 @@ void CompiledExecutor::prepare_mem_eff_scratch_for_capture(std::size_t bytes) {
 
 void CompiledExecutor::mem_eff_scratch_reset() {
     mMemEffScratchOffset = 0;
+    // Arenas retired by a growth inside the previous op: every kernel that read
+    // them was enqueued on MainStream before this point, so a stream-ordered
+    // free needs no synchronisation. A free node cannot be recorded into a
+    // capture, so retired arenas wait for the next reset outside capture.
+    if (mRetiredMemEffScratchArenas.empty()) return;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(mRunState.MainStream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    for (std::byte* retired : mRetiredMemEffScratchArenas) {
+        CUDA_CHECK(cudaFreeAsync(retired, mRunState.MainStream));
+    }
+    mRetiredMemEffScratchArenas.clear();
 }
 
 std::byte* CompiledExecutor::mem_eff_scratch_alloc(std::size_t bytes) {
@@ -685,13 +703,35 @@ std::byte* CompiledExecutor::mem_eff_scratch_alloc(std::size_t bytes) {
         prepare_mem_eff_scratch_for_capture(default_bytes);
     }
     constexpr std::size_t kAlign = 128;  // align for 128-bit bf16 loads
-    const std::size_t aligned_offset = (mMemEffScratchOffset + kAlign - 1) & ~(kAlign - 1);
+    std::size_t aligned_offset = (mMemEffScratchOffset + kAlign - 1) & ~(kAlign - 1);
     if (aligned_offset + bytes > mMemEffScratchCapacity) {
-        std::ostringstream oss;
-        oss << "mem_eff scratch arena exhausted: offset=" << aligned_offset << " + req=" << bytes
-            << " > cap=" << mMemEffScratchCapacity
-            << ". Bump SUROGATE_MEM_EFF_ARENA_MB or prepare_mem_eff_scratch_for_capture size.";
-        throw std::runtime_error(oss.str());
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(mRunState.MainStream, &capture) != cudaSuccess) {
+            capture = cudaStreamCaptureStatusActive;  // unknown: treat as capturing, never grow
+        }
+        if (capture != cudaStreamCaptureStatusNone) {
+            std::ostringstream oss;
+            oss << "mem_eff scratch arena exhausted during capture: offset=" << aligned_offset << " + req=" << bytes
+                << " > cap=" << mMemEffScratchCapacity
+                << ". Bump SUROGATE_MEM_EFF_ARENA_MB or prepare_mem_eff_scratch_for_capture size.";
+            throw std::runtime_error(oss.str());
+        }
+        // Outside capture the arena grows. The current arena's live buffers belong
+        // to the attention op in flight (pointers already handed out, kernels
+        // possibly still enqueued), so it is retired rather than freed and released
+        // stream-ordered at the next per-op reset. Sized to this op's need so far
+        // plus a quarter of headroom, in 128 MiB steps: the split-key backward of a
+        // head-dim-512 GQA layer at two documents exceeds the 1 GiB default by a
+        // few dozen MiB, and the offset restarts at zero for every op.
+        constexpr std::size_t kGrowthStep = 128ull * 1024 * 1024;
+        const std::size_t need = aligned_offset + bytes;
+        const std::size_t grown = (need + need / 4 + kGrowthStep - 1) / kGrowthStep * kGrowthStep;
+        mRetiredMemEffScratchArenas.push_back(mMemEffScratchArena);
+        mMemEffScratchArena = nullptr;
+        mMemEffScratchCapacity = 0;
+        mMemEffScratchOffset = 0;
+        prepare_mem_eff_scratch_for_capture(grown);
+        aligned_offset = 0;
     }
     std::byte* p = mMemEffScratchArena + aligned_offset;
     mMemEffScratchOffset = aligned_offset + bytes;

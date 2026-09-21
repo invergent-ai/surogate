@@ -92,8 +92,11 @@ public:
     void export_adapter(std::string path, std::string base_model_path = "");
     void import_adapter(std::string path);
     void init_weights();
-    void load_checkpoint(std::string directory, int step);
-    void save_checkpoint(std::string directory, int step);
+    // `loader` (optional) has its position saved with / restored from the checkpoint
+    // (checkpoint.json "data-loader": seed, epoch, file_index, chunk_index); only the
+    // rank-0 worker touches it, since one loader serves every local rank.
+    void load_checkpoint(std::string directory, int step, DataLoader* loader = nullptr);
+    void save_checkpoint(std::string directory, int step, DataLoader* loader = nullptr);
     void step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
 
     /// Chunked-sequence step (KV-checkpointed chunks): forward KV sweep over

@@ -458,6 +458,65 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
             }
         };
 
+        // Fused rank-r expert LoRA (SUROGATE_FUSED_EXPERT_LORA, default on): one launch
+        // per projection instead of two grouped cuBLAS calls plus two vector_adds. The
+        // cuBLAS path scales via vector_add(t, t, t, 0.5 * s), i.e. by exactly s, but
+        // rounds the rank-r intermediate to bf16 before and after that scaling and the
+        // product to bf16 before adding it to the output; the fused kernel keeps the
+        // intermediate in fp32 and applies s once. Falls back to cuBLAS for dropout,
+        // rollout parity, non-bf16 tensors and compact LoRA weights.
+        auto native_expert_view = [&](const Tensor& w) -> Tensor {
+            // The tensor itself, or the native slice of an EP-global [E_global, ...]
+            // tensor (the rule of dispatch_grouped_gemm); Data == nullptr when unusable.
+            Tensor v = w;
+            v.Data = nullptr;
+            if (w.DType != ETensorDType::BF16 || w.Rank != 3 || !w.Data) return v;
+            const long rows = w.Sizes[0];
+            if (rows == num_experts) {
+                v.Data = w.Data;
+            } else if (mOptions.EPSize > 1 && rows > num_experts) {
+                auto meta_it = mEPLayerMeta.find(ep_key_any);
+                if (meta_it != mEPLayerMeta.end()) {
+                    const auto& meta = meta_it->second;
+                    if (meta.num_local == num_experts && meta.native_start >= 0 &&
+                        meta.native_start + num_experts <= rows) {
+                        v.Data = w.Data + static_cast<std::size_t>(meta.native_start) * w.Sizes[1] * w.Sizes[2] *
+                                              get_dtype_size(w.DType);
+                        v.Sizes[0] = num_experts;
+                    }
+                }
+            }
+            return v;
+        };
+        auto fused_lora_forward = [&](Tensor& out_t,
+                                      const Tensor& in_t,
+                                      const modules::LoRAGroupedLayerWeights<Tensor>& w,
+                                      int in_features,
+                                      int out_features) -> bool {
+            if (!moe_lora_grouped_enabled() || (training && dropout > 0.0f) || mOptions.rollout_parity()) return false;
+            if (out_t.DType != ETensorDType::BF16 || in_t.DType != ETensorDType::BF16) return false;
+            const Tensor A = native_expert_view(w.A);
+            const Tensor B = native_expert_view(w.B);
+            if (!A.Data || !B.Data) return false;
+            return moe_lora_grouped_forward_bf16(out_t.get<nv_bfloat16>(),
+                                                 in_t.get<nv_bfloat16>(),
+                                                 A.get<nv_bfloat16>(),
+                                                 B.get<nv_bfloat16>(),
+                                                 expert_offsets.get<int>(),
+                                                 host_offsets_ptr,
+                                                 num_experts,
+                                                 total_tokens_i,
+                                                 in_features,
+                                                 out_features,
+                                                 rank,
+                                                 scaling,
+                                                 /*accumulate=*/true,
+                                                 mRunState.MainStream);
+        };
+
+        if (total_tokens_i > 0 && rank > 0 && fused_lora_forward(out, inp, lora_down, intermediate_size, hidden_size)) {
+            return;
+        }
         if (total_tokens_i > 0 && rank > 0) {
             Tensor lora_intermediate = view_or_temp(mLoRARunState->moe_lora_intermediate1, total_tokens_l, rank);
             dispatch_grouped_gemm(lora_intermediate,
@@ -1278,7 +1337,108 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                     }
                 };
 
-                if (total_tokens_i > 0 && rank > 0) {
+                // Fused rank-r expert LoRA backward (SUROGATE_FUSED_EXPERT_LORA, default on):
+                // a tile kernel plus a fixed-order reduce replace five grouped cuBLAS calls and
+                // two vector_adds per projection. dx accumulates into d_input; dA/dB follow
+                // grad_beta (experts without tokens stay untouched, as with cuBLAS); the rank-r
+                // intermediates stay in fp32 with the scaling applied once (the cuBLAS path
+                // rounds them to bf16 before and after vector_add(t, t, t, 0.5 * s)). Falls
+                // back to cuBLAS for dropout, rollout parity, non-bf16 tensors, compact LoRA
+                // weights and LLEP merged weight gradients (which need scatter_exchange).
+                auto native_expert_view = [&](const Tensor& w) -> Tensor {
+                    // The tensor itself, or the native slice of an EP-global [E_global, ...]
+                    // tensor (the rule of dispatch_grouped_gemm); Data == nullptr when unusable.
+                    Tensor v = w;
+                    v.Data = nullptr;
+                    if (w.DType != ETensorDType::BF16 || w.Rank != 3 || !w.Data) return v;
+                    const long rows = w.Sizes[0];
+                    if (rows == num_experts) {
+                        v.Data = w.Data;
+                    } else if (mOptions.EPSize > 1 && rows > num_experts) {
+                        auto meta_it = mEPLayerMeta.find(ep_key);
+                        if (meta_it != mEPLayerMeta.end()) {
+                            const auto& meta = meta_it->second;
+                            if (meta.num_local == num_experts && meta.native_start >= 0 &&
+                                meta.native_start + num_experts <= rows) {
+                                v.Data = w.Data + static_cast<std::size_t>(meta.native_start) * w.Sizes[1] *
+                                                      w.Sizes[2] * get_dtype_size(w.DType);
+                                v.Sizes[0] = num_experts;
+                            }
+                        }
+                    }
+                    return v;
+                };
+                auto fused_lora_backward = [&](const modules::LoRAGroupedLayerWeights<Tensor>& w,
+                                               modules::LoRAGroupedLayerWeights<Tensor>* grads,
+                                               const Tensor& d_out_t,
+                                               Tensor& dx_t,
+                                               int in_features,
+                                               int out_features) -> bool {
+                    if (!moe_lora_grouped_enabled() || (training && dropout > 0.0f) || mOptions.rollout_parity() ||
+                        llep_wgrad) {
+                        return false;
+                    }
+                    if (d_out_t.DType != ETensorDType::BF16 || dx_t.DType != ETensorDType::BF16 ||
+                        inp.DType != ETensorDType::BF16) {
+                        return false;
+                    }
+                    // Sanitized host offsets mean the device offsets disagree with the gradient's
+                    // row count; the kernels locate tiles from the device copy, so this case stays
+                    // on the cuBLAS path, which addresses rows through the sanitized host copy.
+                    if (!host_offsets_sanitized.empty() || inp.Rank < 2 || inp.Sizes[0] < total_tokens_l) return false;
+                    const Tensor A = native_expert_view(w.A);
+                    const Tensor B = native_expert_view(w.B);
+                    Tensor dA = grads ? native_expert_view(grads->A) : Tensor{};
+                    Tensor dB = grads ? native_expert_view(grads->B) : Tensor{};
+                    if (!A.Data || !B.Data || (grads && (!dA.Data || !dB.Data))) return false;
+                    std::size_t workspace_floats = 0;
+                    Tensor workspace;
+                    if (grads) {
+                        workspace_floats = moe_lora_grouped_backward_workspace_floats(host_offsets_ptr,
+                                                                                      num_experts,
+                                                                                      total_tokens_i,
+                                                                                      in_features,
+                                                                                      out_features,
+                                                                                      rank);
+                        if (workspace_floats == 0) return false;
+                        workspace = mRunState.temp_alloc(ETensorDType::FP32,
+                                                         {static_cast<long>(workspace_floats)},
+                                                         "moe_lora_grouped_partials");
+                        mTemps.push_back(workspace);
+                    }
+                    return moe_lora_grouped_backward_bf16(dx_t.get<nv_bfloat16>(),
+                                                          grads ? dA.get<nv_bfloat16>() : nullptr,
+                                                          grads ? dB.get<nv_bfloat16>() : nullptr,
+                                                          d_out_t.get<nv_bfloat16>(),
+                                                          inp.get<nv_bfloat16>(),
+                                                          A.get<nv_bfloat16>(),
+                                                          B.get<nv_bfloat16>(),
+                                                          expert_offsets_ptr,
+                                                          host_offsets_ptr,
+                                                          num_experts,
+                                                          total_tokens_i,
+                                                          in_features,
+                                                          out_features,
+                                                          rank,
+                                                          scaling,
+                                                          /*dx_accumulate=*/true,
+                                                          /*grad_accumulate=*/lora_accum,
+                                                          grads ? workspace.get<float>() : nullptr,
+                                                          workspace_floats,
+                                                          mRunState.MainStream);
+                };
+
+                if (total_tokens_i > 0 && rank > 0 &&
+                    fused_lora_backward(lora_down,
+                                        lora_grads && lora_grads->moe.grouped.down.has_value()
+                                            ? &*lora_grads->moe.grouped.down
+                                            : nullptr,
+                                        d_output,
+                                        d_input,
+                                        intermediate_size,
+                                        hidden_size)) {
+                    // dx, dA and dB are complete (two launches).
+                } else if (total_tokens_i > 0 && rank > 0) {
                     Tensor lora_intermediate =
                         view_or_temp(mLoRARunState->moe_lora_intermediate1, total_tokens_l, rank);
                     const unsigned int seed_down = get_dropout_seed(6);

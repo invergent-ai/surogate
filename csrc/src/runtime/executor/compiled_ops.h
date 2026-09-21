@@ -1026,6 +1026,10 @@ private:
     std::byte* mMemEffScratchArena = nullptr;
     std::size_t mMemEffScratchCapacity = 0;
     std::size_t mMemEffScratchOffset = 0;
+    // Arenas replaced by an on-demand growth (outside capture) while their
+    // buffers were still owned by the op in flight; freed stream-ordered at the
+    // next mem_eff_scratch_reset().
+    std::vector<std::byte*> mRetiredMemEffScratchArenas;
 
     /// Bump-allocate `bytes` from the replay-persist arena. Allocates the
     /// arena lazily on first call, rounded up to at least 256 MiB. Returns

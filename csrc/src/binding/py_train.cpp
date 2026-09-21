@@ -525,9 +525,11 @@ void MultiGPUPyTrainer::init_weights() {
  * @param directory Checkpoint root directory.
  * @param step Checkpoint step index to load.
  */
-void MultiGPUPyTrainer::load_checkpoint(std::string directory, int step) {
-    run_work([directory, step](sThreadContext& ctx) {
-        ::load_checkpoint(directory, step, *ctx.Model, nullptr, *ctx.Communicator);
+void MultiGPUPyTrainer::load_checkpoint(std::string directory, int step, DataLoader* loader) {
+    run_work([directory, step, loader](sThreadContext& ctx) {
+        // one DataLoader serves all local ranks: restore it from the local-rank-0 worker only
+        // (chunk_index is rank-local, so every node restores from the same record)
+        ::load_checkpoint(directory, step, *ctx.Model, ctx.Communicator->local_rank() == 0 ? loader : nullptr, *ctx.Communicator);
     });
 }
 
@@ -540,9 +542,9 @@ void MultiGPUPyTrainer::load_checkpoint(std::string directory, int step) {
  * @param directory Checkpoint root directory.
  * @param step Checkpoint step index to save.
  */
-void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
-    run_work([directory, step](sThreadContext& ctx) {
-        ::save_checkpoint(directory, step, *ctx.Model, nullptr, *ctx.Communicator);
+void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step, DataLoader* loader) {
+    run_work([directory, step, loader](sThreadContext& ctx) {
+        ::save_checkpoint(directory, step, *ctx.Model, ctx.Communicator->local_rank() == 0 ? loader : nullptr, *ctx.Communicator);
     });
 }
 

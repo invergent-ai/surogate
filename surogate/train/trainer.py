@@ -527,7 +527,7 @@ class SurogateTrainerWrapper:
                         Path(config.checkpoint_dir) / f"step_{self.start_step:08d}",
                         config.model_dir,
                     )
-                self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
+                self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step, self.train_loader)
             else:
                 logger.warning("No checkpoint found to resume from. Starting training from beginning.")
                 self.start_step = 0
@@ -1000,7 +1000,7 @@ class SurogateTrainerWrapper:
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
                 logger.info(f"Saving checkpoint to {self.config.checkpoint_dir}...")
                 try:
-                    self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+                    self.trainer.save_checkpoint(self.config.checkpoint_dir, step, self.train_loader)
                     logger.info(f"Checkpoint saved successfully at step {step}")
 
                     checkpoint_plot_path = Path(self.config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"
@@ -1293,6 +1293,24 @@ class SurogateTrainerWrapper:
         else:
             early_stopping = None
 
+        if self.start_step > 0:
+            # load_checkpoint restored the data loader's position (seed, epoch, file and
+            # chunk index) when the checkpoint carried one; checkpoints written by builds
+            # that saved without the loader restart the epoch from its first row.
+            resumed_meta = Path(self.config.checkpoint_dir) / f"step_{self.start_step:08d}" / "checkpoint.json"
+            resumed = json.loads(resumed_meta.read_text()) if resumed_meta.exists() else {}
+            if "data-loader" in resumed:
+                logger.info(
+                    f"Resuming at step {self.start_step}: data loader restored to epoch "
+                    f"{self.train_loader.epoch()}, file {self.train_loader.file_index()}, "
+                    f"chunk {self.train_loader.chunk_index()}"
+                )
+            else:
+                logger.warning(
+                    f"Resuming at step {self.start_step} from a checkpoint without data-loader state: "
+                    "the epoch restarts from its first row"
+                )
+
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
         for step in range(self.start_step, self.max_steps):
@@ -1346,7 +1364,7 @@ class SurogateTrainerWrapper:
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
                 logger.info(f"Saving checkpoint to {self.config.checkpoint_dir}...")
                 try:
-                    self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+                    self.trainer.save_checkpoint(self.config.checkpoint_dir, step, self.train_loader)
                     logger.info(f"Checkpoint saved successfully at step {step}")
 
                     # Generate training plot in checkpoint directory
