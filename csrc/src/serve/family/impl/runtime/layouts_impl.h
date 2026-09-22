@@ -1019,9 +1019,26 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.sm() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
-    }
+    // No compute-capability gate here on purpose.
+    //
+    // There used to be `if (device.sm() != 120) throw "Qwen3.6 family runtime
+    // requires compute capability 12.0"`. It was correct when this runtime was
+    // one target's (`targets/qwen3_6/impl/runtime/`), and became wrong the
+    // moment a second target was built on it: every target now compiles this
+    // in, so it refused sm_89 for every model, including BF16 checkpoints that
+    // need nothing from Blackwell. That is hardware `SUROGATE_SERVE_CUDA_ARCHS`
+    // deliberately builds for.
+    //
+    // The real constraint is per weights profile, not per target and not per
+    // device: the FP4 kernel families are pinned to `120a` in CMakeLists, so an
+    // sm_89 fatbin carries no cubin for them and CUDA refuses at the point of
+    // use. The build enforces it; this function cannot see `weights_profile`
+    // anyway, which is why it reached for the device instead.
+    //
+    // A cleaner refusal, keyed on the profile, is written up with the exact
+    // NVFP4 enumerator list in
+    // Misc/specs/trainer-undeclared-grpo-dependencies.md. It needs the profile
+    // threading through to here; do that rather than re-adding a device check.
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,

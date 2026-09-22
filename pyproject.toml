@@ -46,7 +46,13 @@ dependencies = [
     "wandb==0.25.1",
     "jaxtyping",
     "aiolimiter",
-    "openai==2.32.0"
+    "openai==2.32.0",
+    # GRPO's batch transport encodes with it (grpo/transport/base.py,
+    # types.py). Undeclared since the transport landed in v1.0.0 and
+    # unnoticed because vLLM pulled it in; when the rollout server stopped
+    # being vLLM the dependency left with it and every GRPO run died at
+    # ModuleNotFoundError before its first step.
+    "msgspec"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
