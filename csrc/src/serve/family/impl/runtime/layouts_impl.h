@@ -1033,18 +1033,19 @@ void validate_target_options(const EngineOptions& options,
     // The constraint it was reaching for is per weights profile, not per
     // device and not per target. Only `qwen3_5` and `qwen3_5_moe` declare an
     // FP4 profile at all (`api/targets/*/package.h`); every other target's
-    // `WeightsProfile` is `GroupwiseInt`. And the build already enforces it:
-    // `sinfer_nvfp4_tma` and `sinfer_trtllm_moe` are pinned to
-    // `CUDA_ARCHITECTURES 120a` in csrc/CMakeLists.txt, so an sm_89 fatbin
-    // carries no cubin for those kernels and CUDA refuses at the point of use.
-    // The comment on `SUROGATE_SERVE_CUDA_ARCHS` states this design directly:
-    // "the fp4 profile needs sm_120a".
+    // `WeightsProfile` is `GroupwiseInt`.
     //
-    // If a friendlier refusal is wanted, key it on `weights_profile` and raise
-    // it where the profile is in scope. This function cannot see the profile,
-    // which is the likely reason it reached for the device instead. Thread the
-    // profile through rather than re-adding a device check -- `DeviceContext&`
-    // was a parameter here only for that check and has been dropped.
+    // The build pins `sinfer_nvfp4_tma` and `sinfer_trtllm_moe` to
+    // `CUDA_ARCHITECTURES 120a`, so an sm_89 fatbin carries no cubin for those
+    // and CUDA refuses at the point of use. It does NOT cover the dense W4A4
+    // mma kernel: `nvfp4_w4a4.cu` builds inside `sinfer_ops` at the full arch
+    // set, so an sm_89 cubin exists whose body is `__trap()`. The build cannot
+    // be the whole story, which is why the refusal lives in
+    // `make_sequence_planner_impl` below, keyed on the profile.
+    //
+    // This function cannot see `weights_profile`, which is the likely reason
+    // it reached for the device instead. Keep any new refusal where the
+    // profile is in scope rather than re-adding a device check here.
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -1163,11 +1164,29 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 } // namespace
 
+/// Do these weights need the sm_120 block-scaled FP4 MMA? Twelve of the
+/// fourteen targets have no FP4 profile, and this answers for them.
+///
+/// A target that does declares a non-template overload beside its
+/// `WeightsProfile` enum; ADL finds it and it wins over this template on exact
+/// match. Deliberately not `if constexpr (requires ...)`: the function below
+/// is not a template, so an undeclared name there is a hard error rather than
+/// a quiet false.
+template <class Profile>
+constexpr bool weights_profile_needs_sm120(Profile) noexcept {
+    return false;
+}
+
 std::unique_ptr<family::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
     validate_target_options(options, geometry);
+    if (weights_profile_needs_sm120(weights_profile) && device.sm() < 120) {
+        throw std::invalid_argument(
+            "this checkpoint's NVFP4 weights need compute capability 12.0 or newer; "
+            "serve a non-FP4 export of the model on this device");
+    }
     if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {
         throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
     }

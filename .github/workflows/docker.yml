@@ -161,7 +161,11 @@ jobs:
               else:
                   print(f"ok: {mode} -> {path}")
           if problems:
-              sys.exit("::error::" + "; ".join(problems))
+              # print, not sys.exit(msg): workflow commands are parsed from
+              # stdout, and sys.exit writes its argument to stderr, so the
+              # annotation never rendered.
+              print("::error::" + "; ".join(problems))
+              sys.exit(1)
           PY
 
       # The step above asks whether the image carries what the *binary* loads.
@@ -181,6 +185,14 @@ jobs:
       # shared object file` without `--gpus`, which this runner does not have.
       # Same reason the step above treats libcuda.so.1 as its one permitted
       # miss. Adding one of them makes this step red on every build.
+      #
+      # What this CANNOT catch, so nobody reads more into a green tick than is
+      # there: it imports inside the built image, where every dependency is
+      # installed whether or not pyproject asks for it. It proves presence, not
+      # declaration. An undeclared package that some other dependency still
+      # happens to pull in passes here -- which is precisely how msgspec stayed
+      # hidden for a year. Catching that class needs a resolve of the declared
+      # set alone, not an import in the assembled image.
       - name: The package can import what a run will import
         if: steps.should_build.outputs.build == 'true'
         run: |
@@ -190,6 +202,9 @@ jobs:
           import importlib, sys
 
           MODULES = [
+              # The console script's own entry point, which neither step
+              # covered.
+              "surogate.cli.main",
               "surogate.cli.grpo",
               "surogate.grpo.transport.base",
               "surogate.grpo.transport.types",
@@ -204,5 +219,9 @@ jobs:
               except Exception as exc:
                   problems.append(f"{name}: {type(exc).__name__}: {exc}")
           if problems:
-              sys.exit("::error::" + "; ".join(problems))
+              # print, not sys.exit(msg): workflow commands are parsed from
+              # stdout, and sys.exit writes its argument to stderr, so the
+              # annotation never rendered.
+              print("::error::" + "; ".join(problems))
+              sys.exit(1)
           PY

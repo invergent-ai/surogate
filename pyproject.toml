@@ -52,7 +52,14 @@ dependencies = [
     # unnoticed because vLLM pulled it in; when the rollout server stopped
     # being vLLM the dependency left with it and every GRPO run died at
     # ModuleNotFoundError before its first step.
-    "msgspec"
+    "msgspec",
+    # Same bug as msgspec, found the same way. `grpo/transport/zmq.py` imports
+    # zmq at module scope and `transport/__init__.py` imports that
+    # unconditionally, so it is on the import path of every GRPO run whichever
+    # transport is configured. `grpo/utils/client.py` imports tenacity the same
+    # way. Both were vLLM dependencies too.
+    "pyzmq",
+    "tenacity"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

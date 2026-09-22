@@ -47,6 +47,22 @@ enum class WeightsProfile : std::uint8_t {
     CompressedTensors,
 };
 
+/// Do these weights need the sm_120 block-scaled FP4 MMA?
+///
+/// Both NVFP4-bearing profiles here route through `sinfer_trtllm_moe`, which
+/// is pinned to 120a and refuses for itself, so this is belt and braces: a
+/// refusal at load reads better than one raised mid-rollout.
+[[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile profile) noexcept {
+    switch (profile) {
+    case WeightsProfile::GroupwiseInt:
+        return false;
+    case WeightsProfile::RoutedNvfp4:
+    case WeightsProfile::CompressedTensors:
+        return true;
+    }
+    return false;
+}
+
 using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
 using OutputSession  = family::OutputSession;
