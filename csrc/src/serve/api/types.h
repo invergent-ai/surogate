@@ -792,6 +792,11 @@ struct RuntimeStats {
     std::uint32_t kv_granule_pages             = 0;
     std::uint32_t kv_pages_resident_at_granule = 0;
     std::size_t kv_page_bytes                  = 0;
+    // Times the queue head could not be given a lane although the admission ledger found it
+    // unblocked -- it is waiting on pages the ledger cannot attribute, most often KV still
+    // committed to a retained GPU prefix. A benign retry, but a rising count means admission
+    // is spending rounds on a head it cannot place, so it is worth a graph.
+    std::uint64_t admission_unblocked_heads    = 0;
 };
 
 struct LoadSummary {

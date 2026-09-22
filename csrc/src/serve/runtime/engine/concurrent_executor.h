@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include "core/limits.h"
 #include <deque>
@@ -751,6 +752,17 @@ private:
         return active;
     }
 
+    /// Pages the ledger can attribute to running requests. The pool's `entitled_pages` minus
+    /// this is what admission cannot see -- retained GPU prefixes above all.
+    [[nodiscard]] static std::uint32_t
+    active_main_kv_pages(const ActiveAdmissionSet& active) noexcept {
+        std::uint32_t pages = 0;
+        for (const ActiveAdmissionSnapshot& request : active.span()) {
+            pages += request.resources.main_kv_pages;
+        }
+        return pages;
+    }
+
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
@@ -1077,9 +1089,57 @@ private:
                 continue;
             }
             if (!protection_) {
-                protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
-                                                              head_base.admission, active.span(),
-                                                              admission_capacity_));
+                std::optional<AdmissionProtection> protection = make_admission_protection(
+                    next_protection_epoch_, head->id, head_base.admission, active.span(),
+                    admission_capacity_);
+                // A third category of the same kind as the two above, and the one the
+                // neighbouring refusal names: the protection ledger reasons on lanes and
+                // pages, and a retained GPU prefix holds committed KV pages that belong to
+                // no lane and to no active request, so the ledger finds this head unblocked
+                // while the pool has no room for it. There is nothing to protect it from;
+                // leave the queue in order and retry at the round boundary, when completing
+                // lanes and expiring prefixes give their pages back.
+                if (!protection) {
+                    // Counted, not only traced: a trace is readable by someone who already
+                    // suspects this and restarts the server, while the counter reaches
+                    // /metrics and the stats endpoint on a server that is already running.
+                    ++cumulative_stats_.admission_unblocked_heads;
+                    static const bool trace_admission =
+                        std::getenv("SUROGATE_SERVE_ADMISSION_TRACE") != nullptr;
+                    if (trace_admission) {
+                        // Report what the pool was actually asked for. The lane plans differ
+                        // from the base plan by the pages a GPU-prefix fork shares, which is
+                        // exactly the quantity this condition turns on, so the base plan
+                        // overstates the request by it. `entitled` is the other half of the
+                        // story: the pages the pool has committed, including the ones held by
+                        // a retained prefix that the ledger above cannot attribute.
+                        std::uint32_t lane_pages = head_base.admission.main_kv_pages;
+                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                            if (slots_[lane] != nullptr || lane >= head->lane_plans.size() ||
+                                !head->lane_plans[lane]) {
+                                continue;
+                            }
+                            lane_pages = std::min(
+                                lane_pages,
+                                head->lane_plans[lane]->summary().admission.main_kv_pages);
+                        }
+                        const auto kv = instance_.program->kv_occupancy();
+                        std::fprintf(stderr,
+                                     "admission-trace: head %llu unblocked by the lane/page "
+                                     "ledger but refused a lane (active=%zu ledger=%u "
+                                     "lane_pages=%u entitled=%u/%u unattributed=%d)\n",
+                                     static_cast<unsigned long long>(head->id), active.size,
+                                     head_base.admission.main_kv_pages, lane_pages,
+                                     kv.entitled_pages, kv.capacity_pages,
+                                     static_cast<int>(kv.entitled_pages) -
+                                         static_cast<int>(active_main_kv_pages(active)));
+                    }
+                    protection_.reset();
+                    return control_progress ? AdmissionProgress::ControlProgress
+                                            : AdmissionProgress::None;
+                }
+                ++next_protection_epoch_;
+                protection_.emplace(std::move(*protection));
             }
             if (protected_head_safe_without_temporal(*protection_, active.span(),
                                                      admission_capacity_)) {

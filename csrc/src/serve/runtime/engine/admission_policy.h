@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace sinfer::runtime {
@@ -46,7 +47,15 @@ struct AdmissionProtection {
 
 // Freezes the currently active requests and selects the earliest projected completion prefix
 // whose release makes the protected head componentwise feasible.
-[[nodiscard]] AdmissionProtection make_admission_protection(
+//
+// Returns no protection when this ledger says the head is not blocked at all: the incumbents
+// plus the head fit in capacity, so the head was refused admission for a reason the lane/page
+// accounting cannot express -- an elastic device gate, the frozen media buffer, or KV pages
+// still committed to a retained GPU prefix, whose owner is a client-held key and not a lane.
+// That is an observation about resources, not a programming error: there is nothing to protect
+// the head from, and the caller retries at the next round boundary. Broken preconditions (an
+// invalid frontier, an incumbent with no progress state) still throw.
+[[nodiscard]] std::optional<AdmissionProtection> make_admission_protection(
     std::uint64_t epoch_id, std::uint64_t head_request_id, const AdmissionResources& head_resources,
     std::span<const ActiveAdmissionSnapshot> active, const AdmissionResources& capacity);
 
