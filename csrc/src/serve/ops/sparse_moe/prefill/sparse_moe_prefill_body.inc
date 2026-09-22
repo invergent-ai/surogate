@@ -775,7 +775,14 @@ inline void launch_ggml_prefill_codec(I8Launch& i8, Bf16Launch& bf16, bool int8_
         else { bf16.template operator()<Codec>(); }
     } else {
         (void)i8;
-        (void)int8_route;
+        // An int8 plan quantised the activations and did not gather them in BF16, so the BF16
+        // kernel would read nothing. The plan admits a pair to the int8 route only when both
+        // sides have an int8 codec; a plan that disagrees with this trait is a defect, and a
+        // loud one is better than a round of zeros.
+        if (int8_route) {
+            throw std::logic_error(
+                "sparse_moe prefill: an int8 plan for a format without an int8 codec");
+        }
         bf16.template operator()<Codec>();
     }
 }
