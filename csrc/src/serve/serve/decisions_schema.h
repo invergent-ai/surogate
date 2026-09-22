@@ -185,4 +185,39 @@ render_decision_question(const DecisionQuestion& question, const std::vector<std
 
 [[nodiscard]] std::string new_decision_id();
 
+/// Which side of the engine call a failure came from, which is half of who is at fault.
+enum class DecisionsFaultStage : std::uint8_t {
+    /// Reading the body, rendering the prompts, tokenising and checking them: the caller's own
+    /// thread, working on what the caller sent.
+    Preparation,
+    /// Inside `submit`/`wait`: the planner, the scheduler and the rounds, on the engine's
+    /// thread and on the engine's state.
+    Engine,
+};
+
+/// How a decisions failure is reported, once `ApiException` (the endpoint's own refusals) and
+/// `RequestError` (the engine's vocabulary for refusals a caller can act on: too long,
+/// overloaded, cancelled, unavailable) have already been handled.
+///
+/// The endpoint used to catch `std::invalid_argument` wholesale and answer HTTP 400
+/// `invalid_decisions_request` with the exception's text, so an engine-internal invariant was
+/// reported as the caller's `questions` field being wrong -- see
+/// `decision-index-v1/out-full/logs/server-gpu0-8140.log` lines 515, 518 and 519, where the
+/// 400 carries the scheduler's own "protected head is not blocked by frozen incumbents". No
+/// client retries 4xx, so every one of those silently dropped a row.
+///
+/// The split: a failure in preparation is the caller's, and so is `sinfer::InvalidRequest`
+/// from anywhere, because the engine raises that type only about the request itself. Anything
+/// else out of the engine is the engine's, and becomes a retryable 5xx whose detail is logged
+/// rather than returned.
+struct DecisionsFault {
+    /// What the caller is told.
+    ApiError error;
+    /// The fault's own text, when it is to be logged instead of returned. Empty otherwise.
+    std::string internal_detail;
+};
+
+[[nodiscard]] DecisionsFault classify_decisions_fault(const std::exception& fault,
+                                                      DecisionsFaultStage stage);
+
 } // namespace sinfer::serve

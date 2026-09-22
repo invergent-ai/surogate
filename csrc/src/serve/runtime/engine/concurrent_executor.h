@@ -928,6 +928,7 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
+            bool evicted = false;
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
                  !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
@@ -936,10 +937,38 @@ private:
                     instance_.program->has_retained_lane(retained_lane)) {
                     instance_.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
+                    evicted = true;
                 }
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                throw std::logic_error("retained eviction did not make admission feasible");
+                // `can_admit_lane_after_retained_eviction` chose this lane by summing every
+                // `sequences[other].retained && sequences[other].kv`, with no test on the
+                // lane's slot; the loop above only evicts lanes whose slot is free, and gates
+                // on `has_retained_lane`, which does not test `kv`. The two sets are therefore
+                // not the same predicate, and a lane the sum counted can be one the loop
+                // declines to free.
+                //
+                // Today they cannot actually disagree -- `sequence.retained` is set only under
+                // `if (terminal)` (program_impl.h `resolve_pending_batch` and
+                // `resolve_non_speculative_pending`), and the executor clears every terminal
+                // lane's slot inside the same resolution call, before any admission runs, so
+                // `retained` never coexists with an occupied slot at this point. That is a
+                // reading of two files, not a proof, and it is exactly the shape of invariant
+                // that a future prefix, checkpoint or pipeline path breaks quietly.
+                //
+                // So it is not fatal. Nothing has been taken yet: `erase_pending` is below,
+                // the request is still at the front of the queue with its plans, and evicting
+                // retained lanes is progress rather than damage. Re-plan this lane and let the
+                // round boundary try again. Note what this does NOT do: `try_admit_one` returns
+                // straight from here whenever a lane was found, so the `active.size == 0`
+                // refusal is never reached on this path. If the pages genuinely never come
+                // back, the head is retried until its own queue deadline and then failed with
+                // `request_queue_timeout`, and the stuck pages are not reclaimed -- the engine
+                // stays alive, which is the point, but the request is not refused early. Claim
+                // control progress only when something was actually evicted, so a
+                // disagreement that frees nothing cannot spin the admission loop.
+                invalidate_lane_plans(lane);
+                return evicted ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
         }
 
@@ -1642,7 +1671,36 @@ private:
         return lock;
     }
 
-    void fail_all(std::exception_ptr error) noexcept {
+    /// What the requests caught by an engine-wide failure are told.
+    ///
+    /// A fatal out of the worker loop belongs to the engine, not to whichever requests happened
+    /// to be in flight when it fired, and handing them the raw internal exception made every
+    /// protocol layer blame the caller for it: a scheduler invariant came back as HTTP 400 with
+    /// the scheduler's own message (`decision-index-v1/out-full/logs/server-gpu0-8140.log`
+    /// lines 515, 518, 519), and 4xx is exactly what no client retries. Every request submitted
+    /// after this point is refused by `submit` with `Unavailable`; give the ones already here
+    /// the same answer, so the whole outage reads as one retryable condition. The fatal's own
+    /// text is not lost -- the worker prints it on its `engine worker loop fatal:` line before
+    /// calling this. A `RequestError` is already the engine's client-facing vocabulary (this is
+    /// also the shutdown path), so it is passed through untouched.
+    [[nodiscard]] static std::exception_ptr client_facing_failure(std::exception_ptr error) noexcept {
+        if (!error) {
+            return std::make_exception_ptr(
+                RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable"));
+        }
+        try {
+            std::rethrow_exception(error);
+        } catch (const RequestError&) {
+            return error;
+        } catch (...) {
+            return std::make_exception_ptr(RequestError(
+                RequestErrorKind::Unavailable,
+                "the inference engine failed while this request was in flight"));
+        }
+    }
+
+    void fail_all(std::exception_ptr fatal) noexcept {
+        const std::exception_ptr error = client_facing_failure(std::move(fatal));
         std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
         {

@@ -212,6 +212,40 @@ sinfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
                                 .param = std::move(param), .code = code});
 }
 
+/// Answer with a classified decisions fault, keeping an engine-internal detail out of the
+/// response body and in the server log instead.
+[[noreturn]] void throw_decisions_fault(DecisionsFault fault) {
+    if (!fault.internal_detail.empty()) {
+        write_console_log(ConsoleLogLevel::Error,
+                          "decisions request failed inside the engine: " + fault.internal_detail);
+    }
+    throw ApiException(std::move(fault.error));
+}
+
+/// Run one interaction with the engine with the fault boundary drawn around it.
+///
+/// Everything inside is the engine's own thread, planner and scheduler working on the engine's
+/// state. `ApiException` is this endpoint's own refusal (a cancellation, a queue timeout) and
+/// `RequestError` is the engine's client-facing vocabulary, already mapped by
+/// `request_error_to_api_error`; both pass through untouched. Anything else that comes out --
+/// an `std::invalid_argument` from a scheduler invariant handed over by `fail_all`, a prefix
+/// image that is no longer in this engine, a `std::logic_error` from a round -- is the
+/// engine's fault and is reported as such rather than as a 400 against the caller. An
+/// `InvalidRequest` raised by the planner is still the caller's and keeps its 400;
+/// `classify_decisions_fault` is what decides.
+template <class Fn>
+decltype(auto) in_engine(Fn&& fn) {
+    try {
+        return fn();
+    } catch (const ApiException&) {
+        throw;
+    } catch (const sinfer::RequestError&) {
+        throw;
+    } catch (const std::exception& cause) {
+        throw_decisions_fault(classify_decisions_fault(cause, DecisionsFaultStage::Engine));
+    }
+}
+
 void check_preparation_control(Clock::time_point deadline,
                                const std::function<bool()>& is_cancelled) {
     if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
@@ -1128,8 +1162,12 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             sinfer::RequestOptions warm_options    = base;
             warm_options.execution.save_gpu_prefix = key;
             check();
-            auto warm = engine_->submit(engine_->prepare_tokens(prefix), std::move(warm_options), deadline, adapter.lifetime);
-            const auto warm_result = warm.wait(nullptr, cancellation);
+            auto warm_prompt = engine_->prepare_tokens(prefix);
+            auto warm = in_engine([&] {
+                return engine_->submit(std::move(warm_prompt), std::move(warm_options), deadline,
+                                       adapter.lifetime);
+            });
+            const auto warm_result = in_engine([&] { return warm.wait(nullptr, cancellation); });
             check();
             if (warm_result.finish_reason == FinishReason::Cancelled) {
                 throw RequestError(RequestErrorKind::Cancelled, "decisions were cancelled");
@@ -1144,8 +1182,12 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                 return engine_->prepare_tokens(std::move(tokens));
             };
         }
-        const CandidateReadout readout = read_candidates(queries, make_prompt, base, adapter.lifetime,
-                                                         deadline, cancellation, check, "decisions were cancelled");
+        // `make_prompt` runs inside this: the tokens it hands the engine are this endpoint's
+        // own rendering, not the caller's, so a refusal of them is a service fault too.
+        const CandidateReadout readout = in_engine([&] {
+            return read_candidates(queries, make_prompt, base, adapter.lifetime, deadline,
+                                   cancellation, check, "decisions were cancelled");
+        });
         check();
         outcome.prefill_seconds += readout.prefill_seconds;
         outcome.input_tokens  = static_cast<int>(outcome.shared_prefix_tokens) + readout.suffix_tokens;
@@ -1161,9 +1203,12 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
     } catch (const ApiException&) { throw; } catch (const sinfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
-        // Media acquisition raises its own ApiException above; what reaches here is the
-        // engine refusing an argument of the request (a candidate token, a prefix extension).
-        refuse(exception.what(), "questions", "invalid_decisions_request");
+        // Preparation only: everything the engine answers with goes through `in_engine` above,
+        // which has already classified it. Media acquisition raises its own ApiException. What
+        // is left is the chat template or the tokenizer refusing what the caller sent, which is
+        // theirs -- so this keeps the 400 it has always had.
+        throw_decisions_fault(
+            classify_decisions_fault(exception, DecisionsFaultStage::Preparation));
     }
 }
 
