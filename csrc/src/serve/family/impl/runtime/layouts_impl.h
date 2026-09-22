@@ -1022,24 +1022,29 @@ void validate_target_options(const EngineOptions& options,
     // No compute-capability gate here on purpose.
     //
     // There used to be `if (device.sm() != 120) throw "Qwen3.6 family runtime
-    // requires compute capability 12.0"`. It was correct when this runtime was
-    // one target's (`targets/qwen3_6/impl/runtime/`), and became wrong the
-    // moment a second target was built on it: every target now compiles this
-    // in, so it refused sm_89 for every model, including BF16 checkpoints that
-    // need nothing from Blackwell. That is hardware `SUROGATE_SERVE_CUDA_ARCHS`
-    // deliberately builds for.
+    // requires compute capability 12.0"`. It was defensible while this runtime
+    // belonged to one target. It stopped being defensible when a second target
+    // was built on it: every target instantiates this template
+    // (`impl/runtime/instantiate.h`), so one target's device requirement became
+    // all fourteen targets' requirement. sm_89 was refused for a BF16 llama,
+    // which needs nothing from Blackwell and is hardware
+    // `SUROGATE_SERVE_CUDA_ARCHS` builds for by default.
     //
-    // The real constraint is per weights profile, not per target and not per
-    // device: the FP4 kernel families are pinned to `120a` in CMakeLists, so an
-    // sm_89 fatbin carries no cubin for them and CUDA refuses at the point of
-    // use. The build enforces it. This function took a `DeviceContext&` only
-    // for that check and no longer does; it cannot see `weights_profile`,
-    // which is likely why it reached for the device in the first place.
+    // The constraint it was reaching for is per weights profile, not per
+    // device and not per target. Only `qwen3_5` and `qwen3_5_moe` declare an
+    // FP4 profile at all (`api/targets/*/package.h`); every other target's
+    // `WeightsProfile` is `GroupwiseInt`. And the build already enforces it:
+    // `sinfer_nvfp4_tma` and `sinfer_trtllm_moe` are pinned to
+    // `CUDA_ARCHITECTURES 120a` in csrc/CMakeLists.txt, so an sm_89 fatbin
+    // carries no cubin for those kernels and CUDA refuses at the point of use.
+    // The comment on `SUROGATE_SERVE_CUDA_ARCHS` states this design directly:
+    // "the fp4 profile needs sm_120a".
     //
-    // A cleaner refusal, keyed on the profile, is written up with the exact
-    // NVFP4 enumerator list in
-    // Misc/specs/trainer-undeclared-grpo-dependencies.md. It needs the profile
-    // threading through to here; do that rather than re-adding a device check.
+    // If a friendlier refusal is wanted, key it on `weights_profile` and raise
+    // it where the profile is in scope. This function cannot see the profile,
+    // which is the likely reason it reached for the device instead. Thread the
+    // profile through rather than re-adding a device check -- `DeviceContext&`
+    // was a parameter here only for that check and has been dropped.
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
