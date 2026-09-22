@@ -18,18 +18,18 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
         !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
         !std::isfinite(sampling.frequency_penalty) ||
         !std::isfinite(sampling.repetition_penalty)) {
-        throw std::invalid_argument("sampling parameters must be finite");
+        throw InvalidRequest("sampling parameters must be finite");
     }
     // Zero would divide a positive logit by nothing; a negative one would flip the
     // sign of every seen token, which is not a penalty.
     if (sampling.repetition_penalty <= 0.0F) {
-        throw std::invalid_argument("repetition_penalty must be positive");
+        throw InvalidRequest("repetition_penalty must be positive");
     }
     if (sampling.top_p < 0.0F || sampling.top_p > 1.0F) {
-        throw std::invalid_argument("top_p must be in [0,1]");
+        throw InvalidRequest("top_p must be in [0,1]");
     }
     if (sampling.min_p < 0.0F || sampling.min_p > 1.0F) {
-        throw std::invalid_argument("min_p must be in [0,1]");
+        throw InvalidRequest("min_p must be in [0,1]");
     }
 }
 
@@ -78,16 +78,16 @@ std::uint64_t projected_vision_work(const family::VisionGeometry& vision, std::i
 RequestBasePlan
 ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                                    const runtime::ResolvedExecutionOptions& options) {
-    if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
+    if (prompt.token_ids.empty()) { throw InvalidRequest("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
-        throw std::invalid_argument("prompt exceeds configured context capacity");
+        throw InvalidRequest("prompt exceeds configured context capacity");
     }
     if (prompt.token_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("prompt token count exceeds uint32");
     }
     for (const TokenId id : prompt.token_ids) {
         if (id < 0 || id >= cfg.token_domain) {
-            throw std::invalid_argument("prompt contains token outside the 248077-token domain");
+            throw InvalidRequest("prompt contains token outside the 248077-token domain");
         }
     }
     if (prompt.token_types.size() != prompt.token_ids.size() ||
@@ -106,12 +106,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
     }
     if (prompt.has_media() && !vision_enabled) {
-        throw std::invalid_argument("Vision is disabled for this Engine");
+        throw InvalidRequest("Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
     for (const auto& [token, bias] : options.sampling.logit_bias) {
         if (token < 0 || token >= cfg.token_domain || !std::isfinite(bias) || bias < -100.0F || bias > 100.0F) {
-            throw std::invalid_argument("logit_bias token is outside the model vocabulary or value is outside [-100,100]");
+            throw InvalidRequest("logit_bias token is outside the model vocabulary or value is outside [-100,100]");
         }
     }
 
@@ -134,7 +134,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (options.next_token_candidates.size() > 256 ||
         std::any_of(options.next_token_candidates.begin(), options.next_token_candidates.end(),
                     [&](TokenId id) { return id < 0 || id >= cfg.token_domain; })) {
-        throw std::invalid_argument("invalid candidate token readout");
+        throw InvalidRequest("invalid candidate token readout");
     }
     base->next_token_candidates = options.next_token_candidates;
     base->cache_prompt = options.cache_prompt;
@@ -142,17 +142,21 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->save_gpu_prefix = options.save_gpu_prefix;
     base->target_only = bool(options.gpu_prefix || options.save_gpu_prefix);
     if (base->target_only && (prompt.has_media() || options.requested_output_tokens != 1)) {
-        throw std::invalid_argument("GPU prefix readout requires one-token text requests");
+        throw InvalidRequest("GPU prefix readout requires one-token text requests");
     }
     prune_gpu_prefixes();
     if (base->target_only) {
         if (options.gpu_prefix) {
             const auto found = gpu_prefixes.find(options.gpu_prefix.get());
+            // Deliberately not an `InvalidRequest`: the key is well formed and the caller is
+            // holding it, so this says the image is gone from *this* engine -- captured
+            // elsewhere, or dropped with the program. Nothing the caller sends fixes it, so it
+            // must not come back as a 4xx that blames them.
             if (found == gpu_prefixes.end()) throw std::invalid_argument("GPU prefix is unavailable in this engine");
             base->gpu_storage = found->second->storage;
         } else {
             const auto slots = options.save_gpu_prefix->state_slots;
-            if (slots == 0 || slots > 1025) throw std::invalid_argument("GPU prefix state capacity must be in [1,1025]");
+            if (slots == 0 || slots > 1025) throw InvalidRequest("GPU prefix state capacity must be in [1,1025]");
             std::size_t bytes = 0;
             for (const auto& t : prefix_state_tensors(sequences.front(), false, false))
                 bytes = (bytes + 255) / 256 * 256 + t.bytes();
@@ -274,6 +278,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (base_plan.impl_->gpu_prefix) {
         const auto it = gpu_prefixes.find(base_plan.impl_->gpu_prefix.get());
+        // As above, and more so here: the base plan already found this image, so reaching this
+        // means it left the engine between planning and admission. Engine state, not a bad
+        // request -- `find_admission_lane`'s caller fails only this request, and the endpoint
+        // must report that as an internal fault the caller may retry, not as a 4xx.
         if (it == gpu_prefixes.end()) throw std::invalid_argument("GPU prefix is unavailable in this engine");
         auto plan = plan_request_for_sequence(lane, it->second->state, prompt, base_plan);
         plan.impl_->device_prefix = it->second;

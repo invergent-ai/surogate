@@ -349,5 +349,78 @@ int main() {
         assert(decision_choice_confidence({0.0, 0.0, 0.0}) == 0.0);
         assert(decision_choice_confidence({0.7}) == 1.0 && decision_score_confidence({0.7}) == 1.0);
     }
-    std::cout << "decisions dumper, validation, rendering, codebook, shared prefix and readout checks passed\n";
+
+    // ---- Fault attribution: whose fault is it, and does the caller get a status they retry?
+    //
+    // The endpoint used to catch std::invalid_argument wholesale and answer 400
+    // invalid_decisions_request with the exception's own text, so an engine-internal invariant
+    // was reported as the caller's `questions` field being wrong. Incident evidence:
+    // decision-index-v1/out-full/logs/server-gpu0-8140.log lines 515, 518, 519 carry
+    //   status=400 code=invalid_decisions_request message=protected head is not blocked by frozen incumbents
+    // and the benchmark adapter (jev scripts/decision_index_surogate_engine_v1.py) retries only
+    // 429 and 5xx, so each of those permanently lost a row.
+    {
+        // The old rule, spelled out, so the change is literal rather than notional.
+        const auto old_rule = [](const std::exception& fault) {
+            return ApiError{.status = 400, .message = fault.what(),
+                            .param = "questions", .code = "invalid_decisions_request"};
+        };
+
+        // 1. The incident's own exception, arriving from the engine (fail_all hands in-flight
+        //    requests the raw fatal). It is the engine's fault: retryable 5xx, detail logged
+        //    and NOT returned.
+        const std::invalid_argument scheduler("protected head is not blocked by frozen incumbents");
+        assert(old_rule(scheduler).status == 400); // what it used to do
+        const DecisionsFault engine_fault =
+            classify_decisions_fault(scheduler, DecisionsFaultStage::Engine);
+        assert(engine_fault.error.status == 500);
+        assert(engine_fault.error.code == "internal_error");
+        assert(engine_fault.error.type == "server_error");
+        assert(engine_fault.error.param.empty());
+        assert(engine_fault.internal_detail == scheduler.what());
+        assert(engine_fault.error.message.find("protected head") == std::string::npos);
+        assert(engine_fault.error.message.find("retried") != std::string::npos);
+
+        // 2. The healthy-engine trigger, same shape, same answer: a GPU prefix image that is no
+        //    longer in this engine is engine state, not a bad request.
+        const std::invalid_argument prefix_gone("GPU prefix is unavailable in this engine");
+        assert(classify_decisions_fault(prefix_gone, DecisionsFaultStage::Engine).error.status == 500);
+
+        // 3. A logic_error out of the engine is the same class of fault.
+        const std::logic_error round("retained eviction did not make admission feasible");
+        assert(classify_decisions_fault(round, DecisionsFaultStage::Engine).error.status == 500);
+
+        // 4. A genuine client error keeps its 400 and its message, wherever it was raised. The
+        //    engine raises InvalidRequest only about the request itself.
+        const sinfer::InvalidRequest too_long("prompt exceeds configured context capacity");
+        const DecisionsFault caller = classify_decisions_fault(too_long, DecisionsFaultStage::Engine);
+        assert(caller.error.status == 400);
+        assert(caller.error.code == "invalid_decisions_request");
+        assert(caller.error.param == "questions");
+        assert(caller.error.message == std::string(too_long.what()));
+        assert(caller.internal_detail.empty());
+        const sinfer::InvalidRequest options("invalid candidate token readout");
+        assert(classify_decisions_fault(options, DecisionsFaultStage::Engine).error.status == 400);
+
+        // 5. Preparation is the caller's side of the call: the chat template and the tokenizer
+        //    working on what the caller sent. Unchanged from before, message included.
+        const std::invalid_argument rendering("chat template rejected the request");
+        const DecisionsFault prepared =
+            classify_decisions_fault(rendering, DecisionsFaultStage::Preparation);
+        assert(prepared.error.status == 400);
+        assert(prepared.error.code == "invalid_decisions_request");
+        assert(prepared.error.message == std::string(rendering.what()));
+        assert(prepared.internal_detail.empty());
+        assert(prepared.error.status == old_rule(rendering).status); // exactly what it used to do
+
+        // RequestError never reaches this classifier -- decide() maps it through
+        // request_error_to_api_error first -- but it derives from std::invalid_argument, so
+        // guard the ordering: it must not be mistaken for an InvalidRequest.
+        const sinfer::RequestError overloaded(sinfer::RequestErrorKind::Overloaded, "full");
+        assert(dynamic_cast<const sinfer::InvalidRequest*>(
+                   static_cast<const std::exception*>(&overloaded)) == nullptr);
+    }
+
+    std::cout << "decisions dumper, validation, rendering, codebook, shared prefix, readout and "
+                 "fault-attribution checks passed\n";
 }

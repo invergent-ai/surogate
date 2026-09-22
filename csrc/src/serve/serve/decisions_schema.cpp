@@ -637,6 +637,29 @@ OrderedJson resolve_decision_answer(const DecisionQuestion& question, const std:
     return answer;
 }
 
+DecisionsFault classify_decisions_fault(const std::exception& fault, DecisionsFaultStage stage) {
+    // `InvalidRequest` is the engine saying the request itself is wrong -- a prompt that does
+    // not fit, a token outside the domain, an option readout it cannot take -- so it keeps the
+    // 400 it has always had, wherever it was raised. Preparation is the caller's side of the
+    // call by construction: their body, the chat template and the tokenizer, nothing else.
+    if (stage == DecisionsFaultStage::Preparation ||
+        dynamic_cast<const sinfer::InvalidRequest*>(&fault) != nullptr) {
+        return DecisionsFault{.error = ApiError{.status  = 400,
+                                                .message = fault.what(),
+                                                .param   = "questions",
+                                                .code    = "invalid_decisions_request"}};
+    }
+    // The engine broke on its own state. The caller cannot fix it and must not be told they
+    // can, so the detail goes to the log and the answer carries a status a client retries.
+    return DecisionsFault{
+        .error           = ApiError{.status  = 500,
+                                    .type    = "server_error",
+                                    .message = "the inference engine failed while answering this "
+                                               "request; the request is unchanged and may be retried",
+                                    .code    = "internal_error"},
+        .internal_detail = fault.what()};
+}
+
 std::string new_decision_id() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<std::uint64_t> dist;

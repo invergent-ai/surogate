@@ -582,6 +582,26 @@ private:
     RequestErrorKind kind_;
 };
 
+/// The request is not acceptable: a prompt that does not fit, a token outside the domain, a
+/// sampling parameter out of range, an option readout the target cannot take. The caller can
+/// fix it by sending something else, so the fault is theirs.
+///
+/// The engine also raises bare `std::invalid_argument` for its own broken state -- a scheduler
+/// invariant, a prefix image that is not in this engine, a prepared prompt whose metadata does
+/// not describe itself. Those are the engine's fault and no caller can act on them. The two
+/// used to be one type, so a handler had to blame the caller for both: an engine-internal
+/// invariant came back as HTTP 400 against the request that happened to be in flight, and 4xx
+/// is precisely what a client does not retry. Raising this type where the request really is at
+/// fault is what lets a handler tell the two apart.
+///
+/// Derived from `std::invalid_argument` on purpose: every handler that catches the base type
+/// keeps exactly the behaviour it had, and only a handler that wants the distinction asks for
+/// it.
+class InvalidRequest : public std::invalid_argument {
+public:
+    explicit InvalidRequest(std::string message) : std::invalid_argument(std::move(message)) {}
+};
+
 struct PromptSummary {
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
