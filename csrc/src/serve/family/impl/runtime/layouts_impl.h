@@ -943,7 +943,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options,
+void validate_target_options(const EngineOptions& options,
                              const family::TextGeometry& geometry) {
     if (geometry.max_context <= 0 || !geometry.attention_schedule_declared || !geometry.windowed_schedule_declared) {
         throw std::invalid_argument("sequence planning requires complete checkpoint geometry");
@@ -1032,8 +1032,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     // The real constraint is per weights profile, not per target and not per
     // device: the FP4 kernel families are pinned to `120a` in CMakeLists, so an
     // sm_89 fatbin carries no cubin for them and CUDA refuses at the point of
-    // use. The build enforces it; this function cannot see `weights_profile`
-    // anyway, which is why it reached for the device instead.
+    // use. The build enforces it. This function took a `DeviceContext&` only
+    // for that check and no longer does; it cannot see `weights_profile`,
+    // which is likely why it reached for the device in the first place.
     //
     // A cleaner refusal, keyed on the profile, is written up with the exact
     // NVFP4 enumerator list in
@@ -1161,7 +1162,7 @@ std::unique_ptr<family::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
-    validate_target_options(device, options, geometry);
+    validate_target_options(options, geometry);
     if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {
         throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
     }
