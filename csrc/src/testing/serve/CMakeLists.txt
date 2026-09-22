@@ -651,6 +651,11 @@ sinfer_add_test(sinfer_parallel_decoding_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_parallel_decoding_test PRIVATE -UNDEBUG -fno-fast-math)
 
+sinfer_add_test(sinfer_decisions_test
+  SOURCES test_decisions.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_decisions_test PRIVATE -UNDEBUG -fno-fast-math)
+
 sinfer_add_test(sinfer_candidate_readout_test
   SOURCES test_candidate_readout.cpp
   LIBRARIES sinfer_engine)

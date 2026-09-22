@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -172,8 +173,16 @@ Json overrides_json(const sinfer::SamplingOverrides& overrides) {
     return result;
 }
 
+/// The `decisions` protocol's own fields, absent from every other record.
+void add_decisions(Json& record, const std::string& protocol, std::size_t question_count,
+                   std::optional<std::size_t> shared_prefix_tokens) {
+    if (protocol != "decisions") { return; }
+    record["decisions"] = Json{{"question_count", question_count}};
+    if (shared_prefix_tokens) { record["decisions"]["shared_prefix_tokens"] = *shared_prefix_tokens; }
+}
+
 Json request_json(const RequestLogContext& context) {
-    return Json{{"request_id", context.id},
+    Json record = Json{{"request_id", context.id},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -188,6 +197,8 @@ Json request_json(const RequestLogContext& context) {
                 {"enable_thinking", context.enable_thinking},
                 {"preserve_thinking", context.preserve_thinking},
                 {"sampling", sampler_json(context.sampling)}};
+    add_decisions(record, context.protocol, context.question_count, context.shared_prefix_tokens);
+    return record;
 }
 
 Json preparation_json(const RequestLogContext& context) {
@@ -210,7 +221,7 @@ Json preparation_json(const RequestLogContext& context) {
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
-    return Json{{"request_id", context.id},
+    Json record = Json{{"request_id", context.id},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -222,6 +233,8 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"tool_count", context.tool_count},
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history}};
+    add_decisions(record, context.protocol, context.question_count, std::nullopt);
+    return record;
 }
 
 Json error_json(const ApiError& error) {
@@ -368,6 +381,7 @@ std::string format_request_start(const RequestLogContext& context) {
             << context.preparation.media_cache_misses << '/'
             << context.preparation.media_singleflight_waits;
     }
+    if (context.protocol == "decisions") { out << " questions=" << context.question_count; }
     out << " \xE2\x86\x92 submitted";
     return out.str();
 }
@@ -405,6 +419,9 @@ std::string format_request_done(const RequestLogContext& context,
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
         << " speculative=" << speculative_str(metrics);
+    if (context.protocol == "decisions") {
+        out << " questions=" << context.question_count << " shared_prefix=" << context.shared_prefix_tokens;
+    }
     return out.str();
 }
 

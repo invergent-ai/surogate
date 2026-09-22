@@ -26,6 +26,7 @@ the server reports, which is how you keep a client's hard-coded model string wor
 | `POST` | `/v1/chat/completions` | Chat Completions, streaming or not |
 | `POST` | `/v1/chat/completions/tokens` | Chat completions with an optional `tokens` array for exact prompt ids |
 | `POST` | `/v1/completions` | Raw text completion without a chat template |
+| `POST` | `/api/alpha/decisions` (aliases `/v1/decisions`, `/api/v1/decisions`) | Decisions API: several single-token questions over one shared state; see [decisions.md](decisions.md) |
 | `POST` | `/tokenize` | Render and tokenize `messages` or a raw `prompt` without generating |
 | `POST` | `/v1/responses` | Responses API |
 | `POST` | `/v1/responses/input_tokens` | Count input tokens without generating |

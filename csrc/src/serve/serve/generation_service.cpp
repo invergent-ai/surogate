@@ -11,8 +11,10 @@
 #include "serve/tool_constraints.h"
 #include "serve/translate.h"
 #include "serve/parallel_decoding.h"
+#include "serve/decisions_schema.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -157,7 +159,7 @@ void validate_token_media(const GenerationRequest& request) {
     error.status  = 499;
     error.type    = "request_cancelled";
     error.code    = "client_disconnected";
-    error.message = "client disconnected during media preparation";
+    error.message = "client disconnected during request preparation";
     throw ApiException(std::move(error));
 }
 
@@ -203,6 +205,11 @@ sinfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
 
 [[noreturn]] void throw_request_error(const sinfer::RequestError& exception) {
     throw ApiException(request_error_to_api_error(exception));
+}
+
+[[noreturn]] void refuse(std::string message, std::string param, const char* code) {
+    throw ApiException(ApiError{.status = 400, .message = std::move(message),
+                                .param = std::move(param), .code = code});
 }
 
 void check_preparation_control(Clock::time_point deadline,
@@ -800,61 +807,19 @@ GenerationOutcome GenerationService::run_parallel(PreparedRequest& prepared, con
         outcome.metrics.prefix_cache_hit_tokens = warm.reused_prompt_tokens;
         outcome.metrics.prefix_reuse_path = warm.prefix_reuse_path;
         outcome.metrics.prefill_seconds = warm.timings.prefill_seconds;
-        std::vector<std::vector<float>> logits(state->plan.queries.size());
-        // Keep work bounded and share the normal scheduler with other requests.
-        // A one-lane engine runs the same finite-choice computation serially.
-        const auto width = std::max<std::size_t>(1, std::min<std::size_t>(64, options_.max_concurrency));
         state->options.execution.sampling.temperature = prepared.sampling.temperature;
-        std::vector<std::vector<std::size_t>> children(logits.size());
-        std::vector<std::size_t> remaining(logits.size());
-        std::vector<std::shared_ptr<const GpuPrefixKey>> keys(logits.size());
-        std::vector<std::size_t> ready;
-        for (std::size_t i = 0; i < logits.size(); ++i) {
-            const int parent = state->plan.queries[i].parent;
-            if (parent < 0) ready.push_back(i);
-            else { children[parent].push_back(i); ++remaining[parent]; }
-        }
-        for (std::size_t start = 0; start < ready.size();) {
-            const auto end = std::min(start + width, ready.size());
-            std::vector<PreparedPrompt> prompts;
-            std::vector<RequestOptions> options;
-            for (std::size_t j = start; j < end; ++j) {
-                check();
-                const auto i = ready[j];
-                const auto& query = state->plan.queries[i];
+        CandidateReadout readout = read_candidates(state->plan.queries,
+            [&](std::size_t i) {
                 auto tokens = state->prefix;
-                tokens.insert(tokens.end(), query.suffix.begin(), query.suffix.end());
-                auto opt = state->options;
-                opt.execution.next_token_candidates = query.candidates;
-                if (query.parent >= 0) opt.execution.gpu_prefix = keys[query.parent];
-                if (!children[i].empty()) {
-                    keys[i] = std::make_shared<GpuPrefixKey>();
-                    opt.execution.save_gpu_prefix = keys[i];
-                }
-                prompts.push_back(engine_->prepare_tokens(std::move(tokens)));
-                options.push_back(std::move(opt));
-                const auto prefix_suffix = query.parent >= 0 ? state->plan.queries[query.parent].suffix.size() : 0;
-                outcome.prompt_tokens += static_cast<int>(query.suffix.size() - prefix_suffix);
-            }
-            const auto batch_started = Clock::now();
-            auto pending = engine_->submit_batch(std::move(prompts), std::move(options), deadline, state->adapter);
-            for (std::size_t j = start; j < end; ++j) {
-                const auto i = ready[j];
-                const auto result = pending[j - start].wait(nullptr, cancellation);
-                check();
-                if (result.finish_reason == FinishReason::Cancelled)
-                    throw RequestError(RequestErrorKind::Cancelled, "parallel decoding was cancelled");
-                logits[i] = result.next_token_logits;
-                ready.insert(ready.end(), children[i].begin(), children[i].end());
-                const auto parent = state->plan.queries[i].parent;
-                if (parent >= 0 && --remaining[parent] == 0) keys[parent].reset();
-            }
-            // Concurrent rows report overlapping time. Count the wave once.
-            outcome.metrics.prefill_seconds += std::chrono::duration<double>(Clock::now() - batch_started).count();
-            start = end;
-        }
+                const auto& suffix = state->plan.queries[i].suffix;
+                tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+                return engine_->prepare_tokens(std::move(tokens));
+            },
+            state->options, state->adapter, deadline, cancellation, check, "parallel decoding was cancelled");
+        outcome.prompt_tokens += readout.suffix_tokens;
+        outcome.metrics.prefill_seconds += readout.prefill_seconds;
         check();
-        auto classified = resolve_parallel_plan(state->plan, logits, prepared.sampling.temperature);
+        auto classified = resolve_parallel_plan(state->plan, readout.logits, prepared.sampling.temperature);
         outcome.text = classified.content.dump();
         outcome.completion_tokens = static_cast<int>(engine_->encode_fragment(outcome.text).size());
         if (std::size_t(outcome.completion_tokens) > state->max_tokens)
@@ -868,6 +833,338 @@ GenerationOutcome GenerationService::run_parallel(PreparedRequest& prepared, con
         if (sink && sink->on_content) sink->on_content(outcome.text);
         return outcome;
     } catch (const RequestError& exception) { throw_request_error(exception); }
+}
+
+GenerationService::CandidateReadout GenerationService::read_candidates(
+    const std::vector<ParallelQuery>& queries,
+    const std::function<sinfer::PreparedPrompt(std::size_t)>& make_prompt,
+    const sinfer::RequestOptions& options, const std::shared_ptr<void>& adapter,
+    Clock::time_point deadline, const sinfer::CancellationView& cancellation,
+    const std::function<void()>& check, const char* cancelled_message) {
+    CandidateReadout readout;
+    readout.logits.resize(queries.size());
+    // Keep work bounded and share the normal scheduler with other requests.
+    // A one-lane engine runs the same finite-choice computation serially.
+    const auto width = std::max<std::size_t>(1, std::min<std::size_t>(64, options_.max_concurrency));
+    std::vector<std::vector<std::size_t>> children(queries.size());
+    std::vector<std::size_t> remaining(queries.size());
+    std::vector<std::shared_ptr<const GpuPrefixKey>> keys(queries.size());
+    std::vector<std::size_t> ready;
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        const int parent = queries[i].parent;
+        if (parent < 0) ready.push_back(i);
+        else { children[parent].push_back(i); ++remaining[parent]; }
+    }
+    for (std::size_t start = 0; start < ready.size();) {
+        const auto end = std::min(start + width, ready.size());
+        std::vector<PreparedPrompt> prompts;
+        std::vector<RequestOptions> batch;
+        for (std::size_t j = start; j < end; ++j) {
+            check();
+            const auto i = ready[j];
+            const auto& query = queries[i];
+            auto opt = options;
+            opt.execution.next_token_candidates = query.candidates;
+            if (query.parent >= 0) opt.execution.gpu_prefix = keys[query.parent];
+            if (!children[i].empty()) {
+                keys[i] = std::make_shared<GpuPrefixKey>();
+                opt.execution.save_gpu_prefix = keys[i];
+            }
+            prompts.push_back(make_prompt(i));
+            batch.push_back(std::move(opt));
+            const auto parent_suffix = query.parent >= 0 ? queries[query.parent].suffix.size() : 0;
+            readout.suffix_tokens += static_cast<int>(query.suffix.size() - parent_suffix);
+        }
+        const auto batch_started = Clock::now();
+        auto pending = engine_->submit_batch(std::move(prompts), std::move(batch), deadline, adapter);
+        for (std::size_t j = start; j < end; ++j) {
+            const auto i = ready[j];
+            const auto result = pending[j - start].wait(nullptr, cancellation);
+            check();
+            if (result.finish_reason == FinishReason::Cancelled)
+                throw RequestError(RequestErrorKind::Cancelled, cancelled_message);
+            readout.logits[i] = result.next_token_logits;
+            ready.insert(ready.end(), children[i].begin(), children[i].end());
+            const auto parent = queries[i].parent;
+            if (parent >= 0 && --remaining[parent] == 0) keys[parent].reset();
+        }
+        // Concurrent rows report overlapping time. Count the wave once.
+        readout.prefill_seconds += std::chrono::duration<double>(Clock::now() - batch_started).count();
+        start = end;
+    }
+    return readout;
+}
+
+const std::vector<std::string>& GenerationService::decision_codes() {
+    std::lock_guard lock(decision_codes_mutex_);
+    if (!decision_codes_) {
+        decision_codes_ = decision_codebook(
+            [&](std::string_view text) { return engine_->encode_fragment(text); },
+            [&](TokenId id) {
+                const std::array<TokenId, 1> ids{id};
+                return engine_->token_texts(std::span<const TokenId>(ids.data(), ids.size())).front();
+            });
+    }
+    return *decision_codes_;
+}
+
+DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
+                                           std::function<bool()> is_cancelled,
+                                           const PreparationGate& before_prepare) {
+    if (!engine_->supports_chat()) {
+        ApiError error;
+        error.message = "this model publishes no chat template, which is what a base model "
+                        "looks like; decisions need one";
+        error.code    = "chat_not_supported";
+        throw ApiException(std::move(error));
+    }
+    if (!request.images.empty() && !options_.enable_vision) {
+        const std::invalid_argument error("Vision is disabled for this server");
+        throw_invalid_input(error, "vision_disabled");
+    }
+    // Thinking off, spelled the way the chat endpoint spells it, so a template that cannot
+    // be told is refused by the same rule. Every question is a fresh two-turn chat.
+    GenerationRequest shape;
+    shape.model           = request.model;
+    shape.lora_adapter    = request.lora_adapter;
+    shape.enable_thinking = false;
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(shape, options_, prompt_capabilities_);
+    DecisionsOutcome outcome;
+    const auto lifetime = begin_request(is_cancelled, before_prepare);
+    const auto deadline = lifetime->deadline;
+    const auto cancelled = [&] { return is_cancelled && is_cancelled(); };
+    const CancellationView cancellation([&] { return cancelled() || Clock::now() >= deadline; });
+    const auto check = [&] { check_preparation_control(deadline, is_cancelled); };
+    try {
+        auto adapter = lora_slots_.acquire(request.lora_adapter, deadline, is_cancelled);
+        const PreparationControl control{
+            .deadline = deadline, .cancellation = CancellationView(is_cancelled)};
+        // Media are acquired once and handed to every question's prompt in order.
+        std::size_t remaining_media_bytes =
+            std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
+        std::vector<sinfer::OwnedMedia> media;
+        for (const ContentPart& part : request.images) {
+            media.push_back(acquire_media(part, deadline, is_cancelled, remaining_media_bytes));
+        }
+        check();
+        const auto prepare_chat = [&](std::string_view system, std::string user_text) {
+            GenerationRequest turns = shape;
+            ChatTurn system_turn;
+            system_turn.role = ChatRole::System;
+            system_turn.content.push_back(ContentPart{ContentKind::Text, std::string(system), "text"});
+            ChatTurn user_turn;
+            user_turn.role = ChatRole::User;
+            for (const ContentPart& part : request.images) { user_turn.content.push_back(part); }
+            user_turn.content.push_back(ContentPart{ContentKind::Text, std::move(user_text), "text"});
+            turns.messages = {std::move(system_turn), std::move(user_turn)};
+            std::size_t next_media = 0;
+            sinfer::PromptInput input = to_prompt_input(
+                turns, semantics, [&](const ContentPart&) { return media.at(next_media++); });
+            return engine_->prepare(std::move(input), control);
+        };
+        // The rendered text is read back from the ids (special tokens decode to their own
+        // text, so this is the template's output); re-encoding it must give the ids back,
+        // which is what makes "this text plus a label" the in-context tokenisation.
+        const auto decode = [&](const std::vector<TokenId>& ids) {
+            std::string text;
+            for (const std::string& piece : engine_->token_texts(std::span<const TokenId>(ids))) {
+                text += piece;
+            }
+            return text;
+        };
+        const auto encode = [&](std::string_view text) {
+            return engine_->prepare_text(text, false).token_ids();
+        };
+
+        // One rendering of the state per system prompt, split at the question boundary
+        // exactly as the reference does: everything before it is that variant's prefix.
+        struct Variant {
+            bool ready = false;
+            std::string before;
+            std::string after;
+            std::vector<TokenId> prefix;
+        };
+        std::array<Variant, 2> variants;
+        const auto variant_for = [&](bool extended) -> const Variant& {
+            Variant& variant = variants[extended ? 1 : 0];
+            if (variant.ready) { return variant; }
+            const auto marked = prepare_chat(
+                extended ? kDecisionExtendedSystemPrompt : kDecisionSystemPrompt,
+                request.state_text + decision_boundary_marker());
+            const std::string text    = decode(marked.token_ids());
+            const std::string& marker = decision_boundary_marker();
+            const auto at             = text.find(marker);
+            if (at == std::string::npos || text.find(marker, at + marker.size()) != std::string::npos) {
+                refuse("the chat template did not preserve the question boundary", "state",
+                       "decisions_template_boundary");
+            }
+            variant.before = text.substr(0, at);
+            variant.after  = text.substr(at + marker.size());
+            variant.prefix = encode(variant.before);
+            variant.ready  = true;
+            return variant;
+        };
+        const bool any_extended = std::any_of(request.questions.begin(), request.questions.end(),
+            [](const DecisionQuestion& question) { return question.extended(); });
+        static const std::vector<std::string> no_codes;
+        const std::vector<std::string>& codebook = any_extended ? decision_codes() : no_codes;
+
+        struct Item {
+            std::vector<TokenId> ids;
+            std::vector<TokenId> candidates;
+            const Variant* variant = nullptr;
+            sinfer::PreparedPrompt prompt;
+        };
+        const bool with_images = !request.images.empty();
+        const std::size_t max_context = engine_->options().max_context;
+        std::vector<Item> items;
+        items.reserve(request.questions.size());
+        for (const DecisionQuestion& question : request.questions) {
+            check();
+            const RenderedDecisionQuestion rendered = render_decision_question(question, codebook);
+            const Variant& variant = variant_for(rendered.extended);
+            sinfer::PreparedPrompt prompt = prepare_chat(rendered.system, request.state_text + rendered.branch);
+            Item item;
+            item.ids     = prompt.token_ids();
+            item.variant = &variant;
+            if (item.ids.size() + 1 > max_context) {
+                throw ApiException(ApiError{.status = 400,
+                    .message = "question '" + question.name + "' renders to " + std::to_string(item.ids.size()) +
+                               " tokens; with its answer that exceeds the model context of " + std::to_string(max_context),
+                    .param = "questions", .code = "context_length_exceeded"});
+            }
+            const std::string text = decode(item.ids);
+            if (encode(text) != item.ids) {
+                refuse("question '" + question.name + "' renders to text that does not re-tokenise to the same ids, "
+                       "so its option labels cannot be verified in context", "questions",
+                       "decisions_tokenizer_roundtrip");
+            }
+            if (text != variant.before + rendered.branch + variant.after) {
+                refuse("the chat template did not render question '" + question.name +
+                       "' as a continuation of the shared state", "questions", "decisions_template_boundary");
+            }
+            std::set<TokenId> seen;
+            for (const std::string& label : rendered.labels) {
+                const std::vector<TokenId> appended = encode(text + label);
+                if (appended.size() != item.ids.size() + 1 ||
+                    !std::equal(item.ids.begin(), item.ids.end(), appended.begin())) {
+                    refuse("label '" + label + "' of question '" + question.name +
+                           "' is not a single continuation token for this template", "questions",
+                           "decisions_label_tokenization");
+                }
+                if (!seen.insert(appended.back()).second) {
+                    refuse("option labels of question '" + question.name + "' share a token", "questions",
+                           "decisions_label_tokenization");
+                }
+                item.candidates.push_back(appended.back());
+            }
+            item.prompt = std::move(prompt);
+            items.push_back(std::move(item));
+        }
+        outcome.prepare_seconds =
+            std::chrono::duration<double>(Clock::now() - lifetime->started).count();
+
+        // The readout ignores sampling; keep it neutral anyway so nothing else is asked of
+        // the round than the candidate logits.
+        sinfer::RequestOptions base;
+        base.execution.requested_output_tokens = 1;
+        base.execution.cache_prompt            = false;
+        base.execution.allow_prefix_reuse      = false;
+        base.execution.lora_slot               = adapter.slot;
+        base.execution.sampling.temperature    = 1.0F;
+        base.execution.sampling.top_k          = 0;
+        base.execution.sampling.top_p          = 1.0F;
+        base.execution.sampling.min_p          = 0.0F;
+        base.execution.sampling.presence_penalty   = 0.0F;
+        base.execution.sampling.frequency_penalty  = 0.0F;
+        base.execution.sampling.repetition_penalty = 1.0F;
+        base.output.structured                 = true;
+
+        std::vector<ParallelQuery> queries;
+        queries.reserve(items.size());
+        std::function<sinfer::PreparedPrompt(std::size_t)> make_prompt;
+        std::vector<TokenId> prefix;
+        std::shared_ptr<GpuPrefixKey> key;
+        std::size_t shared = 0;
+        // The runtime keeps saved GPU prefix states for text prompts only, so an image request
+        // shares nothing on the GPU; its questions run as their own prompts below.
+        if (!with_images) {
+            std::vector<std::vector<TokenId>> prefixes;
+            std::vector<std::vector<TokenId>> full;
+            for (const Item& item : items) {
+                prefixes.push_back(item.variant->prefix);
+                full.push_back(item.ids);
+            }
+            shared = decision_shared_prefix(prefixes, full);
+            if (shared == 0) {
+                refuse("the chat template yielded an empty shared prefix", "questions", "decisions_shared_prefix");
+            }
+            // The prefill floor (kDecisionMinPrefillTokens): give tokens back until each suffix
+            // is at least that long, and share nothing when the prefix itself would be shorter.
+            std::vector<std::size_t> lengths;
+            for (const Item& item : items) { lengths.push_back(item.ids.size()); }
+            shared = decision_shared_prefix_floor(shared, lengths);
+            // One question has nothing to share with; the warm step would only cost.
+            if (items.size() == 1) { shared = 0; }
+        }
+        if (shared == 0) {
+            // Each question is the full prompt a plain request would be, prefilled whole, with
+            // the engine's prefix cache off so no earlier prompt can shorten the step.
+            for (Item& item : items) {
+                queries.push_back(ParallelQuery{.parent = -1, .suffix = item.ids, .candidates = item.candidates});
+            }
+            make_prompt = [&](std::size_t i) { return std::move(items[i].prompt); };
+        } else {
+            prefix.assign(items.front().ids.begin(), items.front().ids.begin() + static_cast<std::ptrdiff_t>(shared));
+            for (Item& item : items) {
+                queries.push_back(ParallelQuery{.parent = -1,
+                    .suffix = std::vector<TokenId>(item.ids.begin() + static_cast<std::ptrdiff_t>(shared), item.ids.end()),
+                    .candidates = item.candidates});
+            }
+            // Prefill the shared prefix once and keep its GPU state; every question then
+            // extends that state with its own suffix, exactly as parallel decoding does.
+            key = std::make_shared<GpuPrefixKey>();
+            sinfer::RequestOptions warm_options    = base;
+            warm_options.execution.save_gpu_prefix = key;
+            check();
+            auto warm = engine_->submit(engine_->prepare_tokens(prefix), std::move(warm_options), deadline, adapter.lifetime);
+            const auto warm_result = warm.wait(nullptr, cancellation);
+            check();
+            if (warm_result.finish_reason == FinishReason::Cancelled) {
+                throw RequestError(RequestErrorKind::Cancelled, "decisions were cancelled");
+            }
+            outcome.prefill_seconds += warm_result.timings.prefill_seconds;
+            outcome.shared_prefix_tokens = shared;
+            base.execution.gpu_prefix         = key;
+            base.execution.allow_prefix_reuse = true;
+            make_prompt = [&](std::size_t i) {
+                auto tokens = prefix;
+                tokens.insert(tokens.end(), queries[i].suffix.begin(), queries[i].suffix.end());
+                return engine_->prepare_tokens(std::move(tokens));
+            };
+        }
+        const CandidateReadout readout = read_candidates(queries, make_prompt, base, adapter.lifetime,
+                                                         deadline, cancellation, check, "decisions were cancelled");
+        check();
+        outcome.prefill_seconds += readout.prefill_seconds;
+        outcome.input_tokens  = static_cast<int>(outcome.shared_prefix_tokens) + readout.suffix_tokens;
+        outcome.output_tokens = static_cast<int>(request.questions.size());
+        outcome.answers       = OrderedJson::object();
+        for (std::size_t i = 0; i < request.questions.size(); ++i) {
+            outcome.answers[request.questions[i].name] =
+                resolve_decision_answer(request.questions[i], readout.logits[i]);
+        }
+        outcome.total_seconds =
+            std::chrono::duration<double>(Clock::now() - lifetime->started).count();
+        return outcome;
+    } catch (const ApiException&) { throw; } catch (const sinfer::RequestError& exception) {
+        throw_request_error(exception);
+    } catch (const std::invalid_argument& exception) {
+        // Media acquisition raises its own ApiException above; what reaches here is the
+        // engine refusing an argument of the request (a candidate token, a prefix extension).
+        refuse(exception.what(), "questions", "invalid_decisions_request");
+    }
 }
 
 std::vector<sinfer::TokenId> GenerationService::tokenize(const GenerationRequest& request,

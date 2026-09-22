@@ -37,6 +37,10 @@ struct RequestLogContext {
     sinfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     sinfer::PromptPreparationStats preparation;
+    /// Set for the `decisions` protocol: how many questions the request carried and, once it
+    /// has run, how many tokens of shared prefix were prefilled once for all of them.
+    std::size_t question_count       = 0;
+    std::size_t shared_prefix_tokens = 0;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -54,6 +58,7 @@ struct RequestRejectionLogContext {
     std::size_t tool_count                  = 0;
     ToolChoice tool_choice;
     bool has_tool_history = false;
+    std::size_t question_count = 0; // `decisions` protocol
     ApiError error;
 };
 

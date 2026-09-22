@@ -5,6 +5,7 @@
 // streaming callbacks, and tool-call parsing) outside the target package.
 
 #include "api/engine.h"
+#include "serve/decisions_schema.h"
 #include "serve/lora_slots.h"
 #include "serve/model_scheduler.h"
 #include "serve/request.h"
@@ -24,6 +25,7 @@
 namespace sinfer::serve {
 
 struct ParallelDecodingRequest;
+struct ParallelQuery;
 struct RequestLifetime;
 struct RequestCapacity;
 // Runs after reserving ingress capacity; wake and preparation share this control.
@@ -72,6 +74,20 @@ struct GenerationOutcome {
     sinfer::FinishReason finish_reason = sinfer::FinishReason::OutputLimit;
     std::string stop_sequence;
     GenerationMetrics metrics;
+};
+
+/// What a decisions request comes back with: one answer object per question, in request
+/// order, and the tokens the engine actually prefilled to produce them.
+struct DecisionsOutcome {
+    OrderedJson answers;
+    /// The shared prefix once plus every question's suffix (every full prompt for an
+    /// image request, which shares no GPU state).
+    int input_tokens  = 0;
+    int output_tokens = 0; // one readout token per question
+    std::size_t shared_prefix_tokens = 0;
+    double prepare_seconds = 0.0;
+    double prefill_seconds = 0.0;
+    double total_seconds   = 0.0;
 };
 
 struct StreamSink {
@@ -175,6 +191,13 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
+    /// Answer a decisions request: render every question through the chat template with
+    /// thinking off, verify each option label is one continuation token in context, prefill
+    /// the shared prefix once and read each question's label logits at its first generated
+    /// position. Throws ApiException for a refusal (400) or an engine failure.
+    [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
+        std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {});
+
     void warmup();
 
     /// Sleep level 1 (vLLM parity): refuse new work, wait for in-flight
@@ -206,6 +229,27 @@ public:
 private:
     GenerationOutcome run_parallel(PreparedRequest& prepared, const StreamSink* sink,
                                     const std::function<bool()>& is_cancelled);
+
+    /// One candidate-logit row per query, read at the first generated position.
+    struct CandidateReadout {
+        std::vector<std::vector<float>> logits;
+        /// Tokens prefilled beyond what each query's parent (or the shared prefix) already
+        /// covered: what the request is charged for on top of the prefix.
+        int suffix_tokens      = 0;
+        double prefill_seconds = 0.0;
+    };
+    /// Runs queries in waves of at most `max_concurrency` rows on the engine's normal
+    /// scheduler. A query with a parent extends that parent's saved GPU state; a root query
+    /// uses whatever `options.execution.gpu_prefix` names, or none. `make_prompt` builds the
+    /// prompt for a query index; `options` is copied per row and given its candidates.
+    /// Parallel constrained decoding and the decisions endpoint share this loop.
+    [[nodiscard]] CandidateReadout read_candidates(const std::vector<ParallelQuery>& queries,
+        const std::function<sinfer::PreparedPrompt(std::size_t)>& make_prompt,
+        const sinfer::RequestOptions& options, const std::shared_ptr<void>& adapter,
+        std::chrono::steady_clock::time_point deadline, const sinfer::CancellationView& cancellation,
+        const std::function<void()>& check, const char* cancelled_message);
+    /// The tokenizer's single-token option codes, computed once on first use.
+    [[nodiscard]] const std::vector<std::string>& decision_codes();
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
     [[nodiscard]] std::shared_ptr<RequestLifetime> begin_request(
         const std::function<bool()>& is_cancelled, const PreparationGate& before_prepare) const;
@@ -218,6 +262,8 @@ private:
     sinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     bool shared_training_ = false; // guarded by request_capacity_->mutex
+    std::mutex decision_codes_mutex_;
+    std::optional<std::vector<std::string>> decision_codes_;
 };
 
 } // namespace sinfer::serve

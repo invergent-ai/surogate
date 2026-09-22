@@ -5,6 +5,7 @@
 
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
+#include "serve/decisions_schema.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
@@ -313,6 +314,14 @@ void HttpServer::register_routes() {
     server_.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
         handle_completions(req, res);
     });
+    // OpenRouter's decisions API: one shared state, several single-token questions. The
+    // published path first, so a client that swaps the base URL for this host hits the same
+    // route, then a versioned alias beside the other routes.
+    for (const char* path : {"/api/alpha/decisions", "/v1/decisions", "/api/v1/decisions"}) {
+        server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
+            handle_decisions(req, res);
+        });
+    }
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
@@ -1163,6 +1172,82 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
             }
         },
         [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+}
+
+void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response& res) {
+    t_routed_service = nullptr; // keep-alive threads must not inherit a route
+    const std::uint64_t req_id = ++request_seq_;
+    DecisionsRequest request;
+    try {
+        request          = parse_decisions_request(req.body);
+        t_routed_service = &route_model(request.model, &request.lora_adapter);
+    } catch (const ApiException& e) {
+        // Unlike a chat request, a decisions request is fully validated here rather than in
+        // preparation, so most refusals are this one: log them like any other rejection.
+        RequestRejectionLogContext rejection;
+        rejection.id       = req_id;
+        rejection.protocol = "decisions";
+        rejection.model    = request.model;
+        rejection.error    = e.error();
+        log_request_rejected(rejection);
+        write_error(res, e.error());
+        return;
+    }
+    // The same start/done/rejected records every other protocol writes, console and JSONL,
+    // with the decisions-specific counts beside them.
+    RequestLogContext context;
+    context.id                      = req_id;
+    context.protocol                = "decisions";
+    context.model                   = request.model;
+    context.message_count           = 2; // one system and one user turn per question
+    context.media_item_count        = request.images.size();
+    context.requested_output_tokens = static_cast<int>(request.questions.size());
+    context.enable_thinking         = false;
+    context.question_count          = request.questions.size();
+    log_request_start(context);
+    try {
+        DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate());
+        context.shared_prefix_tokens = outcome.shared_prefix_tokens;
+        GenerationOutcome record;
+        record.prompt_tokens           = outcome.input_tokens;
+        record.completion_tokens       = outcome.output_tokens;
+        record.finish_reason           = sinfer::FinishReason::StopToken;
+        record.metrics.prepare_seconds = outcome.prepare_seconds;
+        record.metrics.prefill_seconds = outcome.prefill_seconds;
+        record.metrics.total_seconds   = outcome.total_seconds;
+        record.metrics.ttft_seconds    = outcome.total_seconds;
+        log_request_done(context, record);
+        OrderedJson body       = OrderedJson::object();
+        body["id"]             = new_decision_id();
+        body["model"]          = request.model;
+        body["provider"]       = "surogate";
+        body["answers"]        = std::move(outcome.answers);
+        OrderedJson usage      = OrderedJson::object();
+        usage["input_tokens"]  = outcome.input_tokens;
+        usage["output_tokens"] = outcome.output_tokens;
+        usage["cost"]          = 0;
+        body["usage"]          = std::move(usage);
+        res.set_content(body.dump(), "application/json");
+    } catch (const ApiException& e) {
+        RequestRejectionLogContext rejection;
+        rejection.id                      = req_id;
+        rejection.protocol                = context.protocol;
+        rejection.model                   = request.model;
+        rejection.message_count           = context.message_count;
+        rejection.media_item_count        = context.media_item_count;
+        rejection.requested_output_tokens = context.requested_output_tokens;
+        rejection.question_count          = context.question_count;
+        rejection.error                   = e.error();
+        log_request_rejected(rejection);
+        write_error(res, e.error());
+    } catch (const std::exception& e) {
+        log_request_error(context, e.what());
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = e.what();
+        write_error(res, error);
+    }
 }
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
