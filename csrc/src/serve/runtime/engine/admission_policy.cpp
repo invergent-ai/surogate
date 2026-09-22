@@ -60,10 +60,11 @@ bool admission_resources_fit(const AdmissionResources& used,
     return fits(total, capacity);
 }
 
-AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
-                                              const AdmissionResources& head_resources,
-                                              std::span<const ActiveAdmissionSnapshot> active,
-                                              const AdmissionResources& capacity) {
+std::optional<AdmissionProtection>
+make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
+                          const AdmissionResources& head_resources,
+                          std::span<const ActiveAdmissionSnapshot> active,
+                          const AdmissionResources& capacity) {
     if (epoch_id == 0 || head_request_id == 0 || active.empty() ||
         head_resources.active_lanes == 0 ||
         !admission_resources_fit(head_resources, capacity)) {
@@ -87,9 +88,11 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
         add(survivors, active[i].resources);
     }
     add(survivors, head_resources);
-    if (fits(survivors, capacity)) {
-        throw std::invalid_argument("protected head is not blocked by frozen incumbents");
-    }
+    // The frozen incumbents do not block this head. Whatever refused it is outside this
+    // ledger (see the header), so there is no donor frontier to compute and nothing to
+    // protect: report it, rather than treating a scheduling observation as a broken
+    // precondition and killing the engine that asked.
+    if (fits(survivors, capacity)) { return std::nullopt; }
 
     std::vector<std::size_t> order(active.size());
     for (std::size_t i = 0; i < active.size(); ++i) { order[i] = i; }

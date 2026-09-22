@@ -532,6 +532,7 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
             {"pages_in_use", stats.kv_pages_in_use},
             {"pages_resident_at_granule", stats.kv_pages_resident_at_granule},
             {"pages_mapped", stats.kv_pages_mapped},
+            {"admission_unblocked_heads", stats.admission_unblocked_heads},
             {"pool_bytes", bytes(stats.kv_pages)},
             {"in_use_bytes", bytes(stats.kv_pages_in_use)},
             {"resident_at_granule_bytes", bytes(stats.kv_pages_resident_at_granule)},
@@ -625,6 +626,12 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
     for (const Row& r : rows) { metric("decode_rounds_total", r.model, r.stats.decode_rounds); }
     help("decode_rows_total", "counter", "Summed batch size over decode rounds; over rounds it is the mean batch.");
     for (const Row& r : rows) { metric("decode_rows_total", r.model, r.stats.decode_row_rounds); }
+    help("admission_unblocked_heads_total", "counter",
+         "Times the queue head was refused a lane although the admission ledger found it "
+         "unblocked (KV committed to a retained GPU prefix); a benign retry.");
+    for (const Row& r : rows) {
+        metric("admission_unblocked_heads_total", r.model, r.stats.admission_unblocked_heads);
+    }
 
     help("requests", "gauge", "Requests in each scheduler state.");
     for (const Row& r : rows) {

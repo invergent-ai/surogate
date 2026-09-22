@@ -57,11 +57,11 @@ Common server options (full list: surogate serve --engine-help):
 OMP_WAIT_POLICY=ACTIVE and OMP_NUM_THREADS set to the physical cores of one NUMA
 node.
 
---stt serves Romanian speech recognition on GPU or CPU. Use --lm PATH with a
-local NeMo checkpoint. See docs/inference/speech.md for file uploads and live audio.
+--stt serves surogate speech recognition models on GPU or CPU. Use --lm PATH to add
+a language model. See docs/inference/speech.md for file uploads and live audio.
 
---tts serves Romanian speech generation on CPU with named voices. Build with
-`make serve-tts-build` from source. See docs/inference/tts.md.
+--tts serves surogate speech generation models on CPU with named voices.
+See docs/inference/tts.md.
 
 From a source checkout, build the engine first with: make serve-build
 """
