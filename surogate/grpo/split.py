@@ -67,7 +67,7 @@ def _run_inference_subprocess(infer_config: GRPOInferenceConfig, infer_gpu_ids: 
     grpo_infer(infer_config)
 
 
-def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event, broadcast_dir):
+def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event, broadcast_dir=None):
     """Run the GRPO trainer in a background thread (parent process).
 
     Sets `failure_event` on any exception so the watchdog can interrupt the

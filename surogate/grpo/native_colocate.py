@@ -205,7 +205,14 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
         artifact = Path(temporary) / "model.sinfer"
         bindings = write_shared_artifact(train_config.model_dir, artifact) if execution == "serve" else None
         try:
-            trainer = GRPOTrainer(train_config, resume_checkpoint=checkpoints.trainer_resume)
+            # Colocate replaces `trainer.broadcast` with SharedPolicy below, but
+            # the trainer builds one first; without this it guesses, warns, and
+            # creates a stray directory nothing ever reads.
+            trainer = GRPOTrainer(
+                train_config,
+                resume_checkpoint=checkpoints.trainer_resume,
+                broadcast_dir=get_broadcast_dir(Path(orch.output_dir)),
+            )
             if execution == "serve":
                 from surogate import _surogate_serve
                 weights = borrow_weights(trainer.trainer, bindings)

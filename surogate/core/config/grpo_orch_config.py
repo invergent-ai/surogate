@@ -920,6 +920,13 @@ class GRPOOrchestratorConfig:
         max_concurrent: Maximum number of concurrent rollouts to generate and score per-environment. If None, will not limit concurrency.
         tasks_per_minute: Rate limit for tasks per environment worker, in tasks per minute. Recommended for sandbox-backed environments to prevent sandbox-not-ready errors during autoscaling. When set to None, no rate limiting is applied. Note: with multiple workers, the effective total rate equals workers × this value.
         batch_size: Number of samples to train on per step (rollout-based batching). Set this OR token_batch_size.
+        checkpoint_wait_timeout: Seconds to wait for the trainer's next
+            checkpoint before failing. This is the barrier that
+            batch_stall_timeout deliberately does not count, because a large
+            model's checkpoint and weight broadcast legitimately take a while;
+            it still needs a bound, or a trainer that died or is publishing to
+            the wrong directory hangs the run forever. Generous on purpose. 0
+            or None waits indefinitely.
         batch_stall_timeout: Seconds of no batch progress before a step fails.
             The generation loop has nothing bounding it, and every rollout can
             succeed while progress stays at zero: a uniformly-scored group is
@@ -971,6 +978,7 @@ class GRPOOrchestratorConfig:
     tasks_per_minute: float | None = None
     batch_size: int | None = 128
     batch_stall_timeout: int | None = 600
+    checkpoint_wait_timeout: int | None = 3600
     oversampling_factor: float | None = None
     rollouts_per_example: int | None = 1
     sequence_len: int | None = 2048
@@ -1071,6 +1079,7 @@ class GRPOOrchestratorConfig:
         self.tasks_per_minute = cfg.get("tasks_per_minute", self.tasks_per_minute)
         self.batch_size = cfg.get("batch_size", self.batch_size)
         self.batch_stall_timeout = cfg.get("batch_stall_timeout", self.batch_stall_timeout)
+        self.checkpoint_wait_timeout = cfg.get("checkpoint_wait_timeout", self.checkpoint_wait_timeout)
         self.oversampling_factor = cfg.get("oversampling_factor", self.oversampling_factor)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.sequence_len = cfg.get("sequence_len", self.sequence_len)

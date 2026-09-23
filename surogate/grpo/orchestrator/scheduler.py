@@ -421,7 +421,10 @@ class Scheduler:
             )
             self.checkpoint_ready.clear()
             wait_for_ckpt_start_time = time.perf_counter()
-            await wait_for_path(get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step) / "STABLE")
+            await wait_for_path(
+                get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step) / "STABLE",
+                timeout=self.config.checkpoint_wait_timeout,
+            )
             self.wait_for_ckpt_time = time.perf_counter() - wait_for_ckpt_start_time
             self.logger.info(
                 f"Orchestrator resumed: checkpoint {next_ckpt_step} ready (after {self.wait_for_ckpt_time:.2f}s)"

@@ -85,13 +85,18 @@ def resolve_latest_ckpt_step(ckpt_dir: Path) -> int | None:
 def sync_wait_for_path(
     path: Path, interval: int = 1, log_interval: int = 10, timeout: int | None = 1800
 ) -> None:
-    """Blocking twin of `wait_for_path`, bounded for the same reason.
+    """Blocking twin of `wait_for_path`.
 
-    Its caller is the trainer waiting for a rollout micro-batch the
-    orchestrator writes (`transport/filesystem.py`). That is the same pipe as
-    the weight broadcast, in the other direction, with the same way to fail: if
-    the two disagree about the directory, or the orchestrator dies, an
-    unbounded wait blocks the trainer forever holding its GPUs.
+    Bounded so a missing file cannot wedge the trainer, but note what this
+    call actually waits for: `packer.pack()` writes the micro-batch through
+    `sender.send()` and `data_loader.wait_for_batch()` then waits for it, in
+    the same thread. It is an intra-trainer handoff of sub-second duration,
+    not a wait on the orchestrator, so the timeout only fires if the packer
+    failed to write what it said it wrote.
+
+    The trainer's genuinely unbounded wait on the orchestrator is the
+    `while len(batches) == 0` loop inside `packer.pack()`, which this does not
+    cover.
     """
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
@@ -99,7 +104,7 @@ def sync_wait_for_path(
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
-        if timeout is not None and wait_time >= timeout:
+        if timeout and wait_time >= timeout:
             raise TimeoutError(
                 f"waited {wait_time}s for `{path}` and it never appeared. The process that "
                 f"writes it has stopped, or is writing somewhere else."
@@ -125,7 +130,7 @@ async def wait_for_path(
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
-        if timeout is not None and wait_time >= timeout:
+        if timeout and wait_time >= timeout:
             raise TimeoutError(
                 f"waited {wait_time}s for `{path}` and it never appeared. If this is a GRPO "
                 f"weight broadcast, the trainer is writing somewhere else: the orchestrator "

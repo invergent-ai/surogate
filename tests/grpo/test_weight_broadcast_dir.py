@@ -14,6 +14,7 @@ import logging
 
 import pytest
 
+from surogate.utils.logger import get_logger
 from surogate.grpo.utils.pathing import (
     get_broadcast_dir,
     guess_broadcast_dir,
@@ -42,9 +43,23 @@ def test_the_guess_misses_any_run_dir_that_is_not_run_default(tmp_path, caplog):
     # Nothing to glob yet -> fallback.
     empty = tmp_path / "empty"
     empty.mkdir()
-    with caplog.at_level(logging.WARNING):
+    # Not caplog: get_logger sets `propagate = False` (logger.py), so records
+    # never reach the root handler caplog installs. Attach to the logger the
+    # code actually uses.
+    said: list[str] = []
+
+    class _Catch(logging.Handler):
+        def emit(self, record):
+            said.append(record.getMessage())
+
+    handler = _Catch()
+    real = get_logger()._logger
+    real.addHandler(handler)
+    try:
         assert guess_broadcast_dir(empty) == empty / "run_default" / "broadcasts"
-    assert any("broadcast" in r.message.lower() for r in caplog.records), "the guess must warn"
+    finally:
+        real.removeHandler(handler)
+    assert any("broadcast" in m.lower() for m in said), "the guess must warn"
 
     # Both present -> alphabetical first, which is still not run_tools.
     (train_out / "run_default").mkdir(parents=True)
