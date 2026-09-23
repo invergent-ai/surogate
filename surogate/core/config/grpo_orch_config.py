@@ -962,6 +962,15 @@ class GRPOOrchestratorConfig:
     max_concurrent: int | None = None
     tasks_per_minute: float | None = None
     batch_size: int | None = 128
+    #: Fail a step whose batch makes no progress for this many seconds. The
+    #: generation loop runs `while batch_progress < batch_target` with nothing
+    #: bounding it, and there are several ways for every rollout to succeed
+    #: while progress stays at zero -- a uniformly-scored group is dropped
+    #: whole by difficulty filtering, a rubric that raises drops its group, a
+    #: buffer that can never refill spins on an empty pending set. All present
+    #: identically: a run that looks alive forever with the GPUs held. None
+    #: disables the watchdog.
+    batch_stall_timeout: int | None = 600
     oversampling_factor: float | None = None
     rollouts_per_example: int | None = 1
     sequence_len: int | None = 2048
@@ -1061,6 +1070,7 @@ class GRPOOrchestratorConfig:
         self.max_concurrent = cfg.get("max_concurrent", self.max_concurrent)
         self.tasks_per_minute = cfg.get("tasks_per_minute", self.tasks_per_minute)
         self.batch_size = cfg.get("batch_size", self.batch_size)
+        self.batch_stall_timeout = cfg.get("batch_stall_timeout", self.batch_stall_timeout)
         self.oversampling_factor = cfg.get("oversampling_factor", self.oversampling_factor)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.sequence_len = cfg.get("sequence_len", self.sequence_len)

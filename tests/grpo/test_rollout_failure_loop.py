@@ -70,6 +70,10 @@ class _StubScheduler(Scheduler):
         self.dropped_group_ids: list[int] = []
         self.buffer = _PassThroughBuffer()
         self.prefetch_batches = True
+        # A real Scheduler always has one; this stub predates the first field
+        # it needed to read. The production default, so these tests see what a
+        # real run sees - 600s is far beyond the 30s cap in _run_one_batch.
+        self.config = SimpleNamespace(batch_stall_timeout=600)
 
     async def maybe_update_policy(self) -> None:
         return None
@@ -353,3 +357,74 @@ def test_one_broken_task_does_not_ride_on_another_s_dropped_groups():
     with pytest.raises(RolloutFailureLoop) as excinfo:
         scheduler._note_dropped_group("env_b", "bad row")
     assert "env_b" in str(excinfo.value)
+
+
+# ── Rollouts all succeed, nothing progresses: the run must still fail ──
+
+
+class _DiscardingBuffer(_PassThroughBuffer):
+    """Accepts every group and hands none back.
+
+    What difficulty filtering does to a group scored uniformly: the rollouts
+    are fine, so nothing failure-shaped is recorded, and ``sample_rollouts``
+    returns [] because a flat group carries no learning signal. A rubric that
+    raises on every group drops them the same way.
+    """
+
+    def sample_rollouts(self, n: int) -> list[dict]:
+        return []
+
+
+class _NoProgressScheduler(_StubScheduler):
+    """Every rollout succeeds; the buffer discards them all."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer = _DiscardingBuffer()
+        # Short, so the test does not sit for the 600s production default.
+        self.config.batch_stall_timeout = 1
+
+    def _rollout(self, group_id: int) -> dict:
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None,
+            "example_id": group_id,
+            "reward": 0.0,
+        }
+
+
+def test_a_batch_that_never_progresses_fails_even_though_every_rollout_succeeds():
+    """The case the rollout-failure guard above cannot see.
+
+    Observed live 2026-09-23 on the repo's own tool environment: step 1 scored
+    0.0000 across all 8 rollouts, the flat group was dropped whole, and the
+    loop span with `Active tasks: 0` and both GPUs held until it was killed.
+    Every rollout had completed normally, so the consecutive-failure streak
+    was reset on each pass and never tripped.
+    """
+    scheduler = _NoProgressScheduler()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_one_batch(scheduler)
+
+    message = str(excinfo.value)
+    # Not RolloutFailureLoop: nothing failed. A reader who sees that exception
+    # goes looking for a broken rollout and finds eight healthy ones.
+    assert not isinstance(excinfo.value, RolloutFailureLoop)
+    # The message has to point at the reward spread, which is the actual cause
+    # and is not visible anywhere else in a terminal state.
+    assert "batch progress stuck" in message
+    assert "reward spread" in message
+
+
+def test_the_watchdog_can_be_disabled():
+    """None means no watchdog, for a run that legitimately stalls longer.
+
+    Without this the test above would pass against a hard-coded timeout, and
+    an operator with a slow environment would have no way out.
+    """
+    scheduler = _NoProgressScheduler()
+    scheduler.config = SimpleNamespace(batch_stall_timeout=None)
+
+    with pytest.raises(asyncio.TimeoutError):
+        _run_one_batch(scheduler)   # _run_one_batch caps at 30s
