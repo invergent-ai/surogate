@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 
 from surogate.grpo.config import NoiseSchedulerConfig
-from surogate.grpo.utils.pathing import resolve_broadcast_dir
+from surogate.grpo.utils.pathing import guess_broadcast_dir
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -37,7 +37,9 @@ class SurogateWeightBroadcast:
         max_steps: int = 0,
         broadcast_dir: str | Path | None = None,
     ):
-        self.broadcast_dir = resolve_broadcast_dir(output_dir, broadcast_dir)
+        self.broadcast_dir = (
+            Path(broadcast_dir) if broadcast_dir is not None else guess_broadcast_dir(output_dir)
+        )
         self.broadcast_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_only = adapter_only
         self.max_async_level = max_async_level

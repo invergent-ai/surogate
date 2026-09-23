@@ -31,32 +31,26 @@ def get_broadcast_dir(output_dir: Path) -> Path:
     return output_dir / "broadcasts"
 
 
-def resolve_broadcast_dir(train_output_dir, broadcast_dir=None) -> Path:
-    """Where the trainer publishes weights for the orchestrator to collect.
+def guess_broadcast_dir(train_output_dir) -> Path:
+    """Guess where to publish weights when no orchestrator directory was given.
 
-    `broadcast_dir` is the answer when the caller knows it -- split mode holds
-    both configs and passes `get_broadcast_dir(orch_config.output_dir)`. It has
-    to match exactly, or the orchestrator waits for a checkpoint being written
-    somewhere else, indefinitely, while its log says training is progressing
-    normally.
-
-    Without it there is nothing to go on but the train output_dir, which does
-    not contain the answer, so this guesses and says so. The guess is only ever
-    right for an orchestrator whose output_dir is `run_default`: it lands there
-    by the fallback when nothing matches, and by `sorted(...)[0]` when several
-    do, because "run_default" sorts before most names -- "run_tools" among
-    them, which is why the shipped tool example could never train.
+    Only for callers with no orchestrator config in scope. Anyone holding one
+    should pass `get_broadcast_dir(orch_config.output_dir)` instead: this can
+    only ever land on `run_default`, and the orchestrator polls wherever its
+    own `output_dir` says.
     """
-    if broadcast_dir is not None:
-        return Path(broadcast_dir)
     parent = Path(train_output_dir)
     run_dirs = sorted(parent.glob("run_*"))
     run_dir = run_dirs[0] if run_dirs else parent / "run_default"
     guessed = run_dir / "broadcasts"
-    logger.warning(
-        f"No broadcast_dir given; guessing {guessed}. If the orchestrator's output_dir is "
-        f"not {run_dir}, it will wait there for weights that are never written. Pass "
-        f"broadcast_dir=get_broadcast_dir(orch_config.output_dir)."
+    logger.warning_once(
+        f"No broadcast directory given; publishing to {guessed}. Nothing reads this unless an "
+        f"orchestrator is polling exactly there. If you are in split mode, weights are going "
+        f"somewhere it is not looking."
+        # No hash_id: LoggerWrapper.warning_once reads it from kwargs but does
+        # not remove it, so it reaches the stdlib logger and raises. The
+        # message is the key by default, which is what we want anyway -- one
+        # warning per distinct directory.
     )
     return guessed
 
@@ -88,13 +82,28 @@ def resolve_latest_ckpt_step(ckpt_dir: Path) -> int | None:
     return latest_step
 
 
-def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -> None:
+def sync_wait_for_path(
+    path: Path, interval: int = 1, log_interval: int = 10, timeout: int | None = 1800
+) -> None:
+    """Blocking twin of `wait_for_path`, bounded for the same reason.
+
+    Its caller is the trainer waiting for a rollout micro-batch the
+    orchestrator writes (`transport/filesystem.py`). That is the same pipe as
+    the weight broadcast, in the other direction, with the same way to fail: if
+    the two disagree about the directory, or the orchestrator dies, an
+    unbounded wait blocks the trainer forever holding its GPUs.
+    """
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
+        if timeout is not None and wait_time >= timeout:
+            raise TimeoutError(
+                f"waited {wait_time}s for `{path}` and it never appeared. The process that "
+                f"writes it has stopped, or is writing somewhere else."
+            )
         if wait_time % log_interval == 0 and wait_time > 0:  # Every log_interval seconds
             logger.debug(f"Waiting for path `{path}` for {wait_time} seconds")
         time.sleep(interval)
@@ -106,12 +115,9 @@ async def wait_for_path(
 ) -> None:
     """Wait for `path` to appear, giving up after `timeout` seconds.
 
-    Unbounded by default until 2026-09-23. The orchestrator waits here for a
-    checkpoint the trainer publishes, and if the two disagree about where that
-    is, the wait never ends: the run holds its GPUs indefinitely while the log
-    says "Training is progressing normally". That disagreement was real -- the
-    trainer used to guess the directory -- and a silent forever-wait is what
-    made it take a day to find. `None` restores the old behaviour.
+    Unbounded until 2026-09-23, which is how a directory disagreement between
+    trainer and orchestrator became a run that held its GPUs forever. `None`
+    restores that.
     """
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
