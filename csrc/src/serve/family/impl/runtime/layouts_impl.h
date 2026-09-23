@@ -1190,7 +1190,14 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
     validate_target_options(options, geometry);
-    if (weights_profile_needs_sm120(weights_profile) && device.sm() < 120) {
+    // `!= 120`, not `< 120`. The FP4 archives are pinned `120a`, which is
+    // architecture-specific and loads on exactly sm_120 -- not sm_121 (DGX
+    // Spark), not sm_100/103 (B200/B300). On any of those the driver falls
+    // back to the only other PTX in the fatbin, compute_89, which was built
+    // with __CUDA_ARCH__ == 890 and whose W4A4 body is __trap(). Confirmed by
+    // cuobjdump on the built library: the arch set is exactly
+    // {sm_89, sm_120a}, with no generic compute_120 PTX to fall back to.
+    if (weights_profile_needs_sm120(weights_profile) && device.sm() != 120) {
         throw std::invalid_argument(
             "this checkpoint's NVFP4 weights need compute capability 12.0 or newer; "
             "serve a non-FP4 export of the model on this device");

@@ -206,9 +206,11 @@ jobs:
               # covered.
               "surogate.cli.main",
               "surogate.cli.grpo",
-              # Load-bearing beyond its own import: grpo_orch is the only entry
-              # here that reaches zmq. Drop it and the pyzmq half of this stops
-              # being tested, with nothing to say so.
+              # Load-bearing beyond its own import: grpo_orch is the only
+              # entry here reaching pandas, numpy and pydantic. zmq is NOT
+              # exclusive to it -- transport/__init__.py imports zmq
+              # unconditionally, so transport.base and transport.types reach it
+              # too.
               "surogate.grpo.transport.base",
               "surogate.grpo.transport.types",
               "surogate.grpo.utils.client",

@@ -74,7 +74,10 @@ dependencies = [
     "pandas",      # grpo/orchestrator/{grpo_orch,eval_utils,utils}.py
     "httpx",       # grpo/utils/client.py, rewards/ruler.py
     "pydantic",    # rewards/ruler.py, grpo/utils/pydantic_config.py
-    "safetensors"  # serve/convert/common/safetensors.py, via grpo/shared_weights.py
+    # Not on the ordinary GRPO import path, unlike the rest of this block: it
+    # is reached through the weight-sharing/convert code, and transformers is
+    # what supplies it today. Declared for the same reason, not the same route.
+    "safetensors"  # serve/convert/common/safetensors.py
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
