@@ -43,15 +43,20 @@ def guess_broadcast_dir(train_output_dir) -> Path:
     run_dirs = sorted(parent.glob("run_*"))
     run_dir = run_dirs[0] if run_dirs else parent / "run_default"
     guessed = run_dir / "broadcasts"
-    logger.warning_once(
-        f"No broadcast directory given; publishing to {guessed}. Nothing reads this unless an "
-        f"orchestrator is polling exactly there. If you are in split mode, weights are going "
-        f"somewhere it is not looking."
-        # No hash_id: LoggerWrapper.warning_once reads it from kwargs but does
-        # not remove it, so it reaches the stdlib logger and raises. The
-        # message is the key by default, which is what we want anyway -- one
-        # warning per distinct directory.
-    )
+    # Only when the guess is actually uncertain. Exactly one `run_*` is the
+    # case colocate guarantees -- `validate_configs` pins the orchestrator's
+    # directory inside the train output and rejects any sibling -- so warning
+    # there is a false alarm on every run. Zero means the fallback name, more
+    # than one means an arbitrary pick; both deserve a word.
+    if len(run_dirs) != 1:
+        logger.warning_once(
+            f"No broadcast directory given and {len(run_dirs)} run_* directories to choose "
+            f"from; publishing to {guessed}. An orchestrator polling anywhere else will wait "
+            f"forever. Pass broadcast_dir=get_broadcast_dir(orch_config.output_dir)."
+            # No hash_id: LoggerWrapper.warning_once reads it from kwargs but
+            # does not remove it, so it reaches the stdlib logger and raises.
+            # The message is the key by default, which is what we want anyway.
+        )
     return guessed
 
 
@@ -120,9 +125,9 @@ async def wait_for_path(
 ) -> None:
     """Wait for `path` to appear, giving up after `timeout` seconds.
 
-    Unbounded until 2026-09-23, which is how a directory disagreement between
-    trainer and orchestrator became a run that held its GPUs forever. `None`
-    restores that.
+    An unbounded version of this is how a directory disagreement between
+    trainer and orchestrator became a run that held its GPUs forever. `0` or
+    `None` restores that.
     """
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")

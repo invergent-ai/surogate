@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from surogate.grpo.orchestrator import scheduler as scheduler_mod
 from surogate.grpo.orchestrator.scheduler import (
     MAX_CONSECUTIVE_DROPPED_GROUPS,
     MAX_ROLLOUT_ATTEMPTS_PER_GROUP,
@@ -511,6 +512,73 @@ def test_time_parked_on_the_checkpoint_barrier_is_not_stall_time():
         releaser = asyncio.create_task(release_later())
         try:
             return await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=15)
+        finally:
+            releaser.cancel()
+            await scheduler.stop()
+
+    rollouts = asyncio.run(go())
+    assert len(rollouts) == scheduler.batch_size
+
+
+class _SlowRolloutBarrierScheduler(_StubScheduler):
+    """Rollouts that outlive the barrier, so nothing completes while it holds.
+
+    This is the path the other barrier test cannot reach. There, rollouts
+    finish instantly, so the loop is always parked at `checkpoint_ready.wait()`
+    when the barrier lifts and the re-stamp after it covers the whole pause.
+    Here the loop only ever wakes on the heartbeat during the barrier, and the
+    pause stays on the clock unless it is re-stamped at the top of the loop.
+
+    One round fills the batch, so the run ends before a second round of
+    deliberately-slow rollouts could trip the budget for an unrelated reason --
+    an earlier version of this test failed at 4/8 for exactly that, which was
+    the watchdog being right rather than the fix being wrong.
+    """
+
+    PAUSE = 1.5       # barrier, longer than the budget
+    ROLLOUT = 1.8     # lands after the barrier lifts, 0.3s later
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_size = 4          # one round of max_inflight_rollouts
+        self.config.batch_stall_timeout = 1.2
+        self.checkpoint_ready.clear()
+
+    async def _produce(self, group_id: int) -> dict:
+        await asyncio.sleep(self.ROLLOUT)
+        return self._rollout(group_id)
+
+    def _rollout(self, group_id: int) -> dict:
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None,
+            "example_id": group_id,
+            "reward": 1.0,
+        }
+
+
+def test_a_barrier_that_outlives_every_rollout_is_still_not_stall_time(monkeypatch):
+    """A healthy run must survive a barrier longer than the stall budget.
+
+    Skipping the check while the barrier is held is not enough: it stops the
+    raise during the pause but leaves the pause on the clock, so the first
+    wakeup afterwards fails a run that was never stalled. Here the barrier is
+    1.5s against a 1.2s budget, and the rollouts land 0.3s after it lifts.
+
+    The heartbeat is shrunk so the loop wakes often enough to show the
+    difference in about two seconds rather than sixty.
+    """
+    monkeypatch.setattr(scheduler_mod, "HEARTBEAT_SECONDS", 0.05)
+    scheduler = _SlowRolloutBarrierScheduler()
+
+    async def go():
+        async def release_later():
+            await asyncio.sleep(scheduler.PAUSE)
+            scheduler.checkpoint_ready.set()
+
+        releaser = asyncio.create_task(release_later())
+        try:
+            return await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=20)
         finally:
             releaser.cancel()
             await scheduler.stop()

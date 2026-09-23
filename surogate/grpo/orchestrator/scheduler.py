@@ -66,6 +66,11 @@ MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
 # the failures. Eight groups dying back to back with nothing getting through is
 # not a dataset shape. It can still be reached at a cold start by a dataset
 # that is mostly unrunnable, where failing is the right answer anyway.
+#: How long `generate_batch` blocks before waking to emit a stall line. Also
+#: the granularity at which the stall clock is re-stamped while the checkpoint
+#: barrier is held, so a test that exercises that path shrinks it.
+HEARTBEAT_SECONDS = 60.0
+
 MAX_CONSECUTIVE_DROPPED_GROUPS = 8
 
 
@@ -563,21 +568,26 @@ class Scheduler:
         last_progress_at = time.perf_counter()
 
         while batch_progress < self.batch_target:
-            # `checkpoint_ready.is_set()`: while the barrier is held, progress is
-            # structurally impossible. The re-stamp below only runs once a task
-            # completes, and the two `continue`s before it bypass that -- so
-            # without this, barrier time elapsing during a rollout drought was
-            # charged to the budget and failed a healthy run.
-            if (
-                stall_timeout
-                and self.checkpoint_ready.is_set()
-                and time.perf_counter() - last_progress_at > stall_timeout
-            ):
+            # While the barrier is held, progress is structurally impossible, so
+            # that time is not stall time. Re-stamping here rather than only
+            # skipping the check: skipping stops the raise during the barrier
+            # but leaves its whole duration on the clock, so the first wakeup
+            # after it lifted failed a healthy run. The loop returns here at
+            # least every HEARTBEAT_SECONDS, which caps what can be charged.
+            #
+            # The re-stamp after `checkpoint_ready.wait()` below is still
+            # needed: a barrier spent entirely parked there never reaches this
+            # line.
+            if not self.checkpoint_ready.is_set():
+                last_progress_at = time.perf_counter()
+            elif stall_timeout and time.perf_counter() - last_progress_at > stall_timeout:
                 raise RuntimeError(
                     f"step {step}: batch progress stuck at {batch_progress}/{self.batch_target} "
-                    f"for over {stall_timeout}s. Check this step's reward spread; see the "
-                    f"batch_stall_timeout docstring for the causes. Raise that setting, or "
-                    f"set it to 0 to disable this check."
+                    f"for over {stall_timeout}s: no rollouts were accepted in that time. "
+                    f"Either every group is being filtered (check this step's reward "
+                    f"spread) or rollouts are simply slower than this budget -- a rate "
+                    f"limit plus a slow judge can exceed it with nothing wrong. Raise "
+                    f"batch_stall_timeout, or set it to 0 to disable this check."
                 )
             await self._fill_inflight_requests()
             pending: list[asyncio.Task] = list(self.inflight_requests.keys())
@@ -599,7 +609,7 @@ class Scheduler:
                 # the exact stalls it should surface (observed: 14+ quiet
                 # minutes while the conductor queue was 60 deep). A timed
                 # wakeup emits a stall line instead.
-                timeout=60.0,
+                timeout=HEARTBEAT_SECONDS,
             )
             if not finished_tasks:
                 pbar.stall_tick(

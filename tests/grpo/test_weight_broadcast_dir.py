@@ -43,6 +43,8 @@ def test_the_guess_misses_any_run_dir_that_is_not_run_default(tmp_path, caplog):
     # Nothing to glob yet -> fallback.
     empty = tmp_path / "empty"
     empty.mkdir()
+    # Zero candidates: uncertain, so it warns. Exactly one candidate does not,
+    # because that is the case colocate guarantees is correct.
     # Not caplog: get_logger sets `propagate = False` (logger.py), so records
     # never reach the root handler caplog installs. Attach to the logger the
     # code actually uses.
@@ -68,14 +70,39 @@ def test_the_guess_misses_any_run_dir_that_is_not_run_default(tmp_path, caplog):
     assert guessed != get_broadcast_dir(orch_out)
 
 
+def test_an_unambiguous_guess_stays_quiet(tmp_path):
+    """One `run_*` is what colocate guarantees; warning there is a false alarm.
+
+    The warning fired on every colocate run before this was scoped, telling
+    operators their weights were going somewhere nothing reads when they were
+    not.
+    """
+    train_out = tmp_path / "outputs" / "grpo"
+    (train_out / "run_only").mkdir(parents=True)
+
+    said: list[str] = []
+
+    class _Catch(logging.Handler):
+        def emit(self, record):
+            said.append(record.getMessage())
+
+    handler = _Catch()
+    real = get_logger()._logger
+    real.addHandler(handler)
+    try:
+        assert guess_broadcast_dir(train_out) == train_out / "run_only" / "broadcasts"
+    finally:
+        real.removeHandler(handler)
+    assert not [m for m in said if "broadcast" in m.lower()], "one candidate is not ambiguous"
+
+
 def test_waiting_for_weights_gives_up_instead_of_hanging(tmp_path):
     """The orchestrator's side: a mismatch becomes an error, not a forever-wait."""
     missing = tmp_path / "step_1" / "STABLE"
 
     with pytest.raises(TimeoutError) as excinfo:
-        # Small interval and timeout rather than timeout=0: `0` disables the
-        # watchdog in batch_stall_timeout, and pinning the opposite reading
-        # here would make that inconsistency harder to resolve later.
+        # `0` disables the timeout, here as in batch_stall_timeout, so a
+        # small positive bound is what exercises it.
         asyncio.run(wait_for_path(missing, interval=0.01, timeout=0.05))
 
     assert str(missing) in str(excinfo.value)
