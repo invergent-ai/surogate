@@ -554,26 +554,18 @@ class Scheduler:
             total=self.batch_target, desc="Generating rollouts (train)", json_logging=self.json_logging, step=step
         )
 
-        # Watchdog on the loop's actual invariant. Rollout-level failure
-        # counting does not cover this: every rollout can succeed while
-        # progress stays at zero, and each success resets that streak. Keyed on
-        # batch_progress so it catches the paths nobody has enumerated as well
-        # as the known ones.
+        # Watchdog on batch_progress stalling; see the batch_stall_timeout
+        # docstring for why counting rollout failures cannot catch this.
         stall_timeout = self.config.batch_stall_timeout
-        last_progress_at = time.monotonic()
-        last_progress_value = 0
+        last_progress_at = time.perf_counter()
 
         while batch_progress < self.batch_target:
-            if batch_progress != last_progress_value:
-                last_progress_value = batch_progress
-                last_progress_at = time.monotonic()
-            elif stall_timeout is not None and time.monotonic() - last_progress_at > stall_timeout:
+            if stall_timeout is not None and time.perf_counter() - last_progress_at > stall_timeout:
                 raise RuntimeError(
                     f"step {step}: batch progress stuck at {batch_progress}/{self.batch_target} "
-                    f"for over {stall_timeout}s. Rollouts may be completing and then being "
-                    f"discarded -- a group scored uniformly is dropped whole by difficulty "
-                    f"filtering, and a rubric that raises drops its group. Check the reward "
-                    f"spread for this step. Set batch_stall_timeout to raise or disable this."
+                    f"for over {stall_timeout}s. Check this step's reward spread; see the "
+                    f"batch_stall_timeout docstring for the causes, and set it to raise or "
+                    f"disable this."
                 )
             await self._fill_inflight_requests()
             pending: list[asyncio.Task] = list(self.inflight_requests.keys())
@@ -624,6 +616,8 @@ class Scheduler:
                     batch_rollouts.extend(accepted_rollouts)
                     progress_increment = self.get_batch_progress_increment(accepted_rollouts)
                     batch_progress += progress_increment
+                    if progress_increment:
+                        last_progress_at = time.perf_counter()
                     pbar.update(progress_increment)
                     continue
 
@@ -711,6 +705,8 @@ class Scheduler:
                     batch_rollouts.extend(accepted_rollouts)
                     progress_increment = self.get_batch_progress_increment(accepted_rollouts)
                     batch_progress += progress_increment
+                    if progress_increment:
+                        last_progress_at = time.perf_counter()
                     pbar.update(progress_increment)
 
         if self.prefetch_batches:

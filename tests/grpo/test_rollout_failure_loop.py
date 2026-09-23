@@ -422,9 +422,20 @@ def test_the_watchdog_can_be_disabled():
 
     Without this the test above would pass against a hard-coded timeout, and
     an operator with a slow environment would have no way out.
+
+    Its own short bound rather than ``_run_one_batch``: this scheduler spins
+    at full speed (rollouts complete instantly and are discarded), so the
+    shared 30s cap would burn 30 real seconds of CPU on every suite run to
+    learn one bit.
     """
     scheduler = _NoProgressScheduler()
-    scheduler.config = SimpleNamespace(batch_stall_timeout=None)
+    scheduler.config.batch_stall_timeout = None
+
+    async def go():
+        try:
+            await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=1)
+        finally:
+            await scheduler.stop()
 
     with pytest.raises(asyncio.TimeoutError):
-        _run_one_batch(scheduler)   # _run_one_batch caps at 30s
+        asyncio.run(go())
