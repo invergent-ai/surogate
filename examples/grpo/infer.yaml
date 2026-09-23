@@ -6,3 +6,15 @@ max_loras: 4
 max_model_len: 2048
 max_num_seqs: 8
 port: 8007
+# Required by any tool-using environment. Without it the engine rejects a
+# request that carries tools with a 400 (`auto_tool_choice_disabled`), so every
+# rollout of such an environment fails; `grpo_inference_config.py` calls it
+# required and defaults it off.
+#
+# Harmless for the non-tool examples that share this file: the engine gates
+# tool parsing on the request carrying tools (`prepared.tool_capable =
+# request.uses_tools()`), not on this flag, so markdown-table-qa is unaffected.
+#
+# Read only by `surogate grpo` and `grpo-infer`, which build the engine argv.
+# `grpo-colocate` hardcodes the equivalent in the shared server.
+enable_auto_tool_choice: true

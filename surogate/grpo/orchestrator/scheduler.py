@@ -563,7 +563,16 @@ class Scheduler:
         last_progress_at = time.perf_counter()
 
         while batch_progress < self.batch_target:
-            if stall_timeout and time.perf_counter() - last_progress_at > stall_timeout:
+            # `checkpoint_ready.is_set()`: while the barrier is held, progress is
+            # structurally impossible. The re-stamp below only runs once a task
+            # completes, and the two `continue`s before it bypass that -- so
+            # without this, barrier time elapsing during a rollout drought was
+            # charged to the budget and failed a healthy run.
+            if (
+                stall_timeout
+                and self.checkpoint_ready.is_set()
+                and time.perf_counter() - last_progress_at > stall_timeout
+            ):
                 raise RuntimeError(
                     f"step {step}: batch progress stuck at {batch_progress}/{self.batch_target} "
                     f"for over {stall_timeout}s. Check this step's reward spread; see the "

@@ -37,9 +37,9 @@ import psutil
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
-from surogate.grpo.utils.pathing import get_broadcast_dir
 from surogate.grpo.abort import AbortReason
 from surogate.grpo.config import GRPOTrainConfig
+from surogate.grpo.utils.pathing import get_broadcast_dir
 from surogate.utils.logger import get_logger
 
 logger = get_logger()

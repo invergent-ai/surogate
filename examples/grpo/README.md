@@ -23,15 +23,14 @@ unquantized BF16 safetensors, LoRA, one GPU, and a model supported by the shared
 runner (Nemotron is excluded). It does not support checkpoint resume, QLoRA, CPU
 weight offload, or QeRL noise. See [colocation limits](../../docs/guides/rl-colocate.md).
 
-For real function-tool rollouts, use [tools-orch.yaml](tools-orch.yaml) with
-[tools-infer.yaml](tools-infer.yaml), the same training file, and a fresh output
-directory. The separate infer file exists only to set
-`enable_auto_tool_choice`, which a tool environment cannot work without and a
-non-tool one has no reason to carry:
+For real function-tool rollouts, use [tools-orch.yaml](tools-orch.yaml) with the
+same training/inference files and a fresh output directory. Note that
+`infer.yaml` sets `enable_auto_tool_choice`, which a tool environment cannot
+work without:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 surogate grpo-colocate \
-  --train examples/grpo/train.yaml --infer examples/grpo/tools-infer.yaml \
+  --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml \
   --orch examples/grpo/tools-orch.yaml
 ```
 
