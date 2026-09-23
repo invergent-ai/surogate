@@ -1169,9 +1169,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 ///
 /// A target that does declares a non-template overload beside its
 /// `WeightsProfile` enum; ADL finds it and it wins over this template on exact
-/// match. Deliberately not `if constexpr (requires ...)`: the function below
-/// is not a template, so an undeclared name there is a hard error rather than
-/// a quiet false.
+/// match. `if constexpr (requires ...)` cannot be used instead: the function
+/// below is not a template, Variant being a concrete typedef per include, so
+/// an undeclared name there is a compile error rather than a quiet false.
+///
+/// Know the cost of this fallback: it answers false for any target that has
+/// no overload, which is right for the twelve that declare no FP4 profile and
+/// WRONG-AND-SILENT for a target that gains one and forgets the one-liner, or
+/// whose includes put `package.h` after `instantiate.h`. There is no compile
+/// error in either case, only a device abort on sm_89. The backstop for that
+/// is in `validate_nvfp4_weight`, which asks the weight's qtype rather than
+/// the profile and does not depend on this dispatch being right.
 template <class Profile>
 constexpr bool weights_profile_needs_sm120(Profile) noexcept {
     return false;

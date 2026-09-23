@@ -49,9 +49,12 @@ enum class WeightsProfile : std::uint8_t {
 
 /// Do these weights need the sm_120 block-scaled FP4 MMA?
 ///
-/// Both NVFP4-bearing profiles here route through `sinfer_trtllm_moe`, which
-/// is pinned to 120a and refuses for itself, so this is belt and braces: a
-/// refusal at load reads better than one raised mid-rollout.
+/// `RoutedNvfp4`'s experts route through `sinfer_trtllm_moe`, which is pinned
+/// to 120a and refuses for itself. `CompressedTensors` is NOT covered that
+/// way: it stores each text-core weight in whatever format the export's config
+/// gave it, and those dense weights take `ops/linear/nvfp4/`, which builds at
+/// the full arch set and traps on sm_89. Do not downgrade either to false on
+/// the assumption that the archive refuses for itself.
 [[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile profile) noexcept {
     switch (profile) {
     case WeightsProfile::GroupwiseInt:

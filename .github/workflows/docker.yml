@@ -206,6 +206,9 @@ jobs:
               # covered.
               "surogate.cli.main",
               "surogate.cli.grpo",
+              # Load-bearing beyond its own import: grpo_orch is the only entry
+              # here that reaches zmq. Drop it and the pyzmq half of this stops
+              # being tested, with nothing to say so.
               "surogate.grpo.transport.base",
               "surogate.grpo.transport.types",
               "surogate.grpo.utils.client",

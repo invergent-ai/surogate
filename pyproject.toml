@@ -59,7 +59,22 @@ dependencies = [
     # transport is configured. `grpo/utils/client.py` imports tenacity the same
     # way. Both were vLLM dependencies too.
     "pyzmq",
-    "tenacity"
+    "tenacity",
+    # The rest of the same class, found by walking module-scope imports from
+    # the GRPO entry points and diffing against this list. Every one is
+    # imported before step 1 of a run and every one survives today only
+    # because something else drags it in: openai brings httpx and pydantic,
+    # datasets brings numpy, pandas and PyYAML. That is exactly how msgspec
+    # hid for a year, so they are named here rather than left to luck.
+    #
+    # Unpinned on purpose: they are already resolved transitively, and the
+    # point is to make the dependency explicit, not to re-pin the tree.
+    "pyyaml",      # grpo/orchestrator/grpo_orch.py, grpo/runs.py, core/config/loader.py
+    "numpy",       # grpo/data.py, grpo/loss.py, grpo/trainer.py, orchestrator/eval_utils.py
+    "pandas",      # grpo/orchestrator/{grpo_orch,eval_utils,utils}.py
+    "httpx",       # grpo/utils/client.py, rewards/ruler.py
+    "pydantic",    # rewards/ruler.py, grpo/utils/pydantic_config.py
+    "safetensors"  # serve/convert/common/safetensors.py, via grpo/shared_weights.py
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 
