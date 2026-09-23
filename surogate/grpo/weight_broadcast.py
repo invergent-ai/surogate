@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 
 from surogate.grpo.config import NoiseSchedulerConfig
+from surogate.grpo.utils.pathing import guess_broadcast_dir
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -34,19 +35,11 @@ class SurogateWeightBroadcast:
         noise_config: NoiseSchedulerConfig | None = None,
         base_model_dir: str | None = None,
         max_steps: int = 0,
+        broadcast_dir: str | Path | None = None,
     ):
-        # The orchestrator's scheduler polls {orch_output_dir}/broadcasts/step_{step}/STABLE
-        # (via get_broadcast_dir() which returns output_dir / "broadcasts").
-        # The orchestrator's output_dir defaults to "outputs/run_default", so we must
-        # write broadcasts inside the run_* subdirectory to match.
-        parent = Path(output_dir)
-        run_dirs = sorted(parent.glob("run_*"))
-        if run_dirs:
-            run_dir = run_dirs[0]
-        else:
-            # Fallback: create run_default if no run dir exists yet
-            run_dir = parent / "run_default"
-        self.broadcast_dir = run_dir / "broadcasts"
+        self.broadcast_dir = (
+            Path(broadcast_dir) if broadcast_dir is not None else guess_broadcast_dir(output_dir)
+        )
         self.broadcast_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_only = adapter_only
         self.max_async_level = max_async_level

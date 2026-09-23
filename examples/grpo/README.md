@@ -24,7 +24,18 @@ runner (Nemotron is excluded). It does not support checkpoint resume, QLoRA, CPU
 weight offload, or QeRL noise. See [colocation limits](../../docs/guides/rl-colocate.md).
 
 For real function-tool rollouts, use [tools-orch.yaml](tools-orch.yaml) with the
-same training/inference files and a fresh output directory:
+same training/inference files and a fresh output directory.
+
+Split mode reads `enable_auto_tool_choice` from `infer.yaml`, which a tool
+environment cannot work without:
+
+```bash
+surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml \
+  --orch examples/grpo/tools-orch.yaml --infer-gpus 0 --trainer-gpus 1
+```
+
+Colocate hardcodes the equivalent in its shared server, so the flag is not read
+there, but the same orchestrator config applies:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 surogate grpo-colocate \
@@ -50,6 +61,11 @@ CUDA_VISIBLE_DEVICES=1 surogate grpo-train examples/grpo/train.yaml
 ```
 
 Processes must share the output filesystem and see the same paths to broadcasts.
+`grpo-train` cannot currently be told where the orchestrator polls, so this
+layout works only with an orchestrator `output_dir` of `run_default` -- which is
+what `orch.yaml` uses. With `tools-orch.yaml` (`run_tools`) the trainer
+publishes somewhere the orchestrator does not read and the run fails once
+`checkpoint_wait_timeout` expires. Use split mode for tool environments.
 For remote servers, update `client.base_url` and the bind address in the inference
 config. Multi-node SFT uses Ray; this RL layout uses separate service processes.
 

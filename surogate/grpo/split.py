@@ -39,6 +39,7 @@ from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.abort import AbortReason
 from surogate.grpo.config import GRPOTrainConfig
+from surogate.grpo.utils.pathing import get_broadcast_dir
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -66,7 +67,7 @@ def _run_inference_subprocess(infer_config: GRPOInferenceConfig, infer_gpu_ids: 
     grpo_infer(infer_config)
 
 
-def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
+def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event, broadcast_dir=None):
     """Run the GRPO trainer in a background thread (parent process).
 
     Sets `failure_event` on any exception so the watchdog can interrupt the
@@ -79,7 +80,7 @@ def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
         # set no event, raised no signal, and hung the run in `running`.
         from surogate.grpo.trainer import GRPOTrainer
 
-        GRPOTrainer(train_config).train()
+        GRPOTrainer(train_config, broadcast_dir=broadcast_dir).train()
     except Exception:
         # Set the channel FIRST: this used to log first, and the logging call
         # itself raised, so the line below never ran, the watchdog was never
@@ -222,7 +223,10 @@ def grpo_split(
     trainer_failed = threading.Event()
     trainer_thread = Thread(
         target=_run_trainer,
-        args=(train_config, trainer_failed),
+        # The orchestrator polls get_broadcast_dir(orch_config.output_dir).
+        # This process is the only one holding both configs, so it is the only
+        # place the two can be made to agree rather than guessed at.
+        args=(train_config, trainer_failed, get_broadcast_dir(orch_config.output_dir)),
         daemon=True,
         name="grpo-trainer",
     )

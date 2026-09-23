@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from surogate.grpo.orchestrator import scheduler as scheduler_mod
 from surogate.grpo.orchestrator.scheduler import (
     MAX_CONSECUTIVE_DROPPED_GROUPS,
     MAX_ROLLOUT_ATTEMPTS_PER_GROUP,
@@ -70,6 +71,10 @@ class _StubScheduler(Scheduler):
         self.dropped_group_ids: list[int] = []
         self.buffer = _PassThroughBuffer()
         self.prefetch_batches = True
+        # A real Scheduler always has one; this stub predates the first field
+        # it needed to read. The production default, so these tests see what a
+        # real run sees - 600s is far beyond the 30s cap in _run_one_batch.
+        self.config = SimpleNamespace(batch_stall_timeout=600)
 
     async def maybe_update_policy(self) -> None:
         return None
@@ -353,3 +358,230 @@ def test_one_broken_task_does_not_ride_on_another_s_dropped_groups():
     with pytest.raises(RolloutFailureLoop) as excinfo:
         scheduler._note_dropped_group("env_b", "bad row")
     assert "env_b" in str(excinfo.value)
+
+
+# ── Rollouts all succeed, nothing progresses: the run must still fail ──
+
+
+class _DiscardingBuffer(_PassThroughBuffer):
+    """Accepts every group and hands none back.
+
+    What difficulty filtering does to a group scored uniformly: the rollouts
+    are fine, so nothing failure-shaped is recorded, and ``sample_rollouts``
+    returns [] because a flat group carries no learning signal. A rubric that
+    raises on every group drops them the same way.
+    """
+
+    def sample_rollouts(self, n: int) -> list[dict]:
+        return []
+
+
+class _NoProgressScheduler(_StubScheduler):
+    """Every rollout succeeds; the buffer discards them all."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer = _DiscardingBuffer()
+        # Short, so the test does not sit for the 600s production default.
+        self.config.batch_stall_timeout = 1
+
+    def _rollout(self, group_id: int) -> dict:
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None,
+            "example_id": group_id,
+            "reward": 0.0,
+        }
+
+
+def test_a_batch_that_never_progresses_fails_even_though_every_rollout_succeeds():
+    """The case the rollout-failure guard above cannot see.
+
+    Observed live 2026-09-23 on the repo's own tool environment: step 1 scored
+    0.0000 across all 8 rollouts, the flat group was dropped whole, and the
+    loop span with `Active tasks: 0` and both GPUs held until it was killed.
+    Every rollout had completed normally, so the consecutive-failure streak
+    was reset on each pass and never tripped.
+    """
+    scheduler = _NoProgressScheduler()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_one_batch(scheduler)
+
+    message = str(excinfo.value)
+    # Not RolloutFailureLoop: nothing failed. A reader who sees that exception
+    # goes looking for a broken rollout and finds eight healthy ones.
+    assert not isinstance(excinfo.value, RolloutFailureLoop)
+    # The message has to point at the reward spread, which is the actual cause
+    # and is not visible anywhere else in a terminal state.
+    assert "batch progress stuck" in message
+    assert "reward spread" in message
+
+
+def test_the_watchdog_can_be_disabled():
+    """None means no watchdog, for a run that legitimately stalls longer.
+
+    Without this the test above would pass against a hard-coded timeout, and
+    an operator with a slow environment would have no way out.
+
+    Its own short bound rather than ``_run_one_batch``: this scheduler spins
+    at full speed (rollouts complete instantly and are discarded), so the
+    shared 30s cap would burn 30 real seconds of CPU on every suite run to
+    learn one bit.
+    """
+    scheduler = _NoProgressScheduler()
+    scheduler.config.batch_stall_timeout = None
+
+    async def go():
+        try:
+            await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=1)
+        finally:
+            await scheduler.stop()
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(go())
+
+
+class _ColdFirstPassBuffer(_PassThroughBuffer):
+    """Yields nothing on the first sample, then behaves normally.
+
+    This is what makes the barrier test decisive. If progress resumes on the
+    very first pass after the barrier lifts, the reset at the increment sites
+    clears the clock anyway and the barrier fix cannot be observed. The case
+    where it matters is a pass that accepts no rollouts -- a filtered group,
+    a partially-filled batch -- immediately after a long pause.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sampled = 0
+
+    def sample_rollouts(self, n: int) -> list[dict]:
+        self.sampled += 1
+        if self.sampled == 1:
+            return []
+        return super().sample_rollouts(n)
+
+
+class _CheckpointPausedScheduler(_StubScheduler):
+    """Healthy, but parked on the checkpoint barrier past the stall budget.
+
+    The orchestrator clears ``checkpoint_ready`` while it waits for the trainer
+    to land a checkpoint and for the weight broadcast; its own log calls that
+    "Training is progressing normally". Progress is structurally impossible
+    until it clears, so that time is not stall time.
+    """
+
+    PAUSE = 1.5
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.batch_stall_timeout = 1
+        self.checkpoint_ready.clear()
+        self.buffer = _ColdFirstPassBuffer()
+
+    def _rollout(self, group_id: int) -> dict:
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None,
+            "example_id": group_id,
+            "reward": 1.0,
+        }
+
+
+def test_time_parked_on_the_checkpoint_barrier_is_not_stall_time():
+    """A healthy run whose trainer is slow must not be killed.
+
+    Without this, a checkpoint plus weight broadcast longer than
+    batch_stall_timeout fails the run, and the message blames the reward
+    spread -- sending the operator after a data problem that is not there.
+
+    The barrier is released by a separate task, not by the rollouts: they
+    complete at once, so the loop reaches `await checkpoint_ready.wait()` while
+    the event is still clear and is held there past the budget. The buffer
+    accepts nothing on the first pass afterwards, so the barrier's duration is
+    still on the clock when the loop next checks.
+    """
+    scheduler = _CheckpointPausedScheduler()
+
+    async def go():
+        async def release_later():
+            await asyncio.sleep(scheduler.PAUSE)
+            scheduler.checkpoint_ready.set()
+
+        releaser = asyncio.create_task(release_later())
+        try:
+            return await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=15)
+        finally:
+            releaser.cancel()
+            await scheduler.stop()
+
+    rollouts = asyncio.run(go())
+    assert len(rollouts) == scheduler.batch_size
+
+
+class _SlowRolloutBarrierScheduler(_StubScheduler):
+    """Rollouts that outlive the barrier, so nothing completes while it holds.
+
+    This is the path the other barrier test cannot reach. There, rollouts
+    finish instantly, so the loop is always parked at `checkpoint_ready.wait()`
+    when the barrier lifts and the re-stamp after it covers the whole pause.
+    Here the loop only ever wakes on the heartbeat during the barrier, and the
+    pause stays on the clock unless it is re-stamped at the top of the loop.
+
+    One round fills the batch, so the run ends before a second round of
+    deliberately-slow rollouts could trip the budget for an unrelated reason --
+    an earlier version of this test failed at 4/8 for exactly that, which was
+    the watchdog being right rather than the fix being wrong.
+    """
+
+    PAUSE = 1.5       # barrier, longer than the budget
+    ROLLOUT = 1.8     # lands after the barrier lifts, 0.3s later
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_size = 4          # one round of max_inflight_rollouts
+        self.config.batch_stall_timeout = 1.2
+        self.checkpoint_ready.clear()
+
+    async def _produce(self, group_id: int) -> dict:
+        await asyncio.sleep(self.ROLLOUT)
+        return self._rollout(group_id)
+
+    def _rollout(self, group_id: int) -> dict:
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None,
+            "example_id": group_id,
+            "reward": 1.0,
+        }
+
+
+def test_a_barrier_that_outlives_every_rollout_is_still_not_stall_time(monkeypatch):
+    """A healthy run must survive a barrier longer than the stall budget.
+
+    Skipping the check while the barrier is held is not enough: it stops the
+    raise during the pause but leaves the pause on the clock, so the first
+    wakeup afterwards fails a run that was never stalled. Here the barrier is
+    1.5s against a 1.2s budget, and the rollouts land 0.3s after it lifts.
+
+    The heartbeat is shrunk so the loop wakes often enough to show the
+    difference in about two seconds rather than sixty.
+    """
+    monkeypatch.setattr(scheduler_mod, "HEARTBEAT_SECONDS", 0.05)
+    scheduler = _SlowRolloutBarrierScheduler()
+
+    async def go():
+        async def release_later():
+            await asyncio.sleep(scheduler.PAUSE)
+            scheduler.checkpoint_ready.set()
+
+        releaser = asyncio.create_task(release_later())
+        try:
+            return await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=20)
+        finally:
+            releaser.cancel()
+            await scheduler.stop()
+
+    rollouts = asyncio.run(go())
+    assert len(rollouts) == scheduler.batch_size

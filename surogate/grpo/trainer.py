@@ -134,7 +134,11 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
 class GRPOTrainer:
     """GRPO RL trainer using Surogate's C++ engine."""
 
-    def __init__(self, config: GRPOTrainConfig, *, resume_checkpoint=None):
+    def __init__(self, config: GRPOTrainConfig, *, resume_checkpoint=None, broadcast_dir=None):
+        # broadcast_dir: where the orchestrator polls for weights. The train
+        # config does not carry the orchestrator's output_dir, so a caller that
+        # has both must pass it; see SurogateWeightBroadcast for what happens
+        # when nobody does.
         self.phase_controller = None
         self.config = config
 
@@ -263,6 +267,7 @@ class GRPOTrainer:
             noise_config=config.noise_scheduler,
             base_model_dir=config.model_dir,
             max_steps=config.max_steps,
+            broadcast_dir=broadcast_dir,
         )
 
         # Data loader setup is deferred to train() since packer must run first

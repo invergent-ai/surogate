@@ -66,6 +66,11 @@ MAX_ROLLOUT_ATTEMPTS_PER_GROUP = 16
 # the failures. Eight groups dying back to back with nothing getting through is
 # not a dataset shape. It can still be reached at a cold start by a dataset
 # that is mostly unrunnable, where failing is the right answer anyway.
+#: How long `generate_batch` blocks before waking to emit a stall line. Also
+#: the granularity at which the stall clock is re-stamped while the checkpoint
+#: barrier is held, so a test that exercises that path shrinks it.
+HEARTBEAT_SECONDS = 60.0
+
 MAX_CONSECUTIVE_DROPPED_GROUPS = 8
 
 
@@ -421,7 +426,10 @@ class Scheduler:
             )
             self.checkpoint_ready.clear()
             wait_for_ckpt_start_time = time.perf_counter()
-            await wait_for_path(get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step) / "STABLE")
+            await wait_for_path(
+                get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step) / "STABLE",
+                timeout=self.config.checkpoint_wait_timeout,
+            )
             self.wait_for_ckpt_time = time.perf_counter() - wait_for_ckpt_start_time
             self.logger.info(
                 f"Orchestrator resumed: checkpoint {next_ckpt_step} ready (after {self.wait_for_ckpt_time:.2f}s)"
@@ -554,7 +562,33 @@ class Scheduler:
             total=self.batch_target, desc="Generating rollouts (train)", json_logging=self.json_logging, step=step
         )
 
+        # Watchdog on batch_progress stalling; see the batch_stall_timeout
+        # docstring for why counting rollout failures cannot catch this.
+        stall_timeout = self.config.batch_stall_timeout
+        last_progress_at = time.perf_counter()
+
         while batch_progress < self.batch_target:
+            # While the barrier is held, progress is structurally impossible, so
+            # that time is not stall time. Re-stamping here rather than only
+            # skipping the check: skipping stops the raise during the barrier
+            # but leaves its whole duration on the clock, so the first wakeup
+            # after it lifted failed a healthy run. The loop returns here at
+            # least every HEARTBEAT_SECONDS, which caps what can be charged.
+            #
+            # The re-stamp after `checkpoint_ready.wait()` below is still
+            # needed: a barrier spent entirely parked there never reaches this
+            # line.
+            if not self.checkpoint_ready.is_set():
+                last_progress_at = time.perf_counter()
+            elif stall_timeout and time.perf_counter() - last_progress_at > stall_timeout:
+                raise RuntimeError(
+                    f"step {step}: batch progress stuck at {batch_progress}/{self.batch_target} "
+                    f"for over {stall_timeout}s: no rollouts were accepted in that time. "
+                    f"Either every group is being filtered (check this step's reward "
+                    f"spread) or rollouts are simply slower than this budget -- a rate "
+                    f"limit plus a slow judge can exceed it with nothing wrong. Raise "
+                    f"batch_stall_timeout, or set it to 0 to disable this check."
+                )
             await self._fill_inflight_requests()
             pending: list[asyncio.Task] = list(self.inflight_requests.keys())
             pending.extend(self.scoring_tasks.keys())
@@ -575,7 +609,7 @@ class Scheduler:
                 # the exact stalls it should surface (observed: 14+ quiet
                 # minutes while the conductor queue was 60 deep). A timed
                 # wakeup emits a stall line instead.
-                timeout=60.0,
+                timeout=HEARTBEAT_SECONDS,
             )
             if not finished_tasks:
                 pbar.stall_tick(
@@ -583,7 +617,19 @@ class Scheduler:
                     scoring=len(self.scoring_tasks),
                 )
                 continue
+            # Only re-stamp when the barrier actually held us. `wait()` returns
+            # at once in the common case, so an unconditional re-stamp here
+            # would re-arm the clock every iteration and disable the watchdog
+            # -- the same trap as an unguarded reset at the increment sites.
+            paused_for_checkpoint = not self.checkpoint_ready.is_set()
             await self.checkpoint_ready.wait()
+            if paused_for_checkpoint:
+                # The orchestrator was parked waiting for the trainer to land a
+                # checkpoint and for the weight broadcast. Its own log calls
+                # that "Training is progressing normally"; progress here is
+                # structurally impossible until it clears, so it is not stall
+                # time and a big model's checkpoint can outlast the budget.
+                last_progress_at = time.perf_counter()
 
             for finished_task in finished_tasks:
                 if batch_progress >= self.batch_target:
@@ -604,6 +650,8 @@ class Scheduler:
                     batch_rollouts.extend(accepted_rollouts)
                     progress_increment = self.get_batch_progress_increment(accepted_rollouts)
                     batch_progress += progress_increment
+                    if progress_increment:
+                        last_progress_at = time.perf_counter()
                     pbar.update(progress_increment)
                     continue
 
@@ -691,6 +739,8 @@ class Scheduler:
                     batch_rollouts.extend(accepted_rollouts)
                     progress_increment = self.get_batch_progress_increment(accepted_rollouts)
                     batch_progress += progress_increment
+                    if progress_increment:
+                        last_progress_at = time.perf_counter()
                     pbar.update(progress_increment)
 
         if self.prefetch_batches:
