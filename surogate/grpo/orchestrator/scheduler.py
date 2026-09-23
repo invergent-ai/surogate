@@ -560,12 +560,12 @@ class Scheduler:
         last_progress_at = time.perf_counter()
 
         while batch_progress < self.batch_target:
-            if stall_timeout is not None and time.perf_counter() - last_progress_at > stall_timeout:
+            if stall_timeout and time.perf_counter() - last_progress_at > stall_timeout:
                 raise RuntimeError(
                     f"step {step}: batch progress stuck at {batch_progress}/{self.batch_target} "
                     f"for over {stall_timeout}s. Check this step's reward spread; see the "
-                    f"batch_stall_timeout docstring for the causes, and set it to raise or "
-                    f"disable this."
+                    f"batch_stall_timeout docstring for the causes. Raise that setting, or "
+                    f"set it to 0 to disable this check."
                 )
             await self._fill_inflight_requests()
             pending: list[asyncio.Task] = list(self.inflight_requests.keys())
@@ -595,7 +595,19 @@ class Scheduler:
                     scoring=len(self.scoring_tasks),
                 )
                 continue
+            # Only re-stamp when the barrier actually held us. `wait()` returns
+            # at once in the common case, so an unconditional re-stamp here
+            # would re-arm the clock every iteration and disable the watchdog
+            # -- the same trap as an unguarded reset at the increment sites.
+            paused_for_checkpoint = not self.checkpoint_ready.is_set()
             await self.checkpoint_ready.wait()
+            if paused_for_checkpoint:
+                # The orchestrator was parked waiting for the trainer to land a
+                # checkpoint and for the weight broadcast. Its own log calls
+                # that "Training is progressing normally"; progress here is
+                # structurally impossible until it clears, so it is not stall
+                # time and a big model's checkpoint can outlast the budget.
+                last_progress_at = time.perf_counter()
 
             for finished_task in finished_tasks:
                 if batch_progress >= self.batch_target:

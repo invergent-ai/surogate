@@ -439,3 +439,81 @@ def test_the_watchdog_can_be_disabled():
 
     with pytest.raises(asyncio.TimeoutError):
         asyncio.run(go())
+
+
+class _ColdFirstPassBuffer(_PassThroughBuffer):
+    """Yields nothing on the first sample, then behaves normally.
+
+    This is what makes the barrier test decisive. If progress resumes on the
+    very first pass after the barrier lifts, the reset at the increment sites
+    clears the clock anyway and the barrier fix cannot be observed. The case
+    where it matters is a pass that accepts no rollouts -- a filtered group,
+    a partially-filled batch -- immediately after a long pause.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sampled = 0
+
+    def sample_rollouts(self, n: int) -> list[dict]:
+        self.sampled += 1
+        if self.sampled == 1:
+            return []
+        return super().sample_rollouts(n)
+
+
+class _CheckpointPausedScheduler(_StubScheduler):
+    """Healthy, but parked on the checkpoint barrier past the stall budget.
+
+    The orchestrator clears ``checkpoint_ready`` while it waits for the trainer
+    to land a checkpoint and for the weight broadcast; its own log calls that
+    "Training is progressing normally". Progress is structurally impossible
+    until it clears, so that time is not stall time.
+    """
+
+    PAUSE = 1.5
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.batch_stall_timeout = 1
+        self.checkpoint_ready.clear()
+        self.buffer = _ColdFirstPassBuffer()
+
+    def _rollout(self, group_id: int) -> dict:
+        return {
+            "trajectory": [{"tokens": None, "response": {}}],
+            "error": None,
+            "example_id": group_id,
+            "reward": 1.0,
+        }
+
+
+def test_time_parked_on_the_checkpoint_barrier_is_not_stall_time():
+    """A healthy run whose trainer is slow must not be killed.
+
+    Without this, a checkpoint plus weight broadcast longer than
+    batch_stall_timeout fails the run, and the message blames the reward
+    spread -- sending the operator after a data problem that is not there.
+
+    The barrier is released by a separate task, not by the rollouts: they
+    complete at once, so the loop reaches `await checkpoint_ready.wait()` while
+    the event is still clear and is held there past the budget. The buffer
+    accepts nothing on the first pass afterwards, so the barrier's duration is
+    still on the clock when the loop next checks.
+    """
+    scheduler = _CheckpointPausedScheduler()
+
+    async def go():
+        async def release_later():
+            await asyncio.sleep(scheduler.PAUSE)
+            scheduler.checkpoint_ready.set()
+
+        releaser = asyncio.create_task(release_later())
+        try:
+            return await asyncio.wait_for(scheduler.generate_batch(step=0), timeout=15)
+        finally:
+            releaser.cancel()
+            await scheduler.stop()
+
+    rollouts = asyncio.run(go())
+    assert len(rollouts) == scheduler.batch_size

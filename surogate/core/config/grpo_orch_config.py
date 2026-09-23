@@ -920,6 +920,14 @@ class GRPOOrchestratorConfig:
         max_concurrent: Maximum number of concurrent rollouts to generate and score per-environment. If None, will not limit concurrency.
         tasks_per_minute: Rate limit for tasks per environment worker, in tasks per minute. Recommended for sandbox-backed environments to prevent sandbox-not-ready errors during autoscaling. When set to None, no rate limiting is applied. Note: with multiple workers, the effective total rate equals workers × this value.
         batch_size: Number of samples to train on per step (rollout-based batching). Set this OR token_batch_size.
+        batch_stall_timeout: Seconds of no batch progress before a step fails.
+            The generation loop has nothing bounding it, and every rollout can
+            succeed while progress stays at zero: a uniformly-scored group is
+            dropped whole by difficulty filtering, a rubric that raises drops
+            its group, a buffer that can never refill spins on an empty pending
+            set. All present as a run that looks alive forever with the GPUs
+            held. Time spent parked on the trainer's checkpoint barrier does not
+            count. 0 or None disables the check.
         oversampling_factor: Factor by which to oversample the batch. Will lead to more in-flight group rollout requests at the same time. Default is 1.0 (no oversampling).
         rollouts_per_example: Number of output sequences to return per example during training.
         sequence_len: Sequence length to use for training. If a sample is shorter than this, it will be padded. If a sequence is longer than this, it will be truncated.
@@ -962,14 +970,6 @@ class GRPOOrchestratorConfig:
     max_concurrent: int | None = None
     tasks_per_minute: float | None = None
     batch_size: int | None = 128
-    #: Fail a step whose batch makes no progress for this many seconds. The
-    #: generation loop runs `while batch_progress < batch_target` with nothing
-    #: bounding it, and there are several ways for every rollout to succeed
-    #: while progress stays at zero -- a uniformly-scored group is dropped
-    #: whole by difficulty filtering, a rubric that raises drops its group, a
-    #: buffer that can never refill spins on an empty pending set. All present
-    #: identically: a run that looks alive forever with the GPUs held. None
-    #: disables the watchdog.
     batch_stall_timeout: int | None = 600
     oversampling_factor: float | None = None
     rollouts_per_example: int | None = 1
