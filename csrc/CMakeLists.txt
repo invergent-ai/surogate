@@ -109,6 +109,11 @@ option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
 # *inside* the one binary: `set_target_properties(<target> PROPERTIES CUDA_ARCHITECTURES 120a)`
 # below does that for the FP4 families, which keeps the fatbin from carrying an sm_89 copy of a
 # kernel sm_89 cannot execute.
+#
+# It does NOT cover every FP4 kernel. `ops/linear/nvfp4/nvfp4_w4a4.cu` lives in sinfer_ops and
+# so builds at this whole arch set: cuobjdump shows sm_89 cubins AND compute_89 PTX for the
+# w4a4 entries. Their sm_89 bodies are `__trap()`, so the refusal for those is a runtime one
+# (`validate_nvfp4_weight`), not this pinning. Do not read the paragraph above as covering them.
 set(SUROGATE_SERVE_CUDA_ARCHS "89;120a" CACHE STRING
     "CUDA architectures for the serve engine targets (the RTX line: Ada and Blackwell)")
 # A build machine missing FFmpeg or libcurl drops the serve targets with a status

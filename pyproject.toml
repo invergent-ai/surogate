@@ -46,7 +46,38 @@ dependencies = [
     "wandb==0.25.1",
     "jaxtyping",
     "aiolimiter",
-    "openai==2.32.0"
+    "openai==2.32.0",
+    # GRPO's batch transport encodes with it (grpo/transport/base.py,
+    # types.py). Undeclared since the transport landed in v1.0.0 and
+    # unnoticed because vLLM pulled it in; when the rollout server stopped
+    # being vLLM the dependency left with it and every GRPO run died at
+    # ModuleNotFoundError before its first step.
+    "msgspec",
+    # Same bug as msgspec, found the same way. `grpo/transport/zmq.py` imports
+    # zmq at module scope and `transport/__init__.py` imports that
+    # unconditionally, so it is on the import path of every GRPO run whichever
+    # transport is configured. `grpo/utils/client.py` imports tenacity the same
+    # way. Both were vLLM dependencies too.
+    "pyzmq",
+    "tenacity",
+    # The rest of the same class, found by walking module-scope imports from
+    # the GRPO entry points and diffing against this list. Every one is
+    # imported before step 1 of a run and every one survives today only
+    # because something else drags it in: openai brings httpx and pydantic,
+    # datasets brings numpy, pandas and PyYAML. That is exactly how msgspec
+    # hid for a year, so they are named here rather than left to luck.
+    #
+    # Unpinned on purpose: they are already resolved transitively, and the
+    # point is to make the dependency explicit, not to re-pin the tree.
+    "pyyaml",      # grpo/orchestrator/grpo_orch.py, grpo/runs.py, core/config/loader.py
+    "numpy",       # grpo/data.py, grpo/loss.py, grpo/trainer.py, orchestrator/eval_utils.py
+    "pandas",      # grpo/orchestrator/{grpo_orch,eval_utils,utils}.py
+    "httpx",       # grpo/utils/client.py, rewards/ruler.py
+    "pydantic",    # rewards/ruler.py, grpo/utils/pydantic_config.py
+    # Not on the ordinary GRPO import path, unlike the rest of this block: it
+    # is reached through the weight-sharing/convert code, and transformers is
+    # what supplies it today. Declared for the same reason, not the same route.
+    "safetensors"  # serve/convert/common/safetensors.py
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

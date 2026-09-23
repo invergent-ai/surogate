@@ -943,7 +943,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options,
+void validate_target_options(const EngineOptions& options,
                              const family::TextGeometry& geometry) {
     if (geometry.max_context <= 0 || !geometry.attention_schedule_declared || !geometry.windowed_schedule_declared) {
         throw std::invalid_argument("sequence planning requires complete checkpoint geometry");
@@ -1019,9 +1019,33 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.sm() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
-    }
+    // No compute-capability gate here on purpose.
+    //
+    // There used to be `if (device.sm() != 120) throw "Qwen3.6 family runtime
+    // requires compute capability 12.0"`. It was defensible while this runtime
+    // belonged to one target. It stopped being defensible when a second target
+    // was built on it: every target instantiates this template
+    // (`impl/runtime/instantiate.h`), so one target's device requirement became
+    // all fourteen targets' requirement. sm_89 was refused for a BF16 llama,
+    // which needs nothing from Blackwell and is hardware
+    // `SUROGATE_SERVE_CUDA_ARCHS` builds for by default.
+    //
+    // The constraint it was reaching for is per weights profile, not per
+    // device and not per target. Only `qwen3_5` and `qwen3_5_moe` declare an
+    // FP4 profile at all (`api/targets/*/package.h`); every other target's
+    // `WeightsProfile` is `GroupwiseInt`.
+    //
+    // The build pins `sinfer_nvfp4_tma` and `sinfer_trtllm_moe` to
+    // `CUDA_ARCHITECTURES 120a`, so an sm_89 fatbin carries no cubin for those
+    // and CUDA refuses at the point of use. It does NOT cover the dense W4A4
+    // mma kernel: `nvfp4_w4a4.cu` builds inside `sinfer_ops` at the full arch
+    // set, so an sm_89 cubin exists whose body is `__trap()`. The build cannot
+    // be the whole story, which is why the refusal lives in
+    // `make_sequence_planner_impl` below, keyed on the profile.
+    //
+    // This function cannot see `weights_profile`, which is the likely reason
+    // it reached for the device instead. Keep any new refusal where the
+    // profile is in scope rather than re-adding a device check here.
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -1140,11 +1164,44 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 } // namespace
 
+/// Do these weights need the sm_120 block-scaled FP4 MMA? Twelve of the
+/// fourteen targets have no FP4 profile, and this answers for them.
+///
+/// A target that does declares a non-template overload beside its
+/// `WeightsProfile` enum; ADL finds it and it wins over this template on exact
+/// match. `if constexpr (requires ...)` cannot be used instead: the function
+/// below is not a template, Variant being a concrete typedef per include, so
+/// an undeclared name there is a compile error rather than a quiet false.
+///
+/// Know the cost of this fallback: it answers false for any target that has
+/// no overload, which is right for the twelve that declare no FP4 profile and
+/// WRONG-AND-SILENT for a target that gains one and forgets the one-liner, or
+/// whose includes put `package.h` after `instantiate.h`. There is no compile
+/// error in either case, only a device abort on sm_89. The backstop for that
+/// is in `validate_nvfp4_weight`, which asks the weight's qtype rather than
+/// the profile and does not depend on this dispatch being right.
+template <class Profile>
+constexpr bool weights_profile_needs_sm120(Profile) noexcept {
+    return false;
+}
+
 std::unique_ptr<family::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
-    validate_target_options(device, options, geometry);
+    validate_target_options(options, geometry);
+    // `!= 120`, not `< 120`. The FP4 archives are pinned `120a`, which is
+    // architecture-specific and loads on exactly sm_120 -- not sm_121 (DGX
+    // Spark), not sm_100/103 (B200/B300). On any of those the driver falls
+    // back to the only other PTX in the fatbin, compute_89, which was built
+    // with __CUDA_ARCH__ == 890 and whose W4A4 body is __trap(). Confirmed by
+    // cuobjdump on the built library: the arch set is exactly
+    // {sm_89, sm_120a}, with no generic compute_120 PTX to fall back to.
+    if (weights_profile_needs_sm120(weights_profile) && device.sm() != 120) {
+        throw std::invalid_argument(
+            "this checkpoint's NVFP4 weights need compute capability 12.0 or newer; "
+            "serve a non-FP4 export of the model on this device");
+    }
     if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {
         throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
     }

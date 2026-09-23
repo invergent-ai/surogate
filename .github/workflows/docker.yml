@@ -161,5 +161,72 @@ jobs:
               else:
                   print(f"ok: {mode} -> {path}")
           if problems:
-              sys.exit("::error::" + "; ".join(problems))
+              # print, not sys.exit(msg): workflow commands are parsed from
+              # stdout, and sys.exit writes its argument to stderr, so the
+              # annotation never rendered.
+              print("::error::" + "; ".join(problems))
+              sys.exit(1)
+          PY
+
+      # The step above asks whether the image carries what the *binary* loads.
+      # This asks the same of the *package*, and it is the half that was
+      # missing: `surogate.cli.serve` was the only module anything imported
+      # here, so a dependency the GRPO path needs and pyproject does not
+      # declare passed a green build and failed on a user's GPU. That is
+      # exactly what happened to `msgspec`, undeclared since the transport
+      # landed in v1.0.0 and carried transitively by vLLM until the rollout
+      # server stopped being vLLM.
+      #
+      # The list is every module on a run's import path that resolves without
+      # a GPU, and it was established by running it against the image rather
+      # than reasoned about. `surogate.grpo.split`, `cli.sft`,
+      # `cli.distill_capture` and `distill.capture` are deliberately absent:
+      # each pulls in CUDA symbols and fails with `libcuda.so.1: cannot open
+      # shared object file` without `--gpus`, which this runner does not have.
+      # Same reason the step above treats libcuda.so.1 as its one permitted
+      # miss. Adding one of them makes this step red on every build.
+      #
+      # What this CANNOT catch, so nobody reads more into a green tick than is
+      # there: it imports inside the built image, where every dependency is
+      # installed whether or not pyproject asks for it. It proves presence, not
+      # declaration. An undeclared package that some other dependency still
+      # happens to pull in passes here -- which is precisely how msgspec stayed
+      # hidden for a year. Catching that class needs a resolve of the declared
+      # set alone, not an import in the assembled image.
+      - name: The package can import what a run will import
+        if: steps.should_build.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
+          docker run --rm -i --entrypoint python3 "$image" - <<'PY'
+          import importlib, sys
+
+          MODULES = [
+              # The console script's own entry point, which neither step
+              # covered.
+              "surogate.cli.main",
+              "surogate.cli.grpo",
+              # Load-bearing beyond its own import: grpo_orch is the only
+              # entry here reaching pandas, numpy and pydantic. zmq is NOT
+              # exclusive to it -- transport/__init__.py imports zmq
+              # unconditionally, so transport.base and transport.types reach it
+              # too.
+              "surogate.grpo.transport.base",
+              "surogate.grpo.transport.types",
+              "surogate.grpo.utils.client",
+              "surogate.grpo.orchestrator.grpo_orch",
+          ]
+          problems = []
+          for name in MODULES:
+              try:
+                  importlib.import_module(name)
+                  print(f"ok: {name}")
+              except Exception as exc:
+                  problems.append(f"{name}: {type(exc).__name__}: {exc}")
+          if problems:
+              # print, not sys.exit(msg): workflow commands are parsed from
+              # stdout, and sys.exit writes its argument to stderr, so the
+              # annotation never rendered.
+              print("::error::" + "; ".join(problems))
+              sys.exit(1)
           PY

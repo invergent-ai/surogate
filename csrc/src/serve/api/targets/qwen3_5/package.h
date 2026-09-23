@@ -51,6 +51,29 @@ enum class WeightsProfile : std::uint8_t {
     Nvfp4All,
 };
 
+/// Do these weights need the sm_120 block-scaled FP4 MMA?
+///
+/// The dense W4A4 kernel is compiled for the whole `SUROGATE_SERVE_CUDA_ARCHS`
+/// set, not pinned to 120a like `sinfer_nvfp4_tma`, so an sm_89 cubin exists
+/// and its body is `__trap()` (ops/linear/nvfp4/nvfp4_w4a4_mma.cuh). Reaching
+/// it aborts the device and poisons the context for the whole server, so the
+/// planner refuses on the host first. The kernel's own comment states the
+/// assumption this upholds: "W4A4 routes are never admitted below sm_120".
+[[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile profile) noexcept {
+    switch (profile) {
+    // Groupwise int and block-scaled FP8 have sm_89 kernels of their own.
+    case WeightsProfile::GroupwiseInt:
+    case WeightsProfile::Fp8Block:
+        return false;
+    case WeightsProfile::Nvfp4MixedBf16:
+    case WeightsProfile::Nvfp4Uniform:
+    case WeightsProfile::Nvfp4MlpOnly:
+    case WeightsProfile::Nvfp4All:
+        return true;
+    }
+    return false;
+}
+
 using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
 using OutputSession  = family::OutputSession;
