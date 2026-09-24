@@ -1,7 +1,9 @@
 # Native TTS package provenance
 
 Asset preparation pins `surogate/surogate-ro-tts` at revision
-`2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4` and verifies its native package.
+`2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4` and verifies its native package, and
+for a GPU pins its GPU variant (`gpu/`) at revision
+`e6b1372cb1b3db6c205ebfc589fba8d630ed438b`.
 The package supplies the GGML model runtime and includes its runtime and GGML
 licenses, build provenance and patch sources. Surogate supplies the configurable
 worker, adapter and optional optimized CPU backend.

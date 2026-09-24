@@ -1,4 +1,4 @@
-"""Resolve and verify the published native CPU package or a local voice export."""
+"""Resolve and verify the published native packages (CPU, and its GPU variant) or a local voice export."""
 
 import hashlib
 import json
@@ -13,6 +13,11 @@ MODEL_ID = "surogate/surogate-ro-tts"
 REVISION = "2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4"
 PREFIX = "releases/2026-09-18/cpu-voices/native"
 PROFILE_SHA256 = "6c52964585162b516ab3ac6573ee5def535c80067300eb0ad06d0bb310642c9c"
+# The GPU variant: the same model, codec, tokenizer and voices, with lib/ holding the runtime built with
+# CUDA (surogate.serve.tools.tts.gpu_variant), published as built.
+GPU_REVISION = "e6b1372cb1b3db6c205ebfc589fba8d630ed438b"
+GPU_PREFIX = "gpu"
+GPU_PROFILE_SHA256 = "239ef640ec0fcb98297908ea2ff61be0de82c27cebbecf8c4718958afcced009"
 
 
 def sha256(path):
@@ -123,37 +128,60 @@ def _for_device(bundle, device):
 
 
 def prepare_bundle(model, *, reuse_cache=True, echo=print, device="cpu"):
+    # The server's own rule, checked before anything is downloaded for a GPU.
+    if device != "cpu" and not re.fullmatch(r"\d{1,3}", device):
+        raise ValueError("--device must be cpu or a CUDA device index")
+    gpu = device != "cpu"
     path = Path(model).expanduser()
     if path.is_file() and path.name == "voices.json":
         return _for_device(validate_bundle(path.parent), device)
     if path.is_dir():
         if not (path / "voices.json").is_file():
-            path = path / PREFIX
+            # A copy of the model repository: the GPU variant for a GPU, the CPU package otherwise.
+            package = path / (GPU_PREFIX if gpu else PREFIX)
+            if not (package / "voices.json").is_file():
+                raise ValueError(f"No voices.json in {path} or {package}")
+            path = package
         return _for_device(validate_bundle(path), device)
-    if model == MODEL_ID and device != "cpu":
-        raise ValueError(
-            f"The published {MODEL_ID} package has only the CPU runtime so far. To serve on a GPU, "
-            "pass a local GPU variant of the package; see docs/inference/tts.md"
-        )
     if model != MODEL_ID:
-        raise ValueError(f"Use {MODEL_ID} or a local native CPU package containing voices.json")
+        raise ValueError(f"Use {MODEL_ID} or a local native TTS package containing voices.json")
     from filelock import FileLock
 
+    # A GPU gets the pinned GPU variant, the CPU the pinned CPU package, each in its own cache.
+    if gpu:
+        revision, prefix, profile, kind = GPU_REVISION, GPU_PREFIX, GPU_PROFILE_SHA256, "GPU"
+    else:
+        revision, prefix, profile, kind = REVISION, PREFIX, PROFILE_SHA256, "CPU"
     cache = Path(os.environ.get("SUROGATE_SERVE_CACHE", Path.home() / ".cache/surogate/serve"))
     cache.mkdir(parents=True, exist_ok=True)
-    snapshot = cache / f"tts-{REVISION}"
-    root = snapshot / PREFIX
+    snapshot = cache / f"tts-{revision}"
+    root = snapshot / prefix
+
+    def download(force):
+        from huggingface_hub import snapshot_download
+
+        echo(f"surogate serve: downloading the native {kind} TTS package from {MODEL_ID}")
+        snapshot_download(
+            MODEL_ID,
+            revision=revision,
+            allow_patterns=[f"{prefix}/*"],
+            local_dir=snapshot,
+            force_download=force,
+        )
+
     with FileLock(str(snapshot) + ".lock"):
         if not reuse_cache or not (root / "voices.json").is_file():
-            from huggingface_hub import snapshot_download
-
-            echo(f"surogate serve: downloading the native CPU TTS package from {MODEL_ID}")
-            snapshot_download(
-                MODEL_ID,
-                revision=REVISION,
-                allow_patterns=[f"{PREFIX}/*"],
-                local_dir=snapshot,
-                force_download=not reuse_cache,
-            )
-        echo("surogate serve: verifying native CPU TTS assets")
-        return validate_bundle(root, expected_profile_sha256=PROFILE_SHA256)
+            download(force=not reuse_cache)
+        echo(f"surogate serve: verifying native {kind} TTS assets")
+        try:
+            bundle = validate_bundle(root, expected_profile_sha256=profile)
+        except ValueError as first:
+            # An interrupted download leaves the profile and some of the files: fetch what is
+            # missing, once.
+            try:
+                download(force=False)
+                echo(f"surogate serve: verifying native {kind} TTS assets")
+                bundle = validate_bundle(root, expected_profile_sha256=profile)
+            except Exception as error:
+                raise ValueError(f"{first}. Run again with --no-cache to download the package afresh") from error
+        return _for_device(bundle, device)

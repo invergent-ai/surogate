@@ -76,10 +76,20 @@ A GPU needs the package's **GPU variant**:
 - Its `lib/` holds the same Magpie runtime built with CUDA, including `libggml-cuda`, and runs on
   compute capability 12.0 (RTX 50-series) only.
 - The CPU package is refused on a GPU with a clear error.
-- The published package has no GPU variant yet, so serve a local one:
+
+The published model has its GPU variant in the repository's `gpu/` folder. With `--device N`,
+`surogate/surogate-ro-tts` downloads and verifies that variant, pinned like the CPU package:
 
 ```bash
-surogate serve --tts /path/to/gpu-variant --device 0 --port 8080
+surogate serve --tts surogate/surogate-ro-tts --device 0 --port 8080
+```
+
+A downloaded copy, or a local variant, is served the same way:
+
+```bash
+hf download surogate/surogate-ro-tts --revision e6b1372cb1b3db6c205ebfc589fba8d630ed438b \
+  --include "gpu/*" --local-dir surogate-ro-tts
+surogate serve --tts surogate-ro-tts/gpu --device 0 --port 8080
 ```
 
 On an RTX 5090 one request runs at about 25 times real time, with about 25 ms to the first
@@ -119,9 +129,11 @@ qualified (quality and speed), then pinned in `native_worker.cpp` and in the too
 ## Model download
 
 The first start downloads only the native CPU package, approximately 1.15 GiB,
-from HF revision `2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4`. It verifies the
-voice profile and every file listed in it, then completes a short warm-up before
-accepting requests. Subsequent starts verify and reuse the cached package.
+from HF revision `2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4`, or with `--device N`
+only its GPU variant, approximately 1.35 GiB, from revision
+`e6b1372cb1b3db6c205ebfc589fba8d630ed438b`. It verifies the voice profile and
+every file listed in it, then completes a short warm-up before accepting
+requests. Subsequent starts verify and reuse the cached package.
 
 Authenticate for the private repository with `hf auth login` or `HF_TOKEN`.
 The package is cached under `~/.cache/surogate/serve`; `SUROGATE_SERVE_CACHE`
