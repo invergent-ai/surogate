@@ -358,6 +358,10 @@ Weight weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t rows) {
     return weight_row_view(w, row_begin, rows);
 }
 
+bool linear_rows_match_linear(const Weight& w) noexcept {
+    return detail::ggml::is_ggml_qtype(w.qtype) && w.segment_count == 0;
+}
+
 void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t rows = out.ne[0];

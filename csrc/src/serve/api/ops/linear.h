@@ -171,4 +171,10 @@ inline void linear_projections(const Tensor& x, std::initializer_list<LinearProj
 void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                  WorkspaceArena* workspace, cudaStream_t stream);
 
+/// Whether linear_rows writes, for its rows, exactly the values linear writes for them: true for
+/// unsegmented GGML block weights, where both quantize the activation the same way and every
+/// kernel either may choose computes a row with the same arithmetic, whatever the row count.
+/// Other formats' row ranges keep linear_rows' A16 policy, which linear need not use.
+[[nodiscard]] bool linear_rows_match_linear(const Weight& w) noexcept;
+
 } // namespace sinfer::ops

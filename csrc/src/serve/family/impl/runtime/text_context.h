@@ -622,6 +622,15 @@ public:
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
     /// Project a stored round boundary through the model's output transform and head.
     void logits_from_hidden(const Tensor& hidden, Tensor& logits);
+    /// logits_from_hidden's values at the rows `ids` alone, for one column, bit for bit, without
+    /// projecting the rest of the vocabulary: `logits` is `[ids.size(), 1]`. Returns false, and
+    /// writes nothing, when the head's rows cannot be projected on their own exactly
+    /// (ops::linear_rows_match_linear) or an adapter could apply to it.
+    [[nodiscard]] bool candidate_logits_from_hidden(const Tensor& hidden,
+                                                    std::span<const std::int32_t> ids,
+                                                    Tensor& logits);
+    /// Whether candidate_logits_from_hidden would project the rows (rather than return false).
+    [[nodiscard]] bool candidate_rows_exact() const;
 private:
     void bind();
 
