@@ -153,3 +153,14 @@ def test_an_unset_concurrency_is_not_read_as_no_capacity():
     infer = _infer()
     size_pending_capacity(infer, _orch(batch_size=128))
     assert infer.max_pending_requests == 128 - 1
+
+
+def test_colocate_sizes_against_the_concurrency_it_will_actually_run():
+    """Colocate derives its own concurrency when the config leaves it unset, and
+    the C++ used to hardcode the bound at `max(16, that)`. Sizing has to see the
+    same number the server runs, not the None the config still held."""
+    infer = _infer()
+    orch = _orch(batch_size=128)
+    infer.max_num_seqs = 16  # what native_colocate.py computes and writes back
+    size_pending_capacity(infer, orch)
+    assert infer.max_pending_requests == 128 - 16

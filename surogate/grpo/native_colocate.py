@@ -11,6 +11,7 @@ from pathlib import Path
 from surogate.core.config.grpo_inference_config import SERVING_OFFLOAD_FIELDS
 from surogate.grpo.shared_model import SharedModelServer, shared_execution
 from surogate.grpo.shared_weights import adapter_modules, borrow_weights, write_shared_artifact
+from surogate.grpo.utils.capacity import size_pending_capacity
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -176,6 +177,9 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
     Path(orch_config.output_dir).mkdir(parents=True, exist_ok=True)
     context = infer_config.max_model_len or train_config.sequence_len
     concurrency = infer_config.max_num_seqs or min(16, orch_config.batch_size or 16)
+    # Written back so the config says what the server will actually run: the
+    # pending bound is sized against it, and a divergence here silently mis-sizes it.
+    infer_config.max_num_seqs = concurrency
     settings = dict(host=infer_config.host or "127.0.0.1", port=infer_config.port or 8000,
                     device=0, model=orch_config.model.name, max_context=context,
                     prefill_chunk=min(getattr(infer_config, "decode_prefill_chunk", 256), context), max_concurrency=concurrency,
@@ -187,6 +191,11 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
                     rank=train_config.lora_rank)
     # Enforce the local server address; both components live in this process.
     orch_config.client.base_url = [f"http://127.0.0.1:{settings['port']}/v1"]
+    # Sized after the address is forced: whether a RULER judge shares this server
+    # is decided by comparing its base URL against the one just assigned.
+    size_pending_capacity(infer_config, orch_config)
+    settings["max_pending_requests"] = infer_config.max_pending_requests
+    settings["pending_timeout_ms"] = infer_config.pending_timeout_ms
     trainer, server = None, None
     config = json.loads((Path(train_config.model_dir) / "config.json").read_text())
     text_config = config.get("text_config", config)

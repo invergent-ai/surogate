@@ -51,8 +51,16 @@ public:
         options.max_context = nb::cast<std::uint32_t>(settings["max_context"]);
         options.prefill_chunk = nb::cast<std::uint32_t>(settings["prefill_chunk"]);
         options.max_concurrency = nb::cast<std::uint32_t>(settings["max_concurrency"]);
-        options.max_pending_requests = std::max(16U, options.max_concurrency);
-        options.pending_timeout_ms = 300000;
+        // Optional, because a caller that does not know the run cannot size these:
+        // the fallbacks are what this used to hardcode. A GRPO run does know, and
+        // `grpo/utils/capacity.py` sizes them from the rollouts in flight, the same
+        // way split mode passes `--max-pending-requests` to a spawned server.
+        const auto setting = [&settings](const char* key, std::uint32_t fallback) {
+            return settings.contains(key) ? nb::cast<std::uint32_t>(settings[key]) : fallback;
+        };
+        options.max_pending_requests =
+            setting("max_pending_requests", std::max(16U, options.max_concurrency));
+        options.pending_timeout_ms = setting("pending_timeout_ms", 300000);
         options.kv_capacity = sinfer::KvCapacityPolicy::explicit_capacity(
             nb::cast<std::uint32_t>(settings["kv_capacity"]));
         options.use_cuda_graph = nb::cast<bool>(settings["use_cuda_graph"]);
