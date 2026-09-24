@@ -3416,3 +3416,22 @@ refusals). A packed round of about 2,048 prompt tokens runs at about 10,300 toke
 golden set under 8-client load, and chat first-token logprobs), and the golden set reproduces its
 recording at tolerance 0. A recurrent model's prompt that shares a round is split into chunks by
 what is left of the window, as in #80's rounds with decode rows, so its last bits may differ.
+
+## 96
+
+**Wider token tiles for wide K-quant prefill GEMMs (2026-09-24, latency after #14).**
+
+Q4_K/Q5_K/Q6_K projections of a wide prefill step (#14's packed rounds reach 2,048 tokens) ran in
+32-token tiles, so every block unpacked and rescaled its 64-row weight tile once per 32 columns.
+Steps of 128 or more tokens now take 64-column tiles, and 256 or more 128-column tiles, while the
+grid still fills the device (`kquant_tile_multiprocessors`: a 128-column block runs alone on its
+SM, a 64-column one about two to an SM). Q6_K stays at 64 columns: its 128-column tile needs 56 KB
+of static shared memory, over the 48 KiB sm_89 allows, and `dense_i8_kernel` now asserts the
+limit. Every column is still one warp's with the same K loop, so a token's result does not depend
+on the tile it lands in; the K-quant test checks every width bit for bit against the decode kernel
+(it plans tiles for one multiprocessor, so its small fixtures take them all).
+
+Measured on an RTX 5090, Rune, 15 s per level: short decisions at 8 clients 43.4 -> 46.2 req/s on
+Q4_K_M (p50 184 -> 173 ms) and 31.7 -> 34.1 on Q6_K (252 -> 235 ms); 1,000-token decisions at 8
+clients 9.8 -> 10.8 req/s (Q4_K_M) and 7.4 -> 8.4 (Q6_K). Answers are bit-identical: the decisions
+v1 golden set at tolerance 0, and the same answers as before alone and under 8-client load.
