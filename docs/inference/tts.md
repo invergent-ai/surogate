@@ -22,8 +22,9 @@ matching the build. `SUROGATE_TTS_BIN` can select a separately built executable.
 
 Python resolves and verifies assets, then replaces itself with `surogate-tts`.
 HTTP, Romanian normalization and tokenization run in C++. The HTTP setup is
-shared with native STT through `csrc/src/serve/serve/audio_http.h`. One native
-GGML worker keeps the generator and codec loaded between requests. No Python,
+shared with native STT through `csrc/src/serve/serve/audio_http.h`. A native
+GGML worker (one by default, see `--max-num-seqs`) keeps the generator and codec
+loaded between requests. No Python,
 Torch, NeMo or training-recipe process remains in the TTS inference path.
 
 The published binary targets Linux x86-64 and was validated on AMD EPYC 9124.
@@ -158,7 +159,7 @@ curl http://localhost:8080/v1/models
 curl http://localhost:8080/health
 ```
 
-`/health` becomes ready after the model is loaded. `/v1/models` reports the
+`/health` becomes ready after every worker has loaded the model. `/v1/models` reports the
 original startup model argument. Use `--served-model-name my-tts` to set an alias;
 requests that provide `model` must use that alias.
 
@@ -271,16 +272,42 @@ restart. It does not require a separate model process for every name.
 
 ## Queue, authentication and shutdown
 
-One request runs at a time against the shared model. Eight additional requests
-can wait by default. Set `--max-pending-requests N` to change the queue size, or
-`0` to reject requests while the worker is busy or a stream is still being delivered. A full queue
-returns HTTP 429.
+`--max-num-seqs N` (default 1, at most 16) synthesizes N requests at once. Each runs on its own
+worker process with its own copy of the model: about 2.4 GB of GPU memory per worker on a GPU, and
+on the CPU about 1.5 GB of memory and `--threads` + `--codec-threads` threads per worker. All
+workers load before the server answers, and startup names the worker that failed to load. A
+worker that fails is replaced at once without disturbing the others. Requests go to a worker whose
+model is loaded first. A worker that dies while idle is restarted in the background. One that dies
+before its model loads (for example when another process took the GPU memory) is retried every 10
+seconds, and meanwhile takes no request while another worker can serve; when none can, requests get
+HTTP 503 at once. `/health` stays 200 while any worker can serve, with `"status": "degraded"` and
+`"workers": {"ready": R, "total": N}`, and turns 503 when none can: a worker counts once its model
+has loaded, or while it loads in place of one that had.
+
+On one RTX 5090 with `--max-num-seqs 4`, streaming Doina, each request's processing time per
+second of audio was (median, and the maximum in brackets; below 1 is faster than real time):
+
+| Concurrent requests | Alone | Next to Rune serving 8 chats at once |
+|---|---|---|
+| 1 | 0.04 (0.04) | 0.18 (0.44) |
+| 2 | 0.09 (0.13) | 0.66 (0.90) |
+| 3 | 0.19 (0.28) | 0.90 (1.09) |
+| 4 | 0.26 (0.55) | 0.88 (1.43) |
+
+Rune was the Q4_K_M build with `--gpu-memory-limit-mib 20000 --max-num-seqs 8`, beside four TTS
+workers (about 2.46 GB each) on the same card. First audio took 30 ms alone and 110 to 180 ms (median) next to Rune.
+Next to a busy LLM server, 2 requests at a time each stay faster than real time; a third one does
+not always. The workers share the GPU by time slicing and do not batch.
+
+Eight additional requests can wait by default, and they are served in arrival order. Set
+`--max-pending-requests N` to change the queue size, or `0` to reject requests while every worker
+is busy or a stream is still being delivered. A full queue returns HTTP 429.
 `--request-timeout SECONDS` bounds queueing plus synthesis time (default 300);
 expiration returns HTTP 504. When a client leaves, its request stops at the worker's next
 audio chunk and the worker serves the next request without reloading the model. A worker that
 produces no audio for 30 seconds after that is stopped instead. A worker that failed or timed out
-is stopped, and the next request reloads it. At shutdown the worker is stopped at once, even in
-the middle of a request.
+is replaced at once, unless it died before its model loaded (then it is retried every 10 seconds).
+At shutdown the workers are stopped at once, even in the middle of a request.
 
 The server binds to `127.0.0.1` by default. Use `--host` to choose the interface.
 `--api-key-file PATH` enables bearer authentication on every endpoint, with the key read from a
@@ -292,7 +319,7 @@ surogate serve --tts surogate/surogate-ro-tts --api-key-file /etc/surogate/tts.k
 curl -H "Authorization: Bearer $(cat /etc/surogate/tts.key)" http://localhost:8080/v1/audio/voices
 ```
 
-Normal shutdown stops the native worker and removes temporary audio. Finished
+Normal shutdown stops the native workers and removes temporary audio. Finished
 request audio and per-request native statistics are not retained on disk.
 
 `GET /metrics` reports the server in Prometheus text format, like the LLM server:

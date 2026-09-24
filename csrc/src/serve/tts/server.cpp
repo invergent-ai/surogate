@@ -42,6 +42,8 @@ const char* usage =
     "  --threads N                 CPU compute threads (default 4)\n"
     "  --codec-threads N           audio codec threads (0/default: --threads)\n"
     "  --voice NAME                default voice from voices.json\n"
+    "  --max-num-seqs N            requests synthesized at once, each by a worker with its own\n"
+    "                              copy of the model (default 1, maximum 16)\n"
     "  --max-pending-requests N    requests queued or still being delivered (default 8, maximum 128)\n"
     "  --request-timeout SECONDS   queue plus synthesis deadline (default 300)\n"
     "  --max-input-characters N    longest input, synthesized sentence by sentence (default 4096,\n"
@@ -231,11 +233,14 @@ void stream_speech(const httplib::Request& q, httplib::Response& r, Runtime& run
         });
 }
 
-int integer(const std::string& value) {
-    size_t used = 0;
-    int n       = std::stoi(value, &used);
-    if (used != value.size()) throw std::invalid_argument("Invalid integer option");
-    return n;
+int integer(const std::string& flag, const std::string& value) {
+    try {
+        size_t used = 0;
+        const int n = std::stoi(value, &used);
+        if (used == value.size()) return n;
+    } catch (const std::exception&) {
+    }
+    throw std::invalid_argument(flag + " must be an integer");
 }
 
 void validate_policy(const json& policy) {
@@ -255,7 +260,7 @@ int main(int argc, char** argv) {
         std::string artifact, host = "127.0.0.1", name, default_voice, kernels = "auto", device = "cpu";
         std::optional<std::string> key_flag, key_file; // --api-key, --api-key-file (last one wins)
         bool default_set = false;
-        int port = 8080, max_pending = 8, threads = 4, codec_threads = 0;
+        int port = 8080, max_pending = 8, threads = 4, codec_threads = 0, max_num_seqs = 1;
         int max_characters = static_cast<int>(default_max_characters);
         double timeout = 300;
         for (int i = 1; i < argc; ++i) {
@@ -273,11 +278,11 @@ int main(int argc, char** argv) {
             else if (arg == "--cpu-kernels")
                 kernels = value();
             else if (arg == "--threads")
-                threads = integer(value());
+                threads = integer(arg, value());
             else if (arg == "--codec-threads")
-                codec_threads = integer(value());
+                codec_threads = integer(arg, value());
             else if (arg == "--port")
-                port = integer(value());
+                port = integer(arg, value());
             else if (arg == "--device") {
                 device = value();
                 if (device != "cpu" && (device.empty() ||
@@ -295,9 +300,11 @@ int main(int argc, char** argv) {
                 default_voice = value();
                 default_set   = true;
             } else if (arg == "--max-pending-requests")
-                max_pending = integer(value());
+                max_pending = integer(arg, value());
+            else if (arg == "--max-num-seqs")
+                max_num_seqs = integer(arg, value());
             else if (arg == "--max-input-characters")
-                max_characters = integer(value());
+                max_characters = integer(arg, value());
             else if (arg == "--request-timeout") {
                 auto s      = value();
                 size_t used = 0;
@@ -313,6 +320,8 @@ int main(int argc, char** argv) {
             else
                 throw std::invalid_argument("Unknown option: " + arg);
         }
+        if (max_num_seqs < 1 || max_num_seqs > 16)
+            throw std::invalid_argument("--max-num-seqs must be between 1 and 16");
         if (artifact.empty() || host.empty() || port < 1 || port > 65535 || max_pending < 0 ||
             max_pending > 128 || !std::isfinite(timeout) || timeout <= 0 || timeout > 3600)
             throw std::invalid_argument(usage);
@@ -360,7 +369,7 @@ int main(int argc, char** argv) {
         if (!default_set) default_voice = voices.front().name;
         default_voice = voice(default_voice).name;
         if (name.empty()) name = artifact;
-        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device);
+        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device, max_num_seqs);
         const std::string device_name = device == "cpu" ? "cpu" : "cuda:" + device;
         // /metrics: requests in flight (queued ones included) and what was served -- what a
         // supervisor drains this server by.
@@ -373,14 +382,18 @@ int main(int argc, char** argv) {
         // A thread for every request that may run, wait or be delivered (whole recordings and
         // streams keep their queue place until delivered), and spare ones for GETs and idle
         // keep-alive connections, which hold a thread until they time out (1 s here).
-        const size_t http_threads = size_t(max_pending) + 1 + 16;
+        const size_t http_threads = size_t(max_pending) + size_t(max_num_seqs) + 16;
         server.new_task_queue     = [http_threads] {
             return new httplib::ThreadPool(http_threads, http_threads);
         };
         server.set_keep_alive_timeout(1);
         server.Get("/health", [&](const auto&, auto& r) {
-            bool ready = runtime.healthy();
-            response(r, {{"status", ready ? "ok" : "unavailable"}, {"device", device_name}},
+            // Ready while any worker can serve; "workers" says how many of them can.
+            const int ready = runtime.ready_workers();
+            response(r,
+                     {{"status", ready == runtime.workers() ? "ok" : ready ? "degraded" : "unavailable"},
+                      {"device", device_name},
+                      {"workers", {{"ready", ready}, {"total", runtime.workers()}}}},
                      ready ? 200 : 503);
         });
         server.Get("/v1/models", [&](const auto&, auto& r) {
@@ -498,11 +511,16 @@ int main(int argc, char** argv) {
                     server.stop();
                     return;
                 }
+                runtime.revive(); // a worker that died while idle, once every worker has loaded
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
         });
-        runtime.synthesize(tokenize("Bună."), voice(default_voice), 9,
-                           [] { return interrupted != 0; });
+        // Every worker loads its model and synthesizes once before the server answers.
+        const auto warmup_chunks = tokenize("Bună.");
+        runtime.start([&](Runtime::Lease& lease) {
+            runtime.stream(lease, warmup_chunks, voice(default_voice), 9,
+                           [] { return interrupted != 0; }, [](std::string_view) { return true; });
+        });
         if (interrupted) return 0;
         std::cerr << "TTS ready on " << device_name << " at http://" << host << ':' << port << '\n';
         if (!server.listen_after_bind() && !interrupted)
