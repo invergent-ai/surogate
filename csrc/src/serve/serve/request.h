@@ -182,6 +182,9 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 }
 
 struct GenerationRequest {
+    /// The caller's request id (X-Request-Id), already validated; empty when none was sent.
+    /// Written to the request log only; it never changes what is generated.
+    std::string client_request_id;
     std::string json_schema;
     bool parallel_decoding = false;
     std::string model;

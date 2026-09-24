@@ -419,6 +419,50 @@ int main() {
                           "a chat request record grew a decisions block");
     }
 
+    // X-Request-Id: the caller's id reaches every record type, and only a safe value is kept.
+    {
+        failures += check(kClientRequestIdHeader == "X-Request-Id", "request id header name");
+        failures += check(client_request_id("gw-7f3a9c2e-1b4d-4e8f-a0c1-5d6e7f8a9b0c") ==
+                              "gw-7f3a9c2e-1b4d-4e8f-a0c1-5d6e7f8a9b0c",
+                          "a UUID-style id is kept as sent");
+        failures += check(client_request_id(std::string(128, 'a')) == std::string(128, 'a'),
+                          "128 characters are kept");
+        for (const std::string bad : {std::string(), std::string(129, 'a'), std::string("two words"),
+                                      std::string("line\nbreak"), std::string("tab\there"),
+                                      std::string("caf\xC3\xA9"), std::string("nul\0x", 5),
+                                      std::string("\x7F")}) {
+            failures += check(client_request_id(bad).empty(), "an unsafe request id is ignored");
+        }
+
+        GenerationRequest tagged = request;
+        tagged.client_request_id = "gw-123";
+        const RequestLogContext with_id = make_request_log_context(11, "openai_chat_completions", tagged, prepared);
+        const Json start = Json::parse(format_request_start_json("serve-test", 4000, with_id));
+        failures += check(start.at("request").at("client_request_id") == "gw-123", "request_start carries the id");
+        GenerationOutcome cancelled;
+        cancelled.prompt_tokens     = 40;
+        cancelled.completion_tokens = 7;
+        cancelled.finish_reason     = sinfer::FinishReason::Cancelled;
+        const Json done = Json::parse(format_request_done_json("serve-test", 4100, with_id, cancelled));
+        failures += check(done.at("request").at("client_request_id") == "gw-123" &&
+                              done.at("result").at("completion_tokens") == 7 &&
+                              done.at("result").at("finish_reason") == "cancelled",
+                          "request_done carries the id and the tokens a cancelled stream generated");
+        const Json error = Json::parse(format_request_error_json("serve-test", 4200, with_id, "boom"));
+        failures += check(error.at("request").at("client_request_id") == "gw-123", "request_error carries the id");
+        ApiError refusal;
+        refusal.status  = 400;
+        refusal.message = "bad";
+        const Json rejected = Json::parse(format_request_rejected_json(
+            "serve-test", 4300, make_request_rejection_log_context(12, "openai_chat_completions", tagged, refusal)));
+        failures += check(rejected.at("request").at("client_request_id") == "gw-123", "request_rejected carries the id");
+        // Without the header the field is present and null, so a consumer never guesses.
+        const Json anonymous = Json::parse(format_request_start_json("serve-test", 4400, context));
+        failures += check(anonymous.at("request").contains("client_request_id") &&
+                              anonymous.at("request").at("client_request_id").is_null(),
+                          "no header, null id");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

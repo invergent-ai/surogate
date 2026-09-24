@@ -183,8 +183,11 @@ void add_decisions(Json& record, const std::string& protocol, std::size_t questi
     if (temperature) { record["decisions"]["temperature"] = *temperature; }
 }
 
+Json client_request_id_json(const std::string& id) { return id.empty() ? Json(nullptr) : Json(id); }
+
 Json request_json(const RequestLogContext& context) {
     Json record = Json{{"request_id", context.id},
+                {"client_request_id", client_request_id_json(context.client_request_id)},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -225,6 +228,7 @@ Json preparation_json(const RequestLogContext& context) {
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
     Json record = Json{{"request_id", context.id},
+                {"client_request_id", client_request_id_json(context.client_request_id)},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -339,6 +343,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.sampling                           = prepared.sampling;
     context.acquisition_seconds                = prepared.acquisition_seconds;
     context.preparation                        = prepared.preparation;
+    context.client_request_id                  = request.client_request_id;
     return context;
 }
 
@@ -358,8 +363,17 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.tool_count                         = request.tools.size();
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
+    context.client_request_id                  = request.client_request_id;
     context.error                              = std::move(error);
     return context;
+}
+
+std::string client_request_id(std::string_view header) {
+    if (header.empty() || header.size() > 128) { return {}; }
+    for (const char c : header) {
+        if (c < 0x21 || c > 0x7E) { return {}; }
+    }
+    return std::string(header);
 }
 
 std::string format_request_start(const RequestLogContext& context) {

@@ -425,6 +425,39 @@ Cache memory grows with demand by default, so `mapped_bytes` can be smaller than
 It may remain above `in_use_bytes` because the server keeps some memory ready for reuse.
 Use `/metrics` for Prometheus monitoring of requests, throughput, memory, and sleep state.
 
+### Request ids and the request log
+
+A caller, such as a gateway, can name each request with an `X-Request-Id` header. The server
+echoes the header on the response, refusals included. It also writes the id as
+`client_request_id` into every `request_start`, `request_done`, `request_rejected` and
+`request_error` record of `--request-log-jsonl`. The protocols covered are Chat Completions,
+Completions, Anthropic Messages, Responses and decisions. Records of requests sent without the
+header have `client_request_id: null`.
+
+Only ids of 1 to 128 visible ASCII characters are used. Any other value is ignored, neither
+echoed nor logged, so a header cannot inject text into the log. The server warns about this once
+on the console, without the value. Header values are percent-decoded, so an id must not contain
+`%`; UUIDs and similar ids are unaffected. A request that carries more than one `X-Request-Id`
+header gets no id at all. A gateway should therefore replace the client's header with its own,
+not add a second one. With `--cors`, browsers may send the header and read the echoed one.
+
+Every request ends in exactly one terminal record: `request_done`, `request_error` or
+`request_rejected`. A request refused before generation ends in `request_rejected`. This includes
+a request whose client left while it was being prepared. A request refused during preparation
+has no `request_start`.
+
+A streamed request whose client leaves after that still ends in `request_done`. This includes a
+client that leaves before the first event, and a parallel-decoding stream. The record carries
+the prompt tokens, the cached tokens (`prefix_cache_hit_tokens`) and the completion tokens
+generated before generation stopped. A caller that never received the final usage chunk can
+settle the request from that record. Two details:
+
+- `finish_reason` is usually `"cancelled"`. It can also be the normal reason, for example
+  `"stop"`, when generation finished before the server noticed the client had left.
+- `prompt_tokens` and `computed_prefill_tokens` count the whole prompt, even when the client
+  left before its prefill finished. A dropped parallel-decoding stream reports
+  `completion_tokens: 0`.
+
 ## LoRA adapters at runtime
 
 Start with `--enable-lora` to add and remove adapters without restarting:
