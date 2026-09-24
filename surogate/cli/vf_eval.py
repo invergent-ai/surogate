@@ -204,7 +204,7 @@ def prepare_command_parser(parser=None):
         "-u",
         default=False,
         action="store_true",
-        help="Use TUI mode for live evaluation display",
+        help="Full-screen display (alternate screen buffer) for live evaluation",
     )
     parser.add_argument(
         "--debug",
@@ -473,7 +473,6 @@ if __name__ == "__main__":
             max_concurrent=raw.get("max_concurrent", DEFAULT_MAX_CONCURRENT),
             max_retries=raw.get("max_retries", 0),
             verbose=raw.get("verbose", False),
-            debug=raw.get("debug", False),
             state_columns=raw.get("state_columns", []),
             save_results=raw.get("save_results", False),
             resume_path=resume_path,
