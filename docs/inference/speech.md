@@ -173,5 +173,22 @@ minutes without a request. `--max-num-seqs` sets the number of live streams
 (default 8); each keeps its own audio and transcript state. Inference requests
 share one model and run one at a time.
 
+## Metrics
+
+`GET /metrics` reports the server in Prometheus text format, like the LLM server:
+
+- `surogate_up`;
+- `surogate_requests{state="running"}`: every request except a GET, counted from arrival until its
+  response has been written or its client has gone. This includes requests that are uploading,
+  waiting for the model, or sending stream audio.
+- `surogate_streams_open`: live streams, counted from creation until they are finished, deleted or
+  expired;
+- `surogate_requests_total{endpoint,outcome}`: finished transcriptions and stream creations;
+- `surogate_audio_seconds_total`: seconds of audio transcribed.
+
+Wait for both gauges to reach 0 to drain a server before restarting it. A `/metrics` request can
+wait for a request that holds a worker thread; treat a timeout as busy, not idle. With an API key
+set, `/metrics` needs the key like every other endpoint.
+
 Speech serving uses its own server mode. It does not add audio inputs to chat
 completion requests or provide an OpenAI Realtime WebSocket endpoint.

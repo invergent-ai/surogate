@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "transcription.h"
 #include "../serve/api_key_file.h"
+#include "../serve/audio_metrics.h"
 #include "../serve/audio_http.h"
 #include <ATen/Parallel.h>
 #include <chrono>
@@ -98,8 +99,13 @@ int main(int argc, char** argv) {
 
         std::map<std::string, Session> sessions;
         std::random_device random;
+        // /metrics: requests in flight, realtime streams open, and what was served -- what a
+        // supervisor drains this server by.
+        sinfer::serve::audio::Metrics metrics(name, {.streams = true});
+        metrics.declare_endpoint("transcriptions");
+        metrics.declare_endpoint("streams");
         httplib::Server server;
-        sinfer::serve::audio::configure(server, key, 64 * 1024 * 1024);
+        sinfer::serve::audio::configure(server, key, 64 * 1024 * 1024, &metrics);
         server.Get("/health", [](const auto&, auto& r) { response(r, {{"status", "ok"}}); });
         server.Get("/v1/models", [&](const auto&, auto& r) {
             response(
@@ -109,55 +115,62 @@ int main(int argc, char** argv) {
                   json::array({{{"id", name}, {"object", "model"}, {"owned_by", "surogate"}}})}});
         });
         server.Post("/v1/audio/transcriptions", [&](const auto& q, auto& r) {
-            if (!q.has_file("file"))
-                throw std::invalid_argument("multipart audio file is required");
-            std::string format = "json";
-            for (auto& [field, value] : q.files) {
-                if (field == "model" && value.content != name)
-                    throw std::invalid_argument("unknown model");
-                if (field == "language" && value.content != "ro")
-                    throw std::invalid_argument("this model supports Romanian (ro)");
-                if (field == "response_format") format = value.content;
-                if (field != "file" && field != "model" && field != "language" &&
-                    field != "response_format")
-                    throw std::invalid_argument("unsupported transcription field: " + field);
-            }
-            if (format != "json" && format != "text" && format != "verbose_json")
-                throw std::invalid_argument("response_format must be json, text or verbose_json");
-            auto pcm = decode_audio(q.get_file_value("file").content);
-            std::lock_guard lock(mutex);
-            // OpenMP/MKL thread settings belong to the HTTP worker thread.
-            at::set_num_threads(threads);
-            c10::InferenceMode guard;
-            std::vector<json> events;
-            if (model.streaming()) {
-                Stream stream(model, artifact);
-                events = stream.accept(pcm, true);
-            } else {
-                // Full-context features and attention see the complete file.
-                // In particular, do not run VAD or normalize separate chunks.
-                auto samples    = at::from_blob(pcm.data(), {int64_t(pcm.size())}, at::kFloat);
-                auto transcript = pcm.size() < 320
-                                      ? std::string()
-                                      : model.beam(model.ctc(model.encode(model.mel(samples))));
-                events.push_back({{"type", "final"}, {"text", transcript}});
-            }
-            std::string text;
-            for (auto& event : events)
-                if (event["type"] == "final") {
-                    auto segment = event["text"].template get<std::string>();
-                    auto first   = segment.find_first_not_of(" \t\n\r");
-                    if (first == std::string::npos) continue;
-                    segment =
-                        segment.substr(first, segment.find_last_not_of(" \t\n\r") - first + 1);
-                    if (!text.empty()) text += ' ';
-                    text += segment;
+            try {
+                if (!q.has_file("file"))
+                    throw std::invalid_argument("multipart audio file is required");
+                std::string format = "json";
+                for (auto& [field, value] : q.files) {
+                    if (field == "model" && value.content != name)
+                        throw std::invalid_argument("unknown model");
+                    if (field == "language" && value.content != "ro")
+                        throw std::invalid_argument("this model supports Romanian (ro)");
+                    if (field == "response_format") format = value.content;
+                    if (field != "file" && field != "model" && field != "language" &&
+                        field != "response_format")
+                        throw std::invalid_argument("unsupported transcription field: " + field);
                 }
-            // Every format reports the billed seconds (usage in JSON, and a header on all).
-            auto reply = sinfer::speech::transcription_reply(format, text, pcm.size());
-            for (auto& [header, value] : reply.headers) r.set_header(header, value);
-            r.status = 200;
-            r.set_content(std::move(reply.body), reply.content_type);
+                if (format != "json" && format != "text" && format != "verbose_json")
+                    throw std::invalid_argument("response_format must be json, text or verbose_json");
+                auto pcm = decode_audio(q.get_file_value("file").content);
+                std::lock_guard lock(mutex);
+                // OpenMP/MKL thread settings belong to the HTTP worker thread.
+                at::set_num_threads(threads);
+                c10::InferenceMode guard;
+                std::vector<json> events;
+                if (model.streaming()) {
+                    Stream stream(model, artifact);
+                    events = stream.accept(pcm, true);
+                } else {
+                    // Full-context features and attention see the complete file.
+                    // In particular, do not run VAD or normalize separate chunks.
+                    auto samples    = at::from_blob(pcm.data(), {int64_t(pcm.size())}, at::kFloat);
+                    auto transcript = pcm.size() < 320
+                                          ? std::string()
+                                          : model.beam(model.ctc(model.encode(model.mel(samples))));
+                    events.push_back({{"type", "final"}, {"text", transcript}});
+                }
+                std::string text;
+                for (auto& event : events)
+                    if (event["type"] == "final") {
+                        auto segment = event["text"].template get<std::string>();
+                        auto first   = segment.find_first_not_of(" \t\n\r");
+                        if (first == std::string::npos) continue;
+                        segment =
+                            segment.substr(first, segment.find_last_not_of(" \t\n\r") - first + 1);
+                        if (!text.empty()) text += ' ';
+                        text += segment;
+                    }
+                // Every format reports the billed seconds (usage in JSON, and a header on all).
+                auto reply = sinfer::speech::transcription_reply(format, text, pcm.size());
+                for (auto& [header, value] : reply.headers) r.set_header(header, value);
+                r.status = 200;
+                r.set_content(std::move(reply.body), reply.content_type);
+                metrics.add_audio_seconds(sinfer::speech::transcription_seconds(pcm.size()));
+                metrics.request_done("transcriptions", true);
+            } catch (...) {
+                metrics.request_done("transcriptions", false);
+                throw;
+            }
         });
         auto prune = [&]() {
             auto now = std::chrono::steady_clock::now();
@@ -166,34 +179,49 @@ int main(int argc, char** argv) {
                     it = sessions.erase(it);
                 else
                     ++it;
+            metrics.set_open_streams(sessions.size());
         };
+        // Expired streams stop counting even while no stream request arrives to prune them --
+        // exactly when a supervisor is draining -- but a scrape never waits behind inference.
+        metrics.serve(server, [&] {
+            std::unique_lock lock(mutex, std::try_to_lock);
+            if (lock.owns_lock()) prune();
+        });
         server.Post("/v1/audio/streams", [&](const auto& q, auto& r) {
-            if (!model.streaming())
-                throw std::invalid_argument(
-                    "this model needs complete audio; use /v1/audio/transcriptions or serve the "
-                    "streaming sibling for live audio");
-            if (!q.body.empty() && q.body != "{}")
-                throw std::invalid_argument("stream creation takes an empty body; send mono 16 kHz "
-                                            "PCM16 to the returned stream");
-            std::lock_guard lock(mutex);
-            // OpenMP/MKL thread settings belong to the HTTP worker thread.
-            at::set_num_threads(threads);
-            c10::InferenceMode guard;
-            prune();
-            if (sessions.size() >= size_t(limit)) {
-                error(r, "maximum live speech streams reached", 429);
-                return;
+            try {
+                if (!model.streaming())
+                    throw std::invalid_argument(
+                        "this model needs complete audio; use /v1/audio/transcriptions or serve the "
+                        "streaming sibling for live audio");
+                if (!q.body.empty() && q.body != "{}")
+                    throw std::invalid_argument("stream creation takes an empty body; send mono 16 kHz "
+                                                "PCM16 to the returned stream");
+                std::lock_guard lock(mutex);
+                // OpenMP/MKL thread settings belong to the HTTP worker thread.
+                at::set_num_threads(threads);
+                c10::InferenceMode guard;
+                prune();
+                if (sessions.size() >= size_t(limit)) {
+                    metrics.request_done("streams", false);
+                    error(r, "maximum live speech streams reached", 429);
+                    return;
+                }
+                std::ostringstream id;
+                for (int i = 0; i < 4; ++i) id << std::hex << random();
+                sessions.emplace(id.str(), Session{std::make_unique<Stream>(model, artifact),
+                                                   std::chrono::steady_clock::now()});
+                metrics.set_open_streams(sessions.size());
+                response(r,
+                         {{"id", id.str()},
+                          {"sample_rate", 16000},
+                          {"channels", 1},
+                          {"encoding", "pcm_s16le"}},
+                         201);
+                metrics.request_done("streams", true);
+            } catch (...) {
+                metrics.request_done("streams", false);
+                throw;
             }
-            std::ostringstream id;
-            for (int i = 0; i < 4; ++i) id << std::hex << random();
-            sessions.emplace(id.str(), Session{std::make_unique<Stream>(model, artifact),
-                                               std::chrono::steady_clock::now()});
-            response(r,
-                     {{"id", id.str()},
-                      {"sample_rate", 16000},
-                      {"channels", 1},
-                      {"encoding", "pcm_s16le"}},
-                     201);
         });
         server.Post(R"(/v1/audio/streams/([0-9a-f]+))", [&](const auto& q, auto& r) {
             if (q.body.size() > 320000 || q.body.size() % 2)
@@ -221,10 +249,13 @@ int main(int argc, char** argv) {
             it->second.used = std::chrono::steady_clock::now();
             try {
                 auto events = it->second.stream->accept(pcm, finish);
+                metrics.add_audio_seconds(sinfer::speech::transcription_seconds(pcm.size()));
                 if (finish) sessions.erase(it);
+                metrics.set_open_streams(sessions.size());
                 response(r, {{"events", events}});
             } catch (...) {
                 sessions.erase(it);
+                metrics.set_open_streams(sessions.size());
                 throw;
             }
         });
@@ -234,6 +265,7 @@ int main(int argc, char** argv) {
                 error(r, "unknown speech stream", 404);
                 return;
             }
+            metrics.set_open_streams(sessions.size());
             response(r, {{"deleted", true}});
         });
         std::cerr << "surogate-stt: serving " << name << " on " << host << ':' << port << '\n';

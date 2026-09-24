@@ -2,6 +2,7 @@
 #include "frontend.h"
 #include "runtime.h"
 #include "../serve/api_key_file.h"
+#include "../serve/audio_metrics.h"
 #include "../serve/audio_http.h"
 #include <atomic>
 #include <cmath>
@@ -146,8 +147,13 @@ int main(int argc, char** argv) {
         default_voice = voice(default_voice).name;
         if (name.empty()) name = artifact;
         Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels);
+        // /metrics: requests in flight (queued ones included) and what was served -- what a
+        // supervisor drains this server by.
+        sinfer::serve::audio::Metrics metrics(name, {.characters = true});
+        metrics.declare_endpoint("speech");
         httplib::Server server;
-        configure(server, key, 64 * 1024);
+        configure(server, key, 64 * 1024, &metrics);
+        metrics.serve(server);
         const size_t workers  = size_t(max_pending) + 4;
         server.new_task_queue = [workers] { return new httplib::ThreadPool(workers, workers); };
         server.Get("/health", [&](const auto&, auto& r) {
@@ -169,47 +175,58 @@ int main(int argc, char** argv) {
             response(r, {{"object", "list"}, {"default_voice", default_voice}, {"data", data}});
         });
         server.Post("/v1/audio/speech", [&](const httplib::Request& q, httplib::Response& r) {
-            auto content_type = q.get_header_value("Content-Type");
-            if (content_type.substr(0, content_type.find(';')) != "application/json")
-                throw HttpError(415, "Content-Type must be application/json");
-            auto body = json::parse(q.body);
-            if (!body.is_object()) throw std::invalid_argument("Expected a JSON object");
-            const std::set<std::string> fields = {"model",           "input", "voice",
-                                                  "response_format", "speed", "seed"};
-            for (auto& [field, value] : body.items())
-                if (!fields.contains(field))
-                    throw std::invalid_argument("Unsupported speech field: " + field);
-            if (body.value("model", name) != name)
-                throw std::invalid_argument("Unknown model; see /v1/models");
-            if (!body.contains("input") || !body.at("input").is_string())
-                throw std::invalid_argument("input must contain text");
-            if (body.contains("speed") &&
-                (!body["speed"].is_number() || body["speed"].get<double>() != 1))
-                throw std::invalid_argument("This model supports speed=1 only");
-            int64_t seed = 9;
-            if (body.contains("seed")) {
-                if (!body["seed"].is_number_integer() || body["seed"].get<double>() < 0 ||
-                    body["seed"].get<double>() > INT32_MAX)
-                    throw std::invalid_argument("seed must be an integer between 0 and 2147483647");
-                seed = body["seed"].get<int64_t>();
+            try {
+                auto content_type = q.get_header_value("Content-Type");
+                if (content_type.substr(0, content_type.find(';')) != "application/json")
+                    throw HttpError(415, "Content-Type must be application/json");
+                auto body = json::parse(q.body);
+                if (!body.is_object()) throw std::invalid_argument("Expected a JSON object");
+                const std::set<std::string> fields = {"model",           "input", "voice",
+                                                      "response_format", "speed", "seed"};
+                for (auto& [field, value] : body.items())
+                    if (!fields.contains(field))
+                        throw std::invalid_argument("Unsupported speech field: " + field);
+                if (body.value("model", name) != name)
+                    throw std::invalid_argument("Unknown model; see /v1/models");
+                if (!body.contains("input") || !body.at("input").is_string())
+                    throw std::invalid_argument("input must contain text");
+                if (body.contains("speed") &&
+                    (!body["speed"].is_number() || body["speed"].get<double>() != 1))
+                    throw std::invalid_argument("This model supports speed=1 only");
+                int64_t seed = 9;
+                if (body.contains("seed")) {
+                    if (!body["seed"].is_number_integer() || body["seed"].get<double>() < 0 ||
+                        body["seed"].get<double>() > INT32_MAX)
+                        throw std::invalid_argument("seed must be an integer between 0 and 2147483647");
+                    seed = body["seed"].get<int64_t>();
+                }
+                auto format = body.value("response_format", std::string("wav"));
+                if (format != "wav" && format != "pcm")
+                    throw std::invalid_argument("response_format must be wav or pcm");
+                const auto& selected = voice(body.value("voice", default_voice));
+                const auto& input    = body.at("input").get_ref<const std::string&>();
+                auto chunks          = tokenize(input);
+                // Counted like the 4096-character limit. Set only once synthesis has succeeded, so an
+                // error response never carries a billable count.
+                const auto characters = input_characters(input);
+                auto data             = runtime.synthesize(chunks, selected, int(seed), [&] {
+                    return interrupted || (q.is_connection_alive && !q.is_connection_alive());
+                });
+                // 16-bit mono at 22,050 Hz after the 44-byte WAV header.
+                const double seconds =
+                    static_cast<double>(data.size() > 44 ? data.size() - 44 : 0) / (2.0 * 22050.0);
+                if (format == "pcm") data.erase(0, 44);
+                r.set_header("X-Usage-Characters", std::to_string(characters));
+                r.set_header("X-Audio-Sample-Rate", "22050");
+                r.set_header("Cache-Control", "no-store");
+                r.set_content(std::move(data), format == "wav" ? "audio/wav" : "audio/pcm");
+                metrics.add_audio_seconds(seconds);
+                metrics.add_characters(characters);
+                metrics.request_done("speech", true);
+            } catch (...) {
+                metrics.request_done("speech", false);
+                throw;
             }
-            auto format = body.value("response_format", std::string("wav"));
-            if (format != "wav" && format != "pcm")
-                throw std::invalid_argument("response_format must be wav or pcm");
-            const auto& selected = voice(body.value("voice", default_voice));
-            const auto& input    = body.at("input").get_ref<const std::string&>();
-            auto chunks          = tokenize(input);
-            // Counted like the 4096-character limit. Set only once synthesis has succeeded, so an
-            // error response never carries a billable count.
-            const auto characters = input_characters(input);
-            auto data             = runtime.synthesize(chunks, selected, int(seed), [&] {
-                return interrupted || (q.is_connection_alive && !q.is_connection_alive());
-            });
-            if (format == "pcm") data.erase(0, 44);
-            r.set_header("X-Usage-Characters", std::to_string(characters));
-            r.set_header("X-Audio-Sample-Rate", "22050");
-            r.set_header("Cache-Control", "no-store");
-            r.set_content(std::move(data), format == "wav" ? "audio/wav" : "audio/pcm");
         });
         std::signal(SIGPIPE, SIG_IGN);
         std::signal(SIGINT, interrupt);

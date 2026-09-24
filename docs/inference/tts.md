@@ -173,6 +173,17 @@ curl -H "Authorization: Bearer $(cat /etc/surogate/tts.key)" http://localhost:80
 Normal shutdown stops the native worker and removes temporary audio. Finished
 request audio and per-request native statistics are not retained on disk.
 
+`GET /metrics` reports the server in Prometheus text format, like the LLM server:
+
+- `surogate_up`;
+- `surogate_requests{state="running"}`: speech requests, counted from arrival, including while
+  they wait in the queue, until their audio has been written or their client has gone;
+- `surogate_requests_total{endpoint,outcome}`;
+- `surogate_characters_total`: input characters billed;
+- `surogate_audio_seconds_total`: seconds of audio synthesized.
+
+Wait for `surogate_requests{state="running"}` to reach 0 to drain a server before restarting it.
+
 ## Quality
 
 Serving keeps the published model, Romanian normalization, tokenizer and fixed

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #pragma once
 // Common HTTP contracts for native STT and TTS, independent of the model backend.
+#include "audio_metrics.h"
 #include "http_socket.h"
 
 #include <httplib.h>
@@ -40,15 +41,19 @@ inline bool same_key(const std::string& a, const std::string& b) {
     return difference == 0;
 }
 
-inline void configure(httplib::Server& server, const std::string& key, size_t max_body) {
+/// `metrics`, when given, counts every authenticated request but a GET as running from here --
+/// before its body is read -- until its response is destroyed (see Metrics::Running).
+inline void configure(httplib::Server& server, const std::string& key, size_t max_body,
+                      Metrics* metrics = nullptr) {
     disable_nagle(server); // both servers call this before they bind
     server.set_payload_max_length(max_body);
     server.set_read_timeout(60);
-    server.set_pre_routing_handler([key](const httplib::Request& q, httplib::Response& r) {
+    server.set_pre_routing_handler([key, metrics](const httplib::Request& q, httplib::Response& r) {
         if (!key.empty() && !same_key(q.get_header_value("Authorization"), "Bearer " + key)) {
             error(r, "invalid API key", 401);
             return httplib::Server::HandlerResponse::Handled;
         }
+        if (metrics != nullptr && q.method != "GET") { r.hold_resource(metrics->start_request()); }
         return httplib::Server::HandlerResponse::Unhandled;
     });
     server.set_error_handler([](const auto&, auto& r) {
