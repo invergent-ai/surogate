@@ -510,4 +510,6 @@ if __name__ == "__main__":
     if args.debug:
         asyncio.run(run_evaluations(eval_run_config))
     else:
-        asyncio.run(run_evaluations_tui(eval_run_config, tui_mode=args.tui))
+        # verifiers 0.3.0 renamed this argument; it still means the alternate
+        # screen buffer, and upstream renamed the flag to --fullscreen.
+        asyncio.run(run_evaluations_tui(eval_run_config, fullscreen=args.tui))
