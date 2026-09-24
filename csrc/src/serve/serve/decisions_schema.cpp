@@ -349,6 +349,22 @@ std::size_t first_argmax(const std::vector<double>& values) {
     return static_cast<std::size_t>(std::max_element(values.begin(), values.end()) - values.begin());
 }
 
+/// A choice question's answer at a temperature: the first option that is most probable both
+/// untempered and tempered. One always exists -- the largest logit's exponent is exactly 0 at
+/// every T -- so the choice is always a maximum of the probabilities it is returned with. With
+/// T >= 1 it is the untempered choice: tempering cannot separate options that tied by rounding
+/// at T = 1, and a tie that a large T creates by rounding is settled by the untempered order.
+/// Only a T below 1 can move it, and only between options whose logits were so close (within
+/// about 5e-17) that they tied by rounding at T = 1.
+std::size_t tempered_choice(const std::vector<double>& untempered, const std::vector<double>& tempered) {
+    const double top  = *std::max_element(untempered.begin(), untempered.end());
+    const double peak = *std::max_element(tempered.begin(), tempered.end());
+    for (std::size_t i = 0; i < untempered.size(); ++i) {
+        if (untempered[i] == top && tempered[i] == peak) { return i; }
+    }
+    return first_argmax(untempered); // unreachable: the largest logit is maximal on both sides
+}
+
 } // namespace
 
 const char* decision_kind_name(DecisionKind kind) noexcept {
@@ -588,26 +604,49 @@ double decision_score_confidence(const std::vector<double>& probabilities) {
     return std::max(0.0, 1.0 - distance_from_mode / uniform_mad);
 }
 
-OrderedJson resolve_decision_answer(const DecisionQuestion& question, const std::vector<float>& logits) {
-    const std::size_t n = question.option_count();
-    if (logits.size() != n || n == 0) { throw std::runtime_error("decision readout does not match its options"); }
+bool valid_decision_temperature(double temperature) noexcept {
+    return std::isfinite(temperature) && temperature > 0.0;
+}
+
+std::vector<double> decision_probabilities(const std::vector<float>& logits, double temperature) {
+    if (!valid_decision_temperature(temperature)) {
+        throw std::logic_error("decision temperature must be finite and greater than zero");
+    }
+    if (logits.empty()) { throw std::runtime_error("decision readout is empty"); }
     if (std::any_of(logits.begin(), logits.end(), [](float value) { return !std::isfinite(value); })) {
         throw std::runtime_error("model returned non-finite logits");
     }
+    // Shift by the maximum, then temper: every exponent is (z_i - max) / T <= 0 and the
+    // maximum's is exactly 0, so the sum is at least 1 whatever T is. At T == 1 the division
+    // is exact and this is the untempered softmax, bit for bit.
     const double maximum = *std::max_element(logits.begin(), logits.end());
-    std::vector<double> probabilities(n);
+    std::vector<double> probabilities(logits.size());
     double sum = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        probabilities[i] = std::exp(static_cast<double>(logits[i]) - maximum);
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        probabilities[i] = std::exp((static_cast<double>(logits[i]) - maximum) / temperature);
         sum += probabilities[i];
     }
     for (double& p : probabilities) { p /= sum; }
+    return probabilities;
+}
+
+OrderedJson resolve_decision_answer(const DecisionQuestion& question, const std::vector<float>& logits,
+                                    double temperature) {
+    const std::size_t n = question.option_count();
+    if (logits.size() != n || n == 0) { throw std::runtime_error("decision readout does not match its options"); }
+    // The one tempered distribution every number of the answer is computed from.
+    const std::vector<double> probabilities = decision_probabilities(logits, temperature);
 
     OrderedJson answer;
     answer["type"] = decision_kind_name(question.kind);
     switch (question.kind) {
     case DecisionKind::Choice: {
-        const std::size_t best = first_argmax(probabilities);
+        // Dividing by T > 0 keeps the order of the logits, so the choice is the untempered one
+        // (see tempered_choice). At T == 1 both sides are the same vector and this is the first
+        // argmax, exactly as before the temperature existed.
+        const std::size_t best = temperature == kDecisionDefaultTemperature
+                                     ? first_argmax(probabilities)
+                                     : tempered_choice(decision_probabilities(logits), probabilities);
         answer["choice"]       = question.option_keys[best];
         answer["confidence"]   = decision_choice_confidence(probabilities);
         OrderedJson table      = OrderedJson::object();
@@ -635,6 +674,18 @@ OrderedJson resolve_decision_answer(const DecisionQuestion& question, const std:
     }
     }
     return answer;
+}
+
+OrderedJson resolve_decision_answers(const DecisionsRequest& request, const std::vector<std::vector<float>>& logits,
+                                     double temperature) {
+    if (logits.size() != request.questions.size()) {
+        throw std::runtime_error("decision readouts do not match the questions");
+    }
+    OrderedJson answers = OrderedJson::object();
+    for (std::size_t i = 0; i < request.questions.size(); ++i) {
+        answers[request.questions[i].name] = resolve_decision_answer(request.questions[i], logits[i], temperature);
+    }
+    return answers;
 }
 
 DecisionsFault classify_decisions_fault(const std::exception& fault, DecisionsFaultStage stage) {

@@ -56,6 +56,7 @@ int main() {
     options.allow_prefix_reuse             = false;
     options.preserve_thinking              = true;
     options.sampling_overrides.temperature = 0.6F;
+    options.decision_temperature           = 2.5;
     options.startup_argv = {"sinfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
     const sinfer::ModelSamplingDefaults sampling_defaults{
@@ -141,6 +142,17 @@ int main() {
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures += check(server.at("server").at("decision_temperature") == 2.5,
+                      "decisions calibration temperature missing from the server record");
+    failures += check(server.at("sampling_defaults").at("server_overrides").at("temperature").get<float>() == 0.6F,
+                      "decision temperature leaked into the sampling overrides");
+    {
+        const Json uncalibrated = Json::parse(format_server_start_json(
+            "serve-test", 1000, ServeOptions{}, sampling_defaults, "deployment-alias", load, memory,
+            environment, std::nullopt));
+        failures += check(uncalibrated.at("server").at("decision_temperature") == 1.0,
+                          "default decisions temperature is not recorded as 1");
+    }
     failures +=
         check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
                   server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,
@@ -380,6 +392,32 @@ int main() {
     }
     input.close();
     std::filesystem::remove(log_path);
+
+    // A decisions request records the calibration temperature its answers were read at;
+    // no other protocol grows a `decisions` block.
+    {
+        RequestLogContext decisions;
+        decisions.id                   = 9;
+        decisions.protocol             = "decisions";
+        decisions.model                = "rune";
+        decisions.question_count       = 3;
+        decisions.shared_prefix_tokens = 120;
+        decisions.decision_temperature = 2.5;
+        const Json start = Json::parse(format_request_start_json("serve-test", 3000, decisions));
+        failures += check(start.at("request").at("decisions").at("question_count") == 3 &&
+                              start.at("request").at("decisions").at("temperature") == 2.5,
+                          "decisions request record lacks its calibration temperature");
+        GenerationOutcome answered;
+        answered.prompt_tokens     = 300;
+        answered.completion_tokens = 3;
+        const Json done = Json::parse(format_request_done_json("serve-test", 3100, decisions, answered));
+        failures += check(done.at("request").at("decisions").at("temperature") == 2.5 &&
+                              done.at("request").at("decisions").at("shared_prefix_tokens") == 120,
+                          "decisions done record lacks its calibration temperature");
+        const Json chat = Json::parse(format_request_start_json("serve-test", 3200, context));
+        failures += check(!chat.at("request").contains("decisions"),
+                          "a chat request record grew a decisions block");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

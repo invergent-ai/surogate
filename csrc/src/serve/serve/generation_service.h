@@ -194,7 +194,9 @@ public:
     /// Answer a decisions request: render every question through the chat template with
     /// thinking off, verify each option label is one continuation token in context, prefill
     /// the shared prefix once and read each question's label logits at its first generated
-    /// position. Throws ApiException for a refusal (400) or an engine failure.
+    /// position, then answer from softmax(logits / T) with T the server's
+    /// `--decision-temperature` (`resolve_decision_answers`). Throws ApiException for a
+    /// refusal (400) or an engine failure.
     [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
         std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {});
 

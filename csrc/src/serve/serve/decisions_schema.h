@@ -173,15 +173,56 @@ render_decision_question(const DecisionQuestion& question, const std::vector<std
                                                        std::size_t minimum = kDecisionMinPrefillTokens);
 
 /// TypeSafe's confidence metrics, arithmetic as published (normalise by the sum, uniform on a
-/// zero total, first index on ties).
+/// zero total, first index on ties). The endpoint hands them the tempered distribution.
 [[nodiscard]] double decision_choice_confidence(const std::vector<double>& probabilities);
 [[nodiscard]] double decision_score_confidence(const std::vector<double>& probabilities);
 
-/// Softmax over the label logits alone (temperature 1, in double), then the answer object for
-/// the question's kind. Nothing is rounded. Throws `std::runtime_error` on a non-finite or
-/// mis-sized readout.
+/// The calibration temperature every decisions readout is divided by when the server is given
+/// none (`--decision-temperature`): 1, the model's own distribution, unchanged.
+inline constexpr double kDecisionDefaultTemperature = 1.0;
+
+/// Whether `temperature` can calibrate a readout: finite and greater than zero. Zero would be
+/// an argmax rather than a distribution, and a negative value would reverse the option order.
+[[nodiscard]] bool valid_decision_temperature(double temperature) noexcept;
+
+/// The distribution a decision is read from: the softmax over the candidate label logits
+/// alone, divided by the calibration temperature `T`, in double,
+///
+///     p_i = exp((z_i - max_j z_j) / T) / sum_k exp((z_k - max_j z_j) / T).
+///
+/// This is the renormalised candidate distribution tempered once. Any per-row constant cancels
+/// in it: the candidate log-probabilities `log q_i = z_i - logsumexp(z)`, divided by `T` and
+/// renormalised, give the same `p` as the raw logits do, and so would the full-vocabulary
+/// log-probabilities. Subtracting the maximum first keeps every exponent in `(-inf, 0]`, so the
+/// sum is at least 1 for any `T` -- a very large `T` tends to uniform, a very small one to the
+/// argmax -- and nothing overflows or divides by zero. `T == 1` divides by one, which is exact,
+/// so the result is bit for bit the untempered softmax. Throws `std::logic_error` for an
+/// invalid `T` (the server validates it at startup, so reaching here with one is a defect, not
+/// a bad request) and `std::runtime_error` on an empty or non-finite readout.
+[[nodiscard]] std::vector<double> decision_probabilities(const std::vector<float>& logits,
+                                                         double temperature = kDecisionDefaultTemperature);
+
+/// `decision_probabilities` at `temperature`, then the answer object for the question's kind:
+/// every probability, the choice confidence, the noul probability, the expected score and the
+/// score confidence come from that one tempered distribution. A choice answer's key is the
+/// first option that is most probable both untempered and tempered. Dividing by `T > 0` keeps
+/// the order of the logits, so that is the untempered choice -- exact even where a large `T`
+/// rounds a near-tie to two equal tempered probabilities -- and it is always a maximum of the
+/// returned probabilities. Only a `T` below 1 can move it, and only between options whose
+/// logits were within about 5e-17 and so tied by rounding at `T = 1`. Nothing is rounded.
+/// Throws `std::runtime_error` on a non-finite or mis-sized readout and `std::logic_error` on
+/// an invalid temperature.
 [[nodiscard]] OrderedJson resolve_decision_answer(const DecisionQuestion& question,
-                                                  const std::vector<float>& logits);
+                                                  const std::vector<float>& logits,
+                                                  double temperature = kDecisionDefaultTemperature);
+
+/// Every answer of a request, keyed by question name in request order: `logits[i]` is question
+/// `i`'s candidate readout, however it was produced -- a whole prompt or a suffix on the shared
+/// GPU prefix, option letters or codebook codes. The endpoint builds its `answers` here and
+/// nowhere else, so the temperature is applied exactly once per question.
+[[nodiscard]] OrderedJson resolve_decision_answers(const DecisionsRequest& request,
+                                                   const std::vector<std::vector<float>>& logits,
+                                                   double temperature = kDecisionDefaultTemperature);
 
 [[nodiscard]] std::string new_decision_id();
 

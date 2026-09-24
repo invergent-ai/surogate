@@ -339,6 +339,12 @@ void finalize_output_text(GenerationOutcome& outcome, ReasoningFormat format,
 
 GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
     : options_(std::move(options)), lora_slots_(options_.max_loras) {
+    // The CLI refuses a bad calibration temperature, but options can be built in code too; a
+    // bad one must stop the service here, before any weights load, rather than turn every
+    // decisions request into a 500.
+    if (!valid_decision_temperature(options_.decision_temperature)) {
+        throw std::invalid_argument("decision temperature must be finite and greater than zero");
+    }
     sinfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.borrowed_weights         = options_.borrowed_weights;
@@ -1192,11 +1198,12 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         outcome.prefill_seconds += readout.prefill_seconds;
         outcome.input_tokens  = static_cast<int>(outcome.shared_prefix_tokens) + readout.suffix_tokens;
         outcome.output_tokens = static_cast<int>(request.questions.size());
-        outcome.answers       = OrderedJson::object();
-        for (std::size_t i = 0; i < request.questions.size(); ++i) {
-            outcome.answers[request.questions[i].name] =
-                resolve_decision_answer(request.questions[i], readout.logits[i]);
-        }
+        // Both routes above -- whole prompts, or suffixes on the shared GPU prefix -- and both
+        // label schemes -- letters, or codebook codes past 26 options -- end in the same raw
+        // candidate logits, one row per question. The server's calibration temperature is
+        // applied here, once per row, and nowhere else.
+        outcome.answers =
+            resolve_decision_answers(request, readout.logits, options_.decision_temperature);
         outcome.total_seconds =
             std::chrono::duration<double>(Clock::now() - lifetime->started).count();
         return outcome;

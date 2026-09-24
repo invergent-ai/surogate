@@ -343,6 +343,29 @@ the model's chat template.
 | `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
 | `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
 
+### Decisions calibration
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--decision-temperature T` | `1` | Calibration temperature of the [decisions endpoint](decisions.md#calibration-temperature): every answer is read from `softmax(option logits / T)` |
+
+`T` must be a finite number greater than zero (anything else is refused at startup); `1`
+returns the model's own distribution unchanged. It applies to every decisions request
+the process answers: every question type, every route alias, every served model (including
+those added with `--model`) and every adapter. `T > 1` softens an overconfident model and
+`T < 1` sharpens an underconfident one. The chosen option never changes, only the
+probabilities and what is computed from them (`confidence`, `noul`, a score's expected
+level). Other endpoints are unaffected, and it is independent of `--temperature`, which the
+decisions readout never uses. The value appears in the `server_start` and decisions request
+records of `--request-log-jsonl`, and in the startup log when it is not 1.
+
+Fit `T` on a held-out calibration split, never on evaluation data, and state the recommended
+value in the model card; see [Choosing the temperature](decisions.md#choosing-the-temperature).
+
+```bash
+surogate serve ./models/decision-model/ --decision-temperature 2.5
+```
+
 ### Vision
 
 `--vision` enables images and video on supported models. `--media-cache-mib N` (default 1024)

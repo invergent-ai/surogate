@@ -3,6 +3,7 @@
 #include "core/sleep.h"
 #include "serve/model_scheduler.h"
 #include "serve/console_log.h"
+#include "serve/decisions_schema.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
@@ -184,6 +185,15 @@ int main(int argc, char** argv) {
                      << " media-live=" << format_bytes(media.live_capacity_bytes);
         }
         sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, capacity.str());
+        // A calibrated server says so: its decisions answers are not the model's raw readout.
+        // The server_start record carries the value either way.
+        if (options.decision_temperature != sinfer::serve::kDecisionDefaultTemperature) {
+            sinfer::serve::write_console_log(
+                sinfer::serve::ConsoleLogLevel::Info,
+                "decisions calibrated: answers are read from softmax(option logits / " +
+                    sinfer::serve::python_float_repr(options.decision_temperature) +
+                    ") (--decision-temperature), for every served model");
+        }
 
         sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();

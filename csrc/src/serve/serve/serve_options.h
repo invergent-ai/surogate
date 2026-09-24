@@ -136,6 +136,12 @@ struct ServeOptions {
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
+    /// --decision-temperature T: the calibration temperature of the decisions endpoint. Every
+    /// decisions answer this process gives -- every question type, every route alias, every
+    /// served model and adapter -- is read from softmax(logits / T) over the option labels.
+    /// Finite and greater than zero; 1 is the model's own distribution. It is not --temperature:
+    /// the decisions readout samples nothing, and generation never sees this value.
+    double decision_temperature = 1.0;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

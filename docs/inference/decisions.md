@@ -6,8 +6,10 @@ questions about one shared state in a single request, with the field names of Op
 decisions API. It is the serving form of the decision protocol the decision models were
 trained and benchmarked with: each question is rendered as a two-turn chat (a fixed system
 prompt, then the state, the question and lettered options), thinking is off, and the answer
-is read at the first generated position as a softmax over the option-letter logits alone.
-Nothing is sampled and nothing is rounded.
+is read at the first generated position as a softmax over the option-letter logits alone,
+divided by the server's [calibration temperature](#calibration-temperature) (1, meaning
+unchanged, unless the server was started with `--decision-temperature`). Nothing is sampled
+and nothing is rounded.
 
 The shared state is prefilled once. Every question then continues from that GPU state with
 its own suffix, in waves of `min(64, --max-num-seqs)` rows, so a forty-question request costs
@@ -46,6 +48,7 @@ one prefill of the state plus forty short suffixes rather than forty prompts.
 | `questions` | Required, at least one. An object of question name to question; the order is kept. |
 | `provider`, `session_id`, `user`, `trace` | Accepted and ignored. |
 | `images` | Our extension, optional: an array of data URLs (or `{"url": ...}` objects) attached to the user turn ahead of the text, in order, for every question. Needs a server started with `--vision`. |
+| Any other field | Accepted and ignored. There is deliberately no per-request temperature; see [Calibration temperature](#calibration-temperature). |
 
 A question is one of:
 
@@ -79,12 +82,13 @@ that order preserved; a question named twice or a criteria key sent twice is ref
 }
 ```
 
-- `probabilities` is the softmax over the question's option logits at the answer position
-  (temperature 1, computed in double), keyed by option key in option order. Values are
-  written at full precision.
-- A choice answer's `choice` is the most probable key (the first on a tie) and its
-  `confidence` is the peak probability rescaled from uniform to certainty,
-  `(max - 1/n) / (1 - 1/n)`.
+- `probabilities` is the softmax over the question's option logits at the answer position,
+  divided by the server's calibration temperature `T` (1 by default) and computed in double,
+  keyed by option key in option order. Values are written at full precision. Every other
+  number below is computed from this distribution.
+- A choice answer's `choice` is the most probable key (the first on a tie; the temperature
+  does not change it) and its `confidence` is the peak probability rescaled from uniform to
+  certainty, `(max - 1/n) / (1 - 1/n)`.
 - A noul answer's `noul` is the probability of `true`.
 - A score answer's `score` is the expected level index, `sum(i * p_i)`, and its `confidence`
   measures concentration around the modal level (TypeSafe's `score_confidence`, clamped at
@@ -141,14 +145,86 @@ requests the floor guarantees nothing. `input_tokens` counts what was actually p
 
 Requests are recorded like every other protocol: a console line and, with
 `--request-log-jsonl`, `request_start` / `request_done` / `request_rejected` records with
-`protocol: "decisions"`, the question count, the shared prefix and the token usage. Console
-rejection lines echo the question name or label they refer to, never the state.
+`protocol: "decisions"`, the question count, the shared prefix, the calibration temperature
+(`decisions.temperature`, on start and done records) and the token usage. Console rejection lines echo the question name
+or label they refer to, never the state.
+
+A `--decision-temperature` that is not a finite number greater than zero (out-of-range text
+such as `1e999` or a subnormal included) stops the server at startup with the usage text; it
+never reaches a request.
 
 Errors use the server's standard `{"error": {...}}` envelope: HTTP 400 for a malformed body
 (missing or mistyped fields, an unknown question type, fewer than 2 or more than 255
 options, a repeated question name or option key, an empty question set, a prompt over the
 model context), `vision_disabled` for images on a server without `--vision`, 404 for an
 unknown model, and the usual 429/503 when the queue is full.
+
+## Calibration temperature
+
+A model can rank the options well and still be overconfident: its peak probability runs
+ahead of how often it is right. `--decision-temperature T` corrects that on the server (see
+[the CLI](cli.md#decisions-calibration)). With `z` the option-label logits of one question
+at the answer position, the answer is read from
+
+```
+p_i = exp((z_i - max z) / T) / sum_k exp((z_k - max z) / T)        (T > 0, finite)
+```
+
+which is the renormalised candidate distribution tempered once: the candidate
+log-probabilities `log q_i = z_i - logsumexp(z)`, divided by `T` and renormalised, give the
+same `p`, because any per-question constant cancels. `T = 1` is the untempered readout bit
+for bit (dividing by one is exact), `T > 1` flattens the distribution towards uniform and
+`T < 1` sharpens it towards the argmax. Subtracting the maximum first keeps every exponent at
+or below zero, so no temperature overflows, divides by zero or produces a NaN; probabilities
+too small for a double are exactly 0.
+
+What changes and what does not:
+
+- `probabilities`, a choice or score `confidence`, `noul` and the expected `score` are all
+  computed from the tempered `p`, so they stay consistent with each other.
+- `choice` does not change. Dividing by `T > 0` keeps the order of the logits, so the most
+  probable option at any `T` is the most probable at `T = 1`. Where rounding makes two
+  options tie on one side only, the choice is the first option most probable on both: an
+  extreme `T` that rounds a near-tie to equal probabilities keeps the untempered choice, and
+  the choice is always a maximum of the returned `probabilities`. (A `T` below 1 can
+  separate options whose logits were within about 5e-17, which tied by rounding at `T = 1`;
+  that is the only case where the choice can differ from the untempered one.) The benchmark
+  accuracy of a calibrated server is therefore unchanged.
+- It is applied exactly once per question, in one place, after the readout: the same way
+  for choice, noul and score questions, for option letters and for the codebook codes used
+  past 26 options, for questions answered on the shared GPU prefix and for whole prompts, and
+  on `/api/alpha/decisions`, `/v1/decisions` and `/api/v1/decisions` alike.
+- It applies to every decisions request the process answers, including those for models
+  added with `--model` and for LoRA adapters; models whose fitted temperatures differ belong
+  in separate processes. Chat, completions and every other endpoint are unaffected;
+  `--temperature` and request sampling fields never reach this readout.
+
+The value is part of the deployment, not of the request. The request schema accepts and
+ignores unknown fields, so a per-request temperature would be silently dropped by any
+OpenRouter-compatible server that does not implement it, returning uncalibrated
+probabilities without an error. The server records the value in its `server_start` record
+(`server.decision_temperature`) and in every decisions `request_start` and `request_done`
+record (`decisions.temperature`), and prints it at startup when it is not 1. A value that is
+not a finite, normal number greater than zero is refused when the server starts.
+
+### Choosing the temperature
+
+`T` belongs to a model (and to an adapter), and is fitted once:
+
+1. Hold out a calibration split with known answers, separate from any data the model will
+   be evaluated on. Answer it on a server at `T = 1`.
+2. Fit `T` on that split, typically by minimising the mean negative log-likelihood of the
+   right option (a convex problem in `1/T`), then confirm it with the expected calibration
+   error and the share of answers above 95% confidence. A server run is not needed per
+   candidate `T`: the full-precision `probabilities` of the `T = 1` answers determine every
+   tempered answer, since `softmax(log p / T)` equals `softmax(z / T)` (up to options whose
+   probability was already 0 at `T = 1`).
+3. Publish the fitted value with the model: the model card should state the recommended
+   `--decision-temperature`, and the serving command should use it.
+
+Refit when the model, the adapter or the quantization changes. The chosen option is the same
+at every `T`, so accuracy does not move; the stated probabilities do, and with them a score
+question's expected level.
 
 ## Example
 

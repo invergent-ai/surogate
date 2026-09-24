@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
+#include "serve/decisions_schema.h"
 
 #include <fstream>
 #include <sstream>
@@ -11,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <string_view>
 
 namespace sinfer::serve {
@@ -33,6 +35,22 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<float>(value);
+}
+
+/// --decision-temperature: a finite number greater than zero, written in full. Out-of-range
+/// text is refused rather than read as infinity, zero or a subnormal: `1e999` and `1e-400` set
+/// ERANGE, and an exactly representable subnormal such as `0x1p-1074`, which does not, fails
+/// `isnormal`.
+double parse_decision_temperature(const char* text) {
+    errno              = 0;
+    char* end          = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text || *end != '\0' || errno == ERANGE || !std::isnormal(value) ||
+        !valid_decision_temperature(value)) {
+        throw std::invalid_argument(std::string("invalid decision-temperature: ") + text +
+                                    " (a finite number greater than zero; 1 leaves decisions unchanged)");
+    }
+    return value;
 }
 
 std::uint64_t parse_u64(const char* text, const char* label) {
@@ -137,7 +155,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -188,7 +206,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --enable-lora enables adapters; --lora-modules loads named adapters at "
            "startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --decision-temperature T calibrates the decisions endpoint: every answer is read\n"
+           "         from softmax(option logits / T). Default 1 (the model's own distribution);\n"
+           "         T > 1 softens overconfident answers. Fit T on a held-out calibration split.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -590,6 +611,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--decision-temperature") {
+            options.decision_temperature =
+                parse_decision_temperature(require_value("--decision-temperature"));
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
