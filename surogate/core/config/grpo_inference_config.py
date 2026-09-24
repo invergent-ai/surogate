@@ -84,7 +84,14 @@ class GRPOInferenceConfig:
             server (`--enable-lora`).
         max_loras: Adapters held at once (`--max-loras`).
         max_lora_rank: Largest adapter rank the server accepts (`--max-lora-rank`).
-        seed: Sampling seed (`--seed`).
+        seed: Sampling seed (`--seed`). **Leave unset for GRPO.** The engine
+            applies it as a process-level override on every request, so a set
+            seed makes each rollout in a group sample identically. Identical
+            rollouts score identically, and both advantage functions return
+            exactly zero for a group with no reward spread, so training receives
+            no gradient at all. Unset, the engine draws a fresh seed per
+            request, which is what rollouts need and what colocate already does.
+            Set it only to make a server reproducible, never to train.
     """
 
     host: str | None = None
@@ -133,7 +140,7 @@ class GRPOInferenceConfig:
     enable_lora: bool | None = True
     max_loras: int | None = 8
     max_lora_rank: int | None = None
-    seed: int | None = 0
+    seed: int | None = None
 
     def __init__(self, cfg: DictDefault):
         self.host = cfg.get("host", self.host)

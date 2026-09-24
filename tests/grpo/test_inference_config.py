@@ -186,3 +186,25 @@ def test_an_unfamiliar_parser_name_is_left_to_the_engine():
     })
     assert _value(argv, "--tool-call-parser") == "muse_glimmer"
     assert "--enable-auto-tool-choice" in argv
+
+
+def test_rollouts_are_not_pinned_to_one_seed_by_default():
+    """The default must leave `--seed` off the command line.
+
+    The engine applies `--seed` as a process-level override on every request, so
+    a seed set here makes all 8 rollouts of a group sample identically. Identical
+    rollouts score identically, and both functions in
+    `grpo/orchestrator/advantage.py` return exactly zero for a group with no
+    reward spread, so the run trains on a zero gradient while looking healthy.
+    This defaulted to 0 and silently did that to every split run from the commit
+    that first passed it to the engine.
+
+    Omitted, the engine draws a fresh seed per request, which is what colocate
+    already gets by never setting one.
+    """
+    assert "--seed" not in _argv({"model": "m"})
+
+
+def test_an_explicit_seed_still_reaches_the_engine():
+    """Changing the default must not remove the knob, only stop presuming it."""
+    assert _value(_argv({"model": "m", "seed": 1234}), "--seed") == "1234"
