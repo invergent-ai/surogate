@@ -24,6 +24,9 @@ struct GqaSmallTInvocation {
     std::int32_t batch_size     = 1;
     /// Causal sliding window, zero for unbounded. See GqaExecutionEnvelope.
     std::int32_t sliding_window = 0;
+    /// Batched lanes only: each lane's first column in q, pos and out (I32, batch_size), in place
+    /// of column_begin + lane * full_width -- lanes of several sequences at their own columns.
+    const Tensor* lane_columns  = nullptr;
 };
 
 // Splits the launcher will use for this shape, which sizes the partial buffers
@@ -55,6 +58,19 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                   Tensor& out, cudaStream_t stream,
                                   GqaBlockMask selection = {});
+
+// Prompt tiles of several sequences in one launch: lane i covers `width` columns of q, positions
+// and out from lane_columns[i] and reads table row table_rows[i]. BF16/FP8 caches only; the
+// queries' keys must already be in the cache.
+void gqa_attention_cached_lanes_small_t_launch(const Tensor& q, const Tensor& positions,
+                                               const Tensor& valid_columns,
+                                               const Tensor& table_rows,
+                                               const Tensor& lane_columns, float scale,
+                                               PagedKVBatchLayerView cache,
+                                               GqaExecutionEnvelope envelope, std::int32_t width,
+                                               Tensor& partial_acc, Tensor& partial_m,
+                                               Tensor& partial_l, Tensor& out,
+                                               cudaStream_t stream);
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                          const PagedKVLayerView& cache,

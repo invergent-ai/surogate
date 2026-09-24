@@ -117,6 +117,12 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
     return capacity;
 }
 
+inline const std::int32_t* lane_columns_of(const GqaSmallTInvocation& invocation) {
+    return invocation.lane_columns == nullptr
+        ? nullptr
+        : static_cast<const std::int32_t*>(invocation.lane_columns->data);
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput, typename CacheT = __nv_bfloat16>
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
@@ -163,27 +169,38 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                     Masked, CacheInput, CacheT>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                 Masked, CacheInput,
-                                                 CacheT><<<grid, kBlock, kSmemBytes, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), input,
-        static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
-        static_cast<CacheT*>(cache_v.data),
-        static_cast<const std::int32_t*>(cache.block_tables.data),
-        invocation.valid_columns == nullptr
-            ? nullptr
-            : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-        invocation.table_rows == nullptr
-            ? nullptr
-            : static_cast<const std::int32_t*>(invocation.table_rows->data),
-        cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, invocation.sliding_window, scale,
-        static_cast<float*>(partial_acc.data),
-        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    const auto dense = [&]<bool LaneColumns>() {
+        const auto kernel = gqa_attention_small_t_tc_partial_bf16_kernel<
+            Geometry, TokenTile, WarpsPerCta, MultiBatch, Masked, CacheInput, CacheT, false, 4,
+            LaneColumns>;
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+        kernel<<<grid, kBlock, kSmemBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
+            static_cast<CacheT*>(cache_v.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, invocation.sliding_window, scale,
+            static_cast<float*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+            GqaBlockMask{}, lane_columns_of(invocation));
+    };
+    if (invocation.lane_columns != nullptr) {
+        if constexpr (MultiBatch && Masked && !CacheInput::writes_cache) {
+            dense.template operator()<true>();
+        } else {
+            throw std::invalid_argument("gqa_attention: lane columns need a masked batched cached launch");
+        }
+    } else {
+        dense.template operator()<false>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -326,6 +343,14 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     auto splits = gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+    if (invocation.lane_columns != nullptr &&
+        (cache.dtype == DType::I8 || invocation.batch_size < 2 || CacheInput::writes_cache ||
+         invocation.selection.words != nullptr || invocation.column_begin != 0 ||
+         invocation.valid_columns == nullptr)) {
+        // Only the BF16/FP8 kernels read lane columns, only batched, and only over a cache the
+        // queries' keys are already in.
+        throw std::invalid_argument("gqa_attention: lane columns need a batched BF16/FP8 cached launch");
+    }
     // Batch-aware clamp: the grid is (KVHeads, splits, batch), so the batch
     // dimension already supplies parallelism at multi-user widths. Splitting KV
     // further past a full wave only multiplies the partial-buffer traffic the
@@ -465,9 +490,10 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(Geometry::HeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
-    const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
+    const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset,
+                                   bool LaneColumns = false>() {
         gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                   Offset>
+                                                   Offset, LaneColumns>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
                 static_cast<const float*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
@@ -478,10 +504,17 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                 invocation.width, invocation.full_width, invocation.column_begin,
                 invocation.batch_size, splits, invocation.sliding_window,
-                static_cast<__nv_bfloat16*>(out.data));
+                static_cast<__nv_bfloat16*>(out.data), lane_columns_of(invocation));
     };
     const bool masked         = invocation.valid_columns != nullptr;
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
+        if (invocation.lane_columns != nullptr) {
+            if constexpr (!Int8 && MultiBatch && Masked) {
+                launch_reduce.template operator()<Int8, MultiBatch, Masked, false, true>();
+                return;
+            }
+            throw std::invalid_argument("gqa_attention: lane columns need a masked batched launch");
+        }
         if (invocation.column_begin == 0) {
             launch_reduce.template operator()<Int8, MultiBatch, Masked, false>();
         } else {

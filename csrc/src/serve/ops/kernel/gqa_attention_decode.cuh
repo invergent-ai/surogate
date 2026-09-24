@@ -174,13 +174,16 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
+template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
+          bool LaneColumns = false>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, std::int32_t sliding_window, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t sliding_window, __nv_bfloat16* out,
+    const std::int32_t* lane_columns = nullptr) {
     static_assert(DChunk > 0 && DChunk <= Geometry::HeadDim);
+    static_assert(!LaneColumns || (MultiBatch && !Offset), "lane columns replace the batch stride");
 
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
@@ -197,13 +200,21 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         if (batch >= batch_size) { return; }
     }
 
-    if constexpr (Offset) { positions += column_begin; }
-    if constexpr (MultiBatch) { positions += batch * full_width; }
+    if constexpr (LaneColumns) {
+        positions += lane_columns[batch];
+    } else {
+        if constexpr (Offset) { positions += column_begin; }
+        if constexpr (MultiBatch) { positions += batch * full_width; }
+    }
     const int last_pos  = positions[tokens - 1];
     const int first_pos = positions[0];
     int output_column   = token;
-    if constexpr (Offset) { output_column += column_begin; }
-    if constexpr (MultiBatch) { output_column += batch * full_width; }
+    if constexpr (LaneColumns) {
+        output_column += lane_columns[batch];
+    } else {
+        if constexpr (Offset) { output_column += column_begin; }
+        if constexpr (MultiBatch) { output_column += batch * full_width; }
+    }
 
     if constexpr (MultiBatch) {
         const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * Geometry::HeadDim *
