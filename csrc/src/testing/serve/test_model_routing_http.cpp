@@ -166,7 +166,10 @@ int main() {
         if (routed_extra) { assert(!extra.is_sleeping()); }
         auto generated = post("/v1/messages", chat);
         assert(generated && generated->status == 200);
-        assert(Json::parse(generated->body).at("usage").at("input_tokens") == actual);
+        // Anthropic usage splits the prompt: input_tokens excludes what the prefix cache read,
+        // and the loop's repeated prompt is cached from the second request on.
+        const Json usage = Json::parse(generated->body).at("usage");
+        assert(usage.at("input_tokens").get<int>() + usage.at("cache_read_input_tokens").get<int>() == actual);
     }
     server.stop();
     assert(listener.wait_for(2s) == std::future_status::ready);

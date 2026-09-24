@@ -609,7 +609,7 @@ int test_stop_reason_mapping() {
     const auto stopped = Json::parse(make_messages_response(
         "msg_stop", "model", "answer", "", {}, "stop_sequence", CompletionUsage{2, 1}, "</answer>"));
     failures += check(stopped.at("stop_sequence") == "</answer>", "response echoes matched stop sequence");
-    const auto delta = parse_sse(make_message_delta("stop_sequence", 1, "</answer>"));
+    const auto delta = parse_sse(make_message_delta("stop_sequence", CompletionUsage{2, 1}, "</answer>"));
     failures += check(delta.at("delta").at("stop_sequence") == "</answer>",
                       "stream echoes matched stop sequence");
     failures += check(std::string(messages_stop_reason(sinfer::FinishReason::Cancelled, false)) ==
@@ -636,6 +636,18 @@ int test_response_serialization() {
     failures += check(resp.at("stop_sequence").is_null(), "stop_sequence null");
     failures += check(resp.at("usage").at("input_tokens") == 7, "input_tokens");
     failures += check(resp.at("usage").at("output_tokens") == 3, "output_tokens");
+    failures += check(resp.at("usage").at("cache_read_input_tokens") == 0 &&
+                          resp.at("usage").at("cache_creation_input_tokens") == 0,
+                      "no cache reads reported when nothing was cached");
+    // Cached prompt tokens: Anthropic's input_tokens excludes them, cache_read_input_tokens has
+    // them, and the two add up to the whole prompt.
+    const Json cached = Json::parse(make_messages_response(
+        "msg_c", "claude-x", "hi", "", {}, "end_turn", CompletionUsage{100, 3, 64}));
+    failures += check(cached.at("usage") == Json{{"input_tokens", 36},
+                                                 {"cache_creation_input_tokens", 0},
+                                                 {"cache_read_input_tokens", 64},
+                                                 {"output_tokens", 3}},
+                      "cached tokens split out of input_tokens");
     const Json& content = resp.at("content");
     failures += check(content.size() == 3, "thinking + text + tool_use blocks");
     failures += check(content.at(0).at("type") == "thinking" &&
@@ -662,13 +674,18 @@ int test_streaming_events() {
     int failures = 0;
     std::string type;
 
-    const Json start = parse_sse(make_message_start("msg_1", "claude-x", 11), &type);
+    const Json start = parse_sse(make_message_start("msg_1", "claude-x", CompletionUsage{11, 0, 4}), &type);
     failures += check(type == "message_start", "message_start event type");
     failures += check(start.at("type") == "message_start", "message_start payload type");
     failures += check(start.at("message").at("id") == "msg_1", "message_start id");
     failures += check(start.at("message").at("model") == "claude-x", "message_start model");
-    failures += check(start.at("message").at("usage").at("input_tokens") == 11,
-                      "message_start input_tokens");
+    // message_start carries the prompt's real cache split (the server sends it once the prompt
+    // is prefilled): gateways read input tokens from this event only.
+    failures += check(start.at("message").at("usage") == Json{{"input_tokens", 7},
+                                                              {"cache_creation_input_tokens", 0},
+                                                              {"cache_read_input_tokens", 4},
+                                                              {"output_tokens", 0}},
+                      "message_start usage with the cache split");
     failures += check(start.at("message").at("content").is_array() &&
                           start.at("message").at("content").empty(),
                       "message_start empty content");
@@ -711,12 +728,18 @@ int test_streaming_events() {
     const Json stop = parse_sse(make_content_block_stop(2), &type);
     failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
 
-    const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
+    const Json mdelta = parse_sse(make_message_delta("tool_use", CompletionUsage{11, 5, 4}), &type);
     failures +=
         check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
                   mdelta.at("delta").at("stop_sequence").is_null() &&
                   mdelta.at("usage").at("output_tokens") == 5,
               "message_delta stop_reason + usage");
+    // message_delta carries the final, cumulative usage, cache split included.
+    failures += check(mdelta.at("usage") == Json{{"input_tokens", 7},
+                                                 {"cache_creation_input_tokens", 0},
+                                                 {"cache_read_input_tokens", 4},
+                                                 {"output_tokens", 5}},
+                      "message_delta cumulative usage with cache reads");
 
     const Json mstop = parse_sse(make_message_stop(), &type);
     failures += check(type == "message_stop" && mstop.at("type") == "message_stop", "message_stop");

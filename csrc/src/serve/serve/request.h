@@ -51,7 +51,19 @@ struct RequestLimits {
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    /// The part of prompt_tokens served from the prefix cache instead of being prefilled.
+    int cached_tokens     = 0;
 };
+
+/// Usage from an outcome's counts. The cached part is the prompt tokens the prefix cache supplied
+/// (the request log's prefix_cache_hit_tokens), clamped to the prompt: the value the Responses
+/// API reports as input_tokens_details.cached_tokens.
+[[nodiscard]] inline CompletionUsage completion_usage(int prompt_tokens, int completion_tokens,
+                                                      std::uint64_t prefix_cache_hit_tokens) {
+    const auto prompt = static_cast<std::uint64_t>(prompt_tokens > 0 ? prompt_tokens : 0);
+    return CompletionUsage{prompt_tokens, completion_tokens,
+                           static_cast<int>(prefix_cache_hit_tokens < prompt ? prefix_cache_hit_tokens : prompt)};
+}
 
 enum class ContentKind {
     Text,

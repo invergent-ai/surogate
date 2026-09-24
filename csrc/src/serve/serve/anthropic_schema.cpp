@@ -1,5 +1,6 @@
 #include "serve/anthropic_schema.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -576,6 +577,19 @@ const char* messages_stop_reason(sinfer::FinishReason reason, bool has_tool_call
     return "end_turn";
 }
 
+/// Anthropic's usage: input_tokens excludes the tokens read from the cache, which are reported in
+/// cache_read_input_tokens (clients add the two). Nothing is written to a cache on a client's
+/// behalf, so cache_creation_input_tokens is always 0.
+static Json messages_usage(const CompletionUsage& usage) {
+    // Clamped so the two parts always add up to the prompt, whatever a caller passes in.
+    const int prompt = std::max(0, usage.prompt_tokens);
+    const int cached = std::clamp(usage.cached_tokens, 0, prompt);
+    return Json{{"input_tokens", prompt - cached},
+                {"cache_creation_input_tokens", 0},
+                {"cache_read_input_tokens", cached},
+                {"output_tokens", usage.completion_tokens}};
+}
+
 std::string make_messages_response(const std::string& id, const std::string& model,
                                    const std::string& content, const std::string& reasoning,
                                    const std::vector<ToolCall>& tool_calls, const char* stop_reason,
@@ -602,12 +616,11 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                           {"stop_reason", stop_reason},
                           {"stop_sequence", std::string_view(stop_reason) == "stop_sequence" && !stop_sequence.empty()
                                                 ? Json(std::string(stop_sequence)) : Json(nullptr)},
-                          {"usage", Json{{"input_tokens", usage.prompt_tokens},
-                                         {"output_tokens", usage.completion_tokens}}}};
+                          {"usage", messages_usage(usage)}};
     return payload.dump();
 }
 
-std::string make_message_start(const std::string& id, const std::string& model, int input_tokens) {
+std::string make_message_start(const std::string& id, const std::string& model, const CompletionUsage& usage) {
     const Json message = {{"id", id},
                           {"type", "message"},
                           {"role", "assistant"},
@@ -615,7 +628,7 @@ std::string make_message_start(const std::string& id, const std::string& model, 
                           {"content", Json::array()},
                           {"stop_reason", nullptr},
                           {"stop_sequence", nullptr},
-                          {"usage", Json{{"input_tokens", input_tokens}, {"output_tokens", 0}}}};
+                          {"usage", messages_usage(CompletionUsage{usage.prompt_tokens, 0, usage.cached_tokens})}};
     return sse("message_start", Json{{"type", "message_start"}, {"message", message}});
 }
 
@@ -686,13 +699,13 @@ std::string make_content_block_stop(int index) {
     return sse("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}});
 }
 
-std::string make_message_delta(const char* stop_reason, int output_tokens, std::string_view stop_sequence) {
+std::string make_message_delta(const char* stop_reason, const CompletionUsage& usage, std::string_view stop_sequence) {
     return sse("message_delta",
                Json{{"type", "message_delta"},
                     {"delta", Json{{"stop_reason", stop_reason},
                                    {"stop_sequence", std::string_view(stop_reason) == "stop_sequence" && !stop_sequence.empty()
                                                          ? Json(std::string(stop_sequence)) : Json(nullptr)}}},
-                    {"usage", Json{{"output_tokens", output_tokens}}}});
+                    {"usage", messages_usage(usage)}});
 }
 
 std::string make_message_stop() { return sse("message_stop", Json{{"type", "message_stop"}}); }

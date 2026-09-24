@@ -851,7 +851,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                        (req.is_connection_alive && !req.is_connection_alive());
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             TokenDetail detail;
             detail.include_token_ids = request.return_token_ids;
             detail.include_logprobs = request.want_logprobs;
@@ -991,7 +991,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                               include_usage, outcome.parallel_decoding_details));
                 }
                 if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage = completion_usage(outcome);
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage));
                 }
@@ -1098,7 +1098,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                        (req.is_connection_alive && !req.is_connection_alive());
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             // A completion has no assistant turn and so no reasoning channel to split off:
             // whatever the model continued with is the text.
             set_owned_content(res,
@@ -1165,7 +1165,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                                       id, model, created,
                                       finish_reason_wire(outcome.finish_reason), include_usage));
                 if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage = completion_usage(outcome);
                     write_stream_item(sink, *stream,
                                       make_completion_chunk_usage(id, model, created, usage));
                 }
@@ -1380,7 +1380,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                        (req.is_connection_alive && !req.is_connection_alive());
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             set_owned_content(res,
@@ -1418,13 +1418,26 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             }
             stream->started = true;
 
+            // message_start waits for the prompt's prefill, when the cache split is known: gateways
+            // take the input tokens from this event, so reporting the whole prompt as uncached
+            // here would bill its cached part twice. It goes out on prompt_ready, which comes
+            // before the first content. A stream that completes without it sends it after run();
+            // one that fails first sends only the error event.
+            bool message_started = false;
+            const auto start_message = [&](std::uint64_t reused_prompt_tokens) {
+                if (message_started) { return; }
+                message_started = true;
+                write_stream_item(sink, *stream,
+                                  make_message_start(id, model,
+                                                     completion_usage(input_tokens, 0, reused_prompt_tokens)));
+            };
             MessagesStreamBlocks blocks([&](const std::string& event) {
+                start_message(0); // never a content block before the message it belongs to
                 write_stream_item(sink, *stream, event);
             });
             try {
-                write_stream_item(sink, *stream, make_message_start(id, model, input_tokens));
-
                 StreamSink output;
+                output.on_prompt_ready = [&](std::uint32_t reused) { start_message(reused); };
                 output.on_reasoning = [&](const std::string& text) {
                     blocks.append(OutputChannel::Reasoning, text);
                 };
@@ -1439,6 +1452,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                start_message(completion_usage(outcome).cached_tokens);
                 const std::string_view remaining = outcome.unstreamed_content;
 
                 blocks.close();
@@ -1472,8 +1486,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const char* stop_reason =
                     messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
+                // The final, cumulative usage: the prompt's cache split is known only now.
                 write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, outcome.completion_tokens, outcome.stop_sequence));
+                                  make_message_delta(stop_reason, completion_usage(outcome), outcome.stop_sequence));
                 write_stream_item(sink, *stream, make_message_stop());
                 sink.done();
                 return true;

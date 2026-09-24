@@ -157,6 +157,18 @@ With `stream: true`, generated-token scores arrive incrementally in chunks with 
 `delta`. Concatenate `choices[].logprobs.content` across those chunks. Prompt scores accompany
 the first score chunk; requested token-id arrays are sent once before the finish chunk.
 
+### Usage and cached tokens
+
+Every response reports `usage`: `prompt_tokens`, `completion_tokens`, `total_tokens` and
+`prompt_tokens_details.cached_tokens`. The last is the part of the prompt the prefix cache
+supplied instead of prefilling, which a price for cached input applies to. `prompt_tokens`
+still counts the whole prompt, cached part included. `/v1/completions` reports the same
+fields. When streaming with `stream_options.include_usage`, the usage chunk carries them too.
+The number equals `prefix_cache_hit_tokens` in the request's `request_done` log record
+(`--request-log-jsonl`), clamped to the prompt. The Responses API reports the same number as
+`usage.input_tokens_details.cached_tokens`, and Anthropic Messages as
+`usage.cache_read_input_tokens`.
+
 ### Reasoning models
 
 With a matching reasoning parser, non-streaming responses put reasoning in
@@ -479,6 +491,18 @@ curl http://127.0.0.1:8080/v1/responses \
 `POST /v1/messages` and `POST /v1/messages/count_tokens` support Anthropic-style requests,
 including streaming and a top-level `system` prompt. Point your Anthropic client at
 `http://127.0.0.1:8080`.
+
+Usage follows Anthropic's convention:
+
+- `input_tokens` excludes the prompt tokens the prefix cache supplied.
+- `cache_read_input_tokens` reports those tokens. Add the two to get the whole prompt.
+- `cache_creation_input_tokens` is always 0, because nothing is written to a cache on the
+  client's behalf.
+
+When streaming, `message_start` is sent once the prompt is prefilled, before the first content
+block, so it already carries the cache split. The final `message_delta` repeats the cumulative
+usage with the same split. A stream that fails before its prompt is prefilled, for example on a
+queue timeout, sends only an `error` event and no `message_start`.
 
 ## Embeddings
 

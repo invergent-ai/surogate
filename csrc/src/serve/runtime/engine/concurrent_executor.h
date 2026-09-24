@@ -316,19 +316,26 @@ private:
 
         std::exception_ptr caller_error;
         std::vector<OutputDelta> events;
+        bool prompt_ready_sent = false;
         for (;;) {
             events.clear();
             bool done = false;
+            std::optional<std::uint32_t> prompt_ready;
             {
                 std::unique_lock lock(request->mutex);
                 request->cv.wait_for(lock, std::chrono::milliseconds(10),
                                      [&] { return request->done || !request->events.empty(); });
                 events.swap(request->events);
-                done = request->done;
+                done         = request->done;
+                prompt_ready = request->prompt_ready;
             }
 
             if (caller_error == nullptr && sink != nullptr) {
                 try {
+                    if (prompt_ready && !prompt_ready_sent) {
+                        prompt_ready_sent = true;
+                        sink->prompt_ready(*prompt_ready);
+                    }
                     for (OutputDelta& event : events) {
                         if (event.scores) sink->publish_scores(std::move(*event.scores));
                         else sink->publish(std::move(event));
@@ -397,6 +404,9 @@ private:
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
+        /// The prompt's prefix-cache reuse, published under `mutex` when its prefill completes
+        /// so the consumer thread can hand it to the sink before the first output.
+        std::optional<std::uint32_t> prompt_ready;
 
         std::optional<BasePlan> base_plan;
         std::vector<std::optional<Plan>> lane_plans;
@@ -793,6 +803,10 @@ private:
             release_prefill_owner(*request->lane);
         }
         request->begin = step.summary;
+        {
+            std::lock_guard lock(request->mutex);
+            request->prompt_ready = step.summary.reused_prompt_tokens;
+        }
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
         }

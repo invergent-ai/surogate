@@ -684,6 +684,12 @@ public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
     virtual void publish_scores(TokenScoreDelta delta) {}
+    /// The prompt has been prefilled; `reused_prompt_tokens` of it came from the prefix cache
+    /// instead of being computed. Called at most once, before the first `publish`, on the
+    /// consumer's thread -- so a protocol whose stream opens with usage (Anthropic's
+    /// message_start) can report the real cache split. Not called for a request that ends
+    /// before its prompt is prefilled.
+    virtual void prompt_ready(std::uint32_t reused_prompt_tokens) {}
 };
 
 class CancellationView {

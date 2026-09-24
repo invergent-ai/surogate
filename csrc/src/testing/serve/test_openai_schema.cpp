@@ -712,6 +712,34 @@ int test_response_serialization() {
     failures += check(j.at("usage").at("prompt_tokens") == 10, "usage prompt_tokens");
     failures += check(j.at("usage").at("completion_tokens") == 3, "usage completion_tokens");
     failures += check(j.at("usage").at("total_tokens") == 13, "usage total_tokens");
+    failures += check(j.at("usage").at("prompt_tokens_details") == Json{{"cached_tokens", 0}},
+                      "usage prompt_tokens_details present with no cache hit");
+    // Cached prompt tokens: prompt_tokens still counts the whole prompt; the cached part is
+    // reported in prompt_tokens_details, on chat, completions and both streamed usage chunks.
+    {
+        const CompletionUsage cached{100, 5, 64};
+        const Json want = Json{{"prompt_tokens", 100},
+                               {"completion_tokens", 5},
+                               {"total_tokens", 105},
+                               {"prompt_tokens_details", Json{{"cached_tokens", 64}}}};
+        failures += check(Json::parse(make_chat_completion_response("c", "m", 1, "x", "", "stop", cached))
+                                  .at("usage") == want,
+                          "chat usage with cached tokens");
+        failures += check(Json::parse(make_completion_response("c", "m", 1, "x", "stop", cached, {}))
+                                  .at("usage") == want,
+                          "completions usage with cached tokens");
+        failures += check(parse_sse(make_chat_chunk_usage("c", "m", 1, cached)).at("usage") == want,
+                          "chat usage chunk with cached tokens");
+        failures += check(parse_sse(make_completion_chunk_usage("c", "m", 1, cached)).at("usage") == want,
+                          "completions usage chunk with cached tokens");
+        // The cached part is the prefix-cache hit, clamped to the prompt.
+        const CompletionUsage hit = completion_usage(100, 5, 64);
+        failures += check(hit.prompt_tokens == 100 && hit.completion_tokens == 5 && hit.cached_tokens == 64,
+                          "cache hit reported as is");
+        failures += check(completion_usage(100, 5, 150).cached_tokens == 100, "cache hit clamped to the prompt");
+        failures += check(completion_usage(100, 5, 0).cached_tokens == 0, "no hit, nothing cached");
+        failures += check(completion_usage(0, 0, 7).cached_tokens == 0, "empty prompt, nothing cached");
+    }
 
     // Non-empty reasoning is attached as message.reasoning_content, content stays answer-only.
     const Json jr = Json::parse(make_chat_completion_response("id-2", "m", 111, "the answer",

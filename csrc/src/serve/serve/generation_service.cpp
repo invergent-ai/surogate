@@ -291,6 +291,10 @@ public:
         }
     }
 
+    void prompt_ready(std::uint32_t reused_prompt_tokens) override {
+        if (sink_->on_prompt_ready) { sink_->on_prompt_ready(reused_prompt_tokens); }
+    }
+
     void publish_scores(TokenScoreDelta delta) override {
         if (!sink_->on_scores) return;
         GenerationOutcome outcome;

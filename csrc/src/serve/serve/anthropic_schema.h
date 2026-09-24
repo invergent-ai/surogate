@@ -43,7 +43,11 @@ std::string make_messages_response(const std::string& id, const std::string& mod
 // Streaming SSE event strings ("event: <type>\ndata: {...}\n\n"). The transport
 // calls these pure builders. MessagesStreamBlocks keeps alternating text and
 // thinking spans sequential; tool_use blocks follow those spans.
-std::string make_message_start(const std::string& id, const std::string& model, int input_tokens);
+/// The stream's opening event. `usage` is the prompt's: input tokens with the cached part split
+/// out (see messages_usage), and no output yet. The server sends it once the prompt is
+/// prefilled, when the cache split is known, because gateways (agentgateway among them) take
+/// the input tokens from this event and only the output tokens from message_delta.
+std::string make_message_start(const std::string& id, const std::string& model, const CompletionUsage& usage);
 std::string make_content_block_start_text(int index);
 std::string make_content_block_start_thinking(int index);
 std::string make_content_block_start_tool_use(int index, const ToolCall& call);
@@ -51,7 +55,9 @@ std::string make_content_block_delta_text(int index, const std::string& delta_te
 std::string make_content_block_delta_thinking(int index, const std::string& delta_text);
 std::string make_content_block_delta_tool_json(int index, const std::string& partial_json);
 std::string make_content_block_stop(int index);
-std::string make_message_delta(const char* stop_reason, int output_tokens, std::string_view stop_sequence = {});
+/// The final usage of a streamed message, cumulative: input, cache reads and output tokens.
+std::string make_message_delta(const char* stop_reason, const CompletionUsage& usage,
+                               std::string_view stop_sequence = {});
 std::string make_message_stop();
 std::string make_messages_ping();
 
