@@ -1668,6 +1668,24 @@ void ProgramImplCore::prepare_graphs() {
     }
     device.synchronize();
 
+    // An elastic KV region maps a reserve of granules ahead of demand on a worker thread, and the
+    // capture rows' first pages set it off: KV memory, bounded by the region's own cap, not graph
+    // memory. Let this engine's regions finish that work on both sides of the measurement, and
+    // leave out what every elastic region on the device (another engine's in this process too)
+    // mapped or unmapped meanwhile. Otherwise a refill landing in the window fails the startup
+    // (it did for Rune under --gpu-memory-limit-mib).
+    const auto settled_elastic_kv_bytes = [&] {
+        const auto settle = [](family::PagedKVCache* cache) {
+            if (cache == nullptr) { return; }
+            if (ElasticKvRegion* region = cache->pool().elastic_region()) { region->wait_idle(); }
+        };
+        settle(&decoder->text_kv);
+        // The draft caches have a region only if they are ever built elastic.
+        if (speculative_backend == SpeculativeBackend::Mtp) { settle(decoder->mtp_cache()); }
+        if (speculative_backend == SpeculativeBackend::DFlash && dflash->full) { settle(&*dflash->full); }
+        return elastic_kv_mapped_bytes(device.device);
+    };
+    const std::size_t elastic_before = settled_elastic_kv_bytes();
     const DeviceFootprint footprint_before = sample_device_footprint();
 
     const auto clear_stable_controls = [&] {
@@ -2070,6 +2088,7 @@ void ProgramImplCore::prepare_graphs() {
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
 
+    const std::size_t elastic_after        = settled_elastic_kv_bytes();
     const DeviceFootprint footprint_after = sample_device_footprint();
     const DeviceFootprintDelta prepared    = device_footprint_delta(footprint_before,
                                                                     footprint_after);
@@ -2082,8 +2101,12 @@ void ProgramImplCore::prepare_graphs() {
     const std::size_t plane_bytes = ops::detail::w8_derived_plane_bytes() +
                                     ops::detail::marlin_plane_bytes() +
                                     ops::detail::ggml::scratch_bytes();
-    const std::size_t consumed =
-        prepared.bytes > plane_bytes ? prepared.bytes - plane_bytes : 0;
+    // KV mapped in the window is left out; KV unmapped in it would hide as much graph memory.
+    const std::size_t kv_growth = elastic_after > elastic_before ? elastic_after - elastic_before : 0;
+    const std::size_t kv_shrink = elastic_before > elastic_after ? elastic_before - elastic_after : 0;
+    const std::size_t counted   = prepared.bytes + kv_shrink;
+    const std::size_t excluded  = plane_bytes + kv_growth;
+    const std::size_t consumed  = counted > excluded ? counted - excluded : 0;
     graph_observed_bytes = consumed;
     if (consumed > graph_allowance_bytes) {
         // Refuse only on a figure that is this engine's own. Unattributed, the

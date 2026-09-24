@@ -62,6 +62,9 @@ struct ElasticKvRegionSpec {
 /// leave free. Zero when no region is registered there.
 [[nodiscard]] std::size_t elastic_kv_unmapped_commitment(int device) noexcept;
 
+/// Bytes every elastic region on `device` has mapped, in this process (all its engines).
+[[nodiscard]] std::size_t elastic_kv_mapped_bytes(int device) noexcept;
+
 /// True while a region on `device` was recently refused an entitlement by the gate: regions
 /// there give up their reserve and executors give up retained lanes until it clears.
 [[nodiscard]] bool elastic_kv_device_pressure(int device) noexcept;
@@ -116,7 +119,8 @@ public:
     void release_reserve() noexcept;
     void flush_reserve_release() noexcept;
 
-    /// Blocks until the worker has no pending map or unmap work (tests, teardown).
+    /// Blocks until the worker has no pending map or unmap work (tests, teardown, and graph
+    /// preparation, which measures memory around it).
     void wait_idle();
 
 private:
