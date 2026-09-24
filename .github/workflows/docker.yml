@@ -230,3 +230,30 @@ jobs:
               print("::error::" + "; ".join(problems))
               sys.exit(1)
           PY
+
+      # The two steps above ask what the image can import. This asks whether one
+      # import still fits the call made against it, which is a different failure
+      # and the one that took `vf-eval` out: `verifiers` renamed a parameter
+      # between 0.1.11 and 0.3.0, the call site kept the old name, and the
+      # command was dead in the published image for as long as the pin had been
+      # current. No import check catches that -- the module imports fine, it is
+      # the call that does not bind -- and adding `surogate.cli.vf_eval` to the
+      # list above would not help either, since it imports `verifiers` inside
+      # `if __name__ == "__main__":`.
+      #
+      # The test is mounted rather than reimplemented here so there is one
+      # definition of the contract. It reads the real call sites out of
+      # `vf_eval.py` with `ast`, so it follows the code as well as the
+      # dependency. This is the only place it runs unattended: no workflow runs
+      # pytest, which is why the drift went unnoticed in the first place.
+      - name: vf-eval still binds against the pinned verifiers
+        if: steps.should_build.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
+          docker run --rm -i \
+            -v "$PWD/tests/test_vf_eval_signature.py:/t/test_vf_eval_signature.py:ro" \
+            --entrypoint bash "$image" -c "
+              /root/.local/bin/uv pip install --python /root/.venv/bin/python3 --quiet pytest
+              /root/.venv/bin/python -m pytest /t/test_vf_eval_signature.py -q
+            "
