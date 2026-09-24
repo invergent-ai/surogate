@@ -142,7 +142,7 @@ __global__ void delayed_scaling_update_kernel(float* __restrict__ amax_history,
             if (isinf(scale)) {
                 scale = FLT_MAX;
             }
-            if (pow2) {
+            if (pow2 && scale > 0.0f) {
                 // See fp8_scale_from_amax (quant.cu): largest power of two <= scale.
                 int e = 0;
                 frexpf(scale, &e);

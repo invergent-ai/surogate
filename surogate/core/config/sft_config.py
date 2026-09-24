@@ -1135,6 +1135,26 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 raise ValueError("row_packing does not support sequence_chunks > 1")
             if self.parallelism == "dispatch_pp":
                 raise ValueError("row_packing does not support parallelism: dispatch_pp")
+            if int(self.ep_size or 1) > 1:
+                # Under expert parallelism a rank reads host row block rank // ep_size, so packed
+                # windows laid out for gpus * batch slots would not all be trained.
+                raise ValueError("row_packing does not support ep_size > 1")
+            if getattr(self, "lora_dropout", 0) not in (0, 0.0, None):
+                logger.warning(
+                    "[row_packing]: lora_dropout > 0 draws its masks by buffer position, so a row's "
+                    "dropout pattern changes when it is packed; packed training is then not "
+                    "comparable row for row with padded training."
+                )
+            is_moe = bool(getattr(getattr(self, "model_info", None), "is_moe_model", False))
+            aux, z = self.router_aux_loss_coef, self.router_z_loss_coef
+            # None means the model's own default coefficient, which is non-zero for MoE routers.
+            if is_moe and (aux is None or aux > 0 or z is None or z > 0):
+                logger.warning(
+                    "[row_packing]: the MoE router aux/z losses are computed over each micro-step's "
+                    "tokens (including padding) and once per micro-step, so they change with the "
+                    "layout; set router_aux_loss_coef / router_z_loss_coef to 0 for row-for-row "
+                    "equivalence with padded training."
+                )
             if self.use_cuda_graphs:
                 logger.info("[row_packing]: disabling CUDA graphs (the micro-step count varies per step).")
                 self.use_cuda_graphs = False

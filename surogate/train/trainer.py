@@ -1705,6 +1705,11 @@ class SurogateTrainerWrapper:
         if self._stack_shrunk:
             return
         self._stack_shrunk = True
+        if getattr(self, "_row_packer", None) is not None:
+            # A packed step's attention scratch grows with the number of rows in its fullest
+            # window (128 padded rows per document per dQ split), so the first step's peak is
+            # not the run's; keep the upfront sizing.
+            return
         if getattr(self, "_dispatch_pp", False):
             # The dispatch-PP per-stage gated-delta backward peaks right at the
             # measured high-water mark; trimming the stack to it leaves no arena

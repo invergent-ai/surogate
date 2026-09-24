@@ -206,11 +206,13 @@ void mem_eff_forward_with_scratch(AttentionParams& p, const MemEffScratchAllocat
 // forces a count (bounded by the number of key blocks) and
 // SUROGATE_MEM_EFF_KEY_SPLITS=auto picks about two CTAs per SM; both are
 // opt-in, non-deterministic, and -8.7 % per update on the H200 at two
-// sequences. `deterministic_bwd` and non-causal masks always keep one split.
+// sequences. Non-causal masks always keep one split. (`deterministic_bwd` is on by
+// default for every varlen backward now, so it no longer overrides this kernel's
+// own explicit opt-in; SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC still does.)
 int mem_eff_backward_key_splits(const AttentionParams& p, int num_keys, int num_batches, int Hq) {
     constexpr int kKeyBlock = 64;         // kBlockSizeJ of the compiled backward kernel
     constexpr int kSplitsLimit = 0x7fff;  // the kernel stores num_splits_key as int16_t
-    if (p.deterministic_bwd || !p.causal) return 1;
+    if (!p.causal || std::getenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC") != nullptr) return 1;
     const int max_splits = std::max(1, std::min(kSplitsLimit, (num_keys + kKeyBlock - 1) / kKeyBlock));
     const char* env = std::getenv("SUROGATE_MEM_EFF_KEY_SPLITS");
     if (env == nullptr) return 1;  // default: bitwise reproducible backward

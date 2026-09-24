@@ -62,10 +62,23 @@ def test_plan_windows_places_every_row_once_within_capacity(slots):
     placed = sorted(i for w in windows for i in w)
     assert placed == [i for i, n in enumerate(lengths) if n > 0]
     assert all(sum(lengths[i] for i in w) <= T for w in windows)
-    # Fewest waves first-fit decreasing could reach.
-    ffd_windows = plan_windows(lengths, T, 1)
-    assert len(windows) // slots == -(-len(ffd_windows) // slots)
+    # Fewest waves first-fit decreasing reaches (an independent FFD count).
+    bins = []
+    for n in sorted((n for n in lengths if n > 0), reverse=True):
+        for b, used in enumerate(bins):
+            if used + n <= T:
+                bins[b] += n
+                break
+        else:
+            bins.append(n)
+    assert len(windows) // slots == -(-len(bins) // slots)
     assert plan_windows(lengths, T, slots) == windows  # deterministic
+
+
+def test_plan_windows_caps_rows_per_window():
+    windows = plan_windows([3] * 50, 4096, 1, max_rows=16)
+    assert max(len(w) for w in windows) <= 16
+    assert sorted(i for w in windows for i in w) == list(range(50))
 
 
 def test_plan_windows_spreads_rows_over_the_waves_slots():
@@ -169,3 +182,76 @@ def test_each_step_packs_only_its_own_rows():
     second = packer.build()
     assert docs(first) == sorted([tuple(x[0, :12]), tuple(x[1, :30])])
     assert docs(second) == sorted([tuple(x[2, :7]), tuple(x[3, :50])])
+
+
+class _FakeLoader:
+    """A padded shard as the trainer sees it: load_batch fills `slots` rows per call, in order, and an
+    epoch is exhausted after `rows_per_epoch` rows (has_next / advance_epoch as in the native loader)."""
+
+    def __init__(self, x, y, p, rows_per_epoch, rows_per_call):
+        self.x, self.y, self.p = x, y, p
+        self.rows_per_epoch = rows_per_epoch
+        self.rows_per_call = rows_per_call
+        self.cursor = 0
+        self.epochs = 0
+        self.served = []
+
+    def has_next(self, n=1):
+        return self.cursor + n * self.rows_per_call <= self.rows_per_epoch
+
+    def advance_epoch(self):
+        self.epochs += 1
+        self.cursor = 0
+
+    def load_batch(self, inputs, targets, positions, *sidecars):
+        k = inputs.shape[0]
+        idx = [(self.cursor + i) % len(self.x) for i in range(k)]
+        inputs[:], targets[:], positions[:] = self.x[idx], self.y[idx], self.p[idx]
+        self.served += idx
+        self.cursor += k
+
+
+def _wrapper(slots, ga, T, loader):
+    from types import SimpleNamespace
+
+    from surogate.train.trainer import SurogateTrainerWrapper
+
+    w = SurogateTrainerWrapper.__new__(SurogateTrainerWrapper)
+    w.config = SimpleNamespace(
+        gpus=slots,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=ga,
+        sequence_len=T,
+        output_dir="/nonexistent",
+    )
+    w.train_loader = loader
+    w._row_packer = RowPacker(T, slots)
+    w._row_packing_totals = {"steps": 0, "rows": 0, "micro_steps": 0, "real_tokens": 0}
+    w.trainer = SimpleNamespace(ga=[], set_grad_accumulation=lambda n: w.trainer.ga.append(n))
+    return w
+
+
+def test_trainer_packs_exactly_the_rows_a_padded_step_loads(monkeypatch):
+    pytest.importorskip("surogate._surogate")
+    monkeypatch.delenv("SUROGATE_AUDIT_TRAIN_BATCHES", raising=False)
+    T, slots, ga = 256, 2, 3
+    lengths = [30, 7, 120, 64, 5, 90, 33, 12, 40, 18, 77, 9]
+    x, y, p, _, _ = padded_rows(lengths, T)
+    loader = _FakeLoader(x, y, p, rows_per_epoch=len(lengths) - 2, rows_per_call=slots)  # epoch ends mid-way
+    w = _wrapper(slots, ga, T, loader)
+    buf = [np.empty((slots * ga, T), np.int32) for _ in range(3)]
+    steps = [w._load_packed_step(*buf) for _ in range(2)]
+    # Two steps x GA loader calls x slots rows, in loader order, with the epoch advanced where the
+    # padded loop advances it (before a call that would run past the epoch).
+    assert len(loader.served) == 2 * ga * slots and loader.epochs == 1
+    for k, step in enumerate(steps):
+        served = loader.served[k * ga * slots : (k + 1) * ga * slots]
+        packed_docs = sorted(
+            tuple(step.inputs[wv][s][a:b])
+            for wv in range(step.waves)
+            for s in range(slots)
+            for (a, b), _ in zip(doc_boundaries(step.positions[wv][s]), step.windows[wv * slots + s])
+        )
+        assert packed_docs == sorted(tuple(x[r, : lengths[r]]) for r in served)
+        assert w.trainer.ga[k] == step.waves <= ga
+    assert w._row_packing_totals["rows"] == 2 * ga * slots

@@ -18,12 +18,15 @@ std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name) {
 }
 
 std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name, const RecipeConfig& config) {
+    // Process-wide quantizer setting (kernels.h): the recipe being created decides it, so a
+    // non-FP8 recipe never inherits power-of-two scales from an earlier one.
+    const bool fp8 = name == "fp8-hybrid" || name == "fp8_hybrid";
+    set_fp8_power_of_two_scales(fp8 && config.fp8_pow2_scales);
     if (name == "bf16") {
         return std::make_unique<BF16Recipe>();
     }
 
-    if (name == "fp8-hybrid" || name == "fp8_hybrid") {
-        set_fp8_power_of_two_scales(config.fp8_pow2_scales);
+    if (fp8) {
         FP8HybridRecipe::Config fp8_config{.margin = config.fp8_margin,
                                            .amax_history_len = config.fp8_amax_history_len,
                                            .amax_compute_algo = AmaxComputeAlgo::MAX,

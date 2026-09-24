@@ -26,7 +26,9 @@ namespace {
 std::atomic<bool> g_fp8_power_of_two_scales{false};
 }  // namespace
 
-// Power-of-two FP8 scales (opt-in, process-wide; RecipeConfig::fp8_pow2_scales).
+// Power-of-two FP8 scales (opt-in via RecipeConfig::fp8_pow2_scales). Process-wide: every
+// RecipeFactory::create sets it (false for recipes other than fp8-hybrid), so the most recently
+// created recipe decides -- one training recipe per process, as the trainers use it.
 //
 // A per-tensor scale fp8_max / abs_max makes every element's rounding depend on the
 // tensor's maximum, i.e. on whatever else shares the tensor: padding, or the other
@@ -46,7 +48,9 @@ bool fp8_power_of_two_scales() {
 
 __device__ __forceinline__ float fp8_scale_from_amax(float fp8_max, float amax, bool pow2) {
     const float scale = fp8_max / fmaxf(amax, 1e-10f);
-    if (!pow2 || !isfinite(scale)) return scale;
+    // An infinite or NaN amax gives scale 0 or NaN: pass it through so the non-finite input still
+    // surfaces as NaN downstream instead of saturating to a finite value.
+    if (!pow2 || !(scale > 0.0f) || !isfinite(scale)) return scale;
     int e = 0;
     frexpf(scale, &e);          // scale = m * 2^e, m in [0.5, 1)
     return ldexpf(1.0f, e - 1);  // largest power of two <= scale
