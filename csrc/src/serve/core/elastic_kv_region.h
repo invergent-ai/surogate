@@ -89,6 +89,14 @@ public:
 
     [[nodiscard]] std::size_t mapped_bytes() const noexcept;
     [[nodiscard]] std::uint32_t mapped_granules() const noexcept;
+    /// Granules the region may hold mapped at once: its committed cap (under overcommit, the
+    /// larger entitlement the gate granted), rounded up to whole granules. The reserve stays
+    /// within it, demand at the limit trades a free granule for the one it needs, and the pool
+    /// chooses pages so that the granules holding pages fit inside it.
+    [[nodiscard]] std::uint32_t granule_limit() const noexcept;
+    /// Which granules are mapped right now (one entry per granule, nonzero when mapped). A
+    /// snapshot: the worker may map or unmap a free granule a moment later.
+    [[nodiscard]] std::vector<std::uint8_t> mapped_granule_mask() const;
 
     /// Sleep mode: back up every granule holding pages, unmap everything. Returns bytes released.
     std::size_t sleep();

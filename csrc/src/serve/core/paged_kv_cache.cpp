@@ -6,6 +6,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <numeric>
@@ -467,23 +468,78 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
         return true;
     };
 
+    // Elastic pool: the granules holding pages must fit the region's granule limit, the cap the
+    // cache was sized for. A contiguous run is a nicety; one that would spread the pages over
+    // more granules than that is passed over, and the pages are then taken from granules
+    // already holding pages first. Taking them that way needs ceil((in use + count) / granule)
+    // granules at most, which fits whenever the pages in use stay within the cap. Before this,
+    // runs placed past the mapped granules made the cache map 1,072 pages for a cap of 1,010
+    // and fill the device (SUROGATE-CHANGES #16).
+    std::uint32_t granule       = 0;
+    std::uint32_t occupied      = 0;
+    std::uint32_t granule_limit = 0;
+    std::vector<std::uint32_t> free_in_granule;
+    std::vector<std::uint8_t> mapped;
+    const auto granule_size = [&](std::uint32_t g) {
+        return std::min(granule, spec_.page_group_count - g * granule);
+    };
+    const auto holds_pages = [&](std::uint32_t g) { return free_in_granule[g] < granule_size(g); };
+    if (elastic_) {
+        granule = elastic_->granule_pages();
+        free_in_granule.assign(elastic_->granule_count(), 0);
+        for (const std::int32_t page : free_page_ids_) {
+            ++free_in_granule[static_cast<std::uint32_t>(page) / granule];
+        }
+        for (std::uint32_t g = 0; g < free_in_granule.size(); ++g) { occupied += holds_pages(g) ? 1U : 0U; }
+        granule_limit = elastic_->granule_limit();
+        mapped        = elastic_->mapped_granule_mask();
+    }
+    // A run fits when the granules holding pages stay within the limit; with `mapped_only` it
+    // must also need no granule mapped, so it costs no driver call.
+    const auto run_fits = [&](std::size_t begin, bool mapped_only) {
+        if (!elastic_) { return true; }
+        const auto first_g = static_cast<std::uint32_t>(free_page_ids_[begin]) / granule;
+        const auto last_g  = static_cast<std::uint32_t>(free_page_ids_[begin + count - 1]) / granule;
+        std::uint32_t added = 0;
+        for (std::uint32_t g = first_g; g <= last_g; ++g) {
+            if (mapped_only && mapped[g] == 0) { return false; }
+            added += holds_pages(g) ? 0U : 1U;
+        }
+        return occupied + added <= granule_limit;
+    };
+
     std::size_t selected = free_page_ids_.size();
     if (preferred_first >= 0) {
         const auto it =
             std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(), preferred_first);
         if (it != free_page_ids_.end() && *it == preferred_first) {
             const auto begin = static_cast<std::size_t>(it - free_page_ids_.begin());
-            if (run_at(begin)) { selected = begin; }
+            if (run_at(begin) && run_fits(begin, false)) { selected = begin; }
         }
     }
-    if (selected == free_page_ids_.size()) {
-        for (std::size_t begin = 0; begin + count <= free_page_ids_.size(); ++begin) {
-            if (run_at(begin)) {
-                selected = begin;
-                break;
+    // The lowest run of `count` free pages, walking the free list's maximal runs once. An elastic
+    // pool also tries the granule-aligned starts inside a run, since where a run starts decides
+    // which granules it spreads over.
+    const auto find_run = [&](bool mapped_only) {
+        for (std::size_t first = 0; first < free_page_ids_.size();) {
+            std::size_t last = first + 1;
+            while (last < free_page_ids_.size() &&
+                   free_page_ids_[last] == free_page_ids_[last - 1] + 1) {
+                ++last;
             }
+            for (std::size_t begin = first; begin + count <= last; ++begin) {
+                const bool candidate =
+                    begin == first ||
+                    (elastic_ && static_cast<std::uint32_t>(free_page_ids_[begin]) % granule == 0);
+                if (candidate && run_fits(begin, mapped_only)) { return begin; }
+            }
+            first = last;
         }
-    }
+        return free_page_ids_.size();
+    };
+    // A run inside mapped granules first, then any run that fits.
+    if (selected == free_page_ids_.size() && elastic_) { selected = find_run(true); }
+    if (selected == free_page_ids_.size()) { selected = find_run(false); }
 
     std::vector<std::int32_t> out;
     out.reserve(count);
@@ -492,6 +548,25 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
         const auto last  = first + static_cast<std::ptrdiff_t>(count);
         out.insert(out.end(), first, last);
         free_page_ids_.erase(first, last);
+    } else if (elastic_) {
+        // Pages in granules already holding pages first, then free granules already mapped (the
+        // reserve), then unmapped ones, lowest first within each.
+        const auto rank = [&](std::int32_t page) {
+            const auto g = static_cast<std::uint32_t>(page) / granule;
+            return holds_pages(g) ? 0 : (mapped[g] != 0 ? 1 : 2);
+        };
+        for (const int wanted : {0, 1, 2}) {
+            for (const std::int32_t page : free_page_ids_) {
+                if (out.size() == count) { break; }
+                if (rank(page) == wanted) { out.push_back(page); }
+            }
+        }
+        std::sort(out.begin(), out.end());
+        std::vector<std::int32_t> remaining;
+        remaining.reserve(free_page_ids_.size() - count);
+        std::set_difference(free_page_ids_.begin(), free_page_ids_.end(), out.begin(), out.end(),
+                            std::back_inserter(remaining));
+        free_page_ids_ = std::move(remaining);
     } else {
         const auto last = free_page_ids_.begin() + static_cast<std::ptrdiff_t>(count);
         out.insert(out.end(), free_page_ids_.begin(), last);
@@ -506,8 +581,26 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
     }
     if (elastic_) {
         // Physical memory follows the pages just handed out. This is the one place the round
-        // loop may pay a mapping, and only when demand has outrun the reserve.
-        for (const std::int32_t page : out) { elastic_->acquire_page(page); }
+        // loop may pay a mapping, and only when demand has outrun the reserve. A mapping that
+        // fails (the device is out of memory) must leave the pool as it was: the pages go back
+        // to the free list, and the granules already acquired for them are released, so the
+        // executor can fail the round's requests and carry on with a consistent pool.
+        // Pages in mapped granules first: once they hold pages, the granules this take needs are
+        // never the ones a map at the limit gives back to make room.
+        std::vector<std::int32_t> order(out);
+        std::stable_partition(order.begin(), order.end(), [&](std::int32_t page) {
+            return mapped[static_cast<std::uint32_t>(page) / granule] != 0;
+        });
+        std::size_t acquired = 0;
+        try {
+            for (; acquired < order.size(); ++acquired) { elastic_->acquire_page(order[acquired]); }
+        } catch (...) {
+            for (std::size_t i = 0; i < acquired; ++i) { elastic_->release_page(order[i]); }
+            free_page_ids_.insert(free_page_ids_.end(), out.begin(), out.end());
+            std::sort(free_page_ids_.begin(), free_page_ids_.end());
+            mapped_pages_ -= count;
+            throw;
+        }
     }
     return out;
 }

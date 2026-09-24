@@ -285,7 +285,20 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        // An engine whose worker has died refuses every request, so the server is not healthy,
+        // however alive its HTTP side is: a health check, a registry or a load balancer must
+        // take it out. The process also exits (server/main.cpp); this covers the moments until.
+        const std::vector<std::string> failed = failed_models();
+        if (!failed.empty()) {
+            res.status = 503;
+            res.set_content(nlohmann::json{{"status", "unavailable"},
+                                           {"error", "the inference engine has stopped"},
+                                           {"models", failed}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1491,6 +1504,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+
+std::vector<std::string> HttpServer::failed_models() const {
+    std::vector<std::string> failed;
+    if (service_ != nullptr && !service_->healthy()) { failed.push_back(public_model_id_); }
+    for (const auto& [name, service] : extra_services_) {
+        if (!service->healthy()) { failed.push_back(name); }
+    }
+    return failed;
+}
 
 thread_local GenerationService* HttpServer::t_routed_service = nullptr;
 

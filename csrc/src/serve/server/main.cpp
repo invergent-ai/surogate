@@ -10,6 +10,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <stop_token>
+#include <string>
+#include <thread>
+#include <vector>
 #include <csignal>
 #include <cstddef>
 #include <exception>
@@ -21,6 +25,11 @@
 namespace {
 
 std::atomic<sinfer::serve::HttpServer*> g_server{nullptr};
+
+/// How long a server whose engine has died keeps answering (503 on /health, refusals elsewhere)
+/// before it exits: long enough for a health check or the registry to see it, short enough that
+/// a restart follows quickly.
+constexpr std::chrono::milliseconds kFailedEngineExitDelay{2000};
 
 void handle_signal(int) {
     sinfer::serve::HttpServer* server = g_server.load();
@@ -238,12 +247,50 @@ int main(int argc, char** argv) {
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
         sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, listening.str());
 
+        // A dead engine worker refuses every request for the rest of the process's life, so the
+        // process must not outlive it: /health turns 503 at once (health checks and the registry
+        // eject the replica), and after a grace period the server stops and the process exits
+        // non-zero, so systemd (or any supervisor) restarts it.
+        std::atomic<bool> engine_failed{false};
+        std::jthread watchdog([&](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                const std::vector<std::string> failed = server.failed_models();
+                if (!failed.empty()) {
+                    std::string names;
+                    for (const std::string& name : failed) { names += (names.empty() ? "" : ", ") + name; }
+                    sinfer::serve::write_console_log(
+                        sinfer::serve::ConsoleLogLevel::Error,
+                        "the inference engine for " + names +
+                            " has stopped; /health answers 503 and the server exits with status 1 "
+                            "in " + std::to_string(kFailedEngineExitDelay.count()) + " ms");
+                    engine_failed.store(true);
+                    const auto deadline = std::chrono::steady_clock::now() + kFailedEngineExitDelay;
+                    while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    // Asked until listen() returns: a stop before the listener is up does nothing.
+                    while (!stop.stop_requested()) {
+                        server.stop();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        });
         const bool ok = server.listen();
+        watchdog.request_stop();
+        watchdog.join();
         g_server.store(nullptr);
         if (!ok) {
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Error,
                                              "failed to bind " + options.host + ':' +
                                                  std::to_string(options.port));
+            return 1;
+        }
+        if (engine_failed.load()) {
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Error,
+                                             "exiting with status 1: the inference engine stopped");
             return 1;
         }
         return 0;
