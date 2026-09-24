@@ -15,6 +15,13 @@ namespace sinfer::ops::detail::ggml {
 /// Q4_K/Q5_K/Q6_K select their specialized tiles independently.
 std::int32_t wide_min_tokens() noexcept;
 
+/// Multiprocessors the Q4_K/Q5_K/Q6_K prefill tiles are chosen for: wider token tiles only while
+/// the grid still fills them. The device's own count unless set; tests set 1 so small weights take
+/// every tile width. The choice does not change projection arithmetic.
+std::int32_t kquant_tile_multiprocessors() noexcept;
+/// 0 restores the device's count.
+void set_kquant_tile_multiprocessors(std::int32_t count) noexcept;
+
 /// Workspace bytes for `tokens` columns of a [rows, k] GGML weight: int8 activation
 /// codes and scales. F16 uses the original activation and leaves this scratch unused.
 std::size_t linear_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept;

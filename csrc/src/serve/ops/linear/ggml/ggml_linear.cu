@@ -8,6 +8,7 @@
 #include "ops/linear/ggml/ggml_q8_1.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -29,6 +30,11 @@ void run_gemv(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
     }
 }
 
+/// Static shared memory every architecture the kernels build for accepts (sm_89 included).
+constexpr std::size_t kStaticSharedLimit = 48 * 1024;
+
+std::atomic<std::int32_t> tile_multiprocessors_override{0};
+
 // Keep the activation quantisation used by GEMV when a graph pads a short
 // prompt into a wide batch. Expanding to BF16 changed both activation and weight
 // rounding at that boundary, producing different prompt and decode scores.
@@ -36,6 +42,8 @@ template <class Codec, int TileRows, int TileCols>
 __global__ __launch_bounds__((TileCols / 8) * 32) void dense_i8_kernel(
     const std::uint8_t* blocks, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
+    static_assert(sizeof(GgmlI8Smem<Codec, TileCols, TileRows>) <= kStaticSharedLimit,
+                  "static shared memory above 48 KiB does not build for sm_89");
     __shared__ GgmlI8Smem<Codec, TileCols, TileRows> sm;
     const int row0 = blockIdx.x * TileRows;
     const int col0 = blockIdx.y * TileCols;
@@ -88,8 +96,22 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                         static_cast<const std::uint8_t*>(blocks), codes, ds, rows, k,
                         tokens, out, beta != 0.0f);
             };
+            // A wide step takes wider token tiles, so each block unpacks a weight tile once for
+            // more columns, while the grid still fills the device: a 128-column block runs alone
+            // on its SM, a 64-column one about two to an SM. Q6_K's 128-column tile needs more
+            // static shared memory than sm_89 allows, so it stops at 64. Every column is still one
+            // warp's, with the same K loop, so a token's result does not depend on its tile.
+            constexpr bool widest_fits = sizeof(GgmlI8Smem<Codec, 128, 64>) <= kStaticSharedLimit;
+            const auto grid_blocks = [&](int columns) {
+                return ((rows + 63) / 64) * ((tokens + columns - 1) / columns);
+            };
+            const std::int32_t sms = kquant_tile_multiprocessors();
             if (tokens <= 8) { tile.template operator()<16, 8>(); }
             else if (tokens <= 32) { tile.template operator()<32, 32>(); }
+            else if (widest_fits && tokens >= 256 && grid_blocks(128) >= sms) {
+                if constexpr (widest_fits) { tile.template operator()<64, 128>(); }
+            }
+            else if (tokens >= 128 && grid_blocks(64) >= 2 * sms) { tile.template operator()<64, 64>(); }
             else { tile.template operator()<64, 32>(); }
         };
         switch (type) {
@@ -213,6 +235,23 @@ std::int32_t wide_min_tokens() noexcept {
         return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{65};
     }();
     return value;
+}
+
+std::int32_t kquant_tile_multiprocessors() noexcept {
+    static const std::int32_t device_count = [] {
+        int device = 0, sms = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+            return std::int32_t{1};
+        }
+        return static_cast<std::int32_t>(sms);
+    }();
+    const std::int32_t set = tile_multiprocessors_override.load(std::memory_order_relaxed);
+    return set > 0 ? set : device_count;
+}
+
+void set_kquant_tile_multiprocessors(std::int32_t count) noexcept {
+    tile_multiprocessors_override.store(std::max<std::int32_t>(count, 0), std::memory_order_relaxed);
 }
 
 std::size_t linear_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept {

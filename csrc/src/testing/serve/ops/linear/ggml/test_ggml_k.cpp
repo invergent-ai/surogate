@@ -439,10 +439,13 @@ int run_codec(const Fixture& f, void* d_blocks) {
 }
 
 // One input prefix evaluated at several widths must retain its represented
-// outputs. This crosses both the decode and prefill tile boundaries.
+// outputs. This crosses the decode tile boundaries and every prefill tile width
+// its codec takes (32, 64 and 128 token columns; Q6_K stops at 64).
+constexpr int kConsistentColumns = 300;
+
 int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
                            std::size_t scratch_bytes) {
-    constexpr int columns = 129;
+    constexpr int columns = kConsistentColumns;
     auto x = random_activation(f.k, columns, 1773);
     std::fill_n(x.begin() + 2 * f.k, f.k, __float2bfloat16(0.0f));
     std::fill_n(x.begin() + f.k, f.k, __float2bfloat16(-0.003f));
@@ -481,7 +484,7 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
         run(columns, false);
         reference = got;
         for (bool capture : {false, true}) {
-            for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 32, 33, 64, 65, 128}) {
+            for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 32, 33, 64, 65, 127, 128, 129, 255, 256, 257}) {
                 run(tokens, capture);
                 const auto count = std::size_t(f.n) * tokens;
                 const bool equal = std::memcmp(reference.data(), got.data(), count * sizeof(__nv_bfloat16)) == 0;
@@ -875,6 +878,9 @@ int main() {
         return 77;
     }
     int failures = 0, cases = 0;
+    // Plan the K-quant prefill tiles for one multiprocessor, so the small fixtures take every tile
+    // width a large weight would (the device's count keeps them on the narrow ones).
+    gg::set_kquant_tile_multiprocessors(1);
     const bool shared_only = std::getenv("SINFER_GGML_SHARED_ONLY") != nullptr;
     if (!shared_only) {
         for (int tokens : {1, 3, 8, 128, 8193}) {
@@ -921,7 +927,7 @@ int main() {
                 if (big && tokens > 2) { continue; }
                 scratch_bytes = std::max(scratch_bytes, gg::linear_workspace_bytes(f.n, f.k, tokens));
             }
-            scratch_bytes = std::max(scratch_bytes, gg::linear_workspace_bytes(f.n, f.k, 129));
+            scratch_bytes = std::max(scratch_bytes, gg::linear_workspace_bytes(f.n, f.k, kConsistentColumns));
             void* d_scratch = nullptr;
             CHECK_CUDA(cudaMalloc(&d_scratch, scratch_bytes));
             for (const int tokens : {1, 2, 3, 5, 8, 17}) {
@@ -956,7 +962,7 @@ int main() {
                 }
             }
             failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
-            cases += 60;
+            cases += 80;
             if ((type == gg::GgmlType::Q8_0 || type == gg::GgmlType::IQ4_NL ||
                  type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K || type == gg::GgmlType::Q6_K) &&
                 (f.label == "synthetic" || f.label == "odd" || f.label == "tail" || f.label == "decode_rows")) {
