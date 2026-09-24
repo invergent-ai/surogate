@@ -317,10 +317,11 @@ void HttpServer::register_routes() {
     server_.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
         handle_completions(req, res);
     });
-    // OpenRouter's decisions API: one shared state, several single-token questions. The
-    // published path first, so a client that swaps the base URL for this host hits the same
-    // route, then a versioned alias beside the other routes.
-    for (const char* path : {"/api/alpha/decisions", "/v1/decisions", "/api/v1/decisions"}) {
+    // Decisions v1 (stable; see decisions_schema.h): one shared state, several single-token
+    // questions, with OpenRouter's field names. /v1/decisions is the stable path; OpenRouter's
+    // own /api/alpha/decisions and /api/v1/decisions answer identically, so a client that swaps
+    // the base URL for this host keeps working. A future protocol version gets its own path.
+    for (const char* path : {"/v1/decisions", "/api/alpha/decisions", "/api/v1/decisions"}) {
         server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
             handle_decisions(req, res);
         });

@@ -659,6 +659,13 @@ sinfer_add_test(sinfer_decisions_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_decisions_test PRIVATE -UNDEBUG -fno-fast-math)
 
+# Decisions v1 is stable: prompts and answers pinned against fixtures/serve/decisions_v1.
+sinfer_add_test(sinfer_decisions_v1_test
+  NEEDS_SOURCE_DIR
+  SOURCES test_decisions_v1.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_decisions_v1_test PRIVATE -UNDEBUG -fno-fast-math)
+
 sinfer_add_test(sinfer_candidate_readout_test
   SOURCES test_candidate_readout.cpp
   LIBRARIES sinfer_engine)
