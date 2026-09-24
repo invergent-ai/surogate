@@ -3374,6 +3374,18 @@ cross-request leak closed, 105/105 in the suite, and the default-flag smoke
 (27B + 4B, no elastic flags, 8+8 users): 322 + 612 tok/s, 0 errors,
 0.62 + 0.31 GiB mapped, pair-leak 0/8.
 
+## 94
+
+**cpp-httplib: switch protocols (2026-09-24).**
+
+`Response::switch_protocols(session)` answers 101 with the handler's headers and hands the
+connection to `session` on the same thread; the connection is closed when it returns and is
+never reused. An exception escaping the session only ends that connection (the session runs
+after routing, outside its try/catch). The STT server's realtime WebSocket
+(`serve/websocket.h`, SUROGATE-CHANGES #9) is built on it. Nothing else changes for handlers
+that do not call it. A session holds its pool thread until it returns, so `Server::stop()`
+waits for open sessions; the STT server never calls it (it ends on its signal).
+
 ## 95
 
 **Prefill across requests (2026-09-24, SUROGATE-CHANGES #14).**

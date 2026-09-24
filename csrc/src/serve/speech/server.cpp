@@ -4,10 +4,13 @@
 #include "transcription.h"
 #include "../serve/api_key_file.h"
 #include "../serve/audio_metrics.h"
+#include "../serve/websocket.h"
 #include "../serve/audio_http.h"
 #include <ATen/Parallel.h>
+#include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -95,6 +98,8 @@ int main(int argc, char** argv) {
         struct Session {
             std::unique_ptr<Stream> stream;
             std::chrono::steady_clock::time_point used;
+            /// A WebSocket's stream: its connection owns it (no expiry, no HTTP access).
+            bool websocket = false;
         };
 
         std::map<std::string, Session> sessions;
@@ -106,6 +111,12 @@ int main(int argc, char** argv) {
         metrics.declare_endpoint("streams");
         httplib::Server server;
         sinfer::serve::audio::configure(server, key, 64 * 1024 * 1024, &metrics);
+        // A WebSocket stream holds an HTTP thread for its whole life, and so does an idle keep-alive
+        // connection: room for every live stream, as many requests beside them, and more; requests
+        // beyond that wait in an unbounded queue rather than being dropped.
+        const size_t http_threads =
+            std::max<size_t>(CPPHTTPLIB_THREAD_POOL_COUNT, 2 * size_t(limit) + 8);
+        server.new_task_queue = [http_threads] { return new httplib::ThreadPool(http_threads); };
         server.Get("/health", [](const auto&, auto& r) { response(r, {{"status", "ok"}}); });
         server.Get("/v1/models", [&](const auto&, auto& r) {
             response(
@@ -175,7 +186,7 @@ int main(int argc, char** argv) {
         auto prune = [&]() {
             auto now = std::chrono::steady_clock::now();
             for (auto it = sessions.begin(); it != sessions.end();)
-                if (now - it->second.used > std::chrono::minutes(2))
+                if (!it->second.websocket && now - it->second.used > std::chrono::minutes(2))
                     it = sessions.erase(it);
                 else
                     ++it;
@@ -242,7 +253,7 @@ int main(int argc, char** argv) {
             c10::InferenceMode guard;
             prune();
             auto it = sessions.find(q.matches[1]);
-            if (it == sessions.end()) {
+            if (it == sessions.end() || it->second.websocket) {
                 error(r, "unknown or expired speech stream", 404);
                 return;
             }
@@ -259,12 +270,190 @@ int main(int argc, char** argv) {
                 throw;
             }
         });
+        // Realtime transcription over one WebSocket (SUROGATE-CHANGES #9): the same stream as the HTTP
+        // interface, without a round trip per chunk. Binary messages carry PCM16 chunks; each event
+        // the HTTP interface would return comes back as one JSON text message; the text message
+        // {"type": "finish"} drains the audio, sends the last events and {"type": "done"}, and closes.
+        server.Get("/v1/audio/streams", [&](const httplib::Request& q, httplib::Response& r) {
+            namespace ws = sinfer::serve::websocket;
+            if (const auto problem = ws::handshake_error(q)) {
+                error(r, problem->message + "; open a realtime stream as a WebSocket, or POST to create one",
+                      problem->status);
+                ws::refuse_handshake(q, r);
+                return;
+            }
+            if (!model.streaming()) {
+                error(r, "this model needs complete audio; use /v1/audio/transcriptions or serve the "
+                         "streaming sibling for live audio", 400);
+                return;
+            }
+            std::string id;
+            try {
+                std::lock_guard lock(mutex);
+                at::set_num_threads(threads);
+                c10::InferenceMode guard;
+                prune();
+                if (sessions.size() >= size_t(limit)) {
+                    metrics.request_done("streams", false);
+                    error(r, "maximum live speech streams reached", 429);
+                    return;
+                }
+                do { // a fresh id, never one in use
+                    std::ostringstream name_stream;
+                    for (int i = 0; i < 4; ++i) name_stream << std::hex << random();
+                    id = name_stream.str();
+                } while (sessions.contains(id));
+                sessions.emplace(id, Session{std::make_unique<Stream>(model, artifact),
+                                             std::chrono::steady_clock::now(), true});
+                metrics.set_open_streams(sessions.size());
+            } catch (...) {
+                metrics.request_done("streams", false);
+                throw;
+            }
+            metrics.request_done("streams", true);
+            // The stream ends with the session, or with the response if the session never runs (the
+            // client left during the handshake): whichever releases this last.
+            const auto owner = std::shared_ptr<void>(nullptr, [&, id](void*) {
+                std::lock_guard lock(mutex);
+                sessions.erase(id);
+                metrics.set_open_streams(sessions.size());
+            });
+            ws::accept(q, r, [&, id, owner](httplib::Stream& connection) {
+                const auto forget = [&] {
+                    std::lock_guard lock(mutex);
+                    sessions.erase(id);
+                    metrics.set_open_streams(sessions.size());
+                };
+                // Invalid UTF-8 in an event (a stray byte from the model) is replaced, not thrown.
+                const auto text = [](const json& message) {
+                    return message.dump(-1, ' ', false, json::error_handler_t::replace);
+                };
+                const auto send_events = [&](const std::vector<json>& events) {
+                    for (const auto& event : events)
+                        if (!ws::send(connection, ws::Opcode::Text, text(event))) return false;
+                    return true;
+                };
+                // The stream is given back before the close handshake, which may wait on the peer
+                // -- unless a transcription holds the lock: then the close goes first (it waits for
+                // the peer at most a round trip) and the stream follows, rather than the peer
+                // waiting on someone else's audio for its close.
+                const auto close_and_forget = [&](uint16_t code, const std::string& reason) {
+                    std::unique_lock lock(mutex, std::try_to_lock);
+                    if (lock.owns_lock()) {
+                        sessions.erase(id);
+                        metrics.set_open_streams(sessions.size());
+                        lock.unlock();
+                        ws::close(connection, code, reason);
+                        return;
+                    }
+                    ws::close(connection, code, reason);
+                    forget();
+                };
+                const auto fail = [&](const std::string& message, uint16_t code) {
+                    (void)ws::send(connection, ws::Opcode::Text,
+                                   text({{"type", "error"}, {"error", {{"message", message}}}}));
+                    close_and_forget(code, message);
+                };
+                // Inference errors are logged, and the client gets a fixed message: what() may
+                // carry a backtrace with source paths (c10::Error).
+                const auto failed_inference = [&](const std::exception& e) {
+                    std::cerr << "surogate-stt: speech stream: " << e.what() << '\n';
+                    fail(dynamic_cast<const std::invalid_argument*>(&e) ? e.what() : "speech inference failed",
+                         1011);
+                };
+                try {
+                    (void)ws::send(connection, ws::Opcode::Text,
+                                   text({{"type", "ready"}, {"sample_rate", 16000}, {"channels", 1},
+                                         {"encoding", "pcm_s16le"}}));
+                    for (;;) {
+                        ws::Failure failure;
+                        auto message = ws::receive(connection, 320000, &failure);
+                        if (!message) {
+                            if (failure.code != 0) {
+                                fail(failure.reason, failure.code); // the client broke the protocol
+                            } else {
+                                // Broken, or silent past the read timeout: say so if it can hear.
+                                close_and_forget(1001, "connection lost or idle");
+                            }
+                            return;
+                        }
+                        if (message->opcode == ws::Opcode::Close) {
+                            close_and_forget(1000, "");
+                            return;
+                        }
+                        bool finish = false;
+                        std::vector<float> pcm;
+                        if (message->opcode == ws::Opcode::Text) {
+                            const auto control = json::parse(message->payload, nullptr, false);
+                            if (!control.is_object() || !control.contains("type") ||
+                                !control["type"].is_string() || control["type"] != "finish") {
+                                fail("send PCM16 audio as binary messages, or {\"type\": \"finish\"}", 1003);
+                                return;
+                            }
+                            finish = true;
+                        } else {
+                            const auto& body = message->payload;
+                            if (body.size() % 2) {
+                                fail("send whole little-endian PCM16 samples, at most 10 seconds per message",
+                                     1007);
+                                return;
+                            }
+                            pcm.resize(body.size() / 2);
+                            for (size_t i = 0; i < pcm.size(); ++i) {
+                                uint16_t u = static_cast<unsigned char>(body[2 * i]) |
+                                             (static_cast<unsigned char>(body[2 * i + 1]) << 8);
+                                pcm[i] = static_cast<int16_t>(u) / 32768.f;
+                            }
+                        }
+                        std::vector<json> events;
+                        bool ended = false;
+                        try {
+                            std::lock_guard lock(mutex);
+                            at::set_num_threads(threads);
+                            c10::InferenceMode guard;
+                            auto it = sessions.find(id);
+                            if (it == sessions.end()) { // cannot happen while the connection holds it
+                                ended = true;
+                            } else {
+                                it->second.used = std::chrono::steady_clock::now();
+                                events          = it->second.stream->accept(pcm, finish);
+                                metrics.add_audio_seconds(sinfer::speech::transcription_seconds(pcm.size()));
+                                if (finish) {
+                                    sessions.erase(it);
+                                    metrics.set_open_streams(sessions.size());
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            failed_inference(e); // outside the lock: fail() takes it again
+                            return;
+                        }
+                        if (ended) {
+                            fail("speech stream ended", 1011);
+                            return;
+                        }
+                        if (!send_events(events)) {
+                            forget();
+                            return;
+                        }
+                        if (finish) {
+                            (void)ws::send(connection, ws::Opcode::Text, text({{"type", "done"}}));
+                            ws::close(connection, 1000);
+                            return;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    failed_inference(e);
+                }
+            });
+        });
         server.Delete(R"(/v1/audio/streams/([0-9a-f]+))", [&](const auto& q, auto& r) {
             std::lock_guard lock(mutex);
-            if (!sessions.erase(q.matches[1])) {
+            const auto it = sessions.find(q.matches[1]);
+            if (it == sessions.end() || it->second.websocket) {
                 error(r, "unknown speech stream", 404);
                 return;
             }
+            sessions.erase(it);
             metrics.set_open_streams(sessions.size());
             response(r, {{"deleted", true}});
         });

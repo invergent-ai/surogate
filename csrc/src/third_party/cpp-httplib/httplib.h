@@ -664,6 +664,8 @@ struct Request {
   size_t authorization_count_ = 0;
 };
 
+class Stream; // surogate vendor patch: Response::switch_protocols takes one
+
 struct Response {
   std::string version;
   int status = -1;
@@ -686,6 +688,14 @@ struct Response {
   void set_content(std::string &&s, const std::string &content_type);
   void hold_resource(std::shared_ptr<void> resource) {
     resource_guard_ = std::move(resource);
+  }
+  // surogate vendor patch: switch protocols (WebSocket). The response is sent as
+  // 101 Switching Protocols with the handler's headers and no body; `session` then
+  // owns the connection on this thread until it returns, and the connection is
+  // closed afterwards (never reused for another request).
+  void switch_protocols(std::function<void(Stream &)> session) {
+    status = 101;
+    upgrade_session_ = std::move(session);
   }
 
   void set_content_provider(
@@ -724,6 +734,7 @@ struct Response {
   std::string file_content_path_;
   std::string file_content_content_type_;
   std::shared_ptr<void> resource_guard_;
+  std::function<void(Stream &)> upgrade_session_;
 };
 
 class Stream {
@@ -6420,6 +6431,24 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
                                         const Request &req, Response &res,
                                         bool need_apply_ranges) {
   assert(res.status != -1);
+
+  if (res.status == StatusCode::SwitchingProtocol_101 && res.upgrade_session_) {
+    // surogate vendor patch (see Response::switch_protocols): headers as the
+    // handler set them, then the session owns the connection.
+    detail::BufferStream bstrm;
+    if (!detail::write_response_line(bstrm, res.status)) { return false; }
+    if (!header_writer_(bstrm, res.headers)) { return false; }
+    auto &data = bstrm.get_buffer();
+    if (!detail::write_data(strm, data.data(), data.size())) { return false; }
+    if (logger_) { logger_(req, res); }
+    // The session runs outside the routing try/catch: an exception must not reach the
+    // thread pool (std::terminate), only end this connection.
+    try {
+      res.upgrade_session_(strm);
+    } catch (...) {
+    }
+    return false; // close the connection once the session ends
+  }
 
   if (400 <= res.status && error_handler_ &&
       error_handler_(req, res) == HandlerResponse::Handled) {
