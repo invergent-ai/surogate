@@ -99,7 +99,7 @@ _COMMON_SWITCHES = frozenset("""
 """.split())
 _VALUE_OPTIONS = {
     "server": _COMMON_VALUES | frozenset("""
-        --host --port --api-key --served-model-name --max-model-len --max-num-seqs
+        --host --port --api-key --api-key-file --served-model-name --max-model-len --max-num-seqs
         --max-pending-requests --pending-timeout-ms --max-num-batched-tokens
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
@@ -112,8 +112,8 @@ _VALUE_OPTIONS = {
         --reasoning-effort --stop-token-id --stop --reasoning-stop
     """.split()),
     "embed": frozenset("--host --port --device --served-model-name".split()),
-    "stt": frozenset("--host --port --device --served-model-name --api-key --max-num-seqs --threads --cpu-kernels".split()),
-    "tts": frozenset("--host --port --device --served-model-name --api-key --voice --max-pending-requests --request-timeout --threads --codec-threads --cpu-kernels".split()),
+    "stt": frozenset("--host --port --device --served-model-name --api-key --api-key-file --max-num-seqs --threads --cpu-kernels".split()),
+    "tts": frozenset("--host --port --device --served-model-name --api-key --api-key-file --voice --max-pending-requests --request-timeout --threads --codec-threads --cpu-kernels".split()),
 }
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""

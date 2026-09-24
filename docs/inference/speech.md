@@ -83,7 +83,8 @@ need the `silero-vad` dependency.
 
 The served model ID is the model argument supplied at startup. `/v1/models`
 reports it; `--served-model-name` sets a deployment alias. `--api-key` enables
-bearer-token authentication on every endpoint.
+bearer-token authentication on every endpoint. `--api-key-file PATH` reads the key from a file,
+so it doesn't appear in the process's command line.
 
 ## Transcribe a file
 

@@ -1,8 +1,11 @@
 #include "serve/serve_options.h"
+
+#include "serve/api_key_file.h"
 #include "product/speculative_options.h"
 #include "serve/decisions_schema.h"
 
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <cerrno>
 #include <cstdint>
@@ -131,7 +134,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.sinfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.sinfer> [--host H] [--port N] [--api-key KEY|--api-key-file PATH] "
            "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers "
            "N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank "
            "auto|w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens "
@@ -166,6 +169,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --api-key-file reads the key from a file, keeping it off the command line\n"
            "       --served-model-name overrides the supplied model argument reported by the "
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -229,6 +233,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
+    std::optional<std::string> api_key;      // --api-key; the last one given wins
+    std::optional<std::string> api_key_file; // --api-key-file; read once parsing is done
     bool kv_capacity_explicit        = false;
     bool max_context_explicit        = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
@@ -248,7 +254,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
-            options.api_key = require_value("--api-key");
+            api_key = require_value("--api-key");
+        } else if (arg == "--api-key-file") {
+            api_key_file = require_value("--api-key-file");
         } else if (arg == "--served-model-name") {
             options.model_id_override = require_value("--served-model-name");
             if (options.model_id_override->empty()) {
@@ -626,6 +634,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    options.api_key = resolve_api_key(api_key, api_key_file);
     if (!max_context_explicit) { options.max_context = 0; } // auto by default
     if (!options.devices.empty()) {
         for (std::size_t i = 0; i < options.devices.size(); ++i) {

@@ -11,7 +11,9 @@ case "$scenario" in
     exit 0 ;;
 esac
 server=(--host 127.0.0.1 --port "${PORT:-8080}" --served-model-name demo)
-if [[ -n ${SUROGATE_API_KEY:-} ]]; then server+=(--api-key "$SUROGATE_API_KEY"); fi
+# A key file keeps the key out of the process's command line; SUROGATE_API_KEY still works.
+if [[ -n ${SUROGATE_API_KEY_FILE:-} ]]; then server+=(--api-key-file "$SUROGATE_API_KEY_FILE")
+elif [[ -n ${SUROGATE_API_KEY:-} ]]; then server+=(--api-key "$SUROGATE_API_KEY"); fi
 case "$scenario" in
   chat)
     exec surogate serve "${MODEL:-Qwen/Qwen3-0.6B}" "${server[@]}" \

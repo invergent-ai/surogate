@@ -16,6 +16,10 @@ print(client.chat.completions.create(
 
 `--api-key KEY` enables authentication with either `Authorization: Bearer KEY` or `x-api-key:
 KEY`; without it authentication is disabled. `/health` and CORS preflight requests are exempt.
+`--api-key-file PATH` reads the key from a file instead: one line of visible ASCII, surrounding
+whitespace ignored. This keeps the key out of the process's command line, which every local user
+can read in `/proc`. The server refuses `--api-key` and `--api-key-file` together, and warns when
+other users can read the file.
 `--cors` enables browser cross-origin requests. `--served-model-name ID` overrides the model id
 the server reports, which is how you keep a client's hard-coded model string working.
 

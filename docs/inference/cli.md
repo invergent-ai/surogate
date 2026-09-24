@@ -30,6 +30,7 @@ or after the model, and value options accept both `--flag value` and `--flag=val
 | `--host H` | `127.0.0.1` | Bind address; use `0.0.0.0` to accept remote connections |
 | `--port N` | `8080` | HTTP port |
 | `--api-key KEY` | none | Require this key through a bearer token or `x-api-key` header |
+| `--api-key-file PATH` | none | Read that key from a file instead, keeping it out of the process's command line |
 | `--served-model-name ID` | model argument | Name clients use in the `model` field |
 | `--cors` | off | Allow browser cross-origin requests |
 | `--max-request-mib N` | 384 | Maximum request body size |
