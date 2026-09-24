@@ -40,6 +40,12 @@ set_target_properties(surogate-stt PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     INSTALL_RPATH "$ORIGIN/../../../torch/lib")
 if(SUROGATE_SERVE_TESTS)
+    # The transcription reply contract (duration on every format); needs neither Torch nor a model.
+    add_executable(test_transcription_reply EXCLUDE_FROM_ALL ../../testing/serve/test_transcription_reply.cpp)
+    target_include_directories(test_transcription_reply PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SINFER_JSON_INCLUDE})
+    target_compile_options(test_transcription_reply PRIVATE -UNDEBUG)
+    set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS test_transcription_reply)
+    add_test(NAME transcription_reply COMMAND test_transcription_reply)
     add_executable(test_speech_cpu_ops EXCLUDE_FROM_ALL ../../testing/serve/test_speech_cpu_ops.cpp)
     target_link_libraries(test_speech_cpu_ops PRIVATE sinfer_speech)
     set_target_properties(test_speech_cpu_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #include "model.h"
 #include "audio.h"
+#include "transcription.h"
 #include "../serve/audio_http.h"
 #include <ATen/Parallel.h>
 #include <chrono>
@@ -146,15 +147,11 @@ int main(int argc, char** argv) {
                     if (!text.empty()) text += ' ';
                     text += segment;
                 }
-            if (format == "text")
-                r.set_content(text, "text/plain; charset=utf-8");
-            else if (format == "verbose_json")
-                response(r, {{"text", text},
-                             {"language", "romanian"},
-                             {"duration", pcm.size() / 16000.},
-                             {"task", "transcribe"}});
-            else
-                response(r, {{"text", text}});
+            // Every format reports the billed seconds (usage in JSON, and a header on all).
+            auto reply = sinfer::speech::transcription_reply(format, text, pcm.size());
+            for (auto& [header, value] : reply.headers) r.set_header(header, value);
+            r.status = 200;
+            r.set_content(std::move(reply.body), reply.content_type);
         });
         auto prune = [&]() {
             auto now = std::chrono::steady_clock::now();
