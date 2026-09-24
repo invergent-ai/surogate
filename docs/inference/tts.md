@@ -115,6 +115,17 @@ speed changes are unavailable. Unsupported fields return a JSON error. Reserved 
 structured dates/times and oversized expanded text are rejected. Split long
 inputs into separate requests.
 
+Every successful response carries `X-Usage-Characters`: the characters of
+`input` it was billed for. They are counted as sent, in Unicode code points, as
+the 4096-character limit counts them and as Python's `len()` does. A precomposed
+Romanian letter with a diacritic (ă, â, î, ș, ț) is one character, although it
+takes two UTF-8 bytes, so a gateway that counts request bytes would overcharge
+Romanian text by about 10%. A decomposed letter (a base letter followed by a
+combining mark) counts as two, and whitespace and bracketed spans that are not
+spoken count too. An account service that counts characters itself should use
+the same rule. Error responses (4xx and 5xx, including queue-full, timeout and
+worker failures) carry no count.
+
 The endpoint uses the OpenAI speech request shape for the supported fields, with
 WAV as its default format. For an OpenAI client, request `response_format="wav"`
 explicitly. This service speaks Romanian; it does not reproduce the separate

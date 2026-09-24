@@ -478,9 +478,13 @@ std::string normalize(const std::string& text) {
     return trim(sub(t, R"(\s+)", " "));
 }
 
+std::size_t input_characters(const std::string& text) {
+    return static_cast<std::size_t>(unicode(text).countChar32());
+}
+
 std::vector<std::vector<int32_t>> tokenize(const std::string& text) {
     auto input = unicode(text);
-    if (input.countChar32() > 4096) throw std::invalid_argument("input exceeds 4096 characters");
+    if (input_characters(text) > 4096) throw std::invalid_argument("input exceeds 4096 characters");
     for (int32_t i = 0; i < input.length();) {
         auto c = input.char32At(i);
         i += U16_LENGTH(c);

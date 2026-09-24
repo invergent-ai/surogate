@@ -93,7 +93,7 @@ serve-stt-build:
 # TTS-only build: C++20 and ICU development libraries, without Torch or CUDA.
 serve-tts-build:
 	cmake -S csrc/src/serve/tts -B csrc/build-tts -G Ninja -DCMAKE_BUILD_TYPE=Release
-	cmake --build csrc/build-tts --parallel $(PARALLEL_JOBS) --target surogate-tts test_tts_frontend
+	cmake --build csrc/build-tts --parallel $(PARALLEL_JOBS) --target surogate-tts test_tts_frontend test_tts_input_characters
 
 .PHONY: serve-stt-build serve-tts-build
 

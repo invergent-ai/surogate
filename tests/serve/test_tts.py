@@ -271,9 +271,12 @@ def test_native_http_auth_voice_switching_pcm_and_cleanup(bundle, tmp_path):
         work = Path(args[args.index(b"/dev/stdin") + 1].decode())
         first = client.post("/v1/audio/speech", json={"input": "Bună"})
         assert first.content == wav_bytes(12)
+        # Billed characters: four code points, although "ă" takes two bytes.
+        assert first.headers["x-usage-characters"] == "4"
         second = client.post("/v1/audio/speech", json={"input": "Bună", "voice": "doina", "response_format": "pcm"})
         assert second.status_code == 200 and second.content == bytes([11, 0]) * 100
         assert second.headers["x-audio-sample-rate"] == "22050"
+        assert second.headers["x-usage-characters"] == "4"
         with ThreadPoolExecutor(2) as pool:
             futures = [
                 pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "voice": name})
@@ -326,6 +329,7 @@ def test_native_http_rejects_invalid_fields(bundle, tmp_path, body):
     with native_server(bundle, tmp_path) as (client, _):
         r = client.post("/v1/audio/speech", json=body)
         assert r.status_code == 400 and "error" in r.json()
+        assert "x-usage-characters" not in r.headers  # an error response bills nothing
 
 
 def test_native_http_body_limits_and_worker_recovery(bundle, tmp_path):
@@ -333,28 +337,28 @@ def test_native_http_body_limits_and_worker_recovery(bundle, tmp_path):
         client,
         process,
     ):
-        assert client.post("/v1/audio/speech", content="{}", headers={"Content-Type": "text/plain"}).status_code == 415
-        assert (
-            client.post("/v1/audio/speech", content="{", headers={"Content-Type": "application/json"}).status_code
-            == 400
-        )
-        assert (
-            client.post(
-                "/v1/audio/speech", content=" " * 65537, headers={"Content-Type": "application/json"}
-            ).status_code
-            == 413
+        def unbilled(response, status):
+            # Error responses carry no billable character count.
+            assert response.status_code == status and "x-usage-characters" not in response.headers
+            return True
+
+        assert unbilled(client.post("/v1/audio/speech", content="{}", headers={"Content-Type": "text/plain"}), 415)
+        assert unbilled(client.post("/v1/audio/speech", content="{", headers={"Content-Type": "application/json"}), 400)
+        assert unbilled(
+            client.post("/v1/audio/speech", content=" " * 65537, headers={"Content-Type": "application/json"}), 413
         )
         original = child_pids(process.pid)
         with ThreadPoolExecutor(1) as pool:
             slow = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 102})
             time.sleep(0.1)
-            assert client.post("/v1/audio/speech", json={"input": "Bună"}).status_code == 429
-            assert slow.result().status_code == 504
+            assert unbilled(client.post("/v1/audio/speech", json={"input": "Bună"}), 429)
+            assert unbilled(slow.result(), 504)
         assert client.get("/health").status_code == 503
         assert not child_pids(process.pid)
-        assert client.post("/v1/audio/speech", json={"input": "Bună", "voice": "Tudor"}).content == wav_bytes(12)
+        recovered = client.post("/v1/audio/speech", json={"input": "Bună", "voice": "Tudor"})
+        assert recovered.content == wav_bytes(12) and recovered.headers["x-usage-characters"] == "4"
         assert child_pids(process.pid) != original
-        assert client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}).status_code == 503
+        assert unbilled(client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}), 503)
         assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
 
 

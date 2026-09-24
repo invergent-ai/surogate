@@ -12,6 +12,17 @@ import httpx
 import pytest
 
 
+def built_binary(root):
+    """Pin the server to this checkout's build. An editable install elsewhere would otherwise make the
+    launcher import its own copy of surogate and run that checkout's binary."""
+    if os.environ.get("SUROGATE_TTS_BIN"):
+        return {}
+    for candidate in (root / "csrc/build-serve/surogate-tts", root / "csrc/build-tts/surogate-tts"):
+        if candidate.is_file():
+            return {"SUROGATE_TTS_BIN": str(candidate)}
+    return {}
+
+
 def test_released_voices_over_http(tmp_path):
     model = os.environ.get("SUROGATE_TTS_TEST_MODEL")
     if not model:
@@ -40,7 +51,7 @@ def test_released_voices_over_http(tmp_path):
             cwd=root,
             stdout=log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONPATH": str(root)},
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONPATH": str(root), **built_binary(root)},
         )
     try:
         url = f"http://127.0.0.1:{port}"
@@ -67,6 +78,7 @@ def test_released_voices_over_http(tmp_path):
                 "Tudor": "75c8d92d8d2d8b684f34cc6e46ac2f47c652bd6e18e5542ddc8f5f4a37e58d8e",
                 "Radu": "018c5b37b7fd93b5726151e926820799832eec3d8ffe1e30a220d4f59d7baa21",
             }
+            text = "Bună, ce faci? Eu tocmai am ajuns acasă și încerc să-mi dau seama ce să mănânc."
             for voice, digest in expected.items():
                 response = client.post(
                     "/v1/audio/speech",
@@ -75,12 +87,20 @@ def test_released_voices_over_http(tmp_path):
                         "voice": voice,
                         "response_format": "wav",
                         "seed": 9,
-                        "input": "Bună, ce faci? Eu tocmai am ajuns acasă și încerc să-mi dau seama ce să mănânc.",
+                        "input": text,
                     },
                 )
                 assert response.status_code == 200, response.text[:500] if response.is_error else ""
                 assert hashlib.sha256(response.content).hexdigest() == digest
+                # Billed characters: Unicode code points, not the UTF-8 bytes of the diacritics.
+                assert response.headers["X-Usage-Characters"] == str(len(text))
+                assert len(text) < len(text.encode())
                 (tmp_path / f"{voice.lower()}.wav").write_bytes(response.content)
+            pcm = client.post("/v1/audio/speech", json={"input": "Țară.", "response_format": "pcm"})
+            assert pcm.status_code == 200 and pcm.headers["X-Usage-Characters"] == "5"
+            # A refused request bills nothing.
+            refused = client.post("/v1/audio/speech", json={"input": "ă" * 4097})
+            assert refused.status_code == 400 and "X-Usage-Characters" not in refused.headers
             assert "libcuda.so" not in Path(f"/proc/{process.pid}/maps").read_text()
             assert "/torch/" not in Path(f"/proc/{process.pid}/maps").read_text()
     finally:
