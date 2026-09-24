@@ -96,6 +96,21 @@ def test_released_voices_over_http(tmp_path):
                 assert response.headers["X-Usage-Characters"] == str(len(text))
                 assert len(text) < len(text.encode())
                 (tmp_path / f"{voice.lower()}.wav").write_bytes(response.content)
+            # Streamed: the same samples as the whole recording, as they are made.
+            with client.stream("POST", "/v1/audio/speech",
+                               json={"voice": "Radu", "seed": 9, "input": text, "response_format": "pcm",
+                                     "stream_format": "audio"}) as r:
+                assert r.status_code == 200 and r.headers["X-Usage-Characters"] == str(len(text))
+                assert r.read() == (tmp_path / "radu.wav").read_bytes()[44:]
+            # A client that leaves mid-stream: its request is stopped, and the same worker (one
+            # model load, checked at the end) serves the next request exactly as before.
+            with client.stream("POST", "/v1/audio/speech",
+                               json={"voice": "Tudor", "input": " ".join([text] * 6), "stream_format": "audio"}) as r:
+                assert r.status_code == 200
+                next(r.iter_raw())
+            again = client.post("/v1/audio/speech",
+                                json={"voice": "Doina", "response_format": "wav", "seed": 9, "input": text})
+            assert hashlib.sha256(again.content).hexdigest() == expected["Doina"]
             pcm = client.post("/v1/audio/speech", json={"input": "Țară.", "response_format": "pcm"})
             assert pcm.status_code == 200 and pcm.headers["X-Usage-Characters"] == "5"
             # A refused request bills nothing.

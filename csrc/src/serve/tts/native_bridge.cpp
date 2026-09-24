@@ -1,11 +1,16 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 // Adapter for the pinned native model runtime. Resolved after its library loads.
 #include "vendor/magpie_runtime.h"
-#include <sstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -14,6 +19,17 @@
 static void le(std::ostream& out, uint32_t value, int bytes) {
     for (int index = 0; index < bytes; ++index)
         out.put(static_cast<char>((value >> (8 * index)) & 255));
+}
+
+// Writes all of `data` to `fd`; false when the reader has gone.
+static bool write_all(int fd, const std::string& data) {
+    for (size_t written = 0; written < data.size();) {
+        const auto n = write(fd, data.data() + written, data.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        written += static_cast<size_t>(n);
+    }
+    return true;
 }
 
 static void wav(const std::string& path, const std::vector<uint8_t>& audio, int rate) {
@@ -67,13 +83,40 @@ extern "C" int surogate_tts_worker_main(int argc, char** argv) {
     config.override_temperature = true;
     config.cfg_scale            = 1.5f;
     config.override_cfg_scale   = true;
+    // OUTPUT_DIR "-" or "fd:N": stream mode. Audio goes to stdout (or to descriptor N) as it is
+    // produced, one frame per PCM chunk ("ID pcm N\n" and N bytes of 16-bit mono PCM), then
+    // "ID done RATE AUDIO_S ELAPSED_S TTFA_MS\n"; no files. A "cancel" line on stdin while a
+    // request is synthesized stops it at its next audio chunk, which is then answered with
+    // "ID cancelled\n" instead; a "cancel" line between requests (one that came too late) is
+    // skipped. Otherwise each request's WAV and stats go to OUTPUT_DIR.
+    const std::string output = argv[4];
+    const bool stream        = output == "-" || output.starts_with("fd:");
+    // The frames get a descriptor of their own, and anything else that writes to stdout (the
+    // runtime's libraries included) lands on stderr, so a stray line can never split a frame's
+    // header from its audio. surogate-tts-worker sets this up before it loads the runtime and
+    // passes "fd:N"; "-" does it here.
+    int protocol = -1;
+    if (output.starts_with("fd:")) {
+        protocol = std::atoi(output.c_str() + 3);
+        if (protocol < 3) return 2;
+    } else if (stream) {
+        std::cout.flush();
+        std::fflush(stdout);
+        protocol = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+        if (protocol < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
+            std::cerr << "Cannot set up the worker's output\n";
+            return 3;
+        }
+    }
     try {
         MagpieTtsRuntime synth(config);
         std::ifstream jobs(argv[3]);
-        std::ofstream report(std::string(argv[4]) + "/stats.jsonl");
-        if (!jobs || !report) throw std::runtime_error("Cannot open jobs or stats");
+        std::ofstream report;
+        if (!stream) report.open(std::string(argv[4]) + "/stats.jsonl");
+        if (!jobs || (!stream && !report)) throw std::runtime_error("Cannot open jobs or stats");
         std::string line;
         while (std::getline(jobs, line)) {
+            if (stream && line == "cancel") continue;
             std::istringstream fields(line);
             std::string id, voice_text, seed_text, temperature_text, guidance_text, encoded;
             std::getline(fields, id, '\t');
@@ -106,6 +149,38 @@ extern "C" int surogate_tts_worker_main(int argc, char** argv) {
                 chunks.push_back(std::move(tokens));
             }
             if (chunks.empty()) throw std::runtime_error("Empty request");
+            if (stream) {
+                bool produced = false, cancelled = false;
+                MagpieSynthesisStats stats{};
+                try {
+                    stats = synth.synthesize(chunks, options, [&](const std::string& pcm) {
+                        // Anything on stdin now is the server's cancel: the next job only comes
+                        // after this one is answered.
+                        if (jobs.rdbuf()->in_avail() > 0) {
+                            cancelled = true;
+                            return false;
+                        }
+                        if (pcm.empty()) return true;
+                        produced = true;
+                        return write_all(protocol, id + " pcm " + std::to_string(pcm.size()) + "\n" + pcm);
+                    });
+                } catch (const std::exception&) {
+                    if (!cancelled) throw;
+                }
+                if (cancelled) {
+                    if (!std::getline(jobs, line) || line != "cancel")
+                        throw std::runtime_error("Expected a cancel line");
+                    if (!write_all(protocol, id + " cancelled\n")) throw std::runtime_error("Output closed");
+                    continue;
+                }
+                if (!produced) throw std::runtime_error("Empty audio output");
+                std::ostringstream done;
+                done.imbue(std::locale::classic());
+                done << id << " done " << stats.sample_rate << ' ' << stats.audio_s << ' '
+                     << stats.elapsed_s << ' ' << stats.ttfa_ms << '\n';
+                if (!write_all(protocol, done.str())) throw std::runtime_error("Output closed");
+                continue;
+            }
             const std::string file = std::string(argv[4]) + "/" + id + ".wav";
             if (std::ifstream(file))
                 throw std::runtime_error("Output exists; do not overwrite audio");

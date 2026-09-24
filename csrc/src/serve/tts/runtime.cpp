@@ -7,7 +7,6 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <fstream>
 #include <iomanip>
 #include <sstream>
 extern char** environ;
@@ -16,7 +15,18 @@ namespace sinfer::tts {
 using sinfer::serve::audio::HttpError;
 
 namespace {
-constexpr size_t max_audio = 64 * 1024 * 1024;
+constexpr size_t max_audio = 96 * 1024 * 1024; // 38 minutes of 22,050 Hz 16-bit audio
+
+/// The next field of a worker line as a byte count: decimal digits only (no sign, no space), so a
+/// malformed frame is refused rather than read as a huge or wrapped size.
+bool byte_count(std::istringstream& fields, size_t& bytes) {
+    std::string text;
+    if (!(fields >> text) || text.empty() || text.size() > 12 ||
+        text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    bytes = static_cast<size_t>(std::stoull(text));
+    return true;
+}
 
 /// The CUDA_VISIBLE_DEVICES the worker gets: none on the CPU; for `--device N`, the N-th card this
 /// process may use, so N means what it means to the LLM server (an ordinal among the visible
@@ -43,12 +53,6 @@ std::string worker_visible_devices(const std::string& device) {
     return visible[index];
 }
 
-uint32_t le(const std::string& data, size_t offset, size_t count) {
-    uint32_t result = 0;
-    for (size_t i = 0; i < count; ++i)
-        result |= uint32_t(static_cast<unsigned char>(data.at(offset + i))) << (8 * i);
-    return result;
-}
 } // namespace
 
 Runtime::Runtime(std::filesystem::path root, int max_pending, double timeout, int threads,
@@ -83,19 +87,12 @@ void Runtime::stop() noexcept {
         kill(pid, SIGKILL);
         while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
     }
-    std::error_code error;
-    if (!directory_.empty()) std::filesystem::remove_all(directory_, error);
-    directory_.clear();
     buffered_.clear();
 }
 
 void Runtime::spawn() {
     if (healthy()) return;
     stop();
-    auto pattern = (std::filesystem::temp_directory_path() / "surogate-tts-XXXXXX").string();
-    if (!mkdtemp(pattern.data())) throw HttpError(503, "Cannot create native TTS workspace");
-    directory_ = pattern;
-    std::filesystem::create_symlink("/dev/null", directory_ / "stats.jsonl");
     int in[2] = {-1, -1}, out[2] = {-1, -1};
     if (pipe2(in, O_CLOEXEC) || pipe2(out, O_CLOEXEC)) {
         for (int fd : {in[0], in[1], out[0], out[1]})
@@ -110,7 +107,7 @@ void Runtime::spawn() {
                                           (root_ / "model.gguf").string(),
                                           (root_ / "codec.gguf").string(),
                                           "/dev/stdin",
-                                          directory_.string(),
+                                          "-", // stream mode: audio frames on stdout, no files
                                           std::to_string(threads_),
                                           std::to_string(codec_threads_),
                                           kernels_,
@@ -179,26 +176,85 @@ void Runtime::wait_fd(int fd, short event, Clock::time_point deadline,
     }
 }
 
-std::string Runtime::synthesize(const std::vector<std::vector<int32_t>>& chunks, const Voice& voice,
-                                int seed, const std::function<bool()>& cancelled) {
-    auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                                       std::chrono::duration<double>(timeout_));
-    int pending = pending_.fetch_add(1);
+std::string wav_header(uint32_t sample_rate, uint32_t data_bytes) {
+    std::string header;
+    header.reserve(44);
+    const auto put = [&](uint32_t value, int bytes) {
+        for (int i = 0; i < bytes; ++i) header.push_back(static_cast<char>((value >> (8 * i)) & 255));
+    };
+    // An unknown length (a stream) is written as the largest one, which players read as "until
+    // the end of the data".
+    const bool open_ended = data_bytes == 0xFFFFFFFFu;
+    header += "RIFF";
+    put(open_ended ? 0xFFFFFFFFu : 36 + data_bytes, 4);
+    header += "WAVEfmt ";
+    put(16, 4);
+    put(1, 2);
+    put(1, 2);
+    put(sample_rate, 4);
+    put(sample_rate * 2, 4);
+    put(2, 2);
+    put(16, 2);
+    header += "data";
+    put(data_bytes, 4);
+    return header;
+}
 
-    struct Release {
-        std::atomic<int>& n;
+void Runtime::Lease::release_worker() {
+    if (owner_ == nullptr || !held_) return;
+    {
+        const std::lock_guard lock(owner_->assign_mutex_);
+        owner_->leased_ = false;
+        held_           = false;
+    }
+    owner_->freed_.notify_one();
+}
 
-        ~Release() { --n; }
-    } release{pending_};
+Runtime::Lease::~Lease() {
+    if (owner_ == nullptr) return;
+    release_worker();
+    owner_->pending_.fetch_sub(1);
+}
 
+std::unique_ptr<Runtime::Lease> Runtime::acquire(const std::function<bool()>& cancelled) {
+    auto lease       = std::unique_ptr<Lease>(new Lease());
+    lease->deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                          std::chrono::duration<double>(timeout_));
+    const int pending = pending_.fetch_add(1);
+    lease->owner_     = this;
     if (pending >= max_pending_ + 1) throw HttpError(429, "TTS request queue is full");
-    std::unique_lock lock(mutex_, std::defer_lock);
-    while (!lock.try_lock_for(std::chrono::milliseconds(25))) check(deadline, cancelled);
+    std::unique_lock lock(assign_mutex_);
+    while (leased_) {
+        freed_.wait_for(lock, std::chrono::milliseconds(25));
+        lock.unlock();
+        check(lease->deadline_, cancelled);
+        lock.lock();
+    }
+    leased_       = true;
+    lease->held_  = true;
+    lock.unlock();
     // A queued timeout must not stop the request that owns the worker.
-    check(deadline, cancelled);
+    check(lease->deadline_, cancelled);
+    return lease;
+}
+
+int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunks, const Voice& voice,
+                    int seed, const std::function<bool()>& cancelled,
+                    const std::function<bool(std::string_view)>& on_pcm) {
+    if (lease.owner_ != this || !lease.held_) throw std::logic_error("TTS worker not leased");
+    const auto deadline = lease.deadline_;
+    // What a cancelled GPU request needs to hand its worker back intact (see drain()).
+    bool cancel_requested = false, job_sent = false;
+    size_t frame_left = 0;
+    std::string identity;
+    const std::function<bool()> watched = [&] {
+        if (!cancelled()) return false;
+        cancel_requested = true;
+        return true;
+    };
     try {
         spawn();
-        auto identity = std::to_string(++counter_) + "-v" + std::to_string(voice.id);
+        identity = std::to_string(++counter_) + "-v" + std::to_string(voice.id);
         std::ostringstream job;
         job.imbue(std::locale::classic());
         job << identity << '\t' << voice.id << '\t' << seed << '\t' << voice.temperature << '\t'
@@ -213,47 +269,130 @@ std::string Runtime::synthesize(const std::vector<std::vector<int32_t>>& chunks,
         job << '\n';
         auto command = job.str();
         for (size_t written = 0; written < command.size();) {
-            wait_fd(input_, POLLOUT, deadline, cancelled);
+            wait_fd(input_, POLLOUT, deadline, watched);
             auto n = write(input_, command.data() + written, command.size() - written);
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
             written += n;
         }
-        bool complete = false;
-        while (!complete) {
-            auto newline = buffered_.find('\n');
-            if (newline != std::string::npos) {
-                auto line = buffered_.substr(0, newline);
-                buffered_.erase(0, newline + 1);
-                complete = line.starts_with(identity + " ");
+        job_sent = true;
+        // Reads until `buffered_` holds `bytes` bytes.
+        const auto fill = [&](size_t bytes) {
+            while (buffered_.size() < bytes) {
+                wait_fd(output_, POLLIN, deadline, watched);
+                char block[65536];
+                auto n = read(output_, block, sizeof(block));
+                if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+                if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
+                buffered_.append(block, n);
+            }
+        };
+        size_t produced = 0;
+        for (;;) {
+            size_t newline;
+            while ((newline = buffered_.find('\n')) == std::string::npos) {
+                if (buffered_.size() > 4096) throw HttpError(503, "Invalid native TTS output");
+                fill(buffered_.size() + 1);
+            }
+            const auto line = buffered_.substr(0, newline);
+            buffered_.erase(0, newline + 1);
+            if (!line.starts_with(identity + " ")) continue;
+            std::istringstream fields(line.substr(identity.size() + 1));
+            fields.imbue(std::locale::classic());
+            std::string kind;
+            fields >> kind;
+            if (kind == "pcm") {
+                size_t bytes = 0;
+                if (!byte_count(fields, bytes) || bytes == 0 || bytes % 2 || bytes > max_audio - produced)
+                    throw HttpError(503, "Native TTS returned invalid or oversized audio");
+                frame_left = bytes;
+                fill(bytes);
+                produced += bytes;
+                const bool wanted = on_pcm(std::string_view(buffered_).substr(0, bytes));
+                buffered_.erase(0, bytes);
+                frame_left = 0;
+                if (!wanted) {
+                    cancel_requested = true;
+                    throw HttpError(503, "TTS request cancelled");
+                }
+                check(deadline, watched);
                 continue;
             }
-            wait_fd(output_, POLLIN, deadline, cancelled);
-            char block[4096];
-            auto n = read(output_, block, sizeof(block));
-            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-            if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
-            buffered_.append(block, n);
-            if (buffered_.size() > 1024 * 1024) throw HttpError(503, "Invalid native TTS output");
+            int sample_rate = 0;
+            if (kind != "done" || !(fields >> sample_rate) || sample_rate != 22050 || produced == 0)
+                throw HttpError(503, "Native TTS returned invalid audio");
+            return sample_rate;
         }
-        check(deadline, cancelled);
-        auto audio = directory_ / (identity + ".wav");
-        if (!std::filesystem::is_regular_file(audio) ||
-            std::filesystem::file_size(audio) > max_audio)
-            throw HttpError(503, "Native TTS returned missing or oversized audio");
-        std::ifstream stream(audio, std::ios::binary);
-        std::string data((std::istreambuf_iterator<char>(stream)), {});
-        std::filesystem::remove(audio);
-        // This worker emits a canonical 44-byte PCM WAV header.
-        if (data.size() <= 44 || data.compare(0, 4, "RIFF") || data.compare(8, 8, "WAVEfmt ") ||
-            le(data, 16, 4) != 16 || le(data, 20, 2) != 1 || le(data, 22, 2) != 1 ||
-            le(data, 24, 4) != 22050 || le(data, 34, 2) != 16 || data.compare(36, 4, "data") ||
-            le(data, 40, 4) != data.size() - 44 || (data.size() - 44) % 2)
-            throw HttpError(503, "Native TTS returned invalid audio");
-        return data;
     } catch (...) {
+        // A request whose client left gives its worker back intact: the worker is told to stop
+        // at its next audio chunk, and what it wrote before that is read and dropped. The next
+        // request then pays no new model load (on a GPU, no new CUDA context and upload, of
+        // memory a neighbouring server could take in between). Anything else replaces the
+        // worker, and so does a cancel at shutdown, which must not wait for the worker.
+        if (cancel_requested && job_sent && !stopping_ && drain(identity, frame_left)) throw;
         stop();
         throw;
     }
+}
+
+bool Runtime::drain(const std::string& identity, size_t frame_left) noexcept {
+    try {
+        const auto until = Clock::now() + std::chrono::seconds(30);
+        // A shutdown during the drain ends it; the worker is then killed.
+        const std::function<bool()> stopping = [this] { return stopping_.load(); };
+        static constexpr std::string_view cancel = "cancel\n";
+        for (size_t written = 0; written < cancel.size();) {
+            wait_fd(input_, POLLOUT, until, stopping);
+            auto n = write(input_, cancel.data() + written, cancel.size() - written);
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            if (n <= 0) return false;
+            written += static_cast<size_t>(n);
+        }
+        const auto fill = [&](size_t bytes) {
+            while (buffered_.size() < bytes) {
+                wait_fd(output_, POLLIN, until, stopping);
+                char block[65536];
+                auto n = read(output_, block, sizeof(block));
+                if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+                if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
+                buffered_.append(block, n);
+            }
+        };
+        fill(frame_left);
+        buffered_.erase(0, frame_left);
+        for (;;) {
+            size_t newline;
+            while ((newline = buffered_.find('\n')) == std::string::npos) {
+                if (buffered_.size() > 4096) return false;
+                fill(buffered_.size() + 1);
+            }
+            const auto line = buffered_.substr(0, newline);
+            buffered_.erase(0, newline + 1);
+            if (!line.starts_with(identity + " ")) continue;
+            std::istringstream fields(line.substr(identity.size() + 1));
+            fields.imbue(std::locale::classic());
+            std::string kind;
+            fields >> kind;
+            if (kind == "done" || kind == "cancelled") return true;
+            size_t bytes = 0;
+            if (kind != "pcm" || !byte_count(fields, bytes) || bytes > max_audio) return false;
+            fill(bytes);
+            buffered_.erase(0, bytes);
+        }
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string Runtime::synthesize(const std::vector<std::vector<int32_t>>& chunks, const Voice& voice,
+                                int seed, const std::function<bool()>& cancelled) {
+    auto lease = acquire(cancelled);
+    std::string pcm;
+    const int rate = stream(*lease, chunks, voice, seed, cancelled, [&](std::string_view part) {
+        pcm.append(part);
+        return true;
+    });
+    // The canonical 44-byte header of 16-bit mono PCM.
+    return wav_header(static_cast<uint32_t>(rate), static_cast<uint32_t>(pcm.size())) + pcm;
 }
 } // namespace sinfer::tts

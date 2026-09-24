@@ -113,7 +113,7 @@ _VALUE_OPTIONS = {
     """.split()),
     "embed": frozenset("--host --port --device --served-model-name".split()),
     "stt": frozenset("--host --port --device --served-model-name --api-key --api-key-file --max-num-seqs --threads --cpu-kernels".split()),
-    "tts": frozenset("--host --port --device --served-model-name --api-key --api-key-file --voice --max-pending-requests --request-timeout --threads --codec-threads --cpu-kernels".split()),
+    "tts": frozenset("--host --port --device --served-model-name --api-key --api-key-file --voice --max-pending-requests --request-timeout --max-input-characters --threads --codec-threads --cpu-kernels".split()),
 }
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""

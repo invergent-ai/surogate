@@ -40,6 +40,7 @@ def test_native_help_describes_every_option(mode):
     ("stt", "--threads", ["0", "-1", "257", "four", "4oops"]),
     ("tts", "--threads", ["0", "-1", "257", "four", "4oops"]),
     ("tts", "--codec-threads", ["-1", "257", "four", "4oops"]),
+    ("tts", "--max-input-characters", ["0", "-1", "16385", "many"]),
     ("stt", "--cpu-kernels", ["missing"]),
     ("tts", "--cpu-kernels", ["missing"]),
 ])
