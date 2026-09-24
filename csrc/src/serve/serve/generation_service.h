@@ -90,7 +90,16 @@ struct DecisionsOutcome {
     double total_seconds   = 0.0;
 };
 
+/// The usage the Chat Completions, Completions and Anthropic Messages endpoints report.
+[[nodiscard]] inline CompletionUsage completion_usage(const GenerationOutcome& outcome) {
+    return completion_usage(outcome.prompt_tokens, outcome.completion_tokens,
+                            outcome.metrics.prefix_cache_hit_tokens);
+}
+
 struct StreamSink {
+    /// The prompt has been prefilled and `reused_prompt_tokens` of it came from the prefix
+    /// cache. Called at most once, before the first content (see sinfer::OutputSink).
+    std::function<void(std::uint32_t reused_prompt_tokens)> on_prompt_ready;
     std::function<void(const GenerationOutcome&)> on_scores;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;

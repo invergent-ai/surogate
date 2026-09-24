@@ -12,10 +12,9 @@ re-sent each round. The prompt therefore grows by a known amount per turn while 
 constant.
 
 **The measurement is behavioural, not telemetric.** Chat Completions does not report cached
-tokens on every engine — this server reports them on `/v1/responses` and in its request log, vLLM
-reports them in `usage.prompt_tokens_details` — so the probe reads that field when it is offered
-but does not depend on it. What it always has is TTFT against prompt length, and those two
-settle the question on their own:
+tokens on every engine — this server and vLLM report them in `usage.prompt_tokens_details` — so
+the probe reads that field when it is offered but does not depend on it. What it always has is
+TTFT against prompt length, and those two settle the question on their own:
 
 * a working prefix cache makes TTFT track the tokens **new** since the last turn, so it stays
   roughly flat while the prompt grows;

@@ -778,7 +778,8 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
         {"choices", Json::array({std::move(choice)})},
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
-                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
+                       {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}}}};
     // The prompt's ids sit at the top level, where vLLM puts them, because they
     // belong to the request rather than to any one choice.
     if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
@@ -894,7 +895,8 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
     payload["choices"] = Json::array();
     payload["usage"]   = Json{{"prompt_tokens", usage.prompt_tokens},
                               {"completion_tokens", usage.completion_tokens},
-                              {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+                              {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
+                              {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}};
     return sse_event(payload);
 }
 
@@ -988,7 +990,8 @@ std::string make_completion_response(const std::string& id, const std::string& m
                                       {"finish_reason", finish_reason}}})},
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
-                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
+                       {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}}}};
     const Json chat = chat_completion_payload(id, model, created, "", "", "", {}, detail);
     if (chat.contains("prompt_logprobs")) payload["prompt_logprobs"] = chat["prompt_logprobs"];
     if (detail.include_token_ids) {
@@ -1053,7 +1056,8 @@ std::string make_completion_chunk_usage(const std::string& id, const std::string
     payload["choices"] = Json::array();
     payload["usage"]   = Json{{"prompt_tokens", usage.prompt_tokens},
                               {"completion_tokens", usage.completion_tokens},
-                              {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+                              {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
+                              {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}};
     return sse_event(payload);
 }
 

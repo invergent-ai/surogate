@@ -86,7 +86,9 @@ def require_usage(usage: Any, prompt_key: str, completion_key: str) -> tuple[int
         raise ContractError("response usage is not an object")
     prompt = usage.get(prompt_key)
     completion = usage.get(completion_key)
-    if not isinstance(prompt, int) or prompt <= 0:
+    # Anthropic reports the cached part of the prompt apart: input_tokens can be 0 on a full hit.
+    cached = usage.get("cache_read_input_tokens", 0) if prompt_key == "input_tokens" else 0
+    if not isinstance(prompt, int) or prompt < 0 or prompt + (cached if isinstance(cached, int) else 0) <= 0:
         raise ContractError(f"invalid {prompt_key}: {prompt!r}")
     if not isinstance(completion, int) or completion < 0:
         raise ContractError(f"invalid {completion_key}: {completion!r}")
@@ -368,7 +370,10 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("streamed reasoning differs from the non-streaming greedy response")
     if stream_finish != nonstream["choices"][0]["finish_reason"]:
         raise ContractError("streamed and non-streaming finish reasons differ")
-    if stream_usage != nonstream["usage"]:
+    # The streamed request repeats the prompt, so its cached part (prompt_tokens_details) may be
+    # larger; the token counts themselves must agree.
+    counted = ("prompt_tokens", "completion_tokens", "total_tokens")
+    if not isinstance(stream_usage, dict) or any(stream_usage.get(k) != nonstream["usage"].get(k) for k in counted):
         raise ContractError("streamed and non-streaming usage differs")
 
     responses_input = "Reply with a single short word."
@@ -465,8 +470,10 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     anthropic_input_tokens, _ = require_usage(
         anthropic.get("usage"), "input_tokens", "output_tokens"
     )
-    if anthropic_input_tokens != input_tokens:
-        raise ContractError("Anthropic usage input_tokens differs from count_tokens")
+    # input_tokens excludes the cached part (cache_read_input_tokens); together they are the prompt.
+    anthropic_cached = anthropic["usage"].get("cache_read_input_tokens", 0)
+    if anthropic_input_tokens + anthropic_cached != input_tokens:
+        raise ContractError("Anthropic usage input_tokens + cache_read_input_tokens differs from count_tokens")
 
     return {
         "format": "sinfer_serve_contract_v2",
