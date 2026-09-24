@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #pragma once
 // Common HTTP contracts for native STT and TTS, independent of the model backend.
+#include "http_socket.h"
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <iostream>
@@ -39,6 +41,7 @@ inline bool same_key(const std::string& a, const std::string& b) {
 }
 
 inline void configure(httplib::Server& server, const std::string& key, size_t max_body) {
+    disable_nagle(server); // both servers call this before they bind
     server.set_payload_max_length(max_body);
     server.set_read_timeout(60);
     server.set_pre_routing_handler([key](const httplib::Request& q, httplib::Response& r) {

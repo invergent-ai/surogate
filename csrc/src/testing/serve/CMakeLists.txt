@@ -187,6 +187,9 @@ sinfer_add_test(sinfer_lora_admin_http_test SOURCES test_lora_admin_http.cpp LIB
 target_compile_options(sinfer_lora_admin_http_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_model_routing_http_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_shutdown_http_test SOURCES test_shutdown_http.cpp LIBRARIES sinfer_serve)
+# TCP_NODELAY on the HTTP servers: socket options and keep-alive timing, no model or GPU.
+sinfer_add_test(sinfer_http_nodelay_test SOURCES test_http_nodelay.cpp LIBRARIES sinfer_serve)
+target_compile_options(sinfer_http_nodelay_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_shutdown_http_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_model_wake_http_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_pipeline_partition_test SOURCES test_pipeline_partition.cpp)

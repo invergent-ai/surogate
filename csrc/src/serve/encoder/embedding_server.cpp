@@ -28,6 +28,7 @@
 #include "encoder/embedding_request.h"
 #include "encoder/cpu/cpu_text_embedding.h"
 #include "encoder/text_embedding.h"
+#include "serve/http_socket.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -140,6 +141,7 @@ int main(int argc, char** argv) {
         };
 
         httplib::Server server;
+        sinfer::serve::disable_nagle(server);
         server.Get("/health", [](const httplib::Request&, httplib::Response& response) {
             response.set_content(json{{"status", "ok"}}.dump(), "application/json");
         });
