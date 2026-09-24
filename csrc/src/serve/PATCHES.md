@@ -3447,3 +3447,26 @@ Measured on an RTX 5090, Rune, 15 s per level: short decisions at 8 clients 43.4
 Q4_K_M (p50 184 -> 173 ms) and 31.7 -> 34.1 on Q6_K (252 -> 235 ms); 1,000-token decisions at 8
 clients 9.8 -> 10.8 req/s (Q4_K_M) and 7.4 -> 8.4 (Q6_K). Answers are bit-identical: the decisions
 v1 golden set at tolerance 0, and the same answers as before alone and under 8-client load.
+
+## 97
+
+**A decision's first token from its candidates' head rows alone (2026-09-24, latency after #14).**
+
+A one-question decision is a plain prompt with 2-4 `next_token_candidates` and one output token.
+When its prompt finished in a packed round, the zero-suffix step projected the whole
+262,144-row LM head and sampled the whole vocabulary, about 0.8 ms of GPU per decision, only for
+the observer to read the candidates' logits. When the request asks for nothing else (no
+log-probabilities, constraint, logit bias, LoRA or speculative head, at most 16 candidates) and the
+head is an unsegmented GGML weight, `sample_from_hidden` now projects the candidate rows alone
+(`ops::linear_rows`, one row each, then the logit scale and softcap) and hands their values to the
+request; the first candidate stands for the token, with no log-probability, as for a readout
+(`finish_readout_prefills`). Every kernel the GGML route may choose computes a row with the same
+arithmetic whatever the row count, so the values are the whole head's, bit for bit
+(`linear_rows_match_linear`; the K-quant test checks rows against the whole projection, the big
+fixture included). `SUROGATE_SERVE_CANDIDATE_HEAD=0` keeps the whole head, for comparison.
+
+Measured on an RTX 5090, Rune: the head's GEMV and sampling kernels (about 4% of GPU kernel time at
+8 clients) are gone; answers are identical with the switch on and off and to main (the decisions v1
+golden set alone and under 8-client load, and at tolerance 0). Throughput moves little (Q4_K_M
+short decisions at 16 clients 52.1 -> 53.1 req/s, p50 326 -> 300 ms; Q6_K flat): the first-token
+steps are now bound by their host-side synchronization, which batching them would remove.

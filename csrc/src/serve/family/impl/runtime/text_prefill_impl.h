@@ -8,7 +8,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include <cstdio>
 #include <cstdlib>
@@ -210,6 +213,36 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     LoraPrefillScope lora_scope(state.lora_slot, 1, state.execution.device.stream);
+    if (!state.candidate_only.empty() && state.candidate_logits != nullptr && card.candidate_rows_exact()) {
+        // A decision reads its candidates' logits and nothing else: their head rows alone, not
+        // the whole vocabulary's, and no sampling. The values are the whole head's, bit for bit.
+        // The first candidate stands for the token, with no log-probability, as for a readout.
+        const auto count          = static_cast<std::int32_t>(state.candidate_only.size());
+        const cudaStream_t stream = state.execution.device.stream;
+        Tensor candidate          = state.execution.work.alloc(DType::BF16, {count, 1});
+        if (card.candidate_logits_from_hidden(hidden, state.candidate_only, candidate)) {
+            CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
+                                       sizeof(absolute_position), cudaMemcpyHostToDevice, stream));
+            ops::set_i32_scalar(state.execution.io.token, state.candidate_only.front(), stream);
+            if (state.execution.io.logprob.data != nullptr) {
+                static const float kNoLogprob = std::numeric_limits<float>::quiet_NaN();
+                CUDA_CHECK(cudaMemcpyAsync(state.execution.io.logprob.data, &kNoLogprob, sizeof(float),
+                                           cudaMemcpyHostToDevice, stream));
+            }
+            // Into pageable memory: the copy returns when the values are on the host.
+            std::vector<std::uint16_t> raw(static_cast<std::size_t>(count));
+            CUDA_CHECK(cudaMemcpyAsync(raw.data(), candidate.data, raw.size() * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            state.candidate_logits->resize(raw.size());
+            for (std::size_t i = 0; i < raw.size(); ++i) {
+                const std::uint32_t bits = static_cast<std::uint32_t>(raw[i]) << 16;
+                std::memcpy(&(*state.candidate_logits)[i], &bits, sizeof(float));
+            }
+            state.execution.work.reset();
+            return;
+        }
+    }
     card.logits_from_hidden(hidden, logits);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,

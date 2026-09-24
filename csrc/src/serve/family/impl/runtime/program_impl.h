@@ -34,6 +34,16 @@ inline bool round_trace_enabled() {
     static const bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
     return enabled;
 }
+/// Whether a decision's first token projects only its candidates' head rows (sample_from_hidden).
+/// SUROGATE_SERVE_CANDIDATE_HEAD=0 projects the whole head and samples, as before, for comparison;
+/// the candidate logits are the same bits either way.
+inline bool candidate_only_first_tokens() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_CANDIDATE_HEAD");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
 // FNV-1a over every slot's layer-0 recurrent state, so a lane's state can be followed across
 // rounds and its writers identified.
 template <typename Pool>
@@ -2602,6 +2612,23 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (round_trace_enabled()) {
                 std::fprintf(stderr, "round-trace: zero-suffix lane=%u prompt_tokens=%u\n",
                              sequence.lane, staged.prompt_tokens);
+            }
+            // A decision's first token needs its candidates' logits and nothing else (#14's
+            // latency follow-up): their head rows alone, no sampling, the same values. Up to 16
+            // candidates: each row is its own small launch, and past a few dozen the whole head
+            // is cheaper.
+            const bool candidate_only =
+                candidate_only_first_tokens() && stage_holds_head() &&
+                speculative_backend == SpeculativeBackend::None &&
+                !request.next_token_candidates.empty() && request.next_token_candidates.size() <= 16 &&
+                !request.target_only &&
+                request.top_logprobs < 0 && request.prompt_logprobs < 0 &&
+                request.constraint == nullptr && request.logit_bias_host.empty() &&
+                request.lora_slot < 0;
+            if (candidate_only) {
+                schedule_state.candidate_only   = std::span<const std::int32_t>(
+                    request.next_token_candidates.data(), request.next_token_candidates.size());
+                schedule_state.candidate_logits = &request.next_token_logits;
             }
             schedule::sample_from_hidden(schedule_state, sequence.tail_hidden,
                                          checked_i32(staged.prompt_tokens, "sample position"),

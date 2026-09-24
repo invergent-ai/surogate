@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 #include <array>
 #include <functional>
 #include <optional>
@@ -74,6 +75,11 @@ struct PrefillContext {
     int score_prompt_end = 0;
     std::function<void(const Tensor&, int, bool)> logprob_observer;
     std::int32_t rope_delta = 0;
+    /// A first token that needs only these candidates' logits (a decision): sample_from_hidden
+    /// projects their head rows alone into `candidate_logits`, and the first candidate stands in
+    /// for the sampled token, as for a readout. Empty for an ordinary first token.
+    std::span<const std::int32_t> candidate_only{};
+    std::vector<float>* candidate_logits = nullptr;
 };
 
 struct OrdinaryBatchContext {

@@ -1055,6 +1055,31 @@ void TextContext::logits_from_hidden(const Tensor& hidden, Tensor& logits) {
     apply_logit_softcap(cfg_, logits, ctx_.stream);
 }
 
+bool TextContext::candidate_rows_exact() const {
+    return ops::linear_rows_match_linear(*lm_head_) && !ops::lora_active();
+}
+
+bool TextContext::candidate_logits_from_hidden(const Tensor& hidden,
+                                               std::span<const std::int32_t> ids, Tensor& logits) {
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), 1}, "cached hidden");
+    require_tensor_shape(logits, DType::BF16, {static_cast<std::int32_t>(ids.size()), 1},
+                         "candidate logits");
+    if (ids.empty() || !candidate_rows_exact()) { return false; }
+    for (const std::int32_t id : ids) {
+        if (id < 0 || id >= lm_head_->n) { throw std::invalid_argument("candidate token outside the head"); }
+    }
+    auto scope     = work_.scope();
+    const Tensor x = lm_head_view(hidden, ctx_.stream);
+    // Each row runs the kernel the whole head runs, on the same quantized activation; the cap is
+    // elementwise. So each value is the one the whole head would have written in its row.
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        Tensor row = logits.slice(0, static_cast<std::int32_t>(i), 1);
+        ops::linear_rows(x, *lm_head_, ids[i], row, &work_, ctx_.stream);
+    }
+    apply_logit_softcap(cfg_, logits, ctx_.stream);
+    return true;
+}
+
 /// Writes the round's hidden output and the logits that follow it.
 ///
 /// With a trunk-block draft head the buffer that crosses the round boundary is the wide

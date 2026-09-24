@@ -8,6 +8,7 @@
 // ops::linear without a workspace (the engine-slot scratch the lm_head takes) and
 // ops::embedding (the row gather).
 #include "api/ops/embedding.h"
+#include "core/arena.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_swiglu.h"
 #include "api/ops/silu_mul.h"
@@ -319,6 +320,56 @@ int run_wrapper_linear(const Fixture& f, int tokens, void* d_blocks) {
     std::vector<float> got(raw.size());
     for (std::size_t i = 0; i < got.size(); ++i) { got[i] = __bfloat162float(raw[i]); }
     return report(f, "ops::linear (no ws)", tokens, score(got, ref), 4e-3, 8e-3);
+}
+
+// A decision's candidate logits (#14's latency follow-up): single rows through ops::linear_rows
+// equal, bit for bit, the same rows of the whole ops::linear, for one column -- the head's first
+// token -- and a few.
+int run_rows_match_linear(const Fixture& f, void* d_blocks, bool big) {
+    const int n = f.n, k = f.k;
+    int failures = 0;
+    const Weight w = make_weight(f, d_blocks);
+    if (!sinfer::ops::linear_rows_match_linear(w)) {
+        std::fprintf(stderr, "  %s %s rows: linear_rows_match_linear is false for a GGML weight\n",
+                     gg::type_name(f.type), f.label.c_str());
+        return 1;
+    }
+    for (const int tokens : {1, 3}) {
+        if (big && tokens > 1) { continue; } // a whole head (the big fixture), one column
+        const auto x = random_activation(k, tokens, static_cast<unsigned>(5151 + tokens));
+        __nv_bfloat16 *d_x = nullptr, *d_full = nullptr, *d_row = nullptr;
+        CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+        CHECK_CUDA(cudaMalloc(&d_full, static_cast<std::size_t>(n) * tokens * sizeof(__nv_bfloat16)));
+        CHECK_CUDA(cudaMalloc(&d_row, static_cast<std::size_t>(tokens) * sizeof(__nv_bfloat16)));
+        CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+        const Tensor xt(d_x, DType::BF16, {k, tokens});
+        Tensor full(d_full, DType::BF16, {n, tokens});
+        sinfer::ops::linear(xt, w, full, nullptr);
+        std::vector<__nv_bfloat16> whole(static_cast<std::size_t>(n) * tokens);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaMemcpy(whole.data(), d_full, whole.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+        sinfer::WorkspaceArena workspace(gg::linear_workspace_bytes(n, k, tokens) + 4096);
+        for (const int row : {0, n / 2, n - 1}) {
+            CHECK_CUDA(cudaMemset(d_row, 0xFF, static_cast<std::size_t>(tokens) * sizeof(__nv_bfloat16)));
+            Tensor out(d_row, DType::BF16, {1, tokens});
+            sinfer::ops::linear_rows(xt, w, row, out, &workspace, nullptr);
+            std::vector<__nv_bfloat16> got(tokens);
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(got.data(), d_row, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+            for (int t = 0; t < tokens; ++t) {
+                const __nv_bfloat16 expected = whole[static_cast<std::size_t>(t) * n + row];
+                if (std::memcmp(&got[t], &expected, sizeof(expected)) != 0) {
+                    std::fprintf(stderr, "  %s %s rows: row %d column %d differs from ops::linear\n",
+                                 gg::type_name(f.type), f.label.c_str(), row, t);
+                    ++failures;
+                }
+            }
+        }
+        CHECK_CUDA(cudaFree(d_x));
+        CHECK_CUDA(cudaFree(d_full));
+        CHECK_CUDA(cudaFree(d_row));
+    }
+    return failures;
 }
 
 // The row gather, through the launcher and through ops::embedding, against the oracle rows.
@@ -953,6 +1004,8 @@ int main() {
             failures += run_gather(f, false, d_blocks);
             failures += run_gather(f, true, d_blocks);
             cases += 2;
+            failures += run_rows_match_linear(f, d_blocks, big);
+            ++cases;
             if (!big) {
                 failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
                 ++cases;
