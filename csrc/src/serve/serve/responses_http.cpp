@@ -2,6 +2,7 @@
 #include "serve/model_scheduler.h"
 
 #include "serve/openai_schema.h"
+#include "serve/request_log.h"
 #include "serve/responses_schema.h"
 
 #include <nlohmann/json.hpp>
@@ -89,6 +90,17 @@ void write_stream_items(httplib::DataSink& sink, StreamingResponse& request,
     for (const std::string& item : items) { write_stream_item(sink, request, item); }
 }
 
+/// write_stream_items for the output callbacks, which run inside generation: a client that has
+/// gone away marks the stream cancelled instead of throwing through the engine, so generation
+/// stops at its next step and the request_done record carries the tokens actually generated.
+void offer_stream_items(httplib::DataSink& sink, StreamingResponse& request, std::vector<std::string> items) {
+    try {
+        write_stream_items(sink, request, std::move(items));
+    } catch (const ClientDisconnected&) {
+        // Recorded in request.cancelled; is_cancelled reports it to the engine.
+    }
+}
+
 void set_owned_content(httplib::Response& response, std::string body,
                        std::shared_ptr<RequestLifetime> lifetime) {
     response.set_content(std::move(body), "application/json");
@@ -114,6 +126,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
+        request.generation.client_request_id =
+            client_request_id(req.get_header_value(std::string(kClientRequestIdHeader)));
         t_routed_service = nullptr;
         if (request.generation.model != public_model_id_) {
             const auto extra = extra_services_.find(request.generation.model);
@@ -192,17 +206,20 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 return true;
             }
             stream->started = true;
+            bool done_logged    = false;
             try {
-                write_stream_items(sink, *stream, stream->encoder->start());
+                // Offered, not written: a client already gone is noticed by the engine at its
+                // first step, and the request still ends in request_done.
+                offer_stream_items(sink, *stream, stream->encoder->start());
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
+                    offer_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->content_delta(text));
+                    offer_stream_items(sink, *stream, stream->encoder->content_delta(text));
                 };
                 output.on_scores = [&](const GenerationOutcome& scored) {
-                    write_stream_items(sink, *stream, stream->encoder->scores_delta(scored));
+                    offer_stream_items(sink, *stream, stream->encoder->scores_delta(scored));
                 };
                 output.is_cancelled = [&] {
                     return stopping_.load(std::memory_order_relaxed) ||
@@ -211,18 +228,35 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 };
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
+                // The record a caller settles from, written before any final event can fail. A
+                // client that left mid-stream is usually noticed by the engine polling
+                // is_cancelled, not by a failed write, and its usage is here too.
+                log_request_done(stream->log_context, outcome);
+                done_logged = true;
+                if (stream->cancelled.load(std::memory_order_acquire) ||
+                    (sink.is_writable && !sink.is_writable())) {
+                    return false;
+                }
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
                 write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
-                log_request_done(stream->log_context, outcome);
                 write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
-                log_request_error(stream->log_context, exception.what());
+                // After request_done, a failed final write adds nothing a caller can settle from.
+                if (!done_logged) { log_request_error(stream->log_context, exception.what()); }
                 return false;
             } catch (const ApiException& exception) {
+                if (!done_logged && exception.error().code == "client_disconnected" &&
+                    (stream->cancelled.load(std::memory_order_acquire) ||
+                     (sink.is_writable && !sink.is_writable()))) {
+                    // Generation refused as cancelled because the client left, which is how
+                    // parallel decoding reports a drop: settled like any dropped stream.
+                    log_cancelled_stream(stream->log_context, stream->prepared);
+                    return false;
+                }
                 const ApiError error = responses_error(exception.error());
-                log_request_error(stream->log_context, error.message);
+                log_stream_failure(stream->log_context, error.message, done_logged);
                 try {
                     write_stream_item(sink, *stream, stream->encoder->failed(error));
                     sink.done();
@@ -230,7 +264,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& exception) {
                 const ApiError error = internal_error(exception);
-                log_request_error(stream->log_context, error.message);
+                log_stream_failure(stream->log_context, error.message, done_logged);
                 try {
                     write_stream_item(sink, *stream, stream->encoder->failed(error));
                     sink.done();
@@ -238,7 +272,13 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 } catch (const ClientDisconnected&) { return false; }
             }
         },
-        [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+        [this, stream, routed](bool) {
+            stream->cancelled.store(true, std::memory_order_release);
+            if (!stream->started) {
+                stream->started = true;
+                settle_abandoned_stream(*routed, stream->prepared, stream->log_context);
+            }
+        });
 }
 
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {

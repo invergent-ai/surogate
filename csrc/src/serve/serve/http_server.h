@@ -86,6 +86,19 @@ private:
     void log_request_rejected(const RequestRejectionLogContext& context);
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void log_request_error(const RequestLogContext& context, const std::string& message);
+    /// A stream that failed. Each request gets exactly one terminal record: once its
+    /// request_done is written (`record_written`), a later failure goes to the console only.
+    void log_stream_failure(const RequestLogContext& context, const std::string& message,
+                            bool record_written);
+    /// The request_done record of a stream whose client left while its generation was refused
+    /// as cancelled, which is how parallel decoding reports a drop: no completion tokens were
+    /// delivered.
+    void log_cancelled_stream(const RequestLogContext& context, const PreparedRequest& prepared);
+    /// A stream whose content provider never ran, because the client left first. Run from the
+    /// provider's releaser: settles the prepared request, cancelled at once so the engine does no
+    /// further work for it, and writes the terminal record a caller settles from. Never throws.
+    void settle_abandoned_stream(GenerationService& service, PreparedRequest& prepared,
+                                 const RequestLogContext& context) noexcept;
     void log_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();

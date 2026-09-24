@@ -53,6 +53,37 @@ void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
     }
 }
 
+/// write_stream_item for the output callbacks, which run inside generation. A client that has
+/// gone away marks the stream cancelled instead of throwing through the engine: generation then
+/// stops at its next step and returns what it produced, so the request_done record carries the
+/// tokens actually generated -- what a caller settles a dropped stream from.
+void offer_stream_item(httplib::DataSink& sink, StreamingRequest& request, const std::string& item) {
+    try {
+        write_stream_item(sink, request, item);
+    } catch (const ClientDisconnected&) {
+        // Recorded in request.cancelled; is_cancelled reports it to the engine.
+    }
+}
+
+/// The caller's X-Request-Id, if it is safe to log and echo (see client_request_id()). A request
+/// carrying several is given none: which one a proxy chain meant is not knowable here.
+std::string request_id_of(const httplib::Request& request) {
+    const std::string header(kClientRequestIdHeader);
+    if (request.get_header_value_count(header) != 1) { return {}; }
+    return client_request_id(request.get_header_value(header));
+}
+
+/// A caller that sends ids this server cannot use would otherwise see its records carry
+/// `client_request_id: null` with no hint why. Said once per process, without the value: it is
+/// exactly what the sanitizer keeps out of the log.
+void warn_rejected_request_id() {
+    static std::atomic<bool> warned{false};
+    if (warned.exchange(true, std::memory_order_relaxed)) { return; }
+    write_console_log(ConsoleLogLevel::Warning,
+                      "ignoring an X-Request-Id that is not one header of 1 to 128 visible ASCII "
+                      "characters; such ids are neither echoed nor logged (reported once)");
+}
+
 void set_owned_content(httplib::Response& response, std::string body,
                        std::shared_ptr<RequestLifetime> lifetime) {
     response.set_content(std::move(body), "application/json");
@@ -171,6 +202,48 @@ void HttpServer::log_request_error(const RequestLogContext& context, const std::
     request_jsonl_.write_request_error(context, message);
 }
 
+void HttpServer::log_stream_failure(const RequestLogContext& context, const std::string& message,
+                                    bool record_written) {
+    if (record_written) {
+        log_line(format_request_error(context, message));
+    } else {
+        log_request_error(context, message);
+    }
+}
+
+void HttpServer::log_cancelled_stream(const RequestLogContext& context,
+                                      const PreparedRequest& prepared) {
+    GenerationOutcome outcome;
+    outcome.prompt_tokens = prepared.prompt_tokens;
+    outcome.finish_reason = sinfer::FinishReason::Cancelled;
+    log_request_done(context, outcome);
+}
+
+void HttpServer::settle_abandoned_stream(GenerationService& service, PreparedRequest& prepared,
+                                         const RequestLogContext& context) noexcept {
+    try {
+        // A sleeping model's worker is parked until something wakes it, and waking it only to
+        // cancel this request would be a waste: the request is dropped with the PreparedRequest,
+        // which abandons it without waiting.
+        if (service.is_sleeping()) {
+            log_cancelled_stream(context, prepared);
+            return;
+        }
+        try {
+            const GenerationOutcome outcome = service.run(prepared, nullptr, [] { return true; });
+            log_request_done(context, outcome);
+        } catch (const ApiException& e) {
+            if (e.error().code == "client_disconnected") {
+                log_cancelled_stream(context, prepared);
+            } else {
+                log_request_error(context, e.error().message);
+            }
+        } catch (const std::exception& e) { log_request_error(context, e.what()); }
+    } catch (...) {
+        // The releaser runs in the response's destructor; logging here is best effort.
+    }
+}
+
 void HttpServer::log_throughput(const ThroughputReport& report) {
     log_line(format_throughput(report));
     if (std::getenv("SUROGATE_SERVE_MEM_TRACE") != nullptr) {
@@ -235,7 +308,8 @@ void HttpServer::register_routes() {
     if (options_.enable_cors) {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
-             {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+             {"Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id"},
+             {"Access-Control-Expose-Headers", "X-Request-Id"},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
@@ -244,6 +318,13 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        // Echo the caller's request id on every response, refusals included, so a gateway can
+        // match what it saw to this server's request log.
+        if (const std::string id = request_id_of(req); !id.empty()) {
+            res.set_header(std::string(kClientRequestIdHeader), id);
+        } else if (req.has_header(std::string(kClientRequestIdHeader))) {
+            warn_rejected_request_id();
+        }
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -808,6 +889,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
+        request.client_request_id = request_id_of(req);
         // `model` selects a served model or one of the primary's adapters.
         t_routed_service = &route_model(request.model, &request.lora_adapter);
     } catch (const ApiException& e) {
@@ -903,6 +985,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return true;
             }
             stream->started = true;
+            bool done_logged    = false;
             try {
                 // The role chunk goes out with the first streamed item, not at acceptance:
                 // that is when the OpenAI and vLLM servers send theirs, and it is what a
@@ -913,19 +996,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 auto ensure_role = [&] {
                     if (role_sent) { return; }
                     role_sent = true;
-                    write_stream_item(sink, *stream,
+                    offer_stream_item(sink, *stream,
                                       make_chat_chunk_role(id, model, created, include_usage));
                 };
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
                     ensure_role();
-                    write_stream_item(
+                    offer_stream_item(
                         sink, *stream,
                         make_chat_chunk_content(id, model, created, text, include_usage));
                 };
                 output.on_reasoning = [&](const std::string& text) {
                     ensure_role();
-                    write_stream_item(
+                    offer_stream_item(
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
@@ -938,7 +1021,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     detail.prompt_scores = scored.prompt_scores;
                     detail.completion_scores = scored.completion_scores;
                     detail.score_texts = scored.score_texts;
-                    write_stream_item(sink, *stream, make_chat_chunk_token_detail(id, model, created, detail, include_usage));
+                    offer_stream_item(sink, *stream, make_chat_chunk_token_detail(id, model, created, detail, include_usage));
                 };
                 output.is_cancelled = [&] {
                     return stopping_.load(std::memory_order_relaxed) ||
@@ -948,6 +1031,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                done_logged = true;
+                // A client that left mid-stream has its usage in that record; nobody is reading.
+                if (stream->cancelled.load(std::memory_order_acquire)) { return false; }
                 ensure_role();
                 if (stream->prepared.return_token_ids) {
                     TokenDetail detail;
@@ -999,17 +1085,26 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
-                log_request_error(log_context, e.what());
+                // After request_done, a failed final write adds nothing a caller can settle from.
+                if (!done_logged) { log_request_error(log_context, e.what()); }
                 return false;
             } catch (const ApiException& e) {
-                log_request_error(log_context, e.error().message);
+                if (!done_logged && e.error().code == "client_disconnected" &&
+                    (stream->cancelled.load(std::memory_order_acquire) ||
+                     (sink.is_writable && !sink.is_writable()))) {
+                    // Generation refused as cancelled because the client left, which is how
+                    // parallel decoding reports a drop: settled like any dropped stream.
+                    log_cancelled_stream(log_context, stream->prepared);
+                    return false;
+                }
+                log_stream_failure(log_context, e.error().message, done_logged);
                 try {
                     write_stream_item(sink, *stream, sse_error_event(e.error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& e) {
-                log_request_error(log_context, e.what());
+                log_stream_failure(log_context, e.what(), done_logged);
                 ApiError error;
                 error.status  = 500;
                 error.type    = "internal_error";
@@ -1021,7 +1116,13 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 } catch (const ClientDisconnected&) { return false; }
             }
         },
-        [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+        [this, stream, routed, log_context](bool) {
+            stream->cancelled.store(true, std::memory_order_release);
+            if (!stream->started) {
+                stream->started = true;
+                settle_abandoned_stream(*routed, stream->prepared, log_context);
+            }
+        });
 }
 
 static TokenDetail completion_detail(const GenerationOutcome& outcome, const PreparedRequest& prepared) {
@@ -1056,6 +1157,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_completion_request(body, limits);
+        request.client_request_id = request_id_of(req);
         t_routed_service          = &route_model(request.model, &request.lora_adapter);
     } catch (const ApiException& e) {
         write_error(res, e.error());
@@ -1129,10 +1231,11 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                 return true;
             }
             stream->started = true;
+            bool done_logged    = false;
             try {
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
-                    write_stream_item(
+                    offer_stream_item(
                         sink, *stream,
                         make_completion_chunk_text(id, model, created, text, include_usage));
                 };
@@ -1141,7 +1244,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                     auto detail = completion_detail(scored, stream->prepared);
                     detail.include_token_ids = false;
                     detail.text_offset = score_text_offset;
-                    write_stream_item(sink, *stream, make_completion_chunk_token_detail(id, model, created, detail, include_usage));
+                    offer_stream_item(sink, *stream, make_completion_chunk_token_detail(id, model, created, detail, include_usage));
                     for (const auto& text : scored.token_texts) {
                         for (unsigned char byte : text) score_text_offset += (byte & 0xc0) != 0x80;
                     }
@@ -1154,6 +1257,9 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                done_logged = true;
+                // A client that left mid-stream has its usage in that record; nobody is reading.
+                if (stream->cancelled.load(std::memory_order_acquire)) { return false; }
                 if (stream->prepared.return_token_ids) {
                     auto detail = completion_detail(outcome, stream->prepared);
                     detail.include_logprobs = false;
@@ -1173,17 +1279,26 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
-                log_request_error(log_context, e.what());
+                // After request_done, a failed final write adds nothing a caller can settle from.
+                if (!done_logged) { log_request_error(log_context, e.what()); }
                 return false;
             } catch (const ApiException& e) {
-                log_request_error(log_context, e.error().message);
+                if (!done_logged && e.error().code == "client_disconnected" &&
+                    (stream->cancelled.load(std::memory_order_acquire) ||
+                     (sink.is_writable && !sink.is_writable()))) {
+                    // Generation refused as cancelled because the client left, which is how
+                    // parallel decoding reports a drop: settled like any dropped stream.
+                    log_cancelled_stream(log_context, stream->prepared);
+                    return false;
+                }
+                log_stream_failure(log_context, e.error().message, done_logged);
                 try {
                     write_stream_item(sink, *stream, sse_error_event(e.error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& e) {
-                log_request_error(log_context, e.what());
+                log_stream_failure(log_context, e.what(), done_logged);
                 ApiError error;
                 error.status  = 500;
                 error.type    = "internal_error";
@@ -1195,7 +1310,13 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                 } catch (const ClientDisconnected&) { return false; }
             }
         },
-        [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+        [this, stream, routed, log_context](bool) {
+            stream->cancelled.store(true, std::memory_order_release);
+            if (!stream->started) {
+                stream->started = true;
+                settle_abandoned_stream(*routed, stream->prepared, log_context);
+            }
+        });
 }
 
 void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response& res) {
@@ -1209,10 +1330,11 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
         // Unlike a chat request, a decisions request is fully validated here rather than in
         // preparation, so most refusals are this one: log them like any other rejection.
         RequestRejectionLogContext rejection;
-        rejection.id       = req_id;
-        rejection.protocol = "decisions";
-        rejection.model    = request.model;
-        rejection.error    = e.error();
+        rejection.id                = req_id;
+        rejection.protocol          = "decisions";
+        rejection.model             = request.model;
+        rejection.client_request_id = request_id_of(req);
+        rejection.error             = e.error();
         log_request_rejected(rejection);
         write_error(res, e.error());
         return;
@@ -1229,6 +1351,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.enable_thinking         = false;
     context.question_count          = request.questions.size();
     context.decision_temperature    = svc().options().decision_temperature;
+    context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {
         DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate());
@@ -1262,6 +1385,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
         rejection.media_item_count        = context.media_item_count;
         rejection.requested_output_tokens = context.requested_output_tokens;
         rejection.question_count          = context.question_count;
+        rejection.client_request_id       = context.client_request_id;
         rejection.error                   = e.error();
         log_request_rejected(rejection);
         write_error(res, e.error());
@@ -1328,6 +1452,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request = parse_messages_request(body, limits);
+        request.client_request_id = request_id_of(req);
         // Soft routing: an extra's served id selects it; anything else stays on
         // the primary, preserving this endpoint's never-404 contract.
         const auto extra = extra_services_.find(request.model);
@@ -1422,19 +1547,23 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             // take the input tokens from this event, so reporting the whole prompt as uncached
             // here would bill its cached part twice. It goes out on prompt_ready, which comes
             // before the first content. A stream that completes without it sends it after run();
-            // one that fails first sends only the error event.
+            // one that fails first sends only the error event. Offered, not written, like every
+            // event sent from inside generation: a client already gone is noticed by the engine
+            // at its next step, and the request still ends in request_done.
             bool message_started = false;
             const auto start_message = [&](std::uint64_t reused_prompt_tokens) {
                 if (message_started) { return; }
                 message_started = true;
-                write_stream_item(sink, *stream,
+                offer_stream_item(sink, *stream,
                                   make_message_start(id, model,
                                                      completion_usage(input_tokens, 0, reused_prompt_tokens)));
             };
+            // The blocks are written from the output callbacks, inside generation.
             MessagesStreamBlocks blocks([&](const std::string& event) {
                 start_message(0); // never a content block before the message it belongs to
-                write_stream_item(sink, *stream, event);
+                offer_stream_item(sink, *stream, event);
             });
+            bool done_logged = false;
             try {
                 StreamSink output;
                 output.on_prompt_ready = [&](std::uint32_t reused) { start_message(reused); };
@@ -1452,6 +1581,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                done_logged = true;
+                // A client that left mid-stream has its usage in that record; nobody is reading.
+                if (stream->cancelled.load(std::memory_order_acquire)) { return false; }
                 start_message(completion_usage(outcome).cached_tokens);
                 const std::string_view remaining = outcome.unstreamed_content;
 
@@ -1493,17 +1625,26 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
-                log_request_error(log_context, e.what());
+                // After request_done, a failed final write adds nothing a caller can settle from.
+                if (!done_logged) { log_request_error(log_context, e.what()); }
                 return false;
             } catch (const ApiException& e) {
-                log_request_error(log_context, e.error().message);
+                if (!done_logged && e.error().code == "client_disconnected" &&
+                    (stream->cancelled.load(std::memory_order_acquire) ||
+                     (sink.is_writable && !sink.is_writable()))) {
+                    // Generation refused as cancelled because the client left, which is how
+                    // parallel decoding reports a drop: settled like any dropped stream.
+                    log_cancelled_stream(log_context, stream->prepared);
+                    return false;
+                }
+                log_stream_failure(log_context, e.error().message, done_logged);
                 try {
                     write_stream_item(sink, *stream, messages_sse_error_event(e.error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& e) {
-                log_request_error(log_context, e.what());
+                log_stream_failure(log_context, e.what(), done_logged);
                 ApiError error;
                 error.status  = 500;
                 error.type    = "internal_error";
@@ -1515,7 +1656,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 } catch (const ClientDisconnected&) { return false; }
             }
         },
-        [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+        [this, stream, routed, log_context](bool) {
+            stream->cancelled.store(true, std::memory_order_release);
+            if (!stream->started) {
+                stream->started = true;
+                settle_abandoned_stream(*routed, stream->prepared, log_context);
+            }
+        });
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }

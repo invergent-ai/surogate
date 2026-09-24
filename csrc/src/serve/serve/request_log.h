@@ -43,6 +43,8 @@ struct RequestLogContext {
     std::size_t shared_prefix_tokens = 0;
     /// The calibration temperature the answers were read at (`--decision-temperature`).
     double decision_temperature = 1.0;
+    /// The caller's X-Request-Id (see client_request_id()); empty when none was sent.
+    std::string client_request_id;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -61,6 +63,7 @@ struct RequestRejectionLogContext {
     ToolChoice tool_choice;
     bool has_tool_history = false;
     std::size_t question_count = 0; // `decisions` protocol
+    std::string client_request_id;  // the caller's X-Request-Id, empty when none was sent
     ApiError error;
 };
 
@@ -84,6 +87,16 @@ struct ThroughputReport {
     std::uint64_t decode_row_rounds       = 0;
     sinfer::RuntimeStats scheduler;
 };
+
+/// The header a caller (a gateway) names its request with. The server echoes it on the response
+/// and writes it into every request_start, request_done, request_rejected and request_error
+/// record, so a caller can settle a request -- a stream it dropped included -- from the log.
+inline constexpr std::string_view kClientRequestIdHeader = "X-Request-Id";
+
+/// The value of an X-Request-Id header if it is safe to log and echo: 1 to 128 visible ASCII
+/// characters (0x21-0x7E). Anything else -- empty, longer, spaces, control characters, non-ASCII
+/// -- is ignored and yields an empty string, so a header cannot inject text into a log line.
+[[nodiscard]] std::string client_request_id(std::string_view header);
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
