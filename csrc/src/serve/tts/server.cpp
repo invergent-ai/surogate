@@ -191,11 +191,16 @@ int main(int argc, char** argv) {
             if (format != "wav" && format != "pcm")
                 throw std::invalid_argument("response_format must be wav or pcm");
             const auto& selected = voice(body.value("voice", default_voice));
-            auto chunks          = tokenize(body.at("input").get<std::string>());
-            auto data            = runtime.synthesize(chunks, selected, int(seed), [&] {
+            const auto& input    = body.at("input").get_ref<const std::string&>();
+            auto chunks          = tokenize(input);
+            // Counted like the 4096-character limit. Set only once synthesis has succeeded, so an
+            // error response never carries a billable count.
+            const auto characters = input_characters(input);
+            auto data             = runtime.synthesize(chunks, selected, int(seed), [&] {
                 return interrupted || (q.is_connection_alive && !q.is_connection_alive());
             });
             if (format == "pcm") data.erase(0, 44);
+            r.set_header("X-Usage-Characters", std::to_string(characters));
             r.set_header("X-Audio-Sample-Rate", "22050");
             r.set_header("Cache-Control", "no-store");
             r.set_content(std::move(data), format == "wav" ? "audio/wav" : "audio/pcm");

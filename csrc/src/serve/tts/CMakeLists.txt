@@ -29,6 +29,19 @@ if(SUROGATE_SERVE_TESTS)
     # The Python benchmark test feeds frozen requests to this native driver.
     set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS test_tts_frontend)
 endif()
+if(SUROGATE_SERVE_TESTS OR CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    # The billed character count (X-Usage-Characters) and the 4096-character limit agree. Built
+    # by the standalone TTS build (make serve-tts-build) as well as by the serve test aggregate.
+    add_executable(test_tts_input_characters EXCLUDE_FROM_ALL ../../testing/serve/test_tts_input_characters.cpp)
+    target_include_directories(test_tts_input_characters PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_tts_input_characters PRIVATE sinfer_tts_frontend)
+    target_compile_options(test_tts_input_characters PRIVATE -UNDEBUG)
+    set_target_properties(test_tts_input_characters PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    if(SUROGATE_SERVE_TESTS)
+        set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS test_tts_input_characters)
+    endif()
+    add_test(NAME tts_input_characters COMMAND test_tts_input_characters)
+endif()
 # Resolve the model runtime inside the worker after verified assets are present.
 # The adapter's C++ symbols are intentionally supplied by that pinned library.
 add_library(sinfer_tts_bridge SHARED EXCLUDE_FROM_ALL native_bridge.cpp)
