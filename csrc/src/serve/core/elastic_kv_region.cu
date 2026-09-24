@@ -88,6 +88,15 @@ std::size_t elastic_kv_unmapped_commitment(int device) noexcept {
     return outstanding_on(device, nullptr);
 }
 
+std::size_t elastic_kv_mapped_bytes(int device) noexcept {
+    const std::lock_guard<std::mutex> lock(ledger_mutex());
+    std::size_t bytes = 0;
+    for (const auto& [key, entry] : ledger()) {
+        if (entry.device == device) { bytes += entry.mapped; }
+    }
+    return bytes;
+}
+
 bool elastic_kv_device_pressure(int device) noexcept {
     const std::lock_guard<std::mutex> lock(ledger_mutex());
     const auto it = pressure_marks().find(device);

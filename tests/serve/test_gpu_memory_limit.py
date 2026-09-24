@@ -11,6 +11,10 @@ Neither may run out of memory, every request must succeed, and each process's ow
 as nvidia-smi reports it) must stay within its limit the whole time. The card's total usage is
 checked against the sum of the processes', so memory NVML failed to attribute would show. A limit
 below the weights is refused at startup.
+
+With only the limit (default --max-num-seqs and context, elastic KV), a server starts: the elastic
+cache mapping its pages during CUDA graph preparation is KV memory, not graph memory
+(SUROGATE_LIMIT_TEST_ALONE_MIB, default 20000: Rune Q4_K_M beside a TTS server on a 32 GB card).
 """
 
 import concurrent.futures as cf
@@ -170,3 +174,45 @@ def test_a_limit_below_the_weights_is_refused(tmp_path):
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     assert result.returncode != 0
     assert "--gpu-memory-limit-mib 2048" in result.stdout + result.stderr, result.stdout + result.stderr
+
+
+def test_a_limit_alone_starts_with_the_default_sequence_count(tmp_path):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    limit = os.getenv("SUROGATE_LIMIT_TEST_ALONE_MIB", "20000")
+    log = tmp_path / "alone.log"
+    cmd = [_resolve_binary("server"), os.environ["SUROGATE_LIMIT_TEST_ARTIFACT"], "--host", "127.0.0.1",
+           "--port", str(port), "--served-model-name", "test", "--gpu-memory-limit-mib", limit,
+           *json.loads(os.getenv("SUROGATE_LIMIT_TEST_ARGS", "[]"))]
+    base = f"http://127.0.0.1:{port}"
+    with log.open("w") as output:
+        process = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline:
+            assert process.poll() is None, log.read_text()[-4000:]
+            try:
+                if requests.get(base + "/v1/models", timeout=1).status_code == 200:
+                    break
+            except requests.RequestException:
+                pass
+            time.sleep(0.5)
+        else:
+            pytest.fail(log.read_text()[-4000:])
+        reply = requests.post(base + "/v1/chat/completions", timeout=120, json={
+            "model": "test", "max_tokens": 16, "messages": [{"role": "user", "content": "Say hello."}]})
+        assert reply.status_code == 200, reply.text
+        text = log.read_text()
+        assert "gpu-memory-limit=" in text, text[-4000:]  # the limit applied
+        unit = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+        graphs = re.search(r"graphs=([0-9.]+) (B|KiB|MiB|GiB)/([0-9.]+) (B|KiB|MiB|GiB)", text)
+        assert graphs, text[-4000:]
+        assert float(graphs[1]) * unit[graphs[2]] <= float(graphs[3]) * unit[graphs[4]], text[-4000:]
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
