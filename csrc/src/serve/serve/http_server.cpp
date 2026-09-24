@@ -724,6 +724,12 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
     for (const Row& r : rows) { metric("decode_rounds_total", r.model, r.stats.decode_rounds); }
     help("decode_rows_total", "counter", "Summed batch size over decode rounds; over rounds it is the mean batch.");
     for (const Row& r : rows) { metric("decode_rows_total", r.model, r.stats.decode_row_rounds); }
+    help("packed_prefill_rounds_total", "counter",
+         "Prefill rounds that packed several waiting prompts while nothing was decoding.");
+    for (const Row& r : rows) { metric("packed_prefill_rounds_total", r.model, r.stats.packed_prefill_rounds); }
+    help("packed_prefill_prompts_total", "counter",
+         "Prompts advanced by packed prefill rounds; over rounds it is the mean packing.");
+    for (const Row& r : rows) { metric("packed_prefill_prompts_total", r.model, r.stats.packed_prefill_prompts); }
     help("admission_unblocked_heads_total", "counter",
          "Times the queue head was refused a lane although the admission ledger found it "
          "unblocked (KV committed to a retained GPU prefix); a benign retry.");
@@ -742,6 +748,7 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
         state("prefilling", r.stats.prefilling_requests);
         state("decode_ready", r.stats.decode_ready_requests);
         state("waiting", r.stats.waiting_requests);
+        state("reserving", r.stats.reserving_requests);
     }
 
     // The KV pool is the resource that decides whether a request queues, so it is exported in

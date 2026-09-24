@@ -257,6 +257,8 @@ private:
     /// uses whatever `options.execution.gpu_prefix` names, or none. `make_prompt` builds the
     /// prompt for a query index; `options` is copied per row and given its candidates.
     /// Parallel constrained decoding and the decisions endpoint share this loop.
+    /// How many candidate readouts read_candidates submits at once (a wave).
+    [[nodiscard]] std::size_t candidate_wave_width() const;
     [[nodiscard]] CandidateReadout read_candidates(const std::vector<ParallelQuery>& queries,
         const std::function<sinfer::PreparedPrompt(std::size_t)>& make_prompt,
         const sinfer::RequestOptions& options, const std::shared_ptr<void>& adapter,

@@ -117,6 +117,15 @@ public:
            std::chrono::steady_clock::time_point pending_deadline = {},
            std::shared_ptr<void> lifetime = {});
 
+    /// Takes `count` places in the request queue for submissions that follow, waiting for them
+    /// until `deadline` (RequestError QueueTimeout) or a cancellation, so the submissions cannot
+    /// be refused later for a full queue. Each submission that passes the result in its
+    /// ExecutionOptions::reservation uses one of the places, and hands it to the next when it
+    /// finishes.
+    [[nodiscard]] std::shared_ptr<SubmissionReservation>
+    reserve_submissions(std::uint32_t count, std::chrono::steady_clock::time_point deadline,
+                        const CancellationView& cancellation = {});
+
     [[nodiscard]] std::vector<GenerationHandle> submit_batch(std::vector<PreparedPrompt> prompts,
         std::vector<RequestOptions> options, std::chrono::steady_clock::time_point deadline = {},
         std::shared_ptr<void> lifetime = {});

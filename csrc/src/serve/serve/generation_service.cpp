@@ -679,6 +679,13 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
             sampling.frequency_penalty = 0;
             sampling.repetition_penalty = 1;
             sampling.logit_bias.clear();
+            // As a decision does (#14): the queue places the warm step and the readout waves will
+            // need are taken before any GPU work, so the readouts are never refused after the
+            // warm prefix has run.
+            const auto places = static_cast<std::uint32_t>(std::max<std::size_t>(
+                1, std::min(state->plan.queries.size(), candidate_wave_width())));
+            request_options.execution.reservation = engine_->reserve_submissions(
+                places, prepared.lifetime->deadline, CancellationView(is_cancelled));
             state->options = request_options;
             state->options.execution.gpu_prefix = request_options.execution.save_gpu_prefix;
             state->options.execution.save_gpu_prefix.reset();
@@ -880,6 +887,10 @@ GenerationOutcome GenerationService::run_parallel(PreparedRequest& prepared, con
     } catch (const RequestError& exception) { throw_request_error(exception); }
 }
 
+std::size_t GenerationService::candidate_wave_width() const {
+    return std::max<std::size_t>(1, std::min<std::size_t>(64, options_.max_concurrency));
+}
+
 GenerationService::CandidateReadout GenerationService::read_candidates(
     const std::vector<ParallelQuery>& queries,
     const std::function<sinfer::PreparedPrompt(std::size_t)>& make_prompt,
@@ -890,7 +901,7 @@ GenerationService::CandidateReadout GenerationService::read_candidates(
     readout.logits.resize(queries.size());
     // Keep work bounded and share the normal scheduler with other requests.
     // A one-lane engine runs the same finite-choice computation serially.
-    const auto width = std::max<std::size_t>(1, std::min<std::size_t>(64, options_.max_concurrency));
+    const auto width = candidate_wave_width();
     std::vector<std::vector<std::size_t>> children(queries.size());
     std::vector<std::size_t> remaining(queries.size());
     std::vector<std::shared_ptr<const GpuPrefixKey>> keys(queries.size());
@@ -1110,6 +1121,18 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         outcome.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - lifetime->started).count();
 
+        // The queue places the decision will need are taken before any GPU work (#14): as many as
+        // it ever has in the queue at once -- its shared prefix alone, then its questions in waves
+        // (read_candidates) -- and each finished submission hands its place to the next. A busy
+        // queue makes the decision wait for them here, until its deadline (then 503), rather than
+        // refuse its questions after its shared prefix has run on the GPU. Only the client going
+        // away cuts the wait short; the deadline is reserve's own.
+        const auto places = static_cast<std::uint32_t>(std::max<std::size_t>(
+            1, std::min(request.questions.size(), candidate_wave_width())));
+        const auto reservation = in_engine([&] {
+            return engine_->reserve_submissions(places, deadline, CancellationView(is_cancelled));
+        });
+
         // The readout ignores sampling; keep it neutral anyway so nothing else is asked of
         // the round than the candidate logits.
         sinfer::RequestOptions base;
@@ -1125,6 +1148,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         base.execution.sampling.frequency_penalty  = 0.0F;
         base.execution.sampling.repetition_penalty = 1.0F;
         base.output.structured                 = true;
+        base.execution.reservation             = reservation;
 
         std::vector<ParallelQuery> queries;
         queries.reserve(items.size());

@@ -359,6 +359,21 @@ struct GpuPrefixKey {
     std::uint32_t state_slots = 1;
 };
 
+/// Queue places taken ahead of the submissions that will use them (Engine::reserve_submissions).
+/// A submission that names it takes one of its places instead of asking the queue again, and gives
+/// it back to the reservation, not to the queue, when it completes; the places go back to the queue
+/// when the last reference to the reservation goes (the submissions hold one).
+class SubmissionReservation {
+public:
+    virtual ~SubmissionReservation() = default;
+    /// Takes one place; false when none is left (the submission then asks the queue).
+    [[nodiscard]] virtual bool take() noexcept = 0;
+    /// Returns a place taken with take().
+    virtual void give_back() noexcept = 0;
+    /// The queue the places are in: a reservation from another engine is ignored.
+    [[nodiscard]] virtual const void* issuer() const noexcept = 0;
+};
+
 struct ExecutionOptions {
     /// Empty means unconstrained output; otherwise a JSON Schema for the generated text.
     std::string json_schema;
@@ -373,6 +388,8 @@ struct ExecutionOptions {
     bool cache_prompt = false;
     std::shared_ptr<const GpuPrefixKey> gpu_prefix;
     std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
+    /// Queue capacity this submission was given in advance, if any.
+    std::shared_ptr<SubmissionReservation> reservation;
     /// Number of raw full-vocabulary alternatives to return, 0..20; -1 disables scoring.
     int prompt_logprobs = -1;
     int top_logprobs = -1;
@@ -808,10 +825,17 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;
     std::uint64_t decode_row_rounds     = 0;
+    // Prefill rounds that packed several staged prompts with no lane decoding (#14), and the
+    // prompts they advanced; over rounds it is the mean packing.
+    std::uint64_t packed_prefill_rounds  = 0;
+    std::uint64_t packed_prefill_prompts = 0;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    // Callers waiting for queue places before any of their request runs (a decision's
+    // Engine::reserve_submissions, #14).
+    std::uint32_t reserving_requests    = 0;
     std::uint32_t kv_pages_mapped       = 0; ///< pages physically resident (see PagedKVOccupancy)
     // Main KV pool physical occupancy, read on the executor thread at the boundary that published
     // this snapshot -- never by asking the engine, which would queue behind a whole round.

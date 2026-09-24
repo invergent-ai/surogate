@@ -3373,3 +3373,46 @@ design log: throughput parity with the arena pool at every load tried, the
 cross-request leak closed, 105/105 in the suite, and the default-flag smoke
 (27B + 4B, no elastic flags, 8+8 users): 322 + 612 tok/s, 0 errors,
 0.62 + 0.31 GiB mapped, pair-leak 0/8.
+
+## 95
+
+**Prefill across requests (2026-09-24, SUROGATE-CHANGES #14).**
+
+With nothing decoding, the executor prefilled one staged prompt per step, so a burst of short
+prompts (Rune's one-question decisions) ran one after another at the single-request rate. Three
+things stood in the way, and each is changed:
+
+- `Engine::submit_batch` paused execution to hand its rows over whole. A busy worker takes the
+  execution lock again at once, so the submitter waited until the engine went idle: decisions
+  reached the executor one at a time. Its rows now join the queue together when its submission
+  group closes (`open_group`), which waits for nothing.
+- Admission reported a deferred first chunk (#30) as a GPU unit, so `top_up_prefill_lanes` and
+  continuous admission (#41) staged one prompt per loop. It now reports control progress, and
+  every waiting prompt with a free lane is staged at once.
+- With no lane decoding, the first staged prompt and the staged prompts of its kind (plain, or
+  GPU-prefix readouts) now run as one zero-decode mixed round (#80), up to
+  `--max-num-batched-tokens`; before, only multi-question decisions did (`field_batch`). A first
+  prompt a packed round cannot take (at its end, waiting for its first-token step, or an
+  unsupported shape) takes a step of its own; a prompt with no company keeps the single-lane path
+  and its prefill graphs. Speculative (MTP, DFlash) and pipelined engines keep their old
+  behaviour, one prompt staged per pass and no zero-decode packing: it is not validated there.
+
+A decision also takes the queue places its rows will need, min(questions, `--max-num-seqs`, 64),
+before its shared prefix runs (`Engine::reserve_submissions`), waiting for them in arrival order
+within its deadline; the places the oldest waiting reservation needs are spoken for, so single
+requests cannot starve it (they may get 429 sooner while it waits), and each finished row hands
+its place to the next. It used to prefill the prefix and then have its rows refused for a full
+queue. A chat request with `parallel_decoding` reserves its readouts' places the same way. The
+engine's reservation keeps the engine alive while its caller holds it; requests hold only the
+executor's places, so no request keeps its own engine alive. `packed_prefill_rounds_total` and
+`packed_prefill_prompts_total` count the packing, `surogate_requests{state="reserving"}` the
+callers waiting for places; `SUROGATE_SERVE_PACK_TRACE=1` traces each decision to pack.
+
+Measured on an RTX 5090, Rune Q4_K_M (`gateway/spike/capacity/loadgen.py`, 15 s per level, after
+both reviews' fixes): short one-question decisions 23.3 req/s at 1 client (unchanged), 48.6
+at 16 (was 25.8); four-question decisions 11.8 at 16 and 13.0 at 64 (were 8.0 and 3.6 with 2,353
+refusals). A packed round of about 2,048 prompt tokens runs at about 10,300 tokens/s, against
+5,400 for a lone 200-token prompt. On Rune (GGUF, attention only), answers are bit-identical packed or alone (the decisions v1
+golden set under 8-client load, and chat first-token logprobs), and the golden set reproduces its
+recording at tolerance 0. A recurrent model's prompt that shares a round is split into chunks by
+what is left of the window, as in #80's rounds with decode rows, so its last bits may differ.

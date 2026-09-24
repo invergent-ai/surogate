@@ -29,6 +29,19 @@ namespace sinfer {
 
 namespace {
 
+/// A reservation as Engine::reserve_submissions hands it out: the executor's places, and the
+/// engine that owns that executor, kept alive while the caller holds them. The engine is
+/// declared first, so the places go back before it can go. The executor only ever stores the
+/// places themselves (resolve_request_options unwraps this), so no request keeps its own engine
+/// alive.
+struct EngineReservation final : SubmissionReservation {
+    std::shared_ptr<void> engine;
+    std::shared_ptr<SubmissionReservation> places;
+    bool take() noexcept override { return places->take(); }
+    void give_back() noexcept override { places->give_back(); }
+    const void* issuer() const noexcept override { return places->issuer(); }
+};
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
     runtime::ResolvedRequestOptions resolved;
@@ -51,6 +64,10 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     }
     resolved.execution.gpu_prefix = std::move(options.execution.gpu_prefix);
     resolved.execution.save_gpu_prefix = std::move(options.execution.save_gpu_prefix);
+    resolved.execution.reservation     = std::move(options.execution.reservation);
+    if (const auto* held = dynamic_cast<const EngineReservation*>(resolved.execution.reservation.get())) {
+        resolved.execution.reservation = held->places;
+    }
     resolved.execution.prompt_logprobs = options.execution.prompt_logprobs;
     resolved.execution.top_logprobs = options.execution.top_logprobs;
     resolved.execution.lora_slot               = options.execution.lora_slot;
@@ -493,6 +510,25 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         impl_->executor);
 }
 
+std::shared_ptr<SubmissionReservation> Engine::reserve_submissions(
+    std::uint32_t count, std::chrono::steady_clock::time_point deadline,
+    const CancellationView& cancellation) {
+    if (!impl_) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& executor) -> std::shared_ptr<SubmissionReservation> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                auto held    = std::make_shared<EngineReservation>();
+                held->engine = impl_; // before the wait, which can be long
+                held->places = executor->reserve(count, deadline, [&] { return cancellation.requested(); });
+                return held;
+            }
+        },
+        impl_->executor);
+}
+
 std::vector<GenerationHandle> Engine::submit_batch(std::vector<PreparedPrompt> prompts,
     std::vector<RequestOptions> options, std::chrono::steady_clock::time_point deadline,
     std::shared_ptr<void> lifetime) {
@@ -503,7 +539,9 @@ std::vector<GenerationHandle> Engine::submit_batch(std::vector<PreparedPrompt> p
         if constexpr (std::is_same_v<T, std::monostate>) {
             throw std::logic_error("engine executor unavailable");
         } else {
-            auto lock = executor->pause_execution();
+            // The rows join the queue together when the group closes, without waiting for the
+            // round in flight (they are this group's alone: nothing else waits on it).
+            auto group = executor->open_group();
             std::vector<GenerationHandle> handles;
             handles.reserve(prompts.size());
             for (std::size_t i = 0; i < prompts.size(); ++i)

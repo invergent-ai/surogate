@@ -30,6 +30,7 @@ struct ResolvedExecutionOptions {
     bool cache_prompt = false;
     std::shared_ptr<const GpuPrefixKey> gpu_prefix;
     std::shared_ptr<const GpuPrefixKey> save_gpu_prefix;
+    std::shared_ptr<::sinfer::SubmissionReservation> reservation;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     bool allow_prefix_reuse               = true;
