@@ -173,6 +173,51 @@ minutes without a request. `--max-num-seqs` sets the number of live streams
 (default 8); each keeps its own audio and transcript state. Inference requests
 share one model and run one at a time.
 
+### Stream over a WebSocket
+
+Over the internet, a POST per chunk costs a round trip per chunk. A WebSocket carries the same
+stream over one connection: open `GET /v1/audio/streams` as a WebSocket, send audio as binary
+messages without waiting for replies, and read the events as they come.
+
+- The first message from the server is `{"type": "ready", "sample_rate": 16000, "channels": 1,
+  "encoding": "pcm_s16le"}`.
+- Each binary message is a chunk of mono, 16 kHz, 16-bit little-endian PCM, at most ten seconds.
+- Each event that the HTTP interface returns for a chunk comes back as one JSON text message,
+  in the same order and with the same content (`partial`, `final`).
+- The text message `{"type": "finish"}` drains the audio. The server then sends the last events
+  and `{"type": "done"}`, and closes the connection.
+- Closing the WebSocket without `finish` discards the stream, as `DELETE` does.
+- On an error the server sends `{"type": "error", "error": {"message": …}}` and closes with a
+  status code: 1003 for a text message other than `finish`, 1007 for half a sample or invalid
+  UTF-8, 1009 for a message over ten seconds of audio, 1002 for any other protocol error, and
+  1011 when transcription fails.
+
+A WebSocket stream counts against `--max-num-seqs` like an HTTP one. When all are in use, the
+opening handshake is refused with HTTP 429. The stream lives as long as its connection: it does
+not expire after two minutes like an HTTP stream, and the HTTP endpoints cannot reach it. A
+connection that sends nothing, not even a ping, for 60 seconds is closed with status 1001 and its
+stream discarded; a client that pauses its audio keeps the connection open with pings.
+
+The connection needs the same `Authorization` header as the other endpoints, which browsers
+cannot set on a WebSocket: connect from a server-side client, or through a gateway that adds
+it. Subprotocols (`Sec-WebSocket-Protocol`) and compression are not offered; a client that asks
+for a subprotocol and insists on one fails to connect. A client speaking another WebSocket version
+gets HTTP 426 with `Sec-WebSocket-Version: 13`. A client must keep its side of the TCP connection
+open until the server closes: after a half-close (shutting down only its sending side) it receives
+nothing more.
+
+```python
+from websockets.sync.client import connect
+
+with connect("ws://localhost:8080/v1/audio/streams") as ws:
+    print(ws.recv())                 # ready
+    for chunk in chunks:             # bytes of PCM16
+        ws.send(chunk)
+    ws.send('{"type": "finish"}')
+    for message in ws:
+        print(message)               # partial and final events, then done
+```
+
 ## Metrics
 
 `GET /metrics` reports the server in Prometheus text format, like the LLM server:
