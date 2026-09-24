@@ -3,6 +3,7 @@
 #include "api/ops/gqa_attention.h"
 #include "api/ops/gqa_workspace.h"
 
+#include "core/device.h"
 #include "core/layout.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/launcher/gqa_attention.h"
@@ -13,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sinfer::ops {
 namespace {
@@ -814,6 +816,190 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
                                                   envelope.sliding_window, selection);
+}
+
+bool gqa_attention_packs_prompt(std::int32_t head_dim, std::int32_t q_heads,
+                                std::int32_t kv_heads, DType cache_dtype, std::int32_t width,
+                                GqaExecutionEnvelope envelope) {
+    return (cache_dtype == DType::BF16 || cache_dtype == DType::FP8_E4M3FN) && width > 0 &&
+           supported_attention_shape(head_dim, q_heads, kv_heads) &&
+           optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype) &&
+           detail::gqa_attention_resolve_route(q_heads, kv_heads, width, 1, envelope) ==
+               detail::GqaAttentionRoute::Prompt;
+}
+
+void gqa_attention_packed_prompts(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions,
+                                  const std::vector<GqaPackedSegment>& segments, float scale,
+                                  PagedKVBatchLayerView cache, WorkspaceArena& workspace,
+                                  Tensor& out, cudaStream_t stream,
+                                  std::int32_t max_lanes_per_launch) {
+    constexpr const char* op = "gqa_attention_packed_prompts";
+    if (segments.empty()) { return; }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        throw std::logic_error(std::string(op) + ": its tile metadata is copied from the host; not for capture");
+    }
+    const std::int32_t head_dim = q.ne[0];
+    const std::int32_t q_heads  = q.ne[1];
+    const std::int32_t kv_heads = cache.num_kv_heads;
+    const std::int32_t columns  = q.ne[2];
+    const bool append           = k.data != nullptr || v.data != nullptr;
+    require_registered_shape(head_dim, q_heads, kv_heads, op);
+    if (q.ne[3] != 1 || out.ne[2] != columns || out.ne[3] != 1 || positions.ne[0] < columns) {
+        throw std::invalid_argument(std::string(op) + ": q, positions and out must share columns");
+    }
+    if (append) {
+        require_shape(k, head_dim, kv_heads, columns, 1, op, "k");
+        require_shape(v, head_dim, kv_heads, columns, 1, op, "v");
+        require_contiguous_nonnull(k, op, "k");
+        require_contiguous_nonnull(v, op, "v");
+        if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+            throw std::invalid_argument(std::string(op) + ": k/v must be BF16");
+        }
+    }
+    const auto segment_count = static_cast<std::int32_t>(segments.size());
+    const std::int32_t window = segments.front().envelope.sliding_window;
+
+    // Every segment is checked before anything is written.
+    {
+        auto check_scope = workspace.scope();
+        std::vector<std::int32_t> rows(segments.size());
+        for (std::size_t i = 0; i < segments.size(); ++i) { rows[i] = segments[i].table_row; }
+        Tensor row_table = workspace.alloc(DType::I32, {segment_count});
+        if (append) { // only the appends read it; the checks below need its shape
+            CUDA_CHECK(cudaMemcpyAsync(row_table.data, rows.data(), rows.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        for (std::int32_t i = 0; i < segment_count; ++i) {
+            const GqaPackedSegment& segment = segments[i];
+            if (segment.column < 0 || segment.width <= 0 || segment.column + segment.width > columns ||
+                segment.table_row < 0 || segment.table_row >= cache.block_tables.ne[1] ||
+                segment.envelope.sliding_window != window ||
+                !gqa_attention_packs_prompt(head_dim, q_heads, kv_heads, cache.dtype, segment.width,
+                                            segment.envelope)) {
+                throw std::invalid_argument(std::string(op) + ": segment " + std::to_string(i) +
+                                            " is not a packable prompt");
+            }
+            Tensor q_part   = q.slice(2, segment.column, segment.width);
+            Tensor out_part = out.slice(2, segment.column, segment.width);
+            validate_batched_attention_tensors(q_part, positions.slice(0, segment.column, segment.width),
+                                               Tensor{}, row_table.slice(0, i, 1), out_part, cache,
+                                               segment.envelope, scale, op);
+        }
+        // The prompt route appends before it attends; every tile below reads these keys. The row
+        // table's memory goes back when this scope closes: later work on the stream runs after
+        // these appends.
+        if (append) {
+            for (std::int32_t i = 0; i < segment_count; ++i) {
+                const GqaPackedSegment& segment = segments[i];
+                detail::gqa_kv_append_batch_launch(
+                    k.slice(2, segment.column, segment.width), v.slice(2, segment.column, segment.width),
+                    positions.slice(0, segment.column, segment.width), Tensor{}, row_table.slice(0, i, 1),
+                    cache, stream);
+            }
+        }
+    }
+
+    // Every segment's tiles exactly as its own call cuts them (launch_cached_prompt_tiles), filed
+    // by width.
+    struct Lane {
+        std::int32_t column = 0;
+        std::int32_t row    = 0;
+        GqaExecutionEnvelope envelope{};
+        std::int32_t splits = 0;
+    };
+    std::vector<std::vector<Lane>> by_width(33);
+    for (const GqaPackedSegment& segment : segments) {
+        const int capacity = prompt_query_capacity(head_dim, q_heads, kv_heads, cache.dtype,
+                                                   segment.envelope);
+        for_each_prompt_tile(q_heads, kv_heads, segment.width, capacity,
+                             [&](int begin, int width, int lanes) {
+            const std::int32_t splits = detail::gqa_attention_split_capacity(
+                head_dim, q_heads, kv_heads, width, cache.dtype, segment.envelope);
+            for (int lane = 0; lane < lanes; ++lane) {
+                by_width.at(width).push_back(Lane{segment.column + begin + lane * width,
+                                                  segment.table_row, segment.envelope, splits});
+            }
+        });
+    }
+
+    // A launch takes as many lanes as the workspace's free room holds, up to kPackedBudget -- the
+    // arena is sized for the per-prompt path, which needs a tile group's partials at once, so a
+    // lone lane always fits where its own call fit -- and never more lanes than a grid holds.
+    constexpr std::size_t kPackedBudget = std::size_t{64} << 20;
+    for (std::int32_t width = 1; width <= 32; ++width) {
+        std::vector<Lane>& lanes = by_width[width];
+        if (lanes.empty()) { continue; }
+        // A launch's partial buffers are sized for its longest history, so lanes that need fewer
+        // key partitions go together. Which lanes share a launch changes no lane's result.
+        std::stable_sort(lanes.begin(), lanes.end(),
+                         [](const Lane& a, const Lane& b) { return a.splits < b.splits; });
+        const auto lane_bytes = [&](std::int32_t splits) {
+            return static_cast<std::size_t>(head_dim + 2) * q_heads * width * splits * sizeof(float);
+        };
+        std::size_t lane_limit = std::size_t{65535} / static_cast<std::size_t>(width);
+        if (max_lanes_per_launch > 0) {
+            lane_limit = std::min(lane_limit, static_cast<std::size_t>(max_lanes_per_launch));
+        }
+        for (std::size_t start = 0; start < lanes.size();) {
+            auto launch_scope = workspace.scope();
+            // Four allocations below, each padded to 256 bytes at most.
+            constexpr std::size_t kSlack = 4 * 256 + 256;
+            const std::size_t room   = workspace.capacity() - workspace.used();
+            const std::size_t free   = room > kSlack ? room - kSlack : 0;
+            const std::size_t budget = std::min(free, kPackedBudget);
+            std::size_t count   = 0;
+            std::int32_t splits = 0;
+            while (start + count < lanes.size() && count < lane_limit) {
+                const std::int32_t next = std::max(splits, lanes[start + count].splits);
+                const std::size_t need  = lane_bytes(next) * (count + 1) + 3 * sizeof(std::int32_t) * (count + 1);
+                if (count != 0 && need > budget) { break; }
+                splits = next;
+                ++count;
+            }
+            GqaExecutionEnvelope envelope = lanes[start].envelope;
+            const auto n = static_cast<std::int32_t>(count);
+            // One upload per launch: valid columns, table rows and lane columns, back to back.
+            std::vector<std::int32_t> metadata(3 * count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const Lane& lane = lanes[start + i];
+                envelope.min_visible_keys = std::min(envelope.min_visible_keys, lane.envelope.min_visible_keys);
+                envelope.max_visible_keys = std::max(envelope.max_visible_keys, lane.envelope.max_visible_keys);
+                metadata[i]             = width;
+                metadata[count + i]     = lane.row;
+                metadata[2 * count + i] = lane.column;
+            }
+            Tensor lane_data = workspace.alloc(DType::I32, {3 * n});
+            CUDA_CHECK(cudaMemcpyAsync(lane_data.data, metadata.data(), metadata.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+            Tensor valid_columns = lane_data.slice(0, 0, n);
+            Tensor table_rows    = lane_data.slice(0, n, n);
+            Tensor lane_columns  = lane_data.slice(0, 2 * n, n);
+            // The launch sizes its splits for the longest history among its lanes; every lane still
+            // walks only its own key partitions (they are anchored to absolute positions).
+            const std::int32_t launch_splits = detail::gqa_attention_split_capacity(
+                head_dim, q_heads, kv_heads, width, cache.dtype, envelope);
+            SmallTWorkspace partial =
+                allocate_small_t_workspace(workspace, head_dim, q_heads, width, launch_splits, n);
+            if (count == 1) {
+                // A lone lane: the single-sequence form of the same kernel.
+                const std::int32_t column = metadata[2];
+                const Tensor queries = q.slice(2, column, width).view({head_dim, q_heads, width, 1});
+                const Tensor pos     = positions.slice(0, column, width).view({width, 1});
+                Tensor result = out.slice(2, column, width).view({head_dim, q_heads, width, 1});
+                detail::gqa_attention_cached_batch_small_t_launch(
+                    queries, pos, valid_columns, table_rows, scale, cache, envelope, 0, width,
+                    partial.acc, partial.m, partial.l, result, stream);
+            } else {
+                detail::gqa_attention_cached_lanes_small_t_launch(
+                    q, positions, valid_columns, table_rows, lane_columns, scale, cache, envelope,
+                    width, partial.acc, partial.m, partial.l, out, stream);
+            }
+            start += count;
+        }
+    }
 }
 
 } // namespace sinfer::ops

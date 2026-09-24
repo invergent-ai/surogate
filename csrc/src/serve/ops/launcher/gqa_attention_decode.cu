@@ -108,6 +108,37 @@ void gqa_attention_cached_batch_small_t_launch(const Tensor& q, const Tensor& po
     });
 }
 
+/// Prompt tiles of several sequences in one launch over a populated cache (#14's packed rounds):
+/// lane i covers `width` query columns of q, pos and out from lane_columns[i], reads table row
+/// table_rows[i], and valid_columns[i] of its columns are real.
+void gqa_attention_cached_lanes_small_t_launch(const Tensor& q, const Tensor& pos,
+                                               const Tensor& valid_columns,
+                                               const Tensor& table_rows,
+                                               const Tensor& lane_columns, float scale,
+                                               PagedKVBatchLayerView cache,
+                                               GqaExecutionEnvelope envelope, std::int32_t width,
+                                               Tensor& partial_acc, Tensor& partial_m,
+                                               Tensor& partial_l, Tensor& out,
+                                               cudaStream_t stream) {
+    const GqaCachedInput input{};
+    const GqaSmallTInvocation invocation{
+        .valid_columns  = &valid_columns,
+        .table_rows     = &table_rows,
+        .selection      = {},
+        .full_width     = width,
+        .column_begin   = 0,
+        .width          = width,
+        .batch_size     = lane_columns.ne[0],
+        .sliding_window = envelope.sliding_window,
+        .lane_columns   = &lane_columns,
+    };
+    gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                   envelope, partial_acc, partial_m, partial_l,
+                                                   out, stream);
+    });
+}
+
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,

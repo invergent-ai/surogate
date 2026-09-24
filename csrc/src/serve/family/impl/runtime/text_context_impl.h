@@ -53,6 +53,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -295,6 +296,25 @@ namespace {
 [[nodiscard]] bool stage_trace_enabled() {
     static const bool enabled = std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr;
     return enabled;
+}
+
+/// Whether a round's prompts share attention launches (ops::gqa_attention_packed_prompts).
+/// SUROGATE_SERVE_PACKED_ATTENTION=0 runs each prompt's own launches, as before, for comparison;
+/// the output bits are the same either way.
+[[nodiscard]] bool packed_prompt_attention() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_PACKED_ATTENTION");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+/// The packed launches copy their tile metadata from the host, which a captured graph would
+/// freeze; a capture keeps the per-prompt launches.
+[[nodiscard]] bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    return status != cudaStreamCaptureStatusNone;
 }
 } // namespace
 
@@ -2512,6 +2532,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 debug_probe<Variant>("k_post_rope", kn.view({layer_kv_size, total}), cfg_.n_layers, s);
 
                 Tensor a = results.attention.view({layer_head_dim, cfg_.n_q, total});
+                // Several prompts in one round (#14): the ones on the plain prompt route share
+                // attention launches (ops::gqa_attention_packed_prompts) instead of each running
+                // its own few-CTA launches in turn. Every output bit is what its own call writes.
+                std::vector<ops::GqaPackedSegment> packed;
+                const bool may_pack = segments.size() > 1 && packed_prompt_attention() &&
+                                      !stream_is_capturing(s);
                 for (std::size_t sg = 0; sg < segments.size(); ++sg) {
                     const int off = segment_begin[sg];
                     const int len = static_cast<int>(segments[sg].ids.size());
@@ -2538,6 +2564,13 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         selection.image_begin = scatter.front();
                         selection.image_end = scatter.back() + 1;
                     }
+                    if (may_pack && segment.kv_table_row >= 0 && selection.words == nullptr &&
+                        selection.image_end == 0 &&
+                        ops::gqa_attention_packs_prompt(layer_head_dim, cfg_.n_q, kv_view.num_kv_heads,
+                                                        kv_view.dtype, len, envelope)) {
+                        packed.push_back(ops::GqaPackedSegment{off, len, segment.kv_table_row, envelope});
+                        continue;
+                    }
                     if (owns_kv) {
                         ops::gqa_attention(qa, ka, va, positions.slice(0, off, len), Tensor{},
                                            io_.text_kv_table_row, cfg_.attention_scale,
@@ -2547,6 +2580,11 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                   io_.text_kv_table_row, cfg_.attention_scale,
                                                   kv_view, envelope, work_, aa, s, selection);
                     }
+                }
+                if (!packed.empty()) {
+                    ops::gqa_attention_packed_prompts(qn, owns_kv ? kn : Tensor{}, owns_kv ? v : Tensor{},
+                                                      positions, packed, cfg_.attention_scale, kv_view,
+                                                      work_, a, s);
                 }
                 if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, decode_columns)

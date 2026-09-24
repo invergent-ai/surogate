@@ -1591,6 +1591,210 @@ int verify_query_batch_invariance() {
     return failures;
 }
 
+// #14's packed prefill rounds: several sequences' prompt chunks in one call. Every output bit
+// must be what each chunk's own gqa_attention call writes, whatever the workspace lets the call
+// group into one launch, over the Gemma-4 shapes Rune serves and the others the route covers.
+int verify_packed_prompt_invariance() {
+    int failures = 0;
+    struct Chunk {
+        int history;
+        int length;
+    };
+    // Histories cross the 128-, 4096- and 16384-key partition boundaries; lengths give full,
+    // partial and lone tiles, and chunks too short for the prompt route run on their own.
+    // {50, 5} is short enough for the small-T route: it keeps its own call beside the packed ones.
+    const std::vector<Chunk> chunks = {{0, 200}, {127, 41}, {3967, 385}, {300, 7},
+                                       {4095, 64}, {16319, 129}, {0, 33}, {1000, 200}, {50, 5}};
+    constexpr int pages_per_row = 264;
+    const int rows = static_cast<int>(chunks.size());
+    for (const Geometry geometry : {Geometry{"gemma4_26b_window", 16, 8, 256},
+                                    Geometry{"gemma4_26b_global", 16, 2, 512},
+                                    Geometry{"gemma", 8, 4}, Geometry{"qwen", 8, 2}}) {
+      const int dim = geometry.head_dim, heads = geometry.q_heads, kv_heads = geometry.kv_heads;
+      for (const auto dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+        for (const int window : {0, 127, 1024}) {
+          DeviceArena arena(1U << 30);
+          int columns = 0;
+          std::vector<int> column_of(rows);
+          for (int r = 0; r < rows; ++r) { column_of[r] = columns; columns += chunks[r].length; }
+          Tensor q = arena.alloc(DType::BF16, {dim, heads, columns});
+          Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, columns});
+          Tensor v = arena.alloc(DType::BF16, {dim, kv_heads, columns});
+          Tensor positions = arena.alloc(DType::I32, {columns});
+          Tensor reference = arena.alloc(DType::BF16, {dim, heads, columns});
+          Tensor packed_out = arena.alloc(DType::BF16, {dim, heads, columns});
+          unsigned seed = 4242U + dim + heads;
+          const auto fill = [&](Tensor tensor) {
+              std::vector<std::uint16_t> values(tensor.numel());
+              for (auto& value : values) {
+                  seed = seed * 1664525U + 1013904223U;
+                  value = f32_to_bf16((int(seed >> 16) - 32768) / 8192.0F);
+              }
+              CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), tensor.bytes(), cudaMemcpyHostToDevice));
+          };
+          fill(q);
+          fill(k);
+          fill(v);
+          std::vector<int> pos(columns);
+          for (int r = 0; r < rows; ++r) {
+              for (int t = 0; t < chunks[r].length; ++t) { pos[column_of[r] + t] = chunks[r].history + t; }
+          }
+          CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+          PagedKVBatchLayerView cache;
+          cache.head_dim = dim;
+          cache.num_kv_heads = kv_heads;
+          cache.dtype = dtype;
+          // Each row owns the pages its keys need, scattered through its range of the pool.
+          std::vector<int> first_page(rows), row_pages(rows);
+          int pool = 0;
+          for (int r = 0; r < rows; ++r) {
+              row_pages[r] = (chunks[r].history + chunks[r].length + kPagedKVPageSize - 1) / kPagedKVPageSize;
+              first_page[r] = pool;
+              pool += row_pages[r];
+          }
+          cache.k_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, pool});
+          cache.v_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, pool});
+          cache.block_tables = arena.alloc(DType::I32, {pages_per_row, rows});
+          std::vector<int> table(static_cast<std::size_t>(pages_per_row) * rows), row_ids(rows);
+          for (int r = 0; r < rows; ++r) {
+              row_ids[r] = r;
+              for (int p = 0; p < pages_per_row; ++p) {
+                  const int local = p < row_pages[r] ? (p * 7 + 3) % row_pages[r] : 0;
+                  table[static_cast<std::size_t>(r) * pages_per_row + p] = first_page[r] + local;
+              }
+          }
+          CUDA_CHECK(cudaMemcpy(cache.block_tables.data, table.data(), cache.block_tables.bytes(), cudaMemcpyHostToDevice));
+          Tensor row_table = arena.alloc(DType::I32, {rows});
+          CUDA_CHECK(cudaMemcpy(row_table.data, row_ids.data(), row_table.bytes(), cudaMemcpyHostToDevice));
+          // Each row's history: random keys and values at positions [0, history).
+          for (int r = 0; r < rows; ++r) {
+              if (chunks[r].history == 0) { continue; }
+              DeviceArena history(std::size_t(chunks[r].history) * dim * kv_heads * 4 + (1U << 20));
+              Tensor hk = history.alloc(DType::BF16, {dim, kv_heads, chunks[r].history});
+              Tensor hv = history.alloc(DType::BF16, {dim, kv_heads, chunks[r].history});
+              Tensor hp = history.alloc(DType::I32, {chunks[r].history});
+              fill(hk);
+              fill(hv);
+              std::vector<int> history_pos(chunks[r].history);
+              for (int i = 0; i < chunks[r].history; ++i) { history_pos[i] = i; }
+              CUDA_CHECK(cudaMemcpy(hp.data, history_pos.data(), hp.bytes(), cudaMemcpyHostToDevice));
+              PagedKVLayerView row_view;
+              row_view.head_dim = dim;
+              row_view.num_kv_heads = kv_heads;
+              row_view.dtype = dtype;
+              row_view.k_pages = cache.k_pages;
+              row_view.v_pages = cache.v_pages;
+              row_view.block_table = cache.block_tables.slice(1, r, 1).view({pages_per_row});
+              ops::gqa_kv_append(hk, hv, hp, row_view, nullptr);
+          }
+          // The cache as the histories left it, before any chunk's keys: every packed run starts
+          // from it, so its own appends are what the cache comparison sees.
+          Tensor k_before = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, pool});
+          Tensor v_before = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, pool});
+          CUDA_CHECK(cudaMemcpy(k_before.data, cache.k_pages.data, k_before.bytes(), cudaMemcpyDeviceToDevice));
+          CUDA_CHECK(cudaMemcpy(v_before.data, cache.v_pages.data, v_before.bytes(), cudaMemcpyDeviceToDevice));
+          const auto restore_cache = [&] {
+              CUDA_CHECK(cudaMemcpy(cache.k_pages.data, k_before.data, k_before.bytes(), cudaMemcpyDeviceToDevice));
+              CUDA_CHECK(cudaMemcpy(cache.v_pages.data, v_before.data, v_before.bytes(), cudaMemcpyDeviceToDevice));
+          };
+          const auto cache_bytes = [&] {
+              auto keys = from_device<std::uint8_t>(cache.k_pages.data, cache.k_pages.bytes());
+              const auto values = from_device<std::uint8_t>(cache.v_pages.data, cache.v_pages.bytes());
+              keys.insert(keys.end(), values.begin(), values.end());
+              return keys;
+          };
+          const float scale = attention_scale(geometry);
+          const auto envelope_of = [&](int r) {
+              const auto seen = static_cast<std::uint32_t>(chunks[r].history + chunks[r].length);
+              return ops::GqaExecutionEnvelope{seen, seen, window};
+          };
+          // The reference: each chunk's own call, as a round without packing makes it.
+          {
+              WorkspaceArena scratch(64U << 20);
+              for (int r = 0; r < rows; ++r) {
+                  Tensor qa = q.slice(2, column_of[r], chunks[r].length);
+                  Tensor ka = k.slice(2, column_of[r], chunks[r].length);
+                  Tensor va = v.slice(2, column_of[r], chunks[r].length);
+                  Tensor out = reference.slice(2, column_of[r], chunks[r].length);
+                  ops::gqa_attention(qa, ka, va, positions.slice(0, column_of[r], chunks[r].length), Tensor{},
+                                     row_table.slice(0, r, 1), scale, cache, envelope_of(r), scratch, out, nullptr);
+              }
+              cuda_synchronize();
+          }
+          const auto expected = from_device<std::uint16_t>(reference.data, reference.numel());
+          const auto expected_cache = cache_bytes();
+          // Packed: a large workspace (the op then takes up to 64 MiB of partials a launch), one that
+          // fits a few lanes, and
+          // one lane or three per launch (a lane whose own call shared its launch then runs alone,
+          // and the other way round); the first twice. Grouping and runs must not matter. Each run
+          // appends its own keys to the cache as it was before any chunk, then attends; the A3 run
+          // after it reads the keys it left.
+          struct Packing {
+              std::size_t workspace_bytes;
+              std::int32_t max_lanes;
+          };
+          for (const Packing packing : {Packing{512U << 20, 0}, Packing{512U << 20, 0}, Packing{40U << 20, 0},
+                                        Packing{512U << 20, 1}, Packing{512U << 20, 3}}) {
+            for (const bool a3 : {false, true}) {
+              const std::size_t workspace_bytes = packing.workspace_bytes;
+              if (!a3) { restore_cache(); }
+              CUDA_CHECK(cudaMemset(packed_out.data, 0xFF, packed_out.bytes()));
+              WorkspaceArena scratch(workspace_bytes);
+              std::vector<ops::GqaPackedSegment> segments;
+              for (int r = 0; r < rows; ++r) {
+                  if (ops::gqa_attention_packs_prompt(dim, heads, kv_heads, dtype, chunks[r].length, envelope_of(r))) {
+                      segments.push_back({column_of[r], chunks[r].length, r, envelope_of(r)});
+                  } else {
+                      Tensor qa = q.slice(2, column_of[r], chunks[r].length);
+                      Tensor ka = k.slice(2, column_of[r], chunks[r].length);
+                      Tensor va = v.slice(2, column_of[r], chunks[r].length);
+                      Tensor out = packed_out.slice(2, column_of[r], chunks[r].length);
+                      if (a3) {
+                          ops::gqa_attention_cached(qa, positions.slice(0, column_of[r], chunks[r].length),
+                                                    Tensor{}, row_table.slice(0, r, 1), scale, cache,
+                                                    envelope_of(r), scratch, out, nullptr);
+                      } else {
+                          ops::gqa_attention(qa, ka, va, positions.slice(0, column_of[r], chunks[r].length),
+                                             Tensor{}, row_table.slice(0, r, 1), scale, cache, envelope_of(r),
+                                             scratch, out, nullptr);
+                      }
+                  }
+              }
+              if (segments.size() == chunks.size()) {
+                  std::cerr << "Packed prompts " << geometry.name << ": no chunk keeps its own call\n";
+                  ++failures;
+              }
+              if (segments.size() < 4) {
+                  std::cerr << "Packed prompts " << geometry.name << ": only " << segments.size()
+                            << " chunks take the prompt route\n";
+                  ++failures;
+              }
+              ops::gqa_attention_packed_prompts(q, a3 ? Tensor{} : k, a3 ? Tensor{} : v, positions, segments,
+                                                scale, cache, scratch, packed_out, nullptr, packing.max_lanes);
+              cuda_synchronize();
+              const auto actual = from_device<std::uint16_t>(packed_out.data, packed_out.numel());
+              const std::string label = std::string(geometry.name) + " dtype=" + std::to_string(int(dtype)) +
+                  " window=" + std::to_string(window) + " workspace=" + std::to_string(workspace_bytes) +
+                  " max_lanes=" + std::to_string(packing.max_lanes) + (a3 ? " A3" : " A1");
+              if (actual != expected) {
+                  std::size_t first = 0;
+                  while (first < actual.size() && actual[first] == expected[first]) { ++first; }
+                  std::cerr << "Packed prompts " << label << " differ from their own calls at column "
+                            << first / (std::size_t(dim) * heads) << "\n";
+                  ++failures;
+              }
+              if (cache_bytes() != expected_cache) {
+                  std::cerr << "Packed prompts " << label << " left a cache that differs from their own calls'\n";
+                  ++failures;
+              }
+            }
+          }
+        }
+      }
+    }
+    return failures;
+}
+
 int verify_fp8_current_tokens_match_cached(int dim, int heads, int kv_heads) {
     int failures = 0;
     for (bool weighted : {false, true}) {
@@ -1833,6 +2037,7 @@ int main() {
     failures += verify_workspace_capacity_contract();
     failures += verify_split_numerator_precision();
     failures += verify_query_batch_invariance();
+    failures += verify_packed_prompt_invariance();
     failures += verify_fp8_current_tokens_match_cached(256, 8, 1);
     failures += verify_fp8_current_tokens_match_cached(256, 8, 4);
     failures += verify_fp8_current_tokens_match_cached(256, 16, 4);

@@ -3470,3 +3470,27 @@ Measured on an RTX 5090, Rune: the head's GEMV and sampling kernels (about 4% of
 golden set alone and under 8-client load, and at tolerance 0). Throughput moves little (Q4_K_M
 short decisions at 16 clients 52.1 -> 53.1 req/s, p50 326 -> 300 ms; Q6_K flat): the first-token
 steps are now bound by their host-side synchronization, which batching them would remove.
+
+## 98
+
+**Packed prompt attention launches (2026-09-24, latency after #14).**
+
+In a packed prefill round (#14) each prompt ran its own attention: the decode-style small-T
+kernels, a few launches per prompt per layer of 16-64 CTAs each on Rune's shapes, about 19% of
+GPU time at 8 clients with the GPU mostly idle. `ops::gqa_attention_packed_prompts` now serves every
+prompt of the round that takes the plain prompt route: it appends each prompt's keys and values as
+its own call does, cuts each prompt into exactly the query tiles its own call uses, and launches
+the tiles of one width from all prompts together, as many as the workspace's free room holds (up
+to 64 MiB of partials). The small-T partial and reduce kernels take per-lane column offsets for
+this (`LaneColumns`, a compile-time flag: every other instantiation is unchanged). Key partitions
+are anchored to absolute positions and each lane derives its active partitions from its own
+positions, so a tile computes the same bits whatever it shares a launch with. Prompts with an int8
+cache, a QSA selection or an image block, and rounds under graph capture, keep their own calls;
+`SUROGATE_SERVE_PACKED_ATTENTION=0` turns it off, for comparison.
+
+Measured on an RTX 5090, Rune, 15 s per level, same binary off -> on: short decisions at 8 clients
+46.1 -> 49.5 req/s on Q4_K_M (p50 174 -> 161 ms) and 36.4 -> 38.6 on Q6_K (219 -> 208 ms); at 16
+clients 52.9 -> 57.4 and 44.3 -> 48.4. Answers are bit-identical off and on and to main (the
+decisions v1 golden set alone and under 8-client load, and at tolerance 0); the op test compares
+packed prompts with each prompt's own call bit for bit, output and cache, across Gemma-4 and other
+shapes, BF16 and FP8 caches, sliding windows and key-partition boundaries.

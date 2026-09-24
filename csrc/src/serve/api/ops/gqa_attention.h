@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace sinfer::ops {
 
@@ -154,5 +155,46 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
                           const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
                           GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
                           cudaStream_t stream, GqaBlockMask selection = {});
+
+/// One sequence's part of gqa_attention_packed_prompts: its query columns
+/// [column, column + width) of q, k, v, positions and out, the block-table row its cache is
+/// on, and the envelope its own call would declare.
+struct GqaPackedSegment {
+    std::int32_t column    = 0;
+    std::int32_t width     = 0;
+    std::int32_t table_row = 0;
+    GqaExecutionEnvelope envelope{};
+};
+
+/**
+ * Whether gqa_attention_packed_prompts serves a segment of `width` queries under `envelope`
+ * exactly as gqa_attention (or gqa_attention_cached) does alone: the prompt-tile route over a
+ * BF16 or FP8 cache, without a QSA selection or an image block (callers check those).
+ */
+bool gqa_attention_packs_prompt(std::int32_t head_dim, std::int32_t q_heads,
+                                std::int32_t kv_heads, DType cache_dtype, std::int32_t width,
+                                GqaExecutionEnvelope envelope);
+
+/**
+ * The prompt attention of several sequences at once (#14's packed prefill rounds). Each segment
+ * is cut into the query tiles its own call would use, and tiles of one width from every segment
+ * share a launch -- as many as the workspace's free room holds, up to 64 MiB of partials --
+ * instead of each segment's few-CTA launches running one after another. Each tile reads only its
+ * own sequence's keys over the same absolute key partitions, and the reducer sums its own
+ * partitions in order, so every output bit is what the segment's own call writes.
+ *
+ * q and out are `[D, Hq, N]`, positions `[N]`, and k/v `[D, Hkv, N]` over the same N columns.
+ * Every segment must pass gqa_attention_packs_prompt, with its positions sequential and its last
+ * position below its envelope's max_visible_keys, as its own call requires; all share one sliding
+ * window. With k and v, their columns are appended to the cache first (A1); with empty k and v the
+ * cache already holds them (A3). `max_lanes_per_launch` (0: no limit) caps the tiles in one launch.
+ * Not for a stream that is being captured: the tile metadata is copied from the host.
+ */
+void gqa_attention_packed_prompts(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions,
+                                  const std::vector<GqaPackedSegment>& segments, float scale,
+                                  PagedKVBatchLayerView cache, WorkspaceArena& workspace,
+                                  Tensor& out, cudaStream_t stream,
+                                  std::int32_t max_lanes_per_launch = 0);
 
 } // namespace sinfer::ops

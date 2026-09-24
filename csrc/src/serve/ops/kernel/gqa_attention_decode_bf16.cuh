@@ -57,9 +57,12 @@ struct GqaSmallTTcSmem {
     static constexpr int kBytes    = kQkvBytes + kPBytes + kPageBytes;
 };
 
+// LaneColumns: each lane's first column is lane_columns[lane] rather than column_begin + lane *
+// full_width -- prompt tiles of several sequences in one launch (#14's packed rounds). A
+// compile-time choice, so every other instantiation is the code it was.
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput, typename CacheT = __nv_bfloat16, bool Sparse = false,
-          int SparseBlock = 4>
+          int SparseBlock = 4, bool LaneColumns = false>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheT* cache_k,
     CacheT* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
@@ -67,9 +70,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
     std::int32_t sliding_window, float scale,
     float* partial_acc, float* partial_m, float* partial_l,
-    GqaBlockMask block_mask = GqaBlockMask{}) {
+    GqaBlockMask block_mask = GqaBlockMask{}, const std::int32_t* lane_columns = nullptr) {
     static_assert(TokenTile >= 1 && TokenTile <= 32);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
+    static_assert(!LaneColumns || (MultiBatch && !CacheInput::writes_cache && !Sparse),
+                  "lane columns are for batched launches over a populated cache");
 
     constexpr bool kFp8Cache = GqaKvIsFp8<CacheT>::value;
     static_assert(kFp8Cache || sizeof(CacheT) == sizeof(__nv_bfloat16),
@@ -138,7 +143,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int row_count = tokens * Geometry::GroupSize;
 
     std::int64_t column_base = column_begin;
-    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    if constexpr (LaneColumns) {
+        column_base = lane_columns[batch];
+    } else if constexpr (MultiBatch) {
+        column_base += static_cast<std::int64_t>(batch) * full_width;
+    }
     q += static_cast<std::int64_t>(Geometry::HeadDim) * Geometry::QHeads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
