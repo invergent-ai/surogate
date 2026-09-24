@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -184,3 +185,65 @@ def test_cancel_malformed_chunks_and_short_tail(server):
         r = client.post(base + "/v1/audio/streams/" + ident + "?finish=true", data=b"\0\0" * length, timeout=120)
         assert r.ok, (length, r.text)
     assert client.get(base + "/health", timeout=5).ok
+
+
+def test_every_transcription_reports_its_duration(server):
+    """The billed seconds reach the gateway on every format: usage in JSON, a header on all."""
+    client, base, audio = server
+    try:  # a 16 kHz mono WAV has an exactly known length; other formats are decoded by the server
+        with wave.open(str(audio), "rb") as f:
+            exact = f.getnframes() / 16000 if f.getframerate() == 16000 and f.getnchannels() == 1 else None
+    except (wave.Error, EOFError):
+        exact = None
+    seconds = {}
+    for fmt in ("json", "text", "verbose_json"):
+        r = client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()},
+                        data={"response_format": fmt}, timeout=120)
+        assert r.ok, r.text
+        header = float(r.headers["X-Audio-Duration-Seconds"])
+        seconds[fmt] = header
+        if fmt == "text":
+            assert r.headers["Content-Type"].startswith("text/plain")
+            text_body = r.text  # the transcript alone, as before
+            continue
+        body = r.json()
+        assert body["usage"] == {"type": "duration", "seconds": header}
+        if fmt == "verbose_json":
+            assert body["duration"] == header
+    assert len(set(seconds.values())) == 1 and seconds["json"] > 0
+    assert text_body == client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()},
+                                    timeout=120).json()["text"]
+    if exact is not None:
+        assert seconds["json"] == exact
+        # Compressed uploads are billed for the audio, not for the codec's padding: the MP3's
+        # gapless header is honoured, and an M4A with its index after the audio (ffmpeg's and
+        # most phones' default layout) is readable. AAC keeps up to one frame of padding at the
+        # end (1024 samples at the file's rate: 64 ms at 16 kHz), as FFmpeg's own decoder does.
+        encoder = shutil.which("ffmpeg")
+        if encoder:
+            for suffix, codec, tolerance in ((".mp3", "libmp3lame", 0.002), (".m4a", "aac", 1024 / 16000)):
+                encoded = audio.with_name(audio.stem + "-duration-test" + suffix)
+                subprocess.run([encoder, "-loglevel", "error", "-y", "-i", str(audio), "-c:a", codec, str(encoded)],
+                               check=True)
+                try:
+                    r = client.post(base + "/v1/audio/transcriptions", files={"file": encoded.read_bytes()}, timeout=120)
+                    assert r.ok, (suffix, r.text)
+                    billed = float(r.headers["X-Audio-Duration-Seconds"])
+                    assert r.json()["usage"]["seconds"] == billed
+                    assert exact <= billed <= exact + tolerance, (suffix, billed, exact)
+                finally:
+                    encoded.unlink(missing_ok=True)
+    # Silence shorter than a frame has no text and is still billed for its length.
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+        f.writeframes(b"\0\0" * 300)
+    r = client.post(base + "/v1/audio/transcriptions", files={"file": wav.getvalue()}, timeout=120)
+    assert r.ok, r.text
+    assert r.json() == {"text": "", "usage": {"type": "duration", "seconds": 300 / 16000}}
+    assert r.headers["X-Audio-Duration-Seconds"] == "0.01875"
+    # A failed transcription bills nothing.
+    r = client.post(base + "/v1/audio/transcriptions", files={"file": b"bad file"}, timeout=10)
+    assert r.status_code == 400 and "X-Audio-Duration-Seconds" not in r.headers

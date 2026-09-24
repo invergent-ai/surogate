@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #include "audio.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -26,6 +27,24 @@ std::vector<float> decode_audio(const std::string& bytes) {
         in.offset += n;
         return n;
     };
+    // The whole upload is in memory, so it can seek. Without this FFmpeg cannot learn the file's
+    // size: the MP3 demuxer then ignores the encoder's gapless header and counts its padding as
+    // audio (billing up to a frame too much), and an M4A whose index comes after the audio (the
+    // usual layout of phone recordings) cannot be read at all.
+    auto seek = [](void* opaque, int64_t offset, int whence) -> int64_t {
+        auto& in         = *static_cast<Input*>(opaque);
+        const auto total = static_cast<int64_t>(in.bytes.size());
+        if (whence & AVSEEK_SIZE) return total;
+        whence &= ~AVSEEK_FORCE;
+        int64_t base = 0;
+        if (whence == SEEK_CUR) base = static_cast<int64_t>(in.offset);
+        else if (whence == SEEK_END) base = total;
+        else if (whence != SEEK_SET) return AVERROR(EINVAL);
+        const int64_t position = base + offset;
+        if (position < 0 || position > total) return AVERROR(EINVAL);
+        in.offset = static_cast<size_t>(position);
+        return position;
+    };
 
     struct Resources {
         AVFormatContext* format = nullptr;
@@ -49,7 +68,7 @@ std::vector<float> decode_audio(const std::string& bytes) {
     } r;
 
     r.io = avio_alloc_context(static_cast<unsigned char*>(av_malloc(32768)), 32768, 0, &input, read,
-                              nullptr, nullptr);
+                              nullptr, seek);
     r.format = avformat_alloc_context();
     if (!r.io || !r.format || !r.packet || !r.frame)
         throw std::runtime_error("audio allocation failed");

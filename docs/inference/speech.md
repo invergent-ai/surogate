@@ -92,7 +92,8 @@ curl http://localhost:8080/v1/audio/transcriptions \
   -F file=@recording.wav
 ```
 
-The response is `{"text":"…"}`. WAV, FLAC, MP3, Ogg, M4A, AAC, and WebM audio
+The response is `{"text":"…","usage":{"type":"duration","seconds":2.63}}`.
+WAV, FLAC, MP3, Ogg, M4A, AAC, and WebM audio
 are supported; stereo and other sample rates are converted automatically.
 Uploads are limited to 64 MiB and ten minutes. The non-streaming model processes
 the entire file together; longer files need more memory. The streaming model
@@ -109,6 +110,29 @@ Optional form fields:
 `verbose_json` also returns duration and language. Translation, word
 alignment, subtitle formats, and prompting are unavailable. Unsupported fields
 return an error.
+
+Every successful transcription reports the audio length it is billed for, in
+seconds, whatever the format:
+
+- the `X-Audio-Duration-Seconds` response header, on every format;
+- `usage`, OpenAI's object for audio billed by duration
+  (`{"type": "duration", "seconds": …}`), in `json` and `verbose_json`.
+
+The two carry the same number, and so does `verbose_json`'s `duration`. A
+gateway can meter a transcription with it, without decoding the file or reading
+the body. A failed transcription carries neither. The value is the length of the
+decoded audio, counted in 16 kHz samples (62.5 µs each):
+
+- WAV, FLAC and other lossless files are billed for exactly their length.
+- MP3 is billed for its audio, without the encoder's padding, when the file has
+  a gapless (Xing/LAME) header, as encoders write by default.
+- AAC and M4A can include up to one AAC frame of encoder padding at the end:
+  1024 samples at the file's own rate, which is 23 ms at 44.1 kHz and 64 ms at
+  16 kHz.
+
+The header is a decimal number of seconds that always reads back as the same
+value, for example `2.63` or `1.0`. The shortest audio, under a millisecond, is
+written in exponent form (`6.25e-05` for one sample), so parse it as a float.
 
 ## Stream microphone audio
 
