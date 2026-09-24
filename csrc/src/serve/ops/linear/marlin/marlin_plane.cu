@@ -9,6 +9,7 @@
 #include "ops/linear/marlin/marlin_repack.h"
 
 #include "core/device.h"
+#include "core/device_footprint.h"
 
 #include <cstdlib>
 #include <map>
@@ -205,7 +206,7 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
     const std::size_t gptq_bytes = static_cast<std::size_t>(k / 4) * n * sizeof(std::uint32_t);
 
     std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+    if (!budgeted_mem_get_info(free_bytes, total_bytes) ||
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
         g_bytes + b_bytes + s_bytes > total_bytes / 4) {
         // Per-device engine budget: planes duplicate the residency they accelerate, so a
@@ -309,7 +310,7 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     // tensor, and routing dispatches on it, so a fallback is a type error
     // rather than a silent misread.
     std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+    if (!budgeted_mem_get_info(free_bytes, total_bytes) ||
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
         g_bytes + b_bytes + s_bytes > total_bytes / 4) {
         // Per-device engine budget: planes duplicate the residency they accelerate, so a
@@ -445,7 +446,7 @@ bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream) {
     if (b_bytes != static_cast<std::size_t>(n) * k) { return false; }
 
     std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+    if (!budgeted_mem_get_info(free_bytes, total_bytes) ||
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes)) {
         return false;
     }

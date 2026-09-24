@@ -1,6 +1,7 @@
 #include "core/elastic_kv_region.h"
 
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "core/device_memory_error.h"
 #include "core/engine_context.h"
 #include "core/sleep.h"
@@ -77,14 +78,8 @@ std::size_t outstanding_on(int device, const void* except) noexcept {
     }
     return bytes;
 }
-std::size_t region_device_free_bytes(int device) noexcept try {
-    const ScopedDevice selected(device);
-    std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) { return 0; }
-    return free_bytes;
-} catch (...) {
-    return 0;
-}
+// Free memory as this process may use it: under --gpu-memory-limit-mib, its remaining budget.
+std::size_t region_device_free_bytes(int device) noexcept { return device_budget_free_bytes(device); }
 
 } // namespace
 

@@ -2,6 +2,7 @@
 #include "api/engine.h"
 
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "runtime/contract/sampling.h"
 #include "core/limits.h"
 #include "runtime/contract/types.h"
@@ -174,7 +175,8 @@ public:
     using Executor = runtime::ExecutorVariantFor<targets::ActiveTarget>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(normalized_device(std::move(engine_options))), device(options.device) {
+        : options(with_memory_limit(normalized_device(std::move(engine_options)))),
+          device(options.device) {
         if (!options.borrowed_weights.empty() && !options.devices.empty()) {
             throw std::invalid_argument("borrowed weights currently require a single device");
         }
@@ -258,6 +260,18 @@ public:
     // it ran there or not, which on a shared host is someone else's card.
     static EngineOptions normalized_device(EngineOptions options) {
         if (!options.devices.empty()) { options.device = options.devices.front(); }
+        return options;
+    }
+
+    // Registers the per-device budget before anything is allocated, so every sizing decision
+    // of the load reads free memory within it (core/device_footprint.h).
+    static EngineOptions with_memory_limit(EngineOptions options) {
+        if (options.gpu_memory_limit_bytes != 0) {
+            set_device_memory_limit(options.device, options.gpu_memory_limit_bytes);
+            for (const int device : options.devices) {
+                set_device_memory_limit(device, options.gpu_memory_limit_bytes);
+            }
+        }
         return options;
     }
 

@@ -151,6 +151,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
            "[--enforce-eager] [--no-prefix-reuse] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
+           "[--gpu-memory-limit-mib N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -177,6 +178,8 @@ std::string serve_usage_text(const char* argv0) {
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --no-elastic-kv reserves the full cache; --elastic-kv grows it with demand.\n"
+           "       --gpu-memory-limit-mib N caps everything this server holds on each of its GPUs\n"
+           "                    (weights, cache, workspaces, CUDA context); auto sizing fits in it\n"
            "       --elastic-kv-overcommit guarantees each model only its\n"
            "                    --kv-capacity (one full-context request when auto) and admits "
            "every\n"
@@ -418,6 +421,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--elastic-kv-overcommit") {
             options.elastic_kv            = true;
             options.elastic_kv_overcommit = true;
+        } else if (arg == "--gpu-memory-limit-mib") {
+            const int mib = parse_nonnegative_int(require_value("--gpu-memory-limit-mib"),
+                                                  "gpu-memory-limit-mib");
+            if (mib == 0) { throw std::invalid_argument("--gpu-memory-limit-mib must be positive"); }
+            options.gpu_memory_limit_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (arg == "--enforce-eager") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

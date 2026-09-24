@@ -4,6 +4,7 @@
 #include <nvml.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -24,9 +25,11 @@ nvmlReturn_t device_by_pci(const char*, nvmlDevice_t* device) {
     *device = reinterpret_cast<nvmlDevice_t>(static_cast<std::uintptr_t>(mode + 1));
     return NVML_SUCCESS;
 }
+thread_local bool grew = false; // mode 7: a process started between the count and the list
 nvmlReturn_t processes(nvmlDevice_t device, unsigned* count, nvmlProcessInfo_t* output) {
     const int selected = static_cast<int>(reinterpret_cast<std::uintptr_t>(device)) - 1;
     if (selected == 3) { return NVML_ERROR_NO_PERMISSION; }
+    if (selected == 7 && output && !grew) { grew = true; *count = 2; return NVML_ERROR_INSUFFICIENT_SIZE; }
     if (!output) { *count = selected == 2 ? 0 : 1; return *count ? NVML_ERROR_INSUFFICIENT_SIZE : NVML_SUCCESS; }
     output[0] = {};
     output[0].pid = getpid() + (selected == 5 ? 1 : 0);
@@ -51,10 +54,13 @@ extern "C" void* __wrap_dlsym(void* handle, const char* symbol) {
     if (std::strcmp(symbol, "nvmlDeviceGetComputeRunningProcesses_v3") == 0) { return reinterpret_cast<void*>(&processes); }
     return nullptr;
 }
+std::size_t consumed = 0; // what other allocations took from the fake device's free memory
 extern "C" cudaError_t CUDARTAPI cudaMemGetInfo(std::size_t* free, std::size_t* total) {
-    *free = 10000 + mode; *total = 20000; return cudaSuccess;
+    *free = 10000 + mode - consumed; *total = 20000; return cudaSuccess;
 }
 extern "C" cudaError_t CUDARTAPI cudaGetDevice(int* device) { *device = mode; return cudaSuccess; }
+extern "C" cudaError_t CUDARTAPI cudaSetDevice(int) { return cudaSuccess; }
+extern "C" cudaError_t CUDARTAPI cudaGetLastError() { return cudaSuccess; }
 extern "C" cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char* output, int length, int) {
     if (mode == 6) { return cudaErrorInvalidDevice; }
     std::strncpy(output, "0000:01:00.0", length); return cudaSuccess;
@@ -100,5 +106,50 @@ int main() {
     assert(!fail_allocation);
     assert(std::string_view(device_footprint_attribution_note()).find("allocation failed") != std::string_view::npos);
     assert(sample_device_footprint().attributed);
-    std::cout << "NVML diagnostic isolation, stable note pointers and allocation failure recovery passed\n";
+
+    // The per-device budget (--gpu-memory-limit-mib, SUROGATE-CHANGES #8). Device 0 attributes
+    // 1234 bytes to this process and has 10000 free.
+    assert(device_budget_free_bytes(0) == 10000);               // no limit: the device's free memory
+    set_device_memory_limit(0, 5000);
+    assert(device_memory_limit(0) == 5000);
+    assert(device_budget_free_bytes(0) == 5000 - 1234);         // the limit less what the process holds
+    set_device_memory_limit(0, 1000);
+    assert(device_budget_free_bytes(0) == 0);                   // already past it
+    set_device_memory_limit(0, 1000000);
+    assert(device_budget_free_bytes(0) == 10000);               // never more than the device has
+    set_device_memory_limit(0, 0);
+    assert(device_memory_limit(0) == 0 && device_budget_free_bytes(0) == 10000);
+    // Once attributed, a failed NVML sample keeps the last figure instead of switching to the
+    // fallback's (mode 3 refuses the process list).
+    set_device_memory_limit(0, 5000);
+    assert(device_budget_free_bytes(0) == 5000 - 1234);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));  // past the 50 ms reuse
+    mode = 3;
+    assert(device_budget_free_bytes(0) == 5000 - 1234);
+    mode = 0;
+    set_device_memory_limit(0, 0);
+    // A process that starts between NVML's count and its list does not lose the sample.
+    mode = 7;
+    grew = false;
+    assert(sample_device_footprint().attributed && grew);
+    mode = 0;
+    // Device 1: NVML cannot attribute usage, so what left the device's free memory since the
+    // limit was set counts against it, plus an estimate for the CUDA context.
+    constexpr std::size_t context = std::size_t{512} << 20;
+    mode = 1;
+    set_device_memory_limit(1, context + 5000);                  // baseline: 10001 free
+    assert(device_budget_free_bytes(1) == 5000);
+    consumed = 3000;                                             // 7001 free: 3000 used
+    assert(device_budget_free_bytes(1) == 2000);
+    consumed = 1000;                                             // a neighbour freed 2000: not ours
+    assert(device_budget_free_bytes(1) == 2000);
+    consumed = 6000;                                             // 4001 free
+    assert(device_budget_free_bytes(1) == 0);
+    set_device_memory_limit(1, context + 5000);                  // the same limit again keeps its state
+    assert(device_budget_free_bytes(1) == 0);
+    set_device_memory_limit(1, 0);
+    consumed = 0;
+    mode = 0;
+    std::cout << "NVML diagnostic isolation, stable note pointers, allocation failure recovery and "
+                 "the GPU memory budget passed\n";
 }

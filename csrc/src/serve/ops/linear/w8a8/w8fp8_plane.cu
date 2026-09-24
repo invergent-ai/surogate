@@ -6,6 +6,7 @@
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "core/engine_context.h"
 #include "ops/linear/plane_storage.h"
 #include <atomic>
@@ -190,7 +191,7 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     // VRAM guard: keep a 2x margin so a raced allocation cannot starve the
     // serving engine's own reservations.
     std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+    if (!budgeted_mem_get_info(free_bytes, total_bytes) ||
         free_bytes < 2 * (code_bytes + scale_bytes)) {
         g_planes.emplace(weight.qdata, PlaneEntry{});  // do not retry every call
         return {nullptr, nullptr};

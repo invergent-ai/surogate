@@ -92,8 +92,9 @@ std::size_t wake_device(int device, const void* owner = nullptr);
 /// seconds; the scheduler pays this at startup instead.
 void sleep_prepare_backups(const void* owner);
 
-/// Free VRAM on `device` right now (cudaMemGetInfo), for budget planning by
-/// callers that are not CUDA translation units themselves.
+/// Free VRAM on `device` right now that this process may use (cudaMemGetInfo, and under
+/// --gpu-memory-limit-mib no more than the limit less what the process holds), for budget
+/// planning by callers that are not CUDA translation units themselves.
 [[nodiscard]] std::size_t device_free_bytes(int device) noexcept;
 
 } // namespace sinfer

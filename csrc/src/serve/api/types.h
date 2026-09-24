@@ -263,6 +263,12 @@ struct EngineOptions {
     // under automatic sizing) and every page past it is admitted through a device-wide gate
     // on free memory, so co-resident engines share the device's idle KV.
     bool elastic_kv_overcommit         = false;
+    // Everything this process may hold on each of its devices -- weights, cache, workspaces
+    // and the CUDA context -- in bytes; 0 = the whole card. Automatic sizing (KV capacity,
+    // context, expert slots) reads free memory within this budget, and the elastic KV cache,
+    // which never maps past its cap, then keeps the process inside it. Shared by every engine
+    // in the process on a device (--gpu-memory-limit-mib).
+    std::size_t gpu_memory_limit_bytes = 0;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

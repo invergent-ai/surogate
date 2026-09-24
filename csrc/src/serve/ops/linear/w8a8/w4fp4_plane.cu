@@ -4,6 +4,7 @@
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "core/engine_context.h"
 #include "ops/linear/plane_storage.h"
 #include <atomic>
@@ -366,7 +367,7 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
         g_planes.emplace(weight.qdata, PlaneEntry{});
         return W4Fp4Plane{nullptr, nullptr, nullptr, nullptr};
     };
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < 2 * total) { return fail(); }
+    if (!budgeted_mem_get_info(free_bytes, total_bytes) || free_bytes < 2 * total) { return fail(); }
     PlaneEntry entry;
     entry.storage = try_plane_storage(total + 3 * 256);
     if (!entry.storage) { return fail(); }
