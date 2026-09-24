@@ -59,7 +59,18 @@ def bundle(tmp_path):
 from pathlib import Path
 stream = sys.argv[4] == '-'
 assert os.environ['CUDA_VISIBLE_DEVICES'] == os.environ.get('EXPECT_CUDA_VISIBLE_DEVICES', '')
+# FIXTURE_LOAD_SECONDS: a slow model load. FIXTURE_FAIL_LOAD_FROM=K: the K-th worker started, and every
+# later one, fails to load (FIXTURE_LOAD_COUNT counts the starts).
+time.sleep(float(os.environ.get('FIXTURE_LOAD_SECONDS', '0')))
+if os.environ.get('FIXTURE_FAIL_LOAD_FROM'):
+    with open(os.environ['FIXTURE_LOAD_COUNT'], 'ab') as count:
+        count.write(b'x')
+    if os.path.getsize(os.environ['FIXTURE_LOAD_COUNT']) >= int(os.environ['FIXTURE_FAIL_LOAD_FROM']):
+        sys.exit(3)
 out = sys.stdout.buffer
+if stream:
+    out.write(b'0 ready\\n')  # the model is loaded
+    out.flush()
 pending = b''
 def lines():
     global pending
@@ -83,6 +94,8 @@ for line in source:
         sys.exit(3)
     if seed == '102':
         time.sleep(5)
+    if seed == '107':
+        time.sleep(0.15)
     pcm = bytes([int(voice), 0]) * 100
     if not stream:
         with wave.open(str(Path(sys.argv[4]) / (identity + '.wav')), 'wb') as wav:
@@ -642,11 +655,13 @@ def test_native_http_body_limits_and_worker_recovery(bundle, tmp_path):
             time.sleep(0.1)
             assert unbilled(client.post("/v1/audio/speech", json={"input": "Bună"}), 429)
             assert unbilled(slow.result(), 504)
-        assert client.get("/health").status_code == 503
-        assert not child_pids(process.pid)
+        # The timed-out worker was replaced at once: the server stays ready.
+        assert client.get("/health").status_code == 200
+        replaced = child_pids(process.pid)
+        assert len(replaced) == 1 and replaced != original
         recovered = client.post("/v1/audio/speech", json={"input": "Bună", "voice": "Tudor"})
         assert recovered.content == wav_bytes(12) and recovered.headers["x-usage-characters"] == "4"
-        assert child_pids(process.pid) != original
+        assert child_pids(process.pid) == replaced
         assert unbilled(client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}), 503)
         assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
 
@@ -858,6 +873,227 @@ def test_longer_inputs_with_a_higher_limit(bundle, tmp_path):
             assert r.status_code == 200 and r.headers["x-usage-characters"] == str(len(text))
             r.read()
         assert client.post("/v1/audio/speech", json={"input": text * 2}).status_code == 400
+
+
+def test_several_requests_are_synthesized_at_once(bundle, tmp_path):
+    """--max-num-seqs N: N workers, each with its own model, serve N requests at once."""
+    with native_server(bundle, tmp_path, "--max-num-seqs", "3", "--max-pending-requests", "1") as (client, process):
+        workers = child_pids(process.pid)
+        assert len(workers) == 3  # all loaded before the server answered
+        assert client.get("/health").status_code == 200
+        start = time.monotonic()
+        with ThreadPoolExecutor(4) as pool:
+            slow = [pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 102})
+                    for _ in range(3)]
+            time.sleep(0.3)
+            # Three running and one queued fill it; one more is refused.
+            queued = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună"})
+            time.sleep(0.3)
+            full = client.post("/v1/audio/speech", json={"input": "Bună"})
+            assert full.status_code == 429
+            assert [f.result().status_code for f in slow] == [200, 200, 200]
+            assert queued.result().content == wav_bytes(11)
+        # The three 5-second requests ran side by side, not one after another.
+        assert time.monotonic() - start < 9
+        assert child_pids(process.pid) == workers
+
+
+def test_a_failed_worker_is_replaced_without_disturbing_the_others(bundle, tmp_path):
+    with native_server(bundle, tmp_path, "--max-num-seqs", "2") as (client, process):
+        workers = child_pids(process.pid)
+        with ThreadPoolExecutor(2) as pool:
+            slow = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 102})
+            time.sleep(0.2)
+            failed = client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101})
+            assert failed.status_code == 503
+            # Replaced at once, before any other request: two workers, one of them new, and ready.
+            now = child_pids(process.pid)
+            assert len(now) == 2 and len(now & workers) == 1
+            assert client.get("/health").status_code == 200
+            assert slow.result().status_code == 200  # the other worker carried on
+        assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+        assert child_pids(process.pid) == now
+
+
+@pytest.mark.parametrize("value", ["0", "17", "two"])
+def test_invalid_worker_counts_are_refused(bundle, tmp_path, value):
+    binary = serve._resolve_binary("tts")
+    if not binary:
+        pytest.skip("make serve-tts-build first")
+    result = subprocess.run([binary, str(bundle.root), "--max-num-seqs", value], capture_output=True,
+                            text=True, timeout=30,
+                            env={**os.environ, "SUROGATE_TTS_WORKER_BIN": str(bundle.root / "bin/synthesize")})
+    assert result.returncode != 0 and "--max-num-seqs must be" in result.stderr, result.stderr
+
+
+def test_waiting_requests_are_served_in_arrival_order(bundle, tmp_path):
+    with native_server(bundle, tmp_path, "--request-timeout", "30") as (client, _):
+        finished = []
+        with ThreadPoolExecutor(7) as pool:
+            holder = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 103})
+            time.sleep(0.2)
+
+            def speak(index):  # 0.15 s each, so they finish apart in the order they ran
+                assert client.post("/v1/audio/speech", json={"input": "Bună", "seed": 107}).status_code == 200
+                finished.append(index)
+
+            waiting = []
+            for index in range(6):
+                waiting.append(pool.submit(speak, index))
+                time.sleep(0.05)
+            assert holder.result().status_code == 200
+            for future in waiting:
+                future.result()
+        assert finished == list(range(6))
+
+
+def test_a_waiter_that_leaves_does_not_block_the_queue(bundle, tmp_path):
+    with native_server(bundle, tmp_path, "--request-timeout", "30") as (client, _):
+        with ThreadPoolExecutor(3) as pool:
+            start = time.monotonic()
+            holder = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 103})
+            time.sleep(0.1)
+
+            def leave():  # first in line, then gone before the worker is free
+                with httpx.Client(base_url=client.base_url, headers=client.headers, timeout=0.3) as impatient:
+                    with pytest.raises(httpx.TimeoutException):
+                        impatient.post("/v1/audio/speech", json={"input": "Bună"})
+
+            left = pool.submit(leave)
+            time.sleep(0.1)
+            later = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună"})
+            left.result()
+            assert holder.result().status_code == 200
+            assert later.result().content == wav_bytes(11)
+            assert time.monotonic() - start < 2  # served when the holder finished (0.8 s)
+
+
+def test_a_worker_that_cannot_reload_does_not_take_requests(bundle, tmp_path, tmp_path_factory):
+    """A slot whose worker keeps failing to load is left to revive(); requests go to the loaded one."""
+    loads = tmp_path_factory.mktemp("loads") / "count"
+    env = {"FIXTURE_FAIL_LOAD_FROM": "3", "FIXTURE_LOAD_COUNT": str(loads)}  # after startup, none load
+    with native_server(bundle, tmp_path, "--max-num-seqs", "2", env=env) as (client, _):
+        assert client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}).status_code == 503
+        for _ in range(8):
+            assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+        # Between restarts (every 10 s) the slot is down: the server says so and still serves.
+        deadline = time.monotonic() + 3
+        while (health := client.get("/health")).json()["status"] != "degraded":
+            assert time.monotonic() < deadline, health.json()
+            time.sleep(0.02)
+        assert health.status_code == 200 and health.json()["workers"] == {"ready": 1, "total": 2}
+    # Two at startup, the replacement, and at most one retry 10 s later: not one per request.
+    assert loads.stat().st_size <= 4
+
+
+def test_health_is_503_while_the_only_worker_cannot_load(bundle, tmp_path, tmp_path_factory):
+    """The worker crashes; its replacement and every retry die loading (a GPU whose memory was taken)."""
+    loads = tmp_path_factory.mktemp("loads") / "count"
+    env = {"FIXTURE_LOAD_SECONDS": "0.5", "FIXTURE_FAIL_LOAD_FROM": "2", "FIXTURE_LOAD_COUNT": str(loads)}
+    with native_server(bundle, tmp_path, env=env) as (client, _):
+        assert client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}).status_code == 503
+        deadline = time.monotonic() + 5
+        while client.get("/health").status_code != 503:  # once the replacement has died loading
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        started, codes = time.monotonic(), []
+        while time.monotonic() - started < 3:  # requests back to back are refused at once
+            asked = time.monotonic()
+            codes.append(client.post("/v1/audio/speech", json={"input": "Bună"}).status_code)
+            assert time.monotonic() - asked < 1
+            assert client.get("/health").status_code == 503
+        assert set(codes) == {503}
+    assert loads.stat().st_size == 2  # startup and the replacement; the retry is 10 s away
+
+
+def test_a_worker_stopped_while_loading_is_not_a_failed_start(bundle, tmp_path):
+    """The server stops a loading worker (a timeout): it was healthy, so it is replaced at once."""
+    with native_server(bundle, tmp_path, "--request-timeout", "1.5", env={"FIXTURE_LOAD_SECONDS": "1"}) as (client, _):
+        with ThreadPoolExecutor(2) as pool:
+            slow = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 102})
+            time.sleep(0.2)
+            # Queued behind it, then given its replacement while that loads, and timed out mid-load.
+            queued = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună"})
+            assert slow.result().status_code == 504
+            assert queued.result().status_code == 504
+        assert client.get("/health").status_code == 200
+        assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+
+
+def test_a_request_waits_for_the_loaded_worker_rather_than_one_that_cannot_load(bundle, tmp_path,
+                                                                                tmp_path_factory):
+    loads = tmp_path_factory.mktemp("loads") / "count"
+    env = {"FIXTURE_LOAD_SECONDS": "0.5", "FIXTURE_FAIL_LOAD_FROM": "3", "FIXTURE_LOAD_COUNT": str(loads)}
+    with native_server(bundle, tmp_path, "--max-num-seqs", "2", env=env) as (client, _):
+        assert client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}).status_code == 503
+        deadline = time.monotonic() + 5
+        while client.get("/health").json()["workers"]["ready"] != 1:  # its replacement died loading
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        with ThreadPoolExecutor(2) as pool:
+            for _ in range(4):
+                holder = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 103})
+                time.sleep(0.1)
+                asked = time.monotonic()
+                assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+                assert time.monotonic() - asked < 2  # waited for the busy worker, 0.7 s at most
+                assert holder.result().status_code == 200
+    assert loads.stat().st_size == 3
+
+
+def test_a_worker_that_dies_while_idle_is_restarted_without_traffic(bundle, tmp_path):
+    with native_server(bundle, tmp_path) as (client, process):
+        [worker] = child_pids(process.pid)
+        os.kill(worker, 9)
+        deadline = time.monotonic() + 3
+        while not (client.get("/health").status_code == 200 and child_pids(process.pid) - {worker}):
+            assert time.monotonic() < deadline, "the dead worker was not restarted"
+            time.sleep(0.02)
+        assert client.get("/health").json()["status"] == "ok"
+
+
+def test_health_stays_ready_while_a_failed_worker_is_replaced(bundle, tmp_path):
+    with native_server(bundle, tmp_path) as (client, _):
+        statuses, done = [], []
+
+        def poll():
+            with httpx.Client(base_url=client.base_url, headers=client.headers, timeout=5) as poller:
+                while not done:
+                    statuses.append(poller.get("/health").status_code)
+
+        with ThreadPoolExecutor(2) as pool:
+            polling = [pool.submit(poll) for _ in range(2)]
+            for _ in range(10):
+                assert client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}).status_code == 503
+            done.append(True)
+            for future in polling:
+                future.result()
+        assert len(statuses) > 20 and set(statuses) == {200}
+
+
+def test_each_worker_gets_the_whole_timeout_to_load(bundle, tmp_path):
+    # Three workers loading 0.5 s each, one after another, within a 1.2 s request timeout.
+    with native_server(bundle, tmp_path, "--max-num-seqs", "3", "--request-timeout", "1.2",
+                       env={"FIXTURE_LOAD_SECONDS": "0.5"}) as (client, process):
+        assert len(child_pids(process.pid)) == 3
+        assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+
+
+def test_a_worker_that_cannot_load_is_named_at_startup(bundle, tmp_path):
+    binary = serve._resolve_binary("tts")
+    if not binary:
+        pytest.skip("make serve-tts-build first")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    result = subprocess.run(
+        [binary, str(bundle.root), "--max-num-seqs", "3", "--port", str(port)], capture_output=True, text=True,
+        timeout=60, env={**os.environ, "SUROGATE_TTS_WORKER_BIN": str(bundle.root / "bin/synthesize"),
+                         "CUDA_VISIBLE_DEVICES": "", "FIXTURE_FAIL_LOAD_FROM": "3",
+                         "FIXTURE_LOAD_COUNT": str(tmp_path / "loads")})
+    assert result.returncode == 1
+    assert "TTS worker 3 of 3 failed to load" in result.stderr and "--max-num-seqs" in result.stderr, result.stderr
+    assert (tmp_path / "loads").stat().st_size == 3  # each worker started once: no retry during startup
 
 
 def test_native_http_shutdown_cancels_active_inference(bundle, tmp_path):

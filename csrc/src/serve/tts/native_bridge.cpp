@@ -110,6 +110,9 @@ extern "C" int surogate_tts_worker_main(int argc, char** argv) {
     }
     try {
         MagpieTtsRuntime synth(config);
+        // The model is loaded: the server counts this worker as ready from now on, not while a
+        // load that may fail is still running (SUROGATE-CHANGES #7).
+        if (stream && !write_all(protocol, "0 ready\n")) throw std::runtime_error("Output closed");
         std::ifstream jobs(argv[3]);
         std::ofstream report;
         if (!stream) report.open(std::string(argv[4]) + "/stats.jsonl");

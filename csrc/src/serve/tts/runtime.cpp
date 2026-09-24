@@ -56,54 +56,170 @@ std::string worker_visible_devices(const std::string& device) {
 } // namespace
 
 Runtime::Runtime(std::filesystem::path root, int max_pending, double timeout, int threads,
-                 int codec_threads, std::string kernels, std::string device)
+                 int codec_threads, std::string kernels, std::string device, int workers)
     : root_(std::move(root)), max_pending_(max_pending), threads_(threads),
       codec_threads_(codec_threads), kernels_(std::move(kernels)), device_(std::move(device)),
       timeout_(timeout) {
     (void)worker_visible_devices(device_); // refused at startup, not at the first request
+    if (workers < 1) throw std::invalid_argument("at least one TTS worker is needed");
+    for (int i = 0; i < workers; ++i) workers_.push_back(std::make_unique<Worker>());
 }
 
-Runtime::~Runtime() { stop(); }
+Runtime::~Runtime() {
+    for (auto& worker : workers_) stop(*worker);
+}
 
-bool Runtime::healthy() const {
-    auto pid = pid_.load();
+bool Runtime::alive(const Worker& worker) {
+    auto pid = worker.pid.load();
     if (pid <= 0) return false;
     siginfo_t info{};
     return waitid(P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == 0;
 }
 
-void Runtime::stop() noexcept {
-    if (input_ >= 0) {
-        close(input_);
-        input_ = -1;
+void Runtime::take_ready_lines(Worker& worker) noexcept {
+    static constexpr std::string_view ready = "0 ready\n";
+    while (std::string_view(worker.buffered).starts_with(ready)) {
+        worker.buffered.erase(0, ready.size());
+        worker.loaded = true;
     }
-    if (output_ >= 0) {
-        close(output_);
-        output_ = -1;
+}
+
+void Runtime::poll_ready(Worker& worker) noexcept {
+    if (worker.loaded || worker.output < 0) return;
+    char block[256];
+    while (worker.buffered.size() <= 4096) {
+        const auto n = read(worker.output, block, sizeof(block));
+        if (n <= 0) break; // nothing more yet (EAGAIN), or it stopped
+        worker.buffered.append(block, static_cast<size_t>(n));
     }
-    int pid = pid_.exchange(-1);
+    take_ready_lines(worker);
+    if (worker.loaded) worker.start_failed = false;
+}
+
+bool Runtime::ready(const Worker& worker) {
+    // Loaded, or loading in place of one that had loaded (a crash in synthesis): not one that is
+    // retrying after dying before its model loaded -- that load is likely to fail again.
+    return alive(worker) && (worker.loaded || !worker.start_failed);
+}
+
+void Runtime::note_failed_start(Worker& worker) const noexcept {
+    // A worker that stopped before its model loaded, after startup, failed to start: revive()
+    // tries it again in 10 s.
+    if (started_ && !worker.start_failed && !worker.loaded && !alive(worker)) {
+        worker.start_failed = true;
+        worker.retry_at     = Clock::now() + std::chrono::seconds(10);
+    }
+}
+
+int Runtime::ready_workers() const {
+    const std::lock_guard lock(assign_mutex_);
+    int count = 0;
+    for (const auto& worker : workers_) {
+        // A leased worker counts if it was ready when leased: its request replaces it before
+        // handing it back if it fails.
+        if (worker->leased) {
+            count += worker->lease_loaded || worker->loaded;
+            continue;
+        }
+        poll_ready(*worker);
+        note_failed_start(*worker);
+        count += ready(*worker);
+    }
+    return count;
+}
+
+void Runtime::revive() {
+    // Off the request path: a request never waits for a model load while a loaded worker is free.
+    if (!started_ || stopping_) return;
+    for (auto& worker : workers_) {
+        const auto now = Clock::now();
+        {
+            const std::lock_guard lock(assign_mutex_);
+            if (worker->leased) continue;
+            poll_ready(*worker);
+            if (alive(*worker)) continue;
+            // One that died after loading is restarted at once; one that died loading is retried
+            // every 10 s, and requests go elsewhere meanwhile (acquire()).
+            note_failed_start(*worker);
+            if (worker->start_failed && now < worker->retry_at) continue;
+            worker->leased       = true; // held while it restarts
+            worker->lease_loaded = false;
+        }
+        try {
+            spawn(*worker);
+        } catch (...) {
+        }
+        {
+            const std::lock_guard lock(assign_mutex_);
+            worker->retry_at = now + std::chrono::seconds(10);
+            worker->leased   = false;
+        }
+        freed_.notify_all();
+    }
+}
+
+void Runtime::start(const std::function<void(Lease&)>& warmup) {
+    // Every worker loads its model and synthesizes once before the server listens. The leases
+    // are held together, so each warm-up lands on a different worker; each is taken just before
+    // its warm-up, so each has the whole request timeout to itself.
+    std::vector<std::unique_ptr<Lease>> leases;
+    for (size_t i = 0; i < workers_.size(); ++i) {
+        leases.push_back(acquire([this] { return stopping_.load(); }));
+        try {
+            warmup(*leases.back());
+        } catch (const std::exception& error) {
+            if (stopping_) throw;
+            const auto* failure = dynamic_cast<const HttpError*>(&error);
+            std::string hint;
+            if (failure != nullptr && failure->status == 504)
+                hint = ". Loading took longer than --request-timeout; raise it";
+            else if (i > 0)
+                hint = ". Each of the --max-num-seqs workers holds its own copy of the model; try "
+                       "fewer";
+            throw std::runtime_error("TTS worker " + std::to_string(i + 1) + " of " +
+                                     std::to_string(workers_.size()) +
+                                     " failed to load and synthesize: " + error.what() + hint);
+        }
+    }
+    started_ = true;
+}
+
+void Runtime::stop(Worker& worker) noexcept {
+    if (worker.input >= 0) {
+        close(worker.input);
+        worker.input = -1;
+    }
+    if (worker.output >= 0) {
+        close(worker.output);
+        worker.output = -1;
+    }
+    int pid = worker.pid.exchange(-1);
     if (pid > 0) {
         // A cancelled request must finish before another voice can use this worker.
         kill(pid, SIGKILL);
         while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
     }
-    buffered_.clear();
+    worker.buffered.clear();
+    // Whatever comes next starts afresh: a start that fails before its process runs is then seen
+    // as a failed start (and retried every 10 s), not as the loaded worker it replaces.
+    worker.loaded = false;
+    worker.warm   = false;
 }
 
-void Runtime::spawn() {
-    if (healthy()) return;
-    stop();
+void Runtime::spawn(Worker& worker) {
+    if (alive(worker)) return;
+    stop(worker);
     int in[2] = {-1, -1}, out[2] = {-1, -1};
     if (pipe2(in, O_CLOEXEC) || pipe2(out, O_CLOEXEC)) {
         for (int fd : {in[0], in[1], out[0], out[1]})
             if (fd >= 0) close(fd);
         throw HttpError(503, "Cannot create native TTS pipes");
     }
-    auto worker =
+    auto program =
         std::filesystem::read_symlink("/proc/self/exe").parent_path() / "surogate-tts-worker";
     // Also permits a protocol worker for lifecycle tests, without loading weights.
-    if (const char* override = std::getenv("SUROGATE_TTS_WORKER_BIN")) worker = override;
-    std::vector<std::string> arguments = {worker.string(),
+    if (const char* override = std::getenv("SUROGATE_TTS_WORKER_BIN")) program = override;
+    std::vector<std::string> arguments = {program.string(),
                                           (root_ / "model.gguf").string(),
                                           (root_ / "codec.gguf").string(),
                                           "/dev/stdin",
@@ -149,10 +265,12 @@ void Runtime::spawn() {
         close(out[0]);
         throw HttpError(503, "Cannot start native TTS worker");
     }
-    pid_    = pid;
-    input_  = in[1];
-    output_ = out[0];
-    if (fcntl(input_, F_SETFL, O_NONBLOCK) < 0 || fcntl(output_, F_SETFL, O_NONBLOCK) < 0)
+    worker.warm   = false;
+    worker.loaded = false;
+    worker.pid    = pid;
+    worker.input  = in[1];
+    worker.output = out[0];
+    if (fcntl(worker.input, F_SETFL, O_NONBLOCK) < 0 || fcntl(worker.output, F_SETFL, O_NONBLOCK) < 0)
         throw HttpError(503, "Cannot configure native TTS pipes");
 }
 
@@ -201,13 +319,14 @@ std::string wav_header(uint32_t sample_rate, uint32_t data_bytes) {
 }
 
 void Runtime::Lease::release_worker() {
-    if (owner_ == nullptr || !held_) return;
+    if (owner_ == nullptr || worker_ == nullptr) return;
     {
         const std::lock_guard lock(owner_->assign_mutex_);
-        owner_->leased_ = false;
-        held_           = false;
+        if (worker_->loaded) worker_->start_failed = false;
+        worker_->leased = false;
+        worker_         = nullptr;
     }
-    owner_->freed_.notify_one();
+    owner_->freed_.notify_all(); // waiters take workers in arrival order
 }
 
 Runtime::Lease::~Lease() {
@@ -222,16 +341,70 @@ std::unique_ptr<Runtime::Lease> Runtime::acquire(const std::function<bool()>& ca
                                           std::chrono::duration<double>(timeout_));
     const int pending = pending_.fetch_add(1);
     lease->owner_     = this;
-    if (pending >= max_pending_ + 1) throw HttpError(429, "TTS request queue is full");
+    if (pending >= max_pending_ + workers()) throw HttpError(429, "TTS request queue is full");
     std::unique_lock lock(assign_mutex_);
-    while (leased_) {
-        freed_.wait_for(lock, std::chrono::milliseconds(25));
-        lock.unlock();
-        check(lease->deadline_, cancelled);
-        lock.lock();
+    // First come, first served: the oldest waiting request takes the next free worker: a loaded
+    // one first (one that has already synthesized before others), then one loading afresh, then a
+    // stopped one it starts itself. A worker whose last start died before loading (a GPU whose
+    // memory was taken) is taken only when no other worker is running or leased, and a stopped one
+    // only once its retry time has come: the request would likely fail, and another worker will
+    // be free soon. When no worker is running or can start, the request is refused at once.
+    const uint64_t ticket = next_ticket_++;
+    waiting_.insert(ticket);
+    struct Leave { // leaves the queue on every exit, a timeout or a cancel included
+        Runtime& runtime;
+        std::unique_lock<std::mutex>& lock;
+        uint64_t ticket;
+        ~Leave() {
+            if (!lock.owns_lock()) lock.lock();
+            runtime.waiting_.erase(ticket);
+            runtime.freed_.notify_all(); // the next in line may go
+        }
+    };
+    {
+        const Leave leave{*this, lock, ticket};
+        for (;;) {
+            if (*waiting_.begin() == ticket) {
+                const auto now = Clock::now();
+                int live       = 0; // workers running or leased
+                for (auto& worker : workers_) {
+                    if (!worker->leased) {
+                        poll_ready(*worker);
+                        note_failed_start(*worker);
+                    }
+                    live += worker->leased || alive(*worker);
+                }
+                Worker* chosen = nullptr;
+                int best       = -1;
+                for (auto& worker : workers_) {
+                    if (worker->leased) continue;
+                    const bool running = alive(*worker);
+                    const bool alone   = live - int(running) == 0;
+                    int rank           = -1;
+                    if (running && worker->loaded) rank = worker->warm ? 5 : 4;
+                    else if (running && !worker->start_failed) rank = 3;
+                    else if (!running && !worker->start_failed) rank = 2;
+                    else if (running) rank = alone ? 1 : -1;
+                    else if (alone && now >= worker->retry_at) rank = 0;
+                    if (rank > best) {
+                        chosen = worker.get();
+                        best   = rank;
+                    }
+                }
+                if (chosen != nullptr) {
+                    chosen->leased       = true;
+                    chosen->lease_loaded = ready(*chosen);
+                    lease->worker_       = chosen;
+                    break;
+                }
+                if (live == 0) throw HttpError(503, "No TTS worker can load its model; retry the request later");
+            }
+            freed_.wait_for(lock, std::chrono::milliseconds(25));
+            lock.unlock();
+            check(lease->deadline_, cancelled);
+            lock.lock();
+        }
     }
-    leased_       = true;
-    lease->held_  = true;
     lock.unlock();
     // A queued timeout must not stop the request that owns the worker.
     check(lease->deadline_, cancelled);
@@ -241,7 +414,8 @@ std::unique_ptr<Runtime::Lease> Runtime::acquire(const std::function<bool()>& ca
 int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunks, const Voice& voice,
                     int seed, const std::function<bool()>& cancelled,
                     const std::function<bool(std::string_view)>& on_pcm) {
-    if (lease.owner_ != this || !lease.held_) throw std::logic_error("TTS worker not leased");
+    if (lease.owner_ != this || lease.worker_ == nullptr) throw std::logic_error("TTS worker not leased");
+    Worker& worker      = *lease.worker_;
     const auto deadline = lease.deadline_;
     // What a cancelled GPU request needs to hand its worker back intact (see drain()).
     bool cancel_requested = false, job_sent = false;
@@ -253,8 +427,8 @@ int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunk
         return true;
     };
     try {
-        spawn();
-        identity = std::to_string(++counter_) + "-v" + std::to_string(voice.id);
+        spawn(worker);
+        identity = std::to_string(++worker.counter) + "-v" + std::to_string(voice.id);
         std::ostringstream job;
         job.imbue(std::locale::classic());
         job << identity << '\t' << voice.id << '\t' << seed << '\t' << voice.temperature << '\t'
@@ -269,34 +443,38 @@ int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunk
         job << '\n';
         auto command = job.str();
         for (size_t written = 0; written < command.size();) {
-            wait_fd(input_, POLLOUT, deadline, watched);
-            auto n = write(input_, command.data() + written, command.size() - written);
+            wait_fd(worker.input, POLLOUT, deadline, watched);
+            auto n = write(worker.input, command.data() + written, command.size() - written);
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
             written += n;
         }
         job_sent = true;
-        // Reads until `buffered_` holds `bytes` bytes.
+        std::string& buffered = worker.buffered;
+        // Reads until `buffered` holds `bytes` bytes.
         const auto fill = [&](size_t bytes) {
-            while (buffered_.size() < bytes) {
-                wait_fd(output_, POLLIN, deadline, watched);
+            while (buffered.size() < bytes) {
+                wait_fd(worker.output, POLLIN, deadline, watched);
                 char block[65536];
-                auto n = read(output_, block, sizeof(block));
+                auto n = read(worker.output, block, sizeof(block));
                 if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
                 if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
-                buffered_.append(block, n);
+                buffered.append(block, n);
             }
         };
         size_t produced = 0;
         for (;;) {
             size_t newline;
-            while ((newline = buffered_.find('\n')) == std::string::npos) {
-                if (buffered_.size() > 4096) throw HttpError(503, "Invalid native TTS output");
-                fill(buffered_.size() + 1);
+            while ((newline = buffered.find('\n')) == std::string::npos) {
+                if (buffered.size() > 4096) throw HttpError(503, "Invalid native TTS output");
+                fill(buffered.size() + 1);
             }
-            const auto line = buffered_.substr(0, newline);
-            buffered_.erase(0, newline + 1);
-            if (!line.starts_with(identity + " ")) continue;
+            const auto line = buffered.substr(0, newline);
+            buffered.erase(0, newline + 1);
+            if (!line.starts_with(identity + " ")) {
+                if (line == "0 ready") worker.loaded = true; // its model finished loading
+                continue;
+            }
             std::istringstream fields(line.substr(identity.size() + 1));
             fields.imbue(std::locale::classic());
             std::string kind;
@@ -308,8 +486,8 @@ int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunk
                 frame_left = bytes;
                 fill(bytes);
                 produced += bytes;
-                const bool wanted = on_pcm(std::string_view(buffered_).substr(0, bytes));
-                buffered_.erase(0, bytes);
+                const bool wanted = on_pcm(std::string_view(buffered).substr(0, bytes));
+                buffered.erase(0, bytes);
                 frame_left = 0;
                 if (!wanted) {
                     cancel_requested = true;
@@ -321,6 +499,8 @@ int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunk
             int sample_rate = 0;
             if (kind != "done" || !(fields >> sample_rate) || sample_rate != 22050 || produced == 0)
                 throw HttpError(503, "Native TTS returned invalid audio");
+            worker.loaded = true; // also for a worker that sends no ready line
+            worker.warm   = true;
             return sample_rate;
         }
     } catch (...) {
@@ -328,47 +508,75 @@ int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunk
         // at its next audio chunk, and what it wrote before that is read and dropped. The next
         // request then pays no new model load (on a GPU, no new CUDA context and upload, of
         // memory a neighbouring server could take in between). Anything else replaces the
-        // worker, and so does a cancel at shutdown, which must not wait for the worker.
-        if (cancel_requested && job_sent && !stopping_ && drain(identity, frame_left)) throw;
-        stop();
+        // worker, at once unless it died before its model loaded; a cancel at shutdown only
+        // stops it.
+        if (cancel_requested && job_sent && !stopping_ && drain(worker, identity, frame_left))
+            throw;
+        // A worker that ended by itself before its model loaded failed to start. One the server
+        // stops here (a timeout, a client that left, a failed drain) was healthy, as was one that
+        // had loaded: those are replaced at once.
+        const bool died_loading = !worker.loaded && !alive(worker);
+        stop(worker);
+        if (started_ && !stopping_) {
+            if (!died_loading) {
+                {
+                    const std::lock_guard lock(assign_mutex_);
+                    worker.start_failed = false;
+                }
+                try {
+                    spawn(worker);
+                } catch (...) {
+                    // Left stopped: it counts as a failed start, retried every 10 s.
+                }
+            } else {
+                // Retried in 10 s by revive(), not by every request that comes in the meantime.
+                const std::lock_guard lock(assign_mutex_);
+                worker.start_failed = true;
+                worker.retry_at     = Clock::now() + std::chrono::seconds(10);
+            }
+        }
         throw;
     }
 }
 
-bool Runtime::drain(const std::string& identity, size_t frame_left) noexcept {
+bool Runtime::drain(Worker& worker, const std::string& identity, size_t frame_left) noexcept {
     try {
         const auto until = Clock::now() + std::chrono::seconds(30);
         // A shutdown during the drain ends it; the worker is then killed.
         const std::function<bool()> stopping = [this] { return stopping_.load(); };
         static constexpr std::string_view cancel = "cancel\n";
         for (size_t written = 0; written < cancel.size();) {
-            wait_fd(input_, POLLOUT, until, stopping);
-            auto n = write(input_, cancel.data() + written, cancel.size() - written);
+            wait_fd(worker.input, POLLOUT, until, stopping);
+            auto n = write(worker.input, cancel.data() + written, cancel.size() - written);
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (n <= 0) return false;
             written += static_cast<size_t>(n);
         }
+        std::string& buffered = worker.buffered;
         const auto fill = [&](size_t bytes) {
-            while (buffered_.size() < bytes) {
-                wait_fd(output_, POLLIN, until, stopping);
+            while (buffered.size() < bytes) {
+                wait_fd(worker.output, POLLIN, until, stopping);
                 char block[65536];
-                auto n = read(output_, block, sizeof(block));
+                auto n = read(worker.output, block, sizeof(block));
                 if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
                 if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
-                buffered_.append(block, n);
+                buffered.append(block, n);
             }
         };
         fill(frame_left);
-        buffered_.erase(0, frame_left);
+        buffered.erase(0, frame_left);
         for (;;) {
             size_t newline;
-            while ((newline = buffered_.find('\n')) == std::string::npos) {
-                if (buffered_.size() > 4096) return false;
-                fill(buffered_.size() + 1);
+            while ((newline = buffered.find('\n')) == std::string::npos) {
+                if (buffered.size() > 4096) return false;
+                fill(buffered.size() + 1);
             }
-            const auto line = buffered_.substr(0, newline);
-            buffered_.erase(0, newline + 1);
-            if (!line.starts_with(identity + " ")) continue;
+            const auto line = buffered.substr(0, newline);
+            buffered.erase(0, newline + 1);
+            if (!line.starts_with(identity + " ")) {
+                if (line == "0 ready") worker.loaded = true;
+                continue;
+            }
             std::istringstream fields(line.substr(identity.size() + 1));
             fields.imbue(std::locale::classic());
             std::string kind;
@@ -377,7 +585,7 @@ bool Runtime::drain(const std::string& identity, size_t frame_left) noexcept {
             size_t bytes = 0;
             if (kind != "pcm" || !byte_count(fields, bytes) || bytes > max_audio) return false;
             fill(bytes);
-            buffered_.erase(0, bytes);
+            buffered.erase(0, bytes);
         }
     } catch (...) {
         return false;
