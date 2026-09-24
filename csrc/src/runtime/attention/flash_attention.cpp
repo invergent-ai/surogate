@@ -962,7 +962,7 @@ std::vector<Operation> flash_attention_backward(const BackwardRuleContext& ctx) 
 // because the bound must be safe for every backend selection.
 //
 // Per-layer temps allocated by FlashVarlenAttention::backward:
-//   dq_accum   FP32  padded_total * Hq * Hs_rounded  (× splits, assumed 1)
+//   dq_accum   FP32  padded_total * Hq * Hs_rounded  (× flash_varlen_max_dq_splits)
 //   dsoftmax   FP32  padded_total * Hq
 //   dk_exp     BF16  total_q * Hq * Hs               (GQA only, Hq != Hkv)
 //   dv_exp     BF16  total_q * Hq * Hs               (GQA only, Hq != Hkv)
@@ -995,7 +995,8 @@ long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan
     // Flash-varlen's temp footprint. The deterministic backward (the default)
     // keeps one fp32 dQ accumulator per split.
     long flash_varlen_bytes = 0;
-    flash_varlen_bytes += align_stack_bytes(kFlashVarlenMaxDqSplits * padded_total * Hq * Hs_rounded * FP32);  // dq_accum
+    const long dq_splits = flash_varlen_max_dq_splits(plan.B, plan.T, Hq, Hs);
+    flash_varlen_bytes += align_stack_bytes(dq_splits * padded_total * Hq * Hs_rounded * FP32);  // dq_accum
     flash_varlen_bytes += align_stack_bytes(padded_total * Hq * FP32);               // dsoftmax
     if (Hq != Hkv) {
         flash_varlen_bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dk_expanded

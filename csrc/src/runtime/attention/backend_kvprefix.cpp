@@ -114,8 +114,12 @@ public:
 
         const int HS_rounded = p.Hs <= 128 ? ((p.Hs + 31) / 32) * 32 : ((p.Hs + 63) / 64) * 64;
         const long padded_q = static_cast<long>(p.T) + 128L * std::max(1, p.chunk_num_segs);
+        // The deterministic backward keeps one dQ accumulator per split; the split count is
+        // passed down explicitly (FlashAttention's own heuristic would size past this scratch).
+        const int dq_splits =
+            p.deterministic_bwd ? flash_varlen_dq_splits(1, p.T, p.Hq, p.Hs, rs.DeviceProp.multiProcessorCount) : 1;
         Tensor dq_accum = rs.temp_alloc(
-            ETensorDType::FP32, {padded_q * p.Hq * HS_rounded}, "kvprefix_dq_accum");
+            ETensorDType::FP32, {static_cast<long>(dq_splits) * padded_q * p.Hq * HS_rounded}, "kvprefix_dq_accum");
         Tensor dsoftmax = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(p.Hq) * padded_q}, "kvprefix_dsoftmax");
         Tensor dk_exp = rs.temp_alloc(
             ETensorDType::BF16, {static_cast<long>(p.chunk_kv_len) * p.Hq * p.Hs}, "kvprefix_dk_exp");
@@ -155,7 +159,8 @@ public:
                                           p.window_size,
                                           p.chunk_num_segs,
                                           p.chunk_max_q,
-                                          p.chunk_max_k);
+                                          p.chunk_max_k,
+                                          dq_splits);
     }
 };
 

@@ -492,7 +492,8 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                                        int window_size,
                                        int num_segs,
                                        int max_seqlen_q,
-                                       int max_seqlen_k) {
+                                       int max_seqlen_k,
+                                       int dq_splits) {
     if (num_segs <= 0) num_segs = 1;
     if (max_seqlen_q <= 0) max_seqlen_q = T;
     if (max_seqlen_k <= 0) max_seqlen_k = kv_len;
@@ -548,6 +549,7 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
     const int HS_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
     if (deterministic) {
         params.dq_accum_split_stride = static_cast<int64_t>(T + 128 * num_segs) * Hq * HS_rounded;
+        params.num_splits = dq_splits > 0 ? dq_splits : 0;  // see attention_backward_flash_varlen
     }
 
     if (window_size > 0) {

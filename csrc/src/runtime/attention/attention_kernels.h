@@ -278,7 +278,8 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                                        int window_size = 0,
                                        int num_segs = 1,
                                        int max_seqlen_q = 0,
-                                       int max_seqlen_k = 0);
+                                       int max_seqlen_k = 0,
+                                       int dq_splits = 0);  ///< deterministic only; 0 = FA2 heuristic
 
 // Reduce Hq-expanded dK/dV over the whole prefix into FP32 Hkv accumulators.
 void accum_add_dkv(float* dk_accum,

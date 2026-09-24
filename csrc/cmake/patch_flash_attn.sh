@@ -5,7 +5,8 @@
 # must allocate. With packed documents "batch" is the document count, so the same document is
 # summed in a different order (and needs a different amount of scratch) depending on what it was
 # packed with. Let the caller choose: a positive `num_splits` (unused by the backward otherwise)
-# overrides the heuristic. Re-running is a no-op.
+# overrides the heuristic. Re-running is a no-op. Like patch_minja.sh this edits the fetched source in
+# place (a FETCHCONTENT_SOURCE_DIR_FLASH_ATTN checkout would be edited too).
 set -eu
 header="csrc/flash_attn/src/flash_bwd_launch_template.h"
 [ -f "$header" ] || { echo "patch_flash_attn: $header not found in $(pwd)" >&2; exit 1; }

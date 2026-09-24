@@ -31,9 +31,9 @@ transformers = pytest.importorskip("transformers")
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
-T = 512
+T = 2048
 K = 8
-LENGTHS = [150, 37, 211, 90, 12]  # > the 64-token window, and short ones
+LENGTHS = [700, 37, 900, 250, 12]  # longer than the 512-token window, and short ones
 
 
 @pytest.fixture(scope="module")
@@ -52,14 +52,14 @@ def fixture_dir(tmp_path_factory):
         head_dim=128,
         global_head_dim=512,
         attention_k_eq_v=True,
-        sliding_window=64,
+        sliding_window=512,
         layer_types=["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
         enable_moe_block=True,
         num_experts=8,
         top_k_experts=2,
         moe_intermediate_size=128,
         final_logit_softcapping=30.0,
-        max_position_embeddings=2048,
+        max_position_embeddings=4096,
         hidden_size_per_layer_input=0,
         vocab_size_per_layer_input=1024,
         tie_word_embeddings=True,

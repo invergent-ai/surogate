@@ -608,7 +608,7 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs,
     const bool do_timing = mOptions.TriggerTimingEvents;
     run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation, do_timing](sThreadContext& ctx) {
         auto& rs = ctx.Model->get_run_state();
-        if (do_timing && rs.TimingForwardStart.empty()) {
+        if (do_timing && rs.TimingForwardStart.size() < static_cast<std::size_t>(micro_batches) + 1) {
             rs.setup_timing_events(micro_batches);
         }
         Tensor inputs = ctx.Model->get_input_buffer();
@@ -1034,20 +1034,23 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             gs.reset_capture();
         }
 
-        // Allocate per-micro-step pinned buffers if needed.
-        if (gs.inputs.size() != static_cast<size_t>(micro_steps) ||
-            gs.targets.size() != static_cast<size_t>(micro_steps) ||
-            gs.position_ids.size() != static_cast<size_t>(micro_steps) || gs.captured_B != B ||
-            gs.captured_T != T_step) {
+        // Allocate per-micro-step pinned buffers if needed. They only grow: row packing changes
+        // the micro-step count from step to step, and the allocator keeps every pinned buffer
+        // until the trainer is destroyed, so re-allocating on each change would leak.
+        if (gs.captured_B != B || gs.captured_T != T_step) {
             gs.inputs.clear();
             gs.targets.clear();
             gs.position_ids.clear();
+        }
+        if (gs.inputs.size() < static_cast<size_t>(micro_steps) ||
+            gs.targets.size() < static_cast<size_t>(micro_steps) ||
+            gs.position_ids.size() < static_cast<size_t>(micro_steps)) {
             gs.inputs.reserve(micro_steps);
             gs.targets.reserve(micro_steps);
             gs.position_ids.reserve(micro_steps);
 
             const int rank = ctx.Communicator->local_rank();
-            for (int j = 0; j < micro_steps; ++j) {
+            for (int j = static_cast<int>(gs.inputs.size()); j < micro_steps; ++j) {
                 auto in_name = fmt::format("graph_inputs_cpu_ms{}_rank{}", j, rank);
                 auto tgt_name = fmt::format("graph_targets_cpu_ms{}_rank{}", j, rank);
                 auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
@@ -1066,10 +1069,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 }
             }
 
-            gs.captured_B = B;
-            gs.captured_T = T_step;
-            gs.captured_grad_accum = micro_steps;
         }
+        gs.captured_B = B;
+        gs.captured_T = T_step;
+        gs.captured_grad_accum = micro_steps;
 
         // Allocate device-side optimizer parameter buffers if needed.
         // Use the maximum size to support both AdamW and NorMuon
@@ -1212,7 +1215,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         if (!mOptions.UseCudaGraphs) {
             const bool do_timing = mOptions.TriggerTimingEvents;
-            if (do_timing && rs.TimingForwardStart.empty()) {
+            if (do_timing && rs.TimingForwardStart.size() < static_cast<std::size_t>(micro_steps) + 1) {
                 rs.setup_timing_events(micro_steps);
             }
             // Under force-full-capture + doc_masking, GraphExecutor captures

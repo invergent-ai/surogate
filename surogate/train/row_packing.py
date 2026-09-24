@@ -30,7 +30,8 @@ packed window sums several rows inside one GEMM, where padded training sums them
 micro-steps in the gradient dtype (docs/reference/config.md, "Row packing", has the measured
 tolerance). Under ``fp8_hybrid`` the per-tensor quantisation scales also span the whole window,
 so a row's arithmetic depends on the other rows unless ``fp8_pow2_scales`` is on (power-of-two
-scales only shift exponents, which keeps each row's forward bit-identical).
+scales only shift exponents; only elements pushed into the FP8 subnormal range by another row's
+larger maximum still differ).
 """
 
 from __future__ import annotations
@@ -46,17 +47,23 @@ def effective_length(targets_row: np.ndarray) -> int:
     return int(supervised[-1]) + 1 if supervised.size else 0
 
 
-def plan_windows(lengths: list[int], seq_len: int, slots: int) -> list[list[int]]:
+#: Rows per window at most. Every document in a window costs the attention backward 128 padded
+#: rows of fp32 scratch per dQ split (FlashAttention varlen), sized from the stack arena; bounding
+#: the count bounds that (64 x 8 MiB for Gemma 4's sliding layers) independently of the row mix.
+MAX_ROWS_PER_WINDOW = 64
+
+
+def plan_windows(lengths: list[int], seq_len: int, slots: int, max_rows: int = MAX_ROWS_PER_WINDOW) -> list[list[int]]:
     """Assign rows (by index) to windows; returns ``waves * slots`` windows, some possibly empty.
 
     Rows of length 0 are dropped (they supervise nothing). The window count is the smallest
     multiple of ``slots`` that first-fit decreasing can fill; rows are then spread over all of
     those windows, longest first, each into the least-filled window with room (ties to the lower
-    index). If that spreading fails to place a row, the first-fit layout is used instead.
-    Deterministic for a given input.
+    index). If that spreading fails to place a row, the first-fit layout is used instead. No
+    window holds more than ``max_rows`` rows. Deterministic for a given input.
     """
-    if slots < 1:
-        raise ValueError("slots must be >= 1")
+    if slots < 1 or max_rows < 1:
+        raise ValueError("slots and max_rows must be >= 1")
     items = [i for i, n in enumerate(lengths) if n > 0]
     for i in items:
         if lengths[i] > seq_len:
@@ -67,7 +74,7 @@ def plan_windows(lengths: list[int], seq_len: int, slots: int) -> list[list[int]
     ffd_fill: list[int] = []
     for i in order:
         for b, used in enumerate(ffd_fill):
-            if used + lengths[i] <= seq_len:
+            if used + lengths[i] <= seq_len and len(ffd[b]) < max_rows:
                 ffd[b].append(i)
                 ffd_fill[b] += lengths[i]
                 break
@@ -82,7 +89,7 @@ def plan_windows(lengths: list[int], seq_len: int, slots: int) -> list[list[int]
     for i in order:
         best = -1
         for b in range(count):
-            if fill[b] + lengths[i] <= seq_len and (best < 0 or fill[b] < fill[best]):
+            if fill[b] + lengths[i] <= seq_len and len(spread[b]) < max_rows and (best < 0 or fill[b] < fill[best]):
                 best = b
         if best < 0:
             return ffd + [[] for _ in range(count - len(ffd))]

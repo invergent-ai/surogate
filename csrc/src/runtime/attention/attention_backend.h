@@ -15,6 +15,8 @@
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,11 +37,47 @@ constexpr int kFlashVarlen = 90;
 constexpr int kCustom = 80;
 }  // namespace attention_priority
 
-/// Upper bound on the FlashAttention-varlen deterministic backward's dQ split
-/// count (backend_flash_varlen.cpp). Each split keeps a full fp32 dQ copy, so
-/// the backward's scratch is at most this many copies; the stack plan sizes
-/// for it (flash_attention_backward_stack_bound).
+/// dQ split count for FlashAttention-varlen's deterministic backward.
+///
+/// Split s owns key blocks s, s+S, s+2S, ... of every document (block indices
+/// count from the document's own start) and the splits are summed in order,
+/// so S alone fixes the fp32 summation order of each dQ element. S therefore
+/// depends only on the dense batch geometry -- rows, sequence length, heads,
+/// head size, SM count -- never on how many documents the rows hold: a
+/// document gets the same dQ bits padded alone or packed with others
+/// (FlashAttention's own ceil(SMs / (documents * heads)) re-orders the sum with
+/// every packing). Each split keeps a full fp32 dQ copy, so S is capped at
+/// kFlashVarlenMaxDqSplits (4 also measured fastest on a 5090: 1 split +10% per
+/// padded Gemma-4 step, 2 +4.8%, 4 +3.2%, 11 +4.4% against the atomic path) and
+/// by a scratch budget, so long sequences fall back to one split (deterministic
+/// too, same scratch as the atomic path). The stack plan sizes for
+/// flash_varlen_max_dq_splits (flash_attention_backward_stack_bound).
+/// SUROGATE_FLASH_ATTN_DQ_SPLITS=<n> overrides within the same bound (diagnostics).
 constexpr int kFlashVarlenMaxDqSplits = 4;
+constexpr long kFlashVarlenDqScratchBudget = 512L << 20;
+
+inline long flash_varlen_dense_dq_stride_bytes(long rows, long T, long Hq, long Hs) {
+    const long Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
+    return (rows * T + 128) * Hq * Hs_rounded * static_cast<long>(sizeof(float));
+}
+
+/// Upper bound of flash_varlen_dq_splits for this geometry (independent of the SM count).
+inline int flash_varlen_max_dq_splits(long rows, long T, long Hq, long Hs) {
+    const long stride = std::max(1L, flash_varlen_dense_dq_stride_bytes(rows, T, Hq, Hs));
+    const long by_budget = std::max(1L, kFlashVarlenDqScratchBudget / stride);
+    return static_cast<int>(std::min<long>(kFlashVarlenMaxDqSplits, by_budget));
+}
+
+inline int flash_varlen_dq_splits(long rows, long T, long Hq, long Hs, int sm_count) {
+    const int cap = flash_varlen_max_dq_splits(rows, T, Hq, Hs);
+    if (const char* env = std::getenv("SUROGATE_FLASH_ATTN_DQ_SPLITS")) {
+        const int forced = std::atoi(env);
+        if (forced > 0) return std::min(forced, cap);
+    }
+    const long rows_heads = std::max(1L, rows * Hq);
+    const long fill = (std::max(1, sm_count) + rows_heads - 1) / rows_heads;
+    return static_cast<int>(std::clamp<long>(fill, 1, cap));
+}
 
 /// All tensors + execution context needed to run a single
 /// ``flash_attention`` / ``flash_attention_backward`` op. Callers fill in
