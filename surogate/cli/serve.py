@@ -19,7 +19,7 @@ usage: surogate serve <model> [engine options...]
        surogate serve --generate <model> --prompt "..." [options...]
        surogate serve --embed <model> [--frontend DIR] [options...]
        surogate serve --stt <model> [--lm PATH] [--device N|cpu] [options...]
-       surogate serve --tts <model> [--voice NAME] [--device cpu] [options...]
+       surogate serve --tts <model> [--voice NAME] [--device cpu|N] [options...]
 
 <model> is a Hugging Face repo id, a local safetensors model directory, or a
 GGUF file. First use converts transparently into a local cache; after that,
@@ -62,7 +62,7 @@ node.
 --stt serves surogate speech recognition models on GPU or CPU. Use --lm PATH to add
 a language model. See docs/inference/speech.md for file uploads and live audio.
 
---tts serves surogate speech generation models on CPU with named voices.
+--tts serves surogate speech generation models with named voices, on CPU or a GPU.
 See docs/inference/tts.md.
 
 From a source checkout, build the engine first with: make serve-build
@@ -260,7 +260,15 @@ def maybe_exec_serve() -> None:
         if model is not None:
             from surogate.serve.tts.assets import prepare_bundle
 
-            bundle = prepare_bundle(model, reuse_cache=reuse_cache, echo=lambda m: print(m, file=sys.stderr))
+            # The server takes the last --device given, and so does the check here.
+            devices = [rest[i + 1] for i, arg in enumerate(rest[:-1]) if arg == "--device"]
+            try:
+                bundle = prepare_bundle(model, reuse_cache=reuse_cache,
+                                        echo=lambda m: print(m, file=sys.stderr),
+                                        device=devices[-1] if devices else "cpu")
+            except ValueError as error:
+                sys.stderr.write(f"surogate serve: {error}\n")
+                sys.exit(2)
             if "--served-model-name" not in rest[::2]:
                 rest.extend(["--served-model-name", model])
             rest = [str(bundle.root), *rest]

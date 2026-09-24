@@ -112,14 +112,29 @@ def validate_bundle(root, *, expected_profile_sha256=None):
     return Bundle(root, profile)
 
 
-def prepare_bundle(model, *, reuse_cache=True, echo=print):
+def _for_device(bundle, device):
+    """A GPU needs the package's GPU variant: the same runtime built with CUDA (lib/libggml-cuda)."""
+    if device != "cpu" and "lib/libggml-cuda.so.0" not in bundle.profile["files"]:
+        raise ValueError(
+            "This TTS package has only the CPU runtime. Serving on a GPU needs its GPU variant, whose "
+            "lib/ holds the same runtime built with CUDA; see docs/inference/tts.md"
+        )
+    return bundle
+
+
+def prepare_bundle(model, *, reuse_cache=True, echo=print, device="cpu"):
     path = Path(model).expanduser()
     if path.is_file() and path.name == "voices.json":
-        return validate_bundle(path.parent)
+        return _for_device(validate_bundle(path.parent), device)
     if path.is_dir():
         if not (path / "voices.json").is_file():
             path = path / PREFIX
-        return validate_bundle(path)
+        return _for_device(validate_bundle(path), device)
+    if model == MODEL_ID and device != "cpu":
+        raise ValueError(
+            f"The published {MODEL_ID} package has only the CPU runtime so far. To serve on a GPU, "
+            "pass a local GPU variant of the package; see docs/inference/tts.md"
+        )
     if model != MODEL_ID:
         raise ValueError(f"Use {MODEL_ID} or a local native CPU package containing voices.json")
     from filelock import FileLock

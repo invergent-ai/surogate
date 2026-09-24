@@ -19,8 +19,9 @@ struct Voice {
 
 class Runtime {
 public:
+    /// `device`: "cpu", or the CUDA device index the worker synthesizes on.
     Runtime(std::filesystem::path root, int max_pending, double timeout, int threads = 4,
-            int codec_threads = 4, std::string kernels = "auto");
+            int codec_threads = 4, std::string kernels = "auto", std::string device = "cpu");
     ~Runtime();
     Runtime(const Runtime&)            = delete;
     Runtime& operator=(const Runtime&) = delete;
@@ -38,6 +39,7 @@ private:
     int max_pending_;
     int threads_, codec_threads_;
     std::string kernels_;
+    std::string device_;
     double timeout_;
     std::atomic<int> pid_{-1}, pending_{0};
     int input_ = -1, output_ = -1;

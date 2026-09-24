@@ -22,7 +22,8 @@ const char* usage =
     "surogate-tts NATIVE_PACKAGE [options]\n"
     "  --host HOST                 bind address (default 127.0.0.1)\n"
     "  --port PORT                 HTTP port (default 8080)\n"
-    "  --device cpu                CPU synthesis; no CUDA or LibTorch\n"
+    "  --device cpu|N              CPU synthesis (default), or CUDA device N; a GPU needs the\n"
+    "                              package's GPU variant (its lib/ holds the CUDA runtime)\n"
     "  --served-model-name NAME    public model ID\n"
     "  --api-key KEY               bearer authentication\n"
     "  --api-key-file PATH         read the key from a file, keeping it off the command line\n"
@@ -55,7 +56,7 @@ void validate_policy(const json& policy) {
 
 int main(int argc, char** argv) {
     try {
-        std::string artifact, host = "127.0.0.1", name, default_voice, kernels = "auto";
+        std::string artifact, host = "127.0.0.1", name, default_voice, kernels = "auto", device = "cpu";
         std::optional<std::string> key_flag, key_file; // --api-key, --api-key-file (last one wins)
         bool default_set = false;
         int port = 8080, max_pending = 8, threads = 4, codec_threads = 0;
@@ -81,7 +82,12 @@ int main(int argc, char** argv) {
             else if (arg == "--port")
                 port = integer(value());
             else if (arg == "--device") {
-                if (value() != "cpu") throw std::invalid_argument("TTS supports --device cpu only");
+                device = value();
+                if (device != "cpu" && (device.empty() ||
+                                        device.find_first_not_of("0123456789") != std::string::npos ||
+                                        device.size() > 3))
+                    throw std::invalid_argument("--device must be cpu or a CUDA device index");
+                if (device != "cpu") device = std::to_string(std::stoul(device)); // "00" is 0
             } else if (arg == "--served-model-name")
                 name = value();
             else if (arg == "--api-key")
@@ -146,7 +152,8 @@ int main(int argc, char** argv) {
         if (!default_set) default_voice = voices.front().name;
         default_voice = voice(default_voice).name;
         if (name.empty()) name = artifact;
-        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels);
+        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device);
+        const std::string device_name = device == "cpu" ? "cpu" : "cuda:" + device;
         // /metrics: requests in flight (queued ones included) and what was served -- what a
         // supervisor drains this server by.
         sinfer::serve::audio::Metrics metrics(name, {.characters = true});
@@ -158,7 +165,7 @@ int main(int argc, char** argv) {
         server.new_task_queue = [workers] { return new httplib::ThreadPool(workers, workers); };
         server.Get("/health", [&](const auto&, auto& r) {
             bool ready = runtime.healthy();
-            response(r, {{"status", ready ? "ok" : "unavailable"}, {"device", "cpu"}},
+            response(r, {{"status", ready ? "ok" : "unavailable"}, {"device", device_name}},
                      ready ? 200 : 503);
         });
         server.Get("/v1/models", [&](const auto&, auto& r) {
@@ -244,7 +251,7 @@ int main(int argc, char** argv) {
         runtime.synthesize(tokenize("Bună."), voice(default_voice), 9,
                            [] { return interrupted != 0; });
         if (interrupted) return 0;
-        std::cerr << "CPU TTS ready at http://" << host << ':' << port << '\n';
+        std::cerr << "TTS ready on " << device_name << " at http://" << host << ':' << port << '\n';
         if (!server.listen_after_bind() && !interrupted)
             throw std::runtime_error("TTS HTTP server failed");
         return 0;

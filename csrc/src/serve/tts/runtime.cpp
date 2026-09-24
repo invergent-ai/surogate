@@ -18,6 +18,31 @@ using sinfer::serve::audio::HttpError;
 namespace {
 constexpr size_t max_audio = 64 * 1024 * 1024;
 
+/// The CUDA_VISIBLE_DEVICES the worker gets: none on the CPU; for `--device N`, the N-th card this
+/// process may use, so N means what it means to the LLM server (an ordinal among the visible
+/// devices), whatever CUDA_VISIBLE_DEVICES the server itself was started with.
+std::string worker_visible_devices(const std::string& device) {
+    if (device == "cpu") return {};
+    const char* inherited = std::getenv("CUDA_VISIBLE_DEVICES");
+    if (inherited == nullptr) return device;
+    // Set but empty hides every device, as it does for CUDA itself.
+    std::vector<std::string> visible;
+    std::string entry;
+    for (std::istringstream list(inherited); std::getline(list, entry, ',');) {
+        const auto first = entry.find_first_not_of(" \t");
+        const auto last  = entry.find_last_not_of(" \t");
+        if (first == std::string::npos)
+            throw std::invalid_argument(std::string("CUDA_VISIBLE_DEVICES=") + inherited +
+                                        " has an empty entry");
+        visible.push_back(entry.substr(first, last - first + 1));
+    }
+    const auto index = static_cast<size_t>(std::stoul(device));
+    if (index >= visible.size())
+        throw std::invalid_argument("--device " + device + " is not among CUDA_VISIBLE_DEVICES=" +
+                                    inherited);
+    return visible[index];
+}
+
 uint32_t le(const std::string& data, size_t offset, size_t count) {
     uint32_t result = 0;
     for (size_t i = 0; i < count; ++i)
@@ -27,9 +52,12 @@ uint32_t le(const std::string& data, size_t offset, size_t count) {
 } // namespace
 
 Runtime::Runtime(std::filesystem::path root, int max_pending, double timeout, int threads,
-                 int codec_threads, std::string kernels)
+                 int codec_threads, std::string kernels, std::string device)
     : root_(std::move(root)), max_pending_(max_pending), threads_(threads),
-      codec_threads_(codec_threads), kernels_(std::move(kernels)), timeout_(timeout) {}
+      codec_threads_(codec_threads), kernels_(std::move(kernels)), device_(std::move(device)),
+      timeout_(timeout) {
+    (void)worker_visible_devices(device_); // refused at startup, not at the first request
+}
 
 Runtime::~Runtime() { stop(); }
 
@@ -85,7 +113,8 @@ void Runtime::spawn() {
                                           directory_.string(),
                                           std::to_string(threads_),
                                           std::to_string(codec_threads_),
-                                          kernels_};
+                                          kernels_,
+                                          device_ == "cpu" ? "cpu" : "cuda"};
     std::vector<char*> argv;
     for (auto& s : arguments) argv.push_back(s.data());
     argv.push_back(nullptr);
@@ -96,8 +125,10 @@ void Runtime::spawn() {
             !s.starts_with("OMP_NUM_THREADS=") && !s.starts_with("OPENBLAS_NUM_THREADS="))
             environment.push_back(std::move(s));
     }
+    // The worker sees only the card it serves on (as its device 0), or none on the CPU.
     environment.insert(environment.end(),
-                       {"CUDA_VISIBLE_DEVICES=", "LD_LIBRARY_PATH=" + (root_ / "lib").string(),
+                       {"CUDA_VISIBLE_DEVICES=" + worker_visible_devices(device_),
+                        "LD_LIBRARY_PATH=" + (root_ / "lib").string(),
                         "OMP_NUM_THREADS=" + std::to_string(threads_), "OPENBLAS_NUM_THREADS=1"});
     std::vector<char*> env;
     for (auto& s : environment) env.push_back(s.data());
@@ -108,6 +139,9 @@ void Runtime::spawn() {
     posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
     posix_spawn_file_actions_addclose(&actions, in[1]);
     posix_spawn_file_actions_addclose(&actions, out[0]);
+    // The runtime libraries carry empty RUNPATH entries, which the loader reads as the working
+    // directory: run the worker from / so nothing there can be loaded in their place.
+    posix_spawn_file_actions_addchdir_np(&actions, "/");
     pid_t pid;
     int status = posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), env.data());
     posix_spawn_file_actions_destroy(&actions);
@@ -116,7 +150,7 @@ void Runtime::spawn() {
     if (status) {
         close(in[1]);
         close(out[0]);
-        throw HttpError(503, "Cannot start native CPU TTS worker");
+        throw HttpError(503, "Cannot start native TTS worker");
     }
     pid_    = pid;
     input_  = in[1];
@@ -138,10 +172,10 @@ void Runtime::wait_fd(int fd, short event, Clock::time_point deadline,
         int n = poll(&poll_fd, 1, 25);
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 || (poll_fd.revents & (POLLERR | POLLNVAL)))
-            throw HttpError(503, "Native CPU TTS worker failed; retry the request");
+            throw HttpError(503, "Native TTS worker failed; retry the request");
         if (poll_fd.revents & event) return;
         if (poll_fd.revents & POLLHUP)
-            throw HttpError(503, "Native CPU TTS worker stopped; retry the request");
+            throw HttpError(503, "Native TTS worker stopped; retry the request");
     }
 }
 
@@ -182,7 +216,7 @@ std::string Runtime::synthesize(const std::vector<std::vector<int32_t>>& chunks,
             wait_fd(input_, POLLOUT, deadline, cancelled);
             auto n = write(input_, command.data() + written, command.size() - written);
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-            if (n <= 0) throw HttpError(503, "Native CPU TTS worker stopped");
+            if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
             written += n;
         }
         bool complete = false;
@@ -198,7 +232,7 @@ std::string Runtime::synthesize(const std::vector<std::vector<int32_t>>& chunks,
             char block[4096];
             auto n = read(output_, block, sizeof(block));
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-            if (n <= 0) throw HttpError(503, "Native CPU TTS worker stopped");
+            if (n <= 0) throw HttpError(503, "Native TTS worker stopped");
             buffered_.append(block, n);
             if (buffered_.size() > 1024 * 1024) throw HttpError(503, "Invalid native TTS output");
         }
