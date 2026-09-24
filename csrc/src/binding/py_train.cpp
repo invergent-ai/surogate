@@ -4554,6 +4554,26 @@ void MultiGPUPyTrainer::backward_grpo(const float* per_token_grads) {
     ++mTrainMicroStep;
 }
 
+std::vector<float> MultiGPUPyTrainer::get_token_losses(int gpu_id) {
+    std::vector<float> result;
+    run_work(
+        [&result](sThreadContext& ctx) {
+            auto& rs = ctx.Model->get_run_state();
+            if (!rs.Losses.Data) {
+                return;
+            }
+            result.resize(static_cast<std::size_t>(rs.Losses.nelem()));
+            CUDA_CHECK(cudaMemcpyAsync(result.data(),
+                                       rs.Losses.Data,
+                                       result.size() * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       rs.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        },
+        gpu_id);
+    return result;
+}
+
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {
     int result = 0;
     run_work(

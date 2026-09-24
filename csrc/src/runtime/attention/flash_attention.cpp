@@ -700,12 +700,16 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.cudnn_workspace = mRunState.scratch().cudnn_workspace;
     params.run_state = &mRunState;
     params.temps = &mTemps;
-    // Packed sliding-window attention has shown unstable backward norms on the
-    // non-deterministic FlashAttention varlen path. Route that case through
-    // the deterministic kernel by default; the env flag still forces
-    // deterministic mode for all varlen backward calls when desired.
-    params.deterministic_bwd = (std::getenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC") != nullptr) ||
-                               (mCuSeqlensGpu != nullptr && window_size > 0);
+    // FlashAttention varlen's default backward adds dQ partials with fp32 atomics
+    // in whatever order the key blocks finish, so the same step gives different
+    // gradient bits run to run (and fp8's E5M2 re-rounding amplifies one-ulp dQ
+    // flips into percent-level LoRA gradient differences). The deterministic
+    // kernel fixes the order -- and, with the split count chosen from the batch
+    // geometry rather than the document count (backend_flash_varlen.cpp), fixes
+    // it identically for a document padded alone and the same document packed
+    // with others. Deterministic is the default; the atomic path is an opt-in
+    // (SUROGATE_FLASH_ATTN_VARLEN_BWD_NONDETERMINISTIC=1).
+    params.deterministic_bwd = std::getenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_NONDETERMINISTIC") == nullptr;
     params.attn_bwd_chunks = mOptions.AttBwdChunks;
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
@@ -788,6 +792,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         params.lse = packed_lse;
     }
     backend.backward(params);
+    if (should_dump_attention_layer(layer_idx)) {
+        debug_dump_runtime_tensor(
+            fmt::format("attn_live.layer{}.d_qkv", layer_idx), d_qkv, std::getenv("SUROGATE_DEBUG_DUMP_DIR"));
+    }
 
     // Under EP with dp_size=1, attention activations are replicated
     // across ranks, so the backward must produce identical dQKV per rank.
@@ -984,9 +992,10 @@ long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan
     const long padded_total = total_q + 128;
     const long Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
 
-    // Flash-varlen's temp footprint.
+    // Flash-varlen's temp footprint. The deterministic backward (the default)
+    // keeps one fp32 dQ accumulator per split.
     long flash_varlen_bytes = 0;
-    flash_varlen_bytes += align_stack_bytes(padded_total * Hq * Hs_rounded * FP32);  // dq_accum
+    flash_varlen_bytes += align_stack_bytes(kFlashVarlenMaxDqSplits * padded_total * Hq * Hs_rounded * FP32);  // dq_accum
     flash_varlen_bytes += align_stack_bytes(padded_total * Hq * FP32);               // dsoftmax
     if (Hq != Hkv) {
         flash_varlen_bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dk_expanded

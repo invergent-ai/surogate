@@ -523,6 +523,7 @@ NB_MODULE(_surogate, m) {
                const std::string& fp8_weight_cache,
                bool doc_masking,
                int fp8_amax_history,
+               bool fp8_pow2_scales,
                bool fp4_four_over_six,
                const std::string& fp4_backend,
                int skip_quant_first_layers,
@@ -531,6 +532,7 @@ NB_MODULE(_surogate, m) {
                 // Build recipe options
                 recipes::RecipeConfig recipe_options;
                 recipe_options.fp8_amax_history_len = fp8_amax_history;
+                recipe_options.fp8_pow2_scales = fp8_pow2_scales;
                 recipe_options.fp4_four_over_six = fp4_four_over_six;
                 recipe_options.fp4_backend = matmul_backend_from_str(fp4_backend);
                 recipe_options.skip_quant_first_layers = skip_quant_first_layers;
@@ -613,6 +615,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("fp8_weight_cache") = "auto",
             nb::arg("doc_masking") = true,
             nb::arg("fp8_amax_history") = 1024,
+            nb::arg("fp8_pow2_scales") = false,
             nb::arg("fp4_four_over_six") = true,
             nb::arg("fp4_backend") = "cutlass",
             nb::arg("skip_quant_first_layers") = 0,
@@ -635,6 +638,8 @@ NB_MODULE(_surogate, m) {
             "- fp8_weight_cache: Cache FP8 copies of frozen weights under fp8-hybrid ('auto', 'on', 'off').\n"
             "- doc_masking: Enable document-level attention masking for packed sequences.\n"
             "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
+            "- fp8_pow2_scales: Round FP8 scales down to powers of two (fp8-hybrid), so a token's\n"
+            "  quantized bits do not depend on the other tokens of its tensor.\n"
             "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
             "- skip_quant_first_layers: Skip quantization for first N layers.\n"
             "- skip_quant_last_layers: Skip quantization for last N layers.\n"
@@ -2074,6 +2079,21 @@ NB_MODULE(_surogate, m) {
              "Return the accumulated valid-token count for the last training step.\n\n"
              "Parameters:\n- gpu_id: Which GPU's count to return.\n\n"
              "Returns: int (valid tokens accumulated across micro-steps, after all-reduce).")
+        .def(
+            "get_token_losses",
+            [](MultiGPUPyTrainer* trainer, int gpu_id) {
+                auto values = trainer->get_token_losses(gpu_id);
+                float* data = new float[values.size()];
+                std::copy(values.begin(), values.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+                return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {values.size()}, owner);
+            },
+            nb::arg("gpu_id") = 0,
+            "Return one GPU's per-position training losses for the current optimizer step.\n\n"
+            "Each training forward adds its per-token losses into a [B*T] buffer that is zeroed\n"
+            "at micro-step 0, so a position holds the sum over this step's micro-steps. After the\n"
+            "last micro-step, element 0 holds the reduced step total; every other element is\n"
+            "intact. With one supervised position per packed row this is the per-row loss.")
         .def("get_gpu_info",
              &MultiGPUPyTrainer::get_gpu_info,
              "Return current GPU utilization info for all GPUs (implementation-defined structure).")

@@ -199,6 +199,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Under the fp8-hybrid recipe, keep FP8 copies of frozen weights (LoRA base) so they are quantized once per run instead of at every matmul; costs two bytes per weight element. 'auto' enables it when the copies fit in free GPU memory.
         fp8_amax_history (Optional[int], defaults to 16):
             FP8 delayed scaling amax history length (default: 16, for fp8-hybrid recipe)
+        fp8_pow2_scales (Optional[bool], defaults to False):
+            Under fp8-hybrid, round every per-tensor FP8 scale down to a power of two. Scaling by a
+            power of two only shifts exponents, so a token quantizes to the same bits whatever else
+            shares its tensor (padding, or the other rows of a packed window); costs at most one bit
+            of range headroom. Recommended with row_packing.
         fp4_backend (Optional[Literal['cutlass', 'cudnn']], defaults to 'cutlass'):
             FP4 matmul backend: cutlass (default) or cudnn (for nvfp4 recipe)
         skip_quant_first_layers (Optional[int], defaults to 0):
@@ -398,6 +403,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     use_fused_rope: bool | None = False
     fp8_weight_cache: Literal["auto", "on", "off"] | None = "auto"
     fp8_amax_history: int | None = 16
+    fp8_pow2_scales: bool | None = False
     fp4_four_over_six: bool | None = True
     fp4_backend: Literal["cutlass", "cudnn"] | None = "cutlass"
     skip_quant_first_layers: int | None = 0
@@ -457,6 +463,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     ep_load_balance_threshold: float | None = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
     ep_plan_refresh_interval: int | None = 16  # LLEP sticky plans: recompute LPT every N steps (1 = every step)
     sequence_chunks: int | None = 1  # KV-checkpointed chunked training: process sequence_len as N chunks (1 = off)
+    # Train each optimizer step's padded rows packed into as few sequence_len windows as they fit
+    # (surogate/train/row_packing.py). Runtime only: the shard, the tokenize hash, the rows per
+    # step and the loss normalisation are those of padded training. Needs a padded shard
+    # (sample_packing: false or a pre-built non-overlapping shard).
+    row_packing: bool | None = False
 
     adapter_path: str | None = None  # PEFT adapter used to initialize the training run
     adapter_init_mode: Literal["merge", "trainable"] = "merge"
@@ -543,6 +554,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             fp8_weight_cache = "on" if fp8_weight_cache else "off"
         self.fp8_weight_cache = fp8_weight_cache
         self.fp8_amax_history = cfg.get("fp8_amax_history", self.fp8_amax_history)
+        self.fp8_pow2_scales = bool(cfg.get("fp8_pow2_scales", self.fp8_pow2_scales))
         self.fp4_backend = cfg.get("fp4_backend", self.fp4_backend)
         self.skip_quant_first_layers = (
             cfg["skip_quant_first_layers"] if "skip_quant_first_layers" in cfg else self.skip_quant_first_layers
@@ -610,6 +622,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.ep_load_balance_threshold = float(cfg.get("ep_load_balance_threshold", self.ep_load_balance_threshold))
         self.ep_plan_refresh_interval = int(cfg.get("ep_plan_refresh_interval", self.ep_plan_refresh_interval))
         self.sequence_chunks = int(cfg.get("sequence_chunks", self.sequence_chunks or 1))
+        self.row_packing = bool(cfg.get("row_packing", self.row_packing))
 
         self.adapter_path = cfg.get("adapter_path", self.adapter_path)
         self.adapter_init_mode = cfg.get("adapter_init_mode", self.adapter_init_mode)
@@ -1109,6 +1122,23 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             # override the run state honors.
             os.environ["SUROGATE_ROPE_MAX_SEQ"] = str(self.sequence_len)
 
+        if self.row_packing:
+            # The step's micro-step count follows its rows (ceil(windows / slots)), so the full-step
+            # graph cannot be captured once; each packed row is a document, so the engine must mask
+            # attention at document boundaries.
+            if self.sample_packing:
+                raise ValueError(
+                    "row_packing packs a padded shard's rows at train time; set sample_packing: false "
+                    "(tokenize-time sample_packing already concatenates documents into windows)"
+                )
+            if seq_chunks > 1:
+                raise ValueError("row_packing does not support sequence_chunks > 1")
+            if self.parallelism == "dispatch_pp":
+                raise ValueError("row_packing does not support parallelism: dispatch_pp")
+            if self.use_cuda_graphs:
+                logger.info("[row_packing]: disabling CUDA graphs (the micro-step count varies per step).")
+                self.use_cuda_graphs = False
+
         if self.long_context and self.use_cuda_graphs:
             # long_context uses split-attention mode: MLP tile groups run eagerly
             # while the rest of each layer (norms, attention, projections) stays graphed.
@@ -1158,6 +1188,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             use_fused_rope=self.use_fused_rope,
             fp8_weight_cache=("auto" if self.fp8_weight_cache is None else str(self.fp8_weight_cache)),
             fp8_amax_history=self.fp8_amax_history,
+            fp8_pow2_scales=bool(self.fp8_pow2_scales),
             fp4_four_over_six=self.fp4_four_over_six,
             fp4_backend=self.fp4_backend,
             skip_quant_first_layers=self.skip_quant_first_layers,

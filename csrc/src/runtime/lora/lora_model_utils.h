@@ -232,13 +232,7 @@ inline void apply_lora_contribution(Tensor& output,
     // forward and another per backward (~7 LoRA targets × 35 layers × 2
     // (fwd/bwd) × gas ≈ 500+ launches/step avoided).
     if (scaling != 1.0f && !fold_scaling_into_alpha) {
-        vector_add_sr(intermediate,
-                      intermediate,
-                      intermediate,
-                      0.5f * scaling,
-                      intermediate.nelem(),
-                      /*seed=*/0,
-                      stream);
+        vector_add(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), stream);
     }
     const float b_alpha = fold_scaling_into_alpha ? scaling : 1.0f;
 
@@ -458,13 +452,7 @@ inline void apply_lora_contribution_fp32(Tensor& output,
 
     // Scale intermediate so the final B projection includes the LoRA scaling
     if (scaling != 1.0f) {
-        vector_add_sr(intermediate,
-                      intermediate,
-                      intermediate,
-                      0.5f * scaling,
-                      intermediate.nelem(),
-                      /*seed=*/0,
-                      stream);
+        vector_add(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), stream);
     }
 
     // For router logits (small number of outputs), we compute the delta in BF16,
@@ -604,13 +592,7 @@ inline void backward_lora_router(Tensor& dA,
 
     // Apply scaling to intermediate
     if (scaling != 1.0f) {
-        vector_add_sr(intermediate,
-                      intermediate,
-                      intermediate,
-                      0.5f * scaling,
-                      intermediate.nelem(),
-                      /*seed=*/0,
-                      stream);
+        vector_add(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), stream);
     }
 
     // Convert d_logits from FP32 to BF16 for matmul (router outputs are small, so this is OK).
@@ -675,7 +657,7 @@ inline void backward_lora_router(Tensor& dA,
 
     // Apply scaling
     if (scaling != 1.0f) {
-        vector_add_sr(temp, temp, temp, 0.5f * scaling, temp.nelem(), /*seed=*/0, stream);
+        vector_add(temp, temp, temp, 0.5f * scaling, temp.nelem(), stream);
     }
 
     dropped_input = materialize_lora_dropout_input(input,
@@ -979,13 +961,12 @@ inline void backward_lora_layer(Tensor& dA,
     }
 
     if (scaling != 1.0f) {
-        vector_add_sr(intermediate,
-                      intermediate,
-                      intermediate,
-                      0.5f * scaling,
-                      static_cast<long>(BT) * static_cast<long>(rank),
-                      /*seed=*/0,
-                      stream);
+        vector_add(intermediate,
+                   intermediate,
+                   intermediate,
+                   0.5f * scaling,
+                   static_cast<long>(BT) * static_cast<long>(rank),
+                   stream);
     }
 
     // dB = (x @ A^T)^T @ dL_dy (strided read from packed gradient if needed)
@@ -1027,13 +1008,7 @@ inline void backward_lora_layer(Tensor& dA,
                    stream);
 
     if (scaling != 1.0f) {
-        vector_add_sr(intermediate,
-                      intermediate,
-                      intermediate,
-                      0.5f * scaling,
-                      intermediate.nelem(),
-                      /*seed=*/0,
-                      stream);
+        vector_add(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), stream);
     }
 
     // dA = x^T @ (dL_dy @ B)
@@ -1571,13 +1546,7 @@ inline void backward_lora_mlp_up_gate_fused(
             lora_dropout_scale(intermediate1, dropout_prob, dropout_seed, stream);
         }
         if (scaling != 1.0f) {
-            vector_add_sr(intermediate1,
-                          intermediate1,
-                          intermediate1,
-                          0.5f * scaling,
-                          intermediate1.nelem(),
-                          /*seed=*/0,
-                          stream);
+            vector_add(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), stream);
         }
 
         // dB = intermediate1^T @ dL_dy  (strided read from packed gradient)
@@ -1622,13 +1591,7 @@ inline void backward_lora_mlp_up_gate_fused(
             lora_dropout_scale(intermediate2, dropout_prob, dropout_seed, stream);
         }
         if (scaling != 1.0f) {
-            vector_add_sr(intermediate2,
-                          intermediate2,
-                          intermediate2,
-                          0.5f * scaling,
-                          intermediate2.nelem(),
-                          /*seed=*/0,
-                          stream);
+            vector_add(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), stream);
         }
 
         // dA = x^T @ intermediate2

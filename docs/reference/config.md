@@ -261,6 +261,7 @@ distillation:
 | Option             | Type | Default | Description                                                        |
 | ------------------ | ---- | ------- | ------------------------------------------------------------------ |
 | `fp8_amax_history` | int  | `16`    | FP8 delayed scaling amax history length (for `fp8_hybrid` recipe). |
+| `fp8_pow2_scales`  | bool | `false` | Under `fp8_hybrid`, round every per-tensor FP8 scale (JIT and delayed) down to a power of two, so a token quantizes to the same bits whatever else shares its tensor (padding, or the other rows of a packed window). Costs at most one bit of range headroom. Recommended with `row_packing`. |
 | `fp8_weight_cache` | string | `auto` | Keep FP8 copies of frozen weights (the LoRA base) so each is quantized once per run instead of at every matmul of every micro-batch. Costs two bytes per frozen weight element (forward copy plus transposed backward copy). `auto` enables it when the copies fit in free GPU memory with a margin; `on` / `off` force it. Trainable weights are never cached. |
 
 ### FP4/NVFP4 Recipe Options
@@ -330,7 +331,21 @@ Used when `optimizer: "normuon"`. NorMuon uses a hybrid approach: AdamW for embe
 | `train_seed`             | int   | `1234`  | Random seed for the training dataloader. Controls shuffling and sampling order.                                                                                                                                                   |
 | `eval_seed`              | int   | `1234`  | Random seed for the evaluation dataloader. Controls shuffling and sampling order.                                                                                                                                                 |
 | `dataloader_num_workers` | int   | auto    | Number of subprocesses to use for data loading. `0` means data will be loaded in the main process. Defaults to optimal value based on CPU count.                                                                                  |
-| `sample_packing`         | bool  | `true`  | Whether to enable sample packing to fit multiple data samples into a single sequence. Packing reduces the number of samples in the dataset; adjust gradient accumulation steps and learning rate accordingly for packed datasets. |
+| `sample_packing`         | bool  | `true`  | Whether to enable sample packing to fit multiple data samples into a single sequence. Packing reduces the number of samples in the dataset; adjust gradient accumulation steps and learning rate accordingly for packed datasets. Tokenize-time packing concatenates documents into a continuous stream cut every `sequence_len` tokens, so a document can be split across two windows; use `row_packing` when every example must stay whole. |
+| `row_packing`            | bool  | `false` | Train-time packing of a padded shard (one example per window, e.g. `sample_packing: false`). Each optimizer step loads exactly the rows padded training would, cuts each row after its last supervised position, and packs them into `ceil(windows / (gpus × per_device_train_batch_size))` micro-steps instead of `gradient_accumulation_steps`; every row is its own attention document (position ids restart at 0), its KD sidecar rows travel with it, and the loss is normalised over the same supervised tokens. Rows per step, epochs, checkpoints and the tokenize hash are unchanged. Disables CUDA graphs (the micro-step count varies); not with `sequence_chunks`, `dispatch_pp` or multi-node training. See [Row packing](#row-packing). |
+
+### Row packing
+
+`row_packing: true` keeps everything that defines the optimisation of a padded run and removes the padding compute. What stays identical to padded training, and why:
+
+* **The rows of every step and their order**: the step still makes `gradient_accumulation_steps` loader calls, so the data-loader position saved in checkpoints, epoch boundaries and `SUROGATE_AUDIT_TRAIN_BATCHES` audits are the padded run's.
+* **Each row's forward**: position ids restart at 0 at every row, which the engine turns into document masking (FlashAttention varlen for sliding-window layers, the mem-efficient kernel for wide global heads). With `recipe: bf16` a row's per-token losses are bit-identical packed and padded.
+* **Each row's backward, per token**: activation gradients are bit-identical wherever the row sits in its window (the autodiff accumulation adds round to nearest, and the deterministic attention backward uses a split count fixed by the batch geometry, not by the number of documents).
+* **Loss normalisation**: the step's summed loss and gradient are divided by the step's supervised-token count, the same tokens in both layouts.
+
+What differs is floating-point summation order: a packed window's weight gradient sums several rows inside one GEMM, where padded training sums them across micro-steps in the gradient dtype. The measured difference is within the spread padded training shows when only its micro-step order changes. Rows are spread over all the windows a step needs, which keeps windows no fuller than necessary.
+
+Under `fp8_hybrid`, per-tensor quantisation scales span the whole micro-batch, so by default a row's arithmetic also depends on the other rows of its window (as it would with `per_device_train_batch_size > 1`). Set `fp8_pow2_scales: true` with row packing: scales rounded down to powers of two only shift exponents, so every row's forward is again bit-identical to padded training with the same setting; the backward then differs only where a row's gradients fall below FP8 E5M2's range relative to the largest gradient in its window.
 
 ### Dataset Configuration Options
 

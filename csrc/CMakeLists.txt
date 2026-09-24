@@ -263,6 +263,14 @@ execute_process(
     WORKING_DIRECTORY ${minja_SOURCE_DIR}
     COMMAND_ERROR_IS_FATAL ANY)
 FetchContent_MakeAvailable(flash_attn)
+# Caller-chosen dQ split count for the deterministic backward (see the script). Same idempotent
+# re-apply-on-configure arrangement as minja above.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_flash_attn.sh)
+execute_process(
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_flash_attn.sh
+    WORKING_DIRECTORY ${flash_attn_SOURCE_DIR}
+    COMMAND_ERROR_IS_FATAL ANY)
 
 # Find libdw (elfutils) or libdwarf for stack traces with backward-cpp
 # libdw (from elfutils) is preferred, libdwarf is a fallback

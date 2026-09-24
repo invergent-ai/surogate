@@ -24,6 +24,9 @@ struct RecipeConfig {
     // FP8 options (for fp8-hybrid)
     int fp8_amax_history_len = 1024;
     int fp8_margin = 0;
+    /// Round every FP8 scale (JIT and delayed) down to a power of two, so a token's quantized
+    /// bits stop depending on the rest of its tensor (padding, packed neighbours). Process-wide.
+    bool fp8_pow2_scales = false;
 
     // FP4 options (for nvfp4)
     bool fp4_disable_2d_quantization = false;

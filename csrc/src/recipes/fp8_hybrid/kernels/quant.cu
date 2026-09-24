@@ -20,6 +20,38 @@
 #include "utilities/vec.cuh"
 #include "utilities/utils.h"  // for fp8_max_v, fp8_interpretation_v
 
+#include <atomic>
+
+namespace {
+std::atomic<bool> g_fp8_power_of_two_scales{false};
+}  // namespace
+
+// Power-of-two FP8 scales (opt-in, process-wide; RecipeConfig::fp8_pow2_scales).
+//
+// A per-tensor scale fp8_max / abs_max makes every element's rounding depend on the
+// tensor's maximum, i.e. on whatever else shares the tensor: padding, or the other
+// documents of a packed row. Multiplying by a power of two only shifts the exponent, so
+// with scale = 2^floor(log2(fp8_max / abs_max)) an element quantizes to the same
+// mantissa bits whatever the maximum is (it can differ only if it falls into the
+// subnormal range, ~2^14 (E4M3) / ~2^29 (E5M2) below the maximum), and the GEMM's
+// dequantizing alpha = 1/(s_a*s_b) is exact. The cost: up to one bit of headroom at
+// the top of the range goes unused.
+void set_fp8_power_of_two_scales(bool enabled) {
+    g_fp8_power_of_two_scales.store(enabled, std::memory_order_relaxed);
+}
+
+bool fp8_power_of_two_scales() {
+    return g_fp8_power_of_two_scales.load(std::memory_order_relaxed);
+}
+
+__device__ __forceinline__ float fp8_scale_from_amax(float fp8_max, float amax, bool pow2) {
+    const float scale = fp8_max / fmaxf(amax, 1e-10f);
+    if (!pow2 || !isfinite(scale)) return scale;
+    int e = 0;
+    frexpf(scale, &e);          // scale = m * 2^e, m in [0.5, 1)
+    return ldexpf(1.0f, e - 1);  // largest power of two <= scale
+}
+
 /**
  * @brief CUDA kernel to compute the maximum absolute value of an array.
  *
@@ -91,7 +123,8 @@ __global__ void quantize_with_abs_max_kernel(nv_bfloat16* __restrict__ out,
                                              float* __restrict__ scale_ptr,
                                              const float* __restrict__ in,
                                              const float* __restrict__ abs_max,
-                                             long N) {
+                                             long N,
+                                             bool /*pow2*/) {
     using vec_t = GenericVector<float, 16 / sizeof(float)>;
     using bfv_t = GenericVector<nv_bfloat16, 16 / sizeof(nv_bfloat16)>;
     if (threadIdx.x == 0 && blockIdx.x == 0 && scale_ptr) {
@@ -124,7 +157,8 @@ __global__ void quantize_with_abs_max_kernel(nv_bfloat16* __restrict__ out,
  */
 template <class floatX>
 __global__ void
-quantize_with_abs_max_kernel(std::int8_t* out, float* scale_ptr, const floatX* in, const float* abs_max, long N) {
+quantize_with_abs_max_kernel(
+    std::int8_t* out, float* scale_ptr, const floatX* in, const float* abs_max, long N, bool /*pow2*/) {
     using vec_t = GenericVector<floatX, 16 / sizeof(floatX)>;
     using i8v_t = GenericVector<std::int8_t, 16 / sizeof(floatX)>;
     float scale = (float)std::numeric_limits<std::int8_t>::max() / *abs_max;
@@ -163,11 +197,12 @@ __global__ void quantize_with_abs_max_kernel(FloatOut* __restrict__ out,
                                              float* __restrict__ scale_ptr,
                                              const FloatIn* __restrict__ in,
                                              const float* __restrict__ abs_max,
-                                             long N) {
+                                             long N,
+                                             bool pow2) {
     using vec_t = GenericVector<FloatIn, 16 / sizeof(FloatIn)>;
     using f8v_t = GenericVector<FloatOut, 16 / sizeof(FloatIn)>;
     // Use type-specific max: E4M3=448, E5M2=57344
-    float scale = fp8_max_v<FloatOut> / fmaxf(*abs_max, 1e-10f);
+    float scale = fp8_scale_from_amax(fp8_max_v<FloatOut>, *abs_max, pow2);
     if (threadIdx.x == 0 && blockIdx.x == 0 && scale_ptr) {
         *scale_ptr = 1.f / scale;
     }
@@ -211,7 +246,8 @@ void quantize_with_abs_max_launcher(floatY* out,
                                     cudaStream_t stream) {
     int block_size = dp.maxThreadsPerMultiProcessor == 2048 ? 1024 : 768;
     int n_blocks = dp.maxThreadsPerMultiProcessor / block_size * dp.multiProcessorCount;
-    quantize_with_abs_max_kernel<<<n_blocks, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, N);
+    quantize_with_abs_max_kernel<<<n_blocks, block_size, 0, stream>>>(
+        out, scale_ptr, in, abs_max, N, fp8_power_of_two_scales());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -338,7 +374,8 @@ __global__ void quantize_and_transpose_with_abs_max_kernel(nv_bfloat16* out,
                                                            const float* in,
                                                            const float* abs_max,
                                                            int rows,
-                                                           int cols) {
+                                                           int cols,
+                                                           bool /*pow2*/) {
     apply_and_transpose_helper<BLK>([](auto&& a) { return (nv_bfloat16)a; }, out, in, rows, cols);
 }
 
@@ -363,7 +400,8 @@ __global__ void quantize_and_transpose_with_abs_max_kernel(std::int8_t* out,
                                                            const floatX* in,
                                                            const float* abs_max,
                                                            int rows,
-                                                           int cols) {
+                                                           int cols,
+                                                           bool /*pow2*/) {
     float scale = static_cast<float>(std::numeric_limits<std::int8_t>::max()) / *abs_max;
     auto cvt = [scale](auto&& in_val) -> std::int8_t {
         auto out_val = std::max((float)std::numeric_limits<std::int8_t>::min(),
@@ -395,8 +433,9 @@ __global__ void quantize_and_transpose_with_abs_max_kernel(__nv_fp8_e4m3* out,
                                                            const floatX* in,
                                                            const float* abs_max,
                                                            int rows,
-                                                           int cols) {
-    float scale = fp8_max_v<__nv_fp8_e4m3> / fmaxf(*abs_max, 1e-10f);
+                                                           int cols,
+                                                           bool pow2) {
+    float scale = fp8_scale_from_amax(fp8_max_v<__nv_fp8_e4m3>, *abs_max, pow2);
     if (threadIdx.x == 0 && blockIdx.x == 0 && scale_ptr) {
         *scale_ptr = 1.f / scale;
     }
@@ -433,8 +472,9 @@ __global__ void quantize_and_transpose_with_abs_max_kernel(__nv_fp8_e5m2* out,
                                                            const floatX* in,
                                                            const float* abs_max,
                                                            int rows,
-                                                           int cols) {
-    float scale = fp8_max_v<__nv_fp8_e5m2> / fmaxf(*abs_max, 1e-10f);
+                                                           int cols,
+                                                           bool pow2) {
+    float scale = fp8_scale_from_amax(fp8_max_v<__nv_fp8_e5m2>, *abs_max, pow2);
     if (threadIdx.x == 0 && blockIdx.x == 0 && scale_ptr) {
         *scale_ptr = 1.f / scale;
     }
@@ -480,7 +520,7 @@ void quantize_and_transpose_with_abs_max_imp(floatOut* out,
     dim3 grid_size = {(unsigned)div_ceil(rows, BLK * (int)block_size.x),
                       (unsigned)div_ceil(cols, BLK * (int)block_size.y)};
     quantize_and_transpose_with_abs_max_kernel<BLK>
-        <<<grid_size, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, rows, cols);
+        <<<grid_size, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, rows, cols, fp8_power_of_two_scales());
     CUDA_CHECK(cudaGetLastError());
 }
 

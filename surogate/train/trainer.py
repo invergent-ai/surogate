@@ -25,6 +25,7 @@ from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
+from surogate.train.row_packing import RowPacker
 from surogate.train.training_advisor import TrainingAdvisor
 from surogate.train.training_plot import generate_training_plot
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
@@ -385,6 +386,9 @@ class SurogateTrainerWrapper:
             # Calculate steps
             self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
 
+        self._row_packer = self._init_row_packing(train_files) if config.row_packing else None
+        self._row_packing_totals = {"steps": 0, "rows": 0, "micro_steps": 0, "real_tokens": 0}
+
         # First training step triggers a one-shot DSL stack shrink; see
         # `_maybe_shrink_stack_after_warmup`. Gated here so resumed-from-
         # checkpoint runs still measure the first *executed* step.
@@ -594,6 +598,78 @@ class SurogateTrainerWrapper:
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type,
             wsd_decay_steps_fraction=config.wsd_decay_steps_fraction,
+        )
+
+    def _init_row_packing(self, train_files: list[str]) -> RowPacker:
+        """Check that row packing can keep its promises on this run, then build the packer.
+
+        Every packed row must be an isolated document, which needs the engine's document masking
+        and rows that start at position 0 (a padded shard's); see surogate/train/row_packing.py.
+        """
+        from surogate.distill.sidecar import read_token_shard_header
+
+        if self._train_vision or self.train_loader is None:
+            raise ValueError("row_packing needs tokenized shards; it does not support train_vision")
+        runtime = getattr(self.config, "runtime_config", None)
+        if runtime is not None and not getattr(runtime, "doc_masking", True):
+            raise ValueError("row_packing needs doc_masking: packed rows must not attend to each other")
+        for shard in train_files:
+            header = read_token_shard_header(shard)
+            if not header.non_overlapping:
+                raise ValueError(
+                    f"row_packing needs a padded shard (one example per window), but {shard} was written "
+                    "as a continuous token stream; re-tokenize with sample_packing: false"
+                )
+        pad = self.config.tokenizer.pad_token_id if self.config.tokenizer.pad_token_id is not None else 0
+        slots = self.config.gpus * self.config.per_device_train_batch_size
+        logger.info(
+            f"Row packing: each step's {slots * self.config.gradient_accumulation_steps} rows are packed into "
+            f"{slots}-window micro-steps of {self.config.sequence_len} tokens (was "
+            f"{self.config.gradient_accumulation_steps} padded micro-steps)."
+        )
+        return RowPacker(
+            self.config.sequence_len,
+            slots,
+            pad_token_id=pad,
+            kd_top_k=self.config.distillation.top_k if self._kd_enabled else None,
+        )
+
+    def _load_packed_step(self, in_tokens, out_tokens, pos_ids, kd_ids=None, kd_logprobs=None):
+        """Load the step's padded rows exactly as the padded loop would, and pack them."""
+        chunk = self.config.gpus * self.config.per_device_train_batch_size
+        sidecars = () if kd_ids is None else (kd_ids, kd_logprobs)
+        for _ in range(self.config.gradient_accumulation_steps):
+            if not self.train_loader.has_next():
+                self.train_loader.advance_epoch()
+            self._load_training_microbatch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], *sidecars)
+            self._row_packer.add_batch(in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], *sidecars)
+        packed = self._row_packer.build()
+        self._row_packing_totals["steps"] += 1
+        self._row_packing_totals["rows"] += packed.rows
+        self._row_packing_totals["micro_steps"] += packed.waves
+        self._row_packing_totals["real_tokens"] += packed.real_tokens
+        self.trainer.set_grad_accumulation(packed.waves)
+        return packed
+
+    def _kd_step(self, inputs, targets, kd_ids, kd_logprobs, positions):
+        self.trainer.step_with_kd(
+            inputs,
+            targets,
+            kd_ids,
+            kd_logprobs,
+            position_ids=positions,
+            top_k=self.config.distillation.top_k,
+            temperature=self.config.distillation.temperature,
+            kd_weight=self.config.distillation.kd_weight,
+            ce_weight=self.config.distillation.ce_weight,
+            # Ordinary KD remains compatible with installed builds
+            # that predate the optional candidate-only extension.
+            **({"candidate_only": True} if self.config.distillation.candidate_only else {}),
+            **(
+                {"candidate_objective": self.config.distillation.candidate_objective}
+                if self.config.distillation.candidate_objective != "cross_entropy"
+                else {}
+            ),
         )
 
     def _validate_kd_sidecars(self, train_files: list[str]) -> None:
@@ -1391,7 +1467,20 @@ class SurogateTrainerWrapper:
             # Training step
             step_start = time.time()
 
-            if self._kd_enabled:
+            packed = None
+            if self._kd_enabled and self._row_packer is not None:
+                # Row packing: the same rows the padded loop below would train this step,
+                # laid out in ceil(windows / slots) micro-steps.
+                packed = self._load_packed_step(in_tokens, out_tokens, pos_ids, kd_ids, kd_logprobs)
+                for w in range(packed.waves):
+                    self._kd_step(
+                        packed.inputs[w],
+                        packed.targets[w],
+                        packed.kd_ids[w],
+                        packed.kd_logprobs[w],
+                        packed.positions[w],
+                    )
+            elif self._kd_enabled:
                 # KD micro-steps: load one gpus*B chunk plus its teacher top-k rows,
                 # run the forward/backward per micro-step; the optimizer update
                 # happens once below via update_with_config.
@@ -1402,25 +1491,7 @@ class SurogateTrainerWrapper:
                     self._load_training_microbatch(
                         in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], kd_ids, kd_logprobs
                     )
-                    self.trainer.step_with_kd(
-                        in_tokens[:chunk],
-                        out_tokens[:chunk],
-                        kd_ids,
-                        kd_logprobs,
-                        position_ids=pos_ids[:chunk],
-                        top_k=self.config.distillation.top_k,
-                        temperature=self.config.distillation.temperature,
-                        kd_weight=self.config.distillation.kd_weight,
-                        ce_weight=self.config.distillation.ce_weight,
-                        # Ordinary KD remains compatible with installed builds
-                        # that predate the optional candidate-only extension.
-                        **({"candidate_only": True} if self.config.distillation.candidate_only else {}),
-                        **(
-                            {"candidate_objective": self.config.distillation.candidate_objective}
-                            if self.config.distillation.candidate_objective != "cross_entropy"
-                            else {}
-                        ),
-                    )
+                    self._kd_step(in_tokens[:chunk], out_tokens[:chunk], kd_ids, kd_logprobs, pos_ids[:chunk])
             elif self._dispatch_pp:
                 # Fill all gpus*bsz*_dpp_chunks rows = M microbatches. The loader yields one
                 # gpus*bsz chunk per call, so load _dpp_chunks of them into the buffer.
@@ -1431,6 +1502,8 @@ class SurogateTrainerWrapper:
                     start = c * chunk
                     end = start + chunk
                     self._load_training_microbatch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+            elif use_full_step_graphs and self._row_packer is not None:
+                packed = self._load_packed_step(in_tokens, out_tokens, pos_ids)
             elif use_full_step_graphs:
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
                 for micro_step in range(self.config.gradient_accumulation_steps):
@@ -1488,6 +1561,15 @@ class SurogateTrainerWrapper:
                     in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his, opt_config, step, False, M
                 )
                 result = {"loss": float(loss), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
+            elif use_full_step_graphs and packed is not None:
+                result = self.trainer.train_step_graphed(
+                    np.concatenate(packed.inputs),
+                    np.concatenate(packed.targets),
+                    np.concatenate(packed.positions),
+                    opt_config,
+                    step + 1,
+                )
+                self._maybe_log_lora_grad_stats(step)
             elif use_full_step_graphs:
                 result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
                 # Optional LoRA grad debug runs after graph replay (post-update).
@@ -1514,6 +1596,19 @@ class SurogateTrainerWrapper:
                     * self.config.gpus
                     * self._dpp_chunks
                 )
+            elif packed is not None:
+                # Windows actually run (packed rows plus their unused tails and dummy windows).
+                tokens_processed = (
+                    self.config.per_device_train_batch_size * self.config.sequence_len * packed.waves * self.config.gpus
+                )
+                if step == self.start_step or step % 100 == 0:
+                    totals = self._row_packing_totals
+                    logger.info(
+                        f"Row packing step {step}: {packed.rows} rows in {packed.waves} micro-step(s) "
+                        f"({packed.stats['windows_used']} windows used, fill mean {packed.stats['fill_mean']:.0%}); "
+                        f"run so far {totals['micro_steps']} micro-steps for {totals['rows']} rows "
+                        f"({totals['steps'] * self.config.gradient_accumulation_steps} padded)"
+                    )
             else:
                 tokens_processed = (
                     self.config.per_device_train_batch_size

@@ -24,6 +24,29 @@ namespace {
 
 constexpr int kFlashMaxHeadDim = 256;
 
+/// dQ split count for the deterministic backward. Split s owns key blocks s, s+S, s+2S, ... of
+/// every document (block indices count from the document's own start) and the splits are
+/// summed in order, so S alone fixes the fp32 summation order of each dQ element. S therefore
+/// depends only on the batch geometry (rows, heads, SM count), never on how many documents a
+/// packed row holds: a document gets the same dQ bits whether it was padded alone or packed
+/// with others. FlashAttention's own heuristic, ceil(SMs / (documents * heads)), would re-order
+/// the sum (and resize the scratch) with every packing. Each split needs a full fp32 dQ copy,
+/// so S is also capped: kMaxDqSplits copies bound the scratch to a small multiple of the one
+/// the non-deterministic path uses (4 measured best on a 5090 anyway: 1 split +10% per padded
+/// Gemma-4 step, 2 +4.8%, 4 +3.2%, 11 +4.4% against the atomic path).
+/// SUROGATE_FLASH_ATTN_DQ_SPLITS=<n> overrides (diagnostics; the stack plan assumes <= the cap).
+constexpr int kMaxDqSplits = kFlashVarlenMaxDqSplits;
+
+int deterministic_dq_splits(const AttentionParams& p, int sm_count) {
+    if (const char* env = std::getenv("SUROGATE_FLASH_ATTN_DQ_SPLITS")) {
+        const int forced = std::atoi(env);
+        if (forced > 0) return forced;
+    }
+    const int rows_heads = std::max(1, p.B * p.Hq);
+    const int fill = (std::max(1, sm_count) + rows_heads - 1) / rows_heads;
+    return std::clamp(fill, 1, kMaxDqSplits);
+}
+
 class FlashVarlenAttention final : public AttentionBackend {
 public:
     const char* name() const override {
@@ -103,9 +126,8 @@ public:
         const long padded_total = static_cast<long>(p.total_doc_tokens) + 128L * static_cast<long>(p.num_docs);
         const long dq_accum_stride = padded_total * static_cast<long>(p.Hq) * static_cast<long>(Hs_rounded);
 
-        const int split_den = std::max(1, p.num_docs * p.Hq);
         const int dq_accum_splits =
-            p.deterministic_bwd ? std::max(1, (rs.DeviceProp.multiProcessorCount + split_den - 1) / split_den) : 1;
+            p.deterministic_bwd ? deterministic_dq_splits(p, rs.DeviceProp.multiProcessorCount) : 1;
         const long dq_accum_elems = dq_accum_stride * static_cast<long>(dq_accum_splits);
         const long dsoftmax_elems = static_cast<long>(p.Hq) * padded_total;
 
@@ -171,7 +193,8 @@ public:
                                         p.deterministic_bwd,
                                         p.stream,
                                         p.softmax_scale,
-                                        std::max(p.window_size, 0));
+                                        std::max(p.window_size, 0),
+                                        dq_accum_splits);
     }
 
 private:

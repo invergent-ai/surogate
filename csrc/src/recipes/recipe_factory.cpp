@@ -9,6 +9,7 @@
 #include "recipes/bf16/bf16_recipe.h"
 #include "recipes/fp8_hybrid/fp8_hybrid_recipe.h"
 #include "recipes/nvfp4/nvfp4_recipe.h"
+#include "kernels/kernels.h"
 
 namespace recipes {
 
@@ -22,6 +23,7 @@ std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name, const Rec
     }
 
     if (name == "fp8-hybrid" || name == "fp8_hybrid") {
+        set_fp8_power_of_two_scales(config.fp8_pow2_scales);
         FP8HybridRecipe::Config fp8_config{.margin = config.fp8_margin,
                                            .amax_history_len = config.fp8_amax_history_len,
                                            .amax_compute_algo = AmaxComputeAlgo::MAX,

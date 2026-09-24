@@ -97,14 +97,16 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
         }
     }
 
-    if (is_accum_output) {
-        vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, mRunState.MainStream);
-    } else {
-        // Stochastic rounding hashes the flat buffer index, so the same token
-        // would change when decoded alone or moved within a packed batch.
-        // Forward recomputation must use this same deterministic addition.
-        vector_add(out, a, b, 1.0f, static_cast<long>(a.nelem()), mRunState.MainStream);
-    }
+    // Stochastic rounding hashes the flat buffer index, so the same token would
+    // round differently when decoded alone or moved within a packed batch.
+    // Forward recomputation must use this same deterministic addition -- and so
+    // must the autodiff accumulation outputs (AccumTemp): they sum the branch
+    // gradients of one token's activation, and an index-keyed rounding there made
+    // a packed document's gradient depend on where in the window it sat (~2%
+    // relative LoRA-gradient difference by the first layer on Gemma 4).
+    // Parameter-gradient accumulation (dispatch_add_backward) keeps stochastic
+    // rounding: a parameter's index does not move with packing.
+    vector_add(out, a, b, 1.0f, static_cast<long>(a.nelem()), mRunState.MainStream);
     store_tensor(op.outputs[0], out);
 }
 
