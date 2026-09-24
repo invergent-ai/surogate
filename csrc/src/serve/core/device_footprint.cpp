@@ -4,6 +4,11 @@
 #include <nvml.h>
 
 #include <unistd.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <map>
+#include <mutex>
 #include <vector>
 
 #include <dlfcn.h>
@@ -103,8 +108,16 @@ bool process_used(int cuda_device, std::size_t& out) noexcept try {
         return false;
     }
     if (count == 0) { last_note = "this device has no listed compute processes"; return false; }
-    std::vector<nvmlProcessInfo_t> processes(count);
-    if (lib.compute_procs(device, &count, processes.data()) != NVML_SUCCESS) {
+    // A process that starts on the card between the two calls makes the list outgrow the
+    // count: ask again with room to spare rather than give up on the sample.
+    std::vector<nvmlProcessInfo_t> processes;
+    nvmlReturn_t listed = NVML_ERROR_INSUFFICIENT_SIZE;
+    for (int attempt = 0; attempt < 4 && listed == NVML_ERROR_INSUFFICIENT_SIZE; ++attempt) {
+        count += 8;
+        processes.assign(count, nvmlProcessInfo_t{});
+        listed = lib.compute_procs(device, &count, processes.data());
+    }
+    if (listed != NVML_SUCCESS) {
         last_note = "the device's process list is unavailable (permission or namespace)";
         return false;
     }
@@ -160,5 +173,123 @@ DeviceFootprintDelta device_footprint_delta(const DeviceFootprint& before,
 }
 
 const char* device_footprint_attribution_note() noexcept { return last_note != nullptr ? last_note : nvml().note; }
+
+namespace {
+
+struct DeviceLimit {
+    std::size_t bytes         = 0;
+    std::size_t baseline_free = 0; ///< fallback: free memory plus this process's usage, raised on every read
+    std::size_t used          = 0; ///< the last usage figure
+    bool attributed           = false; ///< NVML has attributed this process's usage on the device
+    std::chrono::steady_clock::time_point sampled{};
+    bool warned               = false;
+};
+
+// NVML's process list is a few driver calls; the budget is read under the elastic ledger's lock
+// and on every /kv_stats and /metrics scrape, so a figure younger than this is reused.
+constexpr auto kUsageRefresh = std::chrono::milliseconds(50);
+
+// The fallback cannot see the CUDA context this process created before the limit was set.
+constexpr std::size_t kFallbackContextBytes = std::size_t{512} << 20;
+
+std::mutex& limit_mutex() {
+    static std::mutex instance;
+    return instance;
+}
+
+std::map<int, DeviceLimit>& limits() {
+    static std::map<int, DeviceLimit> instance;
+    return instance;
+}
+
+/// Free memory on `device`, selecting it for the query and restoring the caller's device.
+std::size_t free_on(int device) noexcept {
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess) { previous = -1; }
+    if (previous != device && cudaSetDevice(device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        free_bytes = 0;
+    }
+    if (previous >= 0 && previous != device) { (void)cudaSetDevice(previous); }
+    return free_bytes;
+}
+
+} // namespace
+
+void set_device_memory_limit(int device, std::size_t bytes) noexcept {
+    const std::lock_guard<std::mutex> lock(limit_mutex());
+    if (bytes == 0) {
+        limits().erase(device);
+        return;
+    }
+    DeviceLimit& entry = limits()[device];
+    if (entry.bytes == bytes) { return; }
+    entry               = DeviceLimit{};
+    entry.bytes         = bytes;
+    entry.baseline_free = free_on(device);
+}
+
+std::size_t device_memory_limit(int device) noexcept {
+    const std::lock_guard<std::mutex> lock(limit_mutex());
+    const auto it = limits().find(device);
+    return it == limits().end() ? 0 : it->second.bytes;
+}
+
+std::size_t device_budget_free_bytes(int device) noexcept {
+    const std::size_t free_bytes = free_on(device);
+    const std::lock_guard<std::mutex> lock(limit_mutex());
+    const auto it = limits().find(device);
+    if (it == limits().end()) { return free_bytes; }
+    DeviceLimit& entry = it->second;
+    const auto now     = std::chrono::steady_clock::now();
+    if (!entry.attributed || now - entry.sampled >= kUsageRefresh) {
+        std::size_t used = 0;
+        if (process_used(device, used)) {
+            entry.used       = used;
+            entry.attributed = true;
+            entry.sampled    = now;
+        } else if (!entry.attributed) {
+            // No attribution on this device: what left the device's free memory since the limit
+            // was set counts as this process's, plus the context it could not see. Memory another
+            // process frees afterwards must not be credited to this one, so the baseline rises
+            // with free memory and the figure never falls: a sizing budget errs small.
+            entry.baseline_free = std::max(entry.baseline_free, free_bytes + entry.used);
+            entry.used          = entry.baseline_free - free_bytes;
+            if (!entry.warned) {
+                entry.warned = true;
+                std::fprintf(stderr,
+                             "gpu memory limit: NVML cannot attribute this process's usage on device "
+                             "%d (%s); counting every allocation there since the limit was set, "
+                             "plus %zu MiB for the CUDA context\n",
+                             device, device_footprint_attribution_note(),
+                             kFallbackContextBytes >> 20);
+            }
+        }
+        // Once NVML has attributed usage here, a failed sample keeps the last figure rather than
+        // switching to the fallback's very different one.
+    }
+    const std::size_t used = entry.attributed ? entry.used : entry.used + kFallbackContextBytes;
+    const std::size_t room = entry.bytes > used ? entry.bytes - used : 0;
+    return std::min(free_bytes, room);
+}
+
+bool budgeted_mem_get_info(std::size_t& free_bytes, std::size_t& total_bytes) noexcept {
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { return true; }
+    const std::size_t limit = device_memory_limit(device);
+    if (limit == 0) { return true; }
+    free_bytes  = std::min(free_bytes, device_budget_free_bytes(device));
+    total_bytes = std::min(total_bytes, limit);
+    return true;
+}
 
 } // namespace sinfer

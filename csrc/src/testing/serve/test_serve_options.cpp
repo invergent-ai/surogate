@@ -30,6 +30,25 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"sinfer-serve", "model.sinfer"});
+
+    // --gpu-memory-limit-mib (SUROGATE-CHANGES #8): MiB to bytes, carried to extra models,
+    // positive only.
+    failures += check(defaults.gpu_memory_limit_bytes == 0, "a GPU memory limit is set by default");
+    {
+        const ServeOptions limited = parse({"sinfer-serve", "model.sinfer", "--gpu-memory-limit-mib",
+                                            "20000", "--model", "other=other.sinfer"});
+        failures += check(limited.gpu_memory_limit_bytes == (std::size_t{20000} << 20),
+                          "--gpu-memory-limit-mib was not read as MiB");
+        failures += check(extra_model_options(limited, limited.extra_models.front())
+                                  .gpu_memory_limit_bytes == limited.gpu_memory_limit_bytes,
+                          "an extra model did not share the GPU memory limit");
+        for (const char* bad : {"0", "-1", "12x", ""}) {
+            bool rejected = false;
+            try { (void)parse({"sinfer-serve", "model.sinfer", "--gpu-memory-limit-mib", bad}); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an invalid --gpu-memory-limit-mib was accepted");
+        }
+    }
     for (bool extra : {false, true}) {
         std::vector<std::string> args{"sinfer-serve", "model.sinfer", "--served-model-name", "tuned",
                                       "--enable-lora", "--lora-modules", "tuned=/adapters/tuned"};

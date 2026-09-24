@@ -710,7 +710,7 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
 
     help("up", "gauge", "1 when the server is answering.");
     out += "surogate_up 1\n";
-    help("device_free_bytes", "gauge", "Free device memory on the serving GPU.");
+    help("device_free_bytes", "gauge", "Free device memory on the serving GPU that this server may use (under --gpu-memory-limit-mib, what is left of its limit).");
     out += "surogate_device_free_bytes " + std::to_string(sinfer::device_free_bytes(device_)) +
            "\n";
 

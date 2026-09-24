@@ -3,6 +3,7 @@
 #include "core/sleep.h"
 
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "core/engine_context.h"
 
 #include <atomic>
@@ -274,9 +275,7 @@ void sleep_prepare_backups(const void* owner) {
 
 std::size_t device_free_bytes(int device) noexcept {
     if (cudaSetDevice(device) != cudaSuccess) { return 0; }
-    std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) { return 0; }
-    return free_bytes;
+    return device_budget_free_bytes(device);
 }
 
 bool device_asleep(int device, const void* owner) noexcept {

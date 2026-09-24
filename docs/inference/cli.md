@@ -50,6 +50,7 @@ from earlier tokens; its capacity affects how many requests can run together.
 | `--elastic-kv` | on | Grow cache memory use with demand |
 | `--no-elastic-kv` | off | Reserve the full cache in GPU memory instead of growing memory use with demand |
 | `--elastic-kv-overcommit` | off | Let several models share unused GPU memory for their caches |
+| `--gpu-memory-limit-mib N` | whole card | Cap everything the server holds on each GPU; automatic sizing fits in it (see [Sharing a GPU](#sharing-a-gpu)) |
 | `--no-cache` | off | Rebuild the prepared model cache on disk |
 | `--no-prefix-reuse` | off | Disable reuse of compatible earlier prompts |
 | `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
@@ -76,6 +77,36 @@ models such as Qwen3.5/3.6/3.8, including with DFlash. FP8 uses half the cache s
 
 With `--elastic-kv-overcommit`, `--kv-capacity` becomes a guaranteed minimum; `auto` guarantees
 enough for one full-context request per model. See [Serving models](serving-models.md#several-models-on-one-gpu).
+
+### Sharing a GPU
+
+`--gpu-memory-limit-mib N` gives the server a budget of N MiB on each of its GPUs. The budget
+covers weights, cache, working buffers and the CUDA context. Automatic sizing then works within
+it instead of within the card's free memory:
+
+- `--kv-capacity auto` and `--max-model-len auto`;
+- `--host-moe-layers auto`, automatic expert slots and pipelines;
+- the optional repacked weight copies.
+
+An explicit `--kv-capacity`, or the capacity that an explicit `--max-model-len` implies, must fit
+the budget with 1024 MiB left over, or the server refuses to start. So must the weights and
+their load staging.
+
+The cache never grows past the capacity it was sized for. The 1024 MiB left over absorbs
+working buffers that grow later, so the server stays within its limit.
+
+Several models in one server share the budget. To share a GPU between processes, give every
+process on it a limit, and keep the limits below the card's memory less what the driver reserves.
+Processes without a limit, such as other programs, can still take memory the others counted on.
+`--expert-slots N` is not checked against the limit.
+
+The server measures its own usage through NVML. Inside a container that hides host process ids,
+NVML cannot attribute usage to the process. The server then counts everything allocated on the
+device since it started, plus 512 MiB for the CUDA context, and prints a warning. Run such
+containers with `--pid=host` for an exact figure.
+
+With a limit set, the `device_free_bytes` reported by `/kv_stats` and `/metrics` is what the
+server may still allocate.
 
 ### Devices
 

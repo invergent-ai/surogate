@@ -46,4 +46,24 @@ struct DeviceFootprintDelta {
 /// while attribution is working.
 [[nodiscard]] const char* device_footprint_attribution_note() noexcept;
 
+/// A cap on everything this process holds on one device: weights, cache, workspaces and the
+/// CUDA context (`--gpu-memory-limit-mib`). Zero removes it. Several engines in one process
+/// share it. Setting the same value again keeps the first setting's baseline.
+void set_device_memory_limit(int device, std::size_t bytes) noexcept;
+[[nodiscard]] std::size_t device_memory_limit(int device) noexcept;
+
+/// Device memory this process may still allocate on `device`: what is free there, and under a
+/// limit no more than the limit less what this process already holds. Every sizing decision
+/// that reads "free memory" goes through this, so a limited server sizes itself to its budget
+/// rather than to the card. The process's usage comes from NVML; where NVML cannot attribute
+/// it, from the device's free memory against its level when the limit was set, which also
+/// charges this process for other processes' growth since then (the safe direction) and does
+/// not count the CUDA context created before it.
+[[nodiscard]] std::size_t device_budget_free_bytes(int device) noexcept;
+
+/// cudaMemGetInfo for the current device as this process may use it: under a limit, `free` is
+/// no more than device_budget_free_bytes and `total` no more than the limit. For the checks that
+/// decide whether an optional derived copy fits. False when cudaMemGetInfo fails.
+[[nodiscard]] bool budgeted_mem_get_info(std::size_t& free_bytes, std::size_t& total_bytes) noexcept;
+
 } // namespace sinfer

@@ -105,7 +105,7 @@ _VALUE_OPTIONS = {
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
         --model-priority --model --lora-modules --max-loras --max-lora-rank
-        --decision-temperature
+        --decision-temperature --gpu-memory-limit-mib
     """.split()),
     "generate": _COMMON_VALUES | frozenset("""
         --prompt --messages --max-new --max-context --prefill-chunk --kv-dtype

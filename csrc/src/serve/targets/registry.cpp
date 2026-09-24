@@ -10,6 +10,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "core/engine_context.h"
 #include "core/elastic_kv_region.h"
 #include "ops/linear/marlin/marlin_plane.h"
@@ -85,28 +86,62 @@ artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
     return artifact::LoadProgress{.callback = progress.callback};
 }
 
+// What this process may still allocate on the current device: its free memory, and under
+// --gpu-memory-limit-mib no more than the limit less what the process already holds. Every
+// sizing decision below reads free memory through this.
+std::size_t current_free_device_bytes() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes)); // a sticky CUDA error surfaces here
+    return std::min(free_bytes, device_budget_free_bytes(device));
+}
+
 std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const std::size_t free_bytes = current_free_device_bytes();
     if (weight_bytes > free_bytes) {
-        throw std::invalid_argument("model weights require " + std::to_string(weight_bytes) +
-                                    " bytes of device memory, but only " +
-                                    std::to_string(free_bytes) +
-                                    " bytes are free before loading weights");
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        const std::size_t limit = device_memory_limit(device);
+        throw std::invalid_argument(
+            "model weights require " + std::to_string(weight_bytes) +
+            " bytes of device memory, but only " + std::to_string(free_bytes) + " bytes are " +
+            (limit != 0 ? "left within --gpu-memory-limit-mib " + std::to_string(limit >> 20)
+                        : std::string("free")) +
+            " before loading weights");
     }
     return free_bytes - static_cast<std::size_t>(weight_bytes);
 }
 
-std::size_t current_free_device_bytes() {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    return free_bytes;
-}
-
 std::size_t subtract_saturating(std::size_t value, std::size_t amount) noexcept {
     return value > amount ? value - amount : 0;
+}
+
+// Under --gpu-memory-limit-mib an explicit cache size keeps the same headroom an automatic one
+// does: lazily grown workspaces and graph captures come on top of the reservation, and the
+// limit covers them too. Without a limit an explicit size stays exactly what it was.
+std::size_t explicit_capacity_headroom(int device, const KvCapacityPolicy& policy) {
+    return device_memory_limit(device) != 0 && policy.mode == KvCapacityMode::Explicit
+               ? kDefaultKvCapacityHeadroomBytes
+               : 0;
+}
+
+// resolve_kv_capacity, with the limit named in its refusal.
+runtime::KvCapacityResolution resolve_kv_capacity_within_limit(int device,
+                                                               const KvCapacityPolicy& policy,
+                                                               const runtime::SequenceCapacityCurve& curve,
+                                                               std::size_t available) {
+    try {
+        return runtime::resolve_kv_capacity(
+            policy, curve, subtract_saturating(available, explicit_capacity_headroom(device, policy)));
+    } catch (const std::invalid_argument& error) {
+        const std::size_t limit = device_memory_limit(device);
+        if (limit == 0) { throw; }
+        throw std::invalid_argument(std::string(error.what()) + " (within --gpu-memory-limit-mib " +
+                                    std::to_string(limit >> 20) + ", less " +
+                                    std::to_string(kDefaultKvCapacityHeadroomBytes >> 20) +
+                                    " MiB of headroom)");
+    }
 }
 
 // The FP8/FP4 and Marlin residencies derive a second, repacked copy of every
@@ -323,6 +358,22 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         runtime_bytes_after_planned_weights(options.borrowed_weights.empty()
             ? load_plan.materialization().device_capacity_bytes : 0),
         derived_residency_bytes);
+    if (const std::size_t limit = device_memory_limit(device.device); limit != 0) {
+        // The load also holds staging for the objects it rearranges; under a limit it must fit
+        // beside the weights, or the limit is exceeded before serving even starts.
+        const std::uint64_t weights = options.borrowed_weights.empty()
+                                          ? load_plan.materialization().device_capacity_bytes
+                                          : 0;
+        const std::size_t staging = projected_load_staging_bytes(binder, load_plan.materialization());
+        const std::size_t budget  = current_free_device_bytes();
+        if (weights + staging > budget) {
+            throw std::invalid_argument(
+                "loading needs " + std::to_string(weights >> 20) + " MiB of weights and up to " +
+                std::to_string(staging >> 20) + " MiB of staging, but only " +
+                std::to_string(budget >> 20) + " MiB are left within --gpu-memory-limit-mib " +
+                std::to_string(limit >> 20));
+        }
+    }
     EngineOptions effective = options;
     if (effective.max_context == 0) {
         effective.max_context = resolve_automatic_context<Target>(
@@ -341,8 +392,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         effective.elastic_kv_overcommit && effective.kv_capacity.mode == KvCapacityMode::Automatic
             ? KvCapacityPolicy::explicit_capacity(effective.max_context)
             : effective.kv_capacity;
-    (void)runtime::resolve_kv_capacity(
-        kv_policy, curve,
+    (void)resolve_kv_capacity_within_limit(
+        device.device, kv_policy, curve,
         subtract_saturating(preflight_runtime_bytes, elastic_kv_unmapped_commitment(device.device)));
 
     auto progress     = artifact_progress(options.load_progress);
@@ -355,8 +406,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     device.synchronize();
     // Elastic pools on this device have mapped only what they use so far; what they may still
     // map is not free for this engine's cap, or two engines would fill against each other.
-    runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
-        kv_policy, curve,
+    runtime::KvCapacityResolution capacity_resolution = resolve_kv_capacity_within_limit(
+        device.device, kv_policy, curve,
         subtract_saturating(
             subtract_saturating(current_free_device_bytes(), derived_residency_bytes),
             elastic_kv_unmapped_commitment(device.device)));

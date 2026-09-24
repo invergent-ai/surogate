@@ -92,6 +92,7 @@ struct ServeOptions {
     std::vector<std::uint32_t> kv_cache_skip_layers;
     bool elastic_kv          = true;  // default; --no-elastic-kv puts the Main KV planes in the arena
     bool elastic_kv_overcommit = false; // --elastic-kv-overcommit: floor + device gate
+    std::size_t gpu_memory_limit_bytes = 0; // --gpu-memory-limit-mib: per-device process budget
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
