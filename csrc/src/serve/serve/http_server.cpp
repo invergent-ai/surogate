@@ -6,6 +6,7 @@
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
 #include "serve/decisions_schema.h"
+#include "serve/http_socket.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
@@ -140,6 +141,8 @@ HttpServer::HttpServer(ServeOptions options)
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
     server_.set_payload_max_length(options_.max_request_bytes);
+    // Before bind(): the listening socket carries the option to every connection.
+    disable_nagle(server_);
     register_routes();
 }
 
