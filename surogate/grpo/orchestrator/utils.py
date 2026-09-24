@@ -44,21 +44,20 @@ def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -
     # Convert SamplingConfig to the OpenAI-compatible sampling args the server accepts
     sampling_args = dict(sampling_config.__dict__)
     sampling_args.pop("temp_scheduler", None)
-    # A seed here reaches the request body, and the engine resolves a request seed
-    # ahead of its own server setting (`serve/translate.cpp:62-67`), so one value
-    # here pins every rollout of a group to the same sample -- and it does so even
-    # when the server passes no `--seed` at all. Identical rollouts score
-    # identically, and a group with no reward spread has an advantage of exactly
-    # zero, so the step trains on nothing. Colocate is no safer: `shared_model.py`
-    # seeds its per-request RNG from this same value. A fixed seed has no
-    # per-rollout meaning, so it is dropped rather than honoured, and said out loud
-    # so a config carrying one gets fixed instead of silently training on noise.
-    if sampling_args.pop("seed", None) is not None:
-        logger.warning_once(
-            "sampling.seed is ignored for rollouts: one seed across a group makes every "
-            "rollout in it identical, which gives an advantage of zero and trains on "
-            "nothing. Remove it from the orchestrator config."
-        )
+    # A seed reaching the request body pins every rollout of a group to the same
+    # sample: the engine resolves a request seed ahead of its own server setting
+    # (`serve/translate.cpp:62-67`), so it does this even when the server passes
+    # no `--seed` at all. Identical rollouts score identically, and a group with
+    # no reward spread has an advantage of exactly zero, so the step trains on
+    # nothing. Colocate is no safer: `shared_model.py` seeds its per-request RNG
+    # from the same value. A fixed seed has no per-rollout meaning, so it is
+    # dropped rather than honoured.
+    #
+    # Both doors have to be shut. `extra_body` is rebuilt from the config below
+    # rather than carried through `sampling_args`, so this pop cannot reach a
+    # seed nested in it, and the clients merge `extra_body` into the top level of
+    # the request where the engine reads it just the same.
+    seed_pinned = sampling_args.pop("seed", None) is not None
     sampling_args["temperature"] = temperature
     if sampling_args.get("top_p") is None:
         sampling_args["top_p"] = 1.0
@@ -77,6 +76,14 @@ def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -
     }
     sampling_args["extra_body"]["min_tokens"] = sampling_args.pop("min_tokens")
     sampling_args["extra_body"]["repetition_penalty"] = sampling_args.pop("repetition_penalty")
+    seed_pinned |= sampling_args["extra_body"].pop("seed", None) is not None
+    if seed_pinned:
+        logger.warning_once(
+            "a sampling seed is ignored for rollouts: one seed across a group makes every "
+            "rollout in it identical, which gives an advantage of zero and trains on "
+            "nothing. Remove `seed` from the orchestrator config's sampling section, "
+            "including from `sampling.extra_body`."
+        )
     return sampling_args
 
 

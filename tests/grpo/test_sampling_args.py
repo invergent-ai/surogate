@@ -29,6 +29,18 @@ def test_a_configured_seed_never_reaches_a_rollout_request():
     assert "seed" not in _args({"seed": 1234, "max_tokens": 32})
 
 
+def test_a_seed_hidden_under_extra_body_does_not_get_through_either():
+    """`extra_body` is rebuilt from the config, so it needs its own pop.
+
+    The clients merge `extra_body` into the top level of the request body, so a
+    seed there is read by the engine exactly as a top-level one is. Nothing sets
+    it today, which is why it is worth a test rather than a comment.
+    """
+    args = _args({"extra_body": {"seed": 1234}, "max_tokens": 32})
+    assert "seed" not in args
+    assert "seed" not in args["extra_body"]
+
+
 def test_the_rest_of_the_sampling_config_still_reaches_the_request():
     """The seed is dropped on its own; nothing else may go missing with it."""
     args = _args({"seed": 1234, "max_tokens": 32, "top_p": 0.9})

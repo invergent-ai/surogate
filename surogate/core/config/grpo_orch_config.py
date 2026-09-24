@@ -152,8 +152,10 @@ class GRPOSamplingConfig:
             its own server setting, so one value here makes every rollout of a
             group sample identically. Identical rollouts score identically, and
             a group with no reward spread has an advantage of exactly zero, so
-            the step trains on nothing. Set it only to make a server
-            reproducible, never to train.
+            the step trains on nothing. Setting it therefore makes nothing
+            reproducible, it is simply discarded; `GRPOInferenceConfig.seed` is
+            the one that still reaches a server. The same applies to a `seed`
+            under `extra_body`, which is dropped with it.
         extra_body: Extra body to pass with each request to the inference server. By default, it is set to an empty dictionary.
     """
 
