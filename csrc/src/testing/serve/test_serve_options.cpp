@@ -1,8 +1,12 @@
 #include "serve/decisions_schema.h"
+#include "serve/api_key_file.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <unistd.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,6 +52,70 @@ int main() {
             catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "an invalid --gpu-memory-limit-mib was accepted");
         }
+    }
+
+    // --api-key-file (SUROGATE-CHANGES #17): the key comes from the file, never the command line.
+    {
+        const auto write = [](const std::string& path, const std::string& text) {
+            std::ofstream(path, std::ios::binary | std::ios::trunc) << text;
+        };
+        const std::string dir = std::filesystem::temp_directory_path() /
+                                ("sinfer-key-" + std::to_string(::getpid()));
+        std::filesystem::create_directories(dir);
+        const std::string file = dir + "/key";
+        write(file, "  s3cret-key\n");
+        std::filesystem::permissions(file, std::filesystem::perms::owner_read |
+                                               std::filesystem::perms::owner_write);
+        const ServeOptions keyed = parse({"sinfer-serve", "model.sinfer", "--api-key-file", file});
+        failures += check(keyed.api_key == "s3cret-key", "--api-key-file did not read the key");
+        write(file, "s3cret-key\r\n");
+        failures += check(read_api_key_file(file) == "s3cret-key", "a CRLF line ending was kept");
+        write(file, "\xEF\xBB\xBFs3cret-key\n");
+        failures += check(read_api_key_file(file) == "s3cret-key", "a UTF-8 byte-order mark was kept");
+        // A repeated --api-key keeps its last value, as before (a launcher's default, then the
+        // user's own).
+        failures += check(parse({"sinfer-serve", "model.sinfer", "--api-key", "a", "--api-key", "b"})
+                                  .api_key == "b",
+                          "a repeated --api-key did not keep the last value");
+        failures += check(parse({"sinfer-serve", "model.sinfer", "--api-key", ""}).api_key.empty(),
+                          "an empty --api-key no longer means no authentication");
+        const auto refused = [&](std::vector<std::string> args) {
+            try { (void)parse(std::move(args)); }
+            catch (const std::invalid_argument& error) {
+                // The message names the file, never the key.
+                return std::string(error.what()).find("s3cret") == std::string::npos;
+            }
+            return false;
+        };
+        write(file, "s3cret-key\n");
+        failures += check(refused({"sinfer-serve", "model.sinfer", "--api-key", "k", "--api-key-file", file}),
+                          "--api-key and --api-key-file together were accepted");
+        failures += check(refused({"sinfer-serve", "model.sinfer", "--api-key-file", file, "--api-key", ""}),
+                          "--api-key-file and an empty --api-key together were accepted");
+        failures += check(refused({"sinfer-serve", "model.sinfer", "--api-key-file", dir + "/missing"}),
+                          "a missing key file was accepted");
+        failures += check(refused({"sinfer-serve", "model.sinfer", "--api-key-file", ""}),
+                          "an empty --api-key-file path was accepted");
+        failures += check(refused({"sinfer-serve", "model.sinfer", "--api-key-file", dir}),
+                          "a directory was accepted as a key file");
+        for (const std::string& bad : {std::string(""), std::string(" \n\n"), std::string("s3cret one\n"),
+                                       std::string("s3cret\nsecond\n"), std::string("s3cr\xC3\xA9t\n"),
+                                       std::string(5000, 'k')}) {
+            write(file, bad);
+            failures += check(refused({"sinfer-serve", "model.sinfer", "--api-key-file", file}),
+                              "an empty, oversized or malformed key file was accepted");
+        }
+        // The resolver the STT and TTS servers use: a key file given with an empty path is read
+        // (and refused), never taken as "no key".
+        write(file, "s3cret-key\n");
+        failures += check(resolve_api_key(std::nullopt, std::nullopt).empty(), "no key was invented");
+        failures += check(resolve_api_key(std::string("k"), std::nullopt) == "k", "--api-key was lost");
+        failures += check(resolve_api_key(std::nullopt, file) == "s3cret-key", "the key file was not read");
+        bool empty_path_refused = false;
+        try { (void)resolve_api_key(std::nullopt, std::string()); }
+        catch (const std::invalid_argument&) { empty_path_refused = true; }
+        failures += check(empty_path_refused, "an empty key-file path left the server without a key");
+        std::filesystem::remove_all(dir);
     }
     for (bool extra : {false, true}) {
         std::vector<std::string> args{"sinfer-serve", "model.sinfer", "--served-model-name", "tuned",

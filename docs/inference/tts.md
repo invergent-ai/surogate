@@ -161,11 +161,13 @@ expiration returns HTTP 504. Interrupted inference discards the worker's output
 before another request uses it. The next request reloads a stopped worker.
 
 The server binds to `127.0.0.1` by default. Use `--host` to choose the interface.
-`--api-key` enables bearer authentication on every endpoint:
+`--api-key-file PATH` enables bearer authentication on every endpoint, with the key read from a
+file. Unlike `--api-key KEY`, it keeps the key out of the process's command line, where every
+local user can read it:
 
 ```bash
-surogate serve --tts surogate/surogate-ro-tts --api-key "$TTS_API_KEY"
-curl -H "Authorization: Bearer $TTS_API_KEY" http://localhost:8080/v1/audio/voices
+surogate serve --tts surogate/surogate-ro-tts --api-key-file /etc/surogate/tts.key
+curl -H "Authorization: Bearer $(cat /etc/surogate/tts.key)" http://localhost:8080/v1/audio/voices
 ```
 
 Normal shutdown stops the native worker and removes temporary audio. Finished

@@ -182,7 +182,9 @@ in each request. Background execution and compaction are unsupported. See the
 [API guide](../../docs/inference/api.md) for structured output, token scores and other options.
 
 For authentication, export the same `SUROGATE_API_KEY` in server and client terminals.
-The launch script passes it as `--api-key`; the client sends a bearer header.
+The launch script passes it as `--api-key`; the client sends a bearer header. To keep the key out
+of the server's command line, which every local user can read, put it in a file readable only by
+you and export `SUROGATE_API_KEY_FILE` instead. The script then passes `--api-key-file`.
 `--host 0.0.0.0` enables remote access and `--cors` enables browser cross-origin access.
 `/health` remains unauthenticated. Inspect `outputs/serve/requests.jsonl` after the
 concurrent scenario; `/metrics` and `/kv_stats` expose throughput and memory use.

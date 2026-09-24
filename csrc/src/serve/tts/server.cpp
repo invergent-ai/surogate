@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #include "frontend.h"
 #include "runtime.h"
+#include "../serve/api_key_file.h"
 #include "../serve/audio_http.h"
 #include <atomic>
 #include <cmath>
@@ -23,6 +24,7 @@ const char* usage =
     "  --device cpu                CPU synthesis; no CUDA or LibTorch\n"
     "  --served-model-name NAME    public model ID\n"
     "  --api-key KEY               bearer authentication\n"
+    "  --api-key-file PATH         read the key from a file, keeping it off the command line\n"
     "  --cpu-kernels auto|optimized|reference   CPU kernel selection (default auto)\n"
     "  --threads N                 CPU compute threads (default 4)\n"
     "  --codec-threads N           audio codec threads (0/default: --threads)\n"
@@ -52,7 +54,8 @@ void validate_policy(const json& policy) {
 
 int main(int argc, char** argv) {
     try {
-        std::string artifact, host = "127.0.0.1", name, key, default_voice, kernels = "auto";
+        std::string artifact, host = "127.0.0.1", name, default_voice, kernels = "auto";
+        std::optional<std::string> key_flag, key_file; // --api-key, --api-key-file (last one wins)
         bool default_set = false;
         int port = 8080, max_pending = 8, threads = 4, codec_threads = 0;
         double timeout = 300;
@@ -81,7 +84,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--served-model-name")
                 name = value();
             else if (arg == "--api-key")
-                key = value();
+                key_flag = value();
+            else if (arg == "--api-key-file")
+                key_file = value();
             else if (arg == "--voice") {
                 default_voice = value();
                 default_set   = true;
@@ -105,6 +110,7 @@ int main(int argc, char** argv) {
         if (threads < 1 || threads > 256 || codec_threads < 0 || codec_threads > 256)
             throw std::invalid_argument("Thread counts must be between 1 and 256");
         if (!codec_threads) codec_threads = threads;
+        const std::string key = sinfer::serve::resolve_api_key(key_flag, key_file);
         auto root = std::filesystem::canonical(artifact);
         if (root.filename() == "voices.json") root = root.parent_path();
         std::ifstream file(root / "voices.json");

@@ -2,6 +2,7 @@
 #include "model.h"
 #include "audio.h"
 #include "transcription.h"
+#include "../serve/api_key_file.h"
 #include "../serve/audio_http.h"
 #include <ATen/Parallel.h>
 #include <chrono>
@@ -18,6 +19,7 @@ const char* usage =
     "  --threads N               CPU compute threads (default 4)\n"
     "  --served-model-name NAME   public model ID\n"
     "  --api-key KEY             authenticate requests\n"
+    "  --api-key-file PATH       read the key from a file, keeping it off the command line\n"
     "  --max-num-seqs N          live streams (default 8)\n"
     "surogate serve --stt MODEL --lm PATH prepares a local NeMo checkpoint.\n";
 
@@ -27,7 +29,8 @@ using sinfer::serve::audio::error;
 
 int main(int argc, char** argv) {
     try {
-        std::string artifact, host = "127.0.0.1", device = "0", name, key, kernels = "auto";
+        std::string artifact, host = "127.0.0.1", device = "0", name, kernels = "auto";
+        std::optional<std::string> key_flag, key_file; // --api-key, --api-key-file (last one wins)
         int port = 8080, limit = 8, threads = 4;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -56,7 +59,9 @@ int main(int argc, char** argv) {
             else if (arg == "--served-model-name")
                 name = value();
             else if (arg == "--api-key")
-                key = value();
+                key_flag = value();
+            else if (arg == "--api-key-file")
+                key_file = value();
             else if (arg == "--max-num-seqs")
                 limit = std::stoi(value());
             else if (!arg.starts_with('-') && artifact.empty())
@@ -68,6 +73,7 @@ int main(int argc, char** argv) {
             threads < 1 || threads > 256)
             throw std::invalid_argument(usage);
         if (name.empty()) name = artifact;
+        const std::string key = sinfer::serve::resolve_api_key(key_flag, key_file);
         at::set_num_threads(threads);
         at::set_num_interop_threads(1);
         at::globalContext().setAllowTF32CuBLAS(false);
