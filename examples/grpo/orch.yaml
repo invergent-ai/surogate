@@ -14,7 +14,6 @@ sampling:
   min_tokens: 24
   top_p: 1.0
   repetition_penalty: 1.05
-  seed: 1234
   extra_body:
     top_k: -1
     min_p: 0.02

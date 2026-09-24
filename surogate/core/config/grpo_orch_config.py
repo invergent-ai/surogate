@@ -147,7 +147,13 @@ class GRPOSamplingConfig:
         repetition_penalty: Penalty for repeating tokens. Values > 1.0 discourage repetition, values < 1.0 encourage repetition, and 1.0 means no penalty.
         max_tokens: Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.
         min_tokens: Minimum number of output tokens to generate per sequence.
-        seed: Random seed for sampling. If None, a random seed will be used.
+        seed: **Ignored for rollouts, and dropped in `get_sampling_args`.** It
+            would reach the request body, where the engine resolves it ahead of
+            its own server setting, so one value here makes every rollout of a
+            group sample identically. Identical rollouts score identically, and
+            a group with no reward spread has an advantage of exactly zero, so
+            the step trains on nothing. Set it only to make a server
+            reproducible, never to train.
         extra_body: Extra body to pass with each request to the inference server. By default, it is set to an empty dictionary.
     """
 
