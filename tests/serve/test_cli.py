@@ -112,6 +112,22 @@ def test_execution_puts_resolved_model_first(mode, monkeypatch):
     prepare = tts.prepare_bundle if mode == "tts" else speech.ensure_speech_weights if mode == "stt" else ingest.ensure_encoder_weights if mode == "embed" else ingest.ensure_engine_weights
     assert prepare.call_args.args == ("model",)
     assert prepare.call_args.kwargs["reuse_cache"] is False
+    if mode == "tts":  # the TTS package is checked for the device it will serve on
+        assert prepare.call_args.kwargs["device"] == "1"
+
+
+def test_tts_package_check_uses_the_last_device_and_refuses_cleanly(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["surogate", "serve", "--tts", "--device", "cpu", "--device", "0", "model"])
+    monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")
+    tts = Mock()
+    tts.prepare_bundle.side_effect = ValueError("This TTS package has only the CPU runtime")
+    monkeypatch.setitem(sys.modules, "surogate.serve.tts.assets", tts)
+    monkeypatch.setattr(serve.os, "execv", Mock())
+    with pytest.raises(SystemExit) as exit_info:
+        serve.maybe_exec_serve()
+    assert exit_info.value.code == 2
+    assert tts.prepare_bundle.call_args.kwargs["device"] == "0"
+    assert "surogate serve: This TTS package has only the CPU runtime" in capsys.readouterr().err
 
 
 def test_frontend_before_model():

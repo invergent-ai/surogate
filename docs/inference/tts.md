@@ -1,6 +1,7 @@
 # Romanian text-to-speech
 
-Serve the published Romanian model on CPU with **Doina**, **Tudor** and **Radu**:
+Serve the published Romanian model on CPU with **Doina**, **Tudor** and **Radu** (for a GPU,
+see [GPU](#gpu)):
 
 ```bash
 surogate serve --tts surogate/surogate-ro-tts --device cpu --threads 4 --port 8080
@@ -26,8 +27,8 @@ GGML worker keeps the generator and codec loaded between requests. No Python,
 Torch, NeMo or training-recipe process remains in the TTS inference path.
 
 The published binary targets Linux x86-64 and was validated on AMD EPYC 9124.
-Other CPUs require a compatible native build and validation. Speech generation
-uses CPU threads and no GPU. Voice creation happens separately on offline
+Other CPUs require a compatible native build and validation. With `--device cpu`, the
+default, speech generation uses CPU threads and no GPU. Voice creation happens separately on offline
 GPUs; serving a voice does not perform cloning or training.
 
 ## CPU kernels and threads
@@ -62,6 +63,58 @@ need a matching adapter.
 On a multi-socket host, measure with a consistent CPU affinity on one socket.
 Increasing threads does not necessarily improve latency. See the
 [CPU kernel validation report](cpu-kernels.md) for measurements and checks.
+
+## GPU
+
+`--device N` runs the generator, the codec and sampling on CUDA device N. N counts among the
+devices the server can see, as it does for the LLM server. The default, `--device cpu`, is
+unchanged, and `--threads` and `--cpu-kernels` apply to the CPU only.
+
+A GPU needs the package's **GPU variant**:
+
+- Its model, codec, tokenizer and voices are the CPU package's.
+- Its `lib/` holds the same Magpie runtime built with CUDA, including `libggml-cuda`, and runs on
+  compute capability 12.0 (RTX 50-series) only.
+- The CPU package is refused on a GPU with a clear error.
+- The published package has no GPU variant yet, so serve a local one:
+
+```bash
+surogate serve --tts /path/to/gpu-variant --device 0 --port 8080
+```
+
+On an RTX 5090 one request runs at about 25 times real time, with about 25 ms to the first
+audio. Each server holds about 2.4 GB of GPU memory per worker. The worker needs the NVIDIA driver
+and the CUDA 13 runtime (`libcudart`, `libcublas`) on the host, as the LLM server does.
+`/health` reports `"device": "cuda:N"`. The variant also serves `--device cpu`, with the same
+results as the CPU package, but still needs those libraries. Use the CPU package on hosts without
+them.
+
+The worker accepts only the CUDA runtime whose checksums it pins, as it does for the CPU runtime,
+so the variant is published as built. Its CUDA-compiled libraries are not bit-for-bit reproducible:
+a rebuild in another build directory gives the same `libggml`, `libggml-base` and `libggml-cpu`,
+but a different `libnemo_speech_tts` and `libggml-cuda`. This is how that build was made, for
+provenance and for qualifying a replacement. It uses `nemo-speech-cpp` at `07003daa` with the package's
+`longform_history_fix.patch` and `longform_context_cache.h`, and the CPU package's TTS-only
+options plus CUDA. The build maps source paths, links no NCCL, and loads its libraries from
+their own directory:
+
+```bash
+SRC=$PWD/nemo-speech-cpp
+cmake -S $SRC -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+  -DNEMO_SPEECH_BUILD_TTS=ON -DNEMO_SPEECH_GGML_PATCHED=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
+  -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DCMAKE_C_FLAGS=-ffile-prefix-map=$SRC=nemo-speech-cpp \
+  -DCMAKE_CXX_FLAGS=-ffile-prefix-map=$SRC=nemo-speech-cpp \
+  -DCMAKE_CUDA_FLAGS=-Xcompiler=-ffile-prefix-map=$SRC=nemo-speech-cpp \
+  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+  -DNEMO_SPEECH_BUILD_ASR=OFF -DNEMO_SPEECH_BUILD_CLI=OFF -DNEMO_SPEECH_BUILD_HTTP=OFF \
+  -DNEMO_SPEECH_BUILD_GRPC=OFF -DNEMO_SPEECH_BUILD_TESTS=OFF -DNEMO_SPEECH_BUILD_TOOLS=OFF
+cmake --build build-cuda --target nemo_speech_tts ggml-cuda
+python -m surogate.serve.tools.tts.gpu_variant CPU_PACKAGE build-cuda/bin GPU_VARIANT
+```
+
+The tool refuses a build whose checksums are not the pinned ones. A different build must first be
+qualified (quality and speed), then pinned in `native_worker.cpp` and in the tool.
 
 ## Model download
 

@@ -35,10 +35,14 @@ static void wav(const std::string& path, const std::vector<uint8_t>& audio, int 
 }
 
 extern "C" int surogate_tts_worker_main(int argc, char** argv) {
-    if (argc != 7) {
-        std::cerr << "Usage: batch MAGPIE CODEC JOBS OUTPUT_DIR THREADS CODEC_THREADS\n";
+    if (argc != 8) {
+        std::cerr << "Usage: batch MAGPIE CODEC JOBS OUTPUT_DIR THREADS CODEC_THREADS cpu|cuda\n";
         return 2;
     }
+    const std::string device = argv[7];
+    if (device != "cpu" && device != "cuda") return 2;
+    // CUDA: the worker sees only the card it serves on (CUDA_VISIBLE_DEVICES), as device 0.
+    const bool cuda = device == "cuda";
     using namespace nemo_speech::tts;
     MagpieRuntimeConfig config;
     config.magpie_model  = argv[1];
@@ -48,11 +52,13 @@ extern "C" int surogate_tts_worker_main(int argc, char** argv) {
     if (config.threads < 1 || config.codec_threads < 1 || config.threads > 256 ||
         config.codec_threads > 256)
         return 2;
-    config.magpie_cpu           = true;
-    config.codec_cpu            = true;
+    config.magpie_cpu           = !cuda;
+    config.codec_cpu            = !cuda;
     config.lt_fp32              = true;
-    config.lt_backend           = MagpieBackendPreference::Cpu;
-    config.sampling_backend     = MagpieBackendPreference::Cpu;
+    config.lt_backend           = cuda ? MagpieBackendPreference::Cuda : MagpieBackendPreference::Cpu;
+    config.sampling_backend     = cuda ? MagpieBackendPreference::Cuda : MagpieBackendPreference::Cpu;
+    // Device memory only: not unified memory, whatever GGML_CUDA_ENABLE_UNIFIED_MEMORY says.
+    config.uma_mode             = MagpieUmaMode::Off;
     config.longform_mode        = MagpieLongformMode::Auto;
     config.seed                 = 9;
     config.steps                = 900;
@@ -113,6 +119,7 @@ extern "C" int surogate_tts_worker_main(int argc, char** argv) {
             report << "{\"id\":\"" << id << "\",\"voice\":" << options.speaker
                    << ",\"seed\":" << options.seed << ",\"audio_s\":" << stats.audio_s
                    << ",\"elapsed_s\":" << stats.elapsed_s << ",\"rtf\":" << stats.rtf
+                   << ",\"ttfa_ms\":" << stats.ttfa_ms
                    << ",\"temperature\":" << options.temperature
                    << ",\"cfg_scale\":" << options.cfg_scale
                    << ",\"frames\":" << stats.generated_frames
