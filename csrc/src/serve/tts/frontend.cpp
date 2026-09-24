@@ -482,9 +482,10 @@ std::size_t input_characters(const std::string& text) {
     return static_cast<std::size_t>(unicode(text).countChar32());
 }
 
-std::vector<std::vector<int32_t>> tokenize(const std::string& text) {
+std::vector<std::vector<int32_t>> tokenize(const std::string& text, std::size_t max_characters) {
     auto input = unicode(text);
-    if (input_characters(text) > 4096) throw std::invalid_argument("input exceeds 4096 characters");
+    if (input_characters(text) > max_characters)
+        throw std::invalid_argument("input exceeds " + std::to_string(max_characters) + " characters");
     for (int32_t i = 0; i < input.length();) {
         auto c = input.char32At(i);
         i += U16_LENGTH(c);
@@ -496,8 +497,10 @@ std::vector<std::vector<int32_t>> tokenize(const std::string& text) {
             throw std::invalid_argument("input contains a reserved tokenizer symbol");
     auto t = normalize(sub(text, R"(\[[^\]]*\]|\*[^*]*\*)", " "));
     if (t.empty()) throw std::invalid_argument("input must contain spoken text");
-    if (unicode(t).countChar32() > 16384)
-        throw std::invalid_argument("Expanded input exceeds 16384 characters");
+    const std::size_t max_spoken = std::min<std::size_t>(4 * max_characters, max_spoken_characters);
+    if (static_cast<std::size_t>(unicode(t).countChar32()) > max_spoken)
+        throw std::invalid_argument("Expanded input exceeds " + std::to_string(max_spoken) +
+                                    " characters");
     std::vector<std::string> pieces;
     if (split(t, ' ').size() < 45)
         pieces.push_back(t);
@@ -545,7 +548,7 @@ std::vector<std::vector<int32_t>> tokenize(const std::string& text) {
         if (tokens.size() > 4096) throw std::invalid_argument("Input exceeds the text-chunk limit");
         chunks.push_back(std::move(tokens));
     }
-    if (chunks.empty() || chunks.size() > 64)
+    if (chunks.empty() || chunks.size() > std::max<std::size_t>(64, max_characters / 16))
         throw std::invalid_argument("Input exceeds the text-chunk limit");
     return chunks;
 }

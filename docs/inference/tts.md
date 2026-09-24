@@ -166,23 +166,35 @@ requests that provide `model` must use that alias.
 
 | Field | Accepted values |
 |---|---|
-| `input` | Required Romanian text, 1–4096 characters |
+| `input` | Required Romanian text, 1–4096 characters (see `--max-input-characters`) |
 | `model` | Optional served model ID |
 | `voice` | A name from `/v1/audio/voices`; defaults to the first voice in the package |
 | `response_format` | `wav` (default) or `pcm` |
 | `speed` | `1` |
 | `seed` | Integer from 0 to 2147483647; defaults to 9 |
+| `stream_format` | Omitted (the complete recording), `audio` or `sse`; see [Streaming](#streaming) |
 
 Both formats contain mono, 22,050 Hz, signed 16-bit little-endian audio. PCM has
-no WAV header. `X-Audio-Sample-Rate` reports the rate. Responses contain the
-complete recording; incremental audio streaming, MP3, style instructions and
+no WAV header. `X-Audio-Sample-Rate` reports the rate. MP3, style instructions and
 speed changes are unavailable. Unsupported fields return a JSON error. Reserved tokenizer symbols, invalid
-structured dates/times and oversized expanded text are rejected. Split long
-inputs into separate requests.
+structured dates/times and oversized expanded text are rejected. A `Range` header is refused
+with HTTP 416.
+
+An input of 45 words or more is synthesized sentence by sentence. `--max-input-characters N`
+raises the 4096-character limit, up to 16384, so a long reply can go in one request; streamed, it
+starts playing as soon as its first audio is made. The limits that scale with N:
+- a sentence for every 16 characters allowed (at least 64 sentences);
+- the text as spoken, with numbers, dates and abbreviations written out, may be four times the
+  input, and at most 16,384 characters in any case: about 24 minutes of speech, within the 96 MiB
+  of audio a request may produce;
+- at most 4,096 numbers, dates and similar values per input, whatever N.
+
+Raise `--request-timeout` with N: on four CPU cores synthesis takes about twice as long as the
+audio lasts.
 
 Every successful response carries `X-Usage-Characters`: the characters of
 `input` it was billed for. They are counted as sent, in Unicode code points, as
-the 4096-character limit counts them and as Python's `len()` does. A precomposed
+the input limit counts them and as Python's `len()` does. A precomposed
 Romanian letter with a diacritic (ă, â, î, ș, ț) is one character, although it
 takes two UTF-8 bytes, so a gateway that counts request bytes would overcharge
 Romanian text by about 10%. A decomposed letter (a base letter followed by a
@@ -190,6 +202,47 @@ combining mark) counts as two, and whitespace and bracketed spans that are not
 spoken count too. An account service that counts characters itself should use
 the same rule. Error responses (4xx and 5xx, including queue-full, timeout and
 worker failures) carry no count.
+
+### Streaming
+
+Without `stream_format`, the response carries the complete recording once it has been
+synthesized. With it, the audio is sent as the runtime produces it, and the first audio reaches
+the client after the runtime's time to first audio plus network time. Measured over HTTP on
+one machine with benchmark sentences of 3 to 5 seconds of audio: 32 ms on an RTX 5090 (median of
+20 requests, p90 38 ms), and 1.3 s on four CPU cores, where the whole recording takes 9.4 s. A
+3,524-character input (5 minutes of audio) started playing after 32 ms on the RTX 5090; its
+synthesis took 17.5 s. On the CPU, streamed audio is the same, sample for sample, as the whole
+recording.
+
+- `stream_format: "audio"` sends the recording's bytes in a chunked body as they are produced.
+  With `wav`, a header of unknown length comes first: its size fields are `0xFFFFFFFF`, which
+  players read as "until the end". With `pcm`, the raw samples come alone.
+- `stream_format: "sse"` sends the same bytes base64-encoded in `speech.audio.delta` events
+  (`{"type": "speech.audio.delta", "audio": "…"}`). A `speech.audio.done` event with
+  `usage.input_characters` and `usage.audio_seconds` ends a complete stream.
+
+The request is queued like any other before its headers go out. A full queue, a queue timeout or
+an invalid request therefore still gets its HTTP error status and carries no
+`X-Usage-Characters`.
+
+The client sets the pace of delivery, not of synthesis. The worker is handed to the next request
+as soon as the last audio is made; audio the client has not read yet waits in the server (at most
+the 96 MiB a request may produce). `--request-timeout` bounds queueing plus synthesis, not
+delivery. A client that reads nothing for 5 seconds is disconnected. A request, streamed or whole,
+keeps its place in the queue until its audio has been delivered, so `--max-pending-requests` also
+bounds how many listeners can be served at once: raise it for many clients that play the audio as
+it arrives. Audio not yet read takes memory, up to 96 MiB per request (about 12 GiB with 128
+pending requests). An idle keep-alive connection is closed after 1 second, so a connection pool in
+front of the server should reuse connections sooner or not keep them.
+
+Once the stream has started, `X-Usage-Characters` has already been sent. A stream that fails
+partway was not delivered: a raw stream then ends without its final chunk, which clients report
+as an incomplete response, and an SSE stream ends with an `error` event instead of
+`speech.audio.done`. Bill a streamed request only when it completes: its status (200) and
+`X-Usage-Characters` arrive before that is known.
+
+`speech.audio.done` carries this server's usage, `input_characters` and `audio_seconds`, not
+the `input_tokens`, `output_tokens` and `total_tokens` of OpenAI's event.
 
 The endpoint uses the OpenAI speech request shape for the supported fields, with
 WAV as its default format. For an OpenAI client, request `response_format="wav"`
@@ -220,10 +273,14 @@ restart. It does not require a separate model process for every name.
 
 One request runs at a time against the shared model. Eight additional requests
 can wait by default. Set `--max-pending-requests N` to change the queue size, or
-`0` to reject requests while the worker is busy. A full queue returns HTTP 429.
+`0` to reject requests while the worker is busy or a stream is still being delivered. A full queue
+returns HTTP 429.
 `--request-timeout SECONDS` bounds queueing plus synthesis time (default 300);
-expiration returns HTTP 504. Interrupted inference discards the worker's output
-before another request uses it. The next request reloads a stopped worker.
+expiration returns HTTP 504. When a client leaves, its request stops at the worker's next
+audio chunk and the worker serves the next request without reloading the model. A worker that
+produces no audio for 30 seconds after that is stopped instead. A worker that failed or timed out
+is stopped, and the next request reloads it. At shutdown the worker is stopped at once, even in
+the middle of a request.
 
 The server binds to `127.0.0.1` by default. Use `--host` to choose the interface.
 `--api-key-file PATH` enables bearer authentication on every endpoint, with the key read from a

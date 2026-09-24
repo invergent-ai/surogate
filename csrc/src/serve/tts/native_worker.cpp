@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -29,6 +32,16 @@ int main(int argc, char** argv) {
         if (argc != 9)
             throw std::runtime_error(
                 "Expected MODEL CODEC JOBS OUTPUT THREADS CODEC_THREADS KERNELS cpu|cuda");
+        // Stream mode (OUTPUT "-"): the audio frames get the original stdout to themselves, before
+        // any runtime library is loaded; whatever else writes to stdout lands on stderr.
+        std::string output = argv[4];
+        if (output == "-") {
+            std::fflush(stdout);
+            const int protocol = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+            if (protocol < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
+                throw std::runtime_error("Cannot set up the worker's output");
+            output = "fd:" + std::to_string(protocol);
+        }
         auto root   = std::filesystem::canonical(argv[1]).parent_path();
         auto binary = std::filesystem::read_symlink("/proc/self/exe").parent_path();
         const std::string device = argv[8];
@@ -93,7 +106,7 @@ int main(int argc, char** argv) {
         auto run =
             reinterpret_cast<int (*)(int, char**)>(dlsym(bridge, "surogate_tts_worker_main"));
         if (!run) throw std::runtime_error(dlerror());
-        char* bridge_argv[] = {argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[8], nullptr};
+        char* bridge_argv[] = {argv[0], argv[1], argv[2], argv[3], output.data(), argv[5], argv[6], argv[8], nullptr};
         int result = run(8, bridge_argv);
         dlclose(bridge);
         dlclose(engine);

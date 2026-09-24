@@ -1,5 +1,6 @@
 """Native TTS asset integrity, Romanian token parity and HTTP lifecycle."""
 
+import base64
 import contextlib
 import hashlib
 import io
@@ -54,22 +55,68 @@ def bundle(tmp_path):
     binary.parent.mkdir()
     binary.write_text(
         f"#!{sys.executable}\n"
-        + """import os, sys, time, wave
+        + """import os, select, sys, time, wave
 from pathlib import Path
-root = Path(sys.argv[4])
+stream = sys.argv[4] == '-'
 assert os.environ['CUDA_VISIBLE_DEVICES'] == os.environ.get('EXPECT_CUDA_VISIBLE_DEVICES', '')
-for line in open(sys.argv[3]):
+out = sys.stdout.buffer
+pending = b''
+def lines():
+    global pending
+    while True:
+        while b'\\n' not in pending:
+            data = os.read(0, 65536)
+            if not data:
+                return
+            pending += data
+        line, _, pending = pending.partition(b'\\n')
+        yield line.decode()
+def cancelled(wait):
+    # The server's cancel line has arrived (within `wait` seconds).
+    return b'\\n' in pending or bool(select.select([0], [], [], wait)[0])
+source = lines() if stream else open(sys.argv[3])
+for line in source:
+    if stream and line == 'cancel':
+        continue  # came after its request had finished
     identity, voice, seed, temperature, cfg, chunks = line.rstrip().split('\\t')
     if seed == '101':
         sys.exit(3)
     if seed == '102':
         time.sleep(5)
-    with wave.open(str(root / (identity + '.wav')), 'wb') as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(22050)
-        wav.writeframes(bytes([int(voice), 0]) * 100)
-    print(identity + ' completed', flush=True)
+    pcm = bytes([int(voice), 0]) * 100
+    if not stream:
+        with wave.open(str(Path(sys.argv[4]) / (identity + '.wav')), 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(22050)
+            wav.writeframes(pcm)
+        print(identity + ' completed', flush=True)
+        continue
+    # Seed 103: three chunks, 0.4 s apart, as a long reply produces them. Seed 104: a chunk, then
+    # a failure. Seed 105: 48 MiB at once, more than the sockets between server and client hold
+    # (up to 16 MiB each way on Linux).
+    # Seed 106: a chunk, then another 3 s later, a slow step during which it misses a cancel.
+    parts = {'103': [pcm] * 3, '105': [pcm * 5243] * 48, '106': [pcm] * 2}.get(seed, [pcm])
+    stopped = False
+    for index, part in enumerate(parts):
+        if index and seed != '105':
+            if seed == '106':
+                time.sleep(3)
+            if cancelled(0 if seed == '106' else 0.4):
+                stopped = True
+                break
+        out.write(f'{identity} pcm {len(part)}\\n'.encode() + part)
+        out.flush()
+    if stopped:
+        assert next(source) == 'cancel'
+        out.write(f'{identity} cancelled\\n'.encode())
+        out.flush()
+        continue
+    if seed == '104':
+        time.sleep(0.4)
+        sys.exit(3)
+    out.write(f'{identity} done 22050 0.01 0.01 1.0\\n'.encode())
+    out.flush()
 """
     )
     profile = {
@@ -470,7 +517,7 @@ def test_native_http_auth_voice_switching_pcm_and_cleanup(bundle, tmp_path):
         assert len(children) == 1
         child = next(iter(children))
         args = Path(f"/proc/{child}/cmdline").read_bytes().split(b"\0")
-        work = Path(args[args.index(b"/dev/stdin") + 1].decode())
+        assert args[args.index(b"/dev/stdin") + 1] == b"-"  # stream mode: audio on stdout, no files
         first = client.post("/v1/audio/speech", json={"input": "Bună"})
         assert first.content == wav_bytes(12)
         # Billed characters: four code points, although "ă" takes two bytes.
@@ -486,9 +533,6 @@ def test_native_http_auth_voice_switching_pcm_and_cleanup(bundle, tmp_path):
             ]
             assert [f.result().content for f in futures] == [wav_bytes(11), wav_bytes(12)]
         assert child_pids(process.pid) == children
-        assert not list(work.glob("*.wav"))
-        assert (work / "stats.jsonl").resolve() == Path(os.devnull)
-    assert not work.exists()
 
 
 @pytest.mark.parametrize("options,expected", [
@@ -605,6 +649,215 @@ def test_native_http_body_limits_and_worker_recovery(bundle, tmp_path):
         assert child_pids(process.pid) != original
         assert unbilled(client.post("/v1/audio/speech", json={"input": "Bună", "seed": 101}), 503)
         assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+
+
+def test_streamed_audio_arrives_as_it_is_synthesized(bundle, tmp_path):
+    """stream_format "audio": the first chunk reaches the client long before the last is made."""
+    with native_server(bundle, tmp_path) as (client, _):
+        whole = client.post("/v1/audio/speech", json={"input": "Bună", "seed": 103, "voice": "Doina"})
+        for fmt in ("wav", "pcm"):
+            start = time.monotonic()
+            arrivals, body = [], b""
+            with client.stream("POST", "/v1/audio/speech", json={"input": "Bună", "seed": 103, "voice": "Doina",
+                                                                 "response_format": fmt, "stream_format": "audio"}) as r:
+                assert r.status_code == 200
+                assert r.headers["x-usage-characters"] == "4" and r.headers["x-audio-sample-rate"] == "22050"
+                assert r.headers["content-type"] == ("audio/wav" if fmt == "wav" else "audio/pcm")
+                for part in r.iter_raw():
+                    arrivals.append(time.monotonic() - start)
+                    body += part
+            assert arrivals[-1] - arrivals[0] > 0.6, arrivals  # three chunks, 0.4 s apart
+            pcm = bytes([11, 0]) * 300
+            if fmt == "pcm":
+                assert body == pcm
+            else:  # an open-ended WAV header, then the same samples the whole file carries
+                assert body[:4] == b"RIFF" and body[40:44] == b"\xff\xff\xff\xff" and body[44:] == pcm
+                assert whole.content[44:] == pcm
+
+
+def test_streamed_audio_as_server_sent_events(bundle, tmp_path):
+    with native_server(bundle, tmp_path) as (client, _):
+        with client.stream("POST", "/v1/audio/speech", json={"input": "Bună", "seed": 103, "voice": "Doina",
+                                                             "response_format": "pcm", "stream_format": "sse"}) as r:
+            assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+            events = [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
+        assert [e["type"] for e in events] == ["speech.audio.delta"] * 3 + ["speech.audio.done"]
+        audio = b"".join(base64.b64decode(e["audio"]) for e in events[:3])
+        assert audio == bytes([11, 0]) * 300
+        assert events[-1]["usage"]["input_characters"] == 4
+
+
+def test_a_stream_that_fails_partway_is_not_completed(bundle, tmp_path):
+    with native_server(bundle, tmp_path) as (client, _):
+        # Raw audio: the connection ends without the final chunk, which a client sees as an error.
+        with pytest.raises(httpx.RemoteProtocolError):
+            with client.stream("POST", "/v1/audio/speech",
+                               json={"input": "Bună", "seed": 104, "stream_format": "audio"}) as r:
+                assert r.status_code == 200
+                for _ in r.iter_raw():
+                    pass
+        # SSE: an error event instead of speech.audio.done.
+        with client.stream("POST", "/v1/audio/speech",
+                           json={"input": "Bună", "seed": 104, "stream_format": "sse"}) as r:
+            events = [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
+        assert [e["type"] for e in events] == ["speech.audio.delta", "error"]
+        # Neither is billed, and both count as failed requests.
+        metrics = client.get("/metrics").text
+        assert 'surogate_requests_total{model="test",endpoint="speech",outcome="error"} 2' in metrics
+        assert 'surogate_characters_total{model="test"} 0' in metrics
+        # The worker is replaced and the next request succeeds.
+        assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+        with client.stream("POST", "/v1/audio/speech", json={"input": "Bună", "stream_format": "audio"}) as r:
+            r.read()
+        metrics = client.get("/metrics").text
+        assert 'surogate_requests_total{model="test",endpoint="speech",outcome="ok"} 2' in metrics
+        assert 'surogate_characters_total{model="test"} 8' in metrics
+
+
+@pytest.mark.parametrize("device", ["cpu", "0"])
+def test_a_client_that_leaves_mid_stream(bundle, tmp_path, device):
+    """The worker stops the request at its next chunk and is kept: the next request pays no new load."""
+    env = {"CUDA_VISIBLE_DEVICES": None, "EXPECT_CUDA_VISIBLE_DEVICES": "0" if device == "0" else ""}
+    with native_server(bundle, tmp_path, "--device", device, env=env) as (client, process):
+        worker = child_pids(process.pid)
+        with client.stream("POST", "/v1/audio/speech",
+                           json={"input": "Bună", "seed": 103, "stream_format": "audio"}) as r:
+            next(r.iter_raw())  # the first chunk, then hang up
+        started = time.monotonic()
+        assert client.post("/v1/audio/speech", json={"input": "Bună"}).content == wav_bytes(11)
+        assert time.monotonic() - started < 0.6  # not after the rest of the request (0.8 s)
+        assert child_pids(process.pid) == worker
+
+
+def test_a_streamed_request_still_gets_queue_errors_as_http_statuses(bundle, tmp_path):
+    with native_server(bundle, tmp_path, "--max-pending-requests", "0", "--request-timeout", "0.6") as (client, _):
+        with ThreadPoolExecutor(1) as pool:
+            slow = pool.submit(client.post, "/v1/audio/speech", json={"input": "Bună", "seed": 102})
+            time.sleep(0.1)
+            queued = client.post("/v1/audio/speech", json={"input": "Bună", "stream_format": "audio"})
+            assert queued.status_code == 429 and "x-usage-characters" not in queued.headers
+            slow.result()
+
+
+def test_a_streamed_request_that_times_out_in_the_queue_gets_504(bundle, tmp_path):
+    # On a GPU a client that leaves keeps its worker until the rest of its request is drained
+    # (seed 106: 3 s), which no deadline cuts short; a stream queued behind it times out.
+    env = {"CUDA_VISIBLE_DEVICES": None, "EXPECT_CUDA_VISIBLE_DEVICES": "0"}
+    with native_server(bundle, tmp_path, "--device", "0", "--request-timeout", "1", env=env) as (client, _):
+        with client.stream("POST", "/v1/audio/speech",
+                           json={"input": "Bună", "seed": 106, "stream_format": "audio"}) as r:
+            next(r.iter_raw())
+        started = time.monotonic()
+        queued = client.post("/v1/audio/speech", json={"input": "Bună", "stream_format": "sse"})
+        assert queued.status_code == 504 and "x-usage-characters" not in queued.headers
+        assert 0.8 < time.monotonic() - started < 2.5
+
+
+def test_a_slow_client_does_not_hold_the_worker(bundle, tmp_path):
+    """The worker is handed back when synthesis ends, while the audio is still being delivered."""
+    with native_server(bundle, tmp_path) as (client, _):
+        expected = bytes([11, 0]) * 100 * 5243 * 48
+        with client.stream("POST", "/v1/audio/speech",
+                           json={"input": "Bună", "seed": 105, "response_format": "pcm",
+                                 "stream_format": "audio"}) as r:
+            parts = r.iter_raw()
+            received = [next(parts)]
+            # The client stops reading for 2 s, far more than the socket buffers hold is still
+            # undelivered; the next request is served meanwhile, not after the slow one.
+            started = time.monotonic()
+            other = client.post("/v1/audio/speech", json={"input": "Bună", "voice": "Tudor"})
+            assert other.content == wav_bytes(12) and time.monotonic() - started < 1.5
+            time.sleep(max(0.0, 2 - (time.monotonic() - started)))
+            received.extend(parts)
+        assert b"".join(received) == expected
+
+
+def test_listeners_that_read_slowly_keep_their_place_in_the_queue(bundle, tmp_path):
+    """A stream still being delivered counts against the queue: more are refused, /health answers."""
+    with native_server(bundle, tmp_path, "--max-pending-requests", "2") as (client, _):
+        statuses, readers = [], []  # an iterator dropped would close its stream
+        with contextlib.ExitStack() as streams:
+            started = time.monotonic()
+            for _ in range(6):
+                listener = streams.enter_context(httpx.Client(base_url=client.base_url, headers=client.headers,
+                                                              timeout=10))
+                r = streams.enter_context(listener.stream(
+                    "POST", "/v1/audio/speech",
+                    json={"input": "Bună", "seed": 105, "response_format": "pcm", "stream_format": "audio"}))
+                statuses.append(r.status_code)
+                if r.status_code == 200:
+                    readers.append(r.iter_raw())
+                    next(readers[-1])  # then read nothing more for now
+            assert statuses.count(200) == 3 and statuses.count(429) == 3, statuses
+            # The refusals come at once, not when an idle connection lets a thread go.
+            assert time.monotonic() - started < 2
+            started = time.monotonic()
+            assert client.get("/health", timeout=2).status_code == 200
+            assert client.get("/metrics", timeout=2).status_code == 200
+            assert time.monotonic() - started < 1
+            # On new connections too, as a supervisor or a gateway's fresh connection comes: the
+            # refused listeners' idle connections must not hold the threads that would serve them.
+            with httpx.Client(base_url=client.base_url, headers=client.headers, timeout=5) as fresh:
+                started = time.monotonic()
+                assert fresh.get("/health").status_code == 200
+                assert time.monotonic() - started < 1.5
+            with httpx.Client(base_url=client.base_url, headers=client.headers, timeout=5) as fresh:
+                started = time.monotonic()
+                assert fresh.post("/v1/audio/speech", json={"input": "Bună", "seed": 105}).status_code == 429
+                assert time.monotonic() - started < 1.5
+
+
+def test_whole_recordings_keep_their_place_until_delivered(bundle, tmp_path):
+    """A whole recording being written to a client that reads slowly counts against the queue too."""
+    with native_server(bundle, tmp_path, "--max-pending-requests", "0") as (client, _):
+        with httpx.Client(base_url=client.base_url, headers=client.headers, timeout=10) as listener:
+            with listener.stream("POST", "/v1/audio/speech", json={"input": "Bună", "seed": 105}) as r:
+                assert r.status_code == 200
+                reader = r.iter_raw()
+                next(reader)  # then read nothing more for now
+                started = time.monotonic()
+                assert client.post("/v1/audio/speech", json={"input": "Bună"}).status_code == 429
+                with httpx.Client(base_url=client.base_url, headers=client.headers, timeout=5) as fresh:
+                    assert fresh.get("/health").status_code == 200
+                assert time.monotonic() - started < 1.5
+                received = sum(len(part) for part in reader)  # all of it, then the place is free
+                assert received > 40 << 20
+        assert client.post("/v1/audio/speech", json={"input": "Bună"}).status_code == 200
+
+
+def test_a_range_request_is_refused_and_not_billed(bundle, tmp_path):
+    with native_server(bundle, tmp_path) as (client, _):
+        for extra in ({}, {"stream_format": "audio"}):
+            r = client.post("/v1/audio/speech", json={"input": "Bună", **extra}, headers={"Range": "bytes=0-10"})
+            assert r.status_code == 416 and "x-usage-characters" not in r.headers
+
+
+def test_shutdown_during_a_gpu_stream_does_not_wait_for_it(bundle, tmp_path):
+    """A request cancelled by a shutdown kills its worker instead of draining it."""
+    env = {"CUDA_VISIBLE_DEVICES": None, "EXPECT_CUDA_VISIBLE_DEVICES": "0"}
+    with native_server(bundle, tmp_path, "--device", "0", env=env) as (client, process):
+        with client.stream("POST", "/v1/audio/speech",
+                           json={"input": "Bună", "seed": 106, "stream_format": "audio"}) as r:
+            next(r.iter_raw())  # the second chunk is 3 s away
+            started = time.monotonic()
+            process.terminate()
+            assert process.wait(timeout=2) == 0
+            assert time.monotonic() - started < 1.5
+
+
+def test_longer_inputs_with_a_higher_limit(bundle, tmp_path):
+    sentence = "Aceasta este o propoziție de test, citită de server. "  # 53 characters
+    text = sentence * 150  # 7,950 characters, 150 sentences
+    with native_server(bundle, tmp_path) as (client, _):
+        refused = client.post("/v1/audio/speech", json={"input": text})
+        assert refused.status_code == 400 and "4096" in refused.json()["error"]["message"]
+        # Up to the limit in ordinary sentences: 77 of them.
+        assert client.post("/v1/audio/speech", json={"input": sentence * 77}).status_code == 200
+    with native_server(bundle, tmp_path, "--max-input-characters", "8192") as (client, _):
+        with client.stream("POST", "/v1/audio/speech", json={"input": text, "stream_format": "audio"}) as r:
+            assert r.status_code == 200 and r.headers["x-usage-characters"] == str(len(text))
+            r.read()
+        assert client.post("/v1/audio/speech", json={"input": text * 2}).status_code == 400
 
 
 def test_native_http_shutdown_cancels_active_inference(bundle, tmp_path):
