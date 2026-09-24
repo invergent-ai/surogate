@@ -132,21 +132,18 @@ def test_the_gpu_variant_tool_and_the_worker_pin_the_same_cuda_runtime():
 def test_a_gpu_needs_the_packages_gpu_variant(bundle, monkeypatch):
     from surogate.serve.tts import assets
 
-    # The CPU-only package (and the published one, which is CPU-only so far) is refused for a GPU
-    # before anything starts; the CPU keeps working.
+    # A CPU-only package is refused for a GPU before anything starts; the CPU keeps working.
     assert assets.prepare_bundle(str(bundle.root), device="cpu") == bundle
     with pytest.raises(ValueError, match="only the CPU runtime"):
         assets.prepare_bundle(str(bundle.root), device="0")
-    monkeypatch.setattr("huggingface_hub.snapshot_download", Mock(side_effect=AssertionError("no download")))
-    with pytest.raises(ValueError, match="only the CPU runtime"):
-        assets.prepare_bundle(assets.MODEL_ID, device="0")
     # A GPU variant carries the CUDA runtime in lib/.
-    cuda = bundle.root / "lib/libggml-cuda.so.0"
-    cuda.write_bytes(b"fixture")
-    profile = json.loads((bundle.root / "voices.json").read_text())
-    profile["files"]["lib/libggml-cuda.so.0"] = sha256(cuda)
-    (bundle.root / "voices.json").write_text(json.dumps(profile))
+    gpu_variant_of(bundle)
     assert assets.prepare_bundle(str(bundle.root), device="0").root == bundle.root
+    # An invalid device is refused before anything is downloaded.
+    monkeypatch.setattr("huggingface_hub.snapshot_download", Mock(side_effect=AssertionError("no download")))
+    for device in ("gpu", "", "CPU", "cuda:0", "-1", "1000"):
+        with pytest.raises(ValueError, match="--device must be cpu or a CUDA device index"):
+            assets.prepare_bundle(assets.MODEL_ID, device=device)
 
 
 def test_gpu_variant_tool_assembles_a_package_the_launcher_accepts_for_a_gpu(bundle, tmp_path_factory):
@@ -190,6 +187,121 @@ def test_corrupt_bundle_is_rejected(bundle, fault):
     path.write_text(json.dumps(profile))
     with pytest.raises(ValueError):
         validate_bundle(bundle.root)
+
+
+def gpu_variant_of(bundle):
+    """The fixture package with a CUDA runtime in lib/, as a GPU variant has."""
+    cuda = bundle.root / "lib/libggml-cuda.so.0"
+    cuda.write_bytes(b"fixture")
+    profile = json.loads((bundle.root / "voices.json").read_text())
+    profile["files"]["lib/libggml-cuda.so.0"] = sha256(cuda)
+    (bundle.root / "voices.json").write_text(json.dumps(profile))
+    return validate_bundle(bundle.root)
+
+
+def published_download(bundle, variant):
+    """A fake snapshot_download of the model repository: the CPU package and the GPU variant."""
+    from surogate.serve.tts import assets
+
+    def download(model, *, revision, allow_patterns, local_dir, force_download):
+        assert model == assets.MODEL_ID
+        prefix, source = {assets.REVISION: (assets.PREFIX, bundle), assets.GPU_REVISION: ("gpu", variant)}[revision]
+        assert allow_patterns == [prefix + "/*"]
+        for name in ["voices.json", "README.md", *source.profile["files"]]:
+            target = local_dir / prefix / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source.root / name if name != "README.md" else source.root / "voices.json", target)
+
+    return Mock(side_effect=download)
+
+
+def test_hf_gpu_variant_download_is_pinned_and_cached(bundle, tmp_path_factory, monkeypatch):
+    """--device N fetches the published GPU variant (gpu/ at its pinned revision), not the CPU package."""
+    from surogate.serve.tts import assets
+
+    tmp_path = tmp_path_factory.mktemp("published")  # outside the fixture package
+    cpu_root = tmp_path / "cpu-package"
+    shutil.copytree(bundle.root, cpu_root)
+    cpu = validate_bundle(cpu_root)
+    variant = gpu_variant_of(bundle)
+    monkeypatch.setenv("SUROGATE_SERVE_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(assets, "PROFILE_SHA256", sha256(cpu.root / "voices.json"))
+    monkeypatch.setattr(assets, "GPU_PROFILE_SHA256", sha256(variant.root / "voices.json"))
+    download = published_download(cpu, variant)
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    first = assets.prepare_bundle(assets.MODEL_ID, device="0")
+    assert first.root == tmp_path / "cache" / f"tts-{assets.GPU_REVISION}" / "gpu"
+    assert os.access(first.root / "bin/synthesize", os.X_OK)
+    assert download.call_args.kwargs["revision"] == assets.GPU_REVISION
+    assert not download.call_args.kwargs["force_download"]
+    assert assets.prepare_bundle(assets.MODEL_ID, device="1") == first and download.call_count == 1
+    # The CPU package goes to a cache of its own, and neither replaces the other.
+    on_cpu = assets.prepare_bundle(assets.MODEL_ID, device="cpu")
+    assert on_cpu.root == tmp_path / "cache" / f"tts-{assets.REVISION}" / assets.PREFIX
+    assert "lib/libggml-cuda.so.0" not in on_cpu.profile["files"] and download.call_count == 2
+    assert assets.prepare_bundle(assets.MODEL_ID, device="0") == first and download.call_count == 2
+    # --no-cache downloads the variant afresh.
+    assert assets.prepare_bundle(assets.MODEL_ID, device="0", reuse_cache=False) == first
+    assert download.call_count == 3 and download.call_args.kwargs["force_download"]
+
+
+def test_a_repository_copy_serves_each_device_its_package(bundle, tmp_path_factory):
+    from surogate.serve.tts import assets
+
+    tmp_path = tmp_path_factory.mktemp("repository")  # outside the fixture package
+    cpu_root = tmp_path / "cpu-package"
+    shutil.copytree(bundle.root, cpu_root)
+    cpu = validate_bundle(cpu_root)
+    variant = gpu_variant_of(bundle)
+    repository = tmp_path / "surogate-ro-tts"
+    for folder, source in ((assets.PREFIX, cpu), ("gpu", variant)):
+        shutil.copytree(source.root, repository / folder)
+    assert assets.prepare_bundle(str(repository), device="0").root == repository / "gpu"
+    assert assets.prepare_bundle(str(repository), device="cpu").root == repository / assets.PREFIX
+    # Only the GPU variant downloaded: a clear error on the CPU, not a traceback.
+    shutil.rmtree(repository / assets.PREFIX)
+    with pytest.raises(ValueError, match="No voices.json"):
+        assets.prepare_bundle(str(repository), device="cpu")
+
+
+def test_an_interrupted_download_is_completed(bundle, tmp_path_factory, monkeypatch):
+    from surogate.serve.tts import assets
+
+    tmp_path = tmp_path_factory.mktemp("interrupted")  # outside the fixture package
+    variant = gpu_variant_of(bundle)
+    monkeypatch.setenv("SUROGATE_SERVE_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(assets, "GPU_PROFILE_SHA256", sha256(variant.root / "voices.json"))
+    download = published_download(bundle, variant)
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    first = assets.prepare_bundle(assets.MODEL_ID, device="0")
+    (first.root / "model.gguf").unlink()  # as a download interrupted during the model leaves it
+    assert assets.prepare_bundle(assets.MODEL_ID, device="0") == first
+    assert download.call_count == 2 and not download.call_args.kwargs["force_download"]
+    # A pin the published files do not match is refused, with the way out named.
+    monkeypatch.setattr(assets, "GPU_PROFILE_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="checksum mismatch.*--no-cache"):
+        assets.prepare_bundle(assets.MODEL_ID, device="0")
+
+
+def test_the_gpu_variant_pins_are_well_formed():
+    from surogate.serve.tts import assets
+
+    assert re.fullmatch(r"[0-9a-f]{40}", assets.GPU_REVISION) and assets.GPU_REVISION != assets.REVISION
+    assert re.fullmatch(r"[0-9a-f]{64}", assets.GPU_PROFILE_SHA256)
+    assert assets.GPU_PREFIX == "gpu"
+
+
+def test_the_pinned_gpu_profile_is_the_published_one(tmp_path):
+    """Opt in with SUROGATE_TTS_TEST_MODEL=surogate/surogate-ro-tts (reads one small file from HF)."""
+    from surogate.serve.tts import assets
+
+    if os.environ.get("SUROGATE_TTS_TEST_MODEL") != assets.MODEL_ID:
+        pytest.skip("set SUROGATE_TTS_TEST_MODEL=surogate/surogate-ro-tts to check the published pins")
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(assets.MODEL_ID, "gpu/voices.json", revision=assets.GPU_REVISION, local_dir=tmp_path)
+    assert sha256(path) == assets.GPU_PROFILE_SHA256
+    assert "lib/libggml-cuda.so.0" in json.loads(Path(path).read_text())["files"]
 
 
 def test_hf_download_is_pinned_and_cached(bundle, tmp_path, monkeypatch):
