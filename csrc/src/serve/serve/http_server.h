@@ -25,6 +25,34 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+/// How many threads the pool runs, and how many connections may wait for one.
+struct HttpPoolSizes {
+    std::size_t workers;
+    std::size_t queued;
+};
+
+/// Size the HTTP pool from the serve options.
+///
+/// The two numbers are not the same thing, and sizing both from the serving capacity is what
+/// silently dropped requests: cpp-httplib does not answer a connection past the queue bound, it
+/// closes the socket with no response, so the caller reads a dead connection and the server logs
+/// nothing. `workers` is what the process can read from at once and costs a thread apiece, so it
+/// stays derived. `queued` is only how many accepted connections may wait, and it is unbounded,
+/// as `speech/server.cpp` and `encoder/embedding_server.cpp` already leave it: the number that
+/// arrives is set by the caller's concurrency, not ours, and shedding load belongs in the
+/// executor, which answers 429 rather than killing the socket -- promptly only because the
+/// constructor also caps keep-alive at one request per connection. Without that cap a queued
+/// connection gets neither a 429 nor a close: it waits for the whole burst ahead of it.
+/// `tts/server.cpp` bounds its own queue by its worker count, and it, `speech/server.cpp` and
+/// `encoder/embedding_server.cpp` all still pin a worker to a connection; filed separately.
+///
+/// The trade that buys: accepted sockets are no longer capped here, so a caller determined enough
+/// to exhaust RLIMIT_NOFILE gets an accept loop spinning on EMFILE rather than a queue that
+/// sheds. Still the better trade, because every bound we could pick is a threshold a legitimate
+/// caller crosses -- the rollout client is configured for 8192 connections -- and crossing it
+/// fails silently, with nothing logged on either side.
+HttpPoolSizes http_pool_sizes(const ServeOptions& options);
+
 class HttpServer {
 public:
     explicit HttpServer(ServeOptions options);

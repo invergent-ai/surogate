@@ -271,7 +271,21 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
     if isinstance(exception, httpx.HTTPStatusError):
         # Retry on 404 (adapter not found) or 500 (server error during loading)
         return exception.response.status_code in (404, 500)
-    return False
+    # A failure with no status at all: the connection was refused, dropped, or
+    # never established. This used to fall through unretried, so one dead socket
+    # ended a run that had already trained and already saved its adapter. Loading
+    # an adapter by name and path is idempotent, so a second attempt is safe.
+    #
+    # Not a read timeout, though it is also a TransportError. That one means the
+    # server took the request and has not answered within the deadline, so it is
+    # very likely still reloading, and retrying stacks ten more 600s waits on top
+    # of a reload that may yet succeed. `_apply_policy_update` gates all new
+    # rollout scheduling while this runs and leaves `checkpoint_ready` cleared,
+    # so those waits are a silently stalled run -- which is the failure the
+    # deadline was added to end, not to multiply.
+    if isinstance(exception, httpx.ReadTimeout):
+        return False
+    return isinstance(exception, httpx.TransportError)
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:
