@@ -1,7 +1,8 @@
 #pragma once
 
-// The decisions API (OpenRouter's `POST /api/alpha/decisions` contract): one shared state,
-// several questions, each answered by a single-token readout over its option labels.
+// The decisions API (`POST /v1/decisions`, with OpenRouter's field names and paths as aliases):
+// one shared state, several questions, each answered by a single-token readout over its option
+// labels.
 //
 // Everything here is model-free and deterministic: parsing and validation of the body (key
 // order preserved, since it decides the option letters), the Python-compatible JSON text of
@@ -9,6 +10,12 @@
 // shared-prefix rule and the answer arithmetic. It pins the protocol the served decision
 // models were trained and benchmarked with (jev `encode_case`, `option_codes`,
 // `confidence.py`), so a change here is a change in what the model is asked.
+//
+// This is decisions v1, and v1 is stable (docs/inference/decisions.md, "Versioning"): the request
+// and response fields, the prompt protocol, the option labelling and the probability readout
+// stay as they are, because customers rely on the answers they give. test_decisions_v1 pins
+// them against an independent implementation (fixtures/serve/decisions_v1). A change that
+// would alter an answer ships as a new protocol version beside v1, never as an edit to v1.
 
 #include "api/types.h"
 #include "serve/request.h"
@@ -24,6 +31,9 @@
 #include <vector>
 
 namespace sinfer::serve {
+
+/// The decisions protocol this file implements. Stable: see the header comment.
+inline constexpr std::string_view kDecisionsProtocolVersion = "v1";
 
 /// Key order is part of the contract, so every JSON value on this path is `ordered_json`.
 using OrderedJson = nlohmann::ordered_json;
@@ -172,8 +182,10 @@ render_decision_question(const DecisionQuestion& question, const std::vector<std
                                                        const std::vector<std::size_t>& full_lengths,
                                                        std::size_t minimum = kDecisionMinPrefillTokens);
 
-/// TypeSafe's confidence metrics, arithmetic as published (normalise by the sum, uniform on a
-/// zero total, first index on ties). The endpoint hands them the tempered distribution.
+/// TypeSafe's confidence metrics: its published formulas (normalise by the sum, uniform on a
+/// zero total, first index on ties), with every sum taken in option order, in double. That order
+/// is part of v1; a compensated sum (Python 3.12's builtin `sum`) differs in the last bits. The
+/// endpoint hands them the tempered distribution.
 [[nodiscard]] double decision_choice_confidence(const std::vector<double>& probabilities);
 [[nodiscard]] double decision_score_confidence(const std::vector<double>& probabilities);
 

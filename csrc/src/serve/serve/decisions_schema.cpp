@@ -163,6 +163,13 @@ public:
                 duplicate = value;
                 return false;
             }
+            // Anywhere else Python keeps the last value of a repeated key, and so does the DOM:
+            // forget any wide literal the earlier value left at this key or below it, or its
+            // text would be written in place of the value that won.
+            const std::string at = pointer();
+            std::erase_if(literals, [&](const auto& entry) {
+                return entry.first == at || entry.first.starts_with(at + "/");
+            });
         }
         return true;
     }

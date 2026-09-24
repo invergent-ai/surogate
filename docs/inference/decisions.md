@@ -1,9 +1,11 @@
 # Decisions API
 
-`POST /api/alpha/decisions` (OpenRouter's path; aliases `POST /v1/decisions` and
-`POST /api/v1/decisions`) answers several single-token
-questions about one shared state in a single request, with the field names of OpenRouter's
-decisions API. It is the serving form of the decision protocol the decision models were
+`POST /v1/decisions` answers several single-token questions about one shared state in a
+single request, with the field names of OpenRouter's decisions API. It is **decisions v1,
+which is stable** (see [Versioning](#versioning)). `POST /api/alpha/decisions`
+(OpenRouter's path) and `POST /api/v1/decisions` are aliases of the same v1 endpoint.
+
+It is the serving form of the decision protocol the decision models were
 trained and benchmarked with: each question is rendered as a two-turn chat (a fixed system
 prompt, then the state, the question and lettered options), thinking is off, and the answer
 is read at the first generated position as a softmax over the option-letter logits alone,
@@ -193,7 +195,7 @@ What changes and what does not:
 - It is applied exactly once per question, in one place, after the readout: the same way
   for choice, noul and score questions, for option letters and for the codebook codes used
   past 26 options, for questions answered on the shared GPU prefix and for whole prompts, and
-  on `/api/alpha/decisions`, `/v1/decisions` and `/api/v1/decisions` alike.
+  on `/v1/decisions`, `/api/alpha/decisions` and `/api/v1/decisions` alike.
 - It applies to every decisions request the process answers, including those for models
   added with `--model` and for LoRA adapters; models whose fitted temperatures differ belong
   in separate processes. Chat, completions and every other endpoint are unaffected;
@@ -226,10 +228,73 @@ Refit when the model, the adapter or the quantization changes. The chosen option
 at every `T`, so accuracy does not move; the stated probabilities do, and with them a score
 question's expected level.
 
+## Versioning
+
+Decisions v1 is stable. Everything the engine does with a v1 request stays as this page
+documents it, because customers rely on the answers it gives:
+
+- **the request and response format:** the fields, their types and what they mean, including
+  which requests are accepted (a request v1 answers keeps being answered) and the error codes of
+  the ones it refuses;
+- **the prompt protocol:** the two system prompts, the user turn's layout, the JSON text of
+  the state and of non-string values (Python's `json.dumps`, with Python's last-wins reading of
+  a repeated key), key order, images ahead of the text, and thinking off;
+- **the option labelling:** `A`..`Z`, then the tokenizer's codebook codes past 26 options;
+  `false`/`true` as `A`/`B` for a noul question; score levels in order;
+- **how the prompts are prefilled:** the shared-prefix rule and the 47-token prefill floor
+  (see [Protocol details](#protocol-details)), which decide the prefill route that computes each
+  answer;
+- **the probability readout:** the softmax over the label logits at the first generated
+  position, in double, and how `choice`, `confidence`, `noul` and `score` are computed from it
+  (TypeSafe's formulas, with every sum taken in order over the options, in double).
+
+Anything that would change an answer ships as a new protocol version at its own path, next
+to v1, which keeps answering as before. That includes a new system prompt, a different label
+scheme, a different prefill floor, another way of reading the logits or another confidence
+formula. Only changes that leave every v1 answer as it is go into v1: faster serving, clearer
+error messages, extra observability.
+
+A test pins v1 (`csrc/src/testing/serve/test_decisions_v1.cpp`). It holds a fixed set of
+requests, and their expected results come from an independent Python implementation of the
+protocol (`fixtures/serve/decisions_v1/`). For each request it checks the rendered prompt text
+byte for byte and the answer for a fixed row of logits bit for bit. It also pins the
+shared-prefix rule and the floor. The set covers:
+
+- every question type, key order and noul criteria in either order;
+- non-string values and JSON number, string and escape edge cases, including hand-written bodies
+  with repeated keys and integers wider than 64 bits;
+- Romanian text;
+- the codebook past 26 options, up to 255;
+- mixed requests and ties.
+
+The chat template and the tokenizer belong to the model, not to the protocol. On a GPU,
+`tests/serve/test_decisions_v1_golden.py` compares a served model's answers with a recording
+made from a v1 engine.
+
+What v1 does not fix:
+
+- **The model.** Different weights give different answers, under v1 or any other version.
+- **The [calibration temperature](#calibration-temperature).** At its default of 1 the
+  answers are the v1 readout bit for bit. A deployment that fits a temperature for its model
+  serves v1 answers tempered by it: the same choices, with calibrated probabilities. The model
+  and the temperature are both recorded in the server's `server_start` log record.
+- **Floating-point results.** The logits come from the model's kernels. Across engine builds,
+  GPU generations and the other rows sharing an engine step, those kernels can round
+  differently, so probabilities can differ in their last bits while the protocol and the
+  arithmetic applied to the logits stay the same. With a LoRA adapter bound, the prefill floor
+  does not select the kernels (see [Protocol details](#protocol-details)).
+
+Two v1 details are kept as they are:
+
+- A score question's `legend` returns an integer level wider than 64 bits as the nearest
+  double. The prompt shows it exactly as sent.
+- The codebook keeps a two-letter code when its token is a special token of the tokenizer. The
+  reference encoder skips such tokens; no tokenizer served so far has one.
+
 ## Example
 
 ```bash
-curl -s http://127.0.0.1:8080/api/alpha/decisions \
+curl -s http://127.0.0.1:8080/v1/decisions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "jev-gemma4-26b-a4b",
@@ -246,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/alpha/decisions \
 With an image, on a server started with `--vision --mmproj <projector>`:
 
 ```bash
-curl -s http://127.0.0.1:8080/api/alpha/decisions \
+curl -s http://127.0.0.1:8080/v1/decisions \
   -H 'Content-Type: application/json' \
   -d '{"model": "jev-gemma4-26b-a4b",
        "images": ["data:image/png;base64,iVBORw0KGgo..."],

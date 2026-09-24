@@ -57,7 +57,8 @@ private:
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_tokenize(const httplib::Request& req, httplib::Response& res);
     void handle_completions(const httplib::Request& req, httplib::Response& res);
-    /// POST /api/alpha/decisions (OpenRouter's path), /v1/decisions and /api/v1/decisions.
+    /// POST /v1/decisions (stable v1), and its aliases /api/alpha/decisions (OpenRouter's path)
+    /// and /api/v1/decisions.
     void handle_decisions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
