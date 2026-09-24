@@ -1211,6 +1211,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.requested_output_tokens = static_cast<int>(request.questions.size());
     context.enable_thinking         = false;
     context.question_count          = request.questions.size();
+    context.decision_temperature    = svc().options().decision_temperature;
     log_request_start(context);
     try {
         DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate());

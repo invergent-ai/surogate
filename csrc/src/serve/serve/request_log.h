@@ -41,6 +41,8 @@ struct RequestLogContext {
     /// has run, how many tokens of shared prefix were prefilled once for all of them.
     std::size_t question_count       = 0;
     std::size_t shared_prefix_tokens = 0;
+    /// The calibration temperature the answers were read at (`--decision-temperature`).
+    double decision_temperature = 1.0;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

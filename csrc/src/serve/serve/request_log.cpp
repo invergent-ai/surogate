@@ -175,10 +175,12 @@ Json overrides_json(const sinfer::SamplingOverrides& overrides) {
 
 /// The `decisions` protocol's own fields, absent from every other record.
 void add_decisions(Json& record, const std::string& protocol, std::size_t question_count,
-                   std::optional<std::size_t> shared_prefix_tokens) {
+                   std::optional<std::size_t> shared_prefix_tokens,
+                   std::optional<double> temperature = std::nullopt) {
     if (protocol != "decisions") { return; }
     record["decisions"] = Json{{"question_count", question_count}};
     if (shared_prefix_tokens) { record["decisions"]["shared_prefix_tokens"] = *shared_prefix_tokens; }
+    if (temperature) { record["decisions"]["temperature"] = *temperature; }
 }
 
 Json request_json(const RequestLogContext& context) {
@@ -197,7 +199,8 @@ Json request_json(const RequestLogContext& context) {
                 {"enable_thinking", context.enable_thinking},
                 {"preserve_thinking", context.preserve_thinking},
                 {"sampling", sampler_json(context.sampling)}};
-    add_decisions(record, context.protocol, context.question_count, context.shared_prefix_tokens);
+    add_decisions(record, context.protocol, context.question_count, context.shared_prefix_tokens,
+                  context.decision_temperature);
     return record;
 }
 
@@ -479,7 +482,8 @@ std::string format_server_start_json(
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
-                              {"default_preserve_thinking", options.preserve_thinking}};
+                              {"default_preserve_thinking", options.preserve_thinking},
+                              {"decision_temperature", options.decision_temperature}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},

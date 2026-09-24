@@ -1,3 +1,4 @@
+#include "serve/decisions_schema.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
@@ -297,6 +298,53 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    // --decision-temperature: the decisions endpoint's calibration, a finite T > 0 kept as the
+    // double that was typed, defaulting to 1 (the model's own distribution).
+    failures += check(defaults.decision_temperature == kDecisionDefaultTemperature &&
+                          defaults.decision_temperature == 1.0,
+                      "decisions are calibrated by default");
+    const ServeOptions calibrated =
+        parse({"sinfer-serve", "model.sinfer", "--decision-temperature", "2.5"});
+    failures += check(calibrated.decision_temperature == 2.5,
+                      "--decision-temperature did not reach serving options");
+    failures += check(parse({"sinfer-serve", "model.sinfer", "--decision-temperature", "0.3"})
+                              .decision_temperature == 0.3,
+                      "--decision-temperature was not kept at double precision");
+    failures += check(parse({"sinfer-serve", "model.sinfer", "--decision-temperature", "1e-3"})
+                                  .decision_temperature == 1e-3 &&
+                              parse({"sinfer-serve", "model.sinfer", "--decision-temperature", "40"})
+                                      .decision_temperature == 40.0,
+                      "valid decision temperatures were refused");
+    for (const char* bad : {"0", "0.0", "-0", "-1", "-2.5", "nan", "NaN", "inf", "-inf", "infinity",
+                            "1e999", "1e-400", "1e-310", "0x1p-1074", "", "abc", "2.5x", "2,5", " "}) {
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", "--decision-temperature", bad}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) { std::cerr << "--decision-temperature accepted '" << bad << "'\n"; }
+        failures += check(rejected, "an invalid --decision-temperature was accepted");
+    }
+    {
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", "--decision-temperature"}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--decision-temperature without a value was accepted");
+    }
+    // Server-wide: models added with --model answer decisions at the same temperature.
+    const ServeOptions calibrated_multi = parse({"sinfer-serve", "model.sinfer", "--decision-temperature",
+                                                 "2.5", "--model", "other=other.sinfer"});
+    failures += check(extra_model_options(calibrated_multi, calibrated_multi.extra_models.front())
+                              .decision_temperature == 2.5,
+                      "an extra model did not inherit --decision-temperature");
+    // It is not a sampling option: generation requests resolve exactly as without it.
+    GenerationRequest generation;
+    generation.max_tokens = 1;
+    failures += check(to_request_options(generation, calibrated).execution.sampling.temperature ==
+                              to_request_options(generation, defaults).execution.sampling.temperature &&
+                          !calibrated.sampling_overrides.temperature && !calibrated.greedy,
+                      "--decision-temperature changed generation sampling");
+    failures += check(serve_usage_text("sinfer-serve").find("--decision-temperature") != std::string::npos,
+                      "serve help omits --decision-temperature");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

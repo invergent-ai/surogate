@@ -4,10 +4,16 @@
 // reference Python (`json.dumps`, jev's `confidence.py`) and pasted in.
 #include "serve/decisions_schema.h"
 
+#include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -83,6 +89,148 @@ const char* kExample = R"json({
   },
   "provider": {"order": ["x"]}, "session_id": "s", "user": "u", "trace": {"t": 1}
 })json";
+
+// ---- the calibration temperature's fixtures ----
+
+std::size_t legacy_first_argmax(const std::vector<double>& values) {
+    return static_cast<std::size_t>(std::max_element(values.begin(), values.end()) - values.begin());
+}
+
+// The readout exactly as it was before --decision-temperature existed (19ff7d38), kept verbatim
+// so that T == 1 is held to it bit for bit rather than to a tolerance.
+OrderedJson legacy_resolve(const DecisionQuestion& question, const std::vector<float>& logits) {
+    const std::size_t n = question.option_count();
+    if (logits.size() != n || n == 0) { throw std::runtime_error("decision readout does not match its options"); }
+    if (std::any_of(logits.begin(), logits.end(), [](float value) { return !std::isfinite(value); })) {
+        throw std::runtime_error("model returned non-finite logits");
+    }
+    const double maximum = *std::max_element(logits.begin(), logits.end());
+    std::vector<double> probabilities(n);
+    double sum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        probabilities[i] = std::exp(static_cast<double>(logits[i]) - maximum);
+        sum += probabilities[i];
+    }
+    for (double& p : probabilities) { p /= sum; }
+
+    OrderedJson answer;
+    answer["type"] = decision_kind_name(question.kind);
+    switch (question.kind) {
+    case DecisionKind::Choice: {
+        const std::size_t best = legacy_first_argmax(probabilities);
+        answer["choice"]       = question.option_keys[best];
+        answer["confidence"]   = decision_choice_confidence(probabilities);
+        OrderedJson table      = OrderedJson::object();
+        for (std::size_t i = 0; i < n; ++i) { table[question.option_keys[i]] = probabilities[i]; }
+        answer["probabilities"] = std::move(table);
+        break;
+    }
+    case DecisionKind::Noul:
+        answer["noul"] = probabilities[1];
+        break;
+    case DecisionKind::Score: {
+        double score = 0.0;
+        for (std::size_t i = 0; i < n; ++i) { score += static_cast<double>(i) * probabilities[i]; }
+        answer["score"]      = score;
+        answer["confidence"] = decision_score_confidence(probabilities);
+        OrderedJson legend   = OrderedJson::object();
+        OrderedJson table    = OrderedJson::object();
+        for (std::size_t i = 0; i < n; ++i) {
+            legend[question.option_keys[i]] = question.option_values[i];
+            table[question.option_keys[i]]  = probabilities[i];
+        }
+        answer["legend"]        = std::move(legend);
+        answer["probabilities"] = std::move(table);
+        break;
+    }
+    }
+    return answer;
+}
+
+// The untempered probabilities exactly as the legacy readout computed them.
+std::vector<double> legacy_probabilities(const std::vector<float>& logits) {
+    const double maximum = *std::max_element(logits.begin(), logits.end());
+    std::vector<double> probabilities(logits.size());
+    double sum = 0.0;
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        probabilities[i] = std::exp(static_cast<double>(logits[i]) - maximum);
+        sum += probabilities[i];
+    }
+    for (double& p : probabilities) { p /= sum; }
+    return probabilities;
+}
+
+// An independent reference for the tempered distribution: renormalise the candidate
+// log-probabilities (not the logits), divide them by T, renormalise again, in long double.
+std::vector<double> reference_tempered(const std::vector<float>& logits, double temperature) {
+    long double maximum = logits.front();
+    for (const float z : logits) { maximum = std::max<long double>(maximum, z); }
+    long double total = 0.0L;
+    for (const float z : logits) { total += std::exp(static_cast<long double>(z) - maximum); }
+    const long double lse = maximum + std::log(total);
+    std::vector<long double> scaled;
+    long double scaled_max = -std::numeric_limits<long double>::infinity();
+    for (const float z : logits) {
+        scaled.push_back((static_cast<long double>(z) - lse) / temperature); // log q_i / T
+        scaled_max = std::max(scaled_max, scaled.back());
+    }
+    long double sum = 0.0L;
+    for (long double& v : scaled) { v = std::exp(v - scaled_max); sum += v; }
+    std::vector<double> out;
+    for (const long double v : scaled) { out.push_back(static_cast<double>(v / sum)); }
+    return out;
+}
+
+DecisionQuestion make_question(DecisionKind kind, std::size_t n) {
+    DecisionQuestion q;
+    q.name         = "q";
+    q.kind         = kind;
+    q.instructions = "i";
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string key = kind == DecisionKind::Score ? std::to_string(i)
+                                : kind == DecisionKind::Noul ? (i == 0 ? "false" : "true")
+                                                             : "k" + std::to_string(i);
+        q.option_keys.push_back(key);
+        q.option_texts.push_back("o" + std::to_string(i));
+        q.option_values.emplace_back("v" + std::to_string(i));
+    }
+    return q;
+}
+
+// Readouts of several shapes: plain, LM-sized with an offset, spread wide enough that the tail
+// underflows, all within 1e-30 of zero, exact integer ties, and one dominant option.
+std::vector<float> random_logits(std::mt19937_64& rng, std::size_t n, int style) {
+    std::normal_distribution<float> unit(0.0F, 1.0F);
+    std::uniform_real_distribution<float> wide(-1.0e4F, 1.0e4F);
+    std::uniform_int_distribution<int> small(0, 2);
+    std::uniform_int_distribution<std::size_t> pick(0, n - 1);
+    std::vector<float> z(n);
+    for (float& v : z) {
+        switch (style) {
+        case 0: v = unit(rng); break;
+        case 1: v = 20.0F + 8.0F * unit(rng); break;
+        case 2: v = wide(rng); break;
+        case 3: v = 1.0e-30F * unit(rng); break;
+        case 4: v = static_cast<float>(small(rng)); break;
+        default: v = -30.0F; break;
+        }
+    }
+    if (style >= 5) { z[pick(rng)] = 30.0F; }
+    return z;
+}
+
+bool refused_temperature(const std::function<void()>& f) {
+    try {
+        f();
+    } catch (const std::invalid_argument&) {
+        return false; // decide() would report this as the caller's fault (400): wrong type
+    } catch (const std::logic_error&) {
+        return true;
+    }
+    return false;
+}
+
+std::uint64_t bits_of(double value) { return std::bit_cast<std::uint64_t>(value); }
 
 } // namespace
 
@@ -350,6 +498,276 @@ int main() {
         assert(decision_choice_confidence({0.7}) == 1.0 && decision_score_confidence({0.7}) == 1.0);
     }
 
+    // ---- the calibration temperature (--decision-temperature) ----
+    {
+        const DecisionsRequest r   = parse_decisions_request(kExample);
+        const std::vector<double> temperatures{1.0e-3, 0.05, 0.5, 0.9, 1.1, 2.0, 2.5, 10.0, 100.0};
+        std::mt19937_64 rng(20260924);
+
+        // 1. T == 1 is today's readout, bit for bit: the default argument and an explicit 1.0
+        //    both reproduce the pre-change function on every question type, on letter-sized and
+        //    codebook-sized option sets, on ties, underflowing tails and near-zero logits.
+        std::size_t identical = 0;
+        for (const DecisionKind kind : {DecisionKind::Choice, DecisionKind::Noul, DecisionKind::Score}) {
+            for (const std::size_t n : {2, 3, 5, 26, 27, 30, 100, 255}) {
+                if (kind == DecisionKind::Noul && n != 2) { continue; }
+                const DecisionQuestion q = make_question(kind, n);
+                for (int style = 0; style <= 5; ++style) {
+                    for (int rep = 0; rep < 20; ++rep) {
+                        const std::vector<float> z = random_logits(rng, n, style);
+                        const std::string legacy   = legacy_resolve(q, z).dump();
+                        assert(resolve_decision_answer(q, z).dump() == legacy);
+                        assert(resolve_decision_answer(q, z, 1.0).dump() == legacy);
+                        const std::vector<double> now = decision_probabilities(z, 1.0);
+                        const std::vector<double> old = legacy_probabilities(z);
+                        for (std::size_t i = 0; i < n; ++i) { assert(bits_of(now[i]) == bits_of(old[i])); }
+                        ++identical;
+                    }
+                }
+            }
+        }
+        assert(identical == (2 * 8 + 1) * 6 * 20);
+        assert(kDecisionDefaultTemperature == 1.0);
+
+        // 2. T = 2 on a known distribution, against the reference Python
+        //    (p = exp((z - max) / T) / sum, then TypeSafe's confidence arithmetic).
+        DecisionQuestion four = r.questions[0];
+        four.option_keys = {"p", "q", "r", "s"}; four.option_texts = four.option_keys; four.option_values = {"p", "q", "r", "s"};
+        const std::vector<float> known{1.0F, 3.0F, 2.0F, 0.5F};
+        const auto t2 = resolve_decision_answer(four, known, 2.0);
+        assert(t2["choice"] == "q");
+        assert(close(t2["probabilities"]["p"].get<double>(), 0.16271264413290337, 1e-15));
+        assert(close(t2["probabilities"]["q"].get<double>(), 0.44229882380699453, 1e-15));
+        assert(close(t2["probabilities"]["r"].get<double>(), 0.2682677973937782, 1e-15));
+        assert(close(t2["probabilities"]["s"].get<double>(), 0.12672073466632397, 1e-15));
+        assert(close(t2["confidence"].get<double>(), 0.25639843174265936, 1e-15));
+        // Softer than T = 1 (0.6307955432474668 / 0.5077273909966223), and applied once: a
+        // second division would have given the T = 4 distribution instead.
+        assert(t2["probabilities"]["q"].get<double>() < 0.6307955432474668);
+        const auto t4 = decision_probabilities(known, 4.0);
+        assert(std::fabs(t2["probabilities"]["q"].get<double>() - t4[1]) > 0.05); // 0.442 vs 0.342
+        const auto n2 = resolve_decision_answer(r.questions[1], {0.25F, -1.25F}, 2.0);
+        assert(close(n2["noul"].get<double>(), 0.32082130082460697, 1e-15) && !n2.contains("confidence"));
+        DecisionQuestion five = r.questions[2];
+        five.option_keys = {"0", "1", "2", "3", "4"}; five.option_texts = five.option_keys;
+        five.option_values = {"a", "b", "c", "d", "e"};
+        const auto s2 = resolve_decision_answer(five, {0.0F, 1.0F, 2.5F, 1.0F, -1.0F}, 2.0);
+        assert(close(s2["score"].get<double>(), 1.9062533903049528, 1e-15));
+        assert(close(s2["confidence"].get<double>(), 0.3536793490343768, 1e-15));
+        assert(close(s2["probabilities"]["2"].get<double>(), 0.41579836779157786, 1e-15));
+        assert(close(s2["probabilities"]["4"].get<double>(), 0.07225492205140105, 1e-15));
+        assert(s2["legend"]["2"] == "c" && s2["legend"].size() == 5);
+        // The math as documented: the renormalised candidate log-probabilities divided by T and
+        // renormalised give the same distribution as the raw logits over T.
+        for (const double t : temperatures) {
+            const auto got = decision_probabilities(known, t);
+            const auto ref = reference_tempered(known, t);
+            for (std::size_t i = 0; i < known.size(); ++i) { assert(close(got[i], ref[i], 1e-15)); }
+        }
+        // Only differences of logits matter: an exact shift of the row changes nothing, which is
+        // why raw logits, candidate log-probabilities and vocabulary log-probabilities agree.
+        {
+            const std::vector<float> shifted{9.0F, 11.0F, 10.0F, 8.5F};
+            for (const double t : temperatures) {
+                const auto a = decision_probabilities(known, t);
+                const auto b = decision_probabilities(shifted, t);
+                for (std::size_t i = 0; i < known.size(); ++i) { assert(bits_of(a[i]) == bits_of(b[i])); }
+            }
+        }
+
+        // 3. The argmax is invariant: the choice at any T is the choice at T = 1, it is always a
+        //    maximum of the probabilities returned with it, and wherever the tempered
+        //    distribution has a single maximum it sits on that same option.
+        std::size_t unique_maxima = 0;
+        for (const std::size_t n : {2, 3, 5, 26, 30, 255}) {
+            const DecisionQuestion q = make_question(DecisionKind::Choice, n);
+            for (int style = 0; style <= 5; ++style) {
+                for (int rep = 0; rep < 10; ++rep) {
+                    const std::vector<float> z = random_logits(rng, n, style);
+                    const OrderedJson base     = legacy_resolve(q, z);
+                    const std::size_t argmax   = legacy_first_argmax(legacy_probabilities(z));
+                    const auto untempered = legacy_probabilities(z);
+                    const bool tied_at_one =
+                        std::count(untempered.begin(), untempered.end(), untempered[argmax]) > 1;
+                    for (const double t : temperatures) {
+                        const OrderedJson tempered = resolve_decision_answer(q, z, t);
+                        const auto p = decision_probabilities(z, t);
+                        const double peak = *std::max_element(p.begin(), p.end());
+                        const std::string key = tempered["choice"].get<std::string>();
+                        assert(tempered["probabilities"][key].get<double>() == peak);
+                        if (t >= 1.0 || !tied_at_one) { assert(key == base["choice"].get<std::string>()); }
+                        if (std::count(p.begin(), p.end(), peak) == 1) {
+                            assert(legacy_first_argmax(p) == argmax);
+                            ++unique_maxima;
+                        }
+                        // The confidence is the tempered peak rescaled, and it moves the way T
+                        // says: never up when T > 1, never down when T < 1.
+                        const double confidence = tempered["confidence"].get<double>();
+                        assert(close(confidence, decision_choice_confidence(p), 0.0));
+                        if (t > 1.0) { assert(confidence <= base["confidence"].get<double>() + 1e-15); }
+                        if (t < 1.0) { assert(confidence >= base["confidence"].get<double>() - 1e-15); }
+                    }
+                }
+            }
+        }
+        assert(unique_maxima > 1500);
+        // An extreme T rounds a near-tie to two equal doubles; the choice still follows the
+        // model's own order rather than falling to the first of the rounded tie.
+        {
+            const DecisionQuestion two = make_question(DecisionKind::Choice, 2);
+            const std::vector<float> near{1.0F, std::nextafter(1.0F, 2.0F)};
+            const auto p = decision_probabilities(near, 1.0e12);
+            assert(p[0] == p[1] && p[0] == 0.5);
+            assert(resolve_decision_answer(two, near, 1.0e12)["choice"] == "k1");
+            assert(legacy_resolve(two, near)["choice"] == "k1");
+            const auto flat = resolve_decision_answer(four, known, std::numeric_limits<double>::max());
+            assert(flat["choice"] == "q"); // the model's argmax, though every probability is 1/4
+            for (const char* key : {"p", "q", "r", "s"}) { assert(flat["probabilities"][key].get<double>() == 0.25); }
+            assert(flat["confidence"].get<double>() == 0.0);
+        }
+        // A true tie in the logits still goes to the first option, as at T = 1.
+        assert(resolve_decision_answer(r.questions[0], {2.0F, 2.0F, 1.0F}, 2.5)["choice"] == "positive");
+        assert(resolve_decision_answer(r.questions[0], {2.0F, 2.0F, 1.0F}, 0.25)["choice"] == "positive");
+        // Logits 5e-17 apart tie by rounding at T = 1 (exp(-5e-17) is 1.0), so the first option
+        // is chosen, as before. T > 1 cannot separate them; T < 1 can, and then the choice is
+        // the option the returned probabilities favour, never one they rank lower.
+        {
+            const DecisionQuestion two = make_question(DecisionKind::Choice, 2);
+            const std::vector<float> close_pair{0.0F, 5.0e-17F};
+            const auto at_one = decision_probabilities(close_pair, 1.0);
+            assert(at_one[0] == at_one[1] && legacy_resolve(two, close_pair)["choice"] == "k0");
+            assert(resolve_decision_answer(two, close_pair)["choice"] == "k0");
+            const auto soft = resolve_decision_answer(two, close_pair, 2.5);
+            assert(soft["choice"] == "k0" && soft["probabilities"]["k0"] == soft["probabilities"]["k1"]);
+            const auto sharp = resolve_decision_answer(two, close_pair, 0.25);
+            assert(sharp["probabilities"]["k1"].get<double>() > sharp["probabilities"]["k0"].get<double>());
+            assert(sharp["choice"] == "k1");
+        }
+
+        // 4. Invalid temperatures are refused -- as a defect (std::logic_error), never as the
+        //    std::invalid_argument decide() would report as the caller's 400 -- on every entry point.
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double inf = std::numeric_limits<double>::infinity();
+        for (const double bad : {0.0, -0.0, -1.0, -2.5, -1.0e-300, nan, inf, -inf}) {
+            assert(!valid_decision_temperature(bad));
+            assert(refused_temperature([&] { (void)decision_probabilities(known, bad); }));
+            assert(refused_temperature([&] { (void)resolve_decision_answer(four, known, bad); }));
+            assert(refused_temperature([&] { (void)resolve_decision_answer(r.questions[1], {0.25F, -1.25F}, bad); }));
+            assert(refused_temperature([&] { (void)resolve_decision_answers(r, {{1.0F, 2.0F, 3.0F}, {0.0F, 1.0F}, {0.0F, 1.0F, 2.0F}}, bad); }));
+        }
+
+        // 5. Numerical range: every valid T, however extreme, gives a finite distribution that
+        //    sums to one -- large T tends to uniform, small T to the argmax, tiny tails stay >= 0.
+        for (const double t : {std::numeric_limits<double>::denorm_min(), std::numeric_limits<double>::min(),
+                               1.0e-300, 1.0e-3, 1.0, 1.0e6, 1.0e300, std::numeric_limits<double>::max()}) {
+            assert(valid_decision_temperature(t));
+            for (int style = 0; style <= 5; ++style) {
+                const std::vector<float> z = random_logits(rng, 30, style);
+                const auto p = decision_probabilities(z, t);
+                double sum = 0.0;
+                for (const double v : p) {
+                    assert(std::isfinite(v) && v >= 0.0 && v <= 1.0);
+                    sum += v;
+                }
+                assert(close(sum, 1.0, 1e-12));
+                const auto answer = resolve_decision_answer(make_question(DecisionKind::Score, 30), z, t);
+                assert(std::isfinite(answer["score"].get<double>()) && std::isfinite(answer["confidence"].get<double>()));
+            }
+        }
+        {
+            const auto sharp = decision_probabilities(known, 1.0e-3);
+            assert(sharp[0] == 0.0 && sharp[1] == 1.0 && sharp[2] == 0.0 && sharp[3] == 0.0);
+            const auto soft = decision_probabilities(known, 1.0e6);
+            for (const double v : soft) { assert(close(v, 0.25, 1e-6)); }
+            // A tail that underflows to zero at T = 1 is small but representable at T = 2.5.
+            const std::vector<float> tail{0.0F, -80.0F, -200.0F, -800.0F};
+            assert(decision_probabilities(tail, 1.0)[3] == 0.0);
+            const auto tempered = decision_probabilities(tail, 2.5);
+            const auto ref      = reference_tempered(tail, 2.5);
+            for (std::size_t i = 0; i < tail.size(); ++i) {
+                assert(tempered[i] > 0.0 && std::fabs(tempered[i] - ref[i]) <= 1e-12 * ref[i]);
+            }
+        }
+
+        // 6. The codebook path: past 26 options the labels are two-letter codes and the prompt
+        //    asks for a code, but the readout is the same row of logits and is tempered the same.
+        {
+            std::string body = R"json({"model": "m", "state": "s", "questions": {"many": {"type": "choice", "instructions": "Pick", "criteria": {)json";
+            for (int i = 0; i < 30; ++i) body += std::string(i ? ", " : "") + "\"k" + std::to_string(i) + "\": \"o" + std::to_string(i) + "\"";
+            body += "}}, \"levels\": {\"type\": \"score\", \"instructions\": \"Rate\", \"criteria\": [";
+            for (int i = 0; i < 255; ++i) body += (i ? ", \"l\"" : "\"l\"");
+            body += "]}}}";
+            const DecisionsRequest extended = parse_decisions_request(body);
+            const auto clean = decision_codebook(clean_encode, clean_decode);
+            for (const DecisionQuestion& q : extended.questions) {
+                assert(q.extended() && render_decision_question(q, clean).extended);
+                assert(render_decision_question(q, clean).labels[26] == "AA");
+                for (int style = 0; style <= 5; ++style) {
+                    const std::vector<float> z = random_logits(rng, q.option_count(), style);
+                    assert(resolve_decision_answer(q, z).dump() == legacy_resolve(q, z).dump());
+                    const auto answer = resolve_decision_answer(q, z, 2.5);
+                    const auto ref    = reference_tempered(z, 2.5);
+                    std::size_t i     = 0;
+                    for (auto it = answer["probabilities"].begin(); it != answer["probabilities"].end(); ++it, ++i) {
+                        assert(it.key() == q.option_keys[i]);
+                        assert(close(it.value().get<double>(), ref[i], 1e-15));
+                    }
+                    assert(i == q.option_count());
+                    if (q.kind == DecisionKind::Choice) {
+                        assert(answer["choice"] == legacy_resolve(q, z)["choice"]);
+                    } else {
+                        double expected = 0.0;
+                        for (std::size_t k = 0; k < ref.size(); ++k) { expected += static_cast<double>(k) * ref[k]; }
+                        assert(close(answer["score"].get<double>(), expected, 1e-10));
+                    }
+                }
+            }
+        }
+
+        // 7. The multi-question path: however the rows were produced (one shared GPU prefix and
+        //    per-question suffixes, or whole prompts), the request's answers come from
+        //    resolve_decision_answers, once per question, in request order.
+        {
+            std::string body = R"json({"model": "m", "state": {"ticket": "late and damaged"}, "questions": {
+                "sentiment": {"type": "choice", "instructions": "Sentiment?", "criteria": {"positive": "p", "neutral": "n", "negative": "x"}},
+                "refund": {"type": "noul", "instructions": "Refund?", "criteria": {"true": "yes", "false": "no"}},
+                "urgency": {"type": "score", "instructions": "Urgency?", "criteria": ["low", "mid", "high"]},
+                "many": {"type": "choice", "instructions": "Pick", "criteria": {)json";
+            for (int i = 0; i < 30; ++i) body += std::string(i ? ", " : "") + "\"c" + std::to_string(i) + "\": \"o\"";
+            body += "}}}}";
+            const DecisionsRequest multi = parse_decisions_request(body);
+            assert(multi.questions.size() == 4 && multi.questions[3].extended());
+            std::vector<std::vector<float>> rows;
+            for (const DecisionQuestion& q : multi.questions) { rows.push_back(random_logits(rng, q.option_count(), 1)); }
+            const OrderedJson plain = resolve_decision_answers(multi, rows);
+            std::vector<std::string> order;
+            for (auto it = plain.begin(); it != plain.end(); ++it) order.push_back(it.key());
+            assert(order == (std::vector<std::string>{"sentiment", "refund", "urgency", "many"}));
+            for (std::size_t i = 0; i < multi.questions.size(); ++i) {
+                assert(plain[multi.questions[i].name].dump() == legacy_resolve(multi.questions[i], rows[i]).dump());
+            }
+            const OrderedJson calibrated = resolve_decision_answers(multi, rows, 2.5);
+            for (std::size_t i = 0; i < multi.questions.size(); ++i) {
+                const DecisionQuestion& q = multi.questions[i];
+                assert(calibrated[q.name].dump() == resolve_decision_answer(q, rows[i], 2.5).dump());
+                const auto ref = reference_tempered(rows[i], 2.5);
+                if (q.kind == DecisionKind::Noul) {
+                    assert(close(calibrated[q.name]["noul"].get<double>(), ref[1], 1e-15));
+                } else {
+                    assert(close(calibrated[q.name]["probabilities"][q.option_keys[0]].get<double>(), ref[0], 1e-15));
+                }
+                if (q.kind == DecisionKind::Choice) { assert(calibrated[q.name]["choice"] == plain[q.name]["choice"]); }
+            }
+            bool mismatched = false;
+            try { (void)resolve_decision_answers(multi, {rows[0], rows[1]}, 2.5); }
+            catch (const std::runtime_error&) { mismatched = true; }
+            assert(mismatched);
+        }
+        std::cout << "calibration temperature: T=1 bit-identical to the pre-change readout on " << identical
+                  << " readouts; choice invariant across " << temperatures.size() << " temperatures ("
+                  << unique_maxima << " single tempered maxima on the model's argmax)\n";
+    }
+
     // ---- Fault attribution: whose fault is it, and does the caller get a status they retry?
     //
     // The endpoint used to catch std::invalid_argument wholesale and answer 400
@@ -421,6 +839,6 @@ int main() {
                    static_cast<const std::exception*>(&overloaded)) == nullptr);
     }
 
-    std::cout << "decisions dumper, validation, rendering, codebook, shared prefix, readout and "
-                 "fault-attribution checks passed\n";
+    std::cout << "decisions dumper, validation, rendering, codebook, shared prefix, readout, "
+                 "calibration temperature and fault-attribution checks passed\n";
 }

@@ -223,3 +223,41 @@ def test_drafter_flag_like_prompt_is_not_consumed(literal, monkeypatch):
     serve.maybe_exec_serve()
     assert "dflash_model" not in ingest.ensure_engine_weights.call_args.kwargs
     execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--prompt", literal])
+
+
+def test_decision_temperature_is_a_server_option():
+    """The decisions calibration reaches the server engine as typed; other modes refuse it."""
+    expected = ("server", "model", ["--decision-temperature", "2.5"], True, None)
+    assert serve._parse_invocation(["model", "--decision-temperature", "2.5"]) == expected
+    assert serve._parse_invocation(["--decision-temperature=2.5", "model"]) == expected
+    with pytest.raises(ValueError, match="needs a value"):
+        serve._parse_invocation(["model", "--decision-temperature"])
+    for mode in ("generate", "embed", "stt", "tts"):
+        with pytest.raises(ValueError, match="not supported"):
+            serve._parse_invocation([f"--{mode}", "model", "--decision-temperature", "2.5"])
+
+
+def test_decision_temperature_is_passed_to_the_engine(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["surogate", "serve", "model", "--decision-temperature", "2.5"])
+    monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")
+    ingest = Mock()
+    ingest.ensure_engine_weights.return_value = Path("/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.ingest", ingest)
+    execute = Mock()
+    monkeypatch.setattr(serve.os, "execv", execute)
+    serve.maybe_exec_serve()
+    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--decision-temperature", "2.5",
+                                                "--served-model-name", "model"])
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "1e999", "abc", ""])
+def test_invalid_decision_temperature_fails_before_model_load(value):
+    # The native parser owns validation and runs before any CUDA call; no GPU is made visible.
+    binary = serve._resolve_binary("server")
+    if binary is None:
+        pytest.skip("native serving binaries are not built")
+    result = subprocess.run([binary, "/nonexistent-model", "--decision-temperature", value],
+                            capture_output=True, text=True, timeout=20,
+                            env={**serve.os.environ, "CUDA_VISIBLE_DEVICES": ""})
+    assert result.returncode != 0
+    assert "invalid decision-temperature" in result.stderr
