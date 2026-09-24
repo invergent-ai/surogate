@@ -221,6 +221,8 @@ class NodeTrainer:
 
         self._train_vision = bool(config.train_vision and config.is_multimodal)
         self._uses_mrope = self._detect_pos_planes(config) > 1
+        if getattr(config, "row_packing", False):
+            raise ValueError("row_packing is implemented by the single-node trainer only")
 
         if self._train_vision:
             if config.sample_packing:

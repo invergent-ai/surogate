@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/kernel_utils.cuh"
+#include "kernels/kernels.h"
 #include "runtime/core/fp8_scaling_config.h"
 #include "runtime/core/fp8_scaling_state.h"
 
@@ -60,7 +61,8 @@ __global__ void delayed_scaling_update_kernel(float* __restrict__ amax_history,
                                               int amax_compute_algo,  // 0 = MAX, 1 = MOST_RECENT
                                               float scaled_max_e4m3,
                                               float scaled_max_e5m2,
-                                              float amax_epsilon) {
+                                              float amax_epsilon,
+                                              bool pow2) {
     const int qid = blockIdx.x;  // Quantizer index
     if (qid >= num_quantizers) return;
 
@@ -139,6 +141,12 @@ __global__ void delayed_scaling_update_kernel(float* __restrict__ amax_history,
             // Clamp to FLT_MAX if scale becomes infinite (amax too small)
             if (isinf(scale)) {
                 scale = FLT_MAX;
+            }
+            if (pow2) {
+                // See fp8_scale_from_amax (quant.cu): largest power of two <= scale.
+                int e = 0;
+                frexpf(scale, &e);
+                scale = ldexpf(1.0f, e - 1);
             }
         } else {
             // Invalid amax: keep previous scale (TransformerEngine behavior)
@@ -247,7 +255,8 @@ void delayed_scaling_update(FP8ScalingState& state, cudaStream_t stream) {
                                                                         algo,
                                                                         scaled_max_e4m3,
                                                                         scaled_max_e5m2,
-                                                                        config.amax_epsilon);
+                                                                        config.amax_epsilon,
+                                                                        fp8_power_of_two_scales());
     CUDA_CHECK(cudaGetLastError());
 }
 

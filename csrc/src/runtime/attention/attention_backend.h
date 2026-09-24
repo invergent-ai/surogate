@@ -35,6 +35,12 @@ constexpr int kFlashVarlen = 90;
 constexpr int kCustom = 80;
 }  // namespace attention_priority
 
+/// Upper bound on the FlashAttention-varlen deterministic backward's dQ split
+/// count (backend_flash_varlen.cpp). Each split keeps a full fp32 dQ copy, so
+/// the backward's scratch is at most this many copies; the stack plan sizes
+/// for it (flash_attention_backward_stack_bound).
+constexpr int kFlashVarlenMaxDqSplits = 4;
+
 /// All tensors + execution context needed to run a single
 /// ``flash_attention`` / ``flash_attention_backward`` op. Callers fill in
 /// the fields relevant to their direction (forward vs backward) and hand
@@ -120,8 +126,9 @@ struct AttentionParams {
     Tensor cudnn_workspace;
 
     // ---- Runtime knobs -------------------------------------------------
-    /// Deterministic varlen backward (opt-in via
-    /// ``SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC`` env var).
+    /// Deterministic varlen backward: fixed-order dQ reduction. The training
+    /// dispatch sets it by default; ``SUROGATE_FLASH_ATTN_VARLEN_BWD_NONDETERMINISTIC``
+    /// opts into the faster fp32-atomic reduction.
     bool deterministic_bwd = false;
 
     /// cuDNN backward batch chunking (``RuntimeOptions::AttBwdChunks``).

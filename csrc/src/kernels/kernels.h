@@ -1985,6 +1985,13 @@ void quantize_with_abs_max(std::int8_t* out,
                            long N,
                            const cudaDeviceProp& dp,
                            cudaStream_t stream);
+/// Power-of-two FP8 scales for every per-tensor quantizer (JIT and delayed), process-wide.
+/// An element then quantizes to the same bits whatever the tensor's maximum is, so a
+/// token's arithmetic stops depending on what else shares its micro-batch. Opt-in via
+/// RecipeConfig::fp8_pow2_scales (recipes/fp8_hybrid/kernels/quant.cu).
+void set_fp8_power_of_two_scales(bool enabled);
+bool fp8_power_of_two_scales();
+
 void quantize_with_abs_max(__nv_fp8_e4m3* out,
                            float* scale_ptr,
                            const float* in,

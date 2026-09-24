@@ -201,7 +201,10 @@ void attention_backward_flash_varlen(nv_bfloat16* dqkv,
                                      bool deterministic,
                                      cudaStream_t stream,
                                      float scale = 0.0f,
-                                     int window_size = 0);
+                                     int window_size = 0,
+                                     int dq_splits = 0);  ///< deterministic only: >0 fixes the dQ split
+                                                          ///< count (dq_accum holds that many copies);
+                                                          ///< 0 keeps FlashAttention's own heuristic
 
 // ---------------------------------------------------------------------------
 // Chunked-sequence (KV-prefix) attention. q = current chunk (T rows of the

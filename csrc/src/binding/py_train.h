@@ -278,6 +278,11 @@ public:
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_shared_base_weights();
     int get_valid_token_count(int gpu_id);
+    // Per-position training losses of the current optimizer step on one GPU: the
+    // run state's [B*T] loss buffer, which each forward adds its per-token losses
+    // into (zeroed at micro-step 0). After the last micro-step the reduction has
+    // overwritten element 0 with the step total; every other element is intact.
+    std::vector<float> get_token_losses(int gpu_id);
     void set_visual_inputs(const std::int32_t* visual_pos_masks,
                            const float* visual_embeds,
                            const std::vector<const float*>& deepstack_visual_embeds);

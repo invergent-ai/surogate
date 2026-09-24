@@ -510,7 +510,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                         lora_dropout_scale(t, dropout, seed, mRunState.MainStream);
                     }
                     if (scaling != 1.0f) {
-                        vector_add_sr(t, t, t, 0.5f * scaling, t.nelem(), /*seed=*/0, mRunState.MainStream);
+                        vector_add(t, t, t, 0.5f * scaling, t.nelem(), mRunState.MainStream);
                     }
                 };
 
@@ -1118,7 +1118,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                         lora_dropout_scale(t, dropout, seed, mRunState.MainStream);
                     }
                     if (scaling != 1.0f) {
-                        vector_add_sr(t, t, t, 0.5f * scaling, t.nelem(), /*seed=*/0, mRunState.MainStream);
+                        vector_add(t, t, t, 0.5f * scaling, t.nelem(), mRunState.MainStream);
                     }
                 };
 

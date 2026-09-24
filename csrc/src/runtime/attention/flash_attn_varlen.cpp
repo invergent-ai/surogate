@@ -201,7 +201,8 @@ void attention_backward_flash_varlen(nv_bfloat16* dqkv,
                                      bool deterministic,
                                      cudaStream_t stream,
                                      float scale_override,
-                                     int window_size) {
+                                     int window_size,
+                                     int dq_splits) {
     surogate_flash::Flash_bwd_params params;
     // IMPORTANT: zero ALL fields first. set_common_params takes Flash_fwd_params&,
     // so its memset only zeros sizeof(Flash_fwd_params) bytes, leaving backward-
@@ -272,6 +273,10 @@ void attention_backward_flash_varlen(nv_bfloat16* dqkv,
     const int HS_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
     if (deterministic) {
         params.dq_accum_split_stride = static_cast<int64_t>(total_q + 128 * B_ragged) * Hq * HS_rounded;
+        // Read by the backward launcher only when deterministic (patch_flash_attn.sh): split s
+        // owns key blocks s, s+dq_splits, ... of every document and the splits are summed in
+        // order, so a fixed count fixes the fp32 summation order of every dQ element.
+        params.num_splits = dq_splits > 0 ? dq_splits : 0;
     }
 
     const bool use_window = window_size > 0;
