@@ -1,4 +1,5 @@
 #include "family/impl/runtime/instance.h"
+#include "core/device_memory_error.h"
 #include "family/impl/runtime/schedule.h"
 #include "api/ops/sampled_logprob.h"
 
@@ -331,6 +332,8 @@ auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    offsetof(family::MtpDecodeEgress, scores) + batch_size * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                    stream));
+        } catch (const DeviceOutOfMemory&) {
+            throw; // survivable: the executor recovers from it by its type
         } catch (const std::exception& error) {
             throw std::runtime_error(std::string("narrow MTP round, step ") + narrow_step + ": " +
                                      error.what());

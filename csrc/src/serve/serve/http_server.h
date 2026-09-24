@@ -47,6 +47,11 @@ public:
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
+    /// The served ids whose engine worker has died for good (see `GenerationService::healthy`).
+    /// Empty while every attached engine is serving. /health answers 503 while it is not, and
+    /// the server process exits (server/main.cpp), so a supervisor restarts it.
+    [[nodiscard]] std::vector<std::string> failed_models() const;
+
 private:
     friend struct HttpServerTestAccess;
     // Serialize namespace changes across the independently locked model services.

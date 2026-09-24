@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/device_memory_error.h"
 #include "core/elastic_kv_region.h"
 
 #include <cuda.h>
@@ -115,12 +116,110 @@ static void test_wake_retry(sinfer::DeviceContext& device) {
     }
 }
 
+// What the region reads as free device memory in the cases below.
+std::size_t g_probe_free = std::size_t{1} << 40;
+std::size_t probe_free() { return g_probe_free; }
+
+// Out of memory on demand (SUROGATE-CHANGES #16): the region gives back the granules no page
+// uses and tries again; with nothing to give back the failure is a DeviceOutOfMemory, which the
+// executor recovers from, and nothing leaks.
+static void test_out_of_memory_on_demand(sinfer::DeviceContext& device) {
+    constexpr std::size_t quantum = 2ULL << 20;
+    const int baseline = live_handles;
+    {
+        sinfer::ElasticKvRegion region({
+            .device = device.device, .fence_stream = device.stream, .bytes = 4 * quantum,
+            .page_count = 4, .granule_pages = 1, .reserve_granules = 2,
+            .planes = {{0, quantum}}});
+        region.wait_idle();
+        region.acquire_page(0);
+        region.wait_idle();
+        require(region.mapped_granules() == 3, "the reserve keeps two free granules mapped");
+        // Page 3 lies past the reserve. Its first cuMemCreate fails; the free granules go back
+        // and the retry maps it.
+        fail_create_after = 1;
+        region.acquire_page(3);
+        require(fail_create_after == 0, "on-demand fault was not injected");
+        require(region.mapped_bytes() >= 2 * quantum, "page 3 was not mapped after the retry");
+        region.wait_idle();
+        region.release_page(3);
+        region.release_page(0);
+        region.wait_idle();
+    }
+    require(live_handles == baseline, "reclaim and retry leaked an allocation handle");
+    {
+        sinfer::ElasticKvRegion region({
+            .device = device.device, .fence_stream = device.stream, .bytes = 2 * quantum,
+            .page_count = 2, .granule_pages = 1, .reserve_granules = 0,
+            .planes = {{0, quantum}}});
+        region.wait_idle();
+        region.acquire_page(0);
+        fail_create_after = 1;
+        bool typed = false;
+        try { region.acquire_page(1); } catch (const sinfer::DeviceOutOfMemory&) { typed = true; }
+        require(typed && fail_create_after == 0, "out of memory with nothing to reclaim was not a DeviceOutOfMemory");
+        require(region.mapped_granules() == 1, "the failed map changed the mapping");
+        region.acquire_page(1);
+        region.wait_idle();
+        require(region.mapped_granules() == 2, "the page could not be mapped once memory returned");
+        region.release_page(1);
+        region.release_page(0);
+        region.wait_idle();
+    }
+    require(live_handles == baseline, "a refused map leaked an allocation handle");
+}
+
+// The mapped footprint stays within the cap that automatic sizing planned for: the reserve does
+// not map past it, a free granule is traded for the one demand needs, and with none to trade the
+// map goes past the cap only while the device keeps the headroom free.
+static void test_mapping_stays_within_the_cap(sinfer::DeviceContext& device) {
+    constexpr std::size_t quantum = 2ULL << 20;
+    const int baseline = live_handles;
+    g_probe_free = std::size_t{1} << 40;
+    {
+        sinfer::ElasticKvRegion region({
+            .device = device.device, .fence_stream = device.stream, .bytes = 4 * quantum,
+            .page_count = 4, .granule_pages = 1, .reserve_granules = 4, .cap_pages = 2,
+            .headroom_bytes = 8 * quantum, .free_bytes_probe = &probe_free,
+            .planes = {{0, quantum}}});
+        region.wait_idle();
+        require(region.mapped_granules() == 2, "the reserve mapped past the cap");
+        region.acquire_page(0);
+        region.acquire_page(1);
+        region.wait_idle();
+        require(region.mapped_granules() == 2, "two pages in use map two granules");
+        region.release_page(1); // kept mapped: it is inside the reserve
+        region.wait_idle();
+        require(region.mapped_granules() == 2, "the emptied granule stays mapped for reuse");
+        region.acquire_page(3); // at the cap: granule 1 is traded for granule 3
+        region.wait_idle();
+        require(region.mapped_granules() == 2, "demand at the cap went past it with a free granule to trade");
+        // Pages 0 and 3 in use, nothing free to trade. Short of the headroom: refused.
+        g_probe_free = 8 * quantum;
+        bool refused = false;
+        try { region.acquire_page(1); } catch (const sinfer::DeviceOutOfMemory&) { refused = true; }
+        require(refused, "a map past the cap was not refused with the headroom at stake");
+        require(region.mapped_granules() == 2, "the refused map changed the mapping");
+        // With the headroom free it goes ahead.
+        g_probe_free = 9 * quantum;
+        region.acquire_page(1);
+        region.wait_idle();
+        require(region.mapped_granules() == 3, "a map past the cap was refused with memory to spare");
+        for (const int page : {0, 1, 3}) { region.release_page(page); }
+        region.wait_idle();
+    }
+    g_probe_free = std::size_t{1} << 40;
+    require(live_handles == baseline, "the cap cases leaked an allocation handle");
+}
+
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { return 77; }
     try {
         sinfer::DeviceContext device(0);
         test_wake_retry(device);
+        test_out_of_memory_on_demand(device);
+        test_mapping_stays_within_the_cap(device);
         constexpr std::size_t quantum = 2ULL << 20;
         for (const bool retry : {false, true}) {
             for (int plane = 0; plane < 3; ++plane) {

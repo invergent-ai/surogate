@@ -1,6 +1,7 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 
 #include "core/device.h"
+#include "core/device_memory_error.h"
 #include "core/engine_context.h"
 #include "ops/linear/ggml/ggml_linear.h"
 #include "ops/linear/ggml/ggml_q8_1.h"
@@ -141,7 +142,16 @@ void* scratch_for(std::size_t bytes, cudaStream_t stream) {
     // are a few MiB at most and are counted in scratch_bytes().
     const std::size_t grown = round_up(bytes, std::size_t{1} << 20);
     void* data              = nullptr;
-    CUDA_CHECK(cudaMalloc(&data, grown));
+    if (const cudaError_t status = cudaMalloc(&data, grown); status != cudaSuccess) {
+        // Out of memory mid-round is recoverable: the executor fails that round's requests and
+        // goes on, and the next wide round tries the growth again.
+        if (status == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw DeviceOutOfMemory("ggml linear: out of device memory growing the activation "
+                                    "scratch to " + std::to_string(grown >> 20) + " MiB");
+        }
+        CUDA_CHECK(status);
+    }
     state.retired_bytes += scratch.bytes;
     scratch.data  = data;
     scratch.bytes = grown;

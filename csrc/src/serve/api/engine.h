@@ -172,6 +172,11 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    /// False once the engine's worker has stopped for good on a fatal error: every request is
+    /// refused from then on and nothing restarts it inside the process. A round that merely ran
+    /// out of device memory does not make an engine unhealthy; it fails that round's requests
+    /// and goes on.
+    [[nodiscard]] bool healthy() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
 

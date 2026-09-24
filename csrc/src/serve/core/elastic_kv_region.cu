@@ -1,12 +1,14 @@
 #include "core/elastic_kv_region.h"
 
 #include "core/device.h"
+#include "core/device_memory_error.h"
 #include "core/engine_context.h"
 #include "core/sleep.h"
 
 #include <cuda.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -131,9 +133,106 @@ struct ElasticKvRegion::Impl {
 
     // ---- device mapping (caller holds mutex) ----
 
-    void map_granule(std::uint32_t g) {
+    /// Fault injection for tests (SUROGATE_SERVE_FAULT_KV_OOM=N): the N-th on-demand map in
+    /// this process fails once as if the device were out of memory. Not for production use.
+    static bool fault_injected_oom() {
+        static const long target = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_FAULT_KV_OOM");
+            return raw == nullptr ? 0L : std::strtol(raw, nullptr, 10);
+        }();
+        static std::atomic<long> maps{0};
+        const bool inject = target > 0 && maps.fetch_add(1) + 1 == target;
+        if (inject) {
+            std::fprintf(stderr, "elastic kv: injected out-of-memory (SUROGATE_SERVE_FAULT_KV_OOM=%ld)\n", target);
+        }
+        return inject;
+    }
+
+    /// Give back up to `at_most` mapped granules no page uses (the reserve, and granules waiting
+    /// for their unmap job), highest first: the pool hands out low page ids first, so those are
+    /// the ones demand reaches last. The engine's stream is drained first, so nothing still in
+    /// flight can touch them; inside a capture that is impossible, and nothing is released.
+    /// Returns the granules released. Executor thread only, with the mutex held.
+    std::uint32_t reclaim_free_granules(std::uint32_t at_most = ~std::uint32_t{0}) {
+        // A null fence stream is the legacy stream, which release_page fences on.
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(spec.fence_stream, &capturing) != cudaSuccess ||
+            capturing != cudaStreamCaptureStatusNone) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (cudaStreamSynchronize(spec.fence_stream) != cudaSuccess) { return 0; }
+        std::uint32_t released = 0;
+        for (std::uint32_t g = granules; g-- > 0 && released < at_most;) {
+            if (state[g].mapped && state[g].used_pages == 0) {
+                unmap_granule(g);
+                ++released;
+            }
+        }
+        return released;
+    }
+
+    std::uint32_t mapped_granule_count() const noexcept {
+        std::uint32_t count = 0;
+        for (const Granule& granule : state) { count += granule.mapped ? 1U : 0U; }
+        return count;
+    }
+
+    /// Granules the region may hold mapped at once: its committed cap, or under overcommit the
+    /// larger entitlement the device gate granted. Automatic KV sizing plans the device around
+    /// that many bytes and leaves the rest to the engine's other allocations, so the reserve and
+    /// the emptied granules kept for reuse have to fit inside it too. Mapping past it is what
+    /// filled the device in the 2026-09-24 fuzz run: 951 pages in use, 1,072 mapped, a cap of
+    /// 1,010, and the next map failed.
+    std::uint32_t mapped_granule_limit() const noexcept {
+        std::size_t bytes = 0;
+        {
+            const std::lock_guard<std::mutex> ledger_lock(ledger_mutex());
+            const auto it = ledger().find(this);
+            if (it == ledger().end()) { return granules; }
+            bytes = std::max(it->second.cap, it->second.entitled);
+        }
+        if (granule_bytes == 0) { return granules; }
+        return static_cast<std::uint32_t>(
+            std::min<std::size_t>(granules, (bytes + granule_bytes - 1) / granule_bytes));
+    }
+
+    std::size_t device_free_bytes() const noexcept {
+        return spec.free_bytes_probe != nullptr ? spec.free_bytes_probe()
+                                                : region_device_free_bytes(spec.device);
+    }
+
+    /// Before an on-demand map at the limit: trade a granule no page uses for the one demand
+    /// needs. With none to trade -- every mapped granule holds a page, and the pool's lowest free
+    /// page lies in an unmapped one -- the map goes past the plan only while the device keeps
+    /// the headroom free; otherwise it is refused as out of memory, which the executor recovers
+    /// from, instead of taking memory a workspace or a graph capture was promised.
+    void make_room_for_demand() {
+        const std::uint32_t limit = mapped_granule_limit();
+        const std::uint32_t count = mapped_granule_count();
+        if (count < limit) { return; }
+        if (reclaim_free_granules(count - limit + 1) != 0 && mapped_granule_count() < limit) {
+            return;
+        }
+        const std::size_t free_bytes = device_free_bytes();
+        if (free_bytes >= spec.headroom_bytes + granule_bytes) { return; }
+        throw DeviceOutOfMemory(
+            "elastic kv: the KV cache is at its planned size (" + std::to_string(count) +
+            " granules mapped, " + std::to_string((count * granule_bytes) >> 20) +
+            " MiB), every mapped granule holds pages, and mapping another would leave less than " +
+            std::to_string(spec.headroom_bytes >> 20) + " MiB free on the device (" +
+            std::to_string(free_bytes >> 20) + " MiB free)");
+    }
+
+    /// Map granule `g` on every plane. `on_demand` is the executor's own call for pages it is
+    /// handing out: when the device is out of memory it first reclaims the free granules and
+    /// tries once more, and a failure that remains is a `DeviceOutOfMemory` the executor can
+    /// recover from. The worker's reserve refill never reclaims (it would only trade one free
+    /// granule for another).
+    void map_granule(std::uint32_t g, bool on_demand = false) {
         Granule& granule = state[g];
         if (granule.mapped) { return; }
+        if (on_demand) { make_room_for_demand(); }
         const CUmemAllocationProp prop = allocation_prop(spec.device);
         CUmemAccessDesc access         = {};
         access.location                = prop.location;
@@ -143,10 +242,30 @@ struct ElasticKvRegion::Impl {
             const std::size_t span = spec.planes[p].page_bytes * spec.granule_pages;
             const CUdeviceptr at   = va + spec.planes[p].offset + span * g;
             CUmemGenericAllocationHandle handle{};
-            const CUresult created = cuMemCreate(&handle, span, &prop, 0);
+            const bool injected = on_demand && p == 0 && fault_injected_oom();
+            // An injected failure stands for a card that stays full: no reclaim, no retry.
+            CUresult created = injected ? CUDA_ERROR_OUT_OF_MEMORY : cuMemCreate(&handle, span, &prop, 0);
+            if (created == CUDA_ERROR_OUT_OF_MEMORY && on_demand && !injected) {
+                const std::uint32_t released = reclaim_free_granules();
+                if (released != 0) {
+                    std::fprintf(stderr,
+                                 "elastic kv: out of device memory mapping granule %u; released "
+                                 "%u free granules (%zu MiB) and retrying\n",
+                                 g, released, (released * granule_bytes) >> 20);
+                    created = cuMemCreate(&handle, span, &prop, 0);
+                }
+            }
             if (created != CUDA_SUCCESS) {
                 for (std::size_t q = 0; q < p; ++q) { unmap_plane(g, q); }
                 granule.handles.clear();
+                if (created == CUDA_ERROR_OUT_OF_MEMORY) {
+                    std::size_t free_bytes = 0, total_bytes = 0;
+                    (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+                    throw DeviceOutOfMemory("cuMemCreate failed: out of memory mapping " +
+                                            std::to_string(span >> 20) + " MiB of KV cache (" +
+                                            std::to_string(free_bytes >> 20) +
+                                            " MiB free on the device)");
+                }
                 driver_check(created, "cuMemCreate");
             }
             CUresult mapped_result = cuMemMap(at, span, 0, handle, 0);
@@ -158,6 +277,9 @@ struct ElasticKvRegion::Impl {
                 (void)cuMemRelease(handle);
                 for (std::size_t q = 0; q < p; ++q) { unmap_plane(g, q); }
                 granule.handles.clear();
+                if (mapped_result == CUDA_ERROR_OUT_OF_MEMORY) {
+                    throw DeviceOutOfMemory("cuMemMap failed: out of memory mapping KV cache");
+                }
                 driver_check(mapped_result, "cuMemMap");
             }
             granule.handles[p] = handle;
@@ -216,8 +338,12 @@ struct ElasticKvRegion::Impl {
                 // Map the lowest unmapped granules until the reserve is met. The pool hands out
                 // low page ids first, so these are the granules demand reaches next.
                 if (!asleep && !elastic_kv_device_pressure(spec.device)) {
-                    for (std::uint32_t g = 0;
-                         g < granules && mapped_free_count() < spec.reserve_granules; ++g) {
+                    // Never past the limit: a reserve granule is still device memory.
+                    const std::uint32_t limit = mapped_granule_limit();
+                    for (std::uint32_t g = 0; g < granules &&
+                                              mapped_free_count() < spec.reserve_granules &&
+                                              mapped_granule_count() < limit;
+                         ++g) {
                         if (!state[g].mapped) {
                             try {
                                 map_granule(g);
@@ -366,7 +492,7 @@ void ElasticKvRegion::acquire_page(std::int32_t page) {
     if (impl.asleep) { throw std::logic_error("elastic kv region: acquire while asleep"); }
     Impl::Granule& granule = impl.state[g];
     ++granule.generation;
-    if (!granule.mapped) { impl.map_granule(g); } // demand outran the reserve: map here and now
+    if (!granule.mapped) { impl.map_granule(g, /*on_demand=*/true); } // demand outran the reserve
     ++granule.used_pages;
     if (granule.used_pages == 1) { impl.post(Impl::Job{Impl::Job::Kind::Trim}); } // top the reserve up
 }
@@ -404,6 +530,15 @@ void ElasticKvRegion::release_page(std::int32_t page) noexcept try {
 std::size_t ElasticKvRegion::mapped_bytes() const noexcept {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->mapped;
+}
+
+std::uint32_t ElasticKvRegion::granule_limit() const noexcept { return impl_->mapped_granule_limit(); }
+
+std::vector<std::uint8_t> ElasticKvRegion::mapped_granule_mask() const {
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::vector<std::uint8_t> mask(impl_->granules, 0);
+    for (std::uint32_t g = 0; g < impl_->granules; ++g) { mask[g] = impl_->state[g].mapped ? 1 : 0; }
+    return mask;
 }
 
 std::uint32_t ElasticKvRegion::mapped_granules() const noexcept {
@@ -541,7 +676,15 @@ std::size_t ElasticKvRegion::wake() {
         CUDA_CHECK(cudaSetDevice(impl.spec.device));
         for (std::uint32_t g = 0; g < impl.granules; ++g) {
             Impl::Granule& granule = impl.state[g];
-            if (granule.used_pages == 0) { continue; }
+            if (granule.used_pages == 0) {
+                // Emptied while asleep (its requests were failed or cancelled meanwhile): nothing
+                // to restore, and the pinned backup is no longer anyone's.
+                for (void* backup : granule.backup) {
+                    if (backup != nullptr) { (void)cudaFreeHost(backup); }
+                }
+                granule.backup.clear();
+                continue;
+            }
             if (granule.backup.empty()) {
                 if (!granule.mapped) { throw std::logic_error("live sleeping granule has no backup"); }
                 continue; // completed by an earlier wake attempt

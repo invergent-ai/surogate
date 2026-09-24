@@ -196,6 +196,50 @@ int pool_cases(sinfer::DeviceContext& device) {
     return failures;
 }
 
+// A fragmented pool at its cap (SUROGATE-CHANGES #16): the pages in use leave a free run only
+// past the mapped granules. Taking that run would map a granule beyond the cap the cache was
+// sized for; the pool takes the free pages of the granules already holding pages instead.
+int pool_cap_cases(sinfer::DeviceContext& device) {
+    int failures = 0;
+    // As above: 256 pages per granule, four granules. A cap of 512 pages allows two.
+    sinfer::LayoutBuilder builder;
+    sinfer::PagedKVPoolLayout layout =
+        sinfer::plan_paged_kv_pool(builder, {.page_group_count      = 1024,
+                                             .logical_page_capacity = 1024,
+                                             .table_rows            = 3,
+                                             .elastic               = true,
+                                             .physical_page_cap     = 512,
+                                             .planes = {{sinfer::DType::I8, 64, 2},
+                                                        {sinfer::DType::I8, 64, 2}}});
+    sinfer::DeviceArena arena(builder.finish(256, "test arena"));
+    const sinfer::PagedKVElasticOptions options{
+        .device = device.device, .fence_stream = device.stream, .reserve_granules = 0};
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout, &options);
+    sinfer::ElasticKvRegion* region = pool.elastic_region();
+    if (region == nullptr) { return failures + expect(false, "the pool owns a region"); }
+    region->wait_idle();
+    failures += expect(region->granule_limit() == 2, "a 512-page cap is two granules");
+
+    auto first = pool.reserve(200);
+    first.materialize_pages(200); // pages 0..199, granule 0
+    auto second = pool.reserve(200);
+    second.materialize_pages(200); // pages 200..399, granules 0 and 1
+    first.release();               // granule 0 keeps pages 200..255
+    region->wait_idle();
+    // 250 pages: no free run of that length inside granules 0 and 1; 400..649 would add granule 2.
+    auto third = pool.reserve(250);
+    third.materialize_pages(250);
+    region->wait_idle();
+    failures += expect(pool.occupancy().pages_in_use == 450, "450 pages in use");
+    failures += expect(region->mapped_granules() == 2,
+                       "a fragmented pool at its cap mapped a granule past it");
+    third.release();
+    second.release();
+    region->wait_idle();
+    failures += expect(pool.occupancy().pages_in_use == 0, "pages returned");
+    return failures;
+}
+
 // Overcommit: the cap is a floor, growth past it is gated on what the device has free, and a
 // refusal marks the device and asks the other regions there for their reserves.
 std::size_t g_fake_free = 0;
@@ -361,6 +405,7 @@ int main() {
         sinfer::DeviceContext device(0);
         int failures = region_cases(device);
         failures += pool_cases(device);
+        failures += pool_cap_cases(device);
         failures += overcommit_cases(device);
         failures += pool_overcommit_cases(device);
         if (count >= 2) { failures += foreign_device_release_cases(); }

@@ -2,6 +2,7 @@
 
 // Configurable request scheduling and bounded batched decode execution for every backend.
 
+#include "core/device_memory_error.h"
 #include "core/engine_context.h"
 #include "api/types.h"
 #include "runtime/contract/types.h"
@@ -263,6 +264,13 @@ public:
         return published_stats_;
     }
 
+    /// False once the worker loop has ended on a fatal error: every request from then on is
+    /// refused, so the server reports itself unhealthy and exits (see `Engine::healthy`).
+    [[nodiscard]] bool worker_alive() const {
+        std::lock_guard lock(queue_mutex_);
+        return !failed_;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -287,6 +295,7 @@ private:
         snapshot.kv_pages_resident_at_granule = kv.resident_pages_at_granule;
         snapshot.kv_pages_mapped            = kv.mapped_pages;
         snapshot.kv_page_bytes              = kv.page_bytes;
+        snapshot.device_oom_rounds          = device_oom_rounds_;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -1035,6 +1044,18 @@ private:
             }
             slots_[lane].reset();
             invalidate_lane_plans(lane);
+            if (is_device_oom(error)) {
+                // Survivable, and only this request asked for the memory: its lane is cleaned up
+                // above, so it alone fails, in words a client retries, and the lanes decoding
+                // beside it carry on.
+                complete_error(request, device_oom_failure());
+                if constexpr (!kPipelined) {
+                    note_device_oom("admitting a request", error, 1);
+                    relieve_device_memory();
+                    return AdmissionProgress::RanGpuUnit;
+                }
+                throw;
+            }
             complete_error(request, error);
             throw;
         }
@@ -1683,6 +1704,120 @@ private:
     /// text is not lost -- the worker prints it on its `engine worker loop fatal:` line before
     /// calling this. A `RequestError` is already the engine's client-facing vocabulary (this is
     /// also the shutdown path), so it is passed through untouched.
+    [[nodiscard]] static bool is_device_oom(const std::exception_ptr& error) noexcept {
+        if (!error) { return false; }
+        try {
+            std::rethrow_exception(error);
+        } catch (const DeviceOutOfMemory&) {
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    /// What a request is told when its round ran out of device memory: the engine is still
+    /// serving, so this is a capacity refusal (HTTP 429), which clients retry and OpenRouter does
+    /// not count as downtime -- not the 503 of an engine that is gone.
+    [[nodiscard]] static std::exception_ptr device_oom_failure() noexcept {
+        return std::make_exception_ptr(RequestError(
+            RequestErrorKind::Overloaded,
+            "the GPU ran out of memory while serving this request; the engine is still serving "
+            "and the request may be retried"));
+    }
+
+    /// A round could not get device memory (`DeviceOutOfMemory`: in practice the KV pool mapping
+    /// a granule when demand outran the reserve, after it has already given back its free
+    /// granules and tried again). The CUDA context is intact, so this is not the end of the
+    /// worker: every request holding a lane fails with a retryable error and its lane is aborted,
+    /// which returns its KV pages; the per-round state is reset; requests still queued stay
+    /// queued; and the loop goes on. Every lane is failed, not only the one that asked for
+    /// memory, because the round may have queued work for all of them before it stopped.
+    ///
+    /// Returns false when the device turns out not to be usable after all (a sticky error when
+    /// draining it), in which case everything has been failed as a fatal would.
+    bool recover_from_device_oom(const char* what) noexcept {
+        std::size_t in_flight = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            in_flight += slots_[lane] != nullptr ? 1U : 0U;
+        }
+        std::fprintf(stderr,
+                     "engine round #%llu (kind=%s batch=%u prefill_lane=%u lanes=%u) ran out of "
+                     "device memory: %s; failing the %zu requests in flight with 429 and "
+                     "continuing\n",
+                     static_cast<unsigned long long>(last_round_.index), last_round_.kind,
+                     last_round_.batch, last_round_.prefill_lane, max_concurrency_, what, in_flight);
+        std::fflush(stderr);
+        // Let whatever the round already queued finish before its lanes' pages are returned.
+        const cudaError_t drained = cudaDeviceSynchronize();
+        if (drained != cudaSuccess) {
+            std::fprintf(stderr, "engine worker loop fatal: device unusable after out of memory: %s\n",
+                         cudaGetErrorString(drained));
+            fail_all(std::make_exception_ptr(std::runtime_error(cudaGetErrorString(drained))));
+            return false;
+        }
+        const std::exception_ptr error = device_oom_failure();
+        try {
+            std::scoped_lock execution_lock(execution_mutex_);
+            if (!prefill_lanes_.empty()) {
+                instance_.request_memory.deactivate();
+                transient_owner_.reset();
+                prefill_lanes_.clear();
+            }
+            protection_.reset();
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] != nullptr) {
+                    instance_.program->abort_lane(lane);
+                    complete_error(slots_[lane], error);
+                    slots_[lane].reset();
+                    invalidate_lane_plans(lane);
+                }
+            }
+            relieve_device_memory();
+            ++device_oom_rounds_;
+            publish_runtime_stats();
+        } catch (...) {
+            fail_all(std::current_exception());
+            return false;
+        }
+        return true;
+    }
+
+    /// An out-of-memory that cost only the request being admitted (see try_admit): said once,
+    /// counted with the rounds.
+    void note_device_oom(const char* during, const std::exception_ptr& error,
+                         std::size_t failed) noexcept {
+        std::string what = "unknown";
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception& exception) {
+            what = exception.what();
+        } catch (...) {
+        }
+        std::fprintf(stderr,
+                     "engine ran out of device memory %s: %s; failing %zu request with 429 and "
+                     "continuing\n",
+                     during, what.c_str(), failed);
+        std::fflush(stderr);
+        ++device_oom_rounds_;
+        publish_runtime_stats();
+    }
+
+    /// After an out-of-memory: give back what idle lanes hold (the prefix cache's retained
+    /// lanes) so the next round has room, instead of meeting the same shortage again. The
+    /// caller holds the execution lock. Best effort.
+    void relieve_device_memory() noexcept {
+        try {
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane)) {
+                    instance_.program->evict_retained_lane(lane);
+                    invalidate_lane_plans(lane);
+                }
+            }
+            instance_.program->kv_settle();
+        } catch (...) {
+        }
+    }
+
     [[nodiscard]] static std::exception_ptr client_facing_failure(std::exception_ptr error) noexcept {
         if (!error) {
             return std::make_exception_ptr(
@@ -1728,7 +1863,12 @@ private:
 
     void worker_loop() noexcept {
         // This thread was born with the process default device, not the engine's.
-        if (cudaSetDevice(device_) != cudaSuccess) { return; }
+        if (const cudaError_t selected = cudaSetDevice(device_); selected != cudaSuccess) {
+            std::fprintf(stderr, "engine worker loop fatal: cudaSetDevice(%d): %s\n", device_,
+                         cudaGetErrorString(selected));
+            fail_all(std::make_exception_ptr(std::runtime_error(cudaGetErrorString(selected))));
+            return;
+        }
         // Every round this thread runs must resolve op-plane state (Marlin
         // scratch, LoRA banks) in this engine's context -- the same one target
         // construction bound, so captured-graph addresses and eager calls agree.
@@ -1791,6 +1931,7 @@ private:
                     }
                 }
                 cancel_active_requests(cancelled_at_boundary);
+                inject_worker_fault();
                 if constexpr (kPipelined) {
                     seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
                     seg_timer_.maybe_report();
@@ -1910,6 +2051,22 @@ private:
                     previous_unit_was_decode = true;
                     continue;
                 }
+            } catch (const DeviceOutOfMemory& error) {
+                if constexpr (kPipelined) {
+                    // A pipelined engine has stage flights in flight on other devices, which this
+                    // recovery does not unwind: still fatal there.
+                    std::fprintf(stderr,
+                                 "engine worker loop fatal: %s [last round #%llu kind=%s, pipelined]\n",
+                                 error.what(), static_cast<unsigned long long>(last_round_.index),
+                                 last_round_.kind);
+                    fail_all(std::current_exception());
+                    return;
+                } else {
+                    // Survivable: fail the round's requests, keep the queue, keep serving.
+                    if (!recover_from_device_oom(error.what())) { return; }
+                    previous_unit_was_decode = false;
+                    continue;
+                }
             } catch (const std::exception& error) {
                 std::fprintf(stderr,
                              "engine worker loop fatal: %s [last round #%llu kind=%s batch=%u "
@@ -1924,6 +2081,20 @@ private:
                 fail_all(std::current_exception());
                 return;
             }
+        }
+    }
+
+    /// Fault injection for tests (SUROGATE_SERVE_FAULT_WORKER_FATAL=N): once N rounds have run,
+    /// the next pass of the worker loop throws an error the worker cannot survive, so the
+    /// dead-worker path (/health 503, the process exiting non-zero) can be exercised. Not for
+    /// production use.
+    void inject_worker_fault() const {
+        static const unsigned long long target = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_FAULT_WORKER_FATAL");
+            return raw == nullptr ? 0ULL : std::strtoull(raw, nullptr, 10);
+        }();
+        if (target != 0 && last_round_.index >= target) {
+            throw std::runtime_error("injected worker fault (SUROGATE_SERVE_FAULT_WORKER_FATAL)");
         }
     }
 
@@ -2060,6 +2231,7 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    std::uint64_t device_oom_rounds_ = 0; ///< rounds recovered from out of device memory
     ops::EngineOpsContext* ops_context_ = nullptr;
     int device_ = 0;
     std::thread worker_;

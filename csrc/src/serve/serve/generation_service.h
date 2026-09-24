@@ -174,6 +174,9 @@ public:
 
     [[nodiscard]] sinfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    /// False once the engine's worker has died (see `sinfer::Engine::healthy`).
+    [[nodiscard]] bool healthy() const { return engine_->healthy(); }
+
     [[nodiscard]] sinfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

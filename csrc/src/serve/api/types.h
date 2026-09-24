@@ -817,6 +817,10 @@ struct RuntimeStats {
     // committed to a retained GPU prefix. A benign retry, but a rising count means admission
     // is spending rounds on a head it cannot place, so it is worth a graph.
     std::uint64_t admission_unblocked_heads    = 0;
+    // Rounds that ran out of device memory and were recovered from: their requests were failed
+    // with a retryable error and the engine went on. A rising count means the card is too full
+    // for the traffic (KV capacity, workspace or another process), not that anything crashed.
+    std::uint64_t device_oom_rounds            = 0;
 };
 
 struct LoadSummary {

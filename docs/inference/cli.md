@@ -55,6 +55,10 @@ from earlier tokens; its capacity affects how many requests can run together.
 | `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
 | `--enforce-eager` | off | Disable CUDA graphs for debugging |
 
+With `auto`, the cache grows with demand up to the capacity it was sized for. The 1024 MiB left
+over stays free for CUDA graphs and working buffers. The cache goes past its capacity only when
+its pages are too scattered to fit, and then only while that 1024 MiB is still free.
+
 When `--max-model-len` is automatic, omitted `--kv-capacity` also defaults to `auto`. When
 context is explicit, omitted cache capacity defaults to that same token count. Use
 `--kv-capacity auto` explicitly to make more cache available for simultaneous requests.

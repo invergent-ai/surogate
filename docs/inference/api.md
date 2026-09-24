@@ -39,13 +39,21 @@ the server reports, which is how you keep a client's hard-coded model string wor
 | `GET` | `/is_sleeping` | Sleep state (`?model=NAME`) |
 | `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora`; `?model=NAME` targets a specific model on multi-model servers) |
 | `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name (`?model=NAME`) |
-| `GET` | `/health` | Process health; also answers while a model sleeps |
+| `GET` | `/health` | Process health; also answers while a model sleeps. `503` once an inference engine has stopped (see below) |
 | `GET` | `/kv_stats` | Cache memory use and active or waiting requests per model |
 | `GET` | `/metrics` | Prometheus counters and gauges for throughput, requests, KV, weights, and sleep state |
 | `POST` | `/v1/embeddings` | Embeddings — served by `surogate serve --embed`, a separate process |
 
 On a server with several models, add `?model=NAME` to sleep, wake, sleep-state, and adapter
 management requests to select the model.
+
+If the GPU runs out of memory, the server does not stop. When it happens while a request is being
+admitted, only that request fails. When it happens in the middle of a batch, every request being
+generated at that moment fails. Failed requests get `429` with error code `server_overloaded`,
+which clients may retry. Requests still waiting in the queue, and later ones, are served as
+usual. An engine that fails in a way it cannot recover from makes `/health`
+answer `503` with `"status": "unavailable"`. About two seconds later the process exits with
+status 1, so a supervisor such as systemd can restart it and health checks stop routing to it.
 
 ## Chat Completions
 
