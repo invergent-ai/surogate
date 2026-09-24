@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -56,6 +57,7 @@ public:
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_round_rows_(decode_batch_capacity(options.max_concurrency, options.speculative.backend)),
+          speculative_backend_(options.speculative.backend),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -103,6 +105,31 @@ public:
     [[nodiscard]] std::unique_lock<std::mutex> pause_execution() {
         return std::unique_lock<std::mutex>(execution_mutex_);
     }
+
+    /// While a group is open on this thread, this executor's submissions are held back and join
+    /// the queue together when it closes, in one step, so admission sees a batch (a decision's
+    /// rows) whole and prefills its rows together. Pausing execution did that before, but a busy
+    /// worker takes the execution lock again at once, so a submission that waited on it arrived
+    /// only when the engine had gone idle -- one decision at a time (#14).
+    class SubmissionGroup {
+    public:
+        explicit SubmissionGroup(ConcurrentExecutor& owner)
+            : owner_(owner), previous_(std::exchange(open_group_, this)) {}
+        ~SubmissionGroup() {
+            assert(open_group_ == this && "submission groups close in the order they opened");
+            open_group_ = previous_;
+            owner_.enqueue_group(held_);
+        }
+        SubmissionGroup(const SubmissionGroup&)            = delete;
+        SubmissionGroup& operator=(const SubmissionGroup&) = delete;
+
+    private:
+        friend class ConcurrentExecutor;
+        ConcurrentExecutor& owner_;
+        SubmissionGroup* previous_;
+        std::vector<std::shared_ptr<Request>> held_;
+    };
+    [[nodiscard]] SubmissionGroup open_group() { return SubmissionGroup(*this); }
     /// Give back what idling holds: every retained (prefix-cache) lane is evicted, so an
     /// elastic pool's granules can go back. Runs between rounds; the scheduler calls it on an
     /// idle model before it would sleep one.
@@ -199,39 +226,65 @@ public:
         }
 
         std::uint64_t request_id = 0;
+        // A reserved place is already counted in outstanding_ (reserve()), and goes back to its
+        // reservation rather than to the queue.
+        const std::shared_ptr<SubmissionReservation> reservation =
+            options.execution.reservation && options.execution.reservation->issuer() == this &&
+                    options.execution.reservation->take()
+                ? options.execution.reservation : nullptr;
+        // Another executor's places, or none left: this request takes an ordinary place, and
+        // keeps no reference to places it does not use.
+        if (!reservation) { options.execution.reservation.reset(); }
         {
             std::lock_guard lock(queue_mutex_);
-            if (!accepting_) {
-                throw RequestError(RequestErrorKind::Unavailable,
-                                   "the model is asleep; wake it with POST /wake_up");
-            }
-            if (stopping_ || failed_) {
+            if (!accepting_ || stopping_ || failed_) {
+                if (reservation) { reservation->give_back(); }
+                if (!accepting_) {
+                    throw RequestError(RequestErrorKind::Unavailable,
+                                       "the model is asleep; wake it with POST /wake_up");
+                }
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
-            if (outstanding_ >= max_outstanding_) {
-                throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
+            if (!reservation) {
+                // The places the oldest waiting reservation needs are spoken for.
+                const std::size_t spoken = reservation_waiters_.empty() ? 0 : reservation_waiters_.front().count;
+                if (outstanding_ + spoken >= max_outstanding_) {
+                    throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
+                }
+                ++outstanding_;
             }
-            ++outstanding_;
             request_id = next_request_id_++;
         }
 
         std::shared_ptr<Request> request;
+        bool grouped = false;
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted, std::move(lifetime));
+            request->place = reservation;
+            for (SubmissionGroup* group = open_group_; group != nullptr && !grouped; group = group->previous_) {
+                if (&group->owner_ == this) {
+                    group->held_.push_back(request); // joins the queue with its group
+                    grouped = true;
+                }
+            }
         } catch (...) {
-            release_reserved_capacity();
+            if (reservation) { reservation->give_back(); } else { release_reserved_capacity(); }
             throw;
         }
-
+        if (grouped) { return Submission(*this, std::move(request)); }
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
+                if (reservation) {
+                    reservation->give_back();
+                } else {
+                    --outstanding_;
+                }
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
@@ -260,8 +313,15 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats stats;
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats = published_stats_;
+        }
+        // Read live: callers wait in reserve() while the worker, which publishes, may be idle.
+        std::lock_guard lock(queue_mutex_);
+        stats.reserving_requests = static_cast<std::uint32_t>(reservation_waiters_.size());
+        return stats;
     }
 
     /// False once the worker loop has ended on a fatal error: every request from then on is
@@ -277,6 +337,95 @@ public:
             instance_.program->reset_memory_peaks();
             instance_.request_memory.reset_peak();
         } catch (...) {}
+    }
+
+    /// Queue places taken for submissions that follow (Engine::reserve_submissions): a
+    /// multi-question decision takes the places its rows will need before its shared prefix runs,
+    /// so it never finds the queue full after that prefix has run on the GPU (#14). Waits for the
+    /// places until `deadline`, or until `cancelled` says the caller has gone.
+    [[nodiscard]] std::shared_ptr<SubmissionReservation>
+    reserve(std::uint32_t count, Clock::time_point deadline, const std::function<bool()>& cancelled) {
+        class Places final : public SubmissionReservation {
+        public:
+            explicit Places(ConcurrentExecutor& owner) : owner_(owner) {}
+            // Every submission that took a place holds this reservation, so they have all
+            // given their places back by now.
+            ~Places() override {
+                if (count_ != 0) { owner_.release_reserved_capacity(count_); }
+            }
+            /// The places are counted in outstanding_ from here on (under queue_mutex_).
+            void grant(std::uint32_t count) noexcept {
+                count_ = count;
+                left_.store(count);
+            }
+            bool take() noexcept override {
+                for (std::uint32_t left = left_.load(); left != 0;) {
+                    if (left_.compare_exchange_weak(left, left - 1)) { return true; }
+                }
+                return false;
+            }
+            void give_back() noexcept override { left_.fetch_add(1); }
+            const void* issuer() const noexcept override { return &owner_; }
+
+        private:
+            ConcurrentExecutor& owner_;
+            std::uint32_t count_ = 0;
+            std::atomic<std::uint32_t> left_{0};
+        };
+        if (count == 0 || count > max_outstanding_) {
+            throw RequestError(RequestErrorKind::Overloaded, "inference request queue is too small");
+        }
+        // Allocated first, so nothing can fail between counting the places and handing them out.
+        auto places = std::make_shared<Places>(*this);
+        std::unique_lock lock(queue_mutex_);
+        // First come, first served: only the oldest waiting reservation may take places, and the
+        // places it waits for are spoken for (submit), so a stream of single requests cannot
+        // starve it.
+        const std::uint64_t ticket = next_reservation_ticket_++;
+        reservation_waiters_.push_back(ReservationWaiter{ticket, count});
+        struct Leave { // leaves the line on every exit, a timeout or a cancel included
+            ConcurrentExecutor& owner;
+            std::unique_lock<std::mutex>& lock;
+            std::uint64_t ticket;
+            ~Leave() {
+                if (!lock.owns_lock()) { lock.lock(); }
+                auto& line = owner.reservation_waiters_;
+                line.erase(std::find_if(line.begin(), line.end(),
+                                        [&](const ReservationWaiter& w) { return w.ticket == ticket; }));
+                owner.places_cv_.notify_all();
+            }
+        };
+        {
+            const Leave leave{*this, lock, ticket};
+            const auto granted = [&] {
+                return reservation_waiters_.front().ticket == ticket && outstanding_ <= max_outstanding_ - count;
+            };
+            const auto closed = [&] { return !accepting_ || stopping_ || failed_; };
+            for (;;) {
+                if (!accepting_) {
+                    throw RequestError(RequestErrorKind::Unavailable,
+                                       "the model is asleep; wake it with POST /wake_up");
+                }
+                if (stopping_ || failed_) {
+                    throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
+                }
+                if (granted()) { break; }
+                if (Clock::now() >= deadline) {
+                    throw RequestError(RequestErrorKind::QueueTimeout,
+                                       "inference request expired while waiting for queue places");
+                }
+                lock.unlock(); // the caller's callback may take its own locks
+                const bool gone = cancelled && cancelled();
+                lock.lock();
+                if (gone) { throw RequestError(RequestErrorKind::Cancelled, "inference request was cancelled"); }
+                // Places freed while the callback ran are seen at once: the predicate is checked
+                // before waiting.
+                places_cv_.wait_for(lock, std::chrono::milliseconds(20), [&] { return granted() || closed(); });
+            }
+            outstanding_ += count;
+            places->grant(count);
+        }
+        return places;
     }
 
 private:
@@ -424,6 +573,8 @@ private:
         bool done              = false;
         bool consumer_released = false;
         bool capacity_released = false;
+        /// The reservation this request's queue place came from, if any (Engine::reserve_submissions).
+        std::shared_ptr<SubmissionReservation> place;
     };
 
     struct RoundMembership {
@@ -494,9 +645,57 @@ private:
         }
     }
 
-    void release_reserved_capacity() noexcept {
-        std::lock_guard lock(queue_mutex_);
-        if (outstanding_ != 0) { --outstanding_; }
+    static inline thread_local SubmissionGroup* open_group_ = nullptr;
+
+    /// A closing group's submissions join the queue in one step. The executor stopped or went to
+    /// sleep meanwhile: they fail, as a submission to it would, and give their places back.
+    void enqueue_group(std::vector<std::shared_ptr<Request>>& requests) noexcept {
+        if (requests.empty()) { return; }
+        bool refused = false;
+        bool asleep  = false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            asleep  = !accepting_;
+            refused = asleep || stopping_ || failed_;
+            if (!refused) {
+                for (auto& request : requests) { pending_.push_back(std::move(request)); }
+            }
+        }
+        if (refused) {
+            const char* why = asleep ? "the model is asleep; wake it with POST /wake_up"
+                                     : "inference engine is unavailable";
+            for (const auto& request : requests) {
+                try {
+                    complete_error(request, std::make_exception_ptr(
+                                                RequestError(RequestErrorKind::Unavailable, why)));
+                } catch (...) {}
+            }
+        }
+        requests.clear();
+        queue_cv_.notify_one();
+    }
+
+    void release_reserved_capacity(std::size_t places = 1) noexcept {
+        {
+            std::lock_guard lock(queue_mutex_);
+            outstanding_ -= std::min(outstanding_, places);
+        }
+        places_cv_.notify_all(); // reservations waiting for places (reserve)
+    }
+
+    /// A GPU-prefix readout (a decision's shared prefix or one of its questions): a mixed round
+    /// takes readouts or plain prompts, never both (`target_only`, request_plan_impl.h).
+    static bool is_readout(const Request& request) noexcept {
+        return request.options.execution.gpu_prefix || request.options.execution.save_gpu_prefix;
+    }
+
+    /// A finished request's place: back to its reservation, or to the queue.
+    void release_request_capacity(const std::shared_ptr<Request>& request) noexcept {
+        if (request->place) {
+            request->place->give_back();
+        } else {
+            release_reserved_capacity();
+        }
     }
 
     void release_consumer(const std::shared_ptr<Request>& request) noexcept {
@@ -509,7 +708,7 @@ private:
                 release                    = true;
             }
         }
-        if (release) { release_reserved_capacity(); }
+        if (release) { release_request_capacity(request); }
     }
 
     void abandon_request(std::shared_ptr<Request> request) noexcept {
@@ -549,7 +748,7 @@ private:
             request->error = std::move(error);
             request->done  = true;
         }
-        if (mark_completed(request)) { release_reserved_capacity(); }
+        if (mark_completed(request)) { release_request_capacity(request); }
         request->cv.notify_one();
     }
 
@@ -595,7 +794,7 @@ private:
             request->result = std::move(result);
             request->done   = true;
         }
-        if (mark_completed(request)) { release_reserved_capacity(); }
+        if (mark_completed(request)) { release_request_capacity(request); }
         request->cv.notify_one();
     }
 
@@ -820,9 +1019,10 @@ private:
         }
     }
 
-    void run_prefill_step() {
-        if (prefill_lanes_.empty()) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = prefill_lanes_.front();
+    /// One prefill step for one staged prompt: its next chunk, or, for a prompt already at its
+    /// end, the zero-suffix step that samples its first token.
+    void run_prefill_step(std::uint32_t lane) {
+        if (!prefill_lanes_.contains(lane)) { throw std::logic_error("no request owns staged prefill"); }
         const auto request       = slots_[lane];
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
@@ -1012,6 +1212,10 @@ private:
 
         const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
         bool target_started      = false;
+        // With the deferred first chunk (#30) staging a prompt runs nothing on the GPU: say so, so
+        // top_up_prefill_lanes and continuous admission (#41) go on staging the prompts that are
+        // waiting, and one round can prefill them together (#14).
+        bool ran_gpu_unit        = true;
         try {
             request->budget.emplace(summary.effective_output_tokens,
                                     summary.effective_limit_reason);
@@ -1046,9 +1250,13 @@ private:
                 prefill_lanes_.add(lane);
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-            if (first.processed_prompt_tokens != 0 || first.complete || cancel_at_boundary) {
+            const bool ran = first.processed_prompt_tokens != 0 || first.complete;
+            if (ran || cancel_at_boundary) {
                 resolve_prefill_step(request, first, cancel_at_boundary);
             }
+            // Pipelined and speculative engines keep counting an admission as a unit, and so
+            // stage one prompt per pass as before: staging many at once is not validated there.
+            ran_gpu_unit = ran || kPipelined || speculative_backend_ != SpeculativeBackend::None;
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -1073,7 +1281,7 @@ private:
             complete_error(request, error);
             throw;
         }
-        return AdmissionProgress::RanGpuUnit;
+        return ran_gpu_unit ? AdmissionProgress::RanGpuUnit : AdmissionProgress::ControlProgress;
     }
 
     AdmissionProgress try_admit_one() {
@@ -1140,6 +1348,12 @@ private:
             // The frozen media buffer is also outside the lane/page protection accounting.
             // Its owner releases it when prefill finishes, so retry admission at that boundary.
             if (instance_.program->kv_under_pressure() || transient_owner_) {
+                static const bool pack_trace = std::getenv("SUROGATE_SERVE_PACK_TRACE") != nullptr;
+                if (pack_trace) {
+                    std::fprintf(stderr, "pack-trace: head %llu waits: kv_pressure=%d transient_owner=%d\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 int(instance_.program->kv_under_pressure()), transient_owner_ ? int(*transient_owner_) : -1);
+                }
                 protection_.reset();
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
@@ -1347,10 +1561,7 @@ private:
                 if (owner == nullptr || owner->decode_ready) { continue; }
                 if (lone_lane == max_concurrency_) { lone_lane = candidate; }
                 if (!program.mixed_round_supported(candidate, meta.membership.size)) { continue; }
-                if (meta.staged_count > 0) {
-                    const auto scoring = [](const auto& r) { return bool(r->options.execution.gpu_prefix || r->options.execution.save_gpu_prefix); };
-                    if (scoring(owner) != scoring(slots_[meta.staged[0]])) continue;
-                }
+                if (meta.staged_count > 0 && is_readout(*owner) != is_readout(*slots_[meta.staged[0]])) { continue; }
                 meta.staged[meta.staged_count++] = candidate;
             }
             // Pipeline groups already divide the available prompts. A group may never reach
@@ -1522,7 +1733,8 @@ private:
         }
     }
 
-    void run_mixed_round(const RoundMembership& membership) {
+    /// Returns how many staged prompts the round advanced.
+    std::size_t run_mixed_round(const RoundMembership& membership) {
         if (prefill_lanes_.empty()) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = prefill_lanes_.front();
         const auto request       = slots_[lane];
@@ -1537,8 +1749,7 @@ private:
             if (!instance_.program->mixed_round_supported(candidate, membership.size)) { continue; }
             const auto& owner = slots_[candidate];
             if (owner == nullptr || owner->decode_ready) { continue; }
-            const auto scoring = [](const auto& r) { return bool(r->options.execution.gpu_prefix || r->options.execution.save_gpu_prefix); };
-            if (scoring(owner) != scoring(request)) continue;
+            if (is_readout(*owner) != is_readout(*request)) { continue; }
             staged[staged_count++] = candidate;
         }
         if (staged_count == 0) { throw std::logic_error("mixed round has no advanceable prefill"); }
@@ -1556,6 +1767,7 @@ private:
             resolve_prefill_step(owner, mixed.prefill_at(i), cancelled_now);
         }
         publish_runtime_stats();
+        return mixed.prefill_count;
     }
 
     void process_decode_round(const RoundMembership& membership,
@@ -1986,6 +2198,49 @@ private:
                         continue;
                     }
                     deferred_mixed_rounds_ = 0;
+                    if (membership.empty() && speculative_backend_ == SpeculativeBackend::None) {
+                        // Nothing is decoding: prefill the staged prompts together (#14), in
+                        // admission order. The first staged prompt decides: one a packed round
+                        // cannot take -- at its end, waiting for the step that samples its first
+                        // token, or a shape mixed rounds do not support -- takes a step of its
+                        // own; otherwise it and the staged prompts of its kind (plain, or GPU
+                        // prefix readouts) share a round. A prompt with no company keeps the
+                        // single-lane path and its prefill graphs. Speculative engines keep the
+                        // single-lane path: their packed shapes are not validated.
+                        const std::uint32_t front = prefill_lanes_.front();
+                        std::size_t packable = 0;
+                        if (instance_.program->mixed_round_supported(front, 0)) {
+                            for (const std::uint32_t lane : prefill_lanes_.span()) {
+                                const auto& owner = slots_[lane];
+                                if (owner != nullptr && !owner->decode_ready &&
+                                    is_readout(*owner) == is_readout(*slots_[front]) &&
+                                    instance_.program->mixed_round_supported(lane, 0)) {
+                                    ++packable;
+                                }
+                            }
+                        }
+                        static const bool pack_trace = std::getenv("SUROGATE_SERVE_PACK_TRACE") != nullptr;
+                        if (pack_trace) {
+                            std::fprintf(stderr, "pack-trace: staged=%zu packable=%zu front=%u\n",
+                                         prefill_lanes_.size(), packable, front);
+                        }
+                        if (packable >= 2) {
+                            const auto t_packed = Clock::now();
+                            last_round_ = LastRound{"packed", 0, front, last_round_.index + 1};
+                            const std::size_t prompts = run_mixed_round(membership);
+                            seg_timer_.mixed +=
+                                std::chrono::duration<double>(Clock::now() - t_packed).count();
+                            seg_timer_.mixed_rounds += 1;
+                            if (prompts >= 2) { // a long first prompt can take the whole window
+                                cumulative_stats_.packed_prefill_rounds += 1;
+                                cumulative_stats_.packed_prefill_prompts += prompts;
+                            }
+                        } else {
+                            run_prefill_step(front);
+                        }
+                        previous_unit_was_decode = false;
+                        continue;
+                    }
                     const auto& first_prefill = slots_[prefill_lanes_.front()];
                     const bool field_batch = membership.empty() && prefill_lanes_.size() > 1 &&
                         first_prefill && first_prefill->options.execution.gpu_prefix;
@@ -2008,7 +2263,7 @@ private:
                         run_decode_round(membership);
                         previous_unit_was_decode = true;
                     } else {
-                        run_prefill_step();
+                        run_prefill_step(prefill_lanes_.front());
                         previous_unit_was_decode = false;
                     }
                     continue;
@@ -2048,7 +2303,10 @@ private:
                         previous_unit_was_decode = false;
                         continue;
                     }
-                    if (progress == AdmissionProgress::ControlProgress && membership.empty()) {
+                    // Newly staged prompts go to a mixed round next, which carries the decode rows
+                    // too, rather than waiting behind a decode round of their own.
+                    if (progress == AdmissionProgress::ControlProgress &&
+                        (membership.empty() || !prefill_lanes_.empty())) {
                         continue;
                     }
                 }
@@ -2185,6 +2443,7 @@ private:
     Instance& instance_;
     const std::uint32_t max_concurrency_;
     const std::uint32_t max_round_rows_;
+    const SpeculativeBackend speculative_backend_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
@@ -2193,10 +2452,18 @@ private:
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
+    std::condition_variable places_cv_; ///< with queue_mutex_: reserve() waits here for places
+    struct ReservationWaiter {
+        std::uint64_t ticket = 0;
+        std::uint32_t count  = 0;
+    };
+    std::deque<ReservationWaiter> reservation_waiters_; ///< guarded by queue_mutex_, oldest first
+    std::uint64_t next_reservation_ticket_ = 0;
     bool asleep_ = false; ///< guarded by queue_mutex_; set by sleep(), cleared by wake()
     bool accepting_ = true; ///< close admission while draining, before parking the worker
-    std::deque<std::shared_ptr<Request>> pending_;
+    // Declared before anything that holds a Request: a request's reserved places go back into it.
     std::size_t outstanding_       = 0;
+    std::deque<std::shared_ptr<Request>> pending_;
     std::uint64_t next_request_id_ = 1;
     std::vector<std::shared_ptr<Request>> slots_;
     // Multi-prompt prefill (#80): several prompts can be staged at once and share a round.

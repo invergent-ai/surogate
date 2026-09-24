@@ -205,7 +205,16 @@ Wake waits count toward the pending-request limit. If the pending timeout expire
 the request returns HTTP 503; disconnecting while waiting releases its queue slot.
 
 Incoming prompts can share a batch with requests already generating, including requests
-using different LoRA adapters, DFlash, and images or video. Lower `--max-num-batched-tokens`
+using different LoRA adapters, DFlash, and images or video. On one GPU without `--spec`, prompts
+that arrive together while nothing is generating are prefilled together too, up to
+`--max-num-batched-tokens` per step: a burst of short prompts, such as one-question
+`/v1/decisions`, costs a few steps rather than one step each. A decision, or a chat request with
+`parallel_decoding`, takes the queue places its questions need, up to the smaller of their count,
+`--max-num-seqs` and 64, before any of it runs. When the queue is busy it waits for them, in
+arrival order and within `--pending-timeout-ms` (then HTTP 503), rather than run its shared prefix
+and find no room for its questions. While it waits, the places it needs are kept for it, so other
+requests can get HTTP 429 before the queue is full; `surogate_requests{state="reserving"}` counts
+the requests waiting this way. Lower `--max-num-batched-tokens`
 to reduce the time spent on each prompt chunk when streaming responsiveness matters;
 larger values can improve prompt throughput. Active text requests continue generating throughout
 image and video processing, on one or multiple GPUs. Sharing the GPU can delay image responses;
