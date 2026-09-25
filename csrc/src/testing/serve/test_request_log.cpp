@@ -414,6 +414,15 @@ int main() {
         failures += check(done.at("request").at("decisions").at("temperature") == 2.5 &&
                               done.at("request").at("decisions").at("shared_prefix_tokens") == 120,
                           "decisions done record lacks its calibration temperature");
+        failures += check(done.at("request").at("decisions").at("attempts") == 1 &&
+                              format_request_done(decisions, answered).find("attempts=") == std::string::npos,
+                          "a decisions request that ran once reports attempts differently");
+        RequestLogContext retried = decisions;
+        retried.decision_attempts = 2;
+        failures += check(Json::parse(format_request_done_json("serve-test", 3150, retried, answered))
+                                      .at("request").at("decisions").at("attempts") == 2 &&
+                              format_request_done(retried, answered).find(" attempts=2") != std::string::npos,
+                          "a retried decisions request does not report its attempts");
         const Json chat = Json::parse(format_request_start_json("serve-test", 3200, context));
         failures += check(!chat.at("request").contains("decisions"),
                           "a chat request record grew a decisions block");

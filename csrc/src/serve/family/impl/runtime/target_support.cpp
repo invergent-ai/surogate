@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -33,6 +34,21 @@ std::map<std::string, int>& probe_counts() {
 }
 
 } // namespace
+
+bool take_injected_fault(InjectedFault fault) noexcept {
+    const auto armed = [](const char* name) {
+        const char* raw = std::getenv(name);
+        return raw != nullptr && *raw != '\0' ? std::atoll(raw) : 0LL;
+    };
+    static std::atomic<long long> poison_gpu_prefix{armed("SUROGATE_SERVE_FAULT_POISON_GPU_PREFIX")};
+    static std::atomic<long long> nan_readout{armed("SUROGATE_SERVE_FAULT_NAN_READOUT")};
+    std::atomic<long long>& left = fault == InjectedFault::PoisonGpuPrefix ? poison_gpu_prefix : nan_readout;
+    long long current = left.load(std::memory_order_relaxed);
+    while (current > 0) {
+        if (left.compare_exchange_weak(current, current - 1, std::memory_order_relaxed)) { return true; }
+    }
+    return false;
+}
 
 void debug_probe_dump(std::int32_t magic, const char* tag, const Tensor& tensor,
                       std::int32_t layer_count, cudaStream_t stream) {

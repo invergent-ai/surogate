@@ -1397,8 +1397,15 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {
-        DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate());
+        DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate(),
+            [&](std::uint32_t attempt, const std::string& reason) {
+                // Kept current here, so the error and rejection records of a request that fails
+                // on a later attempt say how many times it ran.
+                context.decision_attempts = attempt;
+                write_console_log(ConsoleLogLevel::Warning, "[req " + std::to_string(req_id) + "] " + reason);
+            });
         context.shared_prefix_tokens = outcome.shared_prefix_tokens;
+        context.decision_attempts    = outcome.attempts;
         GenerationOutcome record;
         record.prompt_tokens           = outcome.input_tokens;
         record.completion_tokens       = outcome.output_tokens;
@@ -1428,6 +1435,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
         rejection.media_item_count        = context.media_item_count;
         rejection.requested_output_tokens = context.requested_output_tokens;
         rejection.question_count          = context.question_count;
+        rejection.decision_attempts       = context.decision_attempts;
         rejection.client_request_id       = context.client_request_id;
         rejection.error                   = e.error();
         log_request_rejected(rejection);

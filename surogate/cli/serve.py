@@ -50,6 +50,8 @@ Common server options (full list: surogate serve --engine-help):
   --offload-output-head          store output-head weights in system RAM
   --decision-temperature T       calibrate the decisions endpoint: answers are read from
                                  softmax(option logits / T); default 1 (unchanged)
+  --decision-attempts N          run a decisions request up to N times while its option
+                                 logits come out non-finite (default 3; 1 = no retry)
 
 --generate runs one shot and has its own spellings for a few options
 (--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
@@ -106,7 +108,7 @@ _VALUE_OPTIONS = {
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
         --model-priority --model --lora-modules --max-loras --max-lora-rank
-        --decision-temperature --gpu-memory-limit-mib
+        --decision-temperature --decision-attempts --gpu-memory-limit-mib
     """.split()),
     "generate": _COMMON_VALUES | frozenset("""
         --prompt --messages --max-new --max-context --prefill-chunk --kv-dtype

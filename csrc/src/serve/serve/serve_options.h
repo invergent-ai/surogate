@@ -152,6 +152,11 @@ struct ServeOptions {
     /// Finite and greater than zero; 1 is the model's own distribution. It is not --temperature:
     /// the decisions readout samples nothing, and generation never sees this value.
     double decision_temperature = 1.0;
+    /// --decision-attempts N: how many times a decisions request is run before non-finite
+    /// option logits are returned as an error. Each attempt after the first recomputes the
+    /// whole request from its prompts: a fresh shared-prefix prefill and fresh question rows,
+    /// nothing kept from the attempt that failed. 1 turns retrying off.
+    std::uint32_t decision_attempts = 3;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

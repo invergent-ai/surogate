@@ -1,5 +1,6 @@
 // Completed-prefix storage for the model-owned radix index. GPU execution slots remain
 // fixed; snapshots use bounded host memory and restore into the admitted slot's pages.
+#include "family/impl/runtime/target_support.h"
 #include "family/impl/runtime/program.h"
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
@@ -183,6 +184,14 @@ void ProgramImplCore::capture_gpu_prefix(SequenceState& sequence,
     }
     device.synchronize();
     image->pages = std::make_shared<SequenceKVBundle>(std::move(*sequence.kv));
+    if (take_injected_fault(InjectedFault::PoisonGpuPrefix)) {
+        // Test fault: bf16 0xFFFF is NaN, so every question read on this prefix is non-finite.
+        // Only the pages this prefix owns: pages it borrowed from a parent prefix are read by
+        // that parent's other forks too.
+        const auto& text = image->pages->text;
+        const auto pages = text.page_ids().subspan(text.borrowed_pages());
+        if (!pages.empty()) { decoder->text_kv.pool().zero_pages(pages, device.stream, 0xFF); }
+    }
     sequence.kv.reset();
     sequence.retained = false;
     gpu_prefixes.emplace(key.get(), std::move(image));
