@@ -25,7 +25,7 @@ from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
 from surogate.train.reporter import training_logger_context
-from surogate.train.row_packing import RowPacker
+from surogate.train.row_packing import RowPacker, document_isolation_problem
 from surogate.train.training_advisor import TrainingAdvisor
 from surogate.train.training_plot import generate_training_plot
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
@@ -613,6 +613,9 @@ class SurogateTrainerWrapper:
         runtime = getattr(self.config, "runtime_config", None)
         if runtime is not None and not getattr(runtime, "doc_masking", True):
             raise ValueError("row_packing needs doc_masking: packed rows must not attend to each other")
+        problem = document_isolation_problem(getattr(runtime, "dsl_ir_json", None) if runtime is not None else None)
+        if problem:
+            raise ValueError(f"row_packing: {problem}")
         for shard in train_files:
             header = read_token_shard_header(shard)
             if not header.non_overlapping:
