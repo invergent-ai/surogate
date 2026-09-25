@@ -11,6 +11,7 @@ from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.utils.capacity import (
     ENGINE_DEFAULT_PENDING,
     MAX_DERIVED_PENDING,
+    admin_client_timeout_s,
     size_judge_pending_capacity,
     size_pending_capacity,
 )
@@ -164,3 +165,57 @@ def test_colocate_sizes_against_the_concurrency_it_will_actually_run():
     infer.max_num_seqs = 16  # what native_colocate.py computes and writes back
     size_pending_capacity(infer, orch)
     assert infer.max_pending_requests == 128 - 16
+
+
+# --- the three deadlines that must never cross -------------------------------
+#
+# A pending request holds a claim on the adapter it has not started using, and
+# loading new weights waits for every claim to clear. Before this the engine
+# used ONE number for "how long may a request wait" and "how long may a weight
+# update wait", so sizing the first to the run silently sized the second too,
+# and pushed it past the admin client's own patience. These assert the order.
+
+
+def test_the_update_deadline_outlasts_the_longest_legitimate_hold():
+    """A request may sit pending for most of the caller's timeout, so a weight
+    update that gives up sooner would abort a run that was merely busy."""
+    infer = _infer(max_num_seqs=8)
+    size_pending_capacity(infer, _orch(batch_size=128, client={"timeout": 1200}))
+    assert infer.adapter_update_timeout_ms > infer.pending_timeout_ms
+
+
+def test_the_admin_client_outlasts_the_update_deadline():
+    """Whoever gives up first decides the error the run reports. The engine has
+    to win that race: it names the adapter it was waiting on, where the client
+    can only say the socket went quiet."""
+    for client_timeout in (600, 1200, 3600):
+        infer = _infer(max_num_seqs=8)
+        orch = _orch(batch_size=128, client={"timeout": client_timeout})
+        size_pending_capacity(infer, orch)
+        assert admin_client_timeout_s(client_timeout) * 1000 > infer.adapter_update_timeout_ms
+
+
+def test_the_whole_chain_is_ordered_for_any_caller_timeout():
+    for client_timeout in (30, 600, 1200, 7200):
+        infer = _infer(max_num_seqs=8)
+        size_pending_capacity(infer, _orch(batch_size=128, client={"timeout": client_timeout}))
+        assert (
+            infer.pending_timeout_ms < infer.adapter_update_timeout_ms < admin_client_timeout_s(client_timeout) * 1000
+        )
+
+
+def test_an_explicit_update_deadline_is_never_overridden():
+    infer = _infer(max_num_seqs=8, adapter_update_timeout_ms=5000)
+    size_pending_capacity(infer, _orch(batch_size=128))
+    assert infer.adapter_update_timeout_ms == 5000
+
+
+def test_the_clamp_says_so_instead_of_silently_refusing_rollouts(caplog):
+    """Past the thread ceiling the bound stops covering the run, which is the
+    failure this module exists to prevent. It has to be audible."""
+    import logging
+
+    infer = _infer(max_num_seqs=8)
+    with caplog.at_level(logging.WARNING):
+        size_pending_capacity(infer, _orch(batch_size=8192))
+    assert "max_pending_requests" in caplog.text

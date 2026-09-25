@@ -13,6 +13,7 @@ from openai import NotFoundError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from surogate.core.config.grpo_orch_config import GRPOClientConfig
+from surogate.grpo.utils.capacity import admin_client_timeout_s
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -177,10 +178,18 @@ def setup_admin_clients(client_config: GRPOClientConfig) -> list[AsyncClient]:
             # request but never finishes the reload wedges the orchestrator
             # silently and indefinitely (observed 2026-08-14: conductor reload
             # at 20:47 -> zero accepted rollouts for ~6h, no error anywhere).
-            # 600s covers the slowest legitimate reload (LoRA load + prefix
-            # cache drain, or a full filesystem weight update) with margin;
-            # on expiry the update_policy_loop retries within 1s.
-            timeout=httpx.Timeout(600.0, connect=60.0),
+            #
+            # Derived rather than fixed, and deliberately LONGER than the
+            # engine's own `adapter_update_timeout_ms`. A weight update waits for
+            # every admitted request to release its adapter claim, so the wait
+            # scales with the in-flight backlog, and a flat 600s aborted runs
+            # that were draining normally. Whoever gives up first decides what
+            # the run reports: the engine's 503 names the adapter it was waiting
+            # on, a timeout here only says the socket went quiet. Expiry is NOT
+            # retried and is not recovered from -- `_apply_policy_update`'s
+            # exception is stored and re-raised by
+            # `raise_if_policy_update_failed`, which aborts the run.
+            timeout=httpx.Timeout(admin_client_timeout_s(client_config.timeout), connect=60.0),
         )
 
     return [_setup_admin_client(base_url) for base_url in client_config.base_url]

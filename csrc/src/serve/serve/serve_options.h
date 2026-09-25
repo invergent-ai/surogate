@@ -77,6 +77,15 @@ struct ServeOptions {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
+    // --adapter-update-timeout-ms N (0 = inherit pending_timeout_ms, as this
+    // shared one number for both jobs before the flag existed). Separate
+    // because they bound different things: above is how long ONE request may
+    // wait for a lane, this is how long a weight update may wait for every
+    // admitted request to release its adapter claim, which scales with the
+    // backlog. Sizing the first to a training run silently sized the second
+    // too, past the admin client's own timeout, so a weight update that was
+    // draining normally failed as an opaque client-side disconnect.
+    std::uint32_t adapter_update_timeout_ms = 0;
     // surogate vendor patch (PATCHES.md #13): 2048 measured +16% prefill on
     // qwen3.5-0.8b (K=1024 tiles amortize) and neutral on qwen3.6-27b
     // (1832 vs 1834 tok/s) on RTX 5090.

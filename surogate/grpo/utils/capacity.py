@@ -8,6 +8,9 @@ different configs know separately.
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
+from surogate.utils.logger import get_logger
+
+logger = get_logger()
 
 # The engine's own default (serve_options.h). It is a serving default, not a
 # training one: a server answering ad-hoc callers should shed load, a training
@@ -32,6 +35,38 @@ MAX_DERIVED_PENDING = 512
 # slot for that retry.
 PENDING_TIMEOUT_FRACTION = 0.9
 DEFAULT_CLIENT_TIMEOUT_S = 1200
+
+# How long a weight update may wait for the adapter to stop being read.
+#
+# A request claims the adapter when it is admitted, not when it starts
+# generating, and `load_lora_adapter` waits for every claim to clear. So this is
+# really "how long may the admitted backlog take to drain", and the longest a
+# single rollout can legitimately hold its claim is its caller's own timeout:
+# past that nobody is waiting for it. Hence 1.0 rather than a guess.
+#
+# It is deliberately NOT `pending_timeout_ms`, which the engine used for both
+# jobs. Sizing the pending hold to the run then silently sized this too, and
+# pushed it past the admin client's patience, so the update failed as an opaque
+# client-side timeout rather than as the engine's own 503. Two jobs, two numbers.
+ADAPTER_UPDATE_FRACTION = 1.0
+
+# The admin client has to outlast the deadline above, because whoever gives up
+# first decides what the run reports. The engine's 503 names the adapter it was
+# waiting on; a client timeout can only say the socket went quiet. This margin
+# is what keeps the engine ahead in that race.
+ADMIN_TIMEOUT_MARGIN_S = 300
+
+
+def admin_client_timeout_s(client_timeout: int | None) -> float:
+    """How long the weight-update POST should wait for an answer.
+
+    Derived from the same input as the engine's own deadline rather than passed
+    across the process boundary: `split.py` sizes the engine before the
+    orchestrator is spawned, and two numbers that must stay ordered should not
+    depend on that order holding.
+    """
+    timeout_s = client_timeout or DEFAULT_CLIENT_TIMEOUT_S
+    return timeout_s * ADAPTER_UPDATE_FRACTION + ADMIN_TIMEOUT_MARGIN_S
 
 
 def size_pending_capacity(infer_config: GRPOInferenceConfig, orch_config: GRPOOrchestratorConfig) -> None:
@@ -71,16 +106,29 @@ def _size(config: GRPOInferenceConfig, demand: int, orch_config: GRPOOrchestrato
     An explicit value in the config always wins: someone who has set it has a
     reason, and the point of a default is to be replaceable.
     """
+    concurrency = config.max_num_seqs or 1
     if config.max_pending_requests is None:
-        concurrency = config.max_num_seqs or 1
-        config.max_pending_requests = min(MAX_DERIVED_PENDING, max(ENGINE_DEFAULT_PENDING, demand - concurrency))
+        wanted = max(ENGINE_DEFAULT_PENDING, demand - concurrency)
+        config.max_pending_requests = min(MAX_DERIVED_PENDING, wanted)
+        if wanted > MAX_DERIVED_PENDING:
+            # Past this the bound stops covering the run, which is the failure
+            # this module exists to prevent, so it cannot pass in silence.
+            logger.warning(
+                f"This run can have {demand} rollouts in flight, more than the "
+                f"{MAX_DERIVED_PENDING + concurrency} the engine will hold without running its "
+                f"thread pool past a container's pid limit. Requests over that bound are refused "
+                f"and enough refusals become lost rollouts. Set inference.max_pending_requests "
+                f"explicitly to override, or lower batch_size / oversampling_factor."
+            )
 
+    # Read the caller's deadline rather than assuming it: `client.timeout` is
+    # configurable, so a hardcoded span drifts from it silently.
+    client = orch_config.client
+    timeout_s = (client.timeout if client else None) or DEFAULT_CLIENT_TIMEOUT_S
     if config.pending_timeout_ms is None:
-        # Read the caller's deadline rather than assuming it: `client.timeout`
-        # is configurable, so a hardcoded span drifts from it silently.
-        client = orch_config.client
-        timeout_s = (client.timeout if client else None) or DEFAULT_CLIENT_TIMEOUT_S
         config.pending_timeout_ms = max(1, int(timeout_s * PENDING_TIMEOUT_FRACTION * 1000))
+    if config.adapter_update_timeout_ms is None:
+        config.adapter_update_timeout_ms = max(1, int(timeout_s * ADAPTER_UPDATE_FRACTION * 1000))
 
 
 def _rollout_demand(orch_config: GRPOOrchestratorConfig) -> int:

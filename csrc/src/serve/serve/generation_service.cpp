@@ -103,6 +103,21 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// How long an adapter update (load or unload) may wait for the adapter to stop
+// being read. A request claims its adapter when it is ADMITTED rather than when
+// it starts generating, so this bounds draining the whole admitted backlog, not
+// one generation. `pending_timeout_ms` bounds something else entirely -- how long
+// one request may wait for a lane -- and the two were the same number until
+// sizing the pending hold to a training run pushed this past the admin client's
+// own timeout, turning a normal drain into an opaque client-side disconnect.
+// Zero keeps the old inheriting behaviour for anyone who has not set the flag.
+Clock::time_point adapter_update_deadline(const ServeOptions& options) {
+    const std::uint32_t timeout_ms = options.adapter_update_timeout_ms != 0
+                                         ? options.adapter_update_timeout_ms
+                                         : options.pending_timeout_ms;
+    return Clock::now() + std::chrono::milliseconds(timeout_ms);
+}
+
 void validate_token_media(const GenerationRequest& request) {
     if (!request.prompt_token_ids.empty() && request.media_item_count() != 0) {
         throw ApiException(ApiError{
@@ -1349,7 +1364,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             if (const auto* store = stores.peek(device)) { store->validate_payloads(payloads); }
         }
     }
-    auto update = lora_slots_.update(name, Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms));
+    auto update = lora_slots_.update(name, adapter_update_deadline(options_));
     const auto slot = update.slot();
     std::lock_guard memory_lock(adapter_memory_mutex_);
     if (engine_->is_sleeping()) {
@@ -1383,7 +1398,7 @@ void GenerationService::unload_lora_adapter(const std::string& name) {
     if (!options_.borrowed_weights.empty()) {
         throw std::invalid_argument("shared GRPO adapters are owned by the trainer");
     }
-    auto update = lora_slots_.update(name, Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms), true);
+    auto update = lora_slots_.update(name, adapter_update_deadline(options_), true);
     std::lock_guard memory_lock(adapter_memory_mutex_);
     if (engine_->is_sleeping()) {
         throw std::invalid_argument("the model is asleep; wake it before unloading an adapter");

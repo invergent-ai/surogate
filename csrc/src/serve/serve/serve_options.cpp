@@ -332,6 +332,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--adapter-update-timeout-ms") {
+            options.adapter_update_timeout_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--adapter-update-timeout-ms"), "adapter-update-timeout-ms"));
         } else if (arg == "--max-num-batched-tokens") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-num-batched-tokens"), "max-num-batched-tokens"));
@@ -668,6 +671,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");
+    }
+    // A request may sit pending for the whole hold, and it claims the adapter
+    // for that entire time, so an update that gives up sooner refuses reloads
+    // that were only waiting on a busy queue.
+    if (options.adapter_update_timeout_ms != 0 &&
+        options.adapter_update_timeout_ms <= options.pending_timeout_ms) {
+        throw std::invalid_argument("--adapter-update-timeout-ms must exceed --pending-timeout-ms (" +
+                                    std::to_string(options.pending_timeout_ms) +
+                                    "): a pending request holds the adapter claim an update waits on");
     }
     // vLLM couples these two: automatic tool choice needs a parser to read the
     // model's calls back, and enabling it without one produces a server that

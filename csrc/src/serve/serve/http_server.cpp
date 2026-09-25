@@ -191,12 +191,17 @@ HttpServer::HttpServer(ServeOptions options)
     // step's worth of rollouts: the rollout clients are pooled and never idle,
     // while the admin client opens a fresh connection and joins the back.
     //
-    // Measured at 64 concurrent rollouts against 25 workers: the admin POST
-    // waited 44s for the load to stop, and 0.0s with this line. Successful
-    // rollouts were unchanged (1067 vs 1080), so the work done is the same; what
-    // changes is that a caller past capacity is refused now, with the executor's
-    // 429, instead of waiting silently for a worker. Load shedding only actually
-    // happens with this line.
+    // Measured at 128 in flight against a bound of 24: the admin POST waited
+    // 132s without this line and 0.0s with it.
+    //
+    // It is only safe BESIDE an admission bound sized to the caller, which is
+    // what `http_pool_sizes` above and `grpo/utils/capacity.py` arrange for a
+    // training run. On its own it made things worse, not better: shedding starts
+    // happening for real, so the same measurement lost 259 rollouts against
+    // main's 195, because every caller past the bound now gets an immediate 429
+    // instead of waiting for a worker. A plain `surogate serve` caller, which has
+    // nobody to size its bound to the run, still sees 429s past the default
+    // `max_num_seqs + max_pending_requests` for exactly this reason.
     //
     // The cost is a connect per request. This engine is reached over loopback by
     // GRPO rollouts and in-cluster by `surogate serve`, where that is noise next
