@@ -262,7 +262,8 @@ public:
      * @brief Execute forward MoE grouped matmul
      *
      * Dispatches the MoE grouped GEMM based on the recipe's precision.
-     * BF16 recipe uses BF16 cuDNN FE, FP8 recipe uses FP8 dequant + MoE GEMM, etc.
+     * BF16 recipe: one CUTLASS grouped launch (moe_grouped_gemm); FP8/FP4 recipes may quantize, then
+     * fall back to it.
      *
      * @param ctx MoE matmul context with all tensors and dimensions
      */

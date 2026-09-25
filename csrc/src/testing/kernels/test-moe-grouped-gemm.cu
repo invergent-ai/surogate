@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <random>
 #include <thread>
@@ -737,7 +738,8 @@ TEST_CASE("The bf16 MoE forward neither waits for its GPU nor holds a lock anoth
             cudaStreamDestroy(stream);
         }
     } a, b;
-    // Token counts no other test uses, so neither worker has run these shapes before.
+    // Each worker is a fresh thread, so neither has run a MoE forward before (cuDNN's plan cache was per
+    // thread); the cuDNN handle and workspace are only there so the same binary can exercise the old path.
     a.setup(0, 37);
     b.setup(1, 41);
 
@@ -752,26 +754,36 @@ TEST_CASE("The bf16 MoE forward neither waits for its GPU nor holds a lock anoth
     *reinterpret_cast<volatile int*>(flag) = 0;
     gate_kernel<<<1, 1, 0, a.stream>>>(dflag);  // GPU 0 busy until the flag is set
 
-    std::atomic<bool> a_done{false}, b_done{false};
-    std::thread ta([&] {
-        a.forward(*recipe);
-        a_done.store(true);
-    });
+    // Both workers stay alive until GPU 0 is released: a thread that exits runs its thread-local
+    // destructors (cudaFree waits for the device), which must not be what B waits behind.
+    std::atomic<bool> a_done{false}, b_done{false}, release{false};
+    std::exception_ptr a_error, b_error;
+    auto worker = [&](Gpu& g, std::atomic<bool>& done, std::exception_ptr& error) {
+        try {
+            g.forward(*recipe);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        done.store(true);
+        while (!release.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    std::thread ta(worker, std::ref(a), std::ref(a_done), std::ref(a_error));
     const auto t0 = clk::now();
     while (!a_done.load() && ms_since(t0) < 5000)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     const bool a_returned_while_busy = a_done.load();
-    std::thread tb([&] {
-        b.forward(*recipe);
-        b_done.store(true);
-    });
+    std::thread tb(worker, std::ref(b), std::ref(b_done), std::ref(b_error));
     const auto t1 = clk::now();
     while (!b_done.load() && ms_since(t1) < 10000)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     const bool b_returned_while_busy = b_done.load();
-    *reinterpret_cast<volatile int*>(flag) = 1;  // releases everything if either could not return
+    *reinterpret_cast<volatile int*>(flag) = 1;  // releases GPU 0, and anything waiting for it
+    release.store(true);
     ta.join();
     tb.join();
+    if (a_error) std::rethrow_exception(a_error);
+    if (b_error) std::rethrow_exception(b_error);
     a.teardown();
     b.teardown();
     cudaFreeHost(flag);

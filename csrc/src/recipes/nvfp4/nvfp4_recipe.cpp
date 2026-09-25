@@ -1100,7 +1100,7 @@ void NVFP4Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // This saves memory bandwidth by reading FP4 (0.5 bytes) instead of BF16 (2 bytes)
     // for expert weights, with the dequantization fused into the matmul kernel.
     //
-    // Falls back to BF16 cuDNN MoE GEMM when FP4 weights are not available
+    // Falls back to the BF16 MoE GEMM (Recipe::forward_moe_matmul) when FP4 weights are not available
     // (on-the-fly quantization is not worthwhile for MoE due to the large
     // aggregate weight size E*N*K — the quantization cost exceeds bandwidth savings).
 
@@ -1126,7 +1126,7 @@ void NVFP4Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
         // FP4 WoQ not supported on this GPU/cuDNN — fall back to BF16
     }
 
-    // Fall back to BF16 cuDNN MoE GEMM (base class implementation)
+    // Fall back to the BF16 MoE GEMM (base class implementation)
     Recipe::forward_moe_matmul(ctx);
 }
 
