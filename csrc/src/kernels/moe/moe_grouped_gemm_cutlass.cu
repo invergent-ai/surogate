@@ -14,8 +14,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cublas_v2.h>
@@ -64,66 +66,88 @@ using GroupedGemm = cutlass::gemm::device::GemmGrouped<typename cutlass::gemm::k
     4,
     cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel>;
 
-// Per-call device arguments, staged through a per-thread ring of pinned host and device slots: one
-// H2D copy per call, a slot reused one generation (kSlots calls) later after an event recorded behind
-// that generation's last copy. The host waits on that event only when it runs more than kSlots grouped
-// GEMMs ahead of its own GPU, and it holds no lock while it waits. One worker thread drives one GPU on
-// one stream; a stream change drains the previous stream first.
-struct Slot {
-    void* pinned = nullptr;
-    void* device = nullptr;
-    std::size_t capacity = 0;
-};
+// Per-call device arguments, staged through a ring of kSlots pinned host and device slots per thread and
+// device: one H2D copy per call. Each slot carries an event recorded behind the GEMM that reads it, and
+// is reused kSlots calls later only once that event has completed, whatever stream either call used.
+// The host therefore waits only when it runs kSlots grouped GEMMs ahead of its own GPU, and it holds no
+// lock while it waits. The wait polls (as stream_wait_spin in ep_strategy.cpp does): a blocking driver
+// wait showed rare lost-wakeup stalls under this process's 8-worker-thread load. No stream handle is
+// kept, so a stream destroyed since (a trainer rebuilt on the same thread) is never touched.
 struct Ring {
     static constexpr int kSlots = 256;
-    Slot slots[kSlots];
+    std::byte* pinned = nullptr;  // kSlots * slot_bytes, one allocation
+    std::byte* device = nullptr;  // kSlots * slot_bytes, one allocation
+    std::size_t slot_bytes = 0;
+    cudaEvent_t read_done[kSlots] = {};  // recorded after the GEMM that read the slot
+    bool pending[kSlots] = {};
     int next = 0;
-    cudaStream_t stream = nullptr;
-    cudaEvent_t generation_done = nullptr;
     ~Ring() {
         // Best effort at thread exit: the driver may already be torn down.
-        if (generation_done) (void)cudaEventDestroy(generation_done);
-        for (auto& s : slots) {
-            if (s.pinned) (void)cudaFreeHost(s.pinned);
-            if (s.device) (void)cudaFree(s.device);
-        }
+        for (auto& e : read_done)
+            if (e) (void)cudaEventDestroy(e);
+        if (pinned) (void)cudaFreeHost(pinned);
+        if (device) (void)cudaFree(device);
     }
 };
-Ring& ring() {
-    static thread_local Ring r;
-    return r;
+
+void event_wait_spin(cudaEvent_t event) {
+    while (true) {
+        const cudaError_t st = cudaEventQuery(event);
+        if (st == cudaSuccess) return;
+        if (st != cudaErrorNotReady) CUDA_CHECK(st);
+        (void)cudaGetLastError();
+        std::this_thread::yield();
+    }
 }
 
-// Copies `bytes` of host data to a device slot in stream order; returns the device address.
-std::byte* stage(const std::byte* host, std::size_t bytes, cudaStream_t stream) {
-    auto& r = ring();
-    if (r.stream && r.stream != stream) {
-        CUDA_CHECK(cudaStreamSynchronize(r.stream));
-        r.stream = nullptr;
+Ring& ring() {
+    constexpr int kMaxDevices = 64;
+    static thread_local std::unique_ptr<Ring> rings[kMaxDevices];
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= kMaxDevices) throw std::runtime_error("MoE grouped GEMM: device index out of range");
+    if (!rings[dev]) rings[dev] = std::make_unique<Ring>();
+    return *rings[dev];
+}
+
+// Copies `bytes` of host data to the next slot in stream order and returns the slot index. The caller
+// launches the GEMM that reads the slot, then calls release() on the same stream.
+int stage(Ring& r, const std::byte* host, std::size_t bytes, cudaStream_t stream) {
+    if (bytes > r.slot_bytes) {
+        // First use, or more experts with tokens than ever before on this thread (32 KB covers 546).
+        for (int i = 0; i < Ring::kSlots; ++i) {
+            if (r.pending[i]) event_wait_spin(r.read_done[i]);
+            r.pending[i] = false;
+        }
+        if (r.pinned) CUDA_CHECK(cudaFreeHost(r.pinned));
+        if (r.device) CUDA_CHECK(cudaFree(r.device));
+        r.pinned = r.device = nullptr;
+        std::size_t grown = std::max<std::size_t>({32768, 2 * r.slot_bytes, (bytes + 4095) / 4096 * 4096});
+        r.slot_bytes = 0;
+        CUDA_CHECK(cudaHostAlloc(&r.pinned, Ring::kSlots * grown, cudaHostAllocDefault));
+        CUDA_CHECK(cudaMalloc(&r.device, Ring::kSlots * grown));
+        r.slot_bytes = grown;
     }
-    if (r.next == 0 && r.stream && r.generation_done) {
-        CUDA_CHECK(cudaEventSynchronize(r.generation_done));
-    }
-    r.stream = stream;
-    Slot& slot = r.slots[r.next];
-    if (slot.capacity < bytes) {
-        // Rare (the expert count is fixed per model); cudaFree waits for the device, which also
-        // covers the GEMM that last read the slot.
-        if (slot.pinned) CUDA_CHECK(cudaFreeHost(slot.pinned));
-        if (slot.device) CUDA_CHECK(cudaFree(slot.device));
-        const std::size_t cap = std::max<std::size_t>((bytes + 4095) / 4096 * 4096, 16384);
-        CUDA_CHECK(cudaHostAlloc(&slot.pinned, cap, cudaHostAllocDefault));
-        CUDA_CHECK(cudaMalloc(&slot.device, cap));
-        slot.capacity = cap;
-    }
-    std::memcpy(slot.pinned, host, bytes);
-    CUDA_CHECK(cudaMemcpyAsync(slot.device, slot.pinned, bytes, cudaMemcpyHostToDevice, stream));
+    const int i = r.next;
     r.next = (r.next + 1) % Ring::kSlots;
-    if (r.next == 0) {
-        if (!r.generation_done) CUDA_CHECK(cudaEventCreateWithFlags(&r.generation_done, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventRecord(r.generation_done, stream));
+    if (r.pending[i]) {
+        event_wait_spin(r.read_done[i]);
+        r.pending[i] = false;
     }
-    return static_cast<std::byte*>(slot.device);
+    if (!r.read_done[i]) CUDA_CHECK(cudaEventCreateWithFlags(&r.read_done[i], cudaEventDisableTiming));
+    std::byte* h = r.pinned + static_cast<std::size_t>(i) * r.slot_bytes;
+    std::memcpy(h, host, bytes);
+    CUDA_CHECK(cudaMemcpyAsync(r.device + static_cast<std::size_t>(i) * r.slot_bytes,
+                               h,
+                               bytes,
+                               cudaMemcpyHostToDevice,
+                               stream));
+    return i;
+}
+
+void release(Ring& r, int i, cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(r.read_done[i], stream));
+    r.pending[i] = true;
 }
 
 // Resident threadblocks per device for one kernel (CUTLASS computes it from the occupancy).
@@ -188,7 +212,9 @@ void run_grouped(const std::vector<int>& m,
         lb[i] = ldb[i];
         lc[i] = ldc[i];
     }
-    std::byte* dev = stage(host.data(), bytes, stream);
+    Ring& r = ring();
+    const int slot = stage(r, host.data(), bytes, stream);
+    std::byte* dev = r.device + static_cast<std::size_t>(slot) * r.slot_bytes;
 
     typename Gemm::EpilogueOutputOp::Params epilogue(alpha, beta);
     typename Gemm::Arguments args(reinterpret_cast<cutlass::gemm::GemmCoord*>(dev),
@@ -205,13 +231,10 @@ void run_grouped(const std::vector<int>& m,
                                   reinterpret_cast<int64_t*>(dev + off_ldc));
     Gemm gemm;
     cutlass::Status status = gemm.initialize(args, nullptr, stream);
+    if (status == cutlass::Status::kSuccess) status = gemm.run(stream);
+    release(r, slot, stream);  // after the H2D copy in any case, and after the GEMM when it launched
     if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error(std::string("MoE grouped GEMM: CUTLASS initialize failed: ") +
-                                 cutlass::cutlassGetStatusString(status));
-    }
-    status = gemm.run(stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error(std::string("MoE grouped GEMM: CUTLASS launch failed: ") +
+        throw std::runtime_error(std::string("MoE grouped GEMM: CUTLASS failed: ") +
                                  cutlass::cutlassGetStatusString(status));
     }
 }
@@ -240,9 +263,12 @@ bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
                                    const std::vector<nv_bfloat16*>& C,
                                    const std::vector<int>& ldc,
                                    cudaStream_t stream) {
-    const bool ta = transa == CUBLAS_OP_T, tb = transb == CUBLAS_OP_T;
+    const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
     if (ta && tb) return false;  // not instantiated (no MoE caller uses TT)
     for (std::size_t i = 0; i < m.size(); ++i) {
+        // What cublasGemmEx would reject goes to it, so the caller gets its error, not a bad launch.
+        if (m[i] <= 0 || n[i] <= 0 || k[i] <= 0) return false;
+        if (lda[i] < (ta ? k[i] : m[i]) || ldb[i] < (tb ? n[i] : k[i]) || ldc[i] < m[i]) return false;
         // Contiguous extent of op(A) (m x k): k when A is transposed (RowMajor), else m.
         // Contiguous extent of op(B) (k x n): n when B is transposed (RowMajor), else k. C: m.
         if (!aligned8(ta ? k[i] : m[i]) || !aligned8(tb ? n[i] : k[i]) || !aligned8(m[i])) return false;

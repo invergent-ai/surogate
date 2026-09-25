@@ -459,7 +459,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         };
 
         // Fused rank-r expert LoRA (SUROGATE_FUSED_EXPERT_LORA, default on): one launch
-        // per projection instead of two grouped cuBLAS calls plus two vector_adds. The
+        // per projection instead of two grouped GEMM calls plus two vector_adds. The
         // cuBLAS path scales via vector_add(t, t, t, 0.5 * s), i.e. by exactly s, but
         // rounds the rank-r intermediate to bf16 before and after that scaling and the
         // product to bf16 before adding it to the output; the fused kernel keeps the
@@ -1338,7 +1338,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                 };
 
                 // Fused rank-r expert LoRA backward (SUROGATE_FUSED_EXPERT_LORA, default on):
-                // a tile kernel plus a fixed-order reduce replace five grouped cuBLAS calls and
+                // a tile kernel plus a fixed-order reduce replace five grouped GEMM calls and
                 // two vector_adds per projection. dx accumulates into d_input; dA/dB follow
                 // grad_beta (experts without tokens stay untouched, as with cuBLAS); the rank-r
                 // intermediates stay in fp32 with the scaling applied once (the cuBLAS path

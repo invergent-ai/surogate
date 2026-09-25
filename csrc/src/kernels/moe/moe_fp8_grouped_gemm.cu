@@ -10,9 +10,8 @@
 // ============================================================================
 //
 // These implementations dispatch FP8 E4M3 × E4M3 (forward) or E4M3 × E5M2
-// (backward) GEMMs for MoE layers. Forward/dgrad still use cuBLASLt per expert
-// for scale-pointer support; wgrad uses native cuBLAS grouped GEMM when the
-// installed CUDA exposes no cuBLASLt grouped matmul entry point.
+// (backward) GEMMs for MoE layers, as one cuBLASLt matmul per expert (for the
+// scale pointers).
 
 /// @brief FP8 MoE grouped GEMM: E4M3 input × E4M3 weights → BF16 output
 void moe_grouped_gemm(nv_bfloat16* output,

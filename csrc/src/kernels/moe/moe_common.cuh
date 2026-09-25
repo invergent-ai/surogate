@@ -5,6 +5,7 @@
 #define SUROGATE_SRC_KERNELS_MOE_MOE_COMMON_CUH
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <climits>
 #include <cstdint>
@@ -94,6 +95,20 @@ inline void moe_expert_gemms(cublasHandle_t handle,
     if constexpr (std::is_same_v<T, nv_bfloat16>) {
         if (moe_cutlass_grouped_gemm_bf16(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream)) {
             return;
+        }
+        static std::atomic<bool> warned{false};
+        if (!m.empty() && !warned.exchange(true)) {
+            std::fprintf(stderr,
+                         "[moe] bf16 expert GEMM (m=%d n=%d k=%d, lda=%d ldb=%d ldc=%d) does not fit the CUTLASS "
+                         "grouped kernel (dimensions and leading dimensions must be multiples of 8); using one "
+                         "cublasGemmEx per expert: slower, and a token's result then depends on its expert's "
+                         "token count. Reported once.\n",
+                         m[0],
+                         n[0],
+                         k[0],
+                         lda[0],
+                         ldb[0],
+                         ldc[0]);
         }
     }
     for (std::size_t i = 0; i < m.size(); ++i) {

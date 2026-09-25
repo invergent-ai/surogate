@@ -4385,7 +4385,7 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
 // ----------------------------------------------------------------------------
 
 /// BF16 MoE grouped GEMM via cuDNN Frontend moe_grouped_matmul.
-/// Replaces cublasGemmGroupedBatchedEx for MoE forward passes.
+/// The bf16 recipe's MoE forward (Recipe::forward_moe_matmul).
 void moe_cudnn_grouped_gemm(nv_bfloat16* output,
                             const nv_bfloat16* input,
                             const nv_bfloat16* weights,
