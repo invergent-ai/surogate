@@ -43,6 +43,13 @@ struct SparseMoePrefillPlan {
     /// and the weights' own codes as the other MMA operand. Set for the Q4_K/Q5_K/Q6_K routed
     /// profile unless `SUROGATE_SERVE_MOE_INT8=0` asks for the BF16-activation kernels.
     bool routed_int8 = false;
+    /// The round was routed here by `SparseMoeRouting::WidthInvariant`, below the pair's own
+    /// prefill floor if need be, so a token column must be computed the same way at every width.
+    /// The plan pins the one width-dependent variant an admitted pair could reach, the Q5/Q6-down
+    /// adaptive split. The W8 kernels read only the expert offsets and have none; a pair whose
+    /// kernels switch templates by width (the 768-token wide plan) must pin that too before it
+    /// is admitted.
+    bool width_invariant = false;
 };
 
 /// Whether a routed codec pair takes the int8 tensor-core route.
@@ -176,10 +183,16 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                              std::int32_t max_tokens,
                                                              bool routed_trtllm,
                                                              bool routed_int8 = false);
+/// `width_invariant`: the round was sent here by SparseMoeRouting::WidthInvariant, so any positive
+/// width is accepted and the plan pins the width-invariant variant.
 [[nodiscard]] SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,
                                                                    std::int32_t tokens,
                                                                    QType routed_gate_up,
-                                                                   QType routed_down);
+                                                                   QType routed_down,
+                                                                   bool width_invariant = false);
+/// Whether SparseMoeRouting::WidthInvariant applies to this routed pair (see the public declaration).
+[[nodiscard]] bool sparse_moe_prefill_routing_admitted_pair(QType routed_gate_up,
+                                                            QType routed_down) noexcept;
 
 /// Fault injection for tests (SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS=N): in the route scan and
 /// the gather, every warp but a block's first sleeps about N ns before its first read of the

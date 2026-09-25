@@ -3,6 +3,7 @@
 
 #include "family/impl/lora_hook.h"
 #include "family/impl/moe/expert_cache.h"
+#include "family/impl/moe/moe_routing.h"
 #include "api/ops/causal_conv1d_silu.h"
 #include "api/ops/embedding.h"
 #include "api/ops/gdn_gating.h"
@@ -619,7 +620,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor&,
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     const auto& g = weights.geometry;
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
@@ -635,12 +636,13 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                                         weights.host_gate_up, weights.host_down},
                   hidden, output, workspace, stream);
     } else {
+        const ops::SparseMoeRouting routing = family::moe_routing(phase);
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype,
-            weights.op.routed_down.qtype, tokens, tokens));
+            weights.op.routed_down.qtype, tokens, tokens, routing));
         WorkspaceArena leaf(storage);
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
-                        stream);
+                        stream, ops::SparseMoeRoundHook{}, routing);
     }
     combine_into(output, residual, stream);
 }
@@ -719,12 +721,12 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const 
            2 * plane_bytes(heads, last, DType::BF16);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile, family::TextPhase,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile, family::TextPhase phase,
                                                          std::int32_t first, std::int32_t last) {
     return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) +
            round_up(ops::sparse_moe_workspace_capacity_bytes(moe_geometry(g),
                                                              QType::W8G32_F16S, QType::W8G32_F16S,
-                                                             first, last));
+                                                             first, last, family::moe_routing(phase)));
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {

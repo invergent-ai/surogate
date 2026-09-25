@@ -194,14 +194,24 @@ std::int32_t sparse_moe_fault_warp_skew_ns() noexcept {
     return skew;
 }
 
+bool sparse_moe_prefill_routing_admitted_pair(QType routed_gate_up, QType routed_down) noexcept {
+    // The pairs whose wide route was shown, column for column, to compute the same bits at
+    // every width from one token up (test_sparse_moe_width_invariance). Each admission is a
+    // measured fact about that pair's kernels, so a pair joins this list with its test case.
+    return routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+}
+
 SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,
                                                      std::int32_t tokens, QType routed_gate_up,
-                                                     QType routed_down) {
+                                                     QType routed_down, bool width_invariant) {
     const std::int32_t minimum = prefill_min_tokens(routed_gate_up, routed_down);
     if (minimum == 0) {
         throw std::invalid_argument("sparse_moe prefill: unsupported routed codec profile");
     }
-    if (tokens < minimum) {
+    if (width_invariant && !sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down)) {
+        throw std::invalid_argument("sparse_moe prefill: the pair is not admitted for prefill routing");
+    }
+    if (tokens < (width_invariant ? 1 : minimum)) {
         throw std::invalid_argument("sparse_moe prefill: unsupported token count");
     }
     const std::int32_t slice_tokens = std::min(tokens, kSparseMoePrefillSliceMax);
@@ -210,7 +220,7 @@ SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& ge
     const bool routed_int8 = sparse_moe_routed_int8_profile(routed_gate_up, routed_down);
     return {tokens, slice_tokens,
             sparse_moe_prefill_workspace_bytes(geometry, tokens, routed_trtllm, routed_int8),
-            routed_trtllm, routed_int8};
+            routed_trtllm, routed_int8, width_invariant};
 }
 
 } // namespace sinfer::ops::detail

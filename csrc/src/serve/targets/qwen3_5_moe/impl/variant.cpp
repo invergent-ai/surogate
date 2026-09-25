@@ -7,6 +7,7 @@
 #include "targets/qwen3_5_moe/impl/variant.h"
 
 #include "family/impl/lora_hook.h"
+#include "family/impl/moe/moe_routing.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
@@ -39,14 +40,15 @@ using family::text_layers_workspace;
 using family::WorkspaceLayers;
 
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    WorkspaceArena& workspace, cudaStream_t stream,
+                    ops::SparseMoeRouting routing = ops::SparseMoeRouting::ByWidth) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
         ops::sparse_moe_geometry(weights), weights.routed_gate_up.qtype, weights.routed_down.qtype,
-        hidden.ne[1], hidden.ne[1]));
+        hidden.ne[1], hidden.ne[1], routing));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, residual, leaf_workspace,
-                    stream);
+                    stream, ops::SparseMoeRoundHook{}, routing);
 }
 
 
@@ -270,11 +272,11 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     if (family::run_banked_experts(weights.banked, weights.op, hidden, residual, workspace, stream)) {
         return;
     }
-    run_sparse_moe(hidden, weights.op, residual, workspace, stream);
+    run_sparse_moe(hidden, weights.op, residual, workspace, stream, family::moe_routing(phase));
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -426,12 +428,14 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const 
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
-    WeightsProfile, family::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile, family::TextPhase phase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
+    const ops::SparseMoeRouting routing = family::moe_routing(phase);
     return text_layers_workspace(geometry, WorkspaceLayers::All, [&](const std::string& prefix) {
         return matrix_workspace(geometry, prefix + "moe/routed_gate_up", [&](QType a, int, int) {
             return matrix_workspace(geometry, prefix + "moe/routed_down", [&](QType b, int, int) {
-                return ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), a, b, first, last);
+                return ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), a, b, first, last,
+                                                                routing);
             });
         });
     });

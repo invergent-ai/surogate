@@ -404,9 +404,14 @@ std::int32_t trtllm_min_tokens() {
     return value;
 }
 
+bool sparse_moe_prefill_routing_admitted(QType routed_gate_up, QType routed_down) noexcept {
+    return detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
+}
+
 std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
                                                 QType routed_gate_up, QType routed_down,
-                                                std::int32_t min_tokens, std::int32_t max_tokens) {
+                                                std::int32_t min_tokens, std::int32_t max_tokens,
+                                                SparseMoeRouting routing) {
     require_registered(geometry);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
@@ -421,6 +426,13 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
         : w8_profile  ? detail::kSparseMoePrefillW8W8Min
                       : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
                                                           : detail::kSparseMoePrefillQ4Q6Min);
+    // Under SparseMoeRouting::WidthInvariant an admitted pair takes the prefill family from one
+    // token. Only the prefill interval widens: the width-chosen terms stay, because a call can
+    // still fall back to them (an adapter-bound round, a hook that resolves experts), so this
+    // capacity covers the ByWidth capacity by construction.
+    const bool width_invariant =
+        routing == SparseMoeRouting::WidthInvariant &&
+        detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
     // Adapted rounds execute their columns concurrently in one set of launches.
     std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry, max_tokens);
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
@@ -439,7 +451,8 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
                                  std::min(max_tokens, prefill_first - 1));
         required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, slice));
     }
-    const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
+    const std::int32_t prefill_interval_first =
+        width_invariant ? min_tokens : std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
         required = std::max(required,
                             detail::sparse_moe_prefill_workspace_bytes(
@@ -456,14 +469,14 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
-                const SparseMoeRoundHook& hook) {
+                const SparseMoeRoundHook& hook, SparseMoeRouting routing) {
     // One tensor for both projections, which is what every mixture but Gemma 4 does.
-    sparse_moe(x, x, weights, epilogue, destination, workspace, stream, hook);
+    sparse_moe(x, x, weights, epilogue, destination, workspace, stream, hook, routing);
 }
 
 void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
                 SparseMoeEpilogue epilogue, Tensor& destination, WorkspaceArena& workspace,
-                cudaStream_t stream, const SparseMoeRoundHook& hook) {
+                cudaStream_t stream, const SparseMoeRoundHook& hook, SparseMoeRouting routing) {
     const SparseMoeRoundHook* round_hook = hook.resolve != nullptr ? &hook : nullptr;
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
@@ -519,14 +532,23 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
             Tensor output = destination.slice(1, offset, count);
             if (saved_round.slots) {
                 ScopedLoraColumns columns(saved_round.slots->slice(0, offset, count));
-                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook);
+                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook,
+                           routing);
             } else {
-                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook);
+                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook,
+                           routing);
             }
         }
         return;
     }
-    const bool use_prefill  = !adapters && (nvfp4_routed
+    // SparseMoeRouting::WidthInvariant: an admitted pair takes the wide prefill route at every width, so
+    // a token's bits do not depend on its round's width. A hook that resolves experts (a bounded
+    // expert cache) plans its own narrow path and keeps the width-chosen route.
+    const bool width_invariant = routing == SparseMoeRouting::WidthInvariant && !adapters &&
+                                 hook.resolve == nullptr && hook.resolve_experts == nullptr &&
+                                 detail::sparse_moe_prefill_routing_admitted_pair(gate_up, down);
+    const bool use_prefill  = !adapters && (width_invariant ? tokens >= 1
+                                  : nvfp4_routed
                                   ? tokens >= trtllm_min_tokens()
                                   : detail::sparse_moe_uses_prefill(tokens, gate_up, down));
     const bool use_small_t =
@@ -538,7 +560,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                 nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
     std::size_t required = 0;
     if (use_prefill) {
-        required = detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down)
+        required = detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down,
+                                                           width_invariant)
                        .workspace_bytes;
     } else if (use_small_t) {
         // Wide rounds run as slices, so the workspace only has to hold the widest one.
@@ -559,7 +582,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     auto scope = workspace.scope();
     if (use_prefill) {
         const detail::SparseMoePrefillPlan plan =
-            detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down);
+            detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down,
+                                                    width_invariant);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens,
                                                           plan.routed_trtllm, plan.routed_int8);

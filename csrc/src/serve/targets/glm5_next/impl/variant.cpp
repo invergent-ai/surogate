@@ -11,6 +11,7 @@
 #include "api/ops/head_linear.h"
 #include "api/ops/manifold_hyper_connection.h"
 #include "api/ops/residual_add.h"
+#include "family/impl/moe/moe_routing.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scatter.h"
 #include "api/ops/sparse_moe.h"
@@ -217,14 +218,15 @@ std::size_t plane_bytes(std::int32_t rows, std::int32_t tokens, DType dtype) {
 /// The mixture, over an arena of its own, into a destination it adds to -- so the caller zeroes
 /// what it hands over when it wants the block's output rather than a sum with the residual.
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& out,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    WorkspaceArena& workspace, cudaStream_t stream,
+                    ops::SparseMoeRouting routing = ops::SparseMoeRouting::ByWidth) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
         ops::sparse_moe_geometry(weights), weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1],
-        hidden.ne[1]));
+        hidden.ne[1], routing));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, out, leaf_workspace,
-                    stream);
+                    stream, ops::SparseMoeRoundHook{}, routing);
 }
 
 } // namespace
@@ -627,18 +629,20 @@ void dense_feed_forward(const Tensor& hidden, const FeedForwardPayload& weights,
 
 std::size_t feed_forward_capacity(const family::TextGeometry& geometry,
                                   WeightsProfile weights_profile, std::int32_t first,
-                                  std::int32_t last) {
+                                  std::int32_t last,
+                                  ops::SparseMoeRouting routing = ops::SparseMoeRouting::ByWidth) {
     const QType qtype = profile_qtype(weights_profile);
     // Whichever of the two feed-forwards is larger. A layer is one or the other, but the
     // layout is planned for the stack rather than per layer.
     const std::size_t mixture = std::max({
-        ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), qtype, qtype, first, last,
+                                                 routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), QType::Q4_K, QType::Q4_K, first,
-                                                 last),
+                                                 last, routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), QType::Q4_K, QType::Q6_K, first,
-                                                 last),
+                                                 last, routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), QType::Q5_K, QType::Q6_K, first,
-                                                 last),
+                                                 last, routing),
     });
     const std::size_t dense =
         2 * plane_bytes(geometry.dense_intermediate, last, DType::BF16) +
@@ -652,7 +656,7 @@ std::size_t feed_forward_capacity(const family::TextGeometry& geometry,
 } // namespace
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = hidden.ne[1];
     const std::int32_t hidden_rows = hidden.ne[0];
     auto scope = workspace.scope();
@@ -683,7 +687,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
             throw std::logic_error("glm5_next: the Q4 host expert bank needs the expert cache "
                                    "(the pool could not be sized; pass --expert-slots)");
         } else {
-            run_sparse_moe(hidden, weights.moe, out, workspace, stream);
+            run_sparse_moe(hidden, weights.moe, out, workspace, stream, family::moe_routing(phase));
         }
     } else {
         dense_feed_forward(hidden, weights, out, workspace, stream);
@@ -785,12 +789,12 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
                                                          WeightsProfile weights_profile,
-                                                         family::TextPhase, std::int32_t first,
+                                                         family::TextPhase phase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     // The block's own output plane, then the feed-forward's.
     return plane_bytes(geometry.hidden, last, DType::BF16) +
-           feed_forward_capacity(geometry, weights_profile, first, last);
+           feed_forward_capacity(geometry, weights_profile, first, last, family::moe_routing(phase));
 }
 
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(

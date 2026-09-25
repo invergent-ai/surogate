@@ -6,6 +6,7 @@
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/moe/moe_routing.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -38,14 +39,15 @@ constexpr ops::LinearPolicy kTextPolicy = ops::LinearPolicy::A16Only;
 /// The mixture, over one arena of its own. The op sizes its scratch from the geometry and the
 /// two routed codecs, which a GGUF source may vary between layers.
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    WorkspaceArena& workspace, cudaStream_t stream,
+                    ops::SparseMoeRouting routing = ops::SparseMoeRouting::ByWidth) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
         ops::sparse_moe_geometry(weights), weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1],
-        hidden.ne[1]));
+        hidden.ne[1], routing));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, residual,
-                    leaf_workspace, stream);
+                    leaf_workspace, stream, ops::SparseMoeRoundHook{}, routing);
 }
 
 [[noreturn]] void no_linear_layers(const char* leaf) {
@@ -138,16 +140,16 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 // ---- Post-mixer (the routed mixture) ---------------------------------------
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     if (family::run_banked_experts(weights.banked, weights.op, hidden, residual, workspace, stream)) {
         return;
     }
-    run_sparse_moe(hidden, weights.op, residual, workspace, stream);
+    run_sparse_moe(hidden, weights.op, residual, workspace, stream, family::moe_routing(phase));
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& g,
                                                          WeightsProfile weights_profile,
-                                                         family::TextPhase, std::int32_t first,
+                                                         family::TextPhase phase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     // The layout is planned before the weights are read, so it must hold either route this
@@ -155,12 +157,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     // keeps -- and a GGUF may hold a different down type from its gate/up, layer by layer.
     const QType qtype = profile_qtype(weights_profile);
     const ops::SparseMoeGeometry geometry{g.hidden, g.experts, g.experts_per_token, g.intermediate};
+    const ops::SparseMoeRouting routing = family::moe_routing(phase);
     return std::max({
-        ops::sparse_moe_workspace_capacity_bytes(geometry, qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(geometry, qtype, qtype, first, last, routing),
         ops::sparse_moe_workspace_capacity_bytes(geometry, QType::Q4_K, QType::Q4_K, first,
-                                                 last),
+                                                 last, routing),
         ops::sparse_moe_workspace_capacity_bytes(geometry, QType::Q4_K, QType::Q6_K, first,
-                                                 last),
+                                                 last, routing),
     });
 }
 

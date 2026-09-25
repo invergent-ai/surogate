@@ -925,6 +925,145 @@ public:
         return failures;
     }
 
+    // SparseMoeRouting::WidthInvariant: a token column's output bits must not depend on the
+    // round's width or on where in the round it sits. Rounds of `narrow` tokens cut from a
+    // `wide`-token input at several offsets must reproduce the wide round's columns bit for bit --
+    // the property prefill rounds rely on, since packing decides their width and a token's place
+    // in them. Every token's input is perturbed on its own, so the routes (and the experts' column
+    // groups) differ token to token. For a pair that is not admitted the routing must be a no-op:
+    // its WidthInvariant output equals its ByWidth output. The ByWidth rounds of an admitted pair
+    // are reported, not asserted: they show the width-chosen kernels this routing avoids.
+    int run_width_invariance(std::int32_t wide, std::span<const std::int32_t> narrow) {
+        const bool admitted = ops::sparse_moe_prefill_routing_admitted(profile_.routed_gate_up,
+                                                                       profile_.routed_down);
+        const std::string label = std::string(profile_.name) + " width invariance";
+        std::vector<float> input(static_cast<std::size_t>(kHidden) * wide);
+        std::vector<float> residual(static_cast<std::size_t>(kHidden) * wide);
+        for (std::int32_t token = 0; token < wide; ++token) {
+            const int pattern = token % static_cast<int>(kRoutePatterns.size());
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                const std::size_t at = static_cast<std::size_t>(token) * kHidden + row;
+                const int wobble     = (token * 131 + row * 7) % 13 - 6;
+                input[at]    = inputs_[pattern][row] * (1.0F + 0.02F * static_cast<float>(wobble) / 6.0F);
+                residual[at] = residuals_[pattern][row];
+            }
+        }
+        const std::vector<std::uint16_t> input_bits = bf16_bits(input);
+        DeviceBuffer device_input  = to_device(input_bits);
+        DeviceBuffer residual_seed = to_device(bf16_bits(residual));
+        ops::SparseMoeWeights weights{
+            .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(),
+                                                    kHidden),
+            .router_bias        = kSigmoidRouter
+                                      ? static_cast<const float*>(device_router_bias_.p)
+                                      : nullptr,
+            .routed_scale       = kRoutedScale,
+            .shared_gated       = kSharedGated,
+            .swiglu_limit       = kSwigluLimit,
+            .routed_gate_up     = routed_gate_.weight(),
+            .routed_down        = routed_down_.weight(),
+            .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
+            .shared_down        = kHasShared ? shared_down_device_->weight() : Weight{},
+            .experts_per_token  = kTopK,
+        };
+        attach_nvfp4_scales(weights);
+        int failures = 0;
+        // One round of columns [offset, offset + tokens) under `routing`, as raw BF16 bits.
+        const auto round = [&](std::int32_t offset, std::int32_t tokens,
+                               ops::SparseMoeRouting routing) {
+            const std::size_t first = static_cast<std::size_t>(offset) * kHidden;
+            const std::size_t count = static_cast<std::size_t>(kHidden) * tokens;
+            GuardedBf16Output destination_storage(count);
+            cuda_check(cudaMemcpy(destination_storage.data(),
+                                  static_cast<const std::uint16_t*>(residual_seed.p) + first,
+                                  count * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice),
+                       "seed SparseMoe destination");
+            Tensor x(static_cast<std::uint16_t*>(device_input.p) + first, DType::BF16,
+                     {kHidden, tokens});
+            Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
+            const std::size_t capacity = ops::sparse_moe_workspace_capacity_bytes(
+                kGeometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens,
+                routing);
+            WorkspaceArena workspace(capacity);
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
+                            nullptr, ops::SparseMoeRoundHook{}, routing);
+            cuda_synchronize();
+            failures += destination_storage.verify_guards(label + " T=" + std::to_string(tokens));
+            if (workspace.used() != 0 || workspace.peak_used() > capacity) {
+                std::cerr << label << ": T=" << tokens << " workspace exceeds its capacity\n";
+                ++failures;
+            }
+            std::vector<std::uint16_t> bits(count);
+            cuda_check(cudaMemcpy(bits.data(), destination_storage.data(),
+                                  count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                       "read SparseMoe destination");
+            return bits;
+        };
+        // Columns of a round of `tokens` at `offset` that differ from the same columns of `base`.
+        const auto moved_columns = [&](const std::vector<std::uint16_t>& bits,
+                                       const std::vector<std::uint16_t>& base, std::int32_t offset,
+                                       std::int32_t tokens) {
+            int columns = 0;
+            for (std::int32_t column = 0; column < tokens; ++column) {
+                columns += std::memcmp(bits.data() + static_cast<std::size_t>(column) * kHidden,
+                                       base.data() + static_cast<std::size_t>(offset + column) * kHidden,
+                                       kHidden * sizeof(std::uint16_t)) != 0;
+            }
+            return columns;
+        };
+        const std::vector<std::uint16_t> wide_bits =
+            round(0, wide, ops::SparseMoeRouting::WidthInvariant);
+        for (const std::int32_t offset : {0, 1, 7, 33, 63}) {
+            for (const std::int32_t tokens : narrow) {
+                if (offset + tokens > wide) { continue; }
+                const auto pinned   = round(offset, tokens, ops::SparseMoeRouting::WidthInvariant);
+                const auto by_width = round(offset, tokens, ops::SparseMoeRouting::ByWidth);
+                if (admitted) {
+                    const int moved = moved_columns(pinned, wide_bits, offset, tokens);
+                    if (moved != 0) {
+                        std::cerr << label << ": T=" << tokens << " at column " << offset
+                                  << " moved " << moved << " of its columns off the T=" << wide
+                                  << " round\n";
+                        ++failures;
+                    }
+                    if (offset == 0) {
+                        std::cout << label << ": T=" << tokens << " matches T=" << wide
+                                  << " at every offset; width-chosen kernels differ in "
+                                  << moved_columns(by_width, wide_bits, offset, tokens)
+                                  << " columns\n";
+                    }
+                } else if (pinned != by_width) {
+                    std::cerr << label << ": T=" << tokens
+                              << " WidthInvariant routing changed a pair it does not admit\n";
+                    ++failures;
+                }
+            }
+        }
+        // The planned interval covers every width in it, and the ByWidth capacity as well.
+        std::size_t witness = 0;
+        for (const std::int32_t tokens : narrow) {
+            witness = std::max(witness, ops::sparse_moe_workspace_capacity_bytes(
+                                            kGeometry, profile_.routed_gate_up, profile_.routed_down,
+                                            tokens, tokens, ops::SparseMoeRouting::WidthInvariant));
+        }
+        const std::int32_t last = *std::max_element(narrow.begin(), narrow.end());
+        const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
+            kGeometry, profile_.routed_gate_up, profile_.routed_down, 1, last,
+            ops::SparseMoeRouting::WidthInvariant);
+        const std::size_t by_width = ops::sparse_moe_workspace_capacity_bytes(
+            kGeometry, profile_.routed_gate_up, profile_.routed_down, 1, last);
+        if (interval < witness || interval < by_width) {
+            std::cerr << label << ": WidthInvariant interval capacity " << interval
+                      << " misses a width (" << witness << ") or the ByWidth plan (" << by_width
+                      << ")\n";
+            ++failures;
+        }
+        failures += verify_exact((label + " input preservation").c_str(),
+                                 from_device<std::uint16_t>(device_input, input_bits.size()),
+                                 input_bits);
+        return failures;
+    }
+
     // Experts the slot table maps to -1 are "computed elsewhere": every kernel of the round
     // must leave their paths out, including the prefill reduce, which once summed a stale
     // grouped column for them (the Flash-Next host-split corruption, 2026-08-29).
