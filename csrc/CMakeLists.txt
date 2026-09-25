@@ -554,6 +554,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe/moe_gpt_oss_activation.cu
     src/kernels/moe/moe_grouped_gemm_backward.cu
     src/kernels/moe/moe_grouped_gemm_core.cu
+    src/kernels/moe/moe_grouped_gemm_cutlass.cu
     src/kernels/moe/moe_grouped_gemm_expert.cu
     src/kernels/moe/moe_lora_grouped.cu
     src/kernels/moe/moe_losses.cu

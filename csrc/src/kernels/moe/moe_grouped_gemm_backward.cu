@@ -155,7 +155,7 @@ void moe_grouped_gemm_down_backward_impl(
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    // One GEMM per expert with tokens (moe_expert_gemms says why not a grouped call).
+    // One GEMM per expert with tokens, through moe_expert_gemms (moe_common.cuh).
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
@@ -194,6 +194,7 @@ void moe_grouped_gemm_down_backward_impl(
     if (m_vec.empty()) return;
 
     moe_expert_gemms<T>(cublas_handle,
+                        stream,
                         CUBLAS_OP_N,
                         CUBLAS_OP_N,
                         m_vec,
@@ -249,7 +250,7 @@ void moe_grouped_gemm_gate_up_backward_impl(
     const float beta = 0.0f;
     const int gate_up_dim = 2 * intermediate_size;
 
-    // One GEMM per expert with tokens (moe_expert_gemms says why not a grouped call).
+    // One GEMM per expert with tokens, through moe_expert_gemms (moe_common.cuh).
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
@@ -288,6 +289,7 @@ void moe_grouped_gemm_gate_up_backward_impl(
     if (m_vec.empty()) return;
 
     moe_expert_gemms<T>(cublas_handle,
+                        stream,
                         CUBLAS_OP_N,
                         CUBLAS_OP_N,
                         m_vec,
@@ -381,6 +383,7 @@ void moe_grouped_gemm_up_backward_impl(
     if (m_vec.empty()) return;
 
     moe_expert_gemms<T>(cublas_handle,
+                        stream,
                         CUBLAS_OP_N,
                         CUBLAS_OP_N,
                         m_vec,

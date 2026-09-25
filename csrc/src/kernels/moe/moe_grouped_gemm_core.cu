@@ -8,8 +8,8 @@
 // ============================================================================
 // Grouped GEMM for MoE Expert Computation
 // ============================================================================
-// One cuBLAS GEMM per expert with tokens (moe_expert_gemms in moe_common.cuh
-// says why not cuBLAS grouped GEMM).
+// One GEMM per expert with tokens, through moe_expert_gemms (moe_common.cuh):
+// one CUTLASS grouped launch for bf16, a cublasGemmEx loop otherwise.
 //
 // The expert weights are stored in a batched layout:
 //   gate_up_proj: (num_experts, 2*D, C)
@@ -197,6 +197,7 @@ void moe_grouped_gemm_impl(T* output,
     if (m_vec.empty()) return;
 
     moe_expert_gemms<T>(cublas_handle,
+                        stream,
                         transa,
                         transb,
                         m_vec,
@@ -359,6 +360,7 @@ void moe_grouped_gemm_weight_grad_impl(T* d_weight,
     if (m_vec.empty()) return;
 
     moe_expert_gemms<T>(cublas_handle,
+                        stream,
                         CUBLAS_OP_N,
                         CUBLAS_OP_T,
                         m_vec,

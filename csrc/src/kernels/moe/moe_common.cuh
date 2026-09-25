@@ -39,9 +39,28 @@ constexpr cudaDataType_t cublas_dtype() {
         static_assert(!sizeof(T), "Unsupported type for cuBLAS");
 }
 
+/// bf16 grouped GEMM on CUTLASS's grouped kernel (moe_grouped_gemm_cutlass.cu), same convention as
+/// moe_expert_gemms. Returns false, having done nothing, when an operand is not 16-byte aligned along
+/// its contiguous dimension or both operands are transposed.
+bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
+                                   cublasOperation_t transb,
+                                   const std::vector<int>& m,
+                                   const std::vector<int>& n,
+                                   const std::vector<int>& k,
+                                   float alpha,
+                                   const std::vector<const nv_bfloat16*>& A,
+                                   const std::vector<int>& lda,
+                                   const std::vector<const nv_bfloat16*>& B,
+                                   const std::vector<int>& ldb,
+                                   float beta,
+                                   const std::vector<nv_bfloat16*>& C,
+                                   const std::vector<int>& ldc,
+                                   cudaStream_t stream);
+
 /// One GEMM per expert, in cuBLAS column-major terms:
-///   C[i] = alpha * op_a(A[i]) * op_b(B[i]) + beta * C[i],  op_a(A[i]) m[i] x k[i], op_b(B[i]) k[i] x n[i],
-/// issued as a loop of cublasGemmEx on the handle's current stream (the callers set it).
+///   C[i] = alpha * op_a(A[i]) * op_b(B[i]) + beta * C[i],  op_a(A[i]) m[i] x k[i], op_b(B[i]) k[i] x n[i].
+/// bf16 runs as one CUTLASS grouped launch; anything else (fp32, unaligned bf16) as a loop of
+/// cublasGemmEx on the handle, whose stream the callers set to `stream`.
 ///
 /// Not cublasGemmGroupedBatchedEx: cuBLAS runs bf16, fp16 and fp32 groups on one kernel object shared by
 /// the whole process, locks that object's mutex before the launch and unlocks it only after
@@ -50,11 +69,15 @@ constexpr cudaDataType_t cublas_dtype() {
 /// GPU's queue is full, and in multi-GPU training a queue stays full while its GPU waits in a collective
 /// for another GPU. When that GPU's worker thread reaches any grouped GEMM it waits for the mutex, never
 /// issues its part of the collective, and every GPU hangs (8-GPU bf16 MoE LoRA training, 2026-09-25).
-/// A thread blocked in a cublasGemmEx launch holds nothing another worker waits for.
+/// Neither path here takes a lock that another worker could wait for.
 ///
-/// Each GEMM writes its own output block, so the result does not depend on scheduling.
+/// The CUTLASS path uses one tile configuration for every expert and no split-K, so a token's output
+/// does not depend on how many tokens its expert received (row packing needs that: a packed row must
+/// equal the row alone bit for bit). The cublasGemmEx loop lets cuBLAS choose an algorithm per shape
+/// and does not have that property. Both are deterministic run to run.
 template <typename T>
 inline void moe_expert_gemms(cublasHandle_t handle,
+                             cudaStream_t stream,
                              cublasOperation_t transa,
                              cublasOperation_t transb,
                              const std::vector<int>& m,
@@ -68,6 +91,11 @@ inline void moe_expert_gemms(cublasHandle_t handle,
                              float beta,
                              const std::vector<T*>& C,
                              const std::vector<int>& ldc) {
+    if constexpr (std::is_same_v<T, nv_bfloat16>) {
+        if (moe_cutlass_grouped_gemm_bf16(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream)) {
+            return;
+        }
+    }
     for (std::size_t i = 0; i < m.size(); ++i) {
         CUBLAS_CHECK(cublasGemmEx(handle,
                                   transa,
