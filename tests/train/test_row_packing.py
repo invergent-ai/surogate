@@ -255,3 +255,44 @@ def test_trainer_packs_exactly_the_rows_a_padded_step_loads(monkeypatch):
         assert packed_docs == sorted(tuple(x[r, : lengths[r]]) for r in served)
         assert w.trainer.ga[k] == step.waves <= ga
     assert w._row_packing_totals["rows"] == 2 * ga * slots
+
+
+# ---------------------------------------------------------------------------------------------
+# Linear-attention models: row packing is admitted only where every token mixer is document-aware.
+
+
+def _ir(*ops):
+    import json
+
+    return json.dumps({"modules": [{"forward": {"operations": [{"op": op} for op in ops]}}]})
+
+
+def test_this_build_restarts_linear_attention_at_document_boundaries():
+    from surogate.train import row_packing
+
+    assert row_packing.LINEAR_ATTENTION_DOC_BOUNDARIES is True
+    assert row_packing.linear_attention_doc_boundaries() is True
+    assert row_packing.document_isolation_problem(_ir("matmul", "chunk_gated_delta_rule", "mamba_conv1d")) is None
+    assert row_packing.document_isolation_problem(_ir("matmul", "flash_attention")) is None
+    assert row_packing.document_isolation_problem(None) is None
+
+
+def test_row_packing_refuses_linear_attention_on_a_build_without_document_boundaries(monkeypatch):
+    from surogate.train import row_packing
+
+    monkeypatch.setattr(row_packing, "linear_attention_doc_boundaries", lambda: False)
+    problem = row_packing.document_isolation_problem(_ir("chunk_gated_delta_rule", "mamba_conv1d"))
+    assert problem is not None and "LINEAR_ATTENTION_DOC_BOUNDARIES" in problem
+    # Attention-only models do not depend on it.
+    assert row_packing.document_isolation_problem(_ir("flash_attention")) is None
+
+
+def test_row_packing_refuses_unverified_token_mixers(monkeypatch):
+    from surogate.train import row_packing
+
+    monkeypatch.delenv("SUROGATE_ALLOW_UNVERIFIED_ROW_PACKING", raising=False)
+    for op in ("mamba_ssm_scan", "glm_causal_conv1d", "chunk_kimi_delta_rule"):
+        problem = row_packing.document_isolation_problem(_ir("matmul", op))
+        assert problem is not None and op in problem
+    monkeypatch.setenv("SUROGATE_ALLOW_UNVERIFIED_ROW_PACKING", "1")
+    assert row_packing.document_isolation_problem(_ir("mamba_ssm_scan")) is None

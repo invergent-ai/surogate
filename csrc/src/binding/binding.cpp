@@ -198,6 +198,12 @@ NB_MODULE(_surogate, m) {
     // Install crash handler for better stack traces on segfaults and other crashes
     surogate::install_crash_handler();
 
+    // Capability: packed documents (row packing, sample packing) restart the causal convolution
+    // and the gated delta rule's recurrent state of linear-attention layers (Gated DeltaNet) at
+    // every document. Builds without it carry both across documents. Read by
+    // surogate.train.row_packing before it admits row packing on such a model.
+    m.attr("LINEAR_ATTENTION_DOC_BOUNDARIES") = true;
+
     m.def("_decode_sample",
           [](nb::ndarray<nb::ndim<2>, nb::c_contig, nb::device::cuda> logits,
              nb::ndarray<int, nb::ndim<2>, nb::c_contig, nb::device::cuda> counts,

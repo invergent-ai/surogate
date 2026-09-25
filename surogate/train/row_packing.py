@@ -38,9 +38,79 @@ larger maximum still differ).
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
+
+#: This Python package's row packing relies on the engine restarting linear-attention (Gated
+#: DeltaNet) layers at every packed document: the causal convolution reads zeros before a
+#: document's first token and the gated delta rule starts each document from a zero recurrent
+#: state. The compiled extension says whether it does (``_surogate.LINEAR_ATTENTION_DOC_BOUNDARIES``);
+#: :func:`linear_attention_doc_boundaries` checks both, and is what deployment scripts should call.
+LINEAR_ATTENTION_DOC_BOUNDARIES = True
+
+#: Token-mixing ops, other than attention, that honour document boundaries when the compiled
+#: extension reports ``LINEAR_ATTENTION_DOC_BOUNDARIES``.
+DOCUMENT_AWARE_MIXERS = frozenset({"chunk_gated_delta_rule", "mamba_conv1d"})
+
+#: Token-mixing ops not verified to honour document boundaries: a packed row would start from the
+#: previous row's state. Row packing refuses models that use them (override:
+#: SUROGATE_ALLOW_UNVERIFIED_ROW_PACKING=1).
+DOCUMENT_UNVERIFIED_MIXERS = frozenset({"mamba_ssm_scan", "glm_causal_conv1d", "chunk_kimi_delta_rule"})
+
+
+def linear_attention_doc_boundaries() -> bool:
+    """True when both this package and the compiled extension restart linear-attention layers at
+    every packed document. CPU only (imports the extension, touches no GPU)."""
+    if not LINEAR_ATTENTION_DOC_BOUNDARIES:
+        return False
+    try:
+        from surogate import _surogate
+    except ImportError:
+        return False
+    return bool(getattr(_surogate, "LINEAR_ATTENTION_DOC_BOUNDARIES", False))
+
+
+def _ir_ops(ir_json: str) -> set[str]:
+    ops: set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("op", "kernel_type", "type") and isinstance(value, str):
+                    ops.add(value)
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(json.loads(ir_json))
+    return ops
+
+
+def document_isolation_problem(ir_json: str | None) -> str | None:
+    """Why packed rows of this model would not be isolated documents, or None.
+
+    Attention is isolated by document masking; this checks the model's other token mixers."""
+    if not ir_json:
+        return None
+    ops = _ir_ops(ir_json)
+    unverified = sorted(ops & DOCUMENT_UNVERIFIED_MIXERS)
+    if unverified and os.environ.get("SUROGATE_ALLOW_UNVERIFIED_ROW_PACKING") != "1":
+        return (
+            f"the model mixes tokens with {unverified}, which are not verified to restart at a packed "
+            "document boundary (set SUROGATE_ALLOW_UNVERIFIED_ROW_PACKING=1 to pack anyway)"
+        )
+    aware = sorted(ops & DOCUMENT_AWARE_MIXERS)
+    if aware and not linear_attention_doc_boundaries():
+        return (
+            f"the model has linear-attention layers ({aware}) and this surogate build carries their "
+            "convolution and recurrent state across packed documents (the compiled extension lacks "
+            "LINEAR_ATTENTION_DOC_BOUNDARIES); upgrade surogate or train padded"
+        )
+    return None
 
 
 def effective_length(targets_row: np.ndarray) -> int:

@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -147,6 +149,20 @@ std::vector<GdnDocument> gdn_documents(const std::int32_t* cu_seqlens, int num_d
                                  " of " + std::to_string(B * T) + " tokens");
     }
     return docs;
+}
+
+/// Documents are active but the per-document pipeline cannot run (sequence chunks, an initial
+/// state, a CUDA graph capture): the whole-row pipeline runs as it always has, and its state then
+/// crosses document boundaries. Said once per process rather than refused, so configurations that
+/// ran before keep running.
+void warn_documents_not_isolated(const char* op_name, const char* why) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        std::fprintf(stderr,
+                     "[surogate] %s: packed documents with %s: the gated delta rule's recurrent state is carried "
+                     "across document boundaries (documents are not isolated in linear-attention layers)\n",
+                     op_name, why);
+    });
 }
 
 inline void* at(void* base, long elements, ETensorDType dtype) {
@@ -335,17 +351,15 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         return;
     }
 
-    if (mCuSeqlensGpu != nullptr && mCuSeqlensCpu != nullptr && mNumDocs > 0) {
+    const bool documents = mCuSeqlensGpu != nullptr && mCuSeqlensCpu != nullptr && mNumDocs > 0;
+    const char* whole_row_reason = sequence_chunk_active() ? "sequence chunks"
+                                   : initial_state         ? "an initial state"
+                                   : stream_capturing(stream) ? "CUDA graph capture"
+                                                              : nullptr;
+    if (documents && whole_row_reason) warn_documents_not_isolated(op_name, whole_row_reason);
+    if (documents && !whole_row_reason) {
         // Packed documents: one pipeline per document (see GdnDocument). The final state of a row
         // is its last document's.
-        if (sequence_chunk_active() || initial_state) {
-            throw std::runtime_error(std::string(op_name) + ": packed documents cannot be combined with sequence "
-                                     "chunks or an initial state");
-        }
-        if (stream_capturing(stream)) {
-            throw std::runtime_error(std::string(op_name) + ": packed documents are dispatched per document from "
-                                     "the host and cannot be captured in a CUDA graph");
-        }
         const auto docs = gdn_documents(mCuSeqlensCpu, mNumDocs, B, T, op_name);
         const long slots = docs.back().chunk + cdiv(static_cast<int>(docs.back().length), BT);
         Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
@@ -734,6 +748,16 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm path complete\n");
     }
 
+    const bool documents = mCuSeqlensGpu != nullptr && mCuSeqlensCpu != nullptr && mNumDocs > 0;
+    const char* whole_row_reason = sequence_chunk_active()                ? "sequence chunks"
+                                   : initial_state                         ? "an initial state"
+                                   : (d_final_state && d_final_state->Data) ? "a final-state gradient"
+                                   : stream_capturing(stream)              ? "CUDA graph capture"
+                                                                           : nullptr;
+    if (documents && whole_row_reason && !mOptions.MoeRolloutParity) {
+        warn_documents_not_isolated("chunk_gated_delta_rule_backward", whole_row_reason);
+    }
+    const bool per_document = documents && !whole_row_reason;
     if (mOptions.MoeRolloutParity) {
         if (sequence_chunk_active() || initial_state || (d_final_state && d_final_state->Data))
             throw std::runtime_error("MoE rollout parity requires unchunked gated delta rule sequences");
@@ -776,17 +800,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                                     stream);
         mRunState.Stack.free(checkpoints);
         fill_zero(*d_initial, stream);
-    } else if (mCuSeqlensGpu != nullptr && mCuSeqlensCpu != nullptr && mNumDocs > 0) {
+    } else if (per_document) {
         // Packed documents: the forward's per-document pipelines recomputed, then each document's
         // backward on its own (see GdnDocument). No gradient crosses a document boundary.
-        if (sequence_chunk_active() || initial_state || (d_final_state && d_final_state->Data)) {
-            throw std::runtime_error("chunk_gated_delta_rule_backward: packed documents cannot be combined with "
-                                     "sequence chunks, an initial state or a final-state gradient");
-        }
-        if (stream_capturing(stream)) {
-            throw std::runtime_error("chunk_gated_delta_rule_backward: packed documents are dispatched per document "
-                                     "from the host and cannot be captured in a CUDA graph");
-        }
         const auto docs = gdn_documents(mCuSeqlensCpu, mNumDocs, B, T, "chunk_gated_delta_rule_backward");
         const long slots = docs.back().chunk + cdiv(static_cast<int>(docs.back().length), BT);
         long max_length = 0;

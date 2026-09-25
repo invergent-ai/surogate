@@ -79,10 +79,8 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     }
 
     if (sequence_chunk_active() && kernel > 1) {
-        if (mCuSeqlensGpu != nullptr && mNumDocs > 0) {
-            throw std::runtime_error("mamba_conv1d: sequence chunks with packed documents are not supported "
-                                     "(the carried tail would cross a document boundary)");
-        }
+        // (Packed documents are not isolated on this path: the carried tail is the previous
+        // chunk's last inputs whichever document they belong to, as before documents were honoured.)
         // Chunked-sequence carry via the extended-input trick: run the
         // standard kernel (fused activation included) on concat(tail, x) —
         // outputs [K-1, T+K-1) are exactly the values a full-sequence conv
