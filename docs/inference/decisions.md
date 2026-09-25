@@ -155,6 +155,19 @@ A `--decision-temperature` that is not a finite number greater than zero (out-of
 such as `1e999` or a subnormal included) stops the server at startup with the usage text; it
 never reaches a request.
 
+### Non-finite logits
+
+A request whose option logits come out non-finite (NaN or infinite) for any question is run
+again from scratch by the engine, up to `--decision-attempts` times in all (default 3, 1..16).
+Nothing of the failed attempt is reused: the shared prefix is prefilled again under a new key --
+the old one's saved state and KV pages are released first -- and whole-prompt questions are
+prepared again. Each run after the first logs one warning,
+`[req N] decisions attempt k of 3 returned non-finite logits for x of y questions (names); running
+the request again from scratch`; the console `done` line gains ` attempts=N` and the JSONL records
+`decisions.attempts`. Only when every attempt fails does the client get HTTP 500 `model returned
+non-finite logits` (its console error line and record carry the attempts too). Any other failure
+ends the request at once, as before, and retries share the request's deadline.
+
 Errors use the server's standard `{"error": {...}}` envelope: HTTP 400 for a malformed body
 (missing or mistyped fields, an unknown question type, fewer than 2 or more than 255
 options, a repeated question name or option key, an empty question set, a prompt over the

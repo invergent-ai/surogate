@@ -967,7 +967,7 @@ const std::vector<std::string>& GenerationService::decision_codes() {
 DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare,
-                                           const std::function<void(const std::string&)>& on_retry) {
+                                           const std::function<void(std::uint32_t, const std::string&)>& on_retry) {
     if (!engine_->supports_chat()) {
         ApiError error;
         error.message = "this model publishes no chat template, which is what a base model "
@@ -1267,13 +1267,15 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             if (on_retry) {
                 std::string names;
                 for (std::size_t k = 0; k < nonfinite.size() && k < 8; ++k) {
-                    names += (k == 0 ? "" : ",") + request.questions[nonfinite[k]].name;
+                    const std::string& name = request.questions[nonfinite[k]].name;
+                    names += (k == 0 ? "" : ",") + (name.size() > 64 ? name.substr(0, 64) + "..." : name);
                 }
                 if (nonfinite.size() > 8) { names += ",..."; }
-                on_retry("decisions attempt " + std::to_string(attempt) + " of " + std::to_string(attempts) +
-                         " returned non-finite logits for " + std::to_string(nonfinite.size()) + " of " +
-                         std::to_string(readout.logits.size()) + " questions (" + names +
-                         "); running the request again from scratch");
+                on_retry(attempt + 1, "decisions attempt " + std::to_string(attempt) + " of " +
+                                          std::to_string(attempts) + " returned non-finite logits for " +
+                                          std::to_string(nonfinite.size()) + " of " +
+                                          std::to_string(readout.logits.size()) + " questions (" + names +
+                                          "); running the request again from scratch");
             }
             // The attempt's key, options and prompts go out of scope here, before the next
             // attempt submits anything.

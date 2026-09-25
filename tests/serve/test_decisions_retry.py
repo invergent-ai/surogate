@@ -54,6 +54,13 @@ SHARED = json.dumps({"model": "rune", "state": STATE, "questions": {
 SINGLE = json.dumps({"model": "rune", "state": "The package arrived two weeks late and was crushed.",
                      "questions": {"sentiment": {"type": "choice", "instructions": "Sentiment?",
                                                  "criteria": {"positive": "Positive", "negative": "Negative"}}}})
+# Two questions under different system prompts (one needs the extended codebook past 26
+# options) share no prefix, so they run as whole prompts, each prepared again for a retry.
+WHOLE = json.dumps({"model": "rune", "state": "Order 7 arrived late.", "questions": {
+    "late": {"type": "choice", "instructions": "Was it late?", "criteria": {"yes": "Yes", "no": "No"}},
+    "which": {"type": "choice", "instructions": "Which option?",
+              "criteria": {f"o{i}": f"Option {i}" for i in range(30)}},
+}})
 NEIGHBOURS = [json.dumps({"model": "rune", "state": f"Order {i} arrived {i} days late.",
                           "questions": {"late": {"type": "choice", "instructions": "Was it late?",
                                                  "criteria": {"yes": "Yes", "no": "No"}}}})
@@ -109,20 +116,36 @@ def pages_in_use(url):
     return requests.get(url + "/kv_stats", timeout=10).json()["models"][0]["pages_in_use"]
 
 
-def settle(url, baseline):
-    """The KV pages in use come back to a clean server's count once a clean request has run after
-    the faults: nothing a failed attempt held -- its saved prefix, its lanes' pages -- is left."""
+def settle(url, expected):
+    """KV pages in use once a one-question request has run after the faults: exactly what a clean
+    server holds after the same requests (finished lanes stay retained, so the count depends on
+    what ran; nothing a failed attempt held -- its saved prefix, its lanes' pages -- may add to it)."""
     answers(url, SINGLE)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if pages_in_use(url) == baseline:
+        if pages_in_use(url) == expected:
             return
         time.sleep(0.5)
-    assert pages_in_use(url) == baseline
+    assert pages_in_use(url) == expected
+
+
+_EXPECTED_PAGES = {}
+
+
+def clean_pages(tmp_path_factory, *bodies):
+    """Pages in use on a fresh clean server after `bodies` and then SINGLE."""
+    if bodies not in _EXPECTED_PAGES:
+        with serve(tmp_path_factory.mktemp("clean-pages"), "clean-pages") as (url, log):
+            for body in bodies:
+                post(url, body)
+            answers(url, SINGLE)
+            time.sleep(1)
+            _EXPECTED_PAGES[bodies] = pages_in_use(url)
+    return _EXPECTED_PAGES[bodies]
 
 
 def warnings(log):
-    return re.findall(r"\[req \d+\] warning decisions attempt (\d+) of (\d+) returned non-finite logits",
+    return re.findall(r"\[req \d+\] decisions attempt (\d+) of (\d+) returned non-finite logits",
                       Path(log).read_text())
 
 
@@ -130,24 +153,21 @@ def warnings(log):
 def clean(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("decisions-retry")
     with serve(tmp, "clean") as (url, log):
-        recorded = {"shared": answers(url, SHARED), "single": answers(url, SINGLE),
+        recorded = {"shared": answers(url, SHARED), "single": answers(url, SINGLE), "whole": answers(url, WHOLE),
                     "neighbours": [answers(url, body) for body in NEIGHBOURS]}
         # Run to run on an idle server: the same answers again.
         assert answers(url, SHARED) == recorded["shared"]
         assert not warnings(log)
-        # The pages a clean server holds once a one-question request has run after the others.
-        answers(url, SINGLE)
-        time.sleep(1)
-        recorded["pages"] = pages_in_use(url)
     return recorded
 
 
-def test_poisoned_prefix_is_run_again_from_scratch(clean, tmp_path):
+def test_poisoned_prefix_is_run_again_from_scratch(clean, tmp_path, tmp_path_factory):
+    expected = clean_pages(tmp_path_factory, SHARED)  # before this test's server takes the GPU
     with serve(tmp_path, "poison-once", {"SUROGATE_SERVE_FAULT_POISON_GPU_PREFIX": "1"}) as (url, log):
         assert answers(url, SHARED) == clean["shared"]
         assert warnings(log) == [("1", "3")]
         assert re.search(r"done finish=\S+ .* questions=4 shared_prefix=\d+ attempts=2", Path(log).read_text())
-        settle(url, clean["pages"])
+        settle(url, expected)
         # The fault is spent: the next request runs once.
         assert answers(url, SHARED) == clean["shared"]
         assert warnings(log) == [("1", "3")]
@@ -165,20 +185,36 @@ def test_neighbours_are_unaffected(clean, tmp_path):
         assert warnings(log) == [("1", "3")]
 
 
-def test_single_question_readout_is_run_again(clean, tmp_path):
+def test_single_question_readout_is_run_again(clean, tmp_path, tmp_path_factory):
+    expected = clean_pages(tmp_path_factory, SINGLE)  # before this test's server takes the GPU
     with serve(tmp_path, "nan-readout", {"SUROGATE_SERVE_FAULT_NAN_READOUT": "1"}) as (url, log):
         assert answers(url, SINGLE) == clean["single"]
         assert warnings(log) == [("1", "3")]
-        settle(url, clean["pages"])
+        settle(url, expected)
 
 
-def test_persistent_fault_returns_the_error_after_every_attempt(clean, tmp_path):
-    with serve(tmp_path, "poison-always", {"SUROGATE_SERVE_FAULT_POISON_GPU_PREFIX": "1000000"}) as (url, log):
+def test_whole_prompt_questions_are_prepared_again(clean, tmp_path, tmp_path_factory):
+    expected = clean_pages(tmp_path_factory, WHOLE)  # before this test's server takes the GPU
+    with serve(tmp_path, "nan-readout-whole", {"SUROGATE_SERVE_FAULT_NAN_READOUT": "1"}) as (url, log):
+        assert answers(url, WHOLE) == clean["whole"]
+        assert warnings(log) == [("1", "3")]
+        assert re.search(r"questions=2 shared_prefix=0 attempts=2", Path(log).read_text())
+        settle(url, expected)
+
+
+def test_persistent_fault_returns_the_error_after_every_attempt(clean, tmp_path, tmp_path_factory):
+    expected = clean_pages(tmp_path_factory, SHARED)  # before this test's server takes the GPU
+    records = tmp_path / "requests.jsonl"
+    with serve(tmp_path, "poison-always", {"SUROGATE_SERVE_FAULT_POISON_GPU_PREFIX": "1000000"},
+               ["--request-log-jsonl", str(records)]) as (url, log):
         response = post(url, SHARED)
         assert response.status_code == 500, response.text
         assert "model returned non-finite logits" in response.json()["error"]["message"]
         assert warnings(log) == [("1", "3"), ("2", "3")]
-        settle(url, clean["pages"])
+        assert re.search(r"\] error model returned non-finite logits attempts=3", Path(log).read_text())
+        errors = [r for r in map(json.loads, records.read_text().splitlines()) if r.get("event") == "request_error"]
+        assert [r["request"]["decisions"]["attempts"] for r in errors] == [3], errors
+        settle(url, expected)
         # The server serves on: a request without a shared prefix is unaffected by this fault.
         assert answers(url, SINGLE) == clean["single"]
 

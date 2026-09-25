@@ -65,6 +65,8 @@ struct RequestRejectionLogContext {
     ToolChoice tool_choice;
     bool has_tool_history = false;
     std::size_t question_count = 0; // `decisions` protocol
+    /// Decisions: how many times the request ran before it was refused (--decision-attempts).
+    std::uint32_t decision_attempts = 1;
     std::string client_request_id;  // the caller's X-Request-Id, empty when none was sent
     ApiError error;
 };

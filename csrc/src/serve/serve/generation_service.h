@@ -86,6 +86,7 @@ struct DecisionsOutcome {
     int output_tokens = 0; // one readout token per question
     std::size_t shared_prefix_tokens = 0;
     double prepare_seconds = 0.0;
+    /// Every attempt's prefill time; `input_tokens` counts one attempt's tokens.
     double prefill_seconds = 0.0;
     double total_seconds   = 0.0;
     /// How many times the request ran (--decision-attempts): 1 unless an attempt returned
@@ -213,11 +214,12 @@ public:
     /// `--decision-temperature` (`resolve_decision_answers`). Throws ApiException for a
     /// refusal (400) or an engine failure.
     /// A request whose option logits come out non-finite is run again from scratch, up to
-    /// `--decision-attempts` times in all; `on_retry` is told why before each run after the
-    /// first. Only the last attempt's error reaches the caller.
+    /// `--decision-attempts` times in all; `on_retry` is given the number of the attempt about
+    /// to start and why, before each run after the first. Non-finite logits are the only reason
+    /// to run again: any other failure ends the request at once, as it always has.
     [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
         std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {},
-        const std::function<void(const std::string&)>& on_retry = {});
+        const std::function<void(std::uint32_t attempt, const std::string& reason)>& on_retry = {});
 
     void warmup();
 

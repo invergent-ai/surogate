@@ -254,6 +254,18 @@ def test_decision_temperature_is_a_server_option():
             serve._parse_invocation([f"--{mode}", "model", "--decision-temperature", "2.5"])
 
 
+def test_decision_attempts_is_a_server_option():
+    """The decisions retry bound reaches the server engine as typed; other modes refuse it."""
+    expected = ("server", "model", ["--decision-attempts", "5"], True, None)
+    assert serve._parse_invocation(["model", "--decision-attempts", "5"]) == expected
+    assert serve._parse_invocation(["--decision-attempts=5", "model"]) == expected
+    with pytest.raises(ValueError, match="needs a value"):
+        serve._parse_invocation(["model", "--decision-attempts"])
+    for mode in ("generate", "embed", "stt", "tts"):
+        with pytest.raises(ValueError, match="not supported"):
+            serve._parse_invocation([f"--{mode}", "model", "--decision-attempts", "5"])
+
+
 def test_decision_temperature_is_passed_to_the_engine(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["surogate", "serve", "model", "--decision-temperature", "2.5"])
     monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")

@@ -393,6 +393,7 @@ the model's chat template.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--decision-temperature T` | `1` | Calibration temperature of the [decisions endpoint](decisions.md#calibration-temperature): every answer is read from `softmax(option logits / T)` |
+| `--decision-attempts N` | `3` | How many times a [decisions](decisions.md#non-finite-logits) request runs while its option logits come out non-finite (1..16; `1` returns the error at once) |
 
 `T` must be a finite number greater than zero (anything else is refused at startup); `1`
 returns the model's own distribution unchanged. It applies to every decisions request

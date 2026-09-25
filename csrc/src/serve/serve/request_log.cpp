@@ -244,7 +244,8 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"tool_count", context.tool_count},
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history}};
-    add_decisions(record, context.protocol, context.question_count, std::nullopt);
+    add_decisions(record, context.protocol, context.question_count, std::nullopt, std::nullopt,
+                  context.decision_attempts);
     return record;
 }
 
@@ -450,6 +451,9 @@ std::string format_request_done(const RequestLogContext& context,
 std::string format_request_error(const RequestLogContext& context, const std::string& message) {
     std::ostringstream out;
     out << "[req " << context.id << "] error " << message;
+    if (context.protocol == "decisions" && context.decision_attempts > 1) {
+        out << " attempts=" << context.decision_attempts;
+    }
     return out.str();
 }
 
@@ -502,7 +506,8 @@ std::string format_server_start_json(
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
                               {"default_preserve_thinking", options.preserve_thinking},
-                              {"decision_temperature", options.decision_temperature}};
+                              {"decision_temperature", options.decision_temperature},
+                              {"decision_attempts", options.decision_attempts}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},

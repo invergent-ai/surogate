@@ -186,8 +186,11 @@ void ProgramImplCore::capture_gpu_prefix(SequenceState& sequence,
     image->pages = std::make_shared<SequenceKVBundle>(std::move(*sequence.kv));
     if (take_injected_fault(InjectedFault::PoisonGpuPrefix)) {
         // Test fault: bf16 0xFFFF is NaN, so every question read on this prefix is non-finite.
-        const auto pages = image->pages->text.page_ids();
-        decoder->text_kv.pool().zero_pages(pages, device.stream, 0xFF);
+        // Only the pages this prefix owns: pages it borrowed from a parent prefix are read by
+        // that parent's other forks too.
+        const auto& text = image->pages->text;
+        const auto pages = text.page_ids().subspan(text.borrowed_pages());
+        if (!pages.empty()) { decoder->text_kv.pool().zero_pages(pages, device.stream, 0xFF); }
     }
     sequence.kv.reset();
     sequence.retained = false;
