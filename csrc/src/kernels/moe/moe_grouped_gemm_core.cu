@@ -189,9 +189,10 @@ void moe_grouped_gemm_impl(T* output,
         ldc_vec.push_back(M);
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx]) : weights + weight_idx * M * K);
-        B_vec.push_back(input + h_offsets[global_idx] * K);
-        C_vec.push_back(output + h_offsets[global_idx] * M);
+        A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                    : weights + static_cast<std::size_t>(weight_idx) * M * K);
+        B_vec.push_back(input + static_cast<std::size_t>(h_offsets[global_idx]) * K);
+        C_vec.push_back(output + static_cast<std::size_t>(h_offsets[global_idx]) * M);
     }
 
     if (m_vec.empty()) return;

@@ -106,8 +106,8 @@ void CompiledExecutor::initialize_forward_execution(const CompiledGraph& graph, 
         // prevents this accumulation; cudaMalloc overhead is negligible vs A2A/GEMM costs.
         mEpStrategy->buffer_pool().clear_pool();
         // Trim CUDA stream-ordered memory pool to release cached allocations.
-        // cuBLAS cublasGemmGroupedBatchedEx internally uses cudaMallocAsync;
-        // trimming reclaims unused cached blocks from previous steps.
+        // Libraries that allocate through cudaMallocAsync leave cached blocks in
+        // the pool; trimming reclaims those from previous steps.
         int device;
         cudaGetDevice(&device);
         cudaMemPool_t pool;

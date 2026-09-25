@@ -70,10 +70,10 @@ void moe_grouped_gemm_gate_up_impl(
         if (tokens_e == 0) continue;
 
         const int weight_idx = weight_is_compact ? e : global_idx;
-        const T* A_ptr =
-            weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx]) : weights + weight_idx * out_dim * hidden_size;
-        const T* B_ptr = input + h_offsets[global_idx] * hidden_size;
-        T* C_ptr = output + h_offsets[global_idx] * out_dim;
+        const T* A_ptr = weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
+                                     : weights + static_cast<std::size_t>(weight_idx) * out_dim * hidden_size;
+        const T* B_ptr = input + static_cast<std::size_t>(h_offsets[global_idx]) * hidden_size;
+        T* C_ptr = output + static_cast<std::size_t>(h_offsets[global_idx]) * out_dim;
 
         m_vec.push_back(out_dim);
         n_vec.push_back(tokens_e);
@@ -179,9 +179,9 @@ void moe_grouped_gemm_down_impl(
         ldc_vec.push_back(hidden_size);
 
         A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
-                                    : weights + weight_idx * hidden_size * intermediate_size);
-        B_vec.push_back(input + h_offsets[global_idx] * intermediate_size);
-        C_vec.push_back(output + h_offsets[global_idx] * hidden_size);
+                                    : weights + static_cast<std::size_t>(weight_idx) * hidden_size * intermediate_size);
+        B_vec.push_back(input + static_cast<std::size_t>(h_offsets[global_idx]) * intermediate_size);
+        C_vec.push_back(output + static_cast<std::size_t>(h_offsets[global_idx]) * hidden_size);
     }
 
     if (m_vec.empty()) return;

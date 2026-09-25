@@ -186,9 +186,9 @@ void moe_grouped_gemm_down_backward_impl(
 
         const int weight_idx = weight_is_compact ? e : global_idx;
         A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
-                                    : weights + weight_idx * hidden_size * intermediate_size);
-        B_vec.push_back(d_output + h_offsets[global_idx] * hidden_size);
-        C_vec.push_back(d_input + h_offsets[global_idx] * intermediate_size);
+                                    : weights + static_cast<std::size_t>(weight_idx) * hidden_size * intermediate_size);
+        B_vec.push_back(d_output + static_cast<std::size_t>(h_offsets[global_idx]) * hidden_size);
+        C_vec.push_back(d_input + static_cast<std::size_t>(h_offsets[global_idx]) * intermediate_size);
     }
 
     if (m_vec.empty()) return;
@@ -281,9 +281,9 @@ void moe_grouped_gemm_gate_up_backward_impl(
 
         const int weight_idx = weight_is_compact ? e : global_idx;
         A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
-                                    : weights + weight_idx * gate_up_dim * hidden_size);
-        B_vec.push_back(d_gate_up + h_offsets[global_idx] * gate_up_dim);
-        C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
+                                    : weights + static_cast<std::size_t>(weight_idx) * gate_up_dim * hidden_size);
+        B_vec.push_back(d_gate_up + static_cast<std::size_t>(h_offsets[global_idx]) * gate_up_dim);
+        C_vec.push_back(d_input + static_cast<std::size_t>(h_offsets[global_idx]) * hidden_size);
     }
 
     if (m_vec.empty()) return;
@@ -375,9 +375,9 @@ void moe_grouped_gemm_up_backward_impl(
 
         const int weight_idx = weight_is_compact ? e : global_idx;
         A_vec.push_back(weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
-                                    : weights + weight_idx * up_dim * hidden_size);
-        B_vec.push_back(d_up + h_offsets[global_idx] * up_dim);
-        C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
+                                    : weights + static_cast<std::size_t>(weight_idx) * up_dim * hidden_size);
+        B_vec.push_back(d_up + static_cast<std::size_t>(h_offsets[global_idx]) * up_dim);
+        C_vec.push_back(d_input + static_cast<std::size_t>(h_offsets[global_idx]) * hidden_size);
     }
 
     if (m_vec.empty()) return;
