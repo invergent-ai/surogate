@@ -197,7 +197,9 @@ def test_gdn_lora_export_forward_and_gradients(mini_model):
         # 4. gradients against an fp32 HF reference with the adapters as forward hooks
         from transformers import AutoModelForImageTextToText
 
-        hf = AutoModelForImageTextToText.from_pretrained(str(mini_model), torch_dtype=torch.float32).cuda().eval()
+        # The mini checkpoint shrinks the (unused) vision tower, hence ignore_mismatched_sizes.
+        hf = AutoModelForImageTextToText.from_pretrained(str(mini_model), dtype=torch.float32,
+                                                         ignore_mismatched_sizes=True).cuda().eval()
         named = dict(hf.named_modules())
         params, hooks = {}, []
         for module in modules:
@@ -212,10 +214,16 @@ def test_gdn_lora_export_forward_and_gradients(mini_model):
         loss.backward()
         for h in hooks:
             h.remove()
-        assert abs(float(loss) - merged_loss) <= 5e-2 * max(1.0, abs(float(loss))), (float(loss), merged_loss)
+        assert abs(float(loss.detach()) - merged_loss) <= 5e-2 * max(1.0, abs(float(loss.detach()))), (
+            float(loss.detach()), merged_loss)
+
+        # get_lora_gradients returns the step's raw sums (the optimizer normalises by the supervised-token
+        # count); the reference is the mean loss's gradient.
+        n_valid = int((y != -100).sum())
 
         def rel(module):
             ours = torch.cat([grads[module + ".lora_A.weight"].flatten(), grads[module + ".lora_B.weight"].flatten()])
+            ours = ours / n_valid
             ref = torch.cat([params[module][0].grad.flatten().cpu(), params[module][1].grad.flatten().cpu()])
             return float((ours - ref).norm() / ref.norm().clamp_min(1e-12)), float(
                 torch.nn.functional.cosine_similarity(ours, ref, dim=0))
@@ -226,7 +234,9 @@ def test_gdn_lora_export_forward_and_gradients(mini_model):
         floor = max(rel(m)[0] for m in existing)
         report = {m: rel(m) for m in new}
         worst = max(v[0] for v in report.values())
-        print(json.dumps({"existing_worst_relL2": floor, "linear_attn": report, "lora_loss": lora_loss,
-                          "merged_loss": merged_loss, "hf_fp32_loss": float(loss)}, indent=1))
+        print(json.dumps({"existing_worst_relL2": floor, "linear_attn_worst_relL2": worst,
+                          "linear_attn_min_cosine": min(c for _, c in report.values()), "lora_loss": lora_loss,
+                          "merged_loss": merged_loss, "hf_fp32_loss": float(loss.detach())}, indent=1))
+        assert floor <= 0.2, floor  # the existing adapters against the same reference (calibration)
         assert all(cos > 0.98 for _, cos in report.values()), report
-        assert worst <= max(0.2, 1.5 * floor), (worst, floor, report)
+        assert worst <= max(0.1, 1.5 * floor), (worst, floor, report)
