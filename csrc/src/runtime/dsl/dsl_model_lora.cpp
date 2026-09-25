@@ -136,6 +136,35 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
     comm.barrier();
 }
 
+namespace {
+/// (parameters, tensors) of the adapter this trainer holds, in the optimizers' own count.
+template <typename Weights>
+std::pair<std::size_t, int> lora_optimizer_geometry(Weights& weights, int num_layers) {
+    std::size_t params = 0;
+    int tensors = 0;
+    for (int l = 0; l < num_layers; ++l) {
+        modules::for_each_lora_layer_weight(weights.get_master_block(l, nullptr), [&](auto, auto& layer) {
+            for (const auto* t : {&layer.A, &layer.B}) {
+                if (!t->Data) continue;
+                params += t->nelem();
+                ++tensors;
+            }
+        });
+    }
+    return {params, tensors};
+}
+
+void require_optimizer_geometry(const char* optimizer, std::size_t saved_params, long saved_tensors,
+                                std::pair<std::size_t, int> current) {
+    if (saved_params == current.first && (saved_tensors < 0 || saved_tensors == current.second)) return;
+    throw std::runtime_error(fmt::format(
+        "LoRA {} checkpoint geometry does not match the adapter: the checkpoint's optimizer state covers {} "
+        "parameters in {} tensors, this trainer's adapter has {} in {}. Resume with the lora_target_modules "
+        "(and rank) the checkpoint was trained with",
+        optimizer, saved_params, saved_tensors, current.first, current.second));
+}
+}  // namespace
+
 void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {
     reset_decode_state();
     if (!lora_enabled()) return;
@@ -168,7 +197,10 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
     nlohmann::json opt_meta = nlohmann::json::parse(meta_stream);
     std::string optimizer_type = opt_meta["optimizer_type"].get<std::string>();
 
+    const auto current = lora_optimizer_geometry(*mLoRAWeights, mModelConfig.NumLayers);
     if (optimizer_type == "adamw") {
+        require_optimizer_geometry("AdamW", opt_meta.at("total_params").get<size_t>(),
+                                   opt_meta.at("num_tensors").get<int>(), current);
         if (!mLoRAAdamWState) mLoRAAdamWState = std::make_unique<modules::LoRAAdamWState>();
         auto& state = *mLoRAAdamWState;
         const auto total_params = opt_meta.at("total_params").get<size_t>();
@@ -187,6 +219,8 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
         load_safetensors(opt_file.string(), container, /*allow_cast=*/false);
         state.values_restored = true;
     } else if (optimizer_type == "adamw_8bit") {
+        require_optimizer_geometry("AdamW 8-bit", opt_meta.at("total_params").get<size_t>(),
+                                   opt_meta.at("num_tensors").get<int>(), current);
         if (!mLoRAAdamW8BitState) {
             mLoRAAdamW8BitState = std::make_unique<modules::LoRAAdamW8BitState>();
         }
@@ -215,6 +249,9 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
         state.values_restored = true;
 
     } else if (optimizer_type == "normuon") {
+        // NorMuon keeps one variance buffer per tensor, so their count is the tensor count.
+        require_optimizer_geometry("NorMuon", opt_meta.at("total_params").get<size_t>(),
+                                   static_cast<long>(opt_meta.at("variance_shapes").size()), current);
         if (!mLoRANorMuonState) {
             mLoRANorMuonState = std::make_unique<modules::LoRANorMuonState>();
         }
@@ -281,6 +318,13 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
             max_features = std::max<int>(max_features, static_cast<int>(pld.attn_dim));
             max_features = std::max<int>(max_features, static_cast<int>(pld.qkv_channels));
             max_features = std::max<int>(max_features, static_cast<int>(pld.mlp_up));
+        }
+    }
+    // Linear-attention (GatedDeltaNet) adapters: in_proj_qkv/z outputs and out_proj's input can exceed
+    // every dense size (the packed-delta path needs a slice as wide as the adapter's output).
+    if (mLoRAWeights) {
+        for (const auto& shapes : mLoRAWeights->linear_shapes()) {
+            for (const auto& shape : shapes) max_features = std::max({max_features, shape.input, shape.output});
         }
     }
     if (mModelConfig.moe_config.has_value() && mModelConfig.moe_config->use_shared_expert) {
@@ -511,6 +555,9 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
         });
     }
 
+    if (state.values_restored &&
+        (state.total_params != total_params || state.num_tensors != static_cast<int>(h_param_ptrs.size())))
+        throw std::runtime_error("LoRA AdamW 8-bit checkpoint geometry does not match the adapter");
     state.num_tensors = static_cast<int>(h_param_ptrs.size());
     state.total_params = total_params;
     state.num_groups = optimizers::flash_adamw8bit_num_scales(total_params);
@@ -1127,6 +1174,8 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
     constexpr size_t BLOCK_SIZE = optimizers::NORMUON_BLOCK_SIZE;
 
     if (!state.initialized) {
+        const std::size_t restored_params = state.total_params;
+        const auto restored_shapes = state.variance_shapes;
         state.total_params = 0;
         state.state_elems = 0;
         state.max_weight_M = 0;
@@ -1159,6 +1208,8 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         }
 
         state.num_blocks = (state.state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (state.values_restored && (restored_params != state.total_params || restored_shapes != state.variance_shapes))
+            throw std::runtime_error("LoRA NorMuon checkpoint geometry does not match the adapter");
 
         state.momentum_quantiles = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_quantiles", {256});
         std::vector<float> h_quantiles(256);

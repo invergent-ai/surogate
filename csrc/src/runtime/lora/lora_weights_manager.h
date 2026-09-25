@@ -164,6 +164,11 @@ public:
         return mConfig.train_router;
     }
 
+    /// Per-layer linear-attention (GatedDeltaNet) LoRA geometry (empty shapes: no adapter).
+    [[nodiscard]] const std::vector<LoRALinearShapes>& linear_shapes() const {
+        return mConfig.linear_shapes;
+    }
+
     /**
      * @brief Get number of trainable parameters
      */

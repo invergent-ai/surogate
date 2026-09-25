@@ -222,14 +222,18 @@ def adapter_modules(trainer, scale: float):
     import torch
 
     weights = {name: torch.from_dlpack(value) for name, value in trainer.get_lora_weights(0).items()}
-    pattern = re.compile(r"base_model\.model\.model\.(?:language_model\.)?layers\.(\d+)\.(?:self_attn|linear_attn|mlp)\.([a-z_]+)\.lora_A\.weight")
+    pattern = re.compile(r"base_model\.model\.model\.(?:language_model\.)?layers\.(\d+)\.(self_attn|linear_attn|mlp)\.([a-z_]+)\.lora_A\.weight")
     modules, consumed = [], set()
     for name, tensor in weights.items():
         match = pattern.fullmatch(name)
         if match is None:
             continue
         b_name = name.replace(".lora_A.", ".lora_B.")
-        modules.append(dict(layer=int(match[1]), module=match[2], scale=scale,
+        # Serving's LoRA directory names attention and MLP modules bare (q_proj, up_proj; LoraStore aliases
+        # self_attn./mlp.), but the linear-attention (GatedDeltaNet) mixer's as linear_attn.<proj>
+        # (bind_lora_gdn): out_proj is both a linear-attention and a fused-QKV attention name.
+        module = f"linear_attn.{match[3]}" if match[2] == "linear_attn" else match[3]
+        modules.append(dict(layer=int(match[1]), module=module, scale=scale,
                             a=tensor.to(torch.bfloat16).contiguous(),
                             b=weights[b_name].to(torch.bfloat16).contiguous()))
         consumed.update((name, b_name))
