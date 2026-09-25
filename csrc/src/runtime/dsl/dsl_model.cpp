@@ -1424,6 +1424,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         // This covers variable KV heads, gated Q projections, native fused QKV,
         // and K=V/shared-KV layers without inventing absent projection adapters.
         wm.attention_shapes.resize(mModelConfig.NumLayers);
+        wm.linear_shapes.assign(static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)), modules::LoRALinearShapes{});
         const bool glm_attention_names = mModelConfig.ModelTypeName == "glm5_next";
         if (glm_attention_names) {
             wm.tensor_prefix = "base_model.model.model.language_model.layers";
@@ -1438,6 +1439,15 @@ DslModel::DslModel(const PretrainedConfig& config,
                 layer >= mModelConfig.NumLayers)
                 continue;
             for (const auto& target : info.lora_targets) {
+                const int li = modules::linear_target_index(target.name, target.grouped);
+                if (li >= 0) {
+                    if (info.shape.size() != 2)
+                        throw std::invalid_argument("Linear-attention LoRA parameter must have rank 2: " + name);
+                    const auto shape = resolve_shape(info.shape, lora_env);
+                    modules::record_linear_geometry(wm.linear_shapes[layer], li, shape[1], shape[0],
+                                                    target.offset, target.size, name);
+                    continue;
+                }
                 const int i = modules::attention_target_index(target.name, target.grouped);
                 if (i < 0) continue;
                 if (info.shape.size() != 2)
@@ -1453,6 +1463,21 @@ DslModel::DslModel(const PretrainedConfig& config,
                 }
             }
         }
+        // Linear-attention (GatedDeltaNet) mixers declare their own LoRA targets. On such a
+        // model "out_proj" names the mixer's output projection (HF linear_attn.out_proj); the
+        // attention output adapter keeps its o_proj name and exists only if asked for.
+        const bool has_linear_lora = std::any_of(wm.linear_shapes.begin(), wm.linear_shapes.end(),
+            [](const modules::LoRALinearShapes& shapes) {
+                return std::any_of(shapes.begin(), shapes.end(),
+                                   [](const modules::LoRAProjectionShape& s) { return s.input > 0; });
+            });
+        mLoRAConfig->has_linear_attention = has_linear_lora;
+        if (has_linear_lora && !fused_qkv_lora && mLoRAConfig->o_proj_name == "out_proj") {
+            mLoRAConfig->o_proj_name = "o_proj";
+            if (!mLoRAConfig->o_proj_explicit && !mLoRAConfig->all_targets)
+                mLoRAConfig->targets.erase(modules::LoRATarget::O_PROJ);
+        }
+        wm.lora_config = *mLoRAConfig;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
             wm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
@@ -1483,6 +1508,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         gm.model_config = &mModelConfig;
         gm.per_layer_dims = mRuntimeConfig.per_layer_dims;
         gm.attention_shapes = wm.attention_shapes;
+        gm.linear_shapes = wm.linear_shapes;
         gm.layer_has_dense_mlp = mRuntimeConfig.layer_has_dense_mlp;
         gm.layer_has_moe = mRuntimeConfig.layer_has_moe;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {

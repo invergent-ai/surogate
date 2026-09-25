@@ -5,12 +5,14 @@
 #ifndef SUROGATE_SRC_MODULES_LORA_LORA_UTILS_H
 #define SUROGATE_SRC_MODULES_LORA_LORA_UTILS_H
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <vector>
 #include <string>
 #include "runtime/core/model_config.h"
 #include "lora_config.h"
+#include "lora_types.h"
 #include "utilities/tensor_container.h"
 
 namespace modules {
@@ -38,6 +40,13 @@ inline std::vector<std::string> targets_to_peft_names(const ModularLoRAConfig& c
     if (cfg.applies_to_gate_up()) out.emplace_back("gate_up_proj");
     if (cfg.applies_to_up()) out.emplace_back("up_proj");
     if (cfg.applies_to_down()) out.emplace_back("down_proj");
+    if (cfg.has_linear_attention) {
+        for (int i = 0; i < 5; ++i) {
+            // "out_proj" may already be listed as the attention output's name.
+            const std::string name(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]);
+            if (cfg.applies_to_linear(i) && std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
+        }
+    }
     // MoE router gate (when train_router is enabled)
     if (cfg.train_router) out.emplace_back("mlp.gate");
     return out;

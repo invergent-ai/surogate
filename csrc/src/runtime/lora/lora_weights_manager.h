@@ -65,6 +65,9 @@ public:
         /// apply_lora_contribution read past the end of lora_B (→ NaN/garbage).
         std::vector<dsl::BlockTypeDims> per_layer_dims;
         std::vector<LoRAAttentionShapes> attention_shapes;
+        /// Per-layer linear-attention (GatedDeltaNet) projection geometry from the DSL
+        /// declarations (kLinearAttentionLoRANames order); zero shapes = no adapter.
+        std::vector<LoRALinearShapes> linear_shapes;
         std::string tensor_prefix = "base_model.model.model.layers";
         std::vector<std::array<std::string, 4>> attention_names;
 

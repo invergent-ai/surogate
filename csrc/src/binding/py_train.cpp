@@ -2053,16 +2053,29 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
                     mod_lora.fused_qkv = true;
                     mod_lora.q_proj_name = name;
                 } else if (name == "out_proj") {
+                    // Attention output of native fused-QKV models, or the linear-attention
+                    // out_proj (GatedDeltaNet); the model build resolves which (dsl_model.cpp).
                     mod_lora.targets.insert(modules::LoRATarget::O_PROJ);
+                    mod_lora.targets.insert(modules::LoRATarget::LIN_OUT_PROJ);
                     mod_lora.o_proj_name = name;
-                } else if (name == "q_proj")
+                } else if (name == "in_proj_qkv")
+                    mod_lora.targets.insert(modules::LoRATarget::LIN_IN_PROJ_QKV);
+                else if (name == "in_proj_z")
+                    mod_lora.targets.insert(modules::LoRATarget::LIN_IN_PROJ_Z);
+                else if (name == "in_proj_a")
+                    mod_lora.targets.insert(modules::LoRATarget::LIN_IN_PROJ_A);
+                else if (name == "in_proj_b")
+                    mod_lora.targets.insert(modules::LoRATarget::LIN_IN_PROJ_B);
+                else if (name == "q_proj")
                     mod_lora.targets.insert(modules::LoRATarget::Q_PROJ);
                 else if (name == "k_proj")
                     mod_lora.targets.insert(modules::LoRATarget::K_PROJ);
                 else if (name == "v_proj")
                     mod_lora.targets.insert(modules::LoRATarget::V_PROJ);
-                else if (name == "o_proj")
+                else if (name == "o_proj") {
                     mod_lora.targets.insert(modules::LoRATarget::O_PROJ);
+                    mod_lora.o_proj_explicit = true;
+                }
                 else if (name == "gate_proj")
                     mod_lora.targets.insert(modules::LoRATarget::GATE_PROJ);
                 else if (name == "gate_up_proj")
@@ -3191,6 +3204,12 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     add_layer(prefix + ".self_attn.v_proj", block.attention.v);
                     add_layer(prefix + ".self_attn.o_proj", block.attention.o);
                 }
+                // Linear-attention (GatedDeltaNet) mixer LoRA.
+                add_layer(prefix + ".linear_attn.in_proj_qkv", block.linear_attn.in_proj_qkv);
+                add_layer(prefix + ".linear_attn.in_proj_z", block.linear_attn.in_proj_z);
+                add_layer(prefix + ".linear_attn.in_proj_a", block.linear_attn.in_proj_a);
+                add_layer(prefix + ".linear_attn.in_proj_b", block.linear_attn.in_proj_b);
+                add_layer(prefix + ".linear_attn.out_proj", block.linear_attn.out_proj);
 
                 // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
                 if (is_nemotron) {
@@ -3300,6 +3319,12 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                     add_layer(prefix + ".self_attn.v_proj", block.attention.v);
                     add_layer(prefix + ".self_attn.o_proj", block.attention.o);
                 }
+                // Linear-attention (GatedDeltaNet) mixer LoRA.
+                add_layer(prefix + ".linear_attn.in_proj_qkv", block.linear_attn.in_proj_qkv);
+                add_layer(prefix + ".linear_attn.in_proj_z", block.linear_attn.in_proj_z);
+                add_layer(prefix + ".linear_attn.in_proj_a", block.linear_attn.in_proj_a);
+                add_layer(prefix + ".linear_attn.in_proj_b", block.linear_attn.in_proj_b);
+                add_layer(prefix + ".linear_attn.out_proj", block.linear_attn.out_proj);
 
                 // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
                 if (is_nemotron) {

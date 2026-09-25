@@ -200,6 +200,18 @@ void ModularLoRAGradsManager::allocate_gradients() {
             }
         }
 
+        // Linear-attention (GatedDeltaNet) mixer LoRA grads, sized from the DSL declarations.
+        if (static_cast<std::size_t>(l) < mConfig.linear_shapes.size()) {
+            const auto& shapes = mConfig.linear_shapes[static_cast<std::size_t>(l)];
+            for (int i = 0; i < 5; ++i) {
+                const auto& shape = shapes[static_cast<std::size_t>(i)];
+                if (!mConfig.lora_config.applies_to_linear(i) || shape.input == 0 || shape.output == 0) continue;
+                const std::string name = "_lin_" + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]);
+                full.linear_attn.at(i) = alloc_full(shape.input, shape.output, prefix + name);
+                shard.linear_attn.at(i) = alloc_shard(shape.input, shape.output, prefix + name + "_shard");
+            }
+        }
+
         // MoE LoRA grads: enable for MoE block types or Dense blocks in global MoE models.
         // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
         const bool has_global_moe = (mConfig.num_experts > 0);

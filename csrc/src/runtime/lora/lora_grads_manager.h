@@ -60,6 +60,9 @@ public:
         /// manager so gradient buffers line up with the LoRA weights.
         std::vector<dsl::BlockTypeDims> per_layer_dims;
         std::vector<LoRAAttentionShapes> attention_shapes;
+        /// Per-layer linear-attention (GatedDeltaNet) projection geometry from the DSL
+        /// declarations (kLinearAttentionLoRANames order); zero shapes = no adapter.
+        std::vector<LoRALinearShapes> linear_shapes;
 
         /// Per-layer MLP structure — must mirror the weights manager (see
         /// ModularLoRAWeightsManager::Config).

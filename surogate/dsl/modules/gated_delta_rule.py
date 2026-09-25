@@ -6,6 +6,7 @@ from typing import Any
 
 from ..dim import B, Dim, T
 from ..nn import Module, Proxy, Tracer
+from ..specs import LoRATarget
 
 
 class GatedDeltaNetMixer(Module):
@@ -84,10 +85,17 @@ class GatedDeltaNetMixer(Module):
         (x,) = args
 
         # -- params ----------------------------------------------------------
-        tracer.register_param("in_proj_qkv_weight", (self.ConvDim, "C"))
-        tracer.register_param("in_proj_z_weight", (self.ValueDim, "C"))
-        tracer.register_param("in_proj_b_weight", (self.Hv, "C"))
-        tracer.register_param("in_proj_a_weight", (self.Hv, "C"))
+        # LoRA: one adapter per HF projection tensor (linear_attn.{in_proj_qkv,in_proj_z,
+        # in_proj_a,in_proj_b,out_proj}); in_proj_qkv is one fused tensor in HF too, so one
+        # adapter over its whole [ConvDim, C] output is exactly PEFT's.
+        tracer.register_param("in_proj_qkv_weight", (self.ConvDim, "C"),
+                              lora_targets=[LoRATarget(name="lin_qkv", size=self.ConvDim)])
+        tracer.register_param("in_proj_z_weight", (self.ValueDim, "C"),
+                              lora_targets=[LoRATarget(name="lin_z", size=self.ValueDim)])
+        tracer.register_param("in_proj_b_weight", (self.Hv, "C"),
+                              lora_targets=[LoRATarget(name="lin_b", size=self.Hv)])
+        tracer.register_param("in_proj_a_weight", (self.Hv, "C"),
+                              lora_targets=[LoRATarget(name="lin_a", size=self.Hv)])
         tracer.register_param(
             "conv_weight",
             (self.ConvDim, 1, self.ConvK),
@@ -96,7 +104,8 @@ class GatedDeltaNetMixer(Module):
         tracer.register_param("A_log", (self.Hv,), dtype="fp32", quantizable=False)
         tracer.register_param("dt_bias", (self.Hv,), dtype="fp32", quantizable=False)
         tracer.register_param("norm_weight", (self.Vd,), quantizable=False)
-        out_proj_w = tracer.register_param("out_weight", ("C", self.ValueDim))
+        out_proj_w = tracer.register_param("out_weight", ("C", self.ValueDim),
+                                           lora_targets=[LoRATarget(name="lin_out", size=self.d_model)])
 
         # -- activation slots ------------------------------------------------
         out_slot = tracer.register_activation(

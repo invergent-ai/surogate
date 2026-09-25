@@ -177,6 +177,21 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         }
     }
 
+    // Linear-attention (GatedDeltaNet) mixer LoRA, sized from the DSL declarations.
+    if (static_cast<std::size_t>(layer_idx) < mConfig.linear_shapes.size()) {
+        const auto& shapes = mConfig.linear_shapes[static_cast<std::size_t>(layer_idx)];
+        for (int i = 0; i < 5; ++i) {
+            const auto& shape = shapes[static_cast<std::size_t>(i)];
+            if (!mConfig.lora_config.applies_to_linear(i) || shape.input == 0 || shape.output == 0) continue;
+            auto& master_proj = master.linear_attn.at(i);
+            auto& work_proj = work.linear_attn.at(i);
+            master_proj.emplace();
+            work_proj.emplace();
+            allocate_layer_weights(*master_proj, *work_proj, shape.input, shape.output,
+                                   prefix + "_lin_" + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]));
+        }
+    }
+
     // MoE LoRA: enable for MoE block types or Dense blocks in global MoE models.
     // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
     const bool has_global_moe = (mConfig.num_experts > 0);
@@ -390,6 +405,14 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
         init_layer(b.attention.k, C, base + 1);
         init_layer(b.attention.v, C, base + 2);
         init_layer(b.attention.o, q_out, base + 3);
+
+        // Linear-attention LoRA: own subsequences (clear of the expert/shared ranges).
+        for (int i = 0; i < 5; ++i) {
+            auto& layer = b.linear_attn.at(i);
+            if (layer.has_value()) {
+                init_layer(layer, static_cast<int>(layer->A.Sizes[1]), base + 110ULL + static_cast<unsigned long long>(i));
+            }
+        }
 
         // Dense MLP LoRA
         init_layer(b.mlp.gate, C, base + 4);
@@ -609,6 +632,10 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
     sync_layer(work.attention.k, master.attention.k, "k_proj");
     sync_layer(work.attention.v, master.attention.v, "v_proj");
     sync_layer(work.attention.o, master.attention.o, "o_proj");
+    for (int i = 0; i < 5; ++i) {
+        const std::string name = "linear_attn." + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]);
+        sync_layer(work.linear_attn.at(i), master.linear_attn.at(i), name.c_str());
+    }
 
     // A block can contain both a dense MLP and grouped experts (Gemma4 MoE).
     // Sync every allocated projection; the dense work buffers must not retain
@@ -741,6 +768,12 @@ void for_each_lora_tensor(TSet& set, F&& visit) {
         visit_layer(block.attention.v);
         visit_layer(block.attention.o);
 
+        visit_layer(block.linear_attn.in_proj_qkv);
+        visit_layer(block.linear_attn.in_proj_z);
+        visit_layer(block.linear_attn.in_proj_a);
+        visit_layer(block.linear_attn.in_proj_b);
+        visit_layer(block.linear_attn.out_proj);
+
         visit_layer(block.mlp.gate);
         visit_layer(block.mlp.gate_up);
         visit_layer(block.mlp.up);
@@ -861,6 +894,16 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
         if (block.attention.o.has_value()) {
             callback(prefix + ".self_attn." + names[3] + ".lora_A.weight", block.attention.o->A);
             callback(prefix + ".self_attn." + names[3] + ".lora_B.weight", block.attention.o->B);
+        }
+
+        // Linear-attention mixer LoRA: the HF module names (<layer>.linear_attn.<proj>).
+        for (int i = 0; i < 5; ++i) {
+            const auto& layer = block.linear_attn.at(i);
+            if (!layer.has_value()) continue;
+            const std::string module =
+                prefix + ".linear_attn." + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]);
+            callback(module + ".lora_A.weight", layer->A);
+            callback(module + ".lora_B.weight", layer->B);
         }
 
         // Dense MLP LoRA
