@@ -59,7 +59,7 @@ single-sentence measurement, not the broader HTTP average.
   validation does not establish a new 331-sentence WER or unseen-voice score.
 
 These measurements used the earlier EPYC-native build of the package. The published package,
-`surogate/amami-357m-ro` at revision `1b0a595d92b3f41c5780d8d2838a27ba8d4abe67`, uses a portable
+`surogate/amami-357m-ro` at revision `5393e9bf69ec08ef2c89bf387bf3791c446fb26a`, uses a portable
 x86-64-v3 build of the same runtime and model. The optimized backend uses GGML
 `c03b4e2bcece5134827881af90242086daf75be5` with the model's ABI additions and
 Surogate's matrix kernels. The worker checks CPU features and runtime ABI

@@ -11,7 +11,7 @@ from pathlib import Path
 
 MODEL_ID = "surogate/amami-357m-ro"
 RENAMED_FROM = "surogate/surogate-ro-tts"
-REVISION = "1b0a595d92b3f41c5780d8d2838a27ba8d4abe67"
+REVISION = "5393e9bf69ec08ef2c89bf387bf3791c446fb26a"
 PREFIX = "cpu"
 PROFILE_SHA256 = "958dfcda804ebacb3e190963008433c3121cecc9b433646f595cd03b858f5581"
 # The GPU variant: the same model, codec, tokenizer and voices, with lib/ holding the runtime built with

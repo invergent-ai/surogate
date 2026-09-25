@@ -88,7 +88,7 @@ surogate serve --tts surogate/amami-357m-ro --device 0 --port 8080
 A downloaded copy, or a local variant, is served the same way:
 
 ```bash
-hf download surogate/amami-357m-ro --revision 1b0a595d92b3f41c5780d8d2838a27ba8d4abe67 \
+hf download surogate/amami-357m-ro --revision 5393e9bf69ec08ef2c89bf387bf3791c446fb26a \
   --include "gpu/*" --local-dir amami-357m-ro
 surogate serve --tts amami-357m-ro/gpu --device 0 --port 8080
 ```
@@ -133,7 +133,7 @@ qualified (quality and speed), then pinned in `native_worker.cpp` and in the too
 
 The first start downloads only the native CPU package, approximately 1.15 GiB,
 or with `--device N` only its GPU variant, approximately 1.4 GiB, both from HF revision
-`1b0a595d92b3f41c5780d8d2838a27ba8d4abe67`. It verifies the voice profile and
+`5393e9bf69ec08ef2c89bf387bf3791c446fb26a`. It verifies the voice profile and
 every file listed in it, then completes a short warm-up before accepting
 requests. Subsequent starts verify and reuse the cached package.
 

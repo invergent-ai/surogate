@@ -1,5 +1,5 @@
 {
-  "source": "Surogate Speech stress set, frozen native inputs; corpus SHA256 7faa24d037061edafca453bc722514f37238c3596c0b1407032232e18b003dc0",
+  "source": "Surogate Speech stress set v2, frozen native inputs; corpus SHA256 8e580e3c8e750137409ed86c25a7772e46ad29394426a379b24cbec39cf5e04c",
   "rows": [
     {
       "id": "001",
@@ -981,8 +981,8 @@
     },
     {
       "id": "164",
-      "input": "Firma SRL cu CUI 12345678 este plătitoare de TVA și are contul deschis la BCR.",
-      "chunks_sha256": "9aa482e5c1f4cc583bb76a9f6da68cb6975fa85a5d9fba7976a9dda815261123",
+      "input": "Firma SRL cu CUI 12345678 este plătitoare de TVA și are contul deschis la o bancă locală.",
+      "chunks_sha256": "43c3361b008598f9f5f7a001b192dcd82df23814d3de1671f9e5923fcd136bb0",
       "language": "ro"
     },
     {
@@ -1365,8 +1365,8 @@
     },
     {
       "id": "228",
-      "input": "Videoclipul este pe YouTube.",
-      "chunks_sha256": "6f67d4401397d964d27e7481056ad6a23870abe4f1e19cdc749d24e818af102a",
+      "input": "Serialul este pe Netflix.",
+      "chunks_sha256": "5dce900b7d07ee9a9efc075dde98332d90d13de9dec67a48f90b1a4c24e73ddb",
       "language": "ro"
     },
     {
@@ -1857,98 +1857,98 @@
     },
     {
       "id": "310",
-      "input": "În temeiul art. 5 alin. (1) lit. a) din Legea concurenței nr. 21/1996, republicată, Consiliul Concurenței a dispus declanșarea unei investigații.",
-      "chunks_sha256": "089a7b93eec13eae2881415a29857f414c7d5756f2383ac7bd571f29cfb91a7c",
+      "input": "În temeiul art. 7 alin. (2) lit. b) din Legea nr. 54/2019, instanța a admis cererea de chemare în judecată.",
+      "chunks_sha256": "4494433e6c7577d59c39ab4c8a9f7668ad8b8b056c45097f7cd03b230f1db408",
       "language": "ro"
     },
     {
       "id": "311",
-      "input": "Prin Decizia nr. 47 din 12 martie 2026, autoritatea a aplicat o amendă de 3.847.250 de lei, reprezentând 2,7% din cifra de afaceri.",
-      "chunks_sha256": "781d3810c302ebbcc72f4a3cae92df27707f9e824cdeb1c98ddb439da34004d9",
+      "input": "Prin hotărârea nr. 318 din 14 aprilie 2026, tribunalul a obligat pârâtul la plata sumei de 1.275.400 de lei, cu dobânda legală aferentă.",
+      "chunks_sha256": "a13eb5d12b7c80744736002baa9cb01cfa0e7843f8f8e77e423897e9116e2ba6",
       "language": "ro"
     },
     {
       "id": "312",
-      "input": "Practica anticoncurențială constă într-un acord orizontal de fixare a prețurilor între întreprinderile implicate pe piața relevantă.",
-      "chunks_sha256": "a5479dabb48b8c45856e1657c6b13b3906be491293d606019a0a5fa3865103c6",
+      "input": "Contractul se consideră reziliat de drept, fără punere în întârziere și fără intervenția instanței de judecată.",
+      "chunks_sha256": "6c31f5d70fc7c970ac46e0e9dfe1b4a09ebe80e52af548b7a245fee10804b2e4",
       "language": "ro"
     },
     {
       "id": "313",
-      "input": "Termenul de contestare este de 30 de zile de la comunicare, conform art. 49 alin. (2).",
-      "chunks_sha256": "b16e66456e42381bfb440daece225e07a2c275ad6a290352e408c51882c4a780",
+      "input": "Termenul de apel este de 15 zile de la comunicarea hotărârii, potrivit art. 468 alin. (1).",
+      "chunks_sha256": "d7a54d6fcb463d6225666833d9c076850f2dbfb73b0d50eec37e6a874bf3ee17",
       "language": "ro"
     },
     {
       "id": "314",
-      "input": "Analiza a vizat perioada cuprinsă între 1 ianuarie 2023 și 31 decembrie 2025, pe piața distribuției de produse farmaceutice.",
-      "chunks_sha256": "deb2efcb1f6037785174890a143e82aa8f2df1cee16aaae3e5aa0a6a4fb8c0af",
+      "input": "Perioada verificată este cuprinsă între 1 februarie 2024 și 30 noiembrie 2025, pentru toate contractele de furnizare încheiate.",
+      "chunks_sha256": "d0abecda99976d3f5f8d269537420f0e4e9fd671977890a3dcb255e98ff32035",
       "language": "ro"
     },
     {
       "id": "315",
-      "input": "Cota de piață cumulată a părților depășește pragul de 40%, ceea ce ridică prezumția de poziție dominantă.",
-      "chunks_sha256": "2534f47fd1151c6263fb4bda63cf67ad635fae812879bf4f7a72ba910f450885",
+      "input": "Penalitățile de întârziere sunt de 0,15% pe zi, fără ca valoarea lor totală să depășească suma datorată.",
+      "chunks_sha256": "921bd76572e735607d1da2675a616c57e36cdff390335ef2dfa3fbc36b653f93",
       "language": "ro"
     },
     {
       "id": "316",
-      "input": "Întreprinderea a beneficiat de politica de clemență și i s-a redus amenda cu cincizeci la sută.",
-      "chunks_sha256": "1ab26b64d323be9c11d975edfb692dd873516fc03f507f7fc1943484ef53bef8",
+      "input": "Părțile au convenit ca orice litigiu să fie soluționat pe cale amiabilă, iar în caz contrar de instanța competentă.",
+      "chunks_sha256": "604eba6703cea360993582d5ef7f58ce78d804cc652363545cdf1d63d2beaa3e",
       "language": "ro"
     },
     {
       "id": "317",
-      "input": "Regulamentul UE nr. 1/2003 privind punerea în aplicare a normelor de concurență prevăzute la articolele 81 și 82 din tratat.",
-      "chunks_sha256": "4b327208a2e76f9317528e5c6bd70616a8709d06b266916d014f47df3d198d01",
+      "input": "Ordonanța de urgență nr. 34/2025 modifică articolele 12 și 15 din lege, cu aplicare de la 1 iulie.",
+      "chunks_sha256": "06294b2faea096e1352f3ba0dddb093b482f3610163a3631632e059054720eb0",
       "language": "ro"
     },
     {
       "id": "318",
-      "input": "Bună ziua! Soldul disponibil în contul curent este de 12.480,35 lei, iar ultima operațiune a fost pe 26 august.",
-      "chunks_sha256": "8630ac70faedf886481775fe9a0d755b02dffe8c66b4b2eba576582ba73a8555",
+      "input": "Bună ziua! Soldul disponibil în contul de economii este de 8.215,60 lei, iar ultima depunere a fost pe 3 septembrie.",
+      "chunks_sha256": "6784f878d631b66a4d59364c6a918bd49c238045e23e53bf70a92ba2365f33f6",
       "language": "ro"
     },
     {
       "id": "319",
-      "input": "Pentru a confirma plata, vă rog să spuneți codul primit prin mesaj. Aveți la dispoziție două minute.",
-      "chunks_sha256": "bcbf1072104685945e94bb16073c96187962d796771786c7d4c04a2a98821158",
+      "input": "Pentru siguranța dumneavoastră, vă rugăm să nu comunicați nimănui codul de autorizare primit prin mesaj.",
+      "chunks_sha256": "982a97fe45a7a875c9068e6f471e82c4db333ae727143c16ad3cdbc23b5b48a4",
       "language": "ro"
     },
     {
       "id": "320",
-      "input": "Rata lunară este de 1.247 de lei, cu o dobândă anuală efectivă de 8,45%, iar scadența este pe data de cinci a fiecărei luni.",
-      "chunks_sha256": "6a32f5248f1a2d1f200e82d4a6d6f1fbdefa80073a39596a7f973d75a0382340",
+      "input": "Valoarea creditului este de 45.000 de lei, pe o perioadă de 60 de luni, cu o dobândă anuală de 7,9%.",
+      "chunks_sha256": "e44d824200cbb43336bc1a3588bb5922b8267985ead3736e528af1005a76138c",
       "language": "ro"
     },
     {
       "id": "321",
-      "input": "Din motive de securitate, apelul este înregistrat. Doriți să continuați?",
-      "chunks_sha256": "927d39ce1e2d709c56f93e974a06b12a6eb19c0668c6eddf532e7666eed7d713",
+      "input": "Operațiunea a fost refuzată deoarece limita zilnică de plăți a fost atinsă. Doriți să o modificați?",
+      "chunks_sha256": "632104145cd471f9dfc4e9b328a324529a8b8d5dafd030fdd6c0e56e4d501bb9",
       "language": "ro"
     },
     {
       "id": "322",
-      "input": "Comisionul de administrare cont, extrasul de cont și ordinul de plată programată apar în lista de operațiuni.",
-      "chunks_sha256": "82809e81e8c6458b51c703f478d742fc3a574ae54af6490e4d72d8b299d64c0d",
+      "input": "Extrasul lunar include comisioanele, dobânzile încasate și toate plățile efectuate cu cardul.",
+      "chunks_sha256": "185678800bae1e6fe1fddc53c683723e90e33102dd832c04ba8f19a9b0a80dd7",
       "language": "ro"
     },
     {
       "id": "323",
-      "input": "Cardul dumneavoastră se termină în 4729 și expiră în luna noiembrie 2027.",
-      "chunks_sha256": "2c8d43759b6062d5c2d0d3312e5e7a7e5ae0b52891efac4fbf32560fd893b4ba",
+      "input": "Cardul de debit care se termină în 3186 expiră în luna martie 2028 și va fi reînnoit automat.",
+      "chunks_sha256": "5557d184180ffcd4c1be05c855debbcdd5e67a71da0a91fc0f4c33578d5b94f5",
       "language": "ro"
     },
     {
       "id": "324",
-      "input": "Am înregistrat solicitarea de opoziție card. Veți primi confirmarea în cel mult treizeci de minute.",
-      "chunks_sha256": "9cd2235ab3b1d18698f77c3d8ccfec240536f3e20314c02eca511f890206a326",
+      "input": "Contul a fost blocat temporar la cererea dumneavoastră. Îl puteți debloca oricând din aplicație.",
+      "chunks_sha256": "7e5d7d49c1a262bb984770c861924b664090f218d1ce891df16216a2ee2cc014",
       "language": "ro"
     },
     {
       "id": "325",
-      "input": "Transferul în valoare de 5.000 de lei către IBAN-ul RO49 AAAA 1B31 0075 9384 0000 a fost inițiat.",
-      "chunks_sha256": "527f79b4c302c2265fed0db279adbc0666d01b710cb0ba28d876a0b30438015d",
+      "input": "Plata facturii în valoare de 327,45 lei către IBAN-ul RO49 AAAA 1B31 0075 9384 0000 a fost programată.",
+      "chunks_sha256": "ab6ad628507597fcfd7dba79397b8de9ee028e97b8bdc732b3d2d242c281455d",
       "language": "ro"
     },
     {

@@ -14,9 +14,9 @@ from filelock import FileLock
 # repository: (checkpoint, 4-gram LM, pinned revision)
 _MODELS = {
     "surogate/jackrabbit-110m-ro": (
-        "jackrabbit-110m-ro.nemo", "lm-4gram-ro.nemo", "d9e8a3fd619c9726683b50fb719c6238ab4e8e0a"),
+        "jackrabbit-110m-ro.nemo", "lm-4gram-ro.nemo", "a3cce77ded84db5aa936494040d29e6d631c8af4"),
     "surogate/jackrabbit-110m-ro-streaming": (
-        "jackrabbit-110m-ro-streaming.nemo", "lm-4gram-ro.nemo", "3cd1ea864bb1ca55f4ef4b0be63572e12f454c6f"),
+        "jackrabbit-110m-ro-streaming.nemo", "lm-4gram-ro.nemo", "663337372128b936b65a8cc2ad0ce99b5b3e6a03"),
 }
 _RENAMED = {
     "surogate/surogate-ro-110m-tdt-ctc": "surogate/jackrabbit-110m-ro",
