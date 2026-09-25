@@ -181,6 +181,13 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                                    QType routed_gate_up,
                                                                    QType routed_down);
 
+/// Fault injection for tests (SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS=N): in the route scan and
+/// the gather, every warp but a block's first sleeps about N ns before its first read of the
+/// block's shared state, so warp 0 runs ahead. That is the worst case of the warp skew those
+/// kernels must tolerate (a barrier-free write in either once corrupted rare rounds). Not for
+/// production use; 0, the default, costs the kernels one compare.
+[[nodiscard]] std::int32_t sparse_moe_fault_warp_skew_ns() noexcept;
+
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const Tensor& router_x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,

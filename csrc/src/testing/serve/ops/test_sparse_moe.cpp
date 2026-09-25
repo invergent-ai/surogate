@@ -117,6 +117,24 @@ int main(int argc, char** argv) {
                                    QType::NVFP4, tokens, true, 16};
         return qwen36::run_profile(profile) ? 1 : 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--prefill-warp-skew") {
+        // The prefill route's scan and gather each replaced block-shared state (the scan's
+        // prefix sums, the gather's tile ranks) that a slower warp of the same block had yet to
+        // read, with no barrier in between. Such a lag is rare, and a round it hits feeds the
+        // experts a stale workspace slice (a slightly wrong token, or a non-finite one) or
+        // writes past the gather buffer.
+        // SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS holds every warp but a block's first back
+        // before its read, which makes the lag certain, so a missing barrier fails every
+        // prefill width below. Both mixtures run the same kernels; the second has no shared
+        // expert and a narrower router.
+        setenv("SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS", "20000", 1);
+        constexpr std::array<std::int32_t, 3> tokens{{20, 129, 768}};
+        const CodecProfile profile{"w8+w8 prefill, lagging warps", QType::W8G32_F16S,
+                                   QType::W8G32_F16S, tokens, false};
+        const int failures = qwen36::run_profile(profile) + qwen3_moe::run_profile(profile);
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe prefill under warp skew\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--qwen3-vl-235b") {
         constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 128}};
         const CodecProfile profile{"qwen3_vl_235b w8+w8", QType::W8G32_F16S,
