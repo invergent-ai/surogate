@@ -48,52 +48,7 @@ void moe_grouped_gemm_gate_up_impl(
     const float beta = 0.0f;
     const int out_dim = 2 * intermediate_size;
 
-    // Optional debug: force per-expert GEMM loop to bypass grouped GEMM.
-    static int force_loop = -1;
-    if (force_loop < 0) {
-        force_loop = (std::getenv("SUROGATE_MOE_GEMM_LOOP") != nullptr) ? 1 : 0;
-    }
-    if (force_loop) {
-        static int force_default_algo = -1;
-        if (force_default_algo < 0) {
-            force_default_algo = (std::getenv("SUROGATE_MOE_GEMM_DEFAULT") != nullptr) ? 1 : 0;
-        }
-        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-        for (int e = 0; e < n_active; ++e) {
-            int global_idx = active_expert_indices ? active_expert_indices[e] : e;
-            int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
-            if (tokens_e == 0) continue;
-            const int weight_idx = weight_is_compact ? e : global_idx;
-            const T* A_ptr = weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
-                                         : weights + weight_idx * out_dim * hidden_size;
-            const T* B_ptr = input + h_offsets[global_idx] * hidden_size;
-            T* C_ptr = output + h_offsets[global_idx] * out_dim;
-
-            CUBLAS_CHECK(cublasGemmEx(cublas_handle,
-                                      CUBLAS_OP_T,
-                                      CUBLAS_OP_N,
-                                      out_dim,
-                                      tokens_e,
-                                      hidden_size,
-                                      &alpha,
-                                      A_ptr,
-                                      cublas_dtype<T>(),
-                                      hidden_size,
-                                      B_ptr,
-                                      cublas_dtype<T>(),
-                                      hidden_size,
-                                      &beta,
-                                      C_ptr,
-                                      cublas_dtype<T>(),
-                                      out_dim,
-                                      CUBLAS_COMPUTE_32F,
-                                      algo));
-        }
-        return;
-    }
-
-    // Use Grouped GEMM to submit all expert computations in a single call.
-    // This significantly reduces CPU overhead and kernel launch latency compared to a loop.
+    // One GEMM per expert with tokens (moe_expert_gemms says why not a grouped call).
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
@@ -135,41 +90,20 @@ void moe_grouped_gemm_gate_up_impl(
 
     if (m_vec.empty()) return;
 
-    const int gemm_count = static_cast<int>(m_vec.size());
-
-    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
-    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
-    const T** d_A_array = ptr_arrays.A;
-    const T** d_B_array = ptr_arrays.B;
-    T** d_C_array = ptr_arrays.C;
-
-    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_T);
-    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<int> group_size_vec(gemm_count, 1);
-    std::vector<float> alpha_vec(gemm_count, alpha);
-    std::vector<float> beta_vec(gemm_count, beta);
-
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
-                                            transa_vec.data(),
-                                            transb_vec.data(),
-                                            m_vec.data(),
-                                            n_vec.data(),
-                                            k_vec.data(),
-                                            alpha_vec.data(),
-                                            reinterpret_cast<const void**>(d_A_array),
-                                            cublas_dtype<T>(),
-                                            lda_vec.data(),
-                                            reinterpret_cast<const void**>(d_B_array),
-                                            cublas_dtype<T>(),
-                                            ldb_vec.data(),
-                                            beta_vec.data(),
-                                            reinterpret_cast<void**>(d_C_array),
-                                            cublas_dtype<T>(),
-                                            ldc_vec.data(),
-                                            gemm_count,
-                                            group_size_vec.data(),
-                                            CUBLAS_COMPUTE_32F));
-
+    moe_expert_gemms<T>(cublas_handle,
+                        CUBLAS_OP_T,
+                        CUBLAS_OP_N,
+                        m_vec,
+                        n_vec,
+                        k_vec,
+                        alpha,
+                        A_vec,
+                        lda_vec,
+                        B_vec,
+                        ldb_vec,
+                        beta,
+                        C_vec,
+                        ldc_vec);
 }
 
 template <typename T>
@@ -212,51 +146,7 @@ void moe_grouped_gemm_down_impl(
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    // Optional debug: force per-expert GEMM loop to bypass grouped GEMM.
-    static int force_loop = -1;
-    if (force_loop < 0) {
-        force_loop = (std::getenv("SUROGATE_MOE_GEMM_LOOP") != nullptr) ? 1 : 0;
-    }
-    if (force_loop) {
-        static int force_default_algo = -1;
-        if (force_default_algo < 0) {
-            force_default_algo = (std::getenv("SUROGATE_MOE_GEMM_DEFAULT") != nullptr) ? 1 : 0;
-        }
-        const cublasGemmAlgo_t algo = force_default_algo ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-        for (int e = 0; e < n_active; ++e) {
-            int global_idx = active_expert_indices ? active_expert_indices[e] : e;
-            int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
-            if (tokens_e == 0) continue;
-            const int weight_idx = weight_is_compact ? e : global_idx;
-            const T* A_ptr = weight_ptrs ? static_cast<const T*>(weight_ptrs[weight_idx])
-                                         : weights + weight_idx * hidden_size * intermediate_size;
-            const T* B_ptr = input + h_offsets[global_idx] * intermediate_size;
-            T* C_ptr = output + h_offsets[global_idx] * hidden_size;
-
-            CUBLAS_CHECK(cublasGemmEx(cublas_handle,
-                                      CUBLAS_OP_T,
-                                      CUBLAS_OP_N,
-                                      hidden_size,
-                                      tokens_e,
-                                      intermediate_size,
-                                      &alpha,
-                                      A_ptr,
-                                      cublas_dtype<T>(),
-                                      intermediate_size,
-                                      B_ptr,
-                                      cublas_dtype<T>(),
-                                      intermediate_size,
-                                      &beta,
-                                      C_ptr,
-                                      cublas_dtype<T>(),
-                                      hidden_size,
-                                      CUBLAS_COMPUTE_32F,
-                                      algo));
-        }
-        return;
-    }
-
-    // Use Grouped GEMM to submit all expert computations in a single call.
+    // One GEMM per expert with tokens (moe_expert_gemms says why not a grouped call).
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
@@ -295,41 +185,20 @@ void moe_grouped_gemm_down_impl(
 
     if (m_vec.empty()) return;
 
-    const int gemm_count = static_cast<int>(m_vec.size());
-
-    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
-    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
-    const T** d_A_array = ptr_arrays.A;
-    const T** d_B_array = ptr_arrays.B;
-    T** d_C_array = ptr_arrays.C;
-
-    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_T);
-    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<int> group_size_vec(gemm_count, 1);
-    std::vector<float> alpha_vec(gemm_count, alpha);
-    std::vector<float> beta_vec(gemm_count, beta);
-
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
-                                            transa_vec.data(),
-                                            transb_vec.data(),
-                                            m_vec.data(),
-                                            n_vec.data(),
-                                            k_vec.data(),
-                                            alpha_vec.data(),
-                                            reinterpret_cast<const void**>(d_A_array),
-                                            cublas_dtype<T>(),
-                                            lda_vec.data(),
-                                            reinterpret_cast<const void**>(d_B_array),
-                                            cublas_dtype<T>(),
-                                            ldb_vec.data(),
-                                            beta_vec.data(),
-                                            reinterpret_cast<void**>(d_C_array),
-                                            cublas_dtype<T>(),
-                                            ldc_vec.data(),
-                                            gemm_count,
-                                            group_size_vec.data(),
-                                            CUBLAS_COMPUTE_32F));
-
+    moe_expert_gemms<T>(cublas_handle,
+                        CUBLAS_OP_T,
+                        CUBLAS_OP_N,
+                        m_vec,
+                        n_vec,
+                        k_vec,
+                        alpha,
+                        A_vec,
+                        lda_vec,
+                        B_vec,
+                        ldb_vec,
+                        beta,
+                        C_vec,
+                        ldc_vec);
 }
 
 void moe_grouped_gemm_gate_up(nv_bfloat16* output,
