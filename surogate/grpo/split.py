@@ -39,6 +39,7 @@ from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.abort import AbortReason
 from surogate.grpo.config import GRPOTrainConfig
+from surogate.grpo.utils.capacity import size_judge_pending_capacity, size_pending_capacity
 from surogate.grpo.utils.pathing import get_broadcast_dir
 from surogate.utils.logger import get_logger
 
@@ -173,6 +174,8 @@ def grpo_split(
         rollout_infer_config=infer_config,
     )
 
+    size_pending_capacity(infer_config, orch_config)
+
     _check_disjoint_gpus(("--infer-gpus", infer_gpu_ids), ("--trainer-gpus", trainer_gpu_ids))
     _check_gpu_count_matches_topology("--infer-gpus", infer_gpu_ids, infer_config)
     if len(trainer_gpu_ids) != train_config.gpus:
@@ -212,6 +215,8 @@ def grpo_split(
     judge_proc: mp.Process | None = None
     if spawn_judge:
         assert judge_infer_config is not None and judge_gpu_ids is not None  # for type narrowing
+        # Its own server, so its own bound: judge calls, not rollouts.
+        size_judge_pending_capacity(judge_infer_config, orch_config)
         judge_proc = _spawn_inference(ctx, judge_infer_config, judge_gpu_ids, name="judge-subprocess")
 
     components = "rollout server, " + ("judge server, " if judge_proc is not None else "") + "trainer, and orchestrator"

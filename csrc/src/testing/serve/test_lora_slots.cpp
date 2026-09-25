@@ -5,7 +5,9 @@
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <string>
 #include <thread>
+#include <vector>
 
 using sinfer::RequestError;
 using sinfer::RequestErrorKind;
@@ -155,7 +157,61 @@ static void abandoned_update_does_not_lose_a_name_or_a_slot() {
     assert(slots.find("replacement") == 0);
 }
 
+// An update's wait is proportional to how many requests hold the adapter, not to
+// how many are generating. Nothing here is new behaviour; it is the premise the
+// deadline arithmetic in `grpo/utils/capacity.py` rests on, and it was a claim in
+// a review rather than something the suite would notice breaking.
+//
+// The engine takes this claim when a request is ADMITTED, before it is submitted
+// for a decode lane, so a request that has not produced a token yet still blocks a
+// weight update. That is why the update needs a deadline of its own rather than
+// sharing the one that bounds how long a single request may wait for a lane:
+// raising the admission bound to stop losing rollouts necessarily lengthens this.
+static void an_update_waits_for_every_holder_not_just_the_running_one() {
+    LoraSlots slots(4);
+    load(slots, "policy");
+
+    // Three holders, none of them generating: this is the pending queue.
+    std::atomic<bool> release{false};
+    std::vector<std::thread> holders;
+    std::atomic<int> holding{0};
+    for (int i = 0; i < 3; ++i) {
+        holders.emplace_back([&] {
+            auto lease = slots.acquire("policy", deadline(), [] { return false; });
+            ++holding;
+            while (!release.load()) { std::this_thread::sleep_for(1ms); }
+        });
+    }
+    while (holding.load() < 3) { std::this_thread::sleep_for(1ms); }
+
+    // A deadline shorter than the holders live refuses the update, and says which
+    // adapter it was waiting on, which is the diagnostic a client-side timeout
+    // cannot produce.
+    bool refused = false;
+    try {
+        auto update = slots.update("policy", Clock::now() + 80ms);
+        update.commit();
+    } catch (const RequestError& error) {
+        refused = error.kind() == RequestErrorKind::QueueTimeout;
+        assert(std::string(error.what()).find("policy") != std::string::npos &&
+               "the refusal has to name the adapter it was waiting on");
+    }
+    assert(refused && "holders that are not generating still block an update");
+
+    // The same update succeeds once they let go: the wait was the backlog, not a
+    // permanent refusal, which is why a generous deadline is the fix and a short
+    // one is the bug.
+    release.store(true);
+    for (auto& holder : holders) { holder.join(); }
+    {
+        auto update = slots.update("policy", deadline());
+        update.commit();
+    }
+    assert(slots.find("policy") >= 0);
+}
+
 int main() {
+    an_update_waits_for_every_holder_not_just_the_running_one();
     replacement_preserves_running_requests();
     unload_waits_before_recycling_slots();
     timeout_and_cancel_leave_the_old_adapter_usable();

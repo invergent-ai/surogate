@@ -158,19 +158,55 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
     return httplib::Server::HandlerResponse::Handled;
 }
 
+HttpPoolSizes http_pool_sizes(const ServeOptions& options) {
+    // Mirrors `extra_model_options()` in serve_options.cpp for the `0 = inherit the primary's`
+    // rule; that function is the source of truth, but it builds a whole ServeOptions per extra
+    // model, which is a lot of copying to read one number.
+    //
+    // Keep this sum equal to the executor's `max_outstanding_`
+    // (runtime/engine/concurrent_executor.h): the reason an unbounded queue is safe is that a
+    // request which gets a worker is then admitted or refused with a 429 by that bound.
+    std::size_t serving =
+        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+    for (const auto& extra : options.extra_models) {
+        serving += (extra.max_num_seqs != 0 ? extra.max_num_seqs : options.max_concurrency)
+                   + static_cast<std::size_t>(options.max_pending_requests);
+    }
+    return HttpPoolSizes{.workers = serving + 1, .queued = 0};
+}
+
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
-    std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    for (const auto& extra : options_.extra_models) {
-        queued_requests += (extra.max_num_seqs != 0 ? extra.max_num_seqs : options_.max_concurrency)
-                           + static_cast<std::size_t>(options_.max_pending_requests);
-    }
-    const std::size_t worker_count = queued_requests + 1;
-    server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, queued_requests);
+    const HttpPoolSizes sizes = http_pool_sizes(options_);
+    server_.new_task_queue = [sizes] {
+        return new httplib::ThreadPool(sizes.workers, sizes.queued);
     };
+    // One request per queue entry, because cpp-httplib enqueues a task per
+    // *connection* and that task then serves the socket for up to
+    // CPPHTTPLIB_KEEPALIVE_MAX_COUNT requests (process_server_socket_core). A
+    // caller that keeps sending therefore holds its worker for the whole burst,
+    // not for one request, and anything behind it waits for the burst rather
+    // than for a request. That is how a weight update ends up queued behind a
+    // step's worth of rollouts: the rollout clients are pooled and never idle,
+    // while the admin client opens a fresh connection and joins the back.
+    //
+    // Measured at 128 in flight against a bound of 24: the admin POST waited
+    // 132s without this line and 0.0s with it.
+    //
+    // It is only safe BESIDE an admission bound sized to the caller, which is
+    // what `http_pool_sizes` above and `grpo/utils/capacity.py` arrange for a
+    // training run. On its own it made things worse, not better: shedding starts
+    // happening for real, so the same measurement lost 259 rollouts against
+    // main's 195, because every caller past the bound now gets an immediate 429
+    // instead of waiting for a worker. A plain `surogate serve` caller, which has
+    // nobody to size its bound to the run, still sees 429s past the default
+    // `max_num_seqs + max_pending_requests` for exactly this reason.
+    //
+    // The cost is a connect per request. This engine is reached over loopback by
+    // GRPO rollouts and in-cluster by `surogate serve`, where that is noise next
+    // to a generation; it would not be free for a WAN client.
+    server_.set_keep_alive_max_count(1);
     server_.set_payload_max_length(options_.max_request_bytes);
     // Before bind(): the listening socket carries the option to every connection.
     disable_nagle(server_);

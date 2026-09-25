@@ -60,6 +60,13 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
         argv += ["--max-model-len", str(config.max_model_len)]
     if config.max_num_seqs is not None:
         argv += ["--max-num-seqs", str(config.max_num_seqs)]
+    # Admission, not throughput; sized in `grpo/utils/capacity.py`.
+    if config.max_pending_requests is not None:
+        argv += ["--max-pending-requests", str(config.max_pending_requests)]
+    if config.pending_timeout_ms is not None:
+        argv += ["--pending-timeout-ms", str(config.pending_timeout_ms)]
+    if config.adapter_update_timeout_ms is not None:
+        argv += ["--adapter-update-timeout-ms", str(config.adapter_update_timeout_ms)]
     for name in SERVING_OFFLOAD_FIELDS:
         value = getattr(config, name)
         if value is not None:

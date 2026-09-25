@@ -13,6 +13,7 @@ from openai import NotFoundError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from surogate.core.config.grpo_orch_config import GRPOClientConfig
+from surogate.grpo.utils.capacity import admin_client_timeout_s
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -177,10 +178,18 @@ def setup_admin_clients(client_config: GRPOClientConfig) -> list[AsyncClient]:
             # request but never finishes the reload wedges the orchestrator
             # silently and indefinitely (observed 2026-08-14: conductor reload
             # at 20:47 -> zero accepted rollouts for ~6h, no error anywhere).
-            # 600s covers the slowest legitimate reload (LoRA load + prefix
-            # cache drain, or a full filesystem weight update) with margin;
-            # on expiry the update_policy_loop retries within 1s.
-            timeout=httpx.Timeout(600.0, connect=60.0),
+            #
+            # Derived rather than fixed, and deliberately LONGER than the
+            # engine's own `adapter_update_timeout_ms`. A weight update waits for
+            # every admitted request to release its adapter claim, so the wait
+            # scales with the in-flight backlog, and a flat 600s aborted runs
+            # that were draining normally. Whoever gives up first decides what
+            # the run reports: the engine's 503 names the adapter it was waiting
+            # on, a timeout here only says the socket went quiet. Expiry is NOT
+            # retried and is not recovered from -- `_apply_policy_update`'s
+            # exception is stored and re-raised by
+            # `raise_if_policy_update_failed`, which aborts the run.
+            timeout=httpx.Timeout(admin_client_timeout_s(client_config.timeout), connect=60.0),
         )
 
     return [_setup_admin_client(base_url) for base_url in client_config.base_url]
@@ -271,7 +280,21 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
     if isinstance(exception, httpx.HTTPStatusError):
         # Retry on 404 (adapter not found) or 500 (server error during loading)
         return exception.response.status_code in (404, 500)
-    return False
+    # A failure with no status at all: the connection was refused, dropped, or
+    # never established. This used to fall through unretried, so one dead socket
+    # ended a run that had already trained and already saved its adapter. Loading
+    # an adapter by name and path is idempotent, so a second attempt is safe.
+    #
+    # Not a read timeout, though it is also a TransportError. That one means the
+    # server took the request and has not answered within the deadline, so it is
+    # very likely still reloading, and retrying stacks ten more 600s waits on top
+    # of a reload that may yet succeed. `_apply_policy_update` gates all new
+    # rollout scheduling while this runs and leaves `checkpoint_ready` cleared,
+    # so those waits are a silently stalled run -- which is the failure the
+    # deadline was added to end, not to multiply.
+    if isinstance(exception, httpx.ReadTimeout):
+        return False
+    return isinstance(exception, httpx.TransportError)
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:

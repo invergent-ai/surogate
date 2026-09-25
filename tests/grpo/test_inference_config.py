@@ -208,3 +208,21 @@ def test_rollouts_are_not_pinned_to_one_seed_by_default():
 def test_an_explicit_seed_still_reaches_the_engine():
     """Changing the default must not remove the knob, only stop presuming it."""
     assert _value(_argv({"model": "m", "seed": 1234}), "--seed") == "1234"
+
+
+def test_the_admission_bounds_reach_the_engine():
+    """Sized per run in `grpo/utils/capacity.py`; both must survive the trip.
+
+    Written out rather than derived from the field names: a test that builds the
+    flag with the same `replace("_", "-")` the builder uses would agree with it
+    however wrong it was.
+    """
+    argv = _argv({"model": "m", "max_pending_requests": 4242, "pending_timeout_ms": 999})
+    assert _value(argv, "--max-pending-requests") == "4242"
+    assert _value(argv, "--pending-timeout-ms") == "999"
+
+
+def test_unset_admission_bounds_are_left_to_the_engine():
+    argv = _argv({"model": "m"})
+    assert "--max-pending-requests" not in argv
+    assert "--pending-timeout-ms" not in argv

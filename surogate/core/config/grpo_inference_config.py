@@ -63,6 +63,30 @@ class GRPOInferenceConfig:
             (``hermes`` and ``qwen3_xml`` are the same format). Unset leaves the
             engine's own default.
         max_num_seqs: Concurrency cap (`--max-num-seqs`).
+        max_pending_requests: How many requests past `max_num_seqs` the engine
+            will hold rather than refuse (`--max-pending-requests`). The two
+            together are its admission bound, and a request past them gets a
+            429. Rollout clients give up after ten of those, so a run whose
+            in-flight rollouts exceed the bound loses whole rollouts; holding
+            them instead costs a worker thread each and a wait. `grpo/utils/capacity.py`
+            derives a default from the orchestrator's in-flight count, called from
+            `split.py`, the only place both numbers are known. Unset leaves the engine's own
+            default of 16.
+        pending_timeout_ms: How long a held request may wait before the engine
+            gives up on it (`--pending-timeout-ms`). Sized just BELOW the rollout
+            client's own timeout: past that deadline nobody is waiting for the
+            answer, while the held request still occupies its admission slot and
+            worker, so the caller's retry queues behind a request it has already
+            abandoned. Unset leaves the engine's default of 30000.
+        adapter_update_timeout_ms: How long a weight update may wait for the
+            adapter to stop being read (`--adapter-update-timeout-ms`). A request
+            claims the adapter when admitted rather than when it starts
+            generating, so this bounds draining the admitted backlog, not one
+            generation. It must exceed `pending_timeout_ms`, and the admin
+            client's own timeout must exceed it, so the engine's 503 naming the
+            adapter wins the race against an opaque client timeout. Unset leaves
+            the engine inheriting `pending_timeout_ms`, which is what it did for
+            both jobs before this existed.
         gpu_layers: Decoder layers kept on GPU; 0 offloads all, 'all' keeps all resident.
         host_moe_layers: MoE layers with experts in CPU RAM; a count, 'auto', or 'all'.
         expert_slots: GPU expert-cache slots for offloaded MoE models.
@@ -102,6 +126,9 @@ class GRPOInferenceConfig:
     # whether a big model + LoRA fits. Lowering the KV budget does NOT help -- it
     # shrinks the very pool those buffers draw from.
     max_num_seqs: int | None = None
+    max_pending_requests: int | None = None
+    pending_timeout_ms: int | None = None
+    adapter_update_timeout_ms: int | None = None
     # These controls apply to the separate serving engine. None preserves its defaults.
     gpu_layers: int | Literal["all"] | None = None
     host_moe_layers: int | Literal["auto", "all"] | None = None
@@ -148,6 +175,9 @@ class GRPOInferenceConfig:
         self.model = cfg.get("model", self.model)
         self.max_model_len = cfg.get("max_model_len", self.max_model_len)
         self.max_num_seqs = cfg.get("max_num_seqs", self.max_num_seqs)
+        self.max_pending_requests = cfg.get("max_pending_requests", self.max_pending_requests)
+        self.pending_timeout_ms = cfg.get("pending_timeout_ms", self.pending_timeout_ms)
+        self.adapter_update_timeout_ms = cfg.get("adapter_update_timeout_ms", self.adapter_update_timeout_ms)
         self.enable_auto_tool_choice = cfg.get("enable_auto_tool_choice", self.enable_auto_tool_choice)
         self.tool_call_parser = cfg.get("tool_call_parser", self.tool_call_parser)
         # The engine refuses this pair at startup, and it does so after execv,
@@ -157,8 +187,7 @@ class GRPOInferenceConfig:
         # would go stale and reject a name the engine accepts.
         if self.enable_auto_tool_choice and self.tool_call_parser in ("none", "off"):
             raise ValueError(
-                "enable_auto_tool_choice needs a tool_call_parser; "
-                f"{self.tool_call_parser!r} turns parsing off"
+                f"enable_auto_tool_choice needs a tool_call_parser; {self.tool_call_parser!r} turns parsing off"
             )
         self.gpu_layers = _offload_count("gpu_layers", cfg.get("gpu_layers"), ("all",))
         self.host_moe_layers = _offload_count("host_moe_layers", cfg.get("host_moe_layers"), ("auto", "all"))
@@ -179,6 +208,26 @@ class GRPOInferenceConfig:
         self.decode_prefix_entries = int(cfg.get("decode_prefix_entries", self.decode_prefix_entries))
         if self.decode_prefill_chunk <= 0 or self.decode_prefix_entries < 0:
             raise ValueError("decode_prefill_chunk must be positive and decode_prefix_entries nonnegative")
+        # The engine refuses 0 for both, and it does so after execv, so the run
+        # shows a server that never turns healthy instead of the reason.
+        if self.max_pending_requests is not None and self.max_pending_requests <= 0:
+            raise ValueError("max_pending_requests must be positive")
+        if self.pending_timeout_ms is not None and self.pending_timeout_ms <= 0:
+            raise ValueError("pending_timeout_ms must be positive")
+        if self.adapter_update_timeout_ms is not None and self.adapter_update_timeout_ms <= 0:
+            raise ValueError("adapter_update_timeout_ms must be positive")
+        if (
+            self.adapter_update_timeout_ms is not None
+            and self.pending_timeout_ms is not None
+            and self.adapter_update_timeout_ms <= self.pending_timeout_ms
+        ):
+            # A request may sit pending for the whole hold, so an update that
+            # gives up sooner aborts runs that were only busy.
+            raise ValueError(
+                f"adapter_update_timeout_ms ({self.adapter_update_timeout_ms}) must exceed "
+                f"pending_timeout_ms ({self.pending_timeout_ms}): a pending request holds the "
+                f"adapter claim a weight update waits on"
+            )
         self.kv_cache_dtype = cfg.get("kv_cache_dtype", self.kv_cache_dtype)
         self.tp = cfg.get("tp", self.tp)
         self.dp = cfg.get("dp", self.dp)
