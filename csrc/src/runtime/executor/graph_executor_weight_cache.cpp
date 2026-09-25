@@ -1020,7 +1020,7 @@ void GraphExecutor::prefetch_layer_weights(int layer_idx, cudaStream_t stream) {
                 entry.stats = mRunState.Allocator->allocate(ETensorDType::FP32,
                                                             ("fp8_cache_" + name + "_stats").c_str(),
                                                             EAllocationType::ON_DEVICE,
-                                                            {2L});
+                                                            {Tensor::STATS_FLOATS});
                 entry.weight.Stats = entry.stats.get<float>();
                 auto [insert_it, _] = mFP8WeightCache.emplace(name, std::move(entry));
                 it = insert_it;
