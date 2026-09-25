@@ -21,6 +21,7 @@
 
 using sinfer::serve::HttpPoolSizes;
 using sinfer::serve::http_pool_sizes;
+using sinfer::serve::extra_model_options;
 using sinfer::serve::ServeOptions;
 
 namespace {
@@ -68,6 +69,26 @@ int main() {
         options.extra_models.emplace_back(); // max_num_seqs defaults to 0
         const HttpPoolSizes sizes = http_pool_sizes(options);
         assert(sizes.workers == 8 + 16 + 8 + 16 + 1 && "0 inherits the primary's max_num_seqs");
+    }
+
+    // The worker count restates `extra_model_options()`'s inheritance rule rather than calling it,
+    // because it needs the sum and not the options. So pin the two against each other: if someone
+    // changes how an extra model inherits pending capacity, the executor's `max_outstanding_` and
+    // the worker count drift apart with nothing to say so, and that equality is the whole reason
+    // an unbounded queue cannot grow without limit.
+    {
+        for (const std::uint32_t inherited : {std::uint32_t{0}, std::uint32_t{4}, std::uint32_t{600}}) {
+            ServeOptions options = options_for(8, 16);
+            options.extra_models.emplace_back();
+            options.extra_models.back().max_num_seqs = inherited;
+            const ServeOptions derived = extra_model_options(options, options.extra_models.back());
+            const std::size_t outstanding = static_cast<std::size_t>(options.max_concurrency) +
+                                            options.max_pending_requests +
+                                            static_cast<std::size_t>(derived.max_concurrency) +
+                                            derived.max_pending_requests;
+            assert(http_pool_sizes(options).workers == outstanding + 1 &&
+                   "a worker per admissible request, plus one, or the queue can outgrow the pool");
+        }
     }
 
     std::printf("ok: the backlog is unbounded, the worker count is not\n");
