@@ -1814,7 +1814,8 @@ class SurogateTrainerWrapper:
                     mstat["nan"] = True
 
             proj_name = module_name.rsplit(".", 1)[-1]
-            if proj_name in {"q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"}:
+            if proj_name in {"q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj",
+                             "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"}:
                 pstat = proj_stats.get(proj_name)
                 if pstat is None:
                     proj_stats[proj_name] = {

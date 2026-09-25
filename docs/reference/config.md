@@ -597,6 +597,17 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | `adapter_init_mode`   | string | `"merge"`  | How `adapter_path` is applied: `merge` folds it into the base weights and trains a fresh adapter; `trainable` loads it as the initial trainable adapter and continues training it. Honored by SFT, DPO, and GRPO. |
 | `merge_adapter`       | bool   | `false`   | Whether to merge LoRA adapters into the base model after training.         |
 
+`lora_target_modules: ["all"]` adapts every linear projection the model declares for LoRA: attention
+(`q_proj`, `k_proj`, `v_proj`, `o_proj`), MLP (`gate_proj`, `up_proj`, `down_proj`, or the fused names a model
+uses) and, on models with Gated DeltaNet linear attention (the Qwen3.5 family, Qwen3.8), the mixer's
+`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b` and `out_proj`, exported as
+`...layers.N.linear_attn.<proj>` (HF/PEFT names). On such a model `out_proj` names the linear-attention output
+projection; the attention output stays `o_proj`. Adapters trained with `all` before linear-attention LoRA
+(surogate <= 1.5.3) cover only `[q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]`: load or resume
+them with that explicit list, since an import that lacks any adapter tensor the trainer allocates is refused
+(as is optimizer state of another geometry). Serving stacks without linear-attention LoRA support need such
+adapters merged into the weights.
+
 ## MoE Settings
 
 MoE (Mixture-of-Experts) settings control router loss coefficients for load balancing during training.

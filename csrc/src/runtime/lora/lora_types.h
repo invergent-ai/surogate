@@ -22,6 +22,12 @@ struct LoRAProjectionShape {
     int output = 0;
 };
 using LoRAAttentionShapes = std::array<LoRAProjectionShape, 4>;
+// Exact geometry for the linear-attention (GatedDeltaNet) mixer projections, in
+// kLinearAttentionLoRANames order: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj.
+using LoRALinearShapes = std::array<LoRAProjectionShape, 5>;
+/// HF/PEFT module names of the linear-attention projections (``<layer>.linear_attn.<name>``).
+inline constexpr std::array<std::string_view, 5> kLinearAttentionLoRANames = {
+    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"};
 
 /**
  * @brief Type trait to detect if a weights struct has experts
@@ -60,6 +66,36 @@ struct LoRAAttentionWeights {
     std::optional<LoRALayerWeights<TTensor>> k;  ///< Key projection
     std::optional<LoRALayerWeights<TTensor>> v;  ///< Value projection
     std::optional<LoRALayerWeights<TTensor>> o;  ///< Output projection
+};
+
+/**
+ * @brief LoRA weights for linear-attention (GatedDeltaNet) mixer projections
+ *
+ * Qwen3.5-family linear-attention layers carry no q/k/v/o projections; their mixer
+ * projects with in_proj_qkv (fused, [2*key_dim + value_dim, C]), in_proj_z, in_proj_a,
+ * in_proj_b and out_proj, one HF tensor each, so each gets one adapter.
+ */
+template <typename TTensor>
+struct LoRALinearAttentionWeights {
+    std::optional<LoRALayerWeights<TTensor>> in_proj_qkv;
+    std::optional<LoRALayerWeights<TTensor>> in_proj_z;
+    std::optional<LoRALayerWeights<TTensor>> in_proj_a;
+    std::optional<LoRALayerWeights<TTensor>> in_proj_b;
+    std::optional<LoRALayerWeights<TTensor>> out_proj;
+
+    /// Slot by kLinearAttentionLoRANames index.
+    [[nodiscard]] std::optional<LoRALayerWeights<TTensor>>& at(int i) {
+        switch (i) {
+            case 0: return in_proj_qkv;
+            case 1: return in_proj_z;
+            case 2: return in_proj_a;
+            case 3: return in_proj_b;
+            default: return out_proj;
+        }
+    }
+    [[nodiscard]] const std::optional<LoRALayerWeights<TTensor>>& at(int i) const {
+        return const_cast<LoRALinearAttentionWeights*>(this)->at(i);
+    }
 };
 
 /**
@@ -173,6 +209,7 @@ struct LoRAMoEWeights {
 template <typename TTensor>
 struct LoRABlockWeights {
     LoRAAttentionWeights<TTensor> attention;
+    LoRALinearAttentionWeights<TTensor> linear_attn;  ///< Linear-attention (GatedDeltaNet) mixer
     LoRAMLPWeights<TTensor> mlp;  ///< For dense models
     LoRAMoEWeights<TTensor> moe;  ///< For MoE models (per-expert LoRA)
     std::optional<LoRALayerWeights<TTensor>>
@@ -216,6 +253,11 @@ enum class LoRATargetId : std::uint8_t {
     ExpertUp,
     ExpertGateUp,
     ExpertDown,
+    LinQKV,  ///< linear-attention in_proj_qkv
+    LinZ,    ///< linear-attention in_proj_z
+    LinA,    ///< linear-attention in_proj_a
+    LinB,    ///< linear-attention in_proj_b
+    LinOut,  ///< linear-attention out_proj
     Unknown = 255,
 };
 
@@ -236,6 +278,11 @@ inline LoRATargetId lora_target_from_name(std::string_view name) {
     if (name == "expert_up") return LoRATargetId::ExpertUp;
     if (name == "expert_gate_up") return LoRATargetId::ExpertGateUp;
     if (name == "expert_down") return LoRATargetId::ExpertDown;
+    if (name == "lin_qkv") return LoRATargetId::LinQKV;
+    if (name == "lin_z") return LoRATargetId::LinZ;
+    if (name == "lin_a") return LoRATargetId::LinA;
+    if (name == "lin_b") return LoRATargetId::LinB;
+    if (name == "lin_out") return LoRATargetId::LinOut;
     return LoRATargetId::Unknown;
 }
 
@@ -251,6 +298,11 @@ inline LoRALayerWeights<TTensor>* get_layer_weight_by_target(LoRABlockWeights<TT
         case LoRATargetId::Down: return block.mlp.down.has_value() ? &*block.mlp.down : nullptr;
         case LoRATargetId::GateUp: return block.mlp.gate_up.has_value() ? &*block.mlp.gate_up : nullptr;
         case LoRATargetId::Router: return block.router.has_value() ? &*block.router : nullptr;
+        case LoRATargetId::LinQKV: return block.linear_attn.in_proj_qkv.has_value() ? &*block.linear_attn.in_proj_qkv : nullptr;
+        case LoRATargetId::LinZ: return block.linear_attn.in_proj_z.has_value() ? &*block.linear_attn.in_proj_z : nullptr;
+        case LoRATargetId::LinA: return block.linear_attn.in_proj_a.has_value() ? &*block.linear_attn.in_proj_a : nullptr;
+        case LoRATargetId::LinB: return block.linear_attn.in_proj_b.has_value() ? &*block.linear_attn.in_proj_b : nullptr;
+        case LoRATargetId::LinOut: return block.linear_attn.out_proj.has_value() ? &*block.linear_attn.out_proj : nullptr;
         case LoRATargetId::SharedUp:
             return (block.moe.shared.has_value() && block.moe.shared->up.has_value()) ? &*block.moe.shared->up
                                                                                       : nullptr;
@@ -289,7 +341,9 @@ inline LoRALayerWeights<TTensor>* get_expert_weight_by_target(LoRAExpertWeights<
     }
 }
 
-inline constexpr std::array<LoRATargetId, 8> kBaseLoRALayerTargets = {
+// The linear-attention targets come last so the order (and every ordinal derived
+// from it) of models without them is unchanged.
+inline constexpr std::array<LoRATargetId, 13> kBaseLoRALayerTargets = {
     LoRATargetId::Q,
     LoRATargetId::K,
     LoRATargetId::V,
@@ -298,7 +352,16 @@ inline constexpr std::array<LoRATargetId, 8> kBaseLoRALayerTargets = {
     LoRATargetId::GateUp,
     LoRATargetId::Up,
     LoRATargetId::Down,
+    LoRATargetId::LinQKV,
+    LoRATargetId::LinZ,
+    LoRATargetId::LinA,
+    LoRATargetId::LinB,
+    LoRATargetId::LinOut,
 };
+
+/// Linear-attention LoRA target by kLinearAttentionLoRANames index.
+inline constexpr std::array<LoRATargetId, 5> kLinearLoRALayerTargets = {
+    LoRATargetId::LinQKV, LoRATargetId::LinZ, LoRATargetId::LinA, LoRATargetId::LinB, LoRATargetId::LinOut};
 
 inline constexpr std::array<LoRATargetId, 4> kExpertLoRALayerTargets = {
     LoRATargetId::ExpertGate,

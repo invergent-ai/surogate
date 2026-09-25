@@ -25,7 +25,12 @@ enum class LoRATarget {
     GATE_PROJ,     ///< MLP gate projection
     GATE_UP_PROJ,  ///< Fused MLP gate+up projection (GPT-OSS style)
     UP_PROJ,       ///< MLP up projection
-    DOWN_PROJ      ///< MLP down projection
+    DOWN_PROJ,     ///< MLP down projection
+    LIN_IN_PROJ_QKV,  ///< Linear-attention (GatedDeltaNet) in_proj_qkv
+    LIN_IN_PROJ_Z,    ///< Linear-attention in_proj_z
+    LIN_IN_PROJ_A,    ///< Linear-attention in_proj_a
+    LIN_IN_PROJ_B,    ///< Linear-attention in_proj_b
+    LIN_OUT_PROJ      ///< Linear-attention out_proj
 };
 
 /**
@@ -66,6 +71,11 @@ struct ModularLoRAConfig {
     bool all_targets = false;
     std::string q_proj_name = "q_proj";
     std::string o_proj_name = "o_proj";
+    /// "o_proj" was requested by name (so an "out_proj" request that resolves to the
+    /// linear-attention out_proj does not drop the attention output adapter).
+    bool o_proj_explicit = false;
+    /// The model declares linear-attention LoRA targets (set from the DSL at model build).
+    bool has_linear_attention = false;
 
     /// Target modules for LoRA adaptation
     std::set<LoRATarget> targets = {LoRATarget::Q_PROJ, LoRATarget::K_PROJ, LoRATarget::V_PROJ, LoRATarget::O_PROJ};
@@ -113,6 +123,14 @@ struct ModularLoRAConfig {
         return applies_to(LoRATarget::DOWN_PROJ);
     }
 
+    /// Linear-attention target by kLinearAttentionLoRANames index (in_proj_qkv, z, a, b, out_proj).
+    [[nodiscard]] bool applies_to_linear(int index) const {
+        static constexpr LoRATarget kLinear[5] = {LoRATarget::LIN_IN_PROJ_QKV, LoRATarget::LIN_IN_PROJ_Z,
+                                                  LoRATarget::LIN_IN_PROJ_A, LoRATarget::LIN_IN_PROJ_B,
+                                                  LoRATarget::LIN_OUT_PROJ};
+        return index >= 0 && index < 5 && applies_to(kLinear[index]);
+    }
+
     [[nodiscard]] bool applies_to_attention() const {
         return applies_to_q() || applies_to_k() || applies_to_v() || applies_to_o();
     }
@@ -150,10 +168,22 @@ struct ModularLoRAConfig {
     }
 
     /**
-     * @brief Enable all targets
+     * @brief Enable the linear-attention (GatedDeltaNet) mixer targets
+     */
+    ModularLoRAConfig& with_linear_attention() {
+        targets.insert(LoRATarget::LIN_IN_PROJ_QKV);
+        targets.insert(LoRATarget::LIN_IN_PROJ_Z);
+        targets.insert(LoRATarget::LIN_IN_PROJ_A);
+        targets.insert(LoRATarget::LIN_IN_PROJ_B);
+        targets.insert(LoRATarget::LIN_OUT_PROJ);
+        return *this;
+    }
+
+    /**
+     * @brief Enable all targets (every linear projection a model declares for LoRA)
      */
     ModularLoRAConfig& with_all() {
-        return with_attention().with_mlp();
+        return with_attention().with_mlp().with_linear_attention();
     }
 
     /// Create from the user-facing LoRA adapter config (CLI/python).

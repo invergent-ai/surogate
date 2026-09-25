@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <unordered_set>
 #include "lora_weights_manager.h"
 
 #include <algorithm>
@@ -174,6 +175,21 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
             master.attention.o.emplace();
             work.attention.o.emplace();
             allocate_layer_weights(*master.attention.o, *work.attention.o, /*in=*/q_out, /*out=*/C, prefix + "_o");
+        }
+    }
+
+    // Linear-attention (GatedDeltaNet) mixer LoRA, sized from the DSL declarations.
+    if (static_cast<std::size_t>(layer_idx) < mConfig.linear_shapes.size()) {
+        const auto& shapes = mConfig.linear_shapes[static_cast<std::size_t>(layer_idx)];
+        for (int i = 0; i < 5; ++i) {
+            const auto& shape = shapes[static_cast<std::size_t>(i)];
+            if (!mConfig.lora_config.applies_to_linear(i) || shape.input == 0 || shape.output == 0) continue;
+            auto& master_proj = master.linear_attn.at(i);
+            auto& work_proj = work.linear_attn.at(i);
+            master_proj.emplace();
+            work_proj.emplace();
+            allocate_layer_weights(*master_proj, *work_proj, shape.input, shape.output,
+                                   prefix + "_lin_" + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]));
         }
     }
 
@@ -391,6 +407,17 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
         init_layer(b.attention.v, C, base + 2);
         init_layer(b.attention.o, q_out, base + 3);
 
+        // Linear-attention LoRA.
+        for (int i = 0; i < 5; ++i) {
+            auto& layer = b.linear_attn.at(i);
+            if (layer.has_value()) {
+                // A subsequence range of its own: base + k (k < 32) is layer l's, and the per-expert and
+                // shared slots already reach past it, so offset far above every per-layer range.
+                init_layer(layer, static_cast<int>(layer->A.Sizes[1]),
+                           (1ULL << 40) + static_cast<unsigned long long>(l) * 8ULL + static_cast<unsigned long long>(i));
+            }
+        }
+
         // Dense MLP LoRA
         init_layer(b.mlp.gate, C, base + 4);
         init_layer(b.mlp.gate_up, C, base + 5);
@@ -427,6 +454,40 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
 
 void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, NCCLCommunicator& comm) {
     if (!enabled()) return;
+    // Every adapter tensor this trainer allocated must come from the file. Loading is by name and skips
+    // what the file lacks, so an adapter with fewer modules (e.g. a Qwen3.5-family adapter from before
+    // linear-attention LoRA) used to import "successfully" with the missing adapters left at their fresh
+    // init -- and a resumed optimizer state sized for the old adapter then indexed past its buffers.
+    {
+        std::unordered_set<std::string> present;
+        try {
+            SafeTensorsReader reader(file_name);
+            for (const auto& entry : reader.entries()) present.insert(entry.name());
+        } catch (std::exception& e) {
+            throw std::runtime_error(fmt::format("Error reading adapter file '{}': {}", file_name, e.what()));
+        }
+        std::vector<std::string> missing;
+        std::size_t allocated = 0;
+        iterate_tensors([&](std::string name, const TensorShard&) {
+            ++allocated;
+            if (!present.contains(name)) missing.push_back(std::move(name));
+        });
+        if (!missing.empty()) {
+            std::string examples;
+            for (std::size_t i = 0; i < missing.size() && i < 4; ++i) examples += (i ? ", " : "") + missing[i];
+            const bool linear = std::any_of(missing.begin(), missing.end(), [](const std::string& n) {
+                return n.find(".linear_attn.") != std::string::npos;
+            });
+            throw std::runtime_error(fmt::format(
+                "adapter '{}' lacks {} of the {} LoRA tensors this trainer's lora_target_modules allocate (e.g. {}). "
+                "Configure the trainer with the adapter's own target modules{}",
+                file_name, missing.size(), allocated, examples,
+                linear ? ": an adapter trained before linear-attention LoRA on a Qwen3.5-family model covers only "
+                         "[q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj] (`all` now also adapts "
+                         "linear_attn.in_proj_qkv/in_proj_z/in_proj_a/in_proj_b/out_proj)"
+                       : ""));
+        }
+    }
     load_safetensors(file_name, *this, /*allow_cast=*/true);
     advance_sync_generation();
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -609,6 +670,10 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
     sync_layer(work.attention.k, master.attention.k, "k_proj");
     sync_layer(work.attention.v, master.attention.v, "v_proj");
     sync_layer(work.attention.o, master.attention.o, "o_proj");
+    for (int i = 0; i < 5; ++i) {
+        const std::string name = "linear_attn." + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]);
+        sync_layer(work.linear_attn.at(i), master.linear_attn.at(i), name.c_str());
+    }
 
     // A block can contain both a dense MLP and grouped experts (Gemma4 MoE).
     // Sync every allocated projection; the dense work buffers must not retain
@@ -707,7 +772,15 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
         if (mConfig.lora_config.applies_to_down()) per_layer += r * D + C * r;
     }
 
-    return per_layer * static_cast<std::size_t>(mConfig.num_layers);
+    std::size_t linear = 0;  // linear-attention mixers: exact per-layer geometry
+    for (const auto& shapes : mConfig.linear_shapes) {
+        for (int i = 0; i < 5; ++i) {
+            const auto& shape = shapes[static_cast<std::size_t>(i)];
+            if (mConfig.lora_config.applies_to_linear(i) && shape.input > 0 && shape.output > 0)
+                linear += r * static_cast<std::size_t>(shape.input) + static_cast<std::size_t>(shape.output) * r;
+        }
+    }
+    return per_layer * static_cast<std::size_t>(mConfig.num_layers) + linear;
 }
 
 namespace {
@@ -740,6 +813,12 @@ void for_each_lora_tensor(TSet& set, F&& visit) {
         visit_layer(block.attention.k);
         visit_layer(block.attention.v);
         visit_layer(block.attention.o);
+
+        visit_layer(block.linear_attn.in_proj_qkv);
+        visit_layer(block.linear_attn.in_proj_z);
+        visit_layer(block.linear_attn.in_proj_a);
+        visit_layer(block.linear_attn.in_proj_b);
+        visit_layer(block.linear_attn.out_proj);
 
         visit_layer(block.mlp.gate);
         visit_layer(block.mlp.gate_up);
@@ -861,6 +940,16 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
         if (block.attention.o.has_value()) {
             callback(prefix + ".self_attn." + names[3] + ".lora_A.weight", block.attention.o->A);
             callback(prefix + ".self_attn." + names[3] + ".lora_B.weight", block.attention.o->B);
+        }
+
+        // Linear-attention mixer LoRA: the HF module names (<layer>.linear_attn.<proj>).
+        for (int i = 0; i < 5; ++i) {
+            const auto& layer = block.linear_attn.at(i);
+            if (!layer.has_value()) continue;
+            const std::string module =
+                prefix + ".linear_attn." + std::string(kLinearAttentionLoRANames[static_cast<std::size_t>(i)]);
+            callback(module + ".lora_A.weight", layer->A);
+            callback(module + ".lora_B.weight", layer->B);
         }
 
         // Dense MLP LoRA
