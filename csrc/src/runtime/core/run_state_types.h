@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <vector>
 #include "runtime/dsl/tensor_slot.h"
+#include "utilities/allocator.h"
 #include "utilities/tensor.h"
 #include "fp8_run_state.h"
 #include "fp4_run_state.h"
@@ -28,6 +29,39 @@ struct SimplifiedQuantGradients {
     Tensor d_mlp_up;   ///< (B, T, 2*D) in grad_quant_dtype
     Tensor d_qkv;      ///< (B, T, QKV_C) in grad_quant_dtype
 };
+
+/**
+ * @brief Helper to allocate the quantized activation-gradient buffers
+ *
+ * One (B, T, width) buffer in `grad_quant_dtype` (E5M2 under fp8_hybrid) per backward matmul
+ * input: d_res_ffn and d_res_att (C), d_mlp_up (MUp) and d_qkv (QKV), each with its own Stats
+ * block in `stats_buffer`.
+ */
+inline void allocate_grad_quant_buffers(SimplifiedQuantGradients& grads,
+                                        Tensor& stats_buffer,
+                                        TensorAllocator& allocator,
+                                        long B,
+                                        long T,
+                                        long C,
+                                        long MUp,
+                                        long QKV,
+                                        ETensorDType grad_quant_dtype) {
+    // One Stats block per buffer (see fp8_stats_floats).
+    stats_buffer = allocator.allocate(ETensorDType::FP32,
+                                      "dsl_grad_quant_stats",
+                                      EAllocationType::ON_DEVICE,
+                                      {fp8_stats_floats(4)});
+    float* stats = stats_buffer.get<float>();
+
+    grads.d_res_ffn = allocator.allocate(grad_quant_dtype, "dsl_d_res_ffn_q", EAllocationType::ON_DEVICE, {B, T, C});
+    grads.d_res_ffn.Stats = fp8_stats_block(stats, 0);
+    grads.d_res_att = allocator.allocate(grad_quant_dtype, "dsl_d_res_att_q", EAllocationType::ON_DEVICE, {B, T, C});
+    grads.d_res_att.Stats = fp8_stats_block(stats, 1);
+    grads.d_mlp_up = allocator.allocate(grad_quant_dtype, "dsl_d_mlp_up_q", EAllocationType::ON_DEVICE, {B, T, MUp});
+    grads.d_mlp_up.Stats = fp8_stats_block(stats, 2);
+    grads.d_qkv = allocator.allocate(grad_quant_dtype, "dsl_d_qkv_q", EAllocationType::ON_DEVICE, {B, T, QKV});
+    grads.d_qkv.Stats = fp8_stats_block(stats, 3);
+}
 
 /**
  * @brief Non-block activations (embeddings, final norm, output)

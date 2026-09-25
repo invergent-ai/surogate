@@ -28,14 +28,15 @@ struct FP8ForwardQuantActivations {
 /// Floats in a buffer that holds `count` Tensor Stats blocks.
 ///
 /// Tensor::scale() is the first 16-byte boundary past abs_max(), up to four floats further on, so
-/// each Stats block needs Tensor::STATS_FLOATS floats of its own: blocks packed any tighter share
-/// scale slots, and the last ones point past the end of the allocation.
+/// each Stats block reserves Tensor::STATS_FLOATS floats of its own. Packed as (abs_max, scale)
+/// pairs two floats apart, neighbouring blocks share scale slots and the last ones point past the
+/// end of the allocation.
 constexpr long fp8_stats_floats(long count) {
     return count * Tensor::STATS_FLOATS;
 }
 
 /// The `index`-th Stats block of a buffer sized by fp8_stats_floats().
-inline float* fp8_stats_block(float* base, long index) {
+constexpr float* fp8_stats_block(float* base, long index) {
     return base + index * Tensor::STATS_FLOATS;
 }
 
