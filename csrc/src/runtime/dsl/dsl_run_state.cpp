@@ -984,25 +984,15 @@ void DslRunState::allocate_simplified_quant_buffers(const PretrainedConfig& cfg,
         return;
     }
 
-    // One Stats block per buffer (see modules::fp8_stats_floats).
-    mGradQuantStats = mAllocator->allocate(ETensorDType::FP32,
-                                           "dsl_grad_quant_stats",
-                                           EAllocationType::ON_DEVICE,
-                                           {modules::fp8_stats_floats(4)});
-    float* stats = mGradQuantStats.get<float>();
-
-    auto alloc = [&](ETensorDType dtype, const std::string& name, const std::vector<long>& shape) -> Tensor {
-        return mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
-    };
-
-    mSimplifiedQuantGrads.d_res_ffn = alloc(mGradQuantDtype, "dsl_d_res_ffn_q", {B, T, C});
-    mSimplifiedQuantGrads.d_res_ffn.Stats = modules::fp8_stats_block(stats, 0);
-    mSimplifiedQuantGrads.d_res_att = alloc(mGradQuantDtype, "dsl_d_res_att_q", {B, T, C});
-    mSimplifiedQuantGrads.d_res_att.Stats = modules::fp8_stats_block(stats, 1);
-    mSimplifiedQuantGrads.d_mlp_up = alloc(mGradQuantDtype, "dsl_d_mlp_up_q", {B, T, MUp});
-    mSimplifiedQuantGrads.d_mlp_up.Stats = modules::fp8_stats_block(stats, 2);
-    mSimplifiedQuantGrads.d_qkv = alloc(mGradQuantDtype, "dsl_d_qkv_q", {B, T, QKV});
-    mSimplifiedQuantGrads.d_qkv.Stats = modules::fp8_stats_block(stats, 3);
+    modules::allocate_grad_quant_buffers(mSimplifiedQuantGrads,
+                                         mGradQuantStats,
+                                         *mAllocator,
+                                         B,
+                                         T,
+                                         C,
+                                         MUp,
+                                         QKV,
+                                         mGradQuantDtype);
 }
 
 void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {

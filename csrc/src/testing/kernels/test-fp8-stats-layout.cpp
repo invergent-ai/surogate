@@ -9,6 +9,7 @@
 #include <set>
 
 #include "runtime/core/fp8_run_state.h"
+#include "runtime/core/run_state_types.h"
 
 namespace {
 
@@ -17,7 +18,7 @@ namespace {
 void require_disjoint_stats(const Tensor* const* buffers, int count, const float* begin, const float* end) {
     std::set<std::uintptr_t> slots;
     for (int i = 0; i < count; ++i) {
-        const float* amax = const_cast<Tensor*>(buffers[i])->abs_max();
+        const float* amax = buffers[i]->Stats;  // what abs_max() returns
         const float* scale = buffers[i]->scale();
         REQUIRE(reinterpret_cast<std::uintptr_t>(scale) % 16 == 0);
         REQUIRE(amax >= begin);
@@ -30,7 +31,8 @@ void require_disjoint_stats(const Tensor* const* buffers, int count, const float
 }  // namespace
 
 TEST_CASE("FP8 Stats blocks never share a scale slot", "[fp8][stats]") {
-    // The allocator guarantees 4-byte alignment only; try every base offset within 16 bytes.
+    // Stats blocks can start at any 4-byte boundary (e.g. inline after FP8 weight data);
+    // try every offset within 16 bytes.
     alignas(64) static float storage[modules::fp8_stats_floats(4) + 4];
     for (int offset = 0; offset < 4; ++offset) {
         float* base = storage + offset;
@@ -58,6 +60,31 @@ TEST_CASE("FP8 forward buffers get disjoint Stats blocks", "[fp8][stats][cuda]")
     REQUIRE(stats.nelem() == modules::fp8_stats_floats(4));
 
     const Tensor* views[4] = {&quants.ln1, &quants.ln2, &quants.att, &quants.swiglu};
+    const float* begin = stats.get<float>();
+    require_disjoint_stats(views, 4, begin, begin + stats.nelem());
+}
+
+TEST_CASE("FP8 gradient-quant buffers get disjoint Stats blocks", "[fp8][stats][cuda]") {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        SKIP("No CUDA device available");
+    }
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+
+    TensorAllocator allocator;
+    modules::SimplifiedQuantGradients grads;
+    Tensor stats;
+    modules::allocate_grad_quant_buffers(grads, stats, allocator, 1, 16, 64, 128, 96, ETensorDType::FP8_E5M2);
+    REQUIRE(stats.nelem() == modules::fp8_stats_floats(4));
+    REQUIRE(grads.d_res_ffn.nelem() == 16 * 64);
+    REQUIRE(grads.d_res_att.nelem() == 16 * 64);
+    REQUIRE(grads.d_mlp_up.nelem() == 16 * 128);
+    REQUIRE(grads.d_qkv.nelem() == 16 * 96);
+
+    const Tensor* views[4] = {&grads.d_res_ffn, &grads.d_res_att, &grads.d_mlp_up, &grads.d_qkv};
+    for (const Tensor* t : views) {
+        REQUIRE(t->DType == ETensorDType::FP8_E5M2);
+    }
     const float* begin = stats.get<float>();
     require_disjoint_stats(views, 4, begin, begin + stats.nelem());
 }
