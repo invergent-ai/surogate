@@ -182,7 +182,7 @@ public:
      *
      * When FP4 pre-quantized expert weights are available, uses cuDNN FE
      * block_scale_dequantize fused with moe_grouped_matmul for bandwidth savings.
-     * Falls back to BF16 cuDNN MoE GEMM otherwise.
+     * Falls back to the BF16 MoE GEMM (Recipe::forward_moe_matmul) otherwise.
      */
     void forward_moe_matmul(modules::MoeMatmulContext& ctx) const override;
 
