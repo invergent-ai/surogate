@@ -2086,9 +2086,22 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
     rs.zero_activation_gradients(rs.MainStream);
 
     const bool last_step = request.micro_step == request.grad_accum_steps - 1;
-    if (last_step && request.reduce_loss_on_completion && !mSkipGradReduce) {
-        reduce_loss(rs, request.batch, request.sequence, comm);
-        comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
+    // The loss and valid-token all-reduces are enqueued after the backward, not before it. Enqueued
+    // here, they would sit in front of the whole backward on the main stream until every other rank
+    // had finished its forward, while this rank's worker thread kept enqueueing the backward behind
+    // them. A worker that then blocks inside a library call holding a process-wide lock (cuBLAS grouped
+    // GEMM held one across a launch; cuDNN's first execute of a plan holds the driver's library lock
+    // while it waits for its GPU to go idle) keeps another rank from ever reaching its all-reduce, and
+    // every rank hangs (#210, #212). Nothing in the backward reads either value: the gradients are
+    // sums, and the optimizer applies the global token count.
+    const bool reduce_loss_after_backward = last_step && request.reduce_loss_on_completion && !mSkipGradReduce;
+    if (reduce_loss_after_backward) {
+        // This rank's loss sum is taken now: in graphs whose loss backward takes the losses buffer as
+        // its d_loss, the backward overwrites it with the seed.
+        deterministic_sum(rs.LossSum.template get<float>(),
+                          rs.Losses.template get<float>(),
+                          static_cast<std::size_t>(request.batch) * static_cast<std::size_t>(request.sequence),
+                          rs.MainStream);
     }
 
     if (!in_capture) {
@@ -2122,6 +2135,18 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
             CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
         }
         grads.reduce_all_async(comm, rs.MainStream, rs.all_reduce_done_event());
+    }
+    if (reduce_loss_after_backward) {
+        // Losses[0] ends up holding the reduced loss, as it did when the sum was taken in place.
+        CUDA_CHECK(
+            cudaMemcpyAsync(rs.Losses.Data, rs.LossSum.Data, sizeof(float), cudaMemcpyDeviceToDevice, rs.MainStream));
+        comm.reduce_loss(rs.Losses.template get<float>(), rs.MainStream);
+        CUDA_CHECK(cudaMemcpyAsync(rs.LossHost,
+                                   rs.Losses.template get<float>(),
+                                   sizeof(float),
+                                   cudaMemcpyDeviceToHost,
+                                   rs.MainStream));
+        comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     }
     record_event_if_not_capturing(rs.BackwardDone, rs.MainStream);
     if (!request.input_copies.empty()) {
