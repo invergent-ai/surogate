@@ -10,7 +10,9 @@ the step's rows are laid out on the GPUs:
   position and the batch audit are unchanged.
 * **Each row is its own document.** Its position ids restart at 0 where it starts, which is the
   engine's document boundary (``compute_doc_masking``): attention -- sliding-window and global
-  layers alike -- never crosses rows. Everything else in the model is per token.
+  layers alike -- never crosses rows, and neither do the token mixers of linear-attention layers
+  (Gated DeltaNet: the causal convolution and the delta rule's recurrent state restart at every
+  document). Everything else in the model is per token.
 * **Only what can influence a loss is kept.** A row is cut after its last supervised input
   position. With causal attention nothing later can reach an earlier position's output, so the
   dropped tail (the padding, and a trailing answer token nobody predicts from) contributes

@@ -66,6 +66,13 @@ __device__ int convolution_document_start(const int* cu_seqlens, int num_docs, i
     return cu_seqlens[lo];
 }
 
+// The document-aware convolution (packed rows: a document never sees another's inputs). Its
+// arithmetic is the dense kernel's (third_party/causal_conv1d) operation for operation -- the same
+// fp32 multiply-add chain in tap order, SiLU as y / (1 + exp(-y)), the backward's
+// (dout * sigmoid) * (1 + y * (1 - sigmoid)) and its dx chain -- so a document packed after
+// others gives exactly the values it gives alone at the start of a row (row packing's
+// bit-identity with padded training). A tap before the document's first token reads zero, which
+// is what the dense kernel reads before a row's first token.
 template <typename T>
 __device__ float packed_conv_value(const T* x, const T* w, int t, int start, int kernel, float bias) {
     float result = bias;
@@ -76,43 +83,75 @@ __device__ float packed_conv_value(const T* x, const T* w, int t, int start, int
     return result;
 }
 
+// Block-wide sum for the weight/bias gradients: one atomic per block and tap instead of one per
+// token (thousands of tokens per channel would otherwise serialise on the same address).
+__device__ __forceinline__ float packed_block_sum(float value, float* scratch) {
+    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_down_sync(0xffffffffu, value, offset);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __syncthreads();  // scratch may still be read by the previous call's warp 0
+    if (lane == 0) scratch[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < (blockDim.x >> 5) ? scratch[threadIdx.x] : 0.f;
+    if (warp == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;  // valid in thread 0
+}
+
 template <typename T, bool Backward>
 __global__ void packed_convolution(T* out, const T* x, const T* weight, const T* bias, const T* dout,
                                   float* dw, float* db, int Tlen, int channels, int kernel, bool silu,
                                   const int* cu_seqlens, int num_docs) {
     const int row = blockIdx.y, channel = blockIdx.z, t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= Tlen) return;
-    const int start = convolution_document_start(cu_seqlens, num_docs, row * Tlen + t) - row * Tlen;
+    const bool active = t < Tlen;
+    // Inactive threads stay alive: the backward's block reductions need every thread.
+    if constexpr (!Backward) {
+        if (!active) return;
+    }
+    const int start = active ? convolution_document_start(cu_seqlens, num_docs, row * Tlen + t) - row * Tlen : 0;
     x += (row * channels + channel) * Tlen;
     out += (row * channels + channel) * Tlen;
     weight += channel * kernel;
     const float b = bias ? to_float(bias[channel]) : 0.f;
     if constexpr (!Backward) {
         float value = packed_conv_value(x, weight, t, start, kernel, b);
-        if (silu) value *= 1.f / (1.f + expf(-value));
+        if (silu) value = value / (1 + expf(-value));
         out[t] = from_float<T>(value);
     } else {
+        __shared__ float scratch[32];
         dout += (row * channels + channel) * Tlen;
         auto grad = [&](int r) {
             float value = to_float(dout[r]);
             if (silu) {
                 float y = packed_conv_value(x, weight, r, start, kernel, b);
-                float sigmoid = 1.f / (1.f + expf(-y));
-                value *= sigmoid * (1.f + y * (1.f - sigmoid));
+                float sigmoid = 1.0f / (1.0f + expf(-y));
+                value = value * sigmoid * (1.0f + y * (1.0f - sigmoid));
             }
             return value;
         };
-        const float dy = grad(t);
-        if (db) atomicAdd(db + channel, dy);
-        float dx = 0.f;
-        for (int j = 0; j < kernel; ++j) {
-            const int source = t - kernel + 1 + j;
-            if (source >= start) atomicAdd(dw + channel * kernel + j, to_float(x[source]) * dy);
-            const int dest = t + kernel - 1 - j;
-            if (dest < Tlen && convolution_document_start(cu_seqlens, num_docs, row * Tlen + dest) == row * Tlen + start)
-                dx += to_float(weight[j]) * grad(dest);
+        const float dy = active ? grad(t) : 0.f;
+        if (active) {
+            float dx = 0.f;
+            for (int j = 0; j < kernel; ++j) {
+                const int dest = t + kernel - 1 - j;
+                if (dest < Tlen &&
+                    convolution_document_start(cu_seqlens, num_docs, row * Tlen + dest) == row * Tlen + start)
+                    dx += to_float(weight[j]) * grad(dest);
+            }
+            out[t] = from_float<T>(dx);
         }
-        out[t] = from_float<T>(dx);
+        if (db) {
+            const float sum = packed_block_sum(dy, scratch);
+            if (threadIdx.x == 0) atomicAdd(db + channel, sum);
+        }
+        if (dw) {
+            for (int j = 0; j < kernel; ++j) {
+                const int source = t - kernel + 1 + j;
+                const float term = active && source >= start ? to_float(x[source]) * dy : 0.f;
+                const float sum = packed_block_sum(term, scratch);
+                if (threadIdx.x == 0) atomicAdd(dw + channel * kernel + j, sum);
+            }
+        }
     }
 }
 

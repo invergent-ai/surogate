@@ -4228,7 +4228,12 @@ void CompiledGraph::compute_layer_segments(bool decode) {
                            // The final layer span includes the generation head. Its host
                            // result buffer (or sampler workspace) can change each call.
                            ty == CompiledOpType::FusedLMHeadLoss);
-            const bool graph_breaking = decode_dynamic || ty == CompiledOpType::FlashAttention ||
+            // Split segments exist when documents are packed (doc masking): the document-aware
+            // convolution takes the per-step document count as a launch argument, and the gated
+            // delta rule dispatches one pipeline per document from the host -- neither can be
+            // replayed from a capture made for another step's documents.
+            const bool document_dynamic = ty == CompiledOpType::MambaConv1d || ty == CompiledOpType::ChunkGatedDeltaRule;
+            const bool graph_breaking = decode_dynamic || document_dynamic || ty == CompiledOpType::FlashAttention ||
                                         ty == CompiledOpType::FlashAttentionBackward || is_capture_unsafe_op_type(ty);
 
             // Check if this op starts an MLP tile group

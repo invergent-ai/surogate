@@ -79,6 +79,10 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     }
 
     if (sequence_chunk_active() && kernel > 1) {
+        if (mCuSeqlensGpu != nullptr && mNumDocs > 0) {
+            throw std::runtime_error("mamba_conv1d: sequence chunks with packed documents are not supported "
+                                     "(the carried tail would cross a document boundary)");
+        }
         // Chunked-sequence carry via the extended-input trick: run the
         // standard kernel (fused activation included) on concat(tail, x) —
         // outputs [K-1, T+K-1) are exactly the values a full-sequence conv
@@ -111,7 +115,10 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         return;
     }
 
-    // Call kernel
+    // Packed documents (row packing, sample packing, rollout parity): the convolution must not
+    // reach across a document boundary, exactly as attention does not. The document-aware kernel
+    // gives the dense kernel's values for a document that starts a row, bit for bit.
+    const bool documents = mCuSeqlensGpu != nullptr && mNumDocs > 0;
     mamba_causal_conv1d_forward(out_val,
                                 x,
                                 weight,
@@ -122,8 +129,8 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
                                 kernel,
                                 silu,
                                 mRunState.MainStream,
-                                mOptions.MoeRolloutParity ? mCuSeqlensGpu : nullptr,
-                                mNumDocs);
+                                documents ? mCuSeqlensGpu : nullptr,
+                                documents ? mNumDocs : 0);
 
     store_tensor(op.outputs[0], out_val);
 }
@@ -221,9 +228,14 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
         return;
     }
 
-    // Call kernel
+    // Packed documents: see the forward. The document-aware backward reduces the weight/bias
+    // gradients per block; it skips them when nothing consumes them (a frozen convolution).
+    const bool documents = mCuSeqlensGpu != nullptr && mNumDocs > 0;
+    const bool wants_dweight = op.outputs.size() > 1 && !op.outputs[1].name.empty();
+    Tensor dweight_arg = dweight_fp32;
+    if (documents && !wants_dweight) dweight_arg.Data = nullptr;
     mamba_causal_conv1d_backward(dx,
-                                 dweight_fp32,
+                                 dweight_arg,
                                  has_dbias ? &dbias_fp32 : nullptr,
                                  x,
                                  weight,
@@ -234,8 +246,8 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
                                  kernel,
                                  silu,
                                  mRunState.MainStream,
-                                 mOptions.MoeRolloutParity ? mCuSeqlensGpu : nullptr,
-                                 mNumDocs);
+                                 documents ? mCuSeqlensGpu : nullptr,
+                                 documents ? mNumDocs : 0);
 
     store_tensor(op.outputs[0], dx);
     store_tensor(op.outputs[1], dweight_fp32);

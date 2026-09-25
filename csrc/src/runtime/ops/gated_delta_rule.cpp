@@ -96,6 +96,63 @@ inline int next_power_of_2(int v) {
     return v + 1;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Packed documents (row packing, sample packing).
+//
+// The recurrent state of a gated delta rule layer must start at zero where a document starts,
+// as attention never looks across a document boundary. The chunked kernels carry the state
+// from one 64-token chunk to the next along the whole [B, T] row, so a packed batch would leak
+// every document's state into the next one. Every kernel of the pipeline takes its sequence
+// length as an argument and addresses its inputs relative to the pointers it is given, and
+// training recomputes every intermediate inside the op, so each document is run as a sequence
+// of its own: the same launches, at the document's offset, with its length and a zero initial
+// state. A document then computes what it computes when it starts a row of a padded batch (the
+// per-chunk arithmetic is the same; a document's last chunk may end early, and the causal
+// masks already make every position independent of the positions after it).
+// ---------------------------------------------------------------------------------------------
+
+struct GdnDocument {
+    long offset = 0;  ///< first token, flattened over [B, T]
+    long length = 0;  ///< tokens
+    long chunk = 0;   ///< first slot of this document in the per-chunk state buffers
+};
+
+bool stream_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &status) == cudaSuccess && status != cudaStreamCaptureStatusNone;
+}
+
+/// The documents of a [B, T] batch from the executor's host cu_seqlens: every token in exactly
+/// one document, none crossing a row. Empty trailing slots (pad-to-max layouts) are skipped.
+std::vector<GdnDocument> gdn_documents(const std::int32_t* cu_seqlens, int num_docs, long B, long T,
+                                       const char* op_name) {
+    std::vector<GdnDocument> docs;
+    long expect = 0, chunk = 0;
+    for (int d = 0; d < num_docs; ++d) {
+        const long start = cu_seqlens[d];
+        const long end = cu_seqlens[d + 1];
+        if (end == start) continue;
+        if (start != expect || end < start || end > B * T || start / T != (end - 1) / T) {
+            throw std::runtime_error(std::string(op_name) + ": packed documents must tile the [B, T] batch row by row "
+                                     "(document " + std::to_string(d) + " spans [" + std::to_string(start) + ", " +
+                                     std::to_string(end) + "), expected to start at " + std::to_string(expect) +
+                                     ", T=" + std::to_string(T) + ")");
+        }
+        docs.push_back({start, end - start, chunk});
+        chunk += (end - start + 63) / 64;
+        expect = end;
+    }
+    if (expect != B * T) {
+        throw std::runtime_error(std::string(op_name) + ": packed documents cover " + std::to_string(expect) +
+                                 " of " + std::to_string(B * T) + " tokens");
+    }
+    return docs;
+}
+
+inline void* at(void* base, long elements, ETensorDType dtype) {
+    return static_cast<std::byte*>(base) + static_cast<std::size_t>(elements) * get_dtype_size(dtype);
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, const char* op_name) {
@@ -275,6 +332,94 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
                            stream);
         store_tensor(op.outputs[0], out_val);
         if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], state_val);
+        return;
+    }
+
+    if (mCuSeqlensGpu != nullptr && mCuSeqlensCpu != nullptr && mNumDocs > 0) {
+        // Packed documents: one pipeline per document (see GdnDocument). The final state of a row
+        // is its last document's.
+        if (sequence_chunk_active() || initial_state) {
+            throw std::runtime_error(std::string(op_name) + ": packed documents cannot be combined with sequence "
+                                     "chunks or an initial state");
+        }
+        if (stream_capturing(stream)) {
+            throw std::runtime_error(std::string(op_name) + ": packed documents are dispatched per document from "
+                                     "the host and cannot be captured in a CUDA graph");
+        }
+        const auto docs = gdn_documents(mCuSeqlensCpu, mNumDocs, B, T, op_name);
+        const long slots = docs.back().chunk + cdiv(static_cast<int>(docs.back().length), BT);
+        Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
+        mTemps.push_back(g_cum);
+        Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
+        mTemps.push_back(A);
+        Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
+        mTemps.push_back(Ai);
+        CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
+        Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_w");
+        mTemps.push_back(w);
+        Tensor u = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u");
+        mTemps.push_back(u);
+        Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {slots, H, K, V}, "gated_delta_rule_h");
+        mTemps.push_back(h);
+        Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
+        mTemps.push_back(v_new);
+        Tensor h0_zero = mRunState.temp_alloc(ETensorDType::BF16, {1, H, K, V}, "gated_delta_rule_h0_buf");
+        mTemps.push_back(h0_zero);
+        CUDA_CHECK(cudaMemsetAsync(h0_zero.Data, 0, h0_zero.nelem() * 2, stream));
+        const ETensorDType qk = q.DType;
+        const unsigned Hu = static_cast<unsigned>(H);
+        for (const GdnDocument& doc : docs) {
+            const long o = doc.offset;
+            const int NTd = cdiv(static_cast<int>(doc.length), BT);
+            int32_t Td = static_cast<int32_t>(doc.length);
+            void* qd = at(q_eff, o * H * K, qk);
+            void* kd = at(k_eff, o * H * K, k.DType);
+            void* vd = at(v.Data, o * H * V, v.DType);
+            void* gin = at(g_input.Data, o * H, g_input.DType);
+            void* gc = at(g_cum.Data, o * H, ETensorDType::FP32);
+            void* bd = at(beta.Data, o * H, beta.DType);
+            void* Ad = at(A.Data, o * H * BT, ETensorDType::FP32);
+            void* Aid = at(Ai.Data, o * H * BT, ETensorDType::BF16);
+            void* wd = at(w.Data, o * H * K, ETensorDType::BF16);
+            void* ud = at(u.Data, o * H * V, ETensorDType::BF16);
+            void* vnd = at(v_new.Data, o * H * V, ETensorDType::BF16);
+            void* hd = at(h.Data, doc.chunk * H * K * V, ETensorDType::BF16);
+            void* od = at(out_ptr->Data, o * H * V, out_ptr->DType);
+            void* h0d = h0_zero.Data;
+            void* htd = at(final_state_ptr->Data, (o / T) * H * K * V, ETensorDType::FP32);
+            float scale_val = scale;
+            {
+                void* args[] = {&gin, &gc, &Td};
+                mGdrKernels.cumsum_fwd({static_cast<unsigned>(NTd), Hu, 1}, args, 3, stream);
+            }
+            {
+                void* args[] = {&kd, &gc, &bd, &Ad, &Td};
+                mGdrKernels.kkt_fwd({static_cast<unsigned>(NTd), Hu, 1}, args, 5, stream);
+            }
+            {
+                void* args[] = {&Ad, &Aid, &Td};
+                mGdrKernels.solve_tril({static_cast<unsigned>(NTd), Hu, 1}, args, 3, stream);
+            }
+            {
+                void* args[] = {&kd, &vd, &bd, &wd, &ud, &Aid, &gc, &Td};
+                mGdrKernels.wy_fwd({static_cast<unsigned>(NTd), Hu, 1}, args, 8, stream);
+            }
+            {
+                void* args[] = {&kd, &ud, &wd, &vnd, &gc, &hd, &h0d, &htd, &Td};
+                mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), Hu, 1}, args, 9, stream);
+            }
+            {
+                void* args[] = {&qd, &kd, &vnd, &hd, &gc, &od, &scale_val, &Td};
+                mGdrKernels.fwd_o(
+                    {static_cast<unsigned>(cdiv(static_cast<int>(V), BV_o)), static_cast<unsigned>(NTd), Hu},
+                    args,
+                    8,
+                    stream);
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (!op.outputs.empty() && !op.outputs[0].name.empty()) store_tensor(op.outputs[0], *out_ptr);
+        if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], *final_state_ptr);
         return;
     }
 
@@ -630,6 +775,163 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                                     scale,
                                     stream);
         mRunState.Stack.free(checkpoints);
+        fill_zero(*d_initial, stream);
+    } else if (mCuSeqlensGpu != nullptr && mCuSeqlensCpu != nullptr && mNumDocs > 0) {
+        // Packed documents: the forward's per-document pipelines recomputed, then each document's
+        // backward on its own (see GdnDocument). No gradient crosses a document boundary.
+        if (sequence_chunk_active() || initial_state || (d_final_state && d_final_state->Data)) {
+            throw std::runtime_error("chunk_gated_delta_rule_backward: packed documents cannot be combined with "
+                                     "sequence chunks, an initial state or a final-state gradient");
+        }
+        if (stream_capturing(stream)) {
+            throw std::runtime_error("chunk_gated_delta_rule_backward: packed documents are dispatched per document "
+                                     "from the host and cannot be captured in a CUDA graph");
+        }
+        const auto docs = gdn_documents(mCuSeqlensCpu, mNumDocs, B, T, "chunk_gated_delta_rule_backward");
+        const long slots = docs.back().chunk + cdiv(static_cast<int>(docs.back().length), BT);
+        long max_length = 0;
+        for (const GdnDocument& doc : docs) max_length = std::max(max_length, doc.length);
+
+        Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
+        mTemps.push_back(g_cum);
+        Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
+        mTemps.push_back(A);
+        Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
+        mTemps.push_back(Ai);
+        CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
+        Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_w");
+        mTemps.push_back(w);
+        Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u_buf");
+        mTemps.push_back(u_buf);
+        Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {slots, H, K, V}, "gated_delta_rule_h");
+        mTemps.push_back(h);
+        Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
+        mTemps.push_back(v_new);
+        Tensor dh = mRunState.temp_alloc(ETensorDType::BF16, {slots, H, K, V}, "gated_delta_rule_dh");
+        mTemps.push_back(dh);
+        Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_dv2");
+        mTemps.push_back(dv2);
+        Tensor dw = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_dw");
+        mTemps.push_back(dw);
+        Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_dg_wy");
+        mTemps.push_back(dg_wy);
+        // One document's [NK, 1, Td, H] slice of the dq/dk/dw/dg kernel's per-K-block dg.
+        Tensor dg_nk =
+            mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), max_length, H}, "gated_delta_rule_dg_nk");
+        mTemps.push_back(dg_nk);
+        Tensor h0_zero = mRunState.temp_alloc(ETensorDType::BF16, {1, H, K, V}, "gated_delta_rule_h0_buf");
+        mTemps.push_back(h0_zero);
+        CUDA_CHECK(cudaMemsetAsync(h0_zero.Data, 0, h0_zero.nelem() * 2, stream));
+        Tensor ht_scratch = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_ht_dummy");
+        mTemps.push_back(ht_scratch);
+        Tensor dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_dht_zero");
+        mTemps.push_back(dht_zero);
+        CUDA_CHECK(cudaMemsetAsync(dht_zero.Data, 0, dht_zero.nelem() * sizeof(float), stream));
+        Tensor dh0_scratch = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_dh0_scratch");
+        mTemps.push_back(dh0_scratch);
+
+        const unsigned Hu = static_cast<unsigned>(H);
+        cublasHandle_t handle = mRunState.cublas_handle();
+        cublasSetStream(handle, stream);
+        for (const GdnDocument& doc : docs) {
+            const long o = doc.offset;
+            const int NTd = cdiv(static_cast<int>(doc.length), BT);
+            int32_t Td = static_cast<int32_t>(doc.length);
+            int32_t one = 1;
+            float sv = scale;
+            void* qd = at(q_eff, o * H * K, q.DType);
+            void* kd = at(k_eff, o * H * K, k.DType);
+            void* vd = at(v.Data, o * H * V, v.DType);
+            void* gin = at(g_input.Data, o * H, g_input.DType);
+            void* gc = at(g_cum.Data, o * H, ETensorDType::FP32);
+            void* bd = at(beta.Data, o * H, beta.DType);
+            void* Ad = at(A.Data, o * H * BT, ETensorDType::FP32);
+            void* Aid = at(Ai.Data, o * H * BT, ETensorDType::BF16);
+            void* wd = at(w.Data, o * H * K, ETensorDType::BF16);
+            void* ud = at(u_buf.Data, o * H * V, ETensorDType::BF16);
+            void* vnd = at(v_new.Data, o * H * V, ETensorDType::BF16);
+            void* hd = at(h.Data, doc.chunk * H * K * V, ETensorDType::BF16);
+            void* dhd = at(dh.Data, doc.chunk * H * K * V, ETensorDType::BF16);
+            void* dod = at(d_out.Data, o * H * V, d_out.DType);
+            void* dvd = at(d_v->Data, o * H * V, d_v->DType);
+            void* dv2d = at(dv2.Data, o * H * V, ETensorDType::BF16);
+            void* dqd = at(dq_data, o * H * K, q.DType);
+            void* dkd = at(dk_data, o * H * K, k.DType);
+            void* dwd = at(dw.Data, o * H * K, ETensorDType::BF16);
+            void* dbd = at(d_beta->Data, o * H, d_beta->DType);
+            void* dgwyd = at(dg_wy.Data, o * H, ETensorDType::FP32);
+            void* dgnk = dg_nk.Data;
+            void* h0d = h0_zero.Data;
+            void* htd = ht_scratch.Data;
+            void* dhtd = dht_zero.Data;
+            void* dh0d = dh0_scratch.Data;
+            // Recompute the document's forward intermediates.
+            {
+                void* args[] = {&gin, &gc, &Td};
+                mGdrKernels.cumsum_fwd({static_cast<unsigned>(NTd), Hu, 1}, args, 3, stream);
+            }
+            {
+                void* args[] = {&kd, &gc, &bd, &Ad, &Td};
+                mGdrKernels.kkt_fwd({static_cast<unsigned>(NTd), Hu, 1}, args, 5, stream);
+            }
+            {
+                void* args[] = {&Ad, &Aid, &Td};
+                mGdrKernels.solve_tril({static_cast<unsigned>(NTd), Hu, 1}, args, 3, stream);
+            }
+            {
+                void* args[] = {&kd, &vd, &bd, &wd, &ud, &Aid, &gc, &Td};
+                mGdrKernels.wy_fwd({static_cast<unsigned>(NTd), Hu, 1}, args, 8, stream);
+            }
+            {
+                void* args[] = {&kd, &ud, &wd, &vnd, &gc, &hd, &h0d, &htd, &Td};
+                mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), Hu, 1}, args, 9, stream);
+            }
+            // Backward.
+            {
+                void* args[] = {&qd, &kd, &gc, &dod, &dvd, &sv, &Td};
+                mGdrKernels.bwd_dv_local({static_cast<unsigned>(NTd), Hu, 1}, args, 7, stream);
+            }
+            {
+                void* args[] = {&qd, &kd, &wd, &gc, &dhtd, &dh0d, &dod, &dhd, &dvd, &dv2d, &sv, &Td};
+                mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_dhu)), Hu, 1}, args, 12, stream);
+            }
+            {
+                void* args[] = {&qd, &kd, &vnd, &gc, &hd, &dod, &dhd, &dqd, &dkd, &dwd, &dv2d, &dgnk, &sv, &one, &Td};
+                mGdrKernels.bwd_dqkwg({static_cast<unsigned>(NK), static_cast<unsigned>(NTd), Hu}, args, 15, stream);
+            }
+            // dg = sum over the K blocks, into this document's slice.
+            {
+                const long n = doc.length * H;
+                float* dg_doc = static_cast<float*>(at(d_g->Data, o * H, ETensorDType::FP32));
+                CUDA_CHECK(cudaMemcpyAsync(dg_doc, dg_nk.Data, n * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                for (int nk = 1; nk < NK; ++nk) {
+                    const float alpha = 1.0f;
+                    cublasSaxpy(handle, static_cast<int>(n), &alpha, dg_nk.get<float>() + nk * n, 1, dg_doc, 1);
+                }
+            }
+            {
+                void* args[] = {&kd, &vd, &bd, &gc, &Aid, &dwd, &dv2d, &dkd, &dvd, &dbd, &dgwyd, &Td};
+                mGdrKernels.bwd_wy({static_cast<unsigned>(NTd), Hu, 1}, args, 12, stream);
+            }
+        }
+        // dg += dg_wy, then the reverse cumulative sum within each document's own chunks.
+        {
+            const float alpha = 1.0f;
+            cublasSaxpy(handle, static_cast<int>(B * T * H), &alpha, dg_wy.get<float>(), 1, d_g->get<float>(), 1);
+        }
+        Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H}, "gated_delta_rule_dg_out");
+        mTemps.push_back(dg_out);
+        for (const GdnDocument& doc : docs) {
+            const long o = doc.offset;
+            int32_t Td = static_cast<int32_t>(doc.length);
+            void* dg_in = at(d_g->Data, o * H, d_g->DType);
+            void* dg_o = at(dg_out.Data, o * H, dg_out.DType);
+            void* args[] = {&dg_in, &dg_o, &Td};
+            mGdrKernels.cumsum_rev({static_cast<unsigned>(cdiv(static_cast<int>(doc.length), BT)), Hu, 1}, args, 3,
+                                   stream);
+        }
+        CUDA_CHECK(
+            cudaMemcpyAsync(d_g->Data, dg_out.Data, d_g->nelem() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         fill_zero(*d_initial, stream);
     } else {
         // ---- Recompute forward intermediates ----
