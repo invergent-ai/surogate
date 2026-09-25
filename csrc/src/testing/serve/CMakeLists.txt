@@ -535,6 +535,17 @@ set_tests_properties(sinfer_sparse_moe_ggml_prefill_bf16_test PROPERTIES
 add_test(NAME sinfer_sparse_moe_nvfp4_small_t_test COMMAND sinfer_sparse_moe_test --nvfp4-small-t)
 set_tests_properties(sinfer_sparse_moe_nvfp4_small_t_test PROPERTIES
     SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_TRTLLM_MIN=16")
+# The prefill route's scan and gather with every warp but a block's first held back
+# (SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS): each once replaced block-shared state without a barrier,
+# so a rare lagging warp corrupted its prefill round. The W8 pair against the oracle, and Gemma 4's
+# own geometry on the BF16-gather route against its small-T slices.
+add_test(NAME sinfer_sparse_moe_prefill_warp_skew_test
+    COMMAND sinfer_sparse_moe_test --prefill-warp-skew)
+set_tests_properties(sinfer_sparse_moe_prefill_warp_skew_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME sinfer_sparse_moe_ggml_prefill_warp_skew_test
+    COMMAND sinfer_sparse_moe_ggml_prefill_test)
+set_tests_properties(sinfer_sparse_moe_ggml_prefill_warp_skew_test PROPERTIES
+    SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_INT8=0;SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS=20000")
 add_test(NAME sinfer_sparse_moe_qwen3_vl_235b_test
     COMMAND sinfer_sparse_moe_test --qwen3-vl-235b)
 set_tests_properties(sinfer_sparse_moe_qwen3_vl_235b_test PROPERTIES SKIP_RETURN_CODE 77)

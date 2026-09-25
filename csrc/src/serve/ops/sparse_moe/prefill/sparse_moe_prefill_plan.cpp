@@ -3,6 +3,7 @@
 #include "core/layout.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -167,6 +168,30 @@ std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry
     (void)allocate_sparse_moe_prefill_workspace(layout, geometry, capacity_tokens, routed_trtllm,
                                                 routed_int8);
     return layout.peak_bytes(1);
+}
+
+std::int32_t sparse_moe_fault_warp_skew_ns() noexcept {
+    static const std::int32_t skew = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS");
+        if (raw == nullptr || *raw == '\0') { return 0; }
+        char* end         = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end == raw || *end != '\0' || parsed < 0 || parsed > 100'000'000) {
+            std::fprintf(stderr,
+                         "sparse moe: ignoring SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS=%s "
+                         "(want 0..100000000 ns)\n",
+                         raw);
+            return 0;
+        }
+        if (parsed > 0) {
+            std::fprintf(stderr,
+                         "sparse moe: injected warp skew of %ld ns in the prefill scan and "
+                         "gather (SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS)\n",
+                         parsed);
+        }
+        return static_cast<std::int32_t>(parsed);
+    }();
+    return skew;
 }
 
 SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,

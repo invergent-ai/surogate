@@ -3,6 +3,20 @@
 
 namespace {
 
+/// SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS (sparse_moe_fault_warp_skew_ns): every warp but the
+/// block's first waits `skew_ns` of wall time here. The clobber keeps the reads after the call
+/// from being hoisted above the wait.
+__device__ __forceinline__ void sparse_moe_fault_warp_skew(int skew_ns) {
+    if (skew_ns <= 0 || threadIdx.x < 32) { return; }
+    unsigned long long start = 0;
+    unsigned long long now   = 0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start)::"memory");
+    do {
+        __nanosleep(1000);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)::"memory");
+    } while (now - start < static_cast<unsigned long long>(skew_ns));
+}
+
 /// The stored width of a row, against the width the math reads.
 ///
 /// `row-split-k128-v1` pads K up to 128 and stores `padded / group` groups per row, so a
@@ -170,7 +184,8 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
                                                int* __restrict__ route_job_experts,
                                                int* __restrict__ route_job_columns,
                                                int* __restrict__ route_job_count, int route_tiles,
-                                               int job_bn, int tokens, bool adaptive) {
+                                               int job_bn, int tokens, bool adaptive,
+                                               int fault_skew_ns) {
     __shared__ int scan[kExperts];
     const int expert = static_cast<int>(threadIdx.x);
     int count        = 0;
@@ -188,6 +203,7 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         __syncthreads();
     }
 
+    sparse_moe_fault_warp_skew(fault_skew_ns);
     const int base         = expert == 0 ? 0 : scan[expert - 1];
     expert_offsets[expert] = base;
     if (expert == kExperts - 1) { expert_offsets[kExperts] = scan[expert]; }
@@ -199,6 +215,12 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         cursor += tile_counts[index];
     }
 
+    // The job-count scan below reuses `scan`. Every thread must have read its neighbour's
+    // prefix sum (`base`, above) before any thread overwrites its own entry: without this
+    // barrier a warp that runs ahead replaces its last entry, scan[32w + 31], with a job count
+    // while warp w + 1 has yet to read it, and expert 32(w + 1) then takes a base inside
+    // another expert's columns -- overlapping gathers, and columns nothing writes.
+    __syncthreads();
     scan[expert] = (count + job_bn - 1) / job_bn;
     __syncthreads();
 #pragma unroll
@@ -227,10 +249,11 @@ sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int*
                                  int* __restrict__ packed_index, const int* __restrict__ tile_bases,
                                  __nv_bfloat16* __restrict__ gathered,
                                  const int* __restrict__ route_job_count,
-                                 int* __restrict__ column_token) {
+                                 int* __restrict__ column_token, int fault_skew_ns) {
     if constexpr (Adaptive) {
         if (*route_job_count < 0) { return; }
     }
+    sparse_moe_fault_warp_skew(fault_skew_ns);
     const int assignment = static_cast<int>(blockIdx.x);
     const int token      = assignment / kTopK;
     const int expert     = ids[assignment];
@@ -244,6 +267,13 @@ sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int*
         const uint4 value = load_vec<uint4>(x + static_cast<std::int64_t>(token) * kHidden + k);
         store_vec(gathered + static_cast<std::int64_t>(packed) * kHidden + k, value);
     }
+    // packed_index holds the assignment's rank within its tile until thread 0 replaces it with
+    // the packed column below, and every warp reads that rank above. Without this barrier a
+    // warp that reads after the store adds the tile base twice: it copies its slice of the
+    // token into another assignment's column (or past the last one) and leaves this column's
+    // slice stale -- whatever the workspace held, which the experts then read as this token.
+    // (With no copy to make, on the int8 route, only thread 0 uses what it read.)
+    __syncthreads();
     if (threadIdx.x == 0) {
         packed_index[assignment] = packed;
         if (column_token != nullptr) { column_token[packed] = token; }
@@ -1936,7 +1966,7 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
         const int route_job_bn = wide_plan ? 64 : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExperts, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
-            route_tiles, route_job_bn, tokens, adaptive);
+            route_tiles, route_job_bn, tokens, adaptive, sparse_moe_fault_warp_skew_ns());
         CUDA_CHECK(cudaGetLastError());
 
         if (adaptive) {
@@ -1950,11 +1980,11 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
                 tokens, SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
             sparse_moe_prefill_gather_kernel<true><<<assignments, kHidden / 8, 0, stream>>>(
                 input, ids, packed_index, tile_bases, plan.routed_int8 ? nullptr : grouped_io,
-                route_job_count, column_token);
+                route_job_count, column_token, sparse_moe_fault_warp_skew_ns());
         } else {
             sparse_moe_prefill_gather_kernel<false><<<assignments, kHidden / 8, 0, stream>>>(
                 input, ids, packed_index, tile_bases, plan.routed_int8 ? nullptr : grouped_io,
-                nullptr, column_token);
+                nullptr, column_token, sparse_moe_fault_warp_skew_ns());
         }
         CUDA_CHECK(cudaGetLastError());
         if (plan.routed_int8) {
