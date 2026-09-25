@@ -126,20 +126,36 @@ void Recipe::backward_matmul(modules::MatmulContext& ctx) const {
 // =============================================================================
 
 void Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
-    // Default implementation: BF16 MoE grouped GEMM via cuDNN Frontend.
-    // Derived recipes (FP8, FP4) override to add weight dequantization.
-    moe_cudnn_grouped_gemm(ctx.out,
-                           ctx.inp,
-                           ctx.weights,
-                           ctx.expert_offsets,
-                           ctx.num_experts,
-                           ctx.N,
-                           ctx.K,
-                           ctx.total_tokens,
-                           ctx.cudnn_handle,
-                           ctx.workspace,
-                           ctx.workspace_size,
-                           ctx.stream);
+    // Default implementation: BF16 MoE grouped GEMM, out(T, N) = inp(T, K) @ W_e(N, K)^T per expert, as
+    // one CUTLASS grouped launch (moe_grouped_gemm, TN). Derived recipes (FP8, FP4) override to add
+    // weight quantization and fall back here.
+    //
+    // Not cuDNN's moe_grouped_matmul (moe_cudnn_grouped_gemm): its runtime-compiled engine calls
+    // cuKernelSetAttribute on a plan's first execute, and the driver then waits for the GPU to go idle
+    // while holding a process-wide library lock that plan builds (cuLibraryLoadData) and other first
+    // executes need. With a collective pending on that GPU, a worker thread building a plan for a new
+    // token bucket on another GPU waits for that lock, and every GPU hangs (#212). The CUTLASS kernel is
+    // bit-identical to cuDNN's here and faster (Gemma 4 26B-A4B shapes on an RTX 5090, 8,192-34,816
+    // routed rows: gate_up 0.77-1.95 ms vs 1.40-2.14 ms, down 0.42-0.90 vs 0.73-1.12).
+    if (!ctx.cublas_handle) {
+        throw std::runtime_error("Recipe::forward_moe_matmul: cublas_handle is null");
+    }
+    moe_grouped_gemm(ctx.out,
+                     ctx.inp,
+                     ctx.weights,
+                     ctx.expert_offsets,
+                     ctx.num_experts,
+                     ctx.N,
+                     ctx.K,
+                     reinterpret_cast<cublasHandle_t>(ctx.cublas_handle),
+                     ctx.stream,
+                     ctx.host_offsets,
+                     1.0f,
+                     0.0f,
+                     EMMTranspose::TN,
+                     ctx.active_experts,
+                     ctx.weight_is_compact,
+                     ctx.num_active);
 }
 
 void Recipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const {

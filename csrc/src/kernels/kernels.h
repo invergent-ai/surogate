@@ -4385,7 +4385,8 @@ void moe_grouped_gemm_up_backward(nv_bfloat16* d_input,
 // ----------------------------------------------------------------------------
 
 /// BF16 MoE grouped GEMM via cuDNN Frontend moe_grouped_matmul.
-/// The bf16 recipe's MoE forward (Recipe::forward_moe_matmul).
+/// Not used by training: its first execute of a plan waits for the GPU while holding a driver lock
+/// that other threads' plan builds need (#212); Recipe::forward_moe_matmul uses moe_grouped_gemm.
 void moe_cudnn_grouped_gemm(nv_bfloat16* output,
                             const nv_bfloat16* input,
                             const nv_bfloat16* weights,

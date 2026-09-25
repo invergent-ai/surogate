@@ -7,6 +7,7 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cudnn.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,6 +19,12 @@
 #include <vector>
 
 #include "kernels/kernels.h"
+#include "recipes/recipe.h"
+#include "recipes/recipe_factory.h"
+#include "runtime/core/matmul_context.h"
+
+cudnnHandle_t create_cudnn_handle();  // runtime/attention/attention_cudnn.cpp
+void destroy_cudnn_handle(cudnnHandle_t handle) noexcept;
 
 namespace {
 
@@ -649,4 +656,125 @@ TEST_CASE("MoE grouped GEMM holds no lock another GPU's worker waits for", "[moe
     INFO("launches behind the gate: " << capacity << ", rounds with A blocked: " << blocked_rounds);
     REQUIRE(blocked_rounds > 0);  // the setup reached the state it tests
     CHECK(cycles == 0);           // B never waited for A
+}
+
+TEST_CASE("The bf16 MoE forward neither waits for its GPU nor holds a lock another GPU's worker needs",
+          "[moe][gemm][multigpu]") {
+    // #212: cuDNN's grouped matmul, once the bf16 recipe's MoE forward, calls cuKernelSetAttribute on a
+    // plan's first execute, and the driver then waits for the GPU to go idle while holding a process-wide
+    // library lock. On a GPU waiting in a collective, the first forward for a new routed-token count
+    // stalled; a second GPU's worker building its own plan waited for the lock, and neither GPU moved.
+    // Here GPU 0 runs a kernel that only finishes when the host says so. Worker A runs the recipe's MoE
+    // forward on GPU 0 and worker B on GPU 1, each with a shape it never ran before; both must return
+    // while GPU 0 is still busy.
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 2) SKIP("needs two CUDA devices");
+    using clk = std::chrono::steady_clock;
+    auto ms_since = [](clk::time_point t) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t).count();
+    };
+    auto recipe = recipes::RecipeFactory::create("bf16");
+
+    struct Gpu {
+        int dev = 0;
+        cudaStream_t stream{};
+        cublasHandle_t cublas{};
+        cudnnHandle_t cudnn{};
+        std::vector<int> off;
+        int* d_off = nullptr;
+        nv_bfloat16 *w = nullptr, *x = nullptr, *y = nullptr;
+        std::byte* ws = nullptr;
+        const int n = 1408, k = 2816;  // Gemma 4 26B-A4B gate_up: N = 2 x 704, K = hidden
+        void setup(int d, int tokens_per_expert) {
+            dev = d;
+            REQUIRE(cudaSetDevice(dev) == cudaSuccess);
+            REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+            REQUIRE(cublasCreate(&cublas) == CUBLAS_STATUS_SUCCESS);
+            cudnn = create_cudnn_handle();  // only the pre-#212 cuDNN forward used it
+            off.assign(E + 1, 0);
+            for (int e = 0; e < E; ++e)
+                off[e + 1] = off[e] + tokens_per_expert;
+            REQUIRE(cudaMalloc(&d_off, off.size() * sizeof(int)) == cudaSuccess);
+            REQUIRE(cudaMemcpy(d_off, off.data(), off.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess);
+            REQUIRE(cudaMalloc(&w, sizeof(nv_bfloat16) * E * n * k) == cudaSuccess);
+            REQUIRE(cudaMalloc(&x, sizeof(nv_bfloat16) * off.back() * k) == cudaSuccess);
+            REQUIRE(cudaMalloc(&y, sizeof(nv_bfloat16) * off.back() * n) == cudaSuccess);
+            REQUIRE(cudaMemset(w, 0, sizeof(nv_bfloat16) * E * n * k) == cudaSuccess);
+            REQUIRE(cudaMemset(x, 0, sizeof(nv_bfloat16) * off.back() * k) == cudaSuccess);
+            REQUIRE(cudaMalloc(&ws, 64 << 20) == cudaSuccess);
+            REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        }
+        void forward(const recipes::Recipe& r) {
+            cudaSetDevice(dev);
+            modules::MoeMatmulContext ctx;
+            ctx.out = y;
+            ctx.inp = x;
+            ctx.weights = w;
+            ctx.expert_offsets = d_off;
+            ctx.num_experts = E;
+            ctx.N = n;
+            ctx.K = k;
+            ctx.total_tokens = off.back();
+            ctx.cudnn_handle = cudnn;
+            ctx.cublas_handle = cublas;
+            ctx.workspace = ws;
+            ctx.workspace_size = 64 << 20;
+            ctx.stream = stream;
+            ctx.host_offsets = off.data();
+            cublasSetStream(cublas, stream);
+            r.forward_moe_matmul(ctx);
+        }
+        void teardown() {
+            cudaSetDevice(dev);
+            cudaStreamSynchronize(stream);
+            cudaFree(w);
+            cudaFree(x);
+            cudaFree(y);
+            cudaFree(d_off);
+            cudaFree(ws);
+            destroy_cudnn_handle(cudnn);
+            cublasDestroy(cublas);
+            cudaStreamDestroy(stream);
+        }
+    } a, b;
+    // Token counts no other test uses, so neither worker has run these shapes before.
+    a.setup(0, 37);
+    b.setup(1, 41);
+
+    int* flag = nullptr;
+    REQUIRE(cudaHostAlloc(&flag, sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess);
+    int* dflag = nullptr;
+    REQUIRE(cudaHostGetDevicePointer(&dflag, flag, 0) == cudaSuccess);
+    *reinterpret_cast<volatile int*>(flag) = 1;
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    gate_kernel<<<1, 1, 0, a.stream>>>(dflag);  // load the gate kernel while GPU 0 is idle
+    REQUIRE(cudaStreamSynchronize(a.stream) == cudaSuccess);
+    *reinterpret_cast<volatile int*>(flag) = 0;
+    gate_kernel<<<1, 1, 0, a.stream>>>(dflag);  // GPU 0 busy until the flag is set
+
+    std::atomic<bool> a_done{false}, b_done{false};
+    std::thread ta([&] {
+        a.forward(*recipe);
+        a_done.store(true);
+    });
+    const auto t0 = clk::now();
+    while (!a_done.load() && ms_since(t0) < 5000)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool a_returned_while_busy = a_done.load();
+    std::thread tb([&] {
+        b.forward(*recipe);
+        b_done.store(true);
+    });
+    const auto t1 = clk::now();
+    while (!b_done.load() && ms_since(t1) < 10000)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool b_returned_while_busy = b_done.load();
+    *reinterpret_cast<volatile int*>(flag) = 1;  // releases everything if either could not return
+    ta.join();
+    tb.join();
+    a.teardown();
+    b.teardown();
+    cudaFreeHost(flag);
+    CHECK(a_returned_while_busy);  // the forward did not wait for GPU 0's pending work
+    CHECK(b_returned_while_busy);  // and held nothing GPU 1's worker needed
 }
