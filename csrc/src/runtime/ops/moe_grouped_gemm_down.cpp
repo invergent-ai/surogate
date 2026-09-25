@@ -235,8 +235,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                                   0.0f,
                                   mRunState.MainStream);
     } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active) {
-        // Recipe-driven MoE GEMM via cuDNN FE (skip when LLEP active — cuDNN
-        // crashes with variable merged expert counts; cuBLAS per-expert is safe)
+        // Recipe-driven MoE GEMM (the bf16 recipe: one CUTLASS grouped launch; FP8/FP4 recipes may
+        // quantize). Not with LLEP, whose merged expert counts vary; the branch below handles it.
         // down weight is (E, C, D) → N=C, K=D
         modules::MoeMatmulContext ctx;
         ctx.out = out.get<nv_bfloat16>();
@@ -259,6 +259,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         ctx.epilogue_support = op.epilogue_support;
         ctx.storage_compat = op.storage_compat;
         attach_token_role(ctx, mCurrentGraph, op.inputs[0]);
+        ctx.host_offsets = host_offsets_ptr;
+        ctx.active_experts = active_ptr;
+        ctx.num_active = num_active;
+        ctx.weight_is_compact = weight_is_compact;
         attach_moe_fp8_cache(ctx, op.inputs[1].name);
         mRecipe->forward_moe_matmul(ctx);
     } else if (inp.DType == ETensorDType::BF16) {
