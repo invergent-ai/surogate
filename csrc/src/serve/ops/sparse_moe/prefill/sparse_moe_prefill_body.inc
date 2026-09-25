@@ -1900,7 +1900,7 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
         const int adaptive_last = weights.routed_down.qtype == QType::Q5G64_F16S   ? 51
                                   : weights.routed_down.qtype == QType::Q6G64_F16S ? 52
                                                                                    : 0;
-        const bool adaptive     = tokens >= 47 && tokens <= adaptive_last;
+        const bool adaptive     = !plan.width_invariant && tokens >= 47 && tokens <= adaptive_last;
 
         sparse_moe_prefill_router_mma_kernel<<<dim3((kRouterRows + kRouterBM - 1) / kRouterBM,
                                                     (tokens + kRouterBN - 1) / kRouterBN),

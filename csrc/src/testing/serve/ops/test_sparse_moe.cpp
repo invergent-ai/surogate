@@ -135,6 +135,26 @@ int main(int argc, char** argv) {
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe prefill under warp skew\n";
         return failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--width-invariance") {
+        // SparseMoeRouting::WidthInvariant: every width from one token, against a wide round's columns.
+        // 1..19 are the widths the W8 pair would otherwise send to the decode and small-T
+        // kernels; 20, 33 and 47 are wide-route widths of their own (a partial 32/64 column tile).
+        std::vector<std::int32_t> narrow;
+        for (std::int32_t tokens = 1; tokens <= 20; ++tokens) { narrow.push_back(tokens); }
+        narrow.push_back(33);
+        narrow.push_back(47);
+        const CodecProfile w8{"w8+w8", QType::W8G32_F16S, QType::W8G32_F16S, {}, false};
+        const CodecProfile q4q5{"q4+q5 (not admitted)", QType::Q4G64_F16S, QType::Q5G64_F16S, {},
+                                false};
+        int failures = 0;
+        failures += qwen36::SparseMoeFixture(w8).run_width_invariance(96, narrow);
+        failures += qwen36::SparseMoeFixture(q4q5).run_width_invariance(96, narrow);
+        failures += qwen3_moe::SparseMoeFixture(w8).run_width_invariance(96, narrow);
+        failures += glm53::SparseMoeFixture(w8).run_width_invariance(96, narrow);
+        failures += lfm2_moe32::SparseMoeFixture(w8).run_width_invariance(96, narrow);
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe width invariance\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--qwen3-vl-235b") {
         constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 128}};
         const CodecProfile profile{"qwen3_vl_235b w8+w8", QType::W8G32_F16S,

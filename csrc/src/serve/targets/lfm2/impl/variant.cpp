@@ -11,6 +11,7 @@
 #include "family/impl/lora_hook.h"
 #include "family/impl/lora_gdn.h"
 #include "family/impl/mlp_swiglu.h"
+#include "family/impl/moe/moe_routing.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -146,18 +147,19 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 // ---- Post-mixer (SwiGLU MLP) ----------------------------------------------
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     if (family::run_banked_experts(weights.banked, weights.moe, hidden, residual, workspace, stream)) {
         return;
     }
     auto scope        = workspace.scope();
     if (weights.moe.experts_per_token) {
+        const ops::SparseMoeRouting routing = family::moe_routing(phase);
         auto storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.moe), weights.moe.routed_gate_up.qtype,
-            weights.moe.routed_down.qtype, hidden.ne[1], hidden.ne[1]));
+            weights.moe.routed_down.qtype, hidden.ne[1], hidden.ne[1], routing));
         WorkspaceArena leaf(storage);
         ops::sparse_moe(hidden, weights.moe, ops::SparseMoeEpilogue::AddResidual,
-                        residual, leaf, stream);
+                        residual, leaf, stream, ops::SparseMoeRoundHook{}, routing);
         return;
     }
     // The width comes from the weight the SwiGLU reads, so this one function serves whatever
@@ -171,7 +173,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
-                                                         family::TextPhase, std::int32_t first,
+                                                         family::TextPhase phase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
@@ -186,7 +188,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
             geometry.experts_per_token, geometry.intermediate,
             ops::SparseMoeGating::SigmoidBiasTopK, geometry.routed_scale};
         bytes = std::max(bytes, ops::sparse_moe_workspace_capacity_bytes(
-            moe, qtype, qtype, first, last));
+            moe, qtype, qtype, first, last, family::moe_routing(phase)));
     }
     return bytes;
 }

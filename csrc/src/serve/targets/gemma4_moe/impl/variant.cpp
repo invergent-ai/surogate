@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/moe/moe_routing.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -269,7 +270,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 // ---- Post-mixer (gated-GELU MLP, between the other two sandwich norms) ------
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                      = workspace.scope();
     const std::int32_t columns      = hidden.ne[1];
     const std::int32_t width        = residual.ne[0];
@@ -327,14 +328,17 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     CUDA_CHECK(cudaMemsetAsync(routed.data, 0, routed.bytes(), stream));
     if (!family::run_banked_experts(weights.banked, weights.op, routed_input, routed,
                                     workspace, stream, &router_input)){
+        // A prefill round pins the wide route at every width (family::moe_routing), so a
+        // prompt token's experts compute the same bits whatever else shares its round.
+        const ops::SparseMoeRouting routing = family::moe_routing(phase);
         auto moe_scope           = workspace.scope();
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype, weights.op.routed_down.qtype, columns,
-            columns));
+            columns, routing));
         WorkspaceArena moe_workspace(storage);
         ops::sparse_moe(routed_input, router_input, weights.op,
                         ops::SparseMoeEpilogue::AddResidual, routed, moe_workspace, stream,
-                        ops::SparseMoeRoundHook{});
+                        ops::SparseMoeRoundHook{}, routing);
     }
 
     Variant::debug_probe("ffn_routed_out", routed, weights.probe_layer_count, stream);
@@ -361,7 +365,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
                                                          WeightsProfile weights_profile,
-                                                         family::TextPhase, std::int32_t first,
+                                                         family::TextPhase phase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
@@ -381,12 +385,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         .activation = ops::GatedActivation::GeluTanh,
         .per_expert_scaled = true,
     };
+    const ops::SparseMoeRouting routing = family::moe_routing(phase);
     const std::size_t mixture = std::max({
-        ops::sparse_moe_workspace_capacity_bytes(moe_geometry, qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry, qtype, qtype, first, last, routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry, QType::Q4_K, QType::Q4_K, first,
-                                                 last),
+                                                 last, routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry, QType::Q4_K, QType::Q6_K, first,
-                                                 last),
+                                                 last, routing),
     });
     return planes + mixture;
 }

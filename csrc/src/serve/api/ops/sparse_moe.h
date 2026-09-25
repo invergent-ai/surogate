@@ -241,15 +241,56 @@ enum class SparseMoeEpilogue : std::uint8_t {
 };
 
 /**
+ * How a round picks its routed-expert kernels.
+ *
+ * `ByWidth`, the default, takes the fastest kernels for the round's width: the decode kernel for
+ * one token, the small-T kernels below the profile's prefill floor, the wide prefill family from
+ * the floor up. Each is exact to its own arithmetic, but they are different arithmetic, so a
+ * token's output bits depend on how many tokens share its round.
+ *
+ * `WidthInvariant` takes the wide prefill family at every width, down to a single token, for the
+ * pairs whose wide route computes a token column the same way at every width
+ * (`sparse_moe_prefill_routing_admitted`). A token then gets the same bits whether its round
+ * holds one token or thousands. The serving runtime asks for it on every round of the prefill
+ * phase (family::moe_routing), whose width depends on what else was packed into it: a window
+ * split, or a prompt's remainder alone in a round, would otherwise put some of a prompt's tokens
+ * on the small-T or decode kernels and move its answer by a few ulps -- or, for a decisions
+ * request's shared prefix, every question built on it. A mixed round's decode rows ride the same
+ * route (at the widths where they did not already). Verify and decode rounds keep `ByWidth`.
+ *
+ * It does not apply, and the round keeps `ByWidth`, for a pair that is not admitted, for a round
+ * with a LoRA adapter bound (the adapter path runs every column of such a round on the per-token
+ * decode kernels, so a base prompt's bits there depend on whether an adapter request shares its
+ * round), and for a round whose hook resolves experts (a bounded expert cache).
+ */
+enum class SparseMoeRouting : std::uint8_t {
+    ByWidth,
+    WidthInvariant,
+};
+
+/// Whether `SparseMoeRouting::WidthInvariant` changes anything for this routed codec pair: the
+/// pairs whose wide prefill route takes every width from one token and was shown to compute each
+/// token column with the same arithmetic at every width (sinfer_sparse_moe_test
+/// --width-invariance). Only W8+W8 today. The routed-NVFP4 profile cannot be: its vendored runner
+/// tunes its grouped-GEMM tactics per width. The GGML and Q4G64 pairs are not measured, and their
+/// wide route still switches kernel templates by width (the 768-token wide plan, the Q5/Q6
+/// adaptive split), which admission would have to pin first.
+[[nodiscard]] bool sparse_moe_prefill_routing_admitted(QType routed_gate_up,
+                                                       QType routed_down) noexcept;
+
+/**
  * Returns the transient capacity required by SparseMoe for every T in the inclusive
- * [min_tokens,max_tokens] interval. The routed QTypes are the fixed implementation profile.
- * Invalid profiles or intervals throw.
+ * [min_tokens,max_tokens] interval under `routing`. The routed QTypes are the fixed
+ * implementation profile. A WidthInvariant capacity covers the ByWidth one, since a call may
+ * fall back to it. Invalid profiles or intervals throw.
  */
 [[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
                                                               QType routed_gate_up,
                                                               QType routed_down,
                                                               std::int32_t min_tokens,
-                                                              std::int32_t max_tokens);
+                                                              std::int32_t max_tokens,
+                                                              SparseMoeRouting routing =
+                                                                  SparseMoeRouting::ByWidth);
 
 /**
  * Closed sparse-MoE Op over the registered geometries (kSparseMoeQwen36Geometry,
@@ -310,10 +351,12 @@ struct SparseMoeRoundHook {
                             std::int32_t count, cudaStream_t stream) = nullptr;
 };
 
-/// As above with a round hook; a hook with a null `resolve` is the plain call.
+/// As above with a round hook; a hook with a null `resolve` is the plain call. `routing` is
+/// SparseMoeRouting's; the workspace must have been sized with the same value.
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
-                const SparseMoeRoundHook& hook);
+                const SparseMoeRoundHook& hook,
+                SparseMoeRouting routing = SparseMoeRouting::ByWidth);
 
 /**
  * As above, with the router reading `router_x` where the experts read `x`.
@@ -330,6 +373,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
  */
 void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
                 SparseMoeEpilogue epilogue, Tensor& destination, WorkspaceArena& workspace,
-                cudaStream_t stream, const SparseMoeRoundHook& hook);
+                cudaStream_t stream, const SparseMoeRoundHook& hook,
+                SparseMoeRouting routing = SparseMoeRouting::ByWidth);
 
 } // namespace sinfer::ops

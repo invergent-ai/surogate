@@ -546,6 +546,10 @@ add_test(NAME sinfer_sparse_moe_ggml_prefill_warp_skew_test
     COMMAND sinfer_sparse_moe_ggml_prefill_test)
 set_tests_properties(sinfer_sparse_moe_ggml_prefill_warp_skew_test PROPERTIES
     SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_INT8=0;SUROGATE_SERVE_FAULT_MOE_WARP_SKEW_NS=20000")
+# SparseMoeRouting::WidthInvariant: a token column computes the same bits at every round width.
+add_test(NAME sinfer_sparse_moe_width_invariance_test
+    COMMAND sinfer_sparse_moe_test --width-invariance)
+set_tests_properties(sinfer_sparse_moe_width_invariance_test PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME sinfer_sparse_moe_qwen3_vl_235b_test
     COMMAND sinfer_sparse_moe_test --qwen3-vl-235b)
 set_tests_properties(sinfer_sparse_moe_qwen3_vl_235b_test PROPERTIES SKIP_RETURN_CODE 77)

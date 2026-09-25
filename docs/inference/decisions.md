@@ -145,6 +145,16 @@ chunk (2,048 tokens by default) is chunked by the engine on its own terms (tail 
 readout), and with a LoRA adapter bound the wide route is never taken, so on adapter-routed
 requests the floor guarantees nothing. `input_tokens` counts what was actually prefilled.
 
+The floor is per question, but the engine packs several prompts into one prefill round under a
+shared token window, and where it cuts a prompt depends on its round-mates: a remainder can run
+alone in a round of a few tokens. For experts stored as W8 (the bf16 artifacts) every prefill
+round therefore takes the wide MoE route at any width, down to one token
+(`ops::SparseMoeRouting::WidthInvariant`), so a question's answer, and a shared prefix's, do not
+depend on how the window cut them or on what else was being served. Before, such a remainder took
+the decode or small-T kernels and moved an answer by a few ulps -- every question of a request
+when it was part of the shared prefix (tests/serve/test_decisions_prefill_width.py). Other expert
+formats keep the width-chosen kernels.
+
 Requests are recorded like every other protocol: a console line and, with
 `--request-log-jsonl`, `request_start` / `request_done` / `request_rejected` records with
 `protocol: "decisions"`, the question count, the shared prefix, the calibration temperature
