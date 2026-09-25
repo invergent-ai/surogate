@@ -1361,8 +1361,13 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {
-        DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate());
+        DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate(),
+            [&](const std::string& reason) {
+                write_console_log(ConsoleLogLevel::Warning,
+                                  "[req " + std::to_string(req_id) + "] warning " + reason);
+            });
         context.shared_prefix_tokens = outcome.shared_prefix_tokens;
+        context.decision_attempts    = outcome.attempts;
         GenerationOutcome record;
         record.prompt_tokens           = outcome.input_tokens;
         record.completion_tokens       = outcome.output_tokens;

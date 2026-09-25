@@ -176,11 +176,15 @@ Json overrides_json(const sinfer::SamplingOverrides& overrides) {
 /// The `decisions` protocol's own fields, absent from every other record.
 void add_decisions(Json& record, const std::string& protocol, std::size_t question_count,
                    std::optional<std::size_t> shared_prefix_tokens,
-                   std::optional<double> temperature = std::nullopt) {
+                   std::optional<double> temperature = std::nullopt,
+                   std::optional<std::uint32_t> attempts = std::nullopt) {
     if (protocol != "decisions") { return; }
     record["decisions"] = Json{{"question_count", question_count}};
     if (shared_prefix_tokens) { record["decisions"]["shared_prefix_tokens"] = *shared_prefix_tokens; }
     if (temperature) { record["decisions"]["temperature"] = *temperature; }
+    // How many times the request ran (--decision-attempts): above 1 when an attempt returned
+    // non-finite option logits and was run again.
+    if (attempts) { record["decisions"]["attempts"] = *attempts; }
 }
 
 Json client_request_id_json(const std::string& id) { return id.empty() ? Json(nullptr) : Json(id); }
@@ -203,7 +207,7 @@ Json request_json(const RequestLogContext& context) {
                 {"preserve_thinking", context.preserve_thinking},
                 {"sampling", sampler_json(context.sampling)}};
     add_decisions(record, context.protocol, context.question_count, context.shared_prefix_tokens,
-                  context.decision_temperature);
+                  context.decision_temperature, context.decision_attempts);
     return record;
 }
 
@@ -438,6 +442,7 @@ std::string format_request_done(const RequestLogContext& context,
         << " speculative=" << speculative_str(metrics);
     if (context.protocol == "decisions") {
         out << " questions=" << context.question_count << " shared_prefix=" << context.shared_prefix_tokens;
+        if (context.decision_attempts > 1) { out << " attempts=" << context.decision_attempts; }
     }
     return out.str();
 }

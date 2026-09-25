@@ -41,6 +41,8 @@ struct RequestLogContext {
     /// has run, how many tokens of shared prefix were prefilled once for all of them.
     std::size_t question_count       = 0;
     std::size_t shared_prefix_tokens = 0;
+    /// How many times the decisions request ran (--decision-attempts); logged when above 1.
+    std::uint32_t decision_attempts  = 1;
     /// The calibration temperature the answers were read at (`--decision-temperature`).
     double decision_temperature = 1.0;
     /// The caller's X-Request-Id (see client_request_id()); empty when none was sent.

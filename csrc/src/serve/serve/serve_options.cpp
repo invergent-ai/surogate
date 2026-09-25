@@ -159,7 +159,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T]\n"
+           "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
+           "[--decision-attempts N]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -216,7 +217,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --greedy forces temperature 0 (exact argmax).\n"
            "       --decision-temperature T calibrates the decisions endpoint: every answer is read\n"
            "         from softmax(option logits / T). Default 1 (the model's own distribution);\n"
-           "         T > 1 softens overconfident answers. Fit T on a held-out calibration split.\n";
+           "         T > 1 softens overconfident answers. Fit T on a held-out calibration split.\n"
+           "       --decision-attempts N runs a decisions request up to N times (default 3, 1..16)\n"
+           "         while its option logits come out non-finite; each attempt recomputes it from\n"
+           "         scratch and logs a warning. 1 returns the error on the first failure.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -627,6 +631,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--decision-attempts") {
+            const auto attempts = parse_u64(require_value("--decision-attempts"), "decision-attempts");
+            if (attempts < 1 || attempts > 16) {
+                throw std::invalid_argument("invalid decision-attempts: " + std::to_string(attempts) +
+                                            " (1..16; 1 turns retrying off)");
+            }
+            options.decision_attempts = static_cast<std::uint32_t>(attempts);
         } else if (arg == "--decision-temperature") {
             options.decision_temperature =
                 parse_decision_temperature(require_value("--decision-temperature"));

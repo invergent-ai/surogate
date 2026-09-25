@@ -1,3 +1,4 @@
+#include "family/impl/runtime/target_support.h"
 #include "core/device_footprint.h"
 #include "core/sleep.h"
 #include "ops/linear/marlin/marlin_plane.h"
@@ -1331,6 +1332,10 @@ void ProgramImplCore::score_completion(std::uint32_t lane, const Tensor& logits,
         request.next_token_logits = ops::gather_candidate_logits(
             logits, request.next_token_candidates, cfg.token_domain, device.stream,
             DeviceSpan{candidate_readout_storage.base(), candidate_readout_storage.capacity()}, candidate_readout_host);
+        if (take_injected_fault(InjectedFault::NanReadout)) {
+            std::fill(request.next_token_logits.begin(), request.next_token_logits.end(),
+                      std::numeric_limits<float>::quiet_NaN());
+        }
     }
     if (stage_holds_head() && request.top_logprobs >= 0) {
         request.completion_scores.push_back(ops::score_logprobs(

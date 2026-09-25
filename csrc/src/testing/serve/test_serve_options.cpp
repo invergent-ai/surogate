@@ -433,6 +433,27 @@ int main() {
     failures += check(serve_usage_text("sinfer-serve").find("--decision-temperature") != std::string::npos,
                       "serve help omits --decision-temperature");
 
+    // --decision-attempts: how many times a decisions request runs while its option logits come
+    // out non-finite. Three by default; 1..16; an extra model inherits it.
+    failures += check(defaults.decision_attempts == 3, "decisions are not tried three times by default");
+    failures += check(parse({"sinfer-serve", "model.sinfer", "--decision-attempts", "1"}).decision_attempts == 1 &&
+                          parse({"sinfer-serve", "model.sinfer", "--decision-attempts", "16"}).decision_attempts == 16,
+                      "valid --decision-attempts were refused");
+    for (const char* bad : {"0", "17", "-1", "", "abc", "3x", " "}) {
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", "--decision-attempts", bad}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) { std::cerr << "--decision-attempts accepted '" << bad << "'\n"; }
+        failures += check(rejected, "an invalid --decision-attempts was accepted");
+    }
+    const ServeOptions attempts_multi = parse({"sinfer-serve", "model.sinfer", "--decision-attempts", "5",
+                                               "--model", "other=other.sinfer"});
+    failures += check(extra_model_options(attempts_multi, attempts_multi.extra_models.front())
+                              .decision_attempts == 5,
+                      "an extra model did not inherit --decision-attempts");
+    failures += check(serve_usage_text("sinfer-serve").find("--decision-attempts") != std::string::npos,
+                      "serve help omits --decision-attempts");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

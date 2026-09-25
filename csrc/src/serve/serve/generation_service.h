@@ -88,6 +88,9 @@ struct DecisionsOutcome {
     double prepare_seconds = 0.0;
     double prefill_seconds = 0.0;
     double total_seconds   = 0.0;
+    /// How many times the request ran (--decision-attempts): 1 unless an attempt returned
+    /// non-finite option logits and was run again.
+    std::uint32_t attempts = 1;
 };
 
 /// The usage the Chat Completions, Completions and Anthropic Messages endpoints report.
@@ -209,8 +212,12 @@ public:
     /// position, then answer from softmax(logits / T) with T the server's
     /// `--decision-temperature` (`resolve_decision_answers`). Throws ApiException for a
     /// refusal (400) or an engine failure.
+    /// A request whose option logits come out non-finite is run again from scratch, up to
+    /// `--decision-attempts` times in all; `on_retry` is told why before each run after the
+    /// first. Only the last attempt's error reaches the caller.
     [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
-        std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {});
+        std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {},
+        const std::function<void(const std::string&)>& on_retry = {});
 
     void warmup();
 

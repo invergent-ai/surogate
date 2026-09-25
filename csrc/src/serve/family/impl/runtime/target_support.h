@@ -66,4 +66,13 @@ inline void validate_token_interval(std::int32_t first, std::int32_t last) {
 void debug_probe_dump(std::int32_t magic, const char* tag, const Tensor& tensor,
                       std::int32_t layer_count, cudaStream_t stream);
 
+/// Fault injection for the serving tests (tests/serve/test_decisions_retry.py). Each fault is
+/// armed by an environment variable holding a count, read once: the first `count` occasions
+/// take it, then it is spent. Unset, a fault is never taken.
+///   SUROGATE_SERVE_FAULT_POISON_GPU_PREFIX  a saved GPU prefix's KV pages are overwritten with
+///                                           NaN, so every question read on it is non-finite
+///   SUROGATE_SERVE_FAULT_NAN_READOUT        a candidate readout's logits are replaced with NaN
+enum class InjectedFault { PoisonGpuPrefix, NanReadout };
+[[nodiscard]] bool take_injected_fault(InjectedFault fault) noexcept;
+
 } // namespace sinfer::family

@@ -966,7 +966,8 @@ const std::vector<std::string>& GenerationService::decision_codes() {
 
 DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                                            std::function<bool()> is_cancelled,
-                                           const PreparationGate& before_prepare) {
+                                           const PreparationGate& before_prepare,
+                                           const std::function<void(const std::string&)>& on_retry) {
     if (!engine_->supports_chat()) {
         ApiError error;
         error.message = "this model publishes no chat template, which is what a base model "
@@ -1071,6 +1072,10 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             std::vector<TokenId> candidates;
             const Variant* variant = nullptr;
             sinfer::PreparedPrompt prompt;
+            // The rendering the prompt was prepared from: an attempt after the first prepares
+            // it again, since the first attempt's engine consumed the prompt.
+            std::string system;
+            std::string user;
         };
         const bool with_images = !request.images.empty();
         const std::size_t max_context = engine_->options().max_context;
@@ -1084,6 +1089,8 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             Item item;
             item.ids     = prompt.token_ids();
             item.variant = &variant;
+            item.system  = std::string(rendered.system);
+            item.user    = request.state_text + rendered.branch;
             if (item.ids.size() + 1 > max_context) {
                 throw ApiException(ApiError{.status = 400,
                     .message = "question '" + question.name + "' renders to " + std::to_string(item.ids.size()) +
@@ -1152,9 +1159,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
 
         std::vector<ParallelQuery> queries;
         queries.reserve(items.size());
-        std::function<sinfer::PreparedPrompt(std::size_t)> make_prompt;
         std::vector<TokenId> prefix;
-        std::shared_ptr<GpuPrefixKey> key;
         std::size_t shared = 0;
         // The runtime keeps saved GPU prefix states for text prompts only, so an image request
         // shares nothing on the GPU; its questions run as their own prompts below.
@@ -1183,7 +1188,6 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             for (Item& item : items) {
                 queries.push_back(ParallelQuery{.parent = -1, .suffix = item.ids, .candidates = item.candidates});
             }
-            make_prompt = [&](std::size_t i) { return std::move(items[i].prompt); };
         } else {
             prefix.assign(items.front().ids.begin(), items.front().ids.begin() + static_cast<std::ptrdiff_t>(shared));
             for (Item& item : items) {
@@ -1191,40 +1195,91 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                     .suffix = std::vector<TokenId>(item.ids.begin() + static_cast<std::ptrdiff_t>(shared), item.ids.end()),
                     .candidates = item.candidates});
             }
-            // Prefill the shared prefix once and keep its GPU state; every question then
-            // extends that state with its own suffix, exactly as parallel decoding does.
-            key = std::make_shared<GpuPrefixKey>();
-            sinfer::RequestOptions warm_options    = base;
-            warm_options.execution.save_gpu_prefix = key;
-            check();
-            auto warm_prompt = engine_->prepare_tokens(prefix);
-            auto warm = in_engine([&] {
-                return engine_->submit(std::move(warm_prompt), std::move(warm_options), deadline,
-                                       adapter.lifetime);
-            });
-            const auto warm_result = in_engine([&] { return warm.wait(nullptr, cancellation); });
-            check();
-            if (warm_result.finish_reason == FinishReason::Cancelled) {
-                throw RequestError(RequestErrorKind::Cancelled, "decisions were cancelled");
-            }
-            outcome.prefill_seconds += warm_result.timings.prefill_seconds;
-            outcome.shared_prefix_tokens = shared;
-            base.execution.gpu_prefix         = key;
-            base.execution.allow_prefix_reuse = true;
-            make_prompt = [&](std::size_t i) {
-                auto tokens = prefix;
-                tokens.insert(tokens.end(), queries[i].suffix.begin(), queries[i].suffix.end());
-                return engine_->prepare_tokens(std::move(tokens));
-            };
         }
-        // `make_prompt` runs inside this: the tokens it hands the engine are this endpoint's
-        // own rendering, not the caller's, so a refusal of them is a service fault too.
-        const CandidateReadout readout = in_engine([&] {
-            return read_candidates(queries, make_prompt, base, adapter.lifetime, deadline,
-                                   cancellation, check, "decisions were cancelled");
-        });
-        check();
-        outcome.prefill_seconds += readout.prefill_seconds;
+
+        // One attempt runs the whole request on the GPU: the shared prefix (when there is one)
+        // is prefilled and saved under a key of its own, and every question is read on it. A
+        // model can return non-finite option logits for a row that is finite on another run
+        // (2026-09-25: about one request per GPU-hour on RTX PRO 6000 servers, each fine when
+        // sent again), so a failed attempt is run again, up to --decision-attempts in all.
+        // Nothing of a failed attempt is reused: its prefix key is dropped with the attempt,
+        // which releases the saved state and its KV pages before the next warm step is
+        // planned, and the prompts are prepared again. The questions of every attempt are
+        // prefilled with the prefix cache off, as the first attempt's are.
+        const std::uint32_t attempts = std::max<std::uint32_t>(1, options_.decision_attempts);
+        CandidateReadout readout;
+        std::uint32_t attempt = 1;
+        for (;; ++attempt) {
+            sinfer::RequestOptions attempt_base = base;
+            std::shared_ptr<GpuPrefixKey> key;
+            std::function<sinfer::PreparedPrompt(std::size_t)> make_prompt;
+            if (shared == 0) {
+                make_prompt = [&](std::size_t i) {
+                    if (attempt == 1) { return std::move(items[i].prompt); }
+                    sinfer::PreparedPrompt prompt = prepare_chat(items[i].system, items[i].user);
+                    if (prompt.token_ids() != items[i].ids) {
+                        throw std::logic_error("a decisions question prepared again rendered to other tokens");
+                    }
+                    return prompt;
+                };
+            } else {
+                // Prefill the shared prefix once and keep its GPU state; every question then
+                // extends that state with its own suffix, exactly as parallel decoding does.
+                key = std::make_shared<GpuPrefixKey>();
+                sinfer::RequestOptions warm_options    = base;
+                warm_options.execution.save_gpu_prefix = key;
+                check();
+                auto warm_prompt = engine_->prepare_tokens(prefix);
+                auto warm = in_engine([&] {
+                    return engine_->submit(std::move(warm_prompt), std::move(warm_options), deadline,
+                                           adapter.lifetime);
+                });
+                const auto warm_result = in_engine([&] { return warm.wait(nullptr, cancellation); });
+                check();
+                if (warm_result.finish_reason == FinishReason::Cancelled) {
+                    throw RequestError(RequestErrorKind::Cancelled, "decisions were cancelled");
+                }
+                outcome.prefill_seconds += warm_result.timings.prefill_seconds;
+                attempt_base.execution.gpu_prefix         = key;
+                attempt_base.execution.allow_prefix_reuse = true;
+                make_prompt = [&](std::size_t i) {
+                    auto tokens = prefix;
+                    tokens.insert(tokens.end(), queries[i].suffix.begin(), queries[i].suffix.end());
+                    return engine_->prepare_tokens(std::move(tokens));
+                };
+            }
+            // `make_prompt` runs inside this: the tokens it hands the engine are this endpoint's
+            // own rendering, not the caller's, so a refusal of them is a service fault too.
+            readout = in_engine([&] {
+                return read_candidates(queries, make_prompt, attempt_base, adapter.lifetime, deadline,
+                                       cancellation, check, "decisions were cancelled");
+            });
+            check();
+            outcome.prefill_seconds += readout.prefill_seconds;
+            std::vector<std::size_t> nonfinite;
+            for (std::size_t i = 0; i < readout.logits.size(); ++i) {
+                if (std::any_of(readout.logits[i].begin(), readout.logits[i].end(),
+                                [](float value) { return !std::isfinite(value); })) {
+                    nonfinite.push_back(i);
+                }
+            }
+            if (nonfinite.empty() || attempt >= attempts) { break; }
+            if (on_retry) {
+                std::string names;
+                for (std::size_t k = 0; k < nonfinite.size() && k < 8; ++k) {
+                    names += (k == 0 ? "" : ",") + request.questions[nonfinite[k]].name;
+                }
+                if (nonfinite.size() > 8) { names += ",..."; }
+                on_retry("decisions attempt " + std::to_string(attempt) + " of " + std::to_string(attempts) +
+                         " returned non-finite logits for " + std::to_string(nonfinite.size()) + " of " +
+                         std::to_string(readout.logits.size()) + " questions (" + names +
+                         "); running the request again from scratch");
+            }
+            // The attempt's key, options and prompts go out of scope here, before the next
+            // attempt submits anything.
+        }
+        outcome.attempts             = attempt;
+        outcome.shared_prefix_tokens = shared;
         outcome.input_tokens  = static_cast<int>(outcome.shared_prefix_tokens) + readout.suffix_tokens;
         outcome.output_tokens = static_cast<int>(request.questions.size());
         // Both routes above -- whole prompts, or suffixes on the shared GPU prefix -- and both
