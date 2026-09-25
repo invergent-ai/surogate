@@ -100,7 +100,8 @@ _COMMON_SWITCHES = frozenset("""
 _VALUE_OPTIONS = {
     "server": _COMMON_VALUES | frozenset("""
         --host --port --api-key --api-key-file --served-model-name --max-model-len --max-num-seqs
-        --max-pending-requests --pending-timeout-ms --max-num-batched-tokens
+        --max-pending-requests --pending-timeout-ms --adapter-update-timeout-ms
+        --max-num-batched-tokens
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
