@@ -66,10 +66,21 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
         // What the ranking sees. A softmax router ranks the logits themselves; a sigmoid one
         // ranks the score plus a learned per-expert bias, and the bias is dropped again once
         // the winners are known -- it steers which experts are chosen, not what they are worth.
-        const float ranked = Gating == SparseMoeGating::SigmoidBiasTopK
-                                 ? sigmoid(scores[id]) + router_bias[id]
-                                 : scores[id];
-        local[item]  = {ranked, id, lane};
+        const float score = Gating == SparseMoeGating::SigmoidBiasTopK
+                                ? sigmoid(scores[id]) + router_bias[id]
+                                : scores[id];
+        // A NaN ranks as -inf. NaN compares neither better nor worse than anything, so with a
+        // row of NaN logits -- one non-finite value in the token's hidden state makes one -- the
+        // warp reduction below kept lane 0's end-of-list sentinel once lane 0's own values were
+        // taken, and every later rank came out as id 0x7fffffff (ranks 4..7 of Gemma 4's top 8
+        // of 128). Each consumer indexes a table with the id -- the prefill route's per-expert
+        // counts, and its tile bases 8 GiB past the buffer -- and the garbage offsets that follow
+        // reach addresses terabytes from any allocation: cudaErrorIllegalAddress. Ranked as -inf,
+        // an all-NaN row selects valid experts (the lowest ids win the tie) and its output stays
+        // NaN, as its input was; a partly NaN row routes among its finite logits. Rows without a
+        // NaN rank exactly as before.
+        const float ranked = isnan(score) ? -CUDART_INF_F : score;
+        local[item]        = {ranked, id, lane};
     }
 #pragma unroll
     for (int i = 1; i < kPerLane; ++i) {

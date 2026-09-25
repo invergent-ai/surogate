@@ -12,6 +12,8 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <algorithm>
 
 using namespace sinfer;
 namespace test = sinfer::test;
@@ -99,6 +101,59 @@ static void router_bias() {
     test::cuda_check(cudaMemcpy(ids.data(), di.p, ids.size() * sizeof(int), cudaMemcpyDeviceToHost), "router ids");
     assert(ids == expected_ids);
     check(test::from_device_f32(da, top * count), expected);
+}
+
+// The adapter router's own top-k on NaN scores: a NaN ranks as -inf, as in the base router. It
+// used to select expert 0x7fffffff at every rank of an all-NaN row, then write and read through it.
+static void router_bias_nan() {
+    const auto g = ops::kSparseMoeLfm2Moe32Geometry;
+    const int e = g.experts, top = g.experts_per_token, count = 2;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> scores(e * count), base(e), delta(e, 0);
+    for (int j = 0; j < e; ++j) {
+        base[j] = (j % 3) / 16.F;
+        scores[j] = nan;                                          // token 0: every score NaN
+        scores[e + j] = j % 2 == 0 ? nan : (j % 7) / 7.F;         // token 1: every other one NaN
+    }
+    std::vector<int> expected_ids(top * count), selected{0, 0};
+    for (int t = 0; t < count; ++t) {
+        const auto ranked = [&](int j) {
+            const double score = scores[t * e + j];
+            return std::isnan(score) ? -INFINITY : 1 / (1 + std::exp(-score)) + base[j];
+        };
+        std::vector<int> order(e);
+        for (int j = 0; j < e; ++j) order[j] = j;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return ranked(a) > ranked(b); });
+        for (int j = 0; j < top; ++j) expected_ids[t * top + j] = order[j];
+    }
+    std::vector<int> ids(top * count, -1);
+    std::vector<float> initial(top * count, 0);
+    auto ds = test::to_device_f32(scores), db = test::to_device_f32(base), dd = test::to_device_f32(delta);
+    auto di = test::to_device_i32(ids), da = test::to_device_f32(initial), dslots = test::to_device_i32(selected);
+    ops::LoraBank banks[2]{};
+    banks[1].bias = static_cast<const float*>(dd.p);
+    banks[1].n = e;
+    DeviceBuffer table(sizeof(banks));
+    test::cuda_check(cudaMemcpy(table.p, banks, sizeof(banks), cudaMemcpyHostToDevice), "router table");
+    ops::lora_router_bias(Tensor(ds.p, DType::FP32, {e, count}), Tensor(di.p, DType::I32, {top, count}),
+                          Tensor(da.p, DType::FP32, {top, count}), static_cast<const float*>(db.p), nullptr, g,
+                          static_cast<const ops::LoraBank*>(table.p), static_cast<const int*>(dslots.p), 1,
+                          nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "router nan");
+    test::cuda_check(cudaMemcpy(ids.data(), di.p, ids.size() * sizeof(int), cudaMemcpyDeviceToHost), "router ids");
+    if (ids != expected_ids) {
+        std::cerr << "adapter router on NaN scores selected";
+        for (int id : ids) std::cerr << ' ' << id;
+        std::cerr << '\n';
+        std::abort();
+    }
+    const auto alpha = test::from_device_f32(da, top * count);
+    for (int j = 0; j < top; ++j) {
+        if (!std::isnan(alpha[j]) || !std::isfinite(alpha[top + j])) {
+            std::cerr << "adapter router weights on NaN scores: " << alpha[j] << ", " << alpha[top + j] << '\n';
+            std::abort();
+        }
+    }
 }
 
 static void quantized_norms() {
@@ -227,6 +282,7 @@ int main() {
     shared_automatic_projections();
     quantized_norms();
     router_bias();
+    router_bias_nan();
     ops::EngineOpsContext context;
     ops::bind_ops_context(&context);
     constexpr int h = 64, tokens = 4, rank = 2;

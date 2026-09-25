@@ -129,17 +129,24 @@ __global__ void router_bias_adapter_kernel(const float* scores, int score_stride
     if (slot < 0 || !banks[1].bias) { return; }
     scores += token * score_stride; ids += token * topk; alpha += token * topk;
     const float* delta = banks[1].bias + static_cast<std::int64_t>(slot) * experts;
+    // A NaN score ranks as -inf, as in sparse_moe_select_top_k_warp: NaN is neither better nor
+    // worse than the sentinel below, so a NaN row selected id 0x7fffffff at every rank. NaN then
+    // marks a taken expert instead of -inf, which a row of -inf scores could pick again.
     __shared__ float ranked[512];
-    for (int i = lane; i < experts; i += 32) { ranked[i] = sigmoid(scores[i]) + base_bias[i] + delta[i]; }
+    for (int i = lane; i < experts; i += 32) {
+        const float score = sigmoid(scores[i]) + base_bias[i] + delta[i];
+        ranked[i]         = isnan(score) ? -CUDART_INF_F : score;
+    }
     __syncwarp();
     for (int k = 0; k < topk; ++k) {
         detail::SparseMoeRankedValue best{-CUDART_INF_F, 0x7fffffff, lane};
         for (int i = lane; i < experts; i += 32) {
+            if (isnan(ranked[i])) { continue; }
             detail::SparseMoeRankedValue value{ranked[i], i, lane};
             if (detail::sparse_moe_ranked_better(value, best)) { best = value; }
         }
         best = detail::sparse_moe_warp_best(best);
-        if (lane == 0) { ids[k] = best.id; ranked[best.id] = -CUDART_INF_F; }
+        if (lane == 0) { ids[k] = best.id; ranked[best.id] = CUDART_NAN_F; }
         __syncwarp();
     }
     float value = lane < topk ? sigmoid(scores[ids[lane]]) : 0.0F;

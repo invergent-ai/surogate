@@ -511,6 +511,11 @@ sinfer_add_op_test(sinfer_manifold_hyper_connection_test
 sinfer_add_op_test(sinfer_sparse_moe_test
     SOURCES ops/test_sparse_moe.cpp
     LIBRARIES sinfer_ops)
+# The router's top-k on NaN logits, which once selected expert id 0x7fffffff (an illegal address
+# in every consumer), and on finite ones, which must select the reference top-k exactly.
+sinfer_add_op_test(sinfer_sparse_moe_route_test
+    SOURCES ops/test_sparse_moe_route.cu
+    LIBRARIES sinfer_ops)
 # The routed GGML pair a Gemma 4 GGUF actually holds -- a K-quant gate/up beside a Q8_0 down --
 # against the small-T slices that served it before it had prefill kernels. Registered twice so
 # both prefill routes are covered: the default int8 tensor-core one and, with the veto set, the
