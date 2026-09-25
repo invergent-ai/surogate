@@ -136,6 +136,7 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config,
     }
     if (Requirements.loss_metrics) {
         Losses = Allocator->allocate(ETensorDType::FP32, "losses", {B, T});
+        LossSum = Allocator->allocate(ETensorDType::FP32, "loss_sum", {1});
         ValidTokenCount = Allocator->allocate(ETensorDType::INT32, "valid_token_count", {1});
         CorrectCount = Allocator->allocate(ETensorDType::INT32, "correct_count", {1});
     }
@@ -271,6 +272,7 @@ IRunState::IRunState(IRunState&& other) noexcept
       VisualEmbeds(std::move(other.VisualEmbeds)),
       DeepstackVisualEmbeds(std::move(other.DeepstackVisualEmbeds)),
       Losses(std::move(other.Losses)),
+      LossSum(std::move(other.LossSum)),
       ValidTokenCount(std::move(other.ValidTokenCount)),
       CorrectCount(std::move(other.CorrectCount)),
       NormHost(other.NormHost),

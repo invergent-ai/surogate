@@ -294,6 +294,7 @@ public:
     Tensor VisualEmbeds;                        // (B*T, C) model dtype - visual embeddings (ordered by mask)
     std::vector<Tensor> DeepstackVisualEmbeds;  // (B*T, C) per deepstack layer
     Tensor Losses;                              // (B, T) FP32
+    Tensor LossSum;                             // (1,) FP32 - this rank's loss sum, kept until the all-reduce
     Tensor ValidTokenCount;                     // (1,) Int32 - count of non-masked tokens
     Tensor CorrectCount;                        // (1,) Int32 - count of correct predictions
 
