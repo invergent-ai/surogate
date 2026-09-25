@@ -219,3 +219,60 @@ def test_the_clamp_says_so_instead_of_silently_refusing_rollouts(caplog):
     with caplog.at_level(logging.WARNING):
         size_pending_capacity(infer, _orch(batch_size=8192))
     assert "max_pending_requests" in caplog.text
+
+
+# --- the ordering must survive a mix of explicit and derived values ----------
+#
+# The config-level check compares the two fields only when BOTH are set, and it
+# runs at construction, before any sizing. So an explicit value on one side and a
+# derived value on the other reached argv inverted, and the engine refuses that
+# pair at startup: a server that never turns healthy, which is the failure those
+# checks exist to prevent. Both directions were broken.
+
+
+def test_an_explicit_hold_pushes_the_derived_update_deadline_above_it():
+    """Explicit pending, derived update. Was: pending 1500000 > update 1200000."""
+    infer = _infer(max_num_seqs=8, pending_timeout_ms=1_500_000)
+    size_pending_capacity(infer, _orch(batch_size=128, client={"timeout": 1200}))
+    assert infer.adapter_update_timeout_ms > infer.pending_timeout_ms
+    assert infer.pending_timeout_ms == 1_500_000, "an explicit value still wins"
+
+
+def test_an_explicit_update_deadline_pulls_the_derived_hold_below_it():
+    """Explicit update, derived pending. Was: pending 1080000 > update 60000."""
+    infer = _infer(max_num_seqs=8, adapter_update_timeout_ms=60_000)
+    size_pending_capacity(infer, _orch(batch_size=128, client={"timeout": 1200}))
+    assert infer.adapter_update_timeout_ms > infer.pending_timeout_ms
+    assert infer.adapter_update_timeout_ms == 60_000, "an explicit value still wins"
+    assert infer.pending_timeout_ms >= 1
+
+
+def test_the_ordering_holds_for_every_mix_of_explicit_and_derived():
+    """The property, rather than the two cases that happened to be found."""
+    for pending in (None, 1, 60_000, 1_080_000, 1_500_000, 9_000_000):
+        # 2 is the floor: the hold must be >= 1 and the update must exceed it.
+        for update in (None, 2, 60_000, 1_200_000, 9_000_000):
+            if pending is not None and update is not None and update <= pending:
+                continue  # refused at construction, tested separately
+            kwargs = {}
+            if pending is not None:
+                kwargs["pending_timeout_ms"] = pending
+            if update is not None:
+                kwargs["adapter_update_timeout_ms"] = update
+            infer = _infer(max_num_seqs=8, **kwargs)
+            size_pending_capacity(infer, _orch(batch_size=128, client={"timeout": 1200}))
+            assert infer.adapter_update_timeout_ms > infer.pending_timeout_ms, (
+                f"inverted for pending={pending} update={update}: "
+                f"got {infer.pending_timeout_ms} / {infer.adapter_update_timeout_ms}"
+            )
+            assert infer.pending_timeout_ms >= 1
+
+
+def test_an_update_deadline_with_no_room_for_a_hold_is_refused_here():
+    """1ms cannot be above a hold of at least 1ms, so no sizing satisfies it. The
+    engine would refuse the pair after execv; this says so before the run starts."""
+    import pytest
+
+    infer = _infer(max_num_seqs=8, adapter_update_timeout_ms=1)
+    with pytest.raises(ValueError, match="no room for a pending hold"):
+        size_pending_capacity(infer, _orch(batch_size=128))

@@ -141,6 +141,7 @@ std::string serve_usage_text(const char* argv0) {
            "N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--adapter-update-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices "
            "A,B,...] "
            "[--reasoning-parser NAME] [--tool-call-parser NAME] [--enable-auto-tool-choice] "

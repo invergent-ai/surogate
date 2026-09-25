@@ -64,6 +64,12 @@ def admin_client_timeout_s(client_timeout: int | None) -> float:
     across the process boundary: `split.py` sizes the engine before the
     orchestrator is spawned, and two numbers that must stay ordered should not
     depend on that order holding.
+
+    That shared derivation only keeps this above the engine's deadline while the
+    engine's deadline is itself derived. An explicit
+    `inference.adapter_update_timeout_ms` above this can invert the pair, and
+    `_size` warns when it does, because this function cannot see that config: in
+    3-process mode the orchestrator never holds it.
     """
     timeout_s = client_timeout or DEFAULT_CLIENT_TIMEOUT_S
     return timeout_s * ADAPTER_UPDATE_FRACTION + ADMIN_TIMEOUT_MARGIN_S
@@ -125,10 +131,70 @@ def _size(config: GRPOInferenceConfig, demand: int, orch_config: GRPOOrchestrato
     # configurable, so a hardcoded span drifts from it silently.
     client = orch_config.client
     timeout_s = (client.timeout if client else None) or DEFAULT_CLIENT_TIMEOUT_S
+    # The two must stay ordered, and only one of them may be explicit, so the
+    # ordering cannot be left to the two fractions alone. The config-level check
+    # compares them only when BOTH are set, and it runs at construction, before
+    # this. So an explicit value on one side used to reach argv inverted against a
+    # derived value on the other, and the engine refuses that pair at startup: a
+    # server that never turns healthy, which is what those checks exist to stop.
+    #
+    # The gap is the one the two fractions already imply rather than a fresh
+    # constant, so tuning either fraction cannot silently change it.
+    gap_ms = max(1, int(timeout_s * (ADAPTER_UPDATE_FRACTION - PENDING_TIMEOUT_FRACTION) * 1000))
+    explicit_hold = config.pending_timeout_ms is not None
+
     if config.pending_timeout_ms is None:
         config.pending_timeout_ms = max(1, int(timeout_s * PENDING_TIMEOUT_FRACTION * 1000))
+
     if config.adapter_update_timeout_ms is None:
-        config.adapter_update_timeout_ms = max(1, int(timeout_s * ADAPTER_UPDATE_FRACTION * 1000))
+        # Clear the hold even when the hold was set by hand and is longer than the
+        # caller's own deadline.
+        config.adapter_update_timeout_ms = max(
+            int(timeout_s * ADAPTER_UPDATE_FRACTION * 1000),
+            config.pending_timeout_ms + gap_ms,
+        )
+    elif config.adapter_update_timeout_ms <= 1:
+        # A hold has to be at least 1ms and the update deadline has to exceed it,
+        # so nothing below 2ms can ever be satisfied. Say so here rather than
+        # letting the engine refuse the pair after execv.
+        raise ValueError(
+            f"inference.adapter_update_timeout_ms is {config.adapter_update_timeout_ms}ms, which "
+            f"leaves no room for a pending hold above zero; it must exceed "
+            f"inference.pending_timeout_ms and so must be at least 2"
+        )
+    elif config.adapter_update_timeout_ms <= config.pending_timeout_ms and not explicit_hold:
+        # The update deadline was chosen by hand and the hold was not, so the
+        # derived one gives way. Loud, because a hold this short sheds requests the
+        # caller would still have waited for.
+        lowered = max(1, config.adapter_update_timeout_ms - gap_ms)
+        logger.warning(
+            f"inference.adapter_update_timeout_ms is {config.adapter_update_timeout_ms}ms, which is "
+            f"not above the {config.pending_timeout_ms}ms hold derived from the rollout client's "
+            f"{timeout_s}s timeout. Lowering the hold to {lowered}ms to keep the two ordered, since "
+            f"the engine refuses the inverted pair at startup. Requests will be shed sooner than "
+            f"the caller would wait; set inference.pending_timeout_ms explicitly to choose both."
+        )
+        config.pending_timeout_ms = lowered
+
+    # An explicit pair that is inverted is refused at construction, so reaching
+    # here inverted would mean this function did it.
+    assert config.adapter_update_timeout_ms > config.pending_timeout_ms
+
+    # The admin client derives its own deadline from the same T, so it only
+    # outlasts the engine while the engine's deadline is the derived one. An
+    # explicit value above that puts the opaque client-side timeout back in front
+    # of the engine's 503, which is the swap this whole arrangement exists to
+    # prevent. Warned rather than refused: it is a legitimate thing to want, and
+    # `client.py` cannot see this config in 3-process mode, so this is the only
+    # place the inversion is visible at all.
+    admin_ms = int(admin_client_timeout_s(client.timeout if client else None) * 1000)
+    if config.adapter_update_timeout_ms > admin_ms:
+        logger.warning(
+            f"inference.adapter_update_timeout_ms is {config.adapter_update_timeout_ms}ms but the "
+            f"weight-update client gives up after {admin_ms}ms, so a slow adapter reload will fail "
+            f"as a client-side timeout with nothing in the engine's log, rather than as the "
+            f"engine's 503 naming the adapter. Raise client.timeout to move both."
+        )
 
 
 def _rollout_demand(orch_config: GRPOOrchestratorConfig) -> int:
