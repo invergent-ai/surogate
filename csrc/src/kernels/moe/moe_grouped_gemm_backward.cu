@@ -155,7 +155,7 @@ void moe_grouped_gemm_down_backward_impl(
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    // Use Grouped GEMM to submit all expert computations in a single call.
+    // One GEMM per expert with tokens (moe_expert_gemms says why not a grouped call).
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
@@ -193,41 +193,20 @@ void moe_grouped_gemm_down_backward_impl(
 
     if (m_vec.empty()) return;
 
-    const int gemm_count = static_cast<int>(m_vec.size());
-
-    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
-    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
-    const T** d_A_array = ptr_arrays.A;
-    const T** d_B_array = ptr_arrays.B;
-    T** d_C_array = ptr_arrays.C;
-
-    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<int> group_size_vec(gemm_count, 1);
-    std::vector<float> alpha_vec(gemm_count, alpha);
-    std::vector<float> beta_vec(gemm_count, beta);
-
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
-                                            transa_vec.data(),
-                                            transb_vec.data(),
-                                            m_vec.data(),
-                                            n_vec.data(),
-                                            k_vec.data(),
-                                            alpha_vec.data(),
-                                            reinterpret_cast<const void**>(d_A_array),
-                                            cublas_dtype<T>(),
-                                            lda_vec.data(),
-                                            reinterpret_cast<const void**>(d_B_array),
-                                            cublas_dtype<T>(),
-                                            ldb_vec.data(),
-                                            beta_vec.data(),
-                                            reinterpret_cast<void**>(d_C_array),
-                                            cublas_dtype<T>(),
-                                            ldc_vec.data(),
-                                            gemm_count,
-                                            group_size_vec.data(),
-                                            CUBLAS_COMPUTE_32F));
-
+    moe_expert_gemms<T>(cublas_handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        m_vec,
+                        n_vec,
+                        k_vec,
+                        alpha,
+                        A_vec,
+                        lda_vec,
+                        B_vec,
+                        ldb_vec,
+                        beta,
+                        C_vec,
+                        ldc_vec);
 }
 
 template <typename T>
@@ -270,7 +249,7 @@ void moe_grouped_gemm_gate_up_backward_impl(
     const float beta = 0.0f;
     const int gate_up_dim = 2 * intermediate_size;
 
-    // Use Grouped GEMM to submit all expert computations in a single call.
+    // One GEMM per expert with tokens (moe_expert_gemms says why not a grouped call).
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
@@ -308,41 +287,20 @@ void moe_grouped_gemm_gate_up_backward_impl(
 
     if (m_vec.empty()) return;
 
-    const int gemm_count = static_cast<int>(m_vec.size());
-
-    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
-    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
-    const T** d_A_array = ptr_arrays.A;
-    const T** d_B_array = ptr_arrays.B;
-    T** d_C_array = ptr_arrays.C;
-
-    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<int> group_size_vec(gemm_count, 1);
-    std::vector<float> alpha_vec(gemm_count, alpha);
-    std::vector<float> beta_vec(gemm_count, beta);
-
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
-                                            transa_vec.data(),
-                                            transb_vec.data(),
-                                            m_vec.data(),
-                                            n_vec.data(),
-                                            k_vec.data(),
-                                            alpha_vec.data(),
-                                            reinterpret_cast<const void**>(d_A_array),
-                                            cublas_dtype<T>(),
-                                            lda_vec.data(),
-                                            reinterpret_cast<const void**>(d_B_array),
-                                            cublas_dtype<T>(),
-                                            ldb_vec.data(),
-                                            beta_vec.data(),
-                                            reinterpret_cast<void**>(d_C_array),
-                                            cublas_dtype<T>(),
-                                            ldc_vec.data(),
-                                            gemm_count,
-                                            group_size_vec.data(),
-                                            CUBLAS_COMPUTE_32F));
-
+    moe_expert_gemms<T>(cublas_handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        m_vec,
+                        n_vec,
+                        k_vec,
+                        alpha,
+                        A_vec,
+                        lda_vec,
+                        B_vec,
+                        ldb_vec,
+                        beta,
+                        C_vec,
+                        ldc_vec);
 }
 
 template <typename T>
@@ -422,40 +380,20 @@ void moe_grouped_gemm_up_backward_impl(
 
     if (m_vec.empty()) return;
 
-    const int gemm_count = static_cast<int>(m_vec.size());
-
-    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
-    const T** d_A_array = ptr_arrays.A;
-    const T** d_B_array = ptr_arrays.B;
-    T** d_C_array = ptr_arrays.C;
-
-    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
-    std::vector<int> group_size_vec(gemm_count, 1);
-    std::vector<float> alpha_vec(gemm_count, alpha);
-    std::vector<float> beta_vec(gemm_count, beta);
-
-    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(cublas_handle,
-                                            transa_vec.data(),
-                                            transb_vec.data(),
-                                            m_vec.data(),
-                                            n_vec.data(),
-                                            k_vec.data(),
-                                            alpha_vec.data(),
-                                            reinterpret_cast<const void**>(d_A_array),
-                                            cublas_dtype<T>(),
-                                            lda_vec.data(),
-                                            reinterpret_cast<const void**>(d_B_array),
-                                            cublas_dtype<T>(),
-                                            ldb_vec.data(),
-                                            beta_vec.data(),
-                                            reinterpret_cast<void**>(d_C_array),
-                                            cublas_dtype<T>(),
-                                            ldc_vec.data(),
-                                            gemm_count,
-                                            group_size_vec.data(),
-                                            CUBLAS_COMPUTE_32F));
-
+    moe_expert_gemms<T>(cublas_handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        m_vec,
+                        n_vec,
+                        k_vec,
+                        alpha,
+                        A_vec,
+                        lda_vec,
+                        B_vec,
+                        ldb_vec,
+                        beta,
+                        C_vec,
+                        ldc_vec);
 }
 
 // Host wrappers for grouped GEMM backward
