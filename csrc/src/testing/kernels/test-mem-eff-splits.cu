@@ -224,10 +224,15 @@ TEST_CASE("mem-eff key split heuristic", "[attention][mem_eff]") {
     REQUIRE(setenv("SUROGATE_MEM_EFF_KEY_SPLITS", "0", 1) == 0);
     REQUIRE(dsl::mem_eff_backward_key_splits(p, 4352, 2, 16) == 1);
     REQUIRE(setenv("SUROGATE_MEM_EFF_KEY_SPLITS", "auto", 1) == 0);
+    // deterministic_bwd is on for every varlen backward, so it does not override this kernel's own
+    // explicit opt-in (backend_mem_eff.cpp); SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC does.
+    REQUIRE(setenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC", "1", 1) == 0);
     p.deterministic_bwd = true;
-    REQUIRE(dsl::mem_eff_backward_key_splits(p, 4352, 2, 16) == 1);  // deterministic_bwd beats the opt-in
-    p.deterministic_bwd = false;
+    REQUIRE(dsl::mem_eff_backward_key_splits(p, 4352, 2, 16) == 1);
+    unsetenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC");
     const int auto_splits = dsl::mem_eff_backward_key_splits(p, 4352, 2, 16);
+    p.deterministic_bwd = false;
+    REQUIRE(dsl::mem_eff_backward_key_splits(p, 4352, 2, 16) == auto_splits);
     REQUIRE(auto_splits >= 1);
     REQUIRE(auto_splits <= 68);  // ceil(4352 / 64) key blocks
     int device = 0, sms = 0;
