@@ -58,8 +58,9 @@ single-sentence measurement, not the broader HTTP average.
 - The model weights, codec weights and decoding settings are unchanged. This
   validation does not establish a new 331-sentence WER or unseen-voice score.
 
-The native model package is pinned to HF revision
-`2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4`. The optimized backend uses GGML
+These measurements used the earlier EPYC-native build of the package. The published package,
+`surogate/amami-357m-ro` at revision `1b0a595d92b3f41c5780d8d2838a27ba8d4abe67`, uses a portable
+x86-64-v3 build of the same runtime and model. The optimized backend uses GGML
 `c03b4e2bcece5134827881af90242086daf75be5` with the model's ABI additions and
 Surogate's matrix kernels. The worker checks CPU features and runtime ABI
 fingerprints before loading it.

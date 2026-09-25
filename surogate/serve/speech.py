@@ -11,9 +11,16 @@ from pathlib import Path
 
 from filelock import FileLock
 
+# repository: (checkpoint, 4-gram LM, pinned revision)
 _MODELS = {
-    "surogate/surogate-ro-110m-streaming": ("Is_ctc_final_20260915.nemo", "ro_4gram.nemo"),
-    "surogate/surogate-ro-110m-tdt-ctc": ("Ib_final.nemo", "ro_4gram.arpa"),
+    "surogate/jackrabbit-110m-ro": (
+        "jackrabbit-110m-ro.nemo", "lm-4gram-ro.nemo", "d9e8a3fd619c9726683b50fb719c6238ab4e8e0a"),
+    "surogate/jackrabbit-110m-ro-streaming": (
+        "jackrabbit-110m-ro-streaming.nemo", "lm-4gram-ro.nemo", "3cd1ea864bb1ca55f4ef4b0be63572e12f454c6f"),
+}
+_RENAMED = {
+    "surogate/surogate-ro-110m-tdt-ctc": "surogate/jackrabbit-110m-ro",
+    "surogate/surogate-ro-110m-streaming": "surogate/jackrabbit-110m-ro-streaming",
 }
 _VERSION = 1
 
@@ -101,20 +108,22 @@ def ensure_speech_weights(model, *, lm=None, reuse_cache=True, echo=print):
     if not path.exists():
         from huggingface_hub import hf_hub_download
 
+        if model in _RENAMED:
+            raise ValueError(f"{model} was renamed to {_RENAMED[model]}")
         if model not in _MODELS:
             raise ValueError(f"unsupported speech repository {model!r}; provide a local .nemo checkpoint")
-        checkpoint, language_model = _MODELS[model]
-        path = Path(hf_hub_download(model, checkpoint))
-        lm = lm or hf_hub_download(model, language_model)
+        checkpoint, language_model, revision = _MODELS[model]
+        path = Path(hf_hub_download(model, checkpoint, revision=revision))
+        lm = lm or hf_hub_download(model, language_model, revision=revision)
     if path.is_dir():
-        candidates = [path / checkpoint for checkpoint, _ in _MODELS.values() if (path / checkpoint).is_file()]
+        candidates = [path / checkpoint for checkpoint, _, _ in _MODELS.values() if (path / checkpoint).is_file()]
         if len(candidates) != 1:
             raise ValueError(
                 "model directory must contain exactly one supported speech checkpoint; otherwise provide its file path"
             )
         path = candidates[0]
     if lm is None:
-        candidates = [path.parent / name for name in ("ro_4gram.nemo", "ro_4gram.arpa")]
+        candidates = [path.parent / name for name in ("lm-4gram-ro.nemo", "lm-4gram-ro.arpa")]
         candidates = [p for p in candidates if p.is_file()]
         if not candidates:
             raise ValueError("provide the matching Romanian 4-gram archive with --lm PATH")

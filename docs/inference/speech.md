@@ -6,13 +6,13 @@ Serve Romanian transcription on a GPU or CPU with either model:
 
 | Model | Use |
 |---|---|
-| [`surogate/surogate-ro-110m-tdt-ctc`](https://huggingface.co/surogate/surogate-ro-110m-tdt-ctc) | Transcribe complete audio files |
-| [`surogate/surogate-ro-110m-streaming`](https://huggingface.co/surogate/surogate-ro-110m-streaming) | File transcription or live audio with partial and final transcripts |
+| [`surogate/jackrabbit-110m-ro`](https://huggingface.co/surogate/jackrabbit-110m-ro) | Transcribe complete audio files |
+| [`surogate/jackrabbit-110m-ro-streaming`](https://huggingface.co/surogate/jackrabbit-110m-ro-streaming) | File transcription or live audio with partial and final transcripts |
 
 Start the non-streaming model:
 
 ```bash
-surogate serve --stt surogate/surogate-ro-110m-tdt-ctc --device 0 --port 8080
+surogate serve --stt surogate/jackrabbit-110m-ro --device 0 --port 8080
 ```
 
 It processes the complete recording before returning text and automatically uses
@@ -23,7 +23,7 @@ For live audio, install the streaming dependency and start the streaming model:
 
 ```bash
 pip install 'silero-vad==6.2.1'
-surogate serve --stt surogate/surogate-ro-110m-streaming --device 0 --port 8080
+surogate serve --stt surogate/jackrabbit-110m-ro-streaming --device 0 --port 8080
 ```
 
 Use `--device cpu` to run without a GPU. CPU-only PyTorch is supported. From a
@@ -31,8 +31,7 @@ source checkout, build with `make serve-build`, or use `make serve-stt-build`
 to build just the speech server without a CUDA toolkit. The latter needs a C++
 compiler, FFmpeg development libraries, and PyTorch in the active environment;
 set `STT_PYTHON=/path/to/python` to choose that environment.
-Installed wheels include the speech server. For a private
-Hugging Face repository, authenticate with `hf auth login` or set `HF_TOKEN`.
+Installed wheels include the speech server.
 
 ### CPU compute options
 
@@ -41,7 +40,7 @@ also applies inside HTTP inference workers; it is independent of the number
 of HTTP connections or streaming sessions.
 
 ```bash
-surogate serve --stt surogate/surogate-ro-110m-tdt-ctc --device cpu --threads 4
+surogate serve --stt surogate/jackrabbit-110m-ro --device cpu --threads 4
 ```
 
 `--cpu-kernels auto` (the default) enables the optimized FP32 path on CPU
@@ -70,11 +69,11 @@ starts reuse them. `SUROGATE_SERVE_CACHE` changes the preparation cache location
 To use local files:
 
 ```bash
-surogate serve --stt /models/Ib_final.nemo \
-  --lm /models/ro_4gram.arpa --device cpu
+surogate serve --stt /models/jackrabbit-110m-ro.nemo \
+  --lm /models/lm-4gram-ro.arpa --device cpu
 
-surogate serve --stt /models/Is_ctc_final_20260915.nemo \
-  --lm /models/ro_4gram.nemo --device 0
+surogate serve --stt /models/jackrabbit-110m-ro-streaming.nemo \
+  --lm /models/lm-4gram-ro.nemo --device 0
 ```
 
 The matching language model can be a NeMo `.nemo` archive or a token-ID `.arpa`

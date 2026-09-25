@@ -4,7 +4,7 @@ Serve the published Romanian model on CPU with **Doina**, **Tudor** and **Radu**
 see [GPU](#gpu)):
 
 ```bash
-surogate serve --tts surogate/surogate-ro-tts --device cpu --threads 4 --port 8080
+surogate serve --tts surogate/amami-357m-ro --device cpu --threads 4 --port 8080
 ```
 
 From a source checkout, build the native server first:
@@ -27,7 +27,7 @@ GGML worker (one by default, see `--max-num-seqs`) keeps the generator and codec
 loaded between requests. No Python,
 Torch, NeMo or training-recipe process remains in the TTS inference path.
 
-The published binary targets Linux x86-64 and was validated on AMD EPYC 9124.
+The published binary targets Linux x86-64 CPUs with AVX2 (x86-64-v3) and was validated on AMD EPYC 9124.
 Other CPUs require a compatible native build and validation. With `--device cpu`, the
 default, speech generation uses CPU threads and no GPU. Voice creation happens separately on offline
 GPUs; serving a voice does not perform cloning or training.
@@ -40,7 +40,7 @@ inherits `--threads`. Both stages can run concurrently; these values are thread
 counts per stage, not a reservation of physical cores. For example:
 
 ```bash
-surogate serve --tts surogate/surogate-ro-tts --threads 4 --codec-threads 4
+surogate serve --tts surogate/amami-357m-ro --threads 4 --codec-threads 4
 ```
 
 `--cpu-kernels auto` selects Surogate's AVX-512 GGML backend when the CPU and
@@ -74,23 +74,23 @@ unchanged, and `--threads` and `--cpu-kernels` apply to the CPU only.
 A GPU needs the package's **GPU variant**:
 
 - Its model, codec, tokenizer and voices are the CPU package's.
-- Its `lib/` holds the same Magpie runtime built with CUDA, including `libggml-cuda`, and runs on
-  compute capability 12.0 (RTX 50-series) only.
+- Its `lib/` holds the same Magpie runtime built with CUDA, including `libggml-cuda`, for NVIDIA
+  Ampere, Ada, Hopper and Blackwell GPUs (compute capability 8.0 to 12.0).
 - The CPU package is refused on a GPU with a clear error.
 
 The published model has its GPU variant in the repository's `gpu/` folder. With `--device N`,
-`surogate/surogate-ro-tts` downloads and verifies that variant, pinned like the CPU package:
+`surogate/amami-357m-ro` downloads and verifies that variant, pinned like the CPU package:
 
 ```bash
-surogate serve --tts surogate/surogate-ro-tts --device 0 --port 8080
+surogate serve --tts surogate/amami-357m-ro --device 0 --port 8080
 ```
 
 A downloaded copy, or a local variant, is served the same way:
 
 ```bash
-hf download surogate/surogate-ro-tts --revision e6b1372cb1b3db6c205ebfc589fba8d630ed438b \
-  --include "gpu/*" --local-dir surogate-ro-tts
-surogate serve --tts surogate-ro-tts/gpu --device 0 --port 8080
+hf download surogate/amami-357m-ro --revision 1b0a595d92b3f41c5780d8d2838a27ba8d4abe67 \
+  --include "gpu/*" --local-dir amami-357m-ro
+surogate serve --tts amami-357m-ro/gpu --device 0 --port 8080
 ```
 
 On an RTX 5090 one request runs at about 25 times real time, with about 25 ms to the first
@@ -112,14 +112,16 @@ their own directory:
 ```bash
 SRC=$PWD/nemo-speech-cpp
 cmake -S $SRC -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-  -DNEMO_SPEECH_BUILD_TTS=ON -DNEMO_SPEECH_GGML_PATCHED=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
-  -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DNEMO_SPEECH_BUILD_TTS=ON -DNEMO_SPEECH_GGML_PATCHED=ON -DGGML_OPENMP=ON \
+  -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF \
+  -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;100;120' \
   -DCMAKE_C_FLAGS=-ffile-prefix-map=$SRC=nemo-speech-cpp \
   -DCMAKE_CXX_FLAGS=-ffile-prefix-map=$SRC=nemo-speech-cpp \
   -DCMAKE_CUDA_FLAGS=-Xcompiler=-ffile-prefix-map=$SRC=nemo-speech-cpp \
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
-  -DNEMO_SPEECH_BUILD_ASR=OFF -DNEMO_SPEECH_BUILD_CLI=OFF -DNEMO_SPEECH_BUILD_HTTP=OFF \
-  -DNEMO_SPEECH_BUILD_GRPC=OFF -DNEMO_SPEECH_BUILD_TESTS=OFF -DNEMO_SPEECH_BUILD_TOOLS=OFF
+  -DNEMO_SPEECH_BUILD_ASR=OFF -DNEMO_SPEECH_BUILD_DIAR=OFF -DNEMO_SPEECH_BUILD_CLI=OFF \
+  -DNEMO_SPEECH_BUILD_HTTP=OFF -DNEMO_SPEECH_BUILD_GRPC=OFF -DNEMO_SPEECH_BUILD_TESTS=OFF \
+  -DNEMO_SPEECH_BUILD_TOOLS=OFF
 cmake --build build-cuda --target nemo_speech_tts ggml-cuda
 python -m surogate.serve.tools.tts.gpu_variant CPU_PACKAGE build-cuda/bin GPU_VARIANT
 ```
@@ -130,13 +132,11 @@ qualified (quality and speed), then pinned in `native_worker.cpp` and in the too
 ## Model download
 
 The first start downloads only the native CPU package, approximately 1.15 GiB,
-from HF revision `2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4`, or with `--device N`
-only its GPU variant, approximately 1.35 GiB, from revision
-`e6b1372cb1b3db6c205ebfc589fba8d630ed438b`. It verifies the voice profile and
+or with `--device N` only its GPU variant, approximately 1.4 GiB, both from HF revision
+`1b0a595d92b3f41c5780d8d2838a27ba8d4abe67`. It verifies the voice profile and
 every file listed in it, then completes a short warm-up before accepting
 requests. Subsequent starts verify and reuse the cached package.
 
-Authenticate for the private repository with `hf auth login` or `HF_TOKEN`.
 The package is cached under `~/.cache/surogate/serve`; `SUROGATE_SERVE_CACHE`
 changes that directory. `--no-cache` refreshes the pinned HF package. A cached
 or local package can start without network access.
@@ -146,7 +146,7 @@ or local package can start without network access.
 ```bash
 curl http://localhost:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"model":"surogate/surogate-ro-tts","input":"Bună ziua! Cu ce vă pot ajuta?","voice":"Doina","response_format":"wav"}' \
+  -d '{"model":"surogate/amami-357m-ro","input":"Bună ziua! Cu ce vă pot ajuta?","voice":"Doina","response_format":"wav"}' \
   --output doina.wav
 ```
 
@@ -259,12 +259,10 @@ surogate serve --tts /models/my-voice-native --voice "My voice" --port 8080
 surogate serve --tts /models/my-voice-native/voices.json --voice "My voice"
 ```
 
-Use the native package produced by the
-[published voice-creation pipeline](https://github.com/invergent-ai/training_tts/blob/main/docs/CREATE-A-VOICE.md).
-Keep its model, codec, runtime libraries, tokenizer and profile together.
+Keep the package's model, codec, runtime libraries, tokenizer and profile together.
 The server verifies their hashes and uses the names and decoding settings from
-the profile. A bare NeMo checkpoint or Python-only voice profile must first be
-exported with that pipeline's `ro_tts.export_native` command.
+the profile. A bare NeMo checkpoint cannot be served directly; it must first be
+exported to a native package.
 
 `--voice` chooses the default name; clients can still select any voice in the
 loaded package. Adding a new voice requires a new native export and a server
@@ -315,7 +313,7 @@ file. Unlike `--api-key KEY`, it keeps the key out of the process's command line
 local user can read it:
 
 ```bash
-surogate serve --tts surogate/surogate-ro-tts --api-key-file /etc/surogate/tts.key
+surogate serve --tts surogate/amami-357m-ro --api-key-file /etc/surogate/tts.key
 curl -H "Authorization: Bearer $(cat /etc/surogate/tts.key)" http://localhost:8080/v1/audio/voices
 ```
 
@@ -341,14 +339,14 @@ token sequences as the accepted native release. HTTP control recordings are
 compared byte-for-byte with the saved native outputs, including voice switching
 and long text. This is an integration check; it does not establish new WER or
 the quality of a newly cloned voice. Published scores and licensing remain in
-the [model card](https://huggingface.co/surogate/surogate-ro-tts).
+the [model card](https://huggingface.co/surogate/amami-357m-ro).
 
 ## Validation
 
 ```bash
 make serve-tts-build
 .venv/bin/python -m pytest -q tests/serve/test_tts.py tests/serve/test_cli.py
-SUROGATE_TTS_TEST_MODEL=surogate/surogate-ro-tts \
+SUROGATE_TTS_TEST_MODEL=surogate/amami-357m-ro \
   .venv/bin/python -m pytest -q tests/serve/test_tts_http.py
 ```
 

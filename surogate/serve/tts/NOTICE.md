@@ -1,9 +1,8 @@
 # Native TTS package provenance
 
-Asset preparation pins `surogate/surogate-ro-tts` at revision
-`2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4` and verifies its native package, and
-for a GPU pins its GPU variant (`gpu/`) at revision
-`e6b1372cb1b3db6c205ebfc589fba8d630ed438b`.
+Asset preparation pins `surogate/amami-357m-ro` at revision
+`1b0a595d92b3f41c5780d8d2838a27ba8d4abe67` and verifies its native CPU package
+(`cpu/`), or for a GPU its GPU variant (`gpu/`) from the same revision.
 The package supplies the GGML model runtime and includes its runtime and GGML
 licenses, build provenance and patch sources. Surogate supplies the configurable
 worker, adapter and optional optimized CPU backend.
@@ -11,4 +10,4 @@ worker, adapter and optional optimized CPU backend.
 The native server and Romanian frontend are documented in
 [csrc/src/serve/tts/NOTICE.md](../../../csrc/src/serve/tts/NOTICE.md).
 Model and voice licensing is separate from the serving implementation; see the
-[model card](https://huggingface.co/surogate/surogate-ro-tts).
+[model card](https://huggingface.co/surogate/amami-357m-ro).

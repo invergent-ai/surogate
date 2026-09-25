@@ -1,5 +1,5 @@
 {
-  "source": "invergent-ai/training_tts, native_cpu_runtime_v1/full_inputs.json; corpus SHA256 7faa24d037061edafca453bc722514f37238c3596c0b1407032232e18b003dc0",
+  "source": "Surogate Speech stress set, frozen native inputs; corpus SHA256 7faa24d037061edafca453bc722514f37238c3596c0b1407032232e18b003dc0",
   "rows": [
     {
       "id": "001",

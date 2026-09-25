@@ -11,7 +11,8 @@ Silero VAD is provided by the separately installed silero-vad package (MIT).
 Its weights are copied into the user's model cache during preparation.
 https://github.com/snakers4/silero-vad
 
-The surogate/surogate-ro-110m-streaming and surogate-ro-110m-tdt-ctc checkpoints are CC-BY-4.0:
-https://huggingface.co/surogate/surogate-ro-110m-streaming
-https://huggingface.co/surogate/surogate-ro-110m-tdt-ctc
+The surogate/jackrabbit-110m-ro and surogate/jackrabbit-110m-ro-streaming checkpoints are
+CC-BY-NC-4.0:
+https://huggingface.co/surogate/jackrabbit-110m-ro
+https://huggingface.co/surogate/jackrabbit-110m-ro-streaming
 No acoustic, language-model, tokenizer, or VAD weights are bundled here.

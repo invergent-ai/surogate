@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Invergent SA. SPDX-License-Identifier: Apache-2.0
-// Romanian normalization adapted from training_tts/frontend.py 2.2.2.
+// Romanian normalization adapted from the Surogate Romanian text frontend 2.2.2.
 // Sentence splitting adapted from NVIDIA NeMo (Apache-2.0). See NOTICE.md.
 #include "frontend.h"
 #include <unicode/locid.h>
