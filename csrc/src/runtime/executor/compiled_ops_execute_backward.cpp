@@ -478,6 +478,69 @@ void CompiledExecutor::bind_param_gradient_tensors_for_backward() {
     }
 }
 
+void CompiledExecutor::commit_param_grad_outputs(const CompiledOp& op) {
+    // Most backward ops write a parameter gradient through ensure_output_tensor(), i.e. into
+    // the buffer bind_param_gradient_tensors_for_backward() bound under "d_<param>". Some hand
+    // back a fresh tensor instead: mamba_conv1d_backward stores an FP32 temp for the conv
+    // weight, and a view of a parameter (the GDN conv weight is viewed [C,1,K] -> [C,K])
+    // gets its gradient through view_backward, which only rebinds the name. Either way the
+    // store's buffer stayed zero and the parameter never trained.
+    for (const auto& ref : op.outputs) {
+        if (ref.name.size() <= 2 || ref.name.compare(0, 2, "d_") != 0) {
+            continue;
+        }
+        bool accumulate = false;
+        Tensor* grad = mGrads.get_param_grad(ref.name.substr(2), accumulate);
+        if (!grad || !grad->Data) {
+            continue;
+        }
+        const Tensor* produced = nullptr;
+        if (ref.tensor_id >= 0 && static_cast<std::size_t>(ref.tensor_id) < mTensors.size()) {
+            produced = &mTensors[static_cast<std::size_t>(ref.tensor_id)];
+        }
+        if (!produced || !produced->Data) {
+            auto it = mNamedTensors.find(ref.name);
+            produced = it == mNamedTensors.end() ? nullptr : &it->second;
+        }
+        if (!produced || !produced->Data || produced->Data == grad->Data) {
+            continue;
+        }
+        if (produced->nelem() != grad->nelem()) {
+            throw std::runtime_error(fmt::format("commit_param_grad_outputs: op {} produced {} elements for {}, "
+                                                 "whose gradient buffer holds {}",
+                                                 op.op_id,
+                                                 produced->nelem(),
+                                                 ref.name,
+                                                 grad->nelem()));
+        }
+        cudaStream_t stream = mRunState.MainStream;
+        const long n = static_cast<long>(grad->nelem());
+        Tensor src = *produced;
+        if (src.DType != grad->DType) {
+            Tensor converted = mRunState.temp_alloc(grad->DType, {n}, "param_grad_commit");
+            mTemps.push_back(converted);
+            if (src.DType == ETensorDType::FP32 && grad->DType == ETensorDType::BF16) {
+                convert_dtype(converted.get<nv_bfloat16>(), src.get<float>(), n, stream);
+            } else if (src.DType == ETensorDType::BF16 && grad->DType == ETensorDType::FP32) {
+                convert_dtype(converted.get<float>(), src.get<nv_bfloat16>(), n, stream);
+            } else {
+                throw std::runtime_error(fmt::format("commit_param_grad_outputs: cannot fold a {} gradient into the "
+                                                     "{} buffer of {}",
+                                                     dtype_to_str(src.DType),
+                                                     dtype_to_str(grad->DType),
+                                                     ref.name));
+            }
+            src = converted;
+        }
+        if (accumulate || mAccumulateTensors.count(ref.name) > 0) {
+            vector_add(*grad, *grad, src, 1.0f, n, stream);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(grad->Data, src.Data, grad->bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        store_tensor(ref, *grad);
+    }
+}
+
 void CompiledExecutor::report_backward_op_profile(const std::unordered_map<std::string, double>& totals_by_op,
                                                   const std::unordered_map<std::string, std::size_t>& counts_by_op,
                                                   cudaEvent_t start_event,
@@ -1301,6 +1364,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         }
                         try {
                             op.fn(*this, op, static_cast<const void*>(hook));
+                            commit_param_grad_outputs(op);
                             sync_after_backward_op(op);
                             check_nonfinite_refs(op, op.outputs);
                         } catch (const std::exception& e) {
@@ -1548,6 +1612,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 std::cerr << "[BWD OP " << idx << "] " << op_type_to_string(op.type) << " id=" << op.op_id << std::endl;
             }
             op.fn(*this, op, static_cast<const void*>(hook));
+            commit_param_grad_outputs(op);
             sync_after_backward_op(op);
             if (bwd_filter_matched && bwd_filter_dump && mDebugDumpFn) {
                 std::vector<std::string> dump_names;

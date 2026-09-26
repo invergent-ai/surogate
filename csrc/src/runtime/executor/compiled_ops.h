@@ -779,6 +779,9 @@ private:
     void bind_backward_entry_gradient_tensors();
     void restore_moe_expert_offsets_for_backward();
     void bind_param_gradient_tensors_for_backward();
+    // Fold a parameter gradient that a backward op handed back as a different tensor (a temp,
+    // or a view of one) into the gradient store's buffer, which is what the optimizer reads.
+    void commit_param_grad_outputs(const CompiledOp& op);
     void report_backward_op_profile(const std::unordered_map<std::string, double>& totals_by_op,
                                     const std::unordered_map<std::string, std::size_t>& counts_by_op,
                                     cudaEvent_t start_event,
