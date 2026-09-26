@@ -1205,6 +1205,19 @@ void GraphExecutor::compile_graphs(long B, long T) {
 
     // Recompile if batch/sequence dimensions changed
     if (B != mCompiledB || T != mCompiledT) {
+        // Once the arenas exist the weights, gradients and non-block activations live in them, and
+        // the run state's buffers are sized for the shape they were built for. A recompile here
+        // released the arenas first and then rebound every owner from the freed memory: a SIGSEGV
+        // in cudaMemcpyAsync (#230). Moving them safely only reaches the forward, which then reads
+        // buffers of the built shape at the new one (an illegal address, a shape mismatch, a short
+        // workspace, depending on the model). So another shape is refused before anything moves.
+        if (mPhaseArenas.allocated) {
+            throw std::invalid_argument(
+                "DSL graph executor: this model runs at B=" + std::to_string(mCompiledB) + ", T=" +
+                std::to_string(mCompiledT) + " (the trainer's batch and sequence length); a pass at B=" +
+                std::to_string(B) + ", T=" + std::to_string(T) +
+                " is not supported. Pad or split the rows to that shape, or build the trainer for this one.");
+        }
         // Reset the tensor-id namespace so the forward+backward pair shares
         // a single tid space. Each compile() inherits the prior compile's
         // tid map, so a tensor name has the same tid in both graphs.
