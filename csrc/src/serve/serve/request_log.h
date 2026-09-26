@@ -45,6 +45,14 @@ struct RequestLogContext {
     std::uint32_t decision_attempts  = 1;
     /// The calibration temperature the answers were read at (`--decision-temperature`).
     double decision_temperature = 1.0;
+    /// Thinking (decisions_thinking.h): whether the request asked for it (when not, nothing
+    /// below is logged); once it has run, how many questions thought, the thought tokens their
+    /// answers were read after, and the thinking rounds (above 1 after a non-finite thinking
+    /// readout).
+    bool decision_thinking = false;
+    std::size_t decision_thinking_questions = 0;
+    int decision_reasoning_tokens           = 0;
+    std::uint32_t decision_thinking_attempts = 0;
     /// The caller's X-Request-Id (see client_request_id()); empty when none was sent.
     std::string client_request_id;
 };

@@ -81,17 +81,29 @@ struct GenerationOutcome {
 struct DecisionsOutcome {
     OrderedJson answers;
     /// The shared prefix once plus every question's suffix (every full prompt for an
-    /// image request, which shares no GPU state).
+    /// image request, which shares no GPU state). With thinking on, also every thinking prompt
+    /// and every thinking readout (prompt, thought and close token), all prefilled whole.
     int input_tokens  = 0;
-    int output_tokens = 0; // one readout token per question
+    /// One readout token per question; with thinking on, also every thought token and one more
+    /// readout token for each question that thought.
+    int output_tokens = 0;
     std::size_t shared_prefix_tokens = 0;
     double prepare_seconds = 0.0;
     /// Every attempt's prefill time; `input_tokens` counts one attempt's tokens.
     double prefill_seconds = 0.0;
+    /// The thoughts' generation time (thinking on only), wave by wave.
+    double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
     /// How many times the request ran (--decision-attempts): 1 unless an attempt returned
     /// non-finite option logits and was run again.
     std::uint32_t attempts = 1;
+    /// Thinking (decisions_thinking.h): how many questions thought, the thought tokens
+    /// their answers were read after (the sum of their `thinking.tokens`), and how many rounds
+    /// the thinking took (above 1 when a thinking readout was non-finite and was thought again;
+    /// 0 when nothing thought).
+    std::size_t thinking_questions  = 0;
+    int reasoning_tokens            = 0;
+    std::uint32_t thinking_attempts = 0;
 };
 
 /// The usage the Chat Completions, Completions and Anthropic Messages endpoints report.
@@ -217,9 +229,16 @@ public:
     /// `--decision-attempts` times in all; `on_retry` is given the number of the attempt about
     /// to start and why, before each run after the first. Non-finite logits are the only reason
     /// to run again: any other failure ends the request at once, as it always has.
+    /// With thinking on (decisions_thinking.h) the one-pass answers above come first,
+    /// unchanged; each question below the gate then thinks greedily within the budget
+    /// and is read again after the thought's close token. The thinking questions of a request
+    /// run together, in waves like the readouts. A thinking readout that is non-finite is
+    /// thought again, the failed questions only, up to `--decision-attempts` rounds in all;
+    /// `on_thinking_retry` is told why before each such round.
     [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
         std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {},
-        const std::function<void(std::uint32_t attempt, const std::string& reason)>& on_retry = {});
+        const std::function<void(std::uint32_t attempt, const std::string& reason)>& on_retry = {},
+        const std::function<void(const std::string& reason)>& on_thinking_retry = {});
 
     void warmup();
 
