@@ -1807,13 +1807,23 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm,
                          static_cast<float>(std::max(1, comm.world_size()));
     const bool capturing = internal::stream_is_capturing(stream);
     const int* token_count = mUseTokenScale ? rs.ValidTokenCount.template get<int>() : nullptr;
+    // Data-parallel gradients are averaged over the ranks (all_reduce_avg, the averaging
+    // reduce-scatter of ZeRO-2/3) while ValidTokenCount is the sum over every rank's tokens, so
+    // the average is undone before the global token denominator, as the LoRA path does. Without
+    // it every multi-GPU full fine-tune scaled its gradients (and the norm it clips and logs) by
+    // 1/world_size. dispatch-PP collects whole gradients unaveraged; EP reduces dense and expert
+    // gradients in different groups.
+    const float reduction_scale = mUseTokenScale && !mDispatchPpLocalGrads && !comm.ep_enabled()
+                                      ? static_cast<float>(std::max(1, comm.world_size()))
+                                      : 1.0f;
     global_norm_sqrt(rs.scratch().norm_buffer.template get<float>(),
                      capturing ? nullptr : rs.NormHost,
                      grad_clip,
                      token_count,
                      total_tokens,
                      rs.DeviceProp,
-                     stream);
+                     stream,
+                     reduction_scale);
     // Async copy grad_scale to pinned host memory for deferred NaN check.
     if (!capturing) {
         CUDA_CHECK(cudaMemcpyAsync(rs.GradScaleHost,

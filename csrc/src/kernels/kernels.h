@@ -1887,7 +1887,8 @@ void global_norm_sqrt(float* out,
                       const int* valid_token_count,
                       float total_tokens,
                       const cudaDeviceProp& dp,
-                      cudaStream_t stream);
+                      cudaStream_t stream,
+                      float reduction_scale = 1.0f);
 
 void deterministic_sum(float* out, const float* values, std::size_t count, cudaStream_t stream);
 void deterministic_sum(float* out, const nv_bfloat16* values, std::size_t count, cudaStream_t stream);
