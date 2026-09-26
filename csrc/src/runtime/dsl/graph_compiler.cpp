@@ -6642,6 +6642,58 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                             ref.shape = {x_shape[0], x_shape[1], x_shape[2] * repeats, x_shape[3]};
                         }
                     }
+                } else if ((compiled.type == CompiledOpType::MambaConv1d ||
+                            compiled.type == CompiledOpType::MambaGatedRMSNorm) &&
+                           i == 0 && !compiled.inputs.empty() && !compiled.inputs[0].shape.empty()) {
+                    // output[0] keeps its input's shape: the GDN conv output [B, ConvDim, T] and
+                    // the gated norm's [N, ValueDim]. Neither is [B, T, C] (ConvDim is 2C on
+                    // Qwen3.5-27B, 6C on 0.8B), and the {B,T,C} default below also starved the
+                    // transpose/split chain after the conv, forward and backward.
+                    ref.dtype = compiled.inputs[0].dtype;
+                    if (ref.shape.empty()) {
+                        ref.shape = compiled.inputs[0].shape;
+                    }
+                } else if (compiled.type == CompiledOpType::Transpose && !compiled.inputs.empty() &&
+                           compiled.inputs[0].shape.size() >= 2) {
+                    // output[0] = input with dim0/dim1 swapped.
+                    ref.dtype = compiled.inputs[0].dtype;
+                    if (ref.shape.empty()) {
+                        auto shape = compiled.inputs[0].shape;
+                        const int rank = static_cast<int>(shape.size());
+                        int dim0 = 0;
+                        int dim1 = 1;
+                        if (auto* a = find_attr(op.attrs, "dim0")) {
+                            if (auto v = attr_int(*a)) dim0 = static_cast<int>(*v);
+                        }
+                        if (auto* a = find_attr(op.attrs, "dim1")) {
+                            if (auto v = attr_int(*a)) dim1 = static_cast<int>(*v);
+                        }
+                        if (dim0 < 0) dim0 += rank;
+                        if (dim1 < 0) dim1 += rank;
+                        if (dim0 >= 0 && dim0 < rank && dim1 >= 0 && dim1 < rank) {
+                            std::swap(shape[dim0], shape[dim1]);
+                            ref.shape = std::move(shape);
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::Split && !compiled.inputs.empty() &&
+                           !compiled.inputs[0].shape.empty() && find_attr(op.attrs, "split_size") &&
+                           attr_list_int(*find_attr(op.attrs, "split_size")) &&
+                           i < attr_list_int(*find_attr(op.attrs, "split_size"))->size()) {
+                    // output[i] = input with the split dim cut to split_size[i].
+                    ref.dtype = compiled.inputs[0].dtype;
+                    if (ref.shape.empty()) {
+                        auto shape = compiled.inputs[0].shape;
+                        const int rank = static_cast<int>(shape.size());
+                        int dim = 0;
+                        if (auto* a = find_attr(op.attrs, "dim")) {
+                            if (auto v = attr_int(*a)) dim = static_cast<int>(*v);
+                        }
+                        if (dim < 0) dim += rank;
+                        if (dim >= 0 && dim < rank) {
+                            shape[dim] = (*attr_list_int(*find_attr(op.attrs, "split_size")))[i];
+                            ref.shape = std::move(shape);
+                        }
+                    }
                 } else if (compiled.type == CompiledOpType::GlmDsaIndexer) {
                     ref.dtype = ETensorDType::INT32;
                 } else if (compiled.type == CompiledOpType::GlmDsaAttention) {
