@@ -326,14 +326,9 @@ def test_dummy_checkpoint_forward_backward_and_update(
                 # B starts at zero, so dA must also be zero on the first step.
                 assert torch.count_nonzero(value) == 0, name
                 continue
-            source = (
-                name.removeprefix("base_model.model.")
-                .replace("model.layers.", "model.language_model.layers.")
-                .replace(".lora_B.weight", ".weight")
-            )
-            layer = int(source.split(".layers.")[1].split(".")[0])
-            if layer % 4 == 3 and ".self_attn." in source:
-                source = source.replace(".q_proj.", ".q_b_proj.").replace(".k_proj.", ".kv_b_proj.")
+            # The getters name each adapter as the exported adapter does: the HF module path under
+            # base_model.model. (language_model layers, q_b_proj/kv_b_proj on the MLA layers).
+            source = name.removeprefix("base_model.model.").replace(".lora_B.weight", ".weight")
             if ".experts." in source:
                 dw = torch.stack([hf_grads[source.replace(".experts.", f".experts.{i}.")] for i in range(4)])
             else:
