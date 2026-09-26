@@ -14,11 +14,22 @@
 
 namespace sinfer::ops::detail::trtllm_moe {
 
+/// The gate the runner puts between its two GEMMs. `Swiglu` is `silu(gate) * up`, every mixture
+/// the runner served first; `GegluTanh` is `gelu_tanh(gate) * up`, Gemma 4's
+/// (`gelu_pytorch_tanh`), which the runner computes with CUTLASS's `GELU_taylor` -- the same
+/// tanh form. Part of the geometry because the tuned tactics and the workspace are per runner
+/// call shape, and a round run through the other gate is a different function.
+enum class Activation : std::uint8_t {
+    Swiglu,
+    GegluTanh,
+};
+
 struct Geometry {
     std::int32_t hidden            = 0;
     std::int32_t experts           = 0;
     std::int32_t experts_per_token = 0;
     std::int32_t intermediate      = 0;
+    Activation activation          = Activation::Swiglu;
 };
 
 /// One layer's routed experts as the runner reads them. Every pointer is device memory.

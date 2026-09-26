@@ -14,4 +14,8 @@ namespace sinfer::ops::detail {
 void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, bool tanh_approx, Tensor& out,
                          cudaStream_t stream, bool round_gate);
 
+// Host entry for the fused-plane form; `gate_up` is [2K, T], `out` [K, T], K even.
+void gelu_and_mul_fused_launch(const Tensor& gate_up, bool tanh_approx, Tensor& out,
+                               cudaStream_t stream);
+
 } // namespace sinfer::ops::detail

@@ -1811,7 +1811,10 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
 } // namespace
 
 /// This geometry's shape as the vendored runner spells it.
-constexpr trtllm_moe::Geometry trtllm_geometry{kHidden, kExperts, kTopK, kIntermediate};
+constexpr trtllm_moe::Geometry trtllm_geometry{
+    kHidden, kExperts, kTopK, kIntermediate,
+    kActivation == GatedActivation::GeluTanh ? trtllm_moe::Activation::GegluTanh
+                                             : trtllm_moe::Activation::Swiglu};
 
 /// The routed weights as the runner reads them. The artifact stores an expert's gate/up rows as
 /// [up; gate] for this profile precisely because that is the order the runner assumes.

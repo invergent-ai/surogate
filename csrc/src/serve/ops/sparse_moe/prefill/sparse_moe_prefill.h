@@ -94,6 +94,13 @@ struct SparseMoePrefillWorkspace {
     DeviceSpan trtllm_workspace;
 };
 
+/// The runner's gate for a mixture's experts.
+[[nodiscard]] constexpr trtllm_moe::Activation
+trtllm_activation(const SparseMoeGeometry& geometry) noexcept {
+    return geometry.activation == GatedActivation::GeluTanh ? trtllm_moe::Activation::GegluTanh
+                                                            : trtllm_moe::Activation::Swiglu;
+}
+
 template <class Arena>
 SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                                 const SparseMoeGeometry& geometry,
@@ -170,7 +177,8 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
             arena.alloc_bytes(trtllm_moe::workspace_bytes(
                                   trtllm_moe::Geometry{geometry.hidden, geometry.experts,
                                                        geometry.experts_per_token,
-                                                       geometry.intermediate},
+                                                       geometry.intermediate,
+                                                       trtllm_activation(geometry)},
                                   capacity_tokens),
                               256);
     }

@@ -56,4 +56,25 @@ __launch_bounds__(256) __global__
     }
 }
 
+/// The same product over one fused `[gate; up]` plane: column t of `gate_up` holds the K gate
+/// values then the K up values (a `[2K, T]` matmul output), and column t of `out` is their
+/// product. Same `gelu_mul_pair`, so a fused and a split projection of the same numbers give the
+/// same bits.
+template <bool TanhApprox>
+__launch_bounds__(256) __global__
+    void gelu_and_mul_fused_kernel(const __nv_bfloat16* gate_up, __nv_bfloat16* out,
+                                   std::int64_t k_pairs, std::int64_t columns) {
+    const std::int64_t total  = k_pairs * columns;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const auto* in2 = reinterpret_cast<const __nv_bfloat162*>(gate_up);
+    auto* out2      = reinterpret_cast<__nv_bfloat162*>(out);
+    for (std::int64_t p = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x; p < total;
+         p += stride) {
+        const std::int64_t column = p / k_pairs;
+        const std::int64_t pair   = p - column * k_pairs;
+        const std::int64_t base   = column * 2 * k_pairs;
+        out2[p] = gelu_mul_pair<TanhApprox>(in2[base + pair], in2[base + k_pairs + pair]);
+    }
+}
+
 } // namespace sinfer::ops

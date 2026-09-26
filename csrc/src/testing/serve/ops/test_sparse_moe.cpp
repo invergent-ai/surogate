@@ -63,7 +63,9 @@ struct CodecProfile {
     constexpr bool kSigmoidRouter =                                                                \
         kGeometry.gating == ops::SparseMoeGating::SigmoidBiasTopK;                                 \
     constexpr float kRoutedScale           = kGeometry.routed_scale;                               \
-    constexpr float kSwigluLimit           = kGeometry.swiglu_limit;
+    constexpr float kSwigluLimit           = kGeometry.swiglu_limit;                               \
+    constexpr ops::GatedActivation kActivation = kGeometry.activation;                             \
+    constexpr bool kPerExpertScaled        = kGeometry.per_expert_scaled;
 
 namespace qwen36 {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen36Geometry)
@@ -84,6 +86,14 @@ namespace glm53 {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeGlm53Geometry)
 #include "ops/test_sparse_moe_body.inc"
 } // namespace glm53
+
+// Gemma 4 26B-A4B: GELU-gated experts, a learned per-expert scale on the renormalised routing
+// weights, and no always-on expert. The W8 profile is the served BF16 conversion's; the NVFP4 one
+// is an NVFP4 export's, with the runner computing `gelu_tanh(gate) * up` between its GEMMs.
+namespace gemma4 {
+SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeGemma4Geometry)
+#include "ops/test_sparse_moe_body.inc"
+} // namespace gemma4
 
 namespace lfm2_moe32 {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeLfm2Moe32Geometry)
@@ -153,6 +163,20 @@ int main(int argc, char** argv) {
         failures += glm53::SparseMoeFixture(w8).run_width_invariance(96, narrow);
         failures += lfm2_moe32::SparseMoeFixture(w8).run_width_invariance(96, narrow);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe width invariance\n";
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--gemma4") {
+        // The NVFP4 profile at every width class: the decode kernel (W4A16) at one token, the
+        // runner's power-of-two and linear rungs, and the 4,096-row slice crossed. (The fixture
+        // stores row-split codecs without the K padding a 704-wide expert needs, so the served
+        // W8 profile is covered by the GGML prefill test's Gemma cases instead.)
+        constexpr std::array<std::int32_t, 8> nvfp4{{1, 2, 19, 20, 47, 139, 768, 4097}};
+        const CodecProfile profiles[] = {
+            {"gemma4 nvfp4 w4a4", QType::NVFP4, QType::NVFP4, nvfp4, false},
+        };
+        int failures = 0;
+        for (const CodecProfile& profile : profiles) { failures += gemma4::run_profile(profile); }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe gemma4\n";
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--qwen3-vl-235b") {

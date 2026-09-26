@@ -76,9 +76,13 @@ constexpr ops::GeluMode kMlpActivation = ops::GeluMode::Tanh;
         "the artifact is bound. Reaching here means a speculative round started without one.");
 }
 
+/// The format of the dense matrices -- attention and the feed-forward beside the experts. The
+/// routed-NVFP4 profile quantises the experts only, so its dense half is the groupwise
+/// profile's.
 QType profile_qtype(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
+    case WeightsProfile::RoutedNvfp4:
         return QType::W8G32_F16S;
     }
     throw std::invalid_argument("gemma4_moe: invalid weights profile");
@@ -142,8 +146,14 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType qtyp
     (void)layout.alloc(DType::BF16, {g.hidden, last});
     (void)layout.alloc(DType::BF16, {g.hidden, last});
     (void)layout.alloc(DType::BF16, {g.hidden, last});
-    account_linear(layout, qtype, dense, g.hidden, first, last);
-    account_linear(layout, qtype, dense, g.hidden, first, last);
+    if (qtype == QType::NVFP4) {
+        // NVFP4 stores gate and up fused (`mlp/gate_up`), one matmul into the same bytes the
+        // two halves take.
+        account_linear(layout, qtype, 2 * dense, g.hidden, first, last);
+    } else {
+        account_linear(layout, qtype, dense, g.hidden, first, last);
+        account_linear(layout, qtype, dense, g.hidden, first, last);
+    }
     account_linear(layout, qtype, g.hidden, dense, first, last);
     return layout.peak_bytes(1);
 }
@@ -255,16 +265,26 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
     // The larger of the two routes this artifact may carry: the profile's row-split format,
     // or the K-quants a GGUF served natively keeps. The layout is planned before the weights
     // are read, so it must hold either.
-    return std::max(
+    std::size_t bytes = std::max(
         attention_projection_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
         attention_projection_workspace_bytes(geometry, QType::Q4_K, first, last));
+    if (weights_profile == WeightsProfile::RoutedNvfp4) {
+        // An NVFP4 export may quantise the attention too (W4A4, whose activation codes take
+        // transient storage); the routed profile is planned for either.
+        bytes = std::max(bytes, attention_projection_workspace_bytes(geometry, QType::NVFP4, first, last));
+    }
+    return bytes;
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return std::max(
+    std::size_t bytes = std::max(
         attention_output_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
         attention_output_workspace_bytes(geometry, QType::Q4_K, first, last));
+    if (weights_profile == WeightsProfile::RoutedNvfp4) {
+        bytes = std::max(bytes, attention_output_workspace_bytes(geometry, QType::NVFP4, first, last));
+    }
+    return bytes;
 }
 
 // ---- Post-mixer (gated-GELU MLP, between the other two sandwich norms) ------
@@ -274,24 +294,33 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     auto scope                      = workspace.scope();
     const std::int32_t columns      = hidden.ne[1];
     const std::int32_t width        = residual.ne[0];
-    const std::int32_t intermediate = weights.gate.n;
+    const bool fused = weights.fused_gate_up.qdata != nullptr;
+    const std::int32_t intermediate = fused ? weights.fused_gate_up.n / 2 : weights.gate.n;
 
     // ---- the dense branch, which is the dense target's feed-forward exactly ----------
     //
     // `hidden` is already `pre_feedforward_layernorm(residual)`; the family normalised it on
     // the way in. Gate and up are separate matrices here, where Llama and the Qwen families
-    // fuse them: that costs a launch and buys two adaptable modules.
-    Tensor gate       = workspace.alloc(DType::BF16, {intermediate, columns});
-    Tensor up         = workspace.alloc(DType::BF16, {intermediate, columns});
+    // fuse them: that costs a launch and buys two adaptable modules. An NVFP4 artifact stores
+    // them as one `[gate; up]` matrix instead (its halves are not whole scale tiles), which is
+    // one matmul into one plane, whose two halves `gelu_mul_fused` reads in place.
     Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
     Tensor dense      = workspace.alloc(DType::BF16, {width, columns});
-    ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
-                                     {weights.up, up, kTextPolicy}}, &workspace, stream);
-    apply_lora(weights.gate, kGatePort, hidden, gate, stream);
-    apply_lora(weights.up, kUpPort, hidden, up, stream);
-    Variant::debug_probe("ffn_gate", gate, weights.probe_layer_count, stream);
-    Variant::debug_probe("ffn_up", up, weights.probe_layer_count, stream);
-    ops::gelu_mul(gate, up, kMlpActivation, activation, stream);
+    if (fused) {
+        Tensor gate_up = workspace.alloc(DType::BF16, {2 * intermediate, columns});
+        ops::linear(hidden, weights.fused_gate_up, gate_up, kTextPolicy, workspace, stream);
+        ops::gelu_mul_fused(gate_up, kMlpActivation, activation, stream);
+    } else {
+        Tensor gate = workspace.alloc(DType::BF16, {intermediate, columns});
+        Tensor up   = workspace.alloc(DType::BF16, {intermediate, columns});
+        ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
+                                         {weights.up, up, kTextPolicy}}, &workspace, stream);
+        apply_lora(weights.gate, kGatePort, hidden, gate, stream);
+        apply_lora(weights.up, kUpPort, hidden, up, stream);
+        Variant::debug_probe("ffn_gate", gate, weights.probe_layer_count, stream);
+        Variant::debug_probe("ffn_up", up, weights.probe_layer_count, stream);
+        ops::gelu_mul(gate, up, kMlpActivation, activation, stream);
+    }
     Variant::debug_probe("ffn_act", activation, weights.probe_layer_count, stream);
     ops::linear(activation, weights.down, dense, kTextPolicy, workspace, stream);
     apply_lora(weights.down, kDownPort, activation, dense, stream);
@@ -374,9 +403,12 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     // for either route this artifact may carry: the profile's group-wise int8, or the
     // K-quants a GGUF served natively keeps -- and a GGUF may hold a different down type from
     // its gate/up, layer by layer.
-    const std::size_t planes =
+    std::size_t planes =
         std::max(post_mixer_workspace_bytes(geometry, qtype, first, last),
                  post_mixer_workspace_bytes(geometry, QType::Q4_K, first, last));
+    if (weights_profile == WeightsProfile::RoutedNvfp4) {
+        planes = std::max(planes, post_mixer_workspace_bytes(geometry, QType::NVFP4, first, last));
+    }
     const ops::SparseMoeGeometry moe_geometry{
         .hidden = geometry.hidden,
         .experts = geometry.experts,
@@ -386,13 +418,20 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         .per_expert_scaled = true,
     };
     const ops::SparseMoeRouting routing = family::moe_routing(phase);
-    const std::size_t mixture = std::max({
+    std::size_t mixture = std::max({
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry, qtype, qtype, first, last, routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry, QType::Q4_K, QType::Q4_K, first,
                                                  last, routing),
         ops::sparse_moe_workspace_capacity_bytes(moe_geometry, QType::Q4_K, QType::Q6_K, first,
                                                  last, routing),
     });
+    if (weights_profile == WeightsProfile::RoutedNvfp4) {
+        // The runner's own scratch, its BF16 output block and permutation map ride in the
+        // prefill arena of this profile, and they are larger than any other route's.
+        mixture = std::max(mixture, ops::sparse_moe_workspace_capacity_bytes(
+                                        moe_geometry, QType::NVFP4, QType::NVFP4, first, last,
+                                        routing));
+    }
     return planes + mixture;
 }
 

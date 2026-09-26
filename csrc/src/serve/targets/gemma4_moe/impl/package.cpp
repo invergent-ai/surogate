@@ -105,6 +105,13 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             index, "o_proj",
             Binding{attention.output.qdata, 3, query_rows, g.hidden});
         // The dense branch and routed experts have separate checkpoint modules.
+        if (attention.post_mixer.fused_gate_up.qdata != nullptr) {
+            // An NVFP4 export's dense gate and up are one fused matrix; an adapter's gate_proj
+            // and up_proj deltas would each land on the wrong half of it.
+            throw std::invalid_argument(
+                "gemma4_moe: LoRA adapters are not served on an artifact whose dense "
+                "feed-forward is NVFP4 (fused gate/up); merge the adapter before quantising");
+        }
         const std::int32_t dense = detail::dense_intermediate(g);
         family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden, dense);
         family::bind_lora_moe(store, index, attention.post_mixer.op);
@@ -136,6 +143,9 @@ std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maxi
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
+    }
+    if (identity.architecture == target_key && identity.weights_id == "routed-nvfp4") {
+        return WeightsProfile::RoutedNvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
@@ -198,6 +208,19 @@ family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    // The routed-NVFP4 experts run on the vendored TensorRT-LLM runner, which picks its grouped
+    // GEMMs' tactics per round width by measurement. That launches and synchronises, so it has
+    // to happen before the program captures a graph; every layer shares the geometry and so the
+    // tactics, and tuning against one layer's weights tunes them all.
+    if (model.impl_->weights_profile == WeightsProfile::RoutedNvfp4) {
+        for (const auto& layer : model.impl_->data.runtime.full_layers) {
+            if (layer.post_mixer.op.routed_gate_up.qtype == QType::NVFP4) {
+                ops::sparse_moe_prepare(layer.post_mixer.op, ops::kSparseMoeTrtllmPrepareWidth,
+                                        device.stream);
+                break;
+            }
+        }
+    }
     family::prepare_banked_experts(model.impl_->data.runtime);
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);

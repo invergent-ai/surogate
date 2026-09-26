@@ -29,4 +29,12 @@ namespace sinfer::ops {
 void gelu_mul(const Tensor& gate, const Tensor& up, GeluMode mode, Tensor& out,
               cudaStream_t stream, bool round_gate = false);
 
+/**
+ * `gelu_mul` over one fused projection: `gate_up` is a contiguous BF16 `[2K, T]` plane whose
+ * column t holds K gate values then K up values, and `out` (`[K, T]`, K even) receives
+ * `gelu(gate) * up` column by column. Exactly `gelu_mul` of the two halves; it exists so a fused
+ * gate/up matmul needs no copy to split its output. `out` must not overlap `gate_up`.
+ */
+void gelu_mul_fused(const Tensor& gate_up, GeluMode mode, Tensor& out, cudaStream_t stream);
+
 } // namespace sinfer::ops

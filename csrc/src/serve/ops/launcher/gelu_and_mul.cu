@@ -35,4 +35,21 @@ void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, bool tanh_approx,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void gelu_and_mul_fused_launch(const Tensor& gate_up, bool tanh_approx, Tensor& out,
+                               cudaStream_t stream) {
+    const std::int64_t k_pairs = out.ne[0] / 2;
+    const std::int64_t columns = out.ne[1];
+    constexpr int kBlock       = 256;
+    const auto grid = static_cast<unsigned int>(
+        std::clamp<std::int64_t>(div_up(k_pairs * columns, static_cast<std::int64_t>(kBlock)), 1, 65535));
+    const auto* in = static_cast<const __nv_bfloat16*>(gate_up.data);
+    auto* o        = static_cast<__nv_bfloat16*>(out.data);
+    if (tanh_approx) {
+        gelu_and_mul_fused_kernel<true><<<grid, kBlock, 0, stream>>>(in, o, k_pairs, columns);
+    } else {
+        gelu_and_mul_fused_kernel<false><<<grid, kBlock, 0, stream>>>(in, o, k_pairs, columns);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace sinfer::ops::detail

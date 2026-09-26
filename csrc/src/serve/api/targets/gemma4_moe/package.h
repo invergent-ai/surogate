@@ -42,12 +42,31 @@ namespace detail {
 
 struct Variant;
 
-/// The one export profile a Gemma 4 mixture artifact carries today. Nothing quantises this
-/// checkpoint any other way yet, and a profile with no converter behind it is a promise the
-/// loader cannot keep.
+/// The export profiles a Gemma 4 mixture artifact carries.
+///
+/// `GroupwiseInt` is the converted BF16 checkpoint: every matrix W8 (or as a GGUF stores it).
+/// `RoutedNvfp4` is an NVFP4 export's: the routed experts in NVFP4 with their per-expert
+/// second-level and activation scales (`surogate/serve/convert/gemma4_moe/exports/
+/// routed_nvfp4.py`), and every other matrix as the BF16 checkpoint converts it. The experts
+/// run on the vendored TensorRT-LLM runner (W4A4) from two tokens up and on the NVFP4 decode
+/// kernels (W4A16) for one.
 enum class WeightsProfile : std::uint8_t {
     GroupwiseInt,
+    RoutedNvfp4,
 };
+
+/// Do these weights need the sm_120 block-scaled FP4 MMA? The routed-NVFP4 experts do: the
+/// runner is pinned to 120a. See the qwen3_5_moe declaration for why this is not left to the
+/// archive to refuse.
+[[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile profile) noexcept {
+    switch (profile) {
+    case WeightsProfile::GroupwiseInt:
+        return false;
+    case WeightsProfile::RoutedNvfp4:
+        return true;
+    }
+    return false;
+}
 
 using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;

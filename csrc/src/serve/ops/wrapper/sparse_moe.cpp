@@ -330,7 +330,8 @@ void sparse_moe_prepare(const SparseMoeWeights& weights, std::int32_t max_tokens
     experts.down_alpha           = weights.routed_down_alpha;
     detail::trtllm_moe::prepare(detail::trtllm_moe::Geometry{geometry.hidden, geometry.experts,
                                                             geometry.experts_per_token,
-                                                            geometry.intermediate},
+                                                            geometry.intermediate,
+                                                            detail::trtllm_activation(geometry)},
                                 experts, max_tokens, stream);
 }
 

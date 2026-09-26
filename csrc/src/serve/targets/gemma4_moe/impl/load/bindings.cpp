@@ -4,6 +4,8 @@
 
 #include "artifact/typed_binding.h"
 
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -25,9 +27,85 @@ static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
+    // Everything but the routed experts is the BF16 checkpoint's conversion in both profiles.
+    case WeightsProfile::RoutedNvfp4:
         return NumericFormat::W8G32_F16S;
     }
     throw std::invalid_argument("gemma4_moe: invalid weights profile");
+}
+
+/// One routed NVFP4 bank as the MoE kernels read it.
+///
+/// `artifact::materialized_linear` would pair it with a dense input divisor the routed profile
+/// does not have: the experts' second level and activation divisors are per expert, in their
+/// own arrays, so the Weight is built here with both of its own divisors at one -- which
+/// `require_identity_divisor` has checked the payload states.
+Weight routed_nvfp4_weight(const artifact::MaterializedArtifact& materialized,
+                           artifact::ObjectHandle handle, std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const artifact::BlockScaleGeometry geometry =
+        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
+    Weight out{};
+    out.payload              = bytes;
+    out.payload_bytes        = geometry.encoded_bytes;
+    out.qtype                = QType::NVFP4;
+    out.group_size           = 16;
+    out.ndim                 = 2;
+    out.qdata                = bytes;
+    out.scales               = bytes + geometry.scale_plane_offset;
+    out.n                    = rows;
+    out.k                    = columns;
+    out.group                = 16;
+    out.layout               = QuantLayout::BlockScaleK16M128x4;
+    out.scale_dtype          = DType::FP8_E4M3FN;
+    out.shape[0]             = rows;
+    out.shape[1]             = columns;
+    out.padded_shape[0]      = rows;
+    out.padded_shape[1]      = columns;
+    out.weight_scale_divisor = 1.0F;
+    out.input_scale_divisor  = 1.0F;
+    return out;
+}
+
+/// The payload's per-tensor divisor word must be the identity: the routed profile carries its
+/// second level per expert, and a per-tensor value here would be dropped on the floor.
+void require_identity_divisor(const artifact::Binder& binder, artifact::ObjectHandle handle,
+                              std::string_view name, std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const artifact::BlockScaleGeometry geometry =
+        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
+    const artifact::PayloadSpan payload = binder.payload(handle);
+    if (payload.data.size() < geometry.weight_divisor_offset + sizeof(std::uint32_t)) {
+        throw artifact::ArtifactError(std::string(name) + ": NVFP4 payload is short of its divisor");
+    }
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, payload.data.data() + geometry.weight_divisor_offset, sizeof(bits));
+    if (std::bit_cast<float>(bits) != 1.0F) {
+        throw artifact::ArtifactError(
+            std::string(name) +
+            ": routed NVFP4 must carry a per-tensor divisor of 1.0; the second level belongs in "
+            "the per-expert scale object");
+    }
+}
+
+/// A routed bank at the format the artifact stores it in. NVFP4 is bound as the plain tensor
+/// it is (its scales are separate objects, see `bind_routed_nvfp4_scales`); every other format
+/// is an ordinary linear.
+artifact::LinearBinding bind_routed(artifact::Binder& binder, const std::string& name,
+                                    std::int32_t rows, std::int32_t columns) {
+    const auto* descriptor = std::get_if<artifact::TensorDescriptor>(binder.reader().find(name));
+    if (descriptor != nullptr && descriptor->format == NumericFormat::NVFP4) {
+        return artifact::LinearBinding{
+            artifact::bind_tensor(binder, name, NumericFormat::NVFP4,
+                                  {static_cast<std::uint64_t>(rows),
+                                   static_cast<std::uint64_t>(columns)},
+                                  artifact::ScopedPlacement::current()),
+            NumericFormat::NVFP4};
+    }
+    return artifact::bind_linear(binder, name, rows, columns);
 }
 
 /// A matrix at whatever format the artifact declares. The profile's format is what a
@@ -40,12 +118,15 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
     const artifact::LinearBinding binding =
         artifact::bind_linear(binder, name, static_cast<std::int32_t>(dims[0]),
                               static_cast<std::int32_t>(dims[1]));
-    return WeightPlan{.object = binding.object, .format = binding.format};
+    return WeightPlan{.object = binding.object, .format = binding.format, .linear = binding};
 }
 
+/// The Weight for a bound matrix. `materialized_linear` is `materialized_weight` for every
+/// format but NVFP4, which it pairs with the divisors `bind_linear` read -- so a W8 or BF16
+/// artifact binds exactly the Weight it always did.
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns) {
-    return artifact::materialized_weight(materialized, plan.object, plan.format, rows, columns);
+    return artifact::materialized_linear(materialized, plan.linear, rows, columns);
 }
 
 Tensor materialized_norm(const artifact::MaterializedArtifact& materialized,
@@ -87,8 +168,12 @@ MixturePostMixerPayload load_mlp(const MlpPlan& plan,
     MixturePostMixerPayload out;
     out.probe_layer_count = g.layers;
     out.rms_epsilon = g.rms_epsilon;
-    out.gate = materialized_weight(materialized, plan.gate, dense, g.hidden);
-    out.up   = materialized_weight(materialized, plan.up, dense, g.hidden);
+    if (plan.gate_up.has_value()) {
+        out.fused_gate_up = materialized_weight(materialized, *plan.gate_up, 2 * dense, g.hidden);
+    } else {
+        out.gate = materialized_weight(materialized, plan.gate, dense, g.hidden);
+        out.up   = materialized_weight(materialized, plan.up, dense, g.hidden);
+    }
     out.down = materialized_weight(materialized, plan.down, g.hidden, dense);
     out.post_feedforward_norm =
         materialized_norm(materialized, plan.post_feedforward_norm, g.hidden);
@@ -110,11 +195,32 @@ MixturePostMixerPayload load_mlp(const MlpPlan& plan,
     // The *stored* format decides how the expert bytes are read, not the profile's
     // expectation -- the trap the other routed targets record, and it costs nothing to avoid
     // here.
+    const bool nvfp4 = plan.routed_gate_up.format == NumericFormat::NVFP4;
     out.op.routed_gate_up =
-        artifact::materialized_linear(materialized, plan.routed_gate_up, routed_gate_up_rows(g),
-                                      g.hidden);
-    out.op.routed_down = artifact::materialized_linear(materialized, plan.routed_down,
-                                                       routed_down_rows(g), g.intermediate);
+        nvfp4 ? routed_nvfp4_weight(materialized, plan.routed_gate_up.object,
+                                    routed_gate_up_rows(g), g.hidden)
+              : artifact::materialized_linear(materialized, plan.routed_gate_up,
+                                              routed_gate_up_rows(g), g.hidden);
+    out.op.routed_down =
+        nvfp4 ? routed_nvfp4_weight(materialized, plan.routed_down.object, routed_down_rows(g),
+                                    g.intermediate)
+              : artifact::materialized_linear(materialized, plan.routed_down, routed_down_rows(g),
+                                              g.intermediate);
+    if (nvfp4) {
+        const auto array = [&](const std::optional<artifact::ObjectHandle>& handle,
+                               std::int32_t count) {
+            return static_cast<const float*>(
+                artifact::materialized_tensor(materialized, *handle, NumericFormat::FP32, {count})
+                    .data);
+        };
+        const std::int32_t experts = g.experts;
+        out.op.routed_gate_up_scale     = array(plan.routed_gate_up_scale, 2 * experts);
+        out.op.routed_gate_up_act_scale = array(plan.routed_gate_up_act_scale, experts);
+        out.op.routed_gate_up_alpha     = array(plan.routed_gate_up_alpha, experts);
+        out.op.routed_down_scale        = array(plan.routed_down_scale, experts);
+        out.op.routed_down_act_scale    = array(plan.routed_down_act_scale, experts);
+        out.op.routed_down_alpha        = array(plan.routed_down_alpha, experts);
+    }
     // No always-on expert. The dense branch beside the experts is the *layer's* projection,
     // not this mixture's shared one: it has no router row, it runs for every token, and the
     // op must not add it a second time.
@@ -194,10 +300,15 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
                                               {static_cast<std::uint64_t>(g.hidden),
                                                static_cast<std::uint64_t>(query_rows)});
         const std::uint64_t dense = static_cast<std::uint64_t>(dense_intermediate(g));
-        target.mlp.gate = bind_weight(binder, prefix + "mlp/gate", weights,
-                                      {dense, static_cast<std::uint64_t>(g.hidden)});
-        target.mlp.up   = bind_weight(binder, prefix + "mlp/up", weights,
-                                      {dense, static_cast<std::uint64_t>(g.hidden)});
+        if (binder.has(prefix + "mlp/gate_up")) {
+            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
+                                             {2 * dense, static_cast<std::uint64_t>(g.hidden)});
+        } else {
+            target.mlp.gate = bind_weight(binder, prefix + "mlp/gate", weights,
+                                          {dense, static_cast<std::uint64_t>(g.hidden)});
+            target.mlp.up   = bind_weight(binder, prefix + "mlp/up", weights,
+                                          {dense, static_cast<std::uint64_t>(g.hidden)});
+        }
         target.mlp.down = bind_weight(binder, prefix + "mlp/down", weights,
                                       {static_cast<std::uint64_t>(g.hidden), dense});
         // The three norms the two branches meet under, then the routed branch itself. Bound in
@@ -225,10 +336,45 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
         // run for every token where an expert runs for one in sixteen, and together they are
         // 0.4 MB against the bank's 800.
         {
-            target.mlp.routed_gate_up = artifact::bind_linear(
-                binder, prefix + "moe/routed_gate_up", routed_gate_up_rows(g), g.hidden);
-            target.mlp.routed_down = artifact::bind_linear(binder, prefix + "moe/routed_down",
-                                                           routed_down_rows(g), g.intermediate);
+            target.mlp.routed_gate_up = bind_routed(binder, prefix + "moe/routed_gate_up",
+                                                    routed_gate_up_rows(g), g.hidden);
+            target.mlp.routed_down = bind_routed(binder, prefix + "moe/routed_down",
+                                                 routed_down_rows(g), g.intermediate);
+            const bool gate_up_nvfp4 = target.mlp.routed_gate_up.format == NumericFormat::NVFP4;
+            if (gate_up_nvfp4 != (target.mlp.routed_down.format == NumericFormat::NVFP4)) {
+                throw artifact::ArtifactError(
+                    "gemma4_moe: layer " + std::to_string(layer) +
+                    " stores one routed bank in NVFP4 and the other not; the routed-NVFP4 "
+                    "runner computes both projections, so the pair is refused");
+            }
+            if (gate_up_nvfp4 != (weights_profile == WeightsProfile::RoutedNvfp4)) {
+                throw artifact::ArtifactError(
+                    "gemma4_moe: layer " + std::to_string(layer) +
+                    (gate_up_nvfp4 ? " stores NVFP4 experts in an artifact that is not routed-nvfp4"
+                                   : " stores non-NVFP4 experts in a routed-nvfp4 artifact"));
+            }
+            if (gate_up_nvfp4) {
+                // The second level and the activation scales ride in per-expert arrays; they
+                // are tiny and every round reads them, so they stay on the device wherever the
+                // experts themselves live.
+                const auto bind_array = [&](const std::string& name, std::uint64_t count) {
+                    return artifact::bind_device_tensor(binder, name, NumericFormat::FP32,
+                                                        {count});
+                };
+                const auto experts = static_cast<std::uint64_t>(g.experts);
+                const std::string gate_up = prefix + "moe/routed_gate_up";
+                const std::string down    = prefix + "moe/routed_down";
+                target.mlp.routed_gate_up_scale     = bind_array(gate_up + "_scale", 2 * experts);
+                target.mlp.routed_gate_up_act_scale = bind_array(gate_up + "_act_scale", experts);
+                target.mlp.routed_gate_up_alpha     = bind_array(gate_up + "_alpha", experts);
+                target.mlp.routed_down_scale        = bind_array(down + "_scale", experts);
+                target.mlp.routed_down_act_scale    = bind_array(down + "_act_scale", experts);
+                target.mlp.routed_down_alpha        = bind_array(down + "_alpha", experts);
+                require_identity_divisor(binder, target.mlp.routed_gate_up.object, gate_up,
+                                         routed_gate_up_rows(g), g.hidden);
+                require_identity_divisor(binder, target.mlp.routed_down.object, down,
+                                         routed_down_rows(g), g.intermediate);
+            }
         }
         target.mlp.layer_scalar = artifact::bind_device_tensor(
             binder, prefix + "layer_scalar", NumericFormat::BF16, {1});

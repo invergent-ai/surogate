@@ -79,6 +79,21 @@ int run_nvfp4_a4() {
                           {2048, 4096, 733U, Comparison::Sampled, true, generic_invocations});
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {2048, 512, 734U, Comparison::Sampled, true, generic_invocations});
+    // Gemma 4 26B-A4B as an NVFP4 export of its dense matrices binds it: the dense gate/up fused
+    // [4224,2816] (its 2,112-row halves are not whole scale tiles), down [2816,2112], the
+    // windowed query [4096,2816] and key/value [2048,2816], the global query [8192,2816], and
+    // the two output projections [2816,4096] and [2816,8192]. K = 2816, 2112 and 8192 were
+    // admitted to the activation quantizer for them.
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {4224, 2816, 741U, Comparison::Sampled, true, generic_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {2816, 2112, 742U, Comparison::Sampled, true, generic_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {8192, 2816, 743U, Comparison::Sampled, true, generic_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {2816, 8192, 744U, Comparison::Sampled, true, generic_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {2048, 2816, 745U, Comparison::Sampled, true, generic_invocations});
     return failures;
 }
 

@@ -170,10 +170,12 @@ inline constexpr bool is_nvfp4_gemv_only_problem(std::int32_t output_rows, std::
 // shape-generic, so only the activation quantizer needs an instantiation per K. The one list
 // below is every K the quantizer is built for -- the family's hidden, query, value and
 // intermediate widths at every published size (0.8B 1024/2048/3584, 2B 2048/6144, 4B
-// 2560/4096/9216, 27B 5120/6144/17408) -- and both the admission predicate and the launch
-// switch expand it, so a new width is one entry here.
+// 2560/4096/9216, 27B 5120/6144/17408), and Gemma 4 26B-A4B's (hidden 2816, windowed and
+// global attention 4096/8192, dense feed-forward 2112) -- and both the admission predicate and
+// the launch switch expand it, so a new width is one entry here.
 #define SINFER_NVFP4_FOR_EACH_ACTIVATION_K(X) \
-    X(512) X(1024) X(2048) X(2560) X(3584) X(4096) X(5120) X(6144) X(9216) X(17408)
+    X(512) X(1024) X(2048) X(2112) X(2560) X(2816) X(3584) X(4096) X(5120) X(6144) X(8192) \
+    X(9216) X(17408)
 using Nvfp4Activation512Geometry   = Nvfp4ActivationGeometry<512>;
 using Nvfp4Activation1024Geometry  = Nvfp4ActivationGeometry<1024>;
 using Nvfp4Activation2048Geometry  = Nvfp4ActivationGeometry<2048>;
@@ -184,6 +186,9 @@ using Nvfp4Activation9216Geometry  = Nvfp4ActivationGeometry<9216>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+using Nvfp4Activation2112Geometry  = Nvfp4ActivationGeometry<2112>;
+using Nvfp4Activation2816Geometry  = Nvfp4ActivationGeometry<2816>;
+using Nvfp4Activation8192Geometry  = Nvfp4ActivationGeometry<8192>;
 
 inline constexpr bool nvfp4_activation_k_instantiated(std::int32_t input_rows) {
 #define SINFER_NVFP4_K_CASE(K) if (input_rows == (K)) { return true; }

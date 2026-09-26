@@ -39,6 +39,11 @@ constexpr std::int32_t kMaxTokens = 4096;
 /// vendored kernels, the ladder, or the timing method change.
 constexpr int kTuningVersion = 1;
 
+tkc::ActivationType activation_of(const Geometry& geometry) noexcept {
+    return geometry.activation == Activation::GegluTanh ? tkc::ActivationType::GegluTanh
+                                                        : tkc::ActivationType::Swiglu;
+}
+
 std::size_t align_up(std::size_t bytes, std::size_t alignment) noexcept {
     return (bytes + alignment - 1) / alignment * alignment;
 }
@@ -79,7 +84,7 @@ WorkspaceLayout workspace_layout(const Geometry& geometry, std::int32_t max_toke
     WorkspaceLayout out;
     out.runner_bytes = runner(geometry).getWorkspaceSize(
         max_tokens, geometry.hidden, geometry.intermediate, geometry.experts,
-        geometry.experts_per_token, tkc::ActivationType::Swiglu, tkc::MOEParallelismConfig{},
+        geometry.experts_per_token, activation_of(geometry), tkc::MOEParallelismConfig{},
         /*use_lora*/ false, /*use_deepseek_fp8_block_scale*/ false, /*use_mxfp8_act_scaling*/ false,
         /*min_latency_mode*/ false, /*use_awq*/ false);
     out.output_bytes = static_cast<std::size_t>(max_tokens) * geometry.hidden * sizeof(__nv_bfloat16);
@@ -133,16 +138,17 @@ struct GeometryKey {
     std::int32_t experts;
     std::int32_t experts_per_token;
     std::int32_t intermediate;
+    Activation activation;
 
     friend bool operator<(const GeometryKey& a, const GeometryKey& b) noexcept {
-        return std::tie(a.hidden, a.experts, a.experts_per_token, a.intermediate) <
-               std::tie(b.hidden, b.experts, b.experts_per_token, b.intermediate);
+        return std::tie(a.hidden, a.experts, a.experts_per_token, a.intermediate, a.activation) <
+               std::tie(b.hidden, b.experts, b.experts_per_token, b.intermediate, b.activation);
     }
 };
 
 GeometryKey key_of(const Geometry& geometry) {
     return GeometryKey{geometry.hidden, geometry.experts, geometry.experts_per_token,
-                       geometry.intermediate};
+                       geometry.intermediate, geometry.activation};
 }
 
 State& state(const Geometry& geometry) {
@@ -182,9 +188,11 @@ std::string cache_path(const Geometry& geometry) {
         if (std::isalnum(static_cast<unsigned char>(character)) == 0) { character = '_'; }
     }
     std::ostringstream path;
+    // The SwiGLU file keeps the name it always had, so tactics tuned before the gate became part
+    // of the geometry stay valid; another gate gets a file of its own.
     path << directory << "/v" << kTuningVersion << "_" << name << "_h" << geometry.hidden << "_e"
          << geometry.experts << "_k" << geometry.experts_per_token << "_i" << geometry.intermediate
-         << ".tactics";
+         << (geometry.activation == Activation::GegluTanh ? "_geglu" : "") << ".tactics";
     return path.str();
 }
 
@@ -299,7 +307,7 @@ void launch(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t token
     // with a corrupt heap and a backtrace pointing at whatever freed next.
     const std::size_t required = state(geometry).runner.getWorkspaceSize(
         tokens, geometry.hidden, geometry.intermediate, geometry.experts,
-        geometry.experts_per_token, tkc::ActivationType::Swiglu, tkc::MOEParallelismConfig{},
+        geometry.experts_per_token, activation_of(geometry), tkc::MOEParallelismConfig{},
         /*use_lora*/ false, /*use_deepseek_fp8_block_scale*/ false, /*use_mxfp8_act_scaling*/ false,
         /*min_latency_mode*/ false, /*use_awq*/ false);
     if (required > runner_workspace_bytes) {
@@ -314,7 +322,7 @@ void launch(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t token
     state(geometry).runner.runMoe(
         x, /*input_sf*/ nullptr, /*swizzled_input_sf*/ false, ids, final_scales,
         experts.gate_up_codes, /*fc1_expert_biases*/ nullptr,
-        tkc::ActivationParams(tkc::ActivationType::Swiglu), experts.down_codes,
+        tkc::ActivationParams(activation_of(geometry)), experts.down_codes,
         /*fc2_expert_biases*/ nullptr, quant_params_of(experts), tokens, geometry.hidden,
         /*unpadded_hidden_size*/ geometry.hidden, geometry.intermediate, geometry.experts,
         geometry.experts_per_token, runner_workspace, output, permutation_map,

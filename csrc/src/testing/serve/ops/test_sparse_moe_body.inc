@@ -466,6 +466,8 @@ static_assert(kPromotingBias >= 1.0F);
 
 /// The per-expert ranking bias. Zero everywhere but the one expert the test promotes; a
 /// softmax-routed mixture has no such tensor at all and binds none.
+std::vector<float> make_per_expert_scale();
+
 std::vector<float> make_router_bias() {
     std::vector<float> bias(static_cast<std::size_t>(kExperts), 0.0f);
     bias[static_cast<std::size_t>(kBiasPromoted)] = kPromotingBias;
@@ -581,12 +583,29 @@ void round_activation_to_nvfp4(std::vector<double>& values, float activation_sca
 /// The expert activation, with the clamp the mixture declares. `kSwigluLimit` is zero for a
 /// mixture that does not clamp, and the bound then never binds.
 double clamped_swiglu(double gate, double up) {
+    if constexpr (kActivation == ops::GatedActivation::GeluTanh) {
+        // `gelu_pytorch_tanh`, Gemma 4's gate: 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3))).
+        constexpr double kSqrt2OverPi = 0.7978845608028654;
+        return 0.5 * gate * (1.0 + std::tanh(kSqrt2OverPi * (gate + 0.044715 * gate * gate * gate))) * up;
+    }
     if constexpr (kSwigluLimit > 0.0F) {
         gate = std::min(gate, static_cast<double>(kSwigluLimit));
         up   = std::min(std::max(up, -static_cast<double>(kSwigluLimit)),
                         static_cast<double>(kSwigluLimit));
     }
     return (gate / (1.0 + std::exp(-gate))) * up;
+}
+
+/// The learned per-expert scale a `per_expert_scaled` mixture multiplies each renormalised
+/// routing weight by. Deterministic and far from one, so a route that ignored it would fail.
+float per_expert_scale_of(int expert) {
+    return 0.5f + 0.125f * static_cast<float>(expert % 9);
+}
+
+std::vector<float> make_per_expert_scale() {
+    std::vector<float> out(static_cast<std::size_t>(kExperts));
+    for (int expert = 0; expert < kExperts; ++expert) { out[static_cast<std::size_t>(expert)] = per_expert_scale_of(expert); }
+    return out;
 }
 
 std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
@@ -657,6 +676,11 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
             route_denominator += route_weight[route];
         }
         for (double& weight : route_weight) { weight /= route_denominator; }
+        if constexpr (kPerExpertScaled) {
+            for (int route = 0; route < kTopK; ++route) {
+                route_weight[route] *= static_cast<double>(per_expert_scale_of(selected[route]));
+            }
+        }
         if (selected != intended_route.selected) {
             throw std::logic_error(
                 "sparse_moe test router did not create its intended ordered top-8");
@@ -734,6 +758,8 @@ public:
         : profile_(profile), router_(make_router()), router_bits_(bf16_bits(router_)),
           device_router_(to_device(router_bits_)), router_bias_(make_router_bias()),
           device_router_bias_(kSigmoidRouter ? to_device(router_bias_) : DeviceBuffer{}),
+          device_per_expert_scale_(kPerExpertScaled ? to_device(make_per_expert_scale())
+                                                    : DeviceBuffer{}),
           routed_gate_(profile.routed_gate_up, kRoutedGateRows, kHidden),
           routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
           shared_gate_(kHasShared ? std::optional<DeviceRowSplit>(std::in_place,
@@ -870,6 +896,10 @@ public:
             .routed_scale       = kRoutedScale,
             .shared_gated       = kSharedGated,
             .swiglu_limit       = kSwigluLimit,
+            .activation         = kActivation,
+            .per_expert_scale   = kPerExpertScaled
+                                      ? static_cast<const float*>(device_per_expert_scale_.p)
+                                      : nullptr,
             .routed_gate_up     = routed_gate_.weight(),
             .routed_down        = routed_down_.weight(),
             .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
@@ -960,6 +990,10 @@ public:
             .routed_scale       = kRoutedScale,
             .shared_gated       = kSharedGated,
             .swiglu_limit       = kSwigluLimit,
+            .activation         = kActivation,
+            .per_expert_scale   = kPerExpertScaled
+                                      ? static_cast<const float*>(device_per_expert_scale_.p)
+                                      : nullptr,
             .routed_gate_up     = routed_gate_.weight(),
             .routed_down        = routed_down_.weight(),
             .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
@@ -1112,6 +1146,10 @@ public:
             .routed_scale       = kRoutedScale,
             .shared_gated       = kSharedGated,
             .swiglu_limit       = kSwigluLimit,
+            .activation         = kActivation,
+            .per_expert_scale   = kPerExpertScaled
+                                      ? static_cast<const float*>(device_per_expert_scale_.p)
+                                      : nullptr,
             .routed_gate_up     = routed_gate_.weight(),
             .routed_down        = routed_down_.weight(),
             .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
@@ -1265,6 +1303,7 @@ private:
     /// The per-expert ranking bias, bound only where the mixture's router ranks with one.
     std::vector<float> router_bias_;
     DeviceBuffer device_router_bias_;
+    DeviceBuffer device_per_expert_scale_;
     DeviceRowSplit routed_gate_;
     DeviceRowSplit routed_down_;
     std::optional<DeviceRowSplit> shared_gate_;
