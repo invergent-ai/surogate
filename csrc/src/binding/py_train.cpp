@@ -3204,12 +3204,11 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                 bool unused_accumulate = false;
                 auto& block =
                     dsl_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-                std::string prefix;
-                if (is_nemotron) {
-                    prefix = fmt::format("base_model.model.backbone.layers.{}", l);
-                } else {
-                    prefix = fmt::format("base_model.model.model.layers.{}", l);
-                }
+                // Named as the export names them (the model's layer path and attention names:
+                // out_proj on LFM2, the MLA projections on GLM), except Nemotron's mixer layout.
+                const auto& names_from = dsl_model->lora_weights();
+                const std::string prefix = is_nemotron ? fmt::format("base_model.model.backbone.layers.{}", l)
+                                                       : names_from.layer_prefix(l);
 
                 // Attention LoRA (same for dense and MoE)
                 if (is_nemotron) {
@@ -3219,10 +3218,11 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     add_layer(mixer_prefix + ".v_proj", block.attention.v);
                     add_layer(mixer_prefix + ".o_proj", block.attention.o);
                 } else {
-                    add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-                    add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-                    add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-                    add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+                    const auto attention = names_from.attention_names(l);
+                    add_layer(prefix + ".self_attn." + attention[0], block.attention.q);
+                    add_layer(prefix + ".self_attn." + attention[1], block.attention.k);
+                    add_layer(prefix + ".self_attn." + attention[2], block.attention.v);
+                    add_layer(prefix + ".self_attn." + attention[3], block.attention.o);
                 }
                 // Linear-attention (GatedDeltaNet) mixer LoRA.
                 add_layer(prefix + ".linear_attn.in_proj_qkv", block.linear_attn.in_proj_qkv);
@@ -3239,6 +3239,7 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     add_layer(mixer_prefix + ".down_proj", block.mlp.down);
                 } else {
                     add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.gate_up_proj", block.mlp.gate_up);
                     add_layer(prefix + ".mlp.up_proj", block.mlp.up);
                     add_layer(prefix + ".mlp.down_proj", block.mlp.down);
                 }
@@ -3269,6 +3270,14 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                         add_layer(expert_prefix + ".up_proj", expert.up);
                         add_layer(expert_prefix + ".down_proj", expert.down);
                     }
+                }
+                // Shared experts and the router, as the export writes them.
+                if (!is_nemotron) {
+                    if (block.moe.shared.has_value()) {
+                        add_layer(prefix + ".mlp.shared_experts.up_proj", block.moe.shared->up);
+                        add_layer(prefix + ".mlp.shared_experts.down_proj", block.moe.shared->down);
+                    }
+                    add_layer(prefix + ".mlp.gate", block.router);
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -3319,12 +3328,11 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
 
             for (int l = 0; l < config.NumLayers; ++l) {
                 auto& block = dsl_model->lora_weights().get_block(l, /*stream=*/nullptr);
-                std::string prefix;
-                if (is_nemotron) {
-                    prefix = fmt::format("base_model.model.backbone.layers.{}", l);
-                } else {
-                    prefix = fmt::format("base_model.model.model.layers.{}", l);
-                }
+                // Named as the export names them (the model's layer path and attention names:
+                // out_proj on LFM2, the MLA projections on GLM), except Nemotron's mixer layout.
+                const auto& names_from = dsl_model->lora_weights();
+                const std::string prefix = is_nemotron ? fmt::format("base_model.model.backbone.layers.{}", l)
+                                                       : names_from.layer_prefix(l);
 
                 // Attention LoRA
                 if (is_nemotron) {
@@ -3334,10 +3342,11 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                     add_layer(mixer_prefix + ".v_proj", block.attention.v);
                     add_layer(mixer_prefix + ".o_proj", block.attention.o);
                 } else {
-                    add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-                    add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-                    add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-                    add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+                    const auto attention = names_from.attention_names(l);
+                    add_layer(prefix + ".self_attn." + attention[0], block.attention.q);
+                    add_layer(prefix + ".self_attn." + attention[1], block.attention.k);
+                    add_layer(prefix + ".self_attn." + attention[2], block.attention.v);
+                    add_layer(prefix + ".self_attn." + attention[3], block.attention.o);
                 }
                 // Linear-attention (GatedDeltaNet) mixer LoRA.
                 add_layer(prefix + ".linear_attn.in_proj_qkv", block.linear_attn.in_proj_qkv);
@@ -3354,6 +3363,7 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                     add_layer(mixer_prefix + ".down_proj", block.mlp.down);
                 } else {
                     add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.gate_up_proj", block.mlp.gate_up);
                     add_layer(prefix + ".mlp.up_proj", block.mlp.up);
                     add_layer(prefix + ".mlp.down_proj", block.mlp.down);
                 }
@@ -3384,6 +3394,14 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                         add_layer(expert_prefix + ".up_proj", expert.up);
                         add_layer(expert_prefix + ".down_proj", expert.down);
                     }
+                }
+                // Shared experts and the router, as the export writes them.
+                if (!is_nemotron) {
+                    if (block.moe.shared.has_value()) {
+                        add_layer(prefix + ".mlp.shared_experts.up_proj", block.moe.shared->up);
+                        add_layer(prefix + ".mlp.shared_experts.down_proj", block.moe.shared->down);
+                    }
+                    add_layer(prefix + ".mlp.gate", block.router);
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());

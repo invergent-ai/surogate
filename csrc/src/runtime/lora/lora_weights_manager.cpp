@@ -912,17 +912,23 @@ std::size_t ModularLoRAWeightsManager::rebind_to_persistent_arena(std::byte* are
     return cursor;
 }
 
+std::string ModularLoRAWeightsManager::layer_prefix(int layer) const {
+    return fmt::format("{}.{}", mConfig.tensor_prefix, layer);
+}
+
+std::array<std::string, 4> ModularLoRAWeightsManager::attention_names(int layer) const {
+    if (layer >= 0 && static_cast<std::size_t>(layer) < mConfig.attention_names.size()) {
+        return mConfig.attention_names[static_cast<std::size_t>(layer)];
+    }
+    return {mConfig.lora_config.q_proj_name, "k_proj", "v_proj", mConfig.lora_config.o_proj_name};
+}
+
 void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
     if (!enabled()) return;
 
     for (int l = 0; l < (int)mMaster.blocks.size(); ++l) {
-        std::string prefix = fmt::format("{}.{}", mConfig.tensor_prefix, l);
-        const auto names = static_cast<std::size_t>(l) < mConfig.attention_names.size()
-                               ? mConfig.attention_names[l]
-                               : std::array<std::string, 4>{mConfig.lora_config.q_proj_name,
-                                                            "k_proj",
-                                                            "v_proj",
-                                                            mConfig.lora_config.o_proj_name};
+        const std::string prefix = layer_prefix(l);
+        const auto names = attention_names(l);
         auto& block = mMaster.blocks[l];
 
         if (block.attention.q.has_value()) {

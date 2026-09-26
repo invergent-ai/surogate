@@ -274,17 +274,18 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
                                   256 * sizeof(float),
                                   cudaMemcpyHostToDevice));
 
-            state.momentum_state =
-                mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_state", {static_cast<long>(state.state_elems)});
+            state.momentum_state = mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_momentum",
+                                                        {static_cast<long>(state.state_elems)});
             state.momentum_absmax =
                 mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
 
+            // As update_lora_normuon allocates and the checkpoint stores them: one row or column of
+            // variances per tensor, not the tensor's own [M, N].
             state.variance_buffers.clear();
-            for (size_t i = 0; i < state.variance_shapes.size(); ++i) {
-                const auto& shape = state.variance_shapes[i];
-                state.variance_buffers.push_back(mAllocator->allocate(ETensorDType::FP32,
-                                                                      fmt::format("lora_normuon_var_{}", i).c_str(),
-                                                                      {shape.first, shape.second}));
+            for (const auto& [M, N] : state.variance_shapes) {
+                state.variance_buffers.push_back(mAllocator->allocate(
+                    ETensorDType::FP32, "lora_normuon_variance",
+                    {static_cast<long>(optimizers::normuon_variance_buffer_size(M, N))}));
             }
         }
 
@@ -1211,36 +1212,42 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         if (state.values_restored && (restored_params != state.total_params || restored_shapes != state.variance_shapes))
             throw std::runtime_error("LoRA NorMuon checkpoint geometry does not match the adapter");
 
-        state.momentum_quantiles = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_quantiles", {256});
-        std::vector<float> h_quantiles(256);
-        optimizers::create_normuon_quantiles(h_quantiles.data());
-        CUDA_CHECK(
-            cudaMemcpy(state.momentum_quantiles.Data, h_quantiles.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
+        if (!state.momentum_quantiles.Data) {
+            state.momentum_quantiles = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_quantiles", {256});
+            std::vector<float> h_quantiles(256);
+            optimizers::create_normuon_quantiles(h_quantiles.data());
+            CUDA_CHECK(cudaMemcpy(state.momentum_quantiles.Data, h_quantiles.data(), 256 * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+        }
 
-        state.momentum_state =
-            mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_momentum", {static_cast<long>(state.state_elems)});
-        state.momentum_absmax =
-            mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
+        // A checkpoint load already allocated the moments and filled them; starting them over here
+        // would resume the adapter with a cold optimizer.
+        if (!state.values_restored) {
+            state.momentum_state = mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_momentum",
+                                                        {static_cast<long>(state.state_elems)});
+            state.momentum_absmax =
+                mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax", {static_cast<long>(state.num_blocks)});
 
-        optimizers::init_normuon_momentum_state(reinterpret_cast<unsigned char*>(state.momentum_state.Data),
-                                                state.momentum_absmax.template get<float>(),
-                                                state.state_elems,
-                                                main_stream);
+            optimizers::init_normuon_momentum_state(reinterpret_cast<unsigned char*>(state.momentum_state.Data),
+                                                    state.momentum_absmax.template get<float>(),
+                                                    state.state_elems,
+                                                    main_stream);
 
-        state.variance_buffers.clear();
-        for (const auto& shape : state.variance_shapes) {
-            int M = shape.first;
-            int N = shape.second;
-            size_t var_size = optimizers::normuon_variance_buffer_size(M, N);
-            Tensor var_buf =
-                mAllocator->allocate(ETensorDType::FP32, "lora_normuon_variance", {static_cast<long>(var_size)});
-            std::vector<float> ones(var_size, 1.0f);
-            CUDA_CHECK(cudaMemcpyAsync(var_buf.Data,
-                                       ones.data(),
-                                       var_size * sizeof(float),
-                                       cudaMemcpyHostToDevice,
-                                       main_stream));
-            state.variance_buffers.push_back(std::move(var_buf));
+            state.variance_buffers.clear();
+            for (const auto& shape : state.variance_shapes) {
+                int M = shape.first;
+                int N = shape.second;
+                size_t var_size = optimizers::normuon_variance_buffer_size(M, N);
+                Tensor var_buf =
+                    mAllocator->allocate(ETensorDType::FP32, "lora_normuon_variance", {static_cast<long>(var_size)});
+                std::vector<float> ones(var_size, 1.0f);
+                CUDA_CHECK(cudaMemcpyAsync(var_buf.Data,
+                                           ones.data(),
+                                           var_size * sizeof(float),
+                                           cudaMemcpyHostToDevice,
+                                           main_stream));
+                state.variance_buffers.push_back(std::move(var_buf));
+            }
         }
 
         size_t max_dim = std::max(state.max_weight_M, state.max_weight_N);

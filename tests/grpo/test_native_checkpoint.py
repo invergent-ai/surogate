@@ -142,6 +142,49 @@ def test_resume_rejects_mismatched_policy_or_partial_state_loading(tmp_path):
         NativeCheckpointCoordinator(train, orch)
 
 
+class AdapterTrainer(Trainer):
+    """Writes a real adapter file holding `modules` on two layers."""
+
+    def __init__(self, modules):
+        self.modules = modules
+
+    def save_checkpoint(self, directory, step):
+        from safetensors.torch import save_file
+
+        super().save_checkpoint(directory, step)
+        tensors = {}
+        for layer in range(2):
+            for module in self.modules:
+                parent = "linear_attn" if module.startswith("in_proj") else \
+                    "self_attn" if module in ("q_proj", "k_proj", "v_proj", "o_proj") else "mlp"
+                for part in ("A", "B"):
+                    tensors[f"base_model.model.model.layers.{layer}.{parent}.{module}.lora_{part}.weight"] = \
+                        torch.zeros(2, 2)
+        save_file(tensors, str(Path(directory) / f"step_{step:08d}" / "adapter_model.safetensors"))
+
+
+def test_all_checkpoint_resumes_under_the_modules_its_adapter_holds(tmp_path):
+    """`all` adapts more after #218 (the linear-attention projections), so an older `all` adapter loads only
+    under its own explicit target list; the checkpoint must accept that list, and no other (#220)."""
+    old = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    train, orch = configs(tmp_path)
+    coordinator = NativeCheckpointCoordinator(train, orch)
+    coordinator.save_training(AdapterTrainer(old), 1)
+    coordinator.save_orchestrator(Progress(step=1), Buffer([5]), next_group_id=9, depth_state={})
+
+    assert NativeCheckpointCoordinator(train, orch).resume_step == 1
+    train.lora_target_modules = list(reversed(old))
+    assert NativeCheckpointCoordinator(train, orch).resume_step == 1
+    for listed in (old + ["in_proj_qkv"], old[:-1]):
+        train.lora_target_modules = listed
+        with pytest.raises(ValueError, match="configuration does not match"):
+            NativeCheckpointCoordinator(train, orch)
+    train.lora_target_modules = old
+    train.lora_alpha = 32
+    with pytest.raises(ValueError, match="configuration does not match"):
+        NativeCheckpointCoordinator(train, orch)
+
+
 def test_checkpoint_cadence_and_retention_keep_complete_pairs(tmp_path):
     train, orch = configs(tmp_path)
     train.save_steps = 2
