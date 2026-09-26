@@ -18,6 +18,28 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 
+def adapter_target_modules(adapter_file):
+    """The sorted target module names a PEFT adapter file holds (q_proj, in_proj_qkv, ...).
+
+    A module is named by its last path component, as lora_target_modules names it; the MoE router
+    (``mlp.gate``) is left out, since train_router adapts it, not a target list.
+    """
+    from safetensors import safe_open
+
+    try:
+        with safe_open(str(adapter_file), "pt") as f:
+            names = list(f.keys())
+    except Exception:
+        return None
+    modules = set()
+    for name in names:
+        module = name.rsplit(".lora_", 1)[0]
+        if module.endswith(".mlp.gate"):
+            continue
+        modules.add(module.rsplit(".", 1)[-1])
+    return sorted(modules)
+
+
 class NativeCheckpointCoordinator:
     def __init__(self, train, orch):
         self.train, self.orch = train, orch
@@ -52,7 +74,7 @@ class NativeCheckpointCoordinator:
                 manifest = self._read_complete(path)
                 if manifest is None:
                     continue
-                if manifest["identity"] != self.identity:
+                if manifest["identity"] != self.identity and not self._holds_listed_targets(manifest["identity"], path, step):
                     raise ValueError("native checkpoint model, adapter, optimizer, or sequence configuration does not match this run")
                 self.resume_step, self.resume_path = step, path
                 break
@@ -65,6 +87,20 @@ class NativeCheckpointCoordinator:
                 raise ValueError("No matching complete native checkpoint; use a fresh output directory for a new run")
         if self.resume_path and orch.ckpt and (orch.ckpt.skip_progress or orch.ckpt.skip_buffer):
             raise ValueError("native resume restores progress and buffer together; skip_progress/skip_buffer are unsupported")
+
+    def _holds_listed_targets(self, recorded, path, step):
+        """Whether a checkpoint recorded with ``all`` holds exactly the modules this run lists.
+
+        What ``all`` adapts grows with the runtime (#218 added the linear-attention projections), so an
+        adapter trained under ``all`` on an older build no longer loads as ``all``: the trainer asks for its
+        own target modules instead. Those are what the adapter file holds, not what the word said.
+        """
+        if recorded.get("targets") != ["all"] or self.identity["targets"] == ["all"]:
+            return False
+        if {**recorded, "targets": self.identity["targets"]} != self.identity:
+            return False
+        return self.identity["targets"] == adapter_target_modules(
+            path / "trainer" / f"step_{step - 1:08d}" / "adapter_model.safetensors")
 
     def _read_complete(self, path):
         try:

@@ -5,6 +5,7 @@
 #ifndef SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
 #define SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -194,6 +195,12 @@ public:
 
     // ITensorContainer interface
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
+
+    /// The PEFT module path layer `layer`'s adapters are exported under, and the names of its
+    /// attention projections (q, k, v, o). Anything else that names these tensors -- the trainer's
+    /// get_lora_weights / get_lora_gradients -- takes them from here so it agrees with the export.
+    [[nodiscard]] std::string layer_prefix(int layer) const;
+    [[nodiscard]] std::array<std::string, 4> attention_names(int layer) const;
 
 private:
     Config mConfig;

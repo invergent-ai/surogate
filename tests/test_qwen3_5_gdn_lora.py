@@ -366,3 +366,61 @@ def test_adapter_without_linear_attention_is_refused(model_case):
         for adapter_file in ckpt_adapters:
             adapter_file.write_bytes((tmp / "new" / "adapter_model.safetensors").read_bytes())
         refused(lambda t: t.load_checkpoint(str(tmp / "ckpt"), 1), "checkpoint geometry does not match the adapter")
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_normuon_resume_continues_the_optimizer(model_case):
+    """A NorMuon LoRA checkpoint resumes with the optimizer state it saved (#220). Loading used to fail on the
+    variances (saved 1-D, one row or column per tensor, but allocated [M, N] on load), and once loaded, the
+    first update allocated fresh moments over them: a cold optimizer under a warm adapter."""
+    from safetensors.torch import load_file
+    from surogate import _surogate as sg
+
+    name, model_dir, vocab_hi = model_case
+    if name != "qwen35_0.8b_mini":
+        pytest.skip("one model is enough")
+    seq = 64
+    options = sg.OptimizerConfig(optimizer="normuon", learning_rate=1e-3)
+
+    def update(trainer, step):
+        x, y = _tokens(seq, vocab_hi, seed=step)
+        trainer.step(x, y)
+        result = trainer.update_with_config(options, step)
+        assert np.isfinite(result["norm"]) and result["norm"] > 0
+
+    def state(directory, step):
+        return load_file(str(directory / f"step_{step:08d}" / "lora_optimizer.safetensors"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        trainer = _trainer(model_dir, ["all"], seq)
+        update(trainer, 1)
+        trainer.save_checkpoint(str(tmp / "saved"), 0)
+        saved = state(tmp / "saved", 0)
+        variances = [k for k in saved if k.startswith("lora_normuon.variance_")]
+        assert variances and all(saved[k].dim() == 1 for k in variances)
+        update(trainer, 2)
+        update(trainer, 3)
+        expected = {k: torch.from_dlpack(v).clone().float().cpu() for k, v in trainer.get_lora_weights(0).items()}
+        trainer.save_checkpoint(str(tmp / "expected"), 2)
+        del trainer
+        torch.cuda.empty_cache()
+
+        resumed = _trainer(model_dir, ["all"], seq)
+        resumed.load_checkpoint(str(tmp / "saved"), 0)
+        resumed.save_checkpoint(str(tmp / "restored"), 0)
+        restored = state(tmp / "restored", 0)
+        assert restored.keys() == saved.keys()
+        assert all(torch.equal(restored[k], saved[k]) for k in saved)
+        update(resumed, 2)
+        update(resumed, 3)
+        # A cold restart puts every variance back to one before the update, far outside these bounds.
+        resumed.save_checkpoint(str(tmp / "resumed"), 2)
+        reference, actual = state(tmp / "expected", 2), state(tmp / "resumed", 2)
+        for k in variances:
+            torch.testing.assert_close(actual[k], reference[k], rtol=0.02, atol=1e-8)
+        for k, v in resumed.get_lora_weights(0).items():
+            torch.testing.assert_close(torch.from_dlpack(v).float().cpu(), expected[k], rtol=0.02, atol=1e-4)
+        del resumed
+        torch.cuda.empty_cache()
