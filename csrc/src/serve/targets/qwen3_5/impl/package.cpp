@@ -61,6 +61,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                                  std::string(target_key) + "'");
     }
     if (identity.weights_id == "groupwise-int") { return WeightsProfile::GroupwiseInt; }
+    if (identity.weights_id == "bf16") { return WeightsProfile::Bf16; }
     if (identity.weights_id == "nvfp4-mixed") { return WeightsProfile::Nvfp4Uniform; }
     if (identity.weights_id == "nvfp4-all") { return WeightsProfile::Nvfp4All; }
     if (identity.weights_id == "fp8-block" || identity.weights_id == "fp8-channel") {

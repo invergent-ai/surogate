@@ -27,13 +27,16 @@
 namespace sinfer::ops {
 
 namespace {
-// A parent split by row range straight into its outputs: the K-quants and block-scaled FP8
-// both project any range, so the fused ops need no registered shape for either.
+// A parent split by row range straight into its outputs: the K-quants, block-scaled FP8 and
+// BF16 (one contiguous plane, cuBLASLt) all project any range, so the fused ops need no
+// registered shape for them. An unquantised checkpoint's gate/up reaches this as BF16.
 bool row_projectable(QType qtype) {
-    return detail::ggml::is_ggml_qtype(qtype) || detail::fp8_block::is_fp8_block_qtype(qtype);
+    return qtype == QType::BF16_CTRL || detail::ggml::is_ggml_qtype(qtype) ||
+           detail::fp8_block::is_fp8_block_qtype(qtype);
 }
 std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
                                                      std::int32_t max_tokens) {
+    if (qtype == QType::BF16_CTRL) { return 0; } // cuBLASLt takes nothing from the arena
     return detail::fp8_block::is_fp8_block_qtype(qtype)
                ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
                : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);

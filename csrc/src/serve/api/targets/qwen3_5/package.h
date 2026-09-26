@@ -49,6 +49,8 @@ enum class WeightsProfile : std::uint8_t {
     Nvfp4MlpOnly,
     /// Every language linear NVFP4, from the export that quantises them all.
     Nvfp4All,
+    /// An unquantised checkpoint served as it is: every projection BF16.
+    Bf16,
 };
 
 /// Do these weights need the sm_120 block-scaled FP4 MMA?
@@ -64,6 +66,7 @@ enum class WeightsProfile : std::uint8_t {
     // Groupwise int and block-scaled FP8 have sm_89 kernels of their own.
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::Fp8Block:
+    case WeightsProfile::Bf16:
         return false;
     case WeightsProfile::Nvfp4MixedBf16:
     case WeightsProfile::Nvfp4Uniform:
