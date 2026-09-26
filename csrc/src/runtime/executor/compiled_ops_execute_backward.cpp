@@ -1043,8 +1043,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Stream-driven backward execution (flag-gated pass-through mode).
     // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
     // op_profile — matches the Llama-only scope of the forward stream path.
+    // SUROGATE_BWD_FORCE_FLAT=1 runs an eager backward through the flat loop a captured
+    // backward uses, to tell a flat-loop defect from a capture defect.
+    static const bool force_flat_backward = env_int("SUROGATE_BWD_FORCE_FLAT", 0) != 0;
     const bool bwd_stream_driven = !graph.instruction_stream.empty() && !bwd_stream_capturing &&
-                                   bwd_tile_group_starts.empty() && !mForceLinear;
+                                   bwd_tile_group_starts.empty() && !mForceLinear && !force_flat_backward;
 
     // Derive the ACTUAL backward layer visit order from the compiled graph so
     // handle_layer_start prefetches the layer that really runs next (see
@@ -1156,12 +1159,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
         }
 
-        // Eager-only side-stream / host-callback work. handle_layer_end
-        // self-skips when mCapturing; debug dump and grad streaming/reduce/
-        // notify/offload do their own host-side recording that's not
-        // permitted during CUDA stream capture.
+        // handle_layer_end runs under capture too: it guards its capture-unsafe work on
+        // mCapturing (the internal graphs) itself, and it is what releases this layer's
+        // prefetch slot. Skipping it under the outer full-step capture (train_step_graphed)
+        // left every slot busy, so each backward prefetch overwrote a slot by round-robin,
+        // often the one the running layer was still reading: with sharded weights (ZeRO-3)
+        // every layer's dgrad read another layer's weights, and the gradient grew ~10x per
+        // layer down the stack while the loss stayed right.
+        handle_layer_end(L);
+
+        // Eager-only side-stream / host-callback work: debug dump and grad
+        // streaming/reduce/notify/offload do their own host-side recording
+        // that's not permitted during CUDA stream capture.
         if (!capturing) {
-            handle_layer_end(L);
             if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
 
             if (mGrads.is_streaming_grads()) {
