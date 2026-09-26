@@ -80,11 +80,17 @@ FP8_BLOCK = "fp8-block"
 #: compressed-tensors per-channel FP8 (one scale per row, dynamic per-token activations):
 #: the same object graph, stored row-scaled and served by the same route.
 FP8_CHANNEL = "fp8-channel"
-PROFILES = (GROUPWISE_INT, NVFP4_MIXED_BF16, NVFP4_UNIFORM, NVFP4_MLP_ONLY, NVFP4_ALL, FP8_BLOCK, FP8_CHANNEL)
+#: An unquantised checkpoint served as it is: every projection BF16, as the checkpoint stores
+#: it. Surogate does not quantise the weights a user brings (the owner's rule), so this is what
+#: a checkpoint without a quantization_config converts to.
+DENSE_BF16 = "bf16"
+PROFILES = (GROUPWISE_INT, DENSE_BF16, NVFP4_MIXED_BF16, NVFP4_UNIFORM, NVFP4_MLP_ONLY, NVFP4_ALL, FP8_BLOCK,
+            FP8_CHANNEL)
 
 #: Each stored weight profile has an unambiguous identity, independent of model name.
 WEIGHTS_IDS = {
     GROUPWISE_INT: "groupwise-int",
+    DENSE_BF16: "bf16",
     NVFP4_UNIFORM: "nvfp4-mixed",
     NVFP4_MIXED_BF16: "nvfp4-mixed-bf16",
     NVFP4_MLP_ONLY: "nvfp4-mlp-only",
@@ -187,6 +193,13 @@ def export_for(profile: str, geometry: Geometry) -> Export:
             vocabulary=W8, draft_head=W8,
             attention_input=(W8,), attention_output=W8,
             gdn_input=(W8,), gdn_output=W8, mlp=(W8, W8),
+        )
+    if profile == DENSE_BF16:
+        return Export(
+            attention_storage=FUSED, gdn_storage=FUSED, control_storage=SPLIT_A_B,
+            vocabulary=BF16, draft_head=BF16,
+            attention_input=(BF16,), attention_output=BF16,
+            gdn_input=(BF16,), gdn_output=BF16, mlp=(BF16, BF16),
         )
     if profile == NVFP4_UNIFORM:
         return Export(
@@ -378,22 +391,23 @@ def build_draft_head_specs(g: Geometry,
     )
 
 
-def build_mtp_specs(g: Geometry) -> tuple[TensorSpec, ...]:
-    # The draft block is byte-wide under every export: it is one layer, and the widths the
-    # quantised exports chose for the stack buy nothing here.
+def build_mtp_specs(g: Geometry, width: str = W8) -> tuple[TensorSpec, ...]:
+    # The draft block is byte-wide under every quantised export: it is one layer, and the widths
+    # the quantised exports chose for the stack buy nothing here. An unquantised export keeps it
+    # as the checkpoint stores it.
     return (
-        _tensor("mtp/input_projection", (g.hidden, 2 * g.hidden), W8),
+        _tensor("mtp/input_projection", (g.hidden, 2 * g.hidden), width),
         _tensor("mtp/embedding_norm", (g.hidden,), BF16),
         _tensor("mtp/hidden_norm", (g.hidden,), BF16),
         _tensor("mtp/layer/input_norm", (g.hidden,), BF16),
         _tensor("mtp/layer/attention/query_key_gate_value",
-                (2 * g.query_size + 2 * g.kv_size, g.hidden), W8),
+                (2 * g.query_size + 2 * g.kv_size, g.hidden), width),
         _tensor("mtp/layer/attention/query_norm", (g.head_dim,), BF16),
         _tensor("mtp/layer/attention/key_norm", (g.head_dim,), BF16),
-        _tensor("mtp/layer/attention/output", (g.hidden, g.query_size), W8),
+        _tensor("mtp/layer/attention/output", (g.hidden, g.query_size), width),
         _tensor("mtp/layer/post_attention_norm", (g.hidden,), BF16),
-        _tensor("mtp/layer/mlp/gate_up", (2 * g.intermediate, g.hidden), W8),
-        _tensor("mtp/layer/mlp/down", (g.hidden, g.intermediate), W8),
+        _tensor("mtp/layer/mlp/gate_up", (2 * g.intermediate, g.hidden), width),
+        _tensor("mtp/layer/mlp/down", (g.hidden, g.intermediate), width),
         _tensor("mtp/final_norm", (g.hidden,), BF16),
     )
 
@@ -412,7 +426,7 @@ def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
     tensors = (build_text_core_specs(geometry, profile)
                + build_draft_head_specs(geometry, profile))
     if (export.mtp if mtp is None else mtp) and geometry.mtp_layers:
-        tensors += build_mtp_specs(geometry)
+        tensors += build_mtp_specs(geometry, BF16 if profile == DENSE_BF16 else W8)
     if export.vision if vision is None else vision:
         tensors += build_vision_specs(geometry, vision_storage=vision_storage)
     return tensors

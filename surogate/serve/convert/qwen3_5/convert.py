@@ -92,8 +92,8 @@ def _config_summary(g: inventory.Geometry, *, vision: bool = True) -> dict:
             "vision": g.declared.hf_config.get("vision_config") if vision else None}
 
 
-def preflight_inventory(geometry: inventory.Geometry) -> None:
-    inventory.export_inventory(inventory.GROUPWISE_INT, geometry).validate_inventory()
+def preflight_inventory(geometry: inventory.Geometry, profile: str = inventory.GROUPWISE_INT) -> None:
+    inventory.export_inventory(profile, geometry).validate_inventory()
     recipe.validate_recipe_coverage(geometry)
 
 
@@ -114,14 +114,15 @@ def carries_vision(object_specs) -> bool:
 
 def build_object_plan(
     resources: Mapping[str, bytes], *, mtp: bool = True, vision: bool = True,
-    native: Mapping[str, str] | None = None, object_specs=None, geometry=None
+    native: Mapping[str, str] | None = None, object_specs=None, geometry=None,
+    profile: str = inventory.GROUPWISE_INT,
 ) -> ObjectPlan:
     """Compute every payload-relative object offset for the selected variant. `native` names
     the objects served as K-quants verbatim from a GGUF, with their format rewritten."""
-    preflight_inventory(geometry)
+    preflight_inventory(geometry, profile)
     if object_specs is None:
         _, object_specs = inventory.active_specs(mtp=mtp, vision=vision,
-                                                 geometry=geometry)
+                                                 geometry=geometry, profile=profile)
     if native:
         object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
@@ -185,6 +186,7 @@ def preflight_conversion(
     native: Mapping[str, str] | None = None,
     object_specs=None,
     geometry: inventory.Geometry | None = None,
+    profile: str = inventory.GROUPWISE_INT,
 ) -> ConversionPreflight:
     """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
 
@@ -193,7 +195,7 @@ def preflight_conversion(
     if geometry is None:
         geometry = inventory.geometry_from_checkpoint(model, config, extra_names=repack.sources if repack else ())
     config_summary = _config_summary(geometry, vision=vision)
-    preflight_inventory(geometry)
+    preflight_inventory(geometry, profile)
     recipes = active_recipes(mtp=mtp, vision=vision, geometry=geometry)
     if planned or not mtp or not vision:
         # surogate vendor patches (PATCHES.md #14/#15): repacked objects read
@@ -210,7 +212,7 @@ def preflight_conversion(
     resources = load_resources(model, geometry)
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map, mtp=mtp, vision=vision, native=native,
-                                    object_specs=object_specs, geometry=geometry)
+                                    object_specs=object_specs, geometry=geometry, profile=profile)
     ranking = _tools_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model, geometry=geometry)
     return ConversionPreflight(
@@ -282,12 +284,13 @@ def build_conversion_report(
     revision: str | None = None,
     environment: Mapping[str, object] | None = None,
     geometry: "inventory.Geometry | None" = None,
+    profile: str = inventory.GROUPWISE_INT,
 ) -> dict[str, object]:
     """Build the external descriptive conversion report."""
 
     return family_conversion.build_conversion_report(
         identity=ArtifactIdentity(
-            inventory.model_id_for(geometry), inventory.WEIGHTS_ID
+            inventory.model_id_for(geometry), inventory.weights_id_for(profile)
         , architecture="qwen3_5"),
         target_key=inventory.TARGET_KEY,
         recipe_id=recipe_id_for(geometry),
@@ -317,8 +320,14 @@ def convert(
     vision: bool = True,
     vision_storage: str = inventory.VISION_BF16,
     dflash_model_dir: str | Path | None = None,
+    profile: str = inventory.GROUPWISE_INT,
 ) -> Path:
-    """Run the complete registered conversion and return the report path."""
+    """Run the complete registered conversion and return the report path. `profile` is
+    groupwise-int (the GGUF repack path) or bf16 (an unquantised checkpoint as it is)."""
+    if profile not in (inventory.GROUPWISE_INT, inventory.DENSE_BF16):
+        raise ValueError(f"convert() writes groupwise-int or bf16, not {profile!r}")
+    if gguf_repack is not None and profile != inventory.GROUPWISE_INT:
+        raise ValueError("a GGUF repack is stored groupwise-int")
 
     started = time.perf_counter()
     model = Path(model_dir)
@@ -334,7 +343,7 @@ def convert(
     geometry = replace(geometry, mtp_layers=geometry.mtp_layers if mtp else 0)
     recipes = active_recipes(mtp=mtp, vision=vision, geometry=geometry)
     active_tensor_specs, active_object_specs = inventory.active_specs(
-        mtp=mtp, vision=vision, geometry=geometry, vision_storage=vision_storage)
+        mtp=mtp, vision=vision, geometry=geometry, profile=profile, vision_storage=vision_storage)
     # A tied head duplicates the vocabulary table; drop the copy and let the loader point
     # both plans at the survivor.
     tied = set(inventory.tied_duplicate_objects(recipes, active_tensor_specs))
@@ -411,7 +420,8 @@ def convert(
         recipes.update((r.object_name, r) for r in dflash_recipes)
     preflight = preflight_conversion(
         model, repack, planned + tuple(native) + tuple(sorted(tied)) + tuple(halves) + tuple(in_place),
-        mtp=mtp, vision=vision, native=native, object_specs=active_object_specs, geometry=geometry
+        mtp=mtp, vision=vision, native=native, object_specs=active_object_specs, geometry=geometry,
+        profile=profile,
     )
 
     print(
@@ -435,7 +445,8 @@ def convert(
         dflash_reader = stack.enter_context(ShardReader.for_directory(dflash_model)) if dflash_model else None
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.model_id_for(geometry), inventory.WEIGHTS_ID, architecture="qwen3_5"),
+            ArtifactIdentity(inventory.model_id_for(geometry), inventory.weights_id_for(profile),
+                             architecture="qwen3_5"),
             preflight.object_plan.specs,
             geometry=geometry_block(geometry),
             dflash_geometry=dflash_checkpoint.geometry_block(dflash_geometry) if dflash_geometry else None,
@@ -507,6 +518,7 @@ def convert(
         "repacked_objects": len(repacked_names),
         "mtp": mtp,
         "dflash_model": str(dflash_model) if dflash_model else None,
+        "profile": profile,
     }
     report = build_conversion_report(
         geometry=geometry,
@@ -520,6 +532,7 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
         ranking_path=ranking,
+        profile=profile,
     )
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:
@@ -552,10 +565,13 @@ def _export_writer(profile: str):
 def profile_for_checkpoint(config: Mapping[str, object]) -> str:
     """Which export this checkpoint is, from what it says about itself.
 
-    Unquantized checkpoints use the groupwise policy; quantized checkpoints dispatch by
-    their declared encoding. Tensor metadata resolves the per-layer exceptions.
+    An unquantised checkpoint is served as it is (bf16); a quantised one dispatches by its
+    declared encoding, and an encoding no export reads is refused rather than re-quantised.
+    Tensor metadata resolves the per-layer exceptions.
     """
     quantization = config.get("quantization_config") or {}
+    if not quantization:
+        return inventory.DENSE_BF16
     text = json.dumps(quantization) if isinstance(quantization, Mapping) else ""
     method = str(quantization.get("quant_method", "")) if isinstance(quantization, Mapping) else ""
     if method == "fp8" and isinstance(quantization, Mapping) and quantization.get("weight_block_size"):
@@ -573,7 +589,8 @@ def profile_for_checkpoint(config: Mapping[str, object]) -> str:
         (group.get("weights") or {}).get("num_bits") == 4
         for group in (quantization.get("config_groups") or {}).values()
     ):
-        return inventory.GROUPWISE_INT
+        raise ValueError(f"quantization_config {method or text!r} is not a storage scheme this target serves "
+                         "(BF16, NVFP4, block/channel FP8, or a GGUF)")
     if method.lower() in ("modelopt", "nvfp4", "modelopt_fp4"):
         return inventory.NVFP4_UNIFORM
     groups = quantization.get("config_groups", {})
@@ -618,14 +635,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         _config, inventory.geometry_from_config(_config), _model, what=family_conversion.checkpoint_label(_model))
     if _scope:
         print(_scope, flush=True)
-    profile = args.profile or profile_for_checkpoint(_config)
-    if profile == inventory.GROUPWISE_INT:
+    # A GGUF bridge directory carries no quantization_config; its repack is groupwise-int.
+    profile = args.profile or (inventory.GROUPWISE_INT if args.gguf_repack else profile_for_checkpoint(_config))
+    if profile in (inventory.GROUPWISE_INT, inventory.DENSE_BF16):
         convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
                 mtp=not args.no_mtp, vision=not args.no_vision,
-                vision_storage=args.vision_storage, dflash_model_dir=args.dflash_model)
+                vision_storage=args.vision_storage, dflash_model_dir=args.dflash_model,
+                profile=profile)
         return
     if args.dflash_model is not None:
-        raise ValueError("--dflash-model currently requires the groupwise-int conversion profile")
+        raise ValueError("--dflash-model currently requires the groupwise-int or bf16 conversion profile")
     writer = _export_writer(profile)
     if profile in DUAL_SOURCE_PROFILES:
         if args.quantized_model is None:
