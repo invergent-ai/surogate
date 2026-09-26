@@ -408,6 +408,19 @@ class NodeTrainer:
         ir_json = build_dsl_ir_for_model(self._config.model_dir, extra_config=dsl_extra or None)
         self._config.runtime_config.dsl_ir_json = ir_json
 
+        from surogate.train.row_packing import cuda_graphs_for_gated_delta_rule
+
+        keep_graphs, warning = cuda_graphs_for_gated_delta_rule(
+            ir_json,
+            use_cuda_graphs=bool(getattr(self._config, "use_cuda_graphs", False)),
+            packed=bool(self._config.sample_packing),
+        )
+        if warning:
+            logger.warning(warning)
+        if not keep_graphs and getattr(self._config, "use_cuda_graphs", False):
+            self._config.use_cuda_graphs = False
+            self._config.runtime_config.use_cuda_graphs = False
+
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
 

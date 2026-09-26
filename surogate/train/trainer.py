@@ -318,14 +318,16 @@ class SurogateTrainerWrapper:
 
         # Packed documents restart the Gated DeltaNet state only in eager execution; a captured
         # step would carry each document's recurrent state into the next one.
-        from surogate.train.row_packing import gated_delta_rule_in
+        from surogate.train.row_packing import cuda_graphs_for_gated_delta_rule
 
-        packed = bool(config.sample_packing) or bool(getattr(config, "row_packing", False))
-        if packed and getattr(config, "use_cuda_graphs", False) and gated_delta_rule_in(ir_json):
-            logger.warning(
-                "Disabling CUDA graphs: packed documents are isolated in the linear-attention (Gated DeltaNet) "
-                "layers only in eager execution. Train with sample_packing: false to keep CUDA graphs."
-            )
+        keep_graphs, warning = cuda_graphs_for_gated_delta_rule(
+            ir_json,
+            use_cuda_graphs=bool(getattr(config, "use_cuda_graphs", False)),
+            packed=bool(config.sample_packing) or bool(getattr(config, "row_packing", False)),
+        )
+        if warning:
+            logger.warning(warning)
+        if not keep_graphs and getattr(config, "use_cuda_graphs", False):
             config.use_cuda_graphs = False
             config.runtime_config.use_cuda_graphs = False
 

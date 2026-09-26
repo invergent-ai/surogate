@@ -296,3 +296,21 @@ def test_row_packing_refuses_unverified_token_mixers(monkeypatch):
         assert problem is not None and op in problem
     monkeypatch.setenv("SUROGATE_ALLOW_UNVERIFIED_ROW_PACKING", "1")
     assert row_packing.document_isolation_problem(_ir("mamba_ssm_scan")) is None
+
+
+def test_cuda_graphs_and_gated_delta_rule():
+    import json
+
+    from surogate.train.row_packing import cuda_graphs_for_gated_delta_rule
+
+    gdn = json.dumps({"modules": [{"forward": [{"op": "chunk_gated_delta_rule"}]}]})
+    dense = json.dumps({"modules": [{"forward": [{"op": "flash_attention"}]}]})
+    # Not a GDN model, or graphs already off: nothing to say.
+    assert cuda_graphs_for_gated_delta_rule(dense, use_cuda_graphs=True, packed=True) == (True, None)
+    assert cuda_graphs_for_gated_delta_rule(gdn, use_cuda_graphs=False, packed=True) == (False, None)
+    # Packed documents on a GDN model: graphs off, with the incompatibility stated.
+    keep, warning = cuda_graphs_for_gated_delta_rule(gdn, use_cuda_graphs=True, packed=True)
+    assert keep is False and "incompatible" in warning and "Disabling CUDA graphs" in warning
+    # Unpacked: graphs stay on, and the user is still told the two are incompatible.
+    keep, warning = cuda_graphs_for_gated_delta_rule(gdn, use_cuda_graphs=True, packed=False)
+    assert keep is True and "incompatible" in warning and "stay on" in warning
