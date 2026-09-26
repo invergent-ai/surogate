@@ -38,7 +38,7 @@ def model_dir():
     return onboarding.prepare_mini_model(snapshot)
 
 
-def _step(model_dir, ngpu: int, graphs: bool, zero3: bool) -> tuple[float, float]:
+def _build(model_dir, ngpu: int, graphs: bool, zero3: bool):
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
     from surogate.utils.hf import get_model_weights_path
@@ -70,12 +70,22 @@ def _step(model_dir, ngpu: int, graphs: bool, zero3: bool) -> tuple[float, float
         qlora_config=None,
     )
     trainer.import_weights(get_model_weights_path(str(model_dir)))
+    return trainer
+
+
+def _rows(ngpu: int):
+    """The same row on every rank, so the averaged gradient is the single-GPU one."""
     rng = np.random.default_rng(0)
     x = np.repeat(rng.integers(10, 8000, size=(1, SEQ), dtype=np.int32), ngpu, axis=0)
     y = np.concatenate([x[:, 1:], np.full((ngpu, 1), -100, np.int32)], axis=1).astype(np.int32)
     pos = np.tile(np.arange(SEQ, dtype=np.int32), (ngpu, 1))
+    return x, y, pos
+
+
+def _step(model_dir, ngpu: int, graphs: bool, zero3: bool) -> tuple[float, float]:
+    trainer = _build(model_dir, ngpu, graphs, zero3)
     config = _surogate.OptimizerConfig(optimizer="adamw_8bit", learning_rate=0.0, grad_clip=0.0)
-    result = dict(trainer.train_step_graphed(x, y, pos, config, 1))
+    result = dict(trainer.train_step_graphed(*_rows(ngpu), config, 1))
     del trainer
     torch.cuda.empty_cache()
     return float(result["loss"]), float(result["norm"])
@@ -143,3 +153,41 @@ def test_zero3_pass_at_another_shape_is_refused_not_a_crash(model_dir, tmp_path)
     output = result.stdout + result.stderr
     assert result.returncode == 0, output[-4000:]
     assert "REFUSED:" in result.stdout and "is not supported" in result.stdout, output[-4000:]
+
+
+def test_zero3_export_writes_the_single_gpu_model(model_dir, tmp_path):
+    """A ZeRO-3 run exports the whole model (#229): every tensor the single-GPU trainer exports, with
+    its dtype, shape and value -- straight after import, and after the same update on the same row."""
+    from safetensors.torch import load_file
+
+    lr = 1e-3
+    config = _surogate.OptimizerConfig(optimizer="adamw_8bit", learning_rate=lr, grad_clip=0.0)
+    for ngpu, zero3 in ((1, False), (2, True)):
+        trainer = _build(model_dir, ngpu, graphs=False, zero3=zero3)
+        trainer.export_model(str(tmp_path / f"gpus{ngpu}_import"))
+        trainer.train_step_graphed(*_rows(ngpu), config, 1)
+        trainer.export_model(str(tmp_path / f"gpus{ngpu}_step"))
+        del trainer
+        torch.cuda.empty_cache()
+
+    imported = load_file(str(tmp_path / "gpus1_import" / "model.safetensors"))
+    for stage in ("import", "step"):
+        single = load_file(str(tmp_path / f"gpus1_{stage}" / "model.safetensors"))
+        sharded = load_file(str(tmp_path / f"gpus2_{stage}" / "model.safetensors"))
+        assert sharded.keys() == single.keys()
+        for name, tensor in single.items():
+            assert sharded[name].dtype == tensor.dtype and sharded[name].shape == tensor.shape, name
+            if stage == "import":
+                assert torch.equal(sharded[name], tensor), name
+            else:
+                # Both runs reduce the same gradient, in a different order. Adam's first step is
+                # sign-like, so an element whose gradient is ~0 may step either way: a few elements are
+                # up to two learning rates apart, the rest at most a bf16 rounding. A stale tensor (the
+                # imported value) would be an Adam step away in nearly every element.
+                a, b = sharded[name].float(), tensor.float()
+                far = ~torch.isclose(a, b, rtol=2**-7, atol=1e-6)
+                assert int(far.sum()) <= max(2, 0.05 * far.numel()), (name, int(far.sum()), far.numel())
+                assert float((a - b).abs().max()) <= 2.5 * lr, name
+    # The update reached the export (a stale work copy would equal the import).
+    moved = load_file(str(tmp_path / "gpus2_step" / "model.safetensors"))
+    assert sum(not torch.equal(moved[name], imported[name]) for name in imported) > len(imported) // 2
