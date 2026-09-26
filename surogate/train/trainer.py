@@ -316,6 +316,19 @@ class SurogateTrainerWrapper:
         config.runtime_config.dsl_ir_json = ir_json
         self._block_schema_summary = _summarize_block_schemas(ir_json)
 
+        # Packed documents restart the Gated DeltaNet state only in eager execution; a captured
+        # step would carry each document's recurrent state into the next one.
+        from surogate.train.row_packing import gated_delta_rule_in
+
+        packed = bool(config.sample_packing) or bool(getattr(config, "row_packing", False))
+        if packed and getattr(config, "use_cuda_graphs", False) and gated_delta_rule_in(ir_json):
+            logger.warning(
+                "Disabling CUDA graphs: packed documents are isolated in the linear-attention (Gated DeltaNet) "
+                "layers only in eager execution. Train with sample_packing: false to keep CUDA graphs."
+            )
+            config.use_cuda_graphs = False
+            config.runtime_config.use_cuda_graphs = False
+
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
 

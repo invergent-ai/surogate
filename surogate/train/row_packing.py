@@ -90,6 +90,13 @@ def _ir_ops(ir_json: str) -> set[str]:
     return ops
 
 
+def gated_delta_rule_in(ir_json: str | None) -> bool:
+    """True when the model has Gated DeltaNet layers. Their packed documents restart only in
+    eager execution: the op runs each document as its own launch sequence from host-side
+    offsets, which a replayed CUDA graph cannot follow (the graphed op runs the whole row)."""
+    return bool(ir_json) and "chunk_gated_delta_rule" in _ir_ops(ir_json)
+
+
 def document_isolation_problem(ir_json: str | None) -> str | None:
     """Why packed rows of this model would not be isolated documents, or None.
 
