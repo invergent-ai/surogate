@@ -225,3 +225,28 @@ def test_quantized_export_refuses_unsupported_optional_component_storage(tmp_pat
     with ShardReader.for_directory(tmp_path) as reader:
         with pytest.raises(ValueError, match=f"--no-{component}"):
             quantized.build(g, inv.NVFP4_ALL, quantized.Sources(reader))
+
+
+def test_an_unquantised_checkpoint_is_served_bf16():
+    from surogate.serve.convert.qwen3_5.convert import profile_for_checkpoint
+
+    assert profile_for_checkpoint(config_for()) == inv.DENSE_BF16
+    assert profile_for_checkpoint({**config_for(), "quantization_config": {}}) == inv.DENSE_BF16
+    # A scheme no export reads is refused, not re-quantised through the dense path.
+    with pytest.raises(ValueError, match="not a storage scheme"):
+        profile_for_checkpoint({**config_for(), "quantization_config": {"quant_method": "gptq", "bits": 4}})
+    assert inv.weights_id_for(inv.DENSE_BF16) == "bf16" and inv.profile_for("bf16") == inv.DENSE_BF16
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+def test_bf16_export_stores_every_matrix_bf16(mtp):
+    g = inv.geometry_from_config(config_for())
+    specs = inv.build_tensor_specs(g, profile=inv.DENSE_BF16, mtp=mtp, vision=False)
+    matrices = [s for s in specs if len(s.shape) == 2 and not s.name.endswith(("token_ids", "conv_weight"))]
+    assert matrices and {s.format for s in matrices} == {inv.BF16}, sorted({(s.name, s.format) for s in matrices
+                                                                            if s.format != inv.BF16})
+    assert any(s.name.startswith("mtp/") for s in matrices) == mtp
+    inv.export_inventory(inv.DENSE_BF16, g).validate_inventory()
+    # The groupwise export of the same checkpoint is unchanged: W8 projections.
+    groupwise = {s.name: s.format for s in inv.build_tensor_specs(g, mtp=mtp, vision=False)}
+    assert groupwise["text/layers/0/mlp/gate_up"] == inv.W8

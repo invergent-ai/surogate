@@ -169,14 +169,18 @@ def validate_structure(
 ) -> StructureSummary:
     """Validate the complete directory without reading tensor payload values."""
 
-    _, object_specs = inventory.active_specs(mtp=mtp, vision=vision, geometry=geometry)
+    try:
+        profile = inventory.profile_for(artifact.identity.weights_id)
+    except ValueError as e:
+        _contract_error(str(e))
+    _, object_specs = inventory.active_specs(mtp=mtp, vision=vision, geometry=geometry, profile=profile)
     present = _object_index(artifact.objects)
     required_resources = {"frontend/tokenizer.json", "frontend/tokenizer_config.json", "frontend/generation_config.json"}
     object_specs = tuple(s for s in object_specs
                          if not (isinstance(s, inventory.ResourceSpec) and s.name not in required_resources and s.name not in present)
                          and not (s.name == "text/output_head" and geometry.tied_embeddings and s.name not in present))
     expected_identity = ArtifactIdentity(
-        inventory.model_id_for(geometry), inventory.WEIGHTS_ID
+        inventory.model_id_for(geometry), inventory.weights_id_for(profile)
     , architecture="qwen3_5")
     if (artifact.identity.architecture, artifact.identity.weights_id) != (
         expected_identity.architecture, expected_identity.weights_id
