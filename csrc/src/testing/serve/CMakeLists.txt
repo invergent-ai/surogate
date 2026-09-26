@@ -691,6 +691,22 @@ sinfer_add_test(sinfer_decisions_v1_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_decisions_v1_test PRIVATE -UNDEBUG -fno-fast-math)
 
+# Thinking levels (decisions_thinking.h): model-free, and held to the v1 golden set's messages.
+sinfer_add_test(sinfer_decisions_thinking_test
+  NEEDS_SOURCE_DIR
+  SOURCES test_decisions_thinking.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_decisions_thinking_test PRIVATE -UNDEBUG -fno-fast-math)
+
+# The thinking prompt on Gemma 4's own template and tokenizer (CPU); skipped without them.
+sinfer_add_test(sinfer_decisions_thinking_gemma4_test
+  SOURCES test_decisions_thinking_gemma4.cpp
+  LIBRARIES sinfer_serve sinfer_engine)
+target_include_directories(sinfer_decisions_thinking_gemma4_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
+target_compile_options(sinfer_decisions_thinking_gemma4_test PRIVATE -UNDEBUG)
+
 sinfer_add_test(sinfer_candidate_readout_test
   SOURCES test_candidate_readout.cpp
   LIBRARIES sinfer_engine)
