@@ -412,7 +412,7 @@ std::string format_request_start(const RequestLogContext& context) {
     }
     if (context.protocol == "decisions") {
         out << " questions=" << context.question_count;
-        if (!context.decision_thinking.empty()) { out << " thinking=" << context.decision_thinking; }
+        if (!context.decision_thinking.empty()) { out << " thinking_level=" << context.decision_thinking; }
     }
     out << " \xE2\x86\x92 submitted";
     return out.str();
@@ -455,7 +455,7 @@ std::string format_request_done(const RequestLogContext& context,
         out << " questions=" << context.question_count << " shared_prefix=" << context.shared_prefix_tokens;
         if (context.decision_attempts > 1) { out << " attempts=" << context.decision_attempts; }
         if (!context.decision_thinking.empty()) {
-            out << " thinking=" << context.decision_thinking << " thought=" << context.decision_thinking_questions
+            out << " thinking_level=" << context.decision_thinking << " thought=" << context.decision_thinking_questions
                 << " reasoning=" << context.decision_reasoning_tokens;
             if (context.decision_thinking_attempts > 1) {
                 out << " thinking_rounds=" << context.decision_thinking_attempts;

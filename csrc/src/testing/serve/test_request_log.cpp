@@ -431,8 +431,8 @@ int main() {
         // exactly what it did before the levels existed.
         failures += check(!start.at("request").at("decisions").contains("thinking") &&
                               !done.at("request").at("decisions").contains("thinking") &&
-                              format_request_start(decisions).find("thinking=") == std::string::npos &&
-                              format_request_done(decisions, answered).find("thinking=") == std::string::npos,
+                              format_request_start(decisions).find("thinking_level=") == std::string::npos &&
+                              format_request_done(decisions, answered).find("thinking_level=") == std::string::npos,
                           "a decisions request without a level grew a thinking record");
         RequestLogContext thinking            = decisions;
         thinking.decision_thinking            = "medium";
@@ -443,9 +443,9 @@ int main() {
         failures += check(thought.at("request").at("decisions").at("thinking") ==
                               Json{{"level", "medium"}, {"questions", 2}, {"reasoning_tokens", 300}, {"attempts", 1}},
                           "a thinking decisions request does not log its level and counts");
-        failures += check(format_request_start(thinking).find(" questions=3 thinking=medium") != std::string::npos,
+        failures += check(format_request_start(thinking).find(" questions=3 thinking_level=medium") != std::string::npos,
                           "a thinking decisions request's start line lacks its level");
-        failures += check(format_request_done(thinking, answered).find(" thinking=medium thought=2 reasoning=300") !=
+        failures += check(format_request_done(thinking, answered).find(" thinking_level=medium thought=2 reasoning=300") !=
                                   std::string::npos &&
                               format_request_done(thinking, answered).find("thinking_rounds=") == std::string::npos,
                           "a thinking decisions request's done line lacks its counts");

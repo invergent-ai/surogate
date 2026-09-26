@@ -289,8 +289,8 @@ for the failed questions only, up to `--decision-attempts` rounds in all; each r
 first logs a warning. When every round fails the request gets HTTP 500 `model returned non-finite
 logits`, as a one-pass readout would.
 
-**Logging.** A request at a level logs it: the console lines gain ` thinking=<level>` (start) and
-` thinking=<level> thought=<questions that thought> reasoning=<thought tokens>` (done, and
+**Logging.** A request at a level logs it: the console lines gain ` thinking_level=<level>` (start)
+and ` thinking_level=<level> thought=<questions that thought> reasoning=<thought tokens>` (done, and
 ` thinking_rounds=N` after a retry); the JSONL records gain `decisions.thinking` with `level`,
 `questions`, `reasoning_tokens` and `attempts`. A request at `none` logs exactly what it did
 before.
