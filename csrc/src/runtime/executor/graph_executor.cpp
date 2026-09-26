@@ -1391,7 +1391,17 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mPhaseArenas.accumulator_bytes > 0) {
                     mPhaseArenas.accumulator_bytes = mGrads.rebindable_accumulator_bytes(*mCompiledBackward);
                 }
-                dsl::allocate_phase_arenas(mPhaseArenas);
+                // The parameters' own storage goes before the arena that replaces it is allocated
+                // (nothing is loaded at the first compile), so the peak holds the weights once.
+                if (base_persistent_bytes > 0) {
+                    mWeights.release_storage_for_persistent_arena(*mCompiledForward, mPhaseArenas.persistent_bytes);
+                }
+                try {
+                    dsl::allocate_phase_arenas(mPhaseArenas);
+                } catch (...) {
+                    mWeights.restore_released_storage();
+                    throw;
+                }
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).
                 dsl::validate_arena_coverage(mPhaseArenas, *mCompiledForward);

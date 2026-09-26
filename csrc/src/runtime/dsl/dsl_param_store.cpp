@@ -336,7 +336,7 @@ std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& grap
     std::size_t high_water = 0;
     for (const auto& kv : mParams) {
         const Entry& entry = kv.second;
-        if (entry.tensor.Data == nullptr) continue;
+        if (entry.tensor.Data == nullptr && !entry.arena_pending) continue;
         const int tid = graph.find_tensor_id(kv.first);
         if (tid < 0) continue;
         const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
@@ -348,18 +348,70 @@ std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& grap
     return high_water;
 }
 
+std::optional<std::size_t> DslParamStore::persistent_arena_offset(const CompiledGraph& graph,
+                                                                  const std::string& name,
+                                                                  const Entry& entry,
+                                                                  std::size_t arena_bytes) const {
+    if (entry.external || entry.managed_by_weight_manager) return std::nullopt;
+    if (entry.tensor.Data == nullptr && !entry.arena_pending) return std::nullopt;
+    const int tid = graph.find_tensor_id(name);
+    if (tid < 0) return std::nullopt;
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.region != RegionKind::Persistent || meta.offset == SIZE_MAX) return std::nullopt;
+    const std::size_t tensor_bytes = entry.tensor.bytes();
+    if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arena_bytes) {
+        return std::nullopt;
+    }
+    return meta.offset;
+}
+
+std::size_t DslParamStore::release_storage_for_persistent_arena(const CompiledGraph& graph, std::size_t arena_bytes) {
+    if (mContentsValid) return 0;  // weights already loaded: the rebind copies them
+    if (mParams.contains("lm_head") && mParams.at("lm_head").storage_alias) return 0;
+    std::size_t released = 0;
+    for (const auto& name : mParamOrder) {
+        auto it = mParams.find(name);
+        if (it == mParams.end()) continue;
+        Entry& entry = it->second;
+        if (entry.arena_pending || !persistent_arena_offset(graph, name, entry, arena_bytes)) continue;
+        released += entry.tensor.bytes();
+        float* preserved_stats = entry.tensor.Stats;
+        const int device = entry.tensor.Device;
+        mAllocator->free(entry.tensor);  // clears Data
+        entry.tensor.Device = device;
+        entry.tensor.Stats = preserved_stats;
+        entry.arena_pending = true;
+    }
+    return released;
+}
+
+void DslParamStore::restore_released_storage() {
+    for (const auto& name : mParamOrder) {
+        auto it = mParams.find(name);
+        if (it == mParams.end() || !it->second.arena_pending) continue;
+        Entry& entry = it->second;
+        std::vector<long> shape(entry.tensor.Sizes.begin(), entry.tensor.Sizes.begin() + entry.tensor.Rank);
+        float* preserved_stats = entry.tensor.Stats;
+        entry.tensor = mAllocator->allocate(entry.tensor.DType, name.c_str(), EAllocationType::ON_DEVICE, shape);
+        entry.tensor.Stats = preserved_stats;
+        entry.arena_pending = false;
+    }
+}
+
 void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
                                                const PhaseArenas& arenas,
                                                cudaStream_t stream) {
     if (mParams.contains("lm_head") && mParams.at("lm_head").storage_alias) return;
-    if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) return;
+    if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) {
+        restore_released_storage();
+        return;
+    }
 
     std::size_t rebound = 0;
+    std::size_t bound_in_place = 0;
     std::size_t skipped_external = 0;
     std::size_t skipped_managed = 0;
-    std::size_t skipped_no_tid = 0;
-    std::size_t skipped_non_persistent = 0;
-    std::size_t skipped_size_mismatch = 0;
+    std::size_t skipped_other = 0;
 
     for (const auto& name : mParamOrder) {
         auto it = mParams.find(name);
@@ -373,26 +425,25 @@ void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
             ++skipped_managed;
             continue;
         }
-        if (entry.tensor.Data == nullptr) continue;
-
-        const int tid = graph.find_tensor_id(name);
-        if (tid < 0) {
-            ++skipped_no_tid;
-            continue;
-        }
-        const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
-        if (meta.region != RegionKind::Persistent || meta.offset == SIZE_MAX) {
-            ++skipped_non_persistent;
-            continue;
-        }
-        const std::size_t tensor_bytes = entry.tensor.bytes();
-        if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arenas.persistent_bytes) {
-            ++skipped_size_mismatch;
+        const auto offset = persistent_arena_offset(graph, name, entry, arenas.persistent_bytes);
+        if (!offset) {
+            if (entry.arena_pending) {
+                throw std::logic_error("DslParamStore: released parameter " + name + " has no persistent arena slot");
+            }
+            ++skipped_other;
             continue;
         }
 
-        std::byte* arena_ptr = arenas.persistent_ptr + meta.offset;
-        CUDA_CHECK(cudaMemcpyAsync(arena_ptr, entry.tensor.Data, tensor_bytes, cudaMemcpyDeviceToDevice, stream));
+        std::byte* arena_ptr = arenas.persistent_ptr + *offset;
+        if (entry.arena_pending) {
+            // Released before the arena existed, with nothing written yet: bind in place.
+            entry.tensor.Data = arena_ptr;
+            entry.arena_pending = false;
+            ++bound_in_place;
+            continue;
+        }
+        CUDA_CHECK(
+            cudaMemcpyAsync(arena_ptr, entry.tensor.Data, entry.tensor.bytes(), cudaMemcpyDeviceToDevice, stream));
 
         float* preserved_stats = entry.tensor.Stats;
         const int device = entry.tensor.Device;
@@ -407,16 +458,15 @@ void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
 
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
-            std::cerr << "[arena-consume persistent] rebound=" << rebound << " skipped_external=" << skipped_external
-                      << " skipped_managed=" << skipped_managed << " skipped_no_tid=" << skipped_no_tid
-                      << " skipped_non_persistent=" << skipped_non_persistent
-                      << " skipped_size_mismatch=" << skipped_size_mismatch
-                      << " arena_bytes=" << arenas.persistent_bytes << "\n";
+            std::cerr << "[arena-consume persistent] rebound=" << rebound << " bound_in_place=" << bound_in_place
+                      << " skipped_external=" << skipped_external << " skipped_managed=" << skipped_managed
+                      << " skipped_other=" << skipped_other << " arena_bytes=" << arenas.persistent_bytes << "\n";
         }
     }
 }
 
 void DslParamStore::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
+    mContentsValid = true;  // the callback may write (load_safetensors)
     if (mUsesWeightManager) {
         if (!mWeightManager) {
             throw std::runtime_error("DslParamStore: weight manager not set for iterate_tensors");

@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -46,6 +47,7 @@ public:
         bool external = false;                   ///< Provided by QLoRA weight provider (no local storage)
         bool managed_by_weight_manager = false;  ///< Provided by DslWeightManager (no local storage)
         bool storage_alias = false;              ///< Frozen tied output reads the embedding allocation
+        bool arena_pending = false;  ///< Storage released ahead of the persistent arena; bound there, not copied
     };
 
     DslParamStore(const Module& module,
@@ -117,9 +119,30 @@ public:
     /// params should not consume arena bytes (their storage is elsewhere).
     std::size_t rebindable_persistent_bytes(const CompiledGraph& graph) const;
 
+    /// Free, before the persistent arena is allocated, the storage of every parameter
+    /// rebind_to_persistent_arena() will move into it, while no weights have been written yet
+    /// (the first compile runs before import_weights). The rebind then binds those parameters
+    /// in place instead of copying uninitialised bytes. Without this the peak holds the base
+    /// weights twice, the per-tensor allocations plus the arena: a bf16 model over ~45 GB could
+    /// not train on a 96 GB card. Returns the bytes released.
+    std::size_t release_storage_for_persistent_arena(const CompiledGraph& graph, std::size_t arena_bytes);
+    /// Re-allocate what release_storage_for_persistent_arena() freed (the arena allocation failed).
+    void restore_released_storage();
+    /// Parameter contents were written: from now on a rebind must copy them.
+    void mark_contents_valid() {
+        mContentsValid = true;
+    }
+
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
 private:
+    /// The arena offset `name` is rebound to, or nothing when it stays in its own storage.
+    std::optional<std::size_t> persistent_arena_offset(const CompiledGraph& graph,
+                                                       const std::string& name,
+                                                       const Entry& entry,
+                                                       std::size_t arena_bytes) const;
+
+    bool mContentsValid = false;
     std::shared_ptr<TensorAllocator> mAllocator;
     std::unordered_map<std::string, Entry> mParams;
     std::vector<std::string> mParamOrder;
