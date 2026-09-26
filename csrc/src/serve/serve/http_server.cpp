@@ -6,6 +6,7 @@
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
 #include "serve/decisions_schema.h"
+#include "serve/decisions_thinking.h"
 #include "serve/http_socket.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
@@ -1394,6 +1395,10 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.enable_thinking         = false;
     context.question_count          = request.questions.size();
     context.decision_temperature    = svc().options().decision_temperature;
+    // Empty for `none`, so a request without a level logs exactly what it always did.
+    if (request.thinking != DecisionThinkingLevel::None) {
+        context.decision_thinking = std::string(decision_thinking_level_name(request.thinking));
+    }
     context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {
@@ -1403,15 +1408,23 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
                 // on a later attempt say how many times it ran.
                 context.decision_attempts = attempt;
                 write_console_log(ConsoleLogLevel::Warning, "[req " + std::to_string(req_id) + "] " + reason);
+            },
+            [&](const std::string& reason) {
+                write_console_log(ConsoleLogLevel::Warning, "[req " + std::to_string(req_id) + "] " + reason);
             });
         context.shared_prefix_tokens = outcome.shared_prefix_tokens;
         context.decision_attempts    = outcome.attempts;
+        context.decision_thinking_questions = outcome.thinking_questions;
+        context.decision_reasoning_tokens   = outcome.reasoning_tokens;
+        context.decision_thinking_attempts  = outcome.thinking_attempts;
         GenerationOutcome record;
         record.prompt_tokens           = outcome.input_tokens;
         record.completion_tokens       = outcome.output_tokens;
+        record.reasoning_tokens        = outcome.reasoning_tokens;
         record.finish_reason           = sinfer::FinishReason::StopToken;
         record.metrics.prepare_seconds = outcome.prepare_seconds;
         record.metrics.prefill_seconds = outcome.prefill_seconds;
+        record.metrics.decode_seconds  = outcome.decode_seconds;
         record.metrics.total_seconds   = outcome.total_seconds;
         record.metrics.ttft_seconds    = outcome.total_seconds;
         log_request_done(context, record);
@@ -1423,6 +1436,11 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
         OrderedJson usage      = OrderedJson::object();
         usage["input_tokens"]  = outcome.input_tokens;
         usage["output_tokens"] = outcome.output_tokens;
+        // Thinking levels only: the thought tokens, which output_tokens includes. A request
+        // without a level keeps v1's usage object exactly.
+        if (request.thinking != DecisionThinkingLevel::None) {
+            usage["reasoning_tokens"] = outcome.reasoning_tokens;
+        }
         usage["cost"]          = 0;
         body["usage"]          = std::move(usage);
         res.set_content(body.dump(), "application/json");

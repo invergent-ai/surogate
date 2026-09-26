@@ -12,6 +12,7 @@
 #include "serve/translate.h"
 #include "serve/parallel_decoding.h"
 #include "serve/decisions_schema.h"
+#include "serve/decisions_thinking.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <thread>
 #include <cstddef>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -982,7 +984,8 @@ const std::vector<std::string>& GenerationService::decision_codes() {
 DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare,
-                                           const std::function<void(std::uint32_t, const std::string&)>& on_retry) {
+                                           const std::function<void(std::uint32_t, const std::string&)>& on_retry,
+                                           const std::function<void(const std::string&)>& on_thinking_retry) {
     if (!engine_->supports_chat()) {
         ApiError error;
         error.message = "this model publishes no chat template, which is what a base model "
@@ -1020,7 +1023,10 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             media.push_back(acquire_media(part, deadline, is_cancelled, remaining_media_bytes));
         }
         check();
-        const auto prepare_chat = [&](std::string_view system, std::string user_text) {
+        // `as` is the template's switches (thinking off for every v1 prompt; on for a thinking
+        // level's), `with` the preparation's deadline and cancellation.
+        const auto prepare_chat_as = [&](const ResolvedPromptSemantics& as, const PreparationControl& with,
+                                         std::string_view system, std::string user_text) {
             GenerationRequest turns = shape;
             ChatTurn system_turn;
             system_turn.role = ChatRole::System;
@@ -1032,8 +1038,11 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             turns.messages = {std::move(system_turn), std::move(user_turn)};
             std::size_t next_media = 0;
             sinfer::PromptInput input = to_prompt_input(
-                turns, semantics, [&](const ContentPart&) { return media.at(next_media++); });
-            return engine_->prepare(std::move(input), control);
+                turns, as, [&](const ContentPart&) { return media.at(next_media++); });
+            return engine_->prepare(std::move(input), with);
+        };
+        const auto prepare_chat = [&](std::string_view system, std::string user_text) {
+            return prepare_chat_as(semantics, control, system, std::move(user_text));
         };
         // The rendered text is read back from the ids (special tokens decode to their own
         // text, so this is the template's output); re-encoding it must give the ids back,
@@ -1139,6 +1148,67 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             }
             item.prompt = std::move(prompt);
             items.push_back(std::move(item));
+        }
+
+        // Thinking levels (decisions_thinking.h): what a level needs of this model and request is
+        // checked here, before any GPU work, so a request that cannot think is refused rather
+        // than answered in one pass. `none` skips all of it.
+        struct ThinkingSetup {
+            ResolvedPromptSemantics semantics;
+            TokenId close = -1;
+            /// The option letters as the model writes them after the close token: A, B, ..
+            std::vector<TokenId> letters;
+        };
+        std::optional<ThinkingSetup> thinking;
+        if (request.thinking != DecisionThinkingLevel::None) {
+            if (with_images) {
+                refuse("thinking levels do not support images yet; send this request with thinking none",
+                       "thinking", "decisions_thinking_not_supported");
+            }
+            if (!prompt_capabilities_.enable_thinking) {
+                refuse("this model's chat template has no thinking switch, so it cannot serve thinking levels",
+                       "thinking", "decisions_thinking_not_supported");
+            }
+            // The close token and the letters after it, in context: the first question's prompt
+            // text followed by the marker must tokenise to that prompt's ids and the marker's one
+            // token, and the marker followed by each letter to that and the letter's one token.
+            // What comes before a special token cannot change how the text after it tokenises, so
+            // this holds after every thought.
+            const std::vector<TokenId>& ids = items.front().ids;
+            const std::string text          = decode(ids);
+            const std::string close_text(kDecisionThinkingClose);
+            const std::vector<TokenId> closed = encode(text + close_text);
+            if (closed.size() != ids.size() + 1 || !std::equal(ids.begin(), ids.end(), closed.begin()) ||
+                decode({closed.back()}) != close_text) {
+                refuse("this model's tokenizer has no single '" + close_text +
+                           "' token to close a thought with, so it cannot serve thinking levels",
+                       "thinking", "decisions_thinking_not_supported");
+            }
+            ThinkingSetup setup;
+            setup.close = closed.back();
+            std::size_t letters = 0;
+            for (const DecisionQuestion& question : request.questions) {
+                if (!question.extended()) { letters = std::max(letters, question.option_count()); }
+            }
+            std::set<TokenId> seen;
+            for (std::size_t i = 0; i < letters; ++i) {
+                const std::string label(1, static_cast<char>('A' + i));
+                const std::vector<TokenId> appended = encode(text + close_text + label);
+                if (appended.size() != closed.size() + 1 ||
+                    !std::equal(closed.begin(), closed.end(), appended.begin()) ||
+                    !seen.insert(appended.back()).second) {
+                    refuse("option letter '" + label + "' is not a single token after '" + close_text +
+                               "' for this model, so it cannot serve thinking levels",
+                           "thinking", "decisions_thinking_not_supported");
+                }
+                setup.letters.push_back(appended.back());
+            }
+            // The template's thinking switch on, spelled as the chat endpoint spells
+            // `chat_template_kwargs.enable_thinking: true`, which is how the reference asked.
+            GenerationRequest thinking_shape = shape;
+            thinking_shape.enable_thinking   = true;
+            setup.semantics = resolve_prompt_semantics(thinking_shape, options_, prompt_capabilities_);
+            thinking        = std::move(setup);
         }
         outcome.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - lifetime->started).count();
@@ -1305,6 +1375,156 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         // applied here, once per row, and nowhere else.
         outcome.answers =
             resolve_decision_answers(request, readout.logits, options_.decision_temperature);
+
+        // Thinking levels (decisions_thinking.h). Everything above is v1 and ran as it always
+        // does; each question the level's gate lets through is now asked again with a thought.
+        if (thinking) {
+            const DecisionThinkingLevelSpec& spec = decision_thinking_spec(request.thinking);
+            struct Thinker {
+                std::size_t question = 0;
+                std::vector<TokenId> prompt;
+                std::size_t budget = 0;
+                DecisionThought thought;
+                std::vector<float> logits;
+            };
+            // A thought takes as long as it takes: like a chat generation it is bounded by the
+            // client alone, not by the queue deadline the one-pass readout ran under. Every
+            // preparation and submission below still gets the usual deadline for its own wait.
+            const auto pending_timeout = std::chrono::milliseconds(options_.pending_timeout_ms);
+            const auto check_client    = [&] {
+                if (cancelled()) { throw_preparation_cancelled(); }
+            };
+            std::vector<Thinker> thinkers;
+            for (std::size_t i = 0; i < request.questions.size(); ++i) {
+                const DecisionQuestion& question = request.questions[i];
+                const double confidence = decision_onepass_confidence(outcome.answers.at(question.name));
+                if (!decision_should_think(request.thinking, question, confidence)) { continue; }
+                check_client();
+                const DecisionChat chat = decision_thinking_chat(request, question);
+                const PreparationControl thinking_control{
+                    .deadline = Clock::now() + pending_timeout, .cancellation = CancellationView(is_cancelled)};
+                Thinker thinker;
+                thinker.question = i;
+                thinker.prompt =
+                    prepare_chat_as(thinking->semantics, thinking_control, chat.system, chat.user).token_ids();
+                const auto budget = decision_thinking_budget(spec.budget, thinker.prompt.size(), max_context);
+                // Not even an empty thought fits the context: the one-pass answer stands.
+                if (!budget) { continue; }
+                thinker.budget = *budget;
+                thinkers.push_back(std::move(thinker));
+            }
+
+            // Greedy, as the reference; the close token ends a thought, and so does any stop
+            // token of the model's own. Everything else is the readouts' neutral options (no
+            // prefix cache, no sampling filters or penalties), which ignore sampling.
+            sinfer::RequestOptions generation   = base;
+            generation.execution.sampling.temperature = 0.0F;
+            generation.stop.token_ids           = {thinking->close};
+            generation.stop.include_model_defaults = true;
+            const CancellationView client([&] { return cancelled(); });
+            const std::size_t width = candidate_wave_width();
+            std::vector<std::size_t> pending(thinkers.size());
+            std::iota(pending.begin(), pending.end(), std::size_t{0});
+            std::uint32_t round = 0;
+            while (!pending.empty()) {
+                ++round;
+                // 1. The thoughts, a wave at a time.
+                const auto generation_started = Clock::now();
+                for (std::size_t start = 0; start < pending.size(); start += width) {
+                    const std::size_t end = std::min(start + width, pending.size());
+                    std::vector<sinfer::PreparedPrompt> prompts;
+                    std::vector<sinfer::RequestOptions> rows;
+                    for (std::size_t j = start; j < end; ++j) {
+                        check_client();
+                        const Thinker& thinker = thinkers[pending[j]];
+                        prompts.push_back(engine_->prepare_tokens(thinker.prompt));
+                        sinfer::RequestOptions row = generation;
+                        row.execution.requested_output_tokens = decision_thinking_generation_limit(thinker.budget);
+                        rows.push_back(std::move(row));
+                    }
+                    auto handles = in_engine([&] {
+                        return engine_->submit_batch(std::move(prompts), std::move(rows),
+                                                     Clock::now() + pending_timeout, adapter.lifetime);
+                    });
+                    for (std::size_t j = start; j < end; ++j) {
+                        const auto result = in_engine([&] { return handles[j - start].wait(nullptr, client); });
+                        check_client();
+                        if (result.finish_reason == FinishReason::Cancelled) {
+                            throw RequestError(RequestErrorKind::Cancelled, "decisions were cancelled");
+                        }
+                        Thinker& thinker = thinkers[pending[j]];
+                        thinker.thought  = decision_thought(result.generated_token_ids, thinking->close, thinker.budget);
+                    }
+                }
+                outcome.decode_seconds += std::chrono::duration<double>(Clock::now() - generation_started).count();
+
+                // 2. The readouts: each thought's prompt, thought and close token prefilled whole,
+                //    the option letters read at the next position, as a one-pass readout is.
+                std::vector<ParallelQuery> thought_queries;
+                for (const std::size_t k : pending) {
+                    const Thinker& thinker = thinkers[k];
+                    const std::size_t options = request.questions[thinker.question].option_count();
+                    thought_queries.push_back(ParallelQuery{
+                        .parent     = -1,
+                        .suffix     = decision_thinking_readout(thinker.prompt, thinker.thought, thinking->close),
+                        .candidates = std::vector<TokenId>(thinking->letters.begin(),
+                                                           thinking->letters.begin() + static_cast<std::ptrdiff_t>(options))});
+                }
+                const auto readout_deadline = Clock::now() + pending_timeout;
+                const CancellationView readout_cancellation(
+                    [&] { return cancelled() || Clock::now() >= readout_deadline; });
+                CandidateReadout thought_readout = in_engine([&] {
+                    return read_candidates(
+                        thought_queries,
+                        [&](std::size_t k) { return engine_->prepare_tokens(thought_queries[k].suffix); }, base,
+                        adapter.lifetime, readout_deadline, readout_cancellation,
+                        [&] { check_preparation_control(readout_deadline, is_cancelled); }, "decisions were cancelled");
+                });
+                check_client();
+                outcome.prefill_seconds += thought_readout.prefill_seconds;
+                std::vector<std::size_t> nonfinite;
+                for (std::size_t k = 0; k < pending.size(); ++k) {
+                    Thinker& thinker = thinkers[pending[k]];
+                    thinker.logits   = std::move(thought_readout.logits[k]);
+                    if (std::any_of(thinker.logits.begin(), thinker.logits.end(),
+                                    [](float value) { return !std::isfinite(value); })) {
+                        nonfinite.push_back(pending[k]);
+                    }
+                }
+                // After the last round a non-finite row is left for the answer to refuse (HTTP
+                // 500, "model returned non-finite logits"), as a one-pass readout's is.
+                if (nonfinite.empty() || round >= attempts) { break; }
+                if (on_thinking_retry) {
+                    std::string names;
+                    for (std::size_t k = 0; k < nonfinite.size() && k < 8; ++k) {
+                        const std::string& name = request.questions[thinkers[nonfinite[k]].question].name;
+                        names += (k == 0 ? "" : ",") + (name.size() > 64 ? name.substr(0, 64) + "..." : name);
+                    }
+                    if (nonfinite.size() > 8) { names += ",..."; }
+                    on_thinking_retry("decisions thinking round " + std::to_string(round) + " of " +
+                                      std::to_string(attempts) + " returned non-finite logits for " +
+                                      std::to_string(nonfinite.size()) + " of " + std::to_string(pending.size()) +
+                                      " thinking questions (" + names + "); thinking again from scratch for those");
+                }
+                pending = std::move(nonfinite);
+            }
+
+            // 3. The answers: each thinking readout through v1's arithmetic at the server's
+            //    calibration temperature, with the one-pass answer kept inside it.
+            for (Thinker& thinker : thinkers) {
+                const DecisionQuestion& question = request.questions[thinker.question];
+                OrderedJson onepass              = std::move(outcome.answers.at(question.name));
+                outcome.answers[question.name] =
+                    decision_thinking_answer(question, thinker.logits, options_.decision_temperature, request.thinking,
+                                             thinker.thought, std::move(onepass));
+                const auto thought_tokens = static_cast<int>(thinker.thought.tokens.size());
+                outcome.reasoning_tokens += thought_tokens;
+                outcome.output_tokens += thought_tokens + 1;
+                outcome.input_tokens += static_cast<int>(2 * thinker.prompt.size()) + thought_tokens + 1;
+            }
+            outcome.thinking_questions = thinkers.size();
+            outcome.thinking_attempts  = round;
+        }
         outcome.total_seconds =
             std::chrono::duration<double>(Clock::now() - lifetime->started).count();
         return outcome;

@@ -208,6 +208,13 @@ Json request_json(const RequestLogContext& context) {
                 {"sampling", sampler_json(context.sampling)}};
     add_decisions(record, context.protocol, context.question_count, context.shared_prefix_tokens,
                   context.decision_temperature, context.decision_attempts);
+    // A thinking level's own counts, beside the rest; absent for `none`.
+    if (context.protocol == "decisions" && !context.decision_thinking.empty()) {
+        record["decisions"]["thinking"] = Json{{"level", context.decision_thinking},
+                                               {"questions", context.decision_thinking_questions},
+                                               {"reasoning_tokens", context.decision_reasoning_tokens},
+                                               {"attempts", context.decision_thinking_attempts}};
+    }
     return record;
 }
 
@@ -403,7 +410,10 @@ std::string format_request_start(const RequestLogContext& context) {
             << context.preparation.media_cache_misses << '/'
             << context.preparation.media_singleflight_waits;
     }
-    if (context.protocol == "decisions") { out << " questions=" << context.question_count; }
+    if (context.protocol == "decisions") {
+        out << " questions=" << context.question_count;
+        if (!context.decision_thinking.empty()) { out << " thinking=" << context.decision_thinking; }
+    }
     out << " \xE2\x86\x92 submitted";
     return out.str();
 }
@@ -444,6 +454,13 @@ std::string format_request_done(const RequestLogContext& context,
     if (context.protocol == "decisions") {
         out << " questions=" << context.question_count << " shared_prefix=" << context.shared_prefix_tokens;
         if (context.decision_attempts > 1) { out << " attempts=" << context.decision_attempts; }
+        if (!context.decision_thinking.empty()) {
+            out << " thinking=" << context.decision_thinking << " thought=" << context.decision_thinking_questions
+                << " reasoning=" << context.decision_reasoning_tokens;
+            if (context.decision_thinking_attempts > 1) {
+                out << " thinking_rounds=" << context.decision_thinking_attempts;
+            }
+        }
     }
     return out.str();
 }
