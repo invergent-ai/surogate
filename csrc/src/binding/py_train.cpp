@@ -1595,6 +1595,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             gs.has_stack_checkpoint = true;
             cudaGraph_t graph = nullptr;
             CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
+            if (auto* wm = dsl_model->weight_manager()) {
+                wm->begin_capture(rs.MainStream);
+            }
             for (int j = 0; j < micro_steps; ++j) {
                 rs.Targets_CPU = gs.targets[j];
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);

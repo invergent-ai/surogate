@@ -769,6 +769,12 @@ void DslWeightManager::sync_work_from_master(cudaStream_t stream) {
         if ((mStreamWeights || mConfig.offload_master) && entry.is_block) {
             continue;  // Block weights are gathered on demand
         }
+        if (entry.master_sharded) {
+            // A shard cannot fill the whole work buffer: the same-dtype copy read work.bytes()
+            // from a master holding 1/N of them, a conversion wrote the shard into slot 0.
+            // gather_non_block all-gathers it on demand.
+            continue;
+        }
         if (mConfig.cpu_training && !entry.is_block &&
             (kv.first == mEmbeddingName || kv.first == mLmHeadName || kv.first == mFinalNormName)) {
             continue;  // Shared/special non-block weights are gathered on demand in cpu_training.
@@ -788,6 +794,11 @@ namespace {
 // be staged at its own slot (offset shard_idx * shard_bytes): NCCL's in-place convention, and the
 // memcpy all-gather copies every peer's slot by pointer too. Staging every rank at offset 0 sent
 // peer memory instead of the shard (NCCL) or overwrote it before it was copied (memcpy).
+bool stream_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &status) == cudaSuccess && status != cudaStreamCaptureStatusNone;
+}
+
 Tensor local_shard_slot(const Tensor& work, const std::vector<long>& shard_shape, int shard_idx, int num_shards) {
     const std::size_t total = work.bytes();
     if (num_shards <= 0 || total % static_cast<std::size_t>(num_shards) != 0) {
@@ -929,6 +940,28 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
     mCurrentPrefetchBuffer = (buf_idx + 1) % mNumPrefetchBuffers;
 }
 
+void DslWeightManager::begin_capture(cudaStream_t stream) {
+    if (!mStreamWeights && !mConfig.offload_master) {
+        return;
+    }
+    for (auto& status : mPrefetchStatus) {
+        // A layer left resident by the eager warmup would otherwise be read in place by the
+        // captured forward, which replays after every optimizer step with the stale slot.
+        status.layer_idx = -1;
+        status.version = -1;
+        status.fetch_pending = false;
+        status.is_ready = true;
+        CUDA_CHECK(cudaEventRecord(status.release_event, stream));
+        CUDA_CHECK(cudaEventRecord(status.done_event, stream));
+    }
+    for (WeightGatherStatus* status : {&mEmbeddingsStatus, &mFinalNormStatus, &mLmHeadStatus}) {
+        status->version = -1;
+        status->fetch_pending = false;
+        status->is_ready = true;
+        CUDA_CHECK(cudaEventRecord(status->done_event, stream));
+    }
+}
+
 void DslWeightManager::release_block(int layer_idx, cudaStream_t stream) {
     if (!mStreamWeights && !mConfig.offload_master) {
         return;
@@ -970,26 +1003,34 @@ void DslWeightManager::wait_for_gather(int layer_idx, cudaStream_t stream) {
     }
 }
 
-void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t stream) {
-    if ((!mStreamWeights && !mConfig.offload_master) || mEmbeddingName.empty()) {
+void DslWeightManager::gather_non_block(WeightGatherStatus& status,
+                                        const std::string& name,
+                                        NCCLCommunicator& comm,
+                                        cudaStream_t stream) {
+    if ((!mStreamWeights && !mConfig.offload_master) || name.empty()) {
         return;
     }
-    // Skip cache check when cpu_training with the SHARED staging buffer — it may
-    // have been overwritten by lm_head. With resident_nonblock each tensor owns
-    // its buffer, so a matching version means the content is already on device.
-    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mEmbeddingsStatus.version == mVersion) {
-        return;
-    }
-
-    auto* entry = find_entry_by_name(mEmbeddingName);
+    auto* entry = find_entry_by_name(name);
     if (!entry) {
         return;
     }
-
-    CUDA_CHECK(cudaStreamWaitEvent(stream, mEmbeddingsStatus.done_event, 0));
-    mEmbeddingsStatus.fetch_pending = true;
-    mEmbeddingsStatus.is_ready = false;
-    mEmbeddingsStatus.version = mVersion;
+    // Under capture the graph is replayed after every optimizer step, so the gather must be
+    // recorded even when the host-side version says the buffer is current. And the event
+    // was recorded outside this capture: a capturing stream may not wait on it (the
+    // cudaErrorStreamCaptureIsolation in gather_lm_head); stream order covers the reuse.
+    const bool capturing = stream_capturing(stream);
+    // Skip cache check when cpu_training with the SHARED staging buffer — it may
+    // have been overwritten by lm_head. With resident_nonblock each tensor owns
+    // its buffer, so a matching version means the content is already on device.
+    if (!capturing && (!mConfig.cpu_training || mConfig.resident_nonblock) && status.version == mVersion) {
+        return;
+    }
+    if (!capturing) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
+    }
+    status.fetch_pending = true;
+    status.is_ready = false;
+    status.version = mVersion;
 
     Tensor& work = entry->work;
     if (entry->master_sharded) {
@@ -1004,12 +1045,18 @@ void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t st
         comm.begin_transaction(stream);
         TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
         comm.schedule_all_gather(local, work);
-        comm.execute_transaction(mEmbeddingsStatus.done_event);
+        comm.execute_transaction(status.done_event);
+        // The all-gather runs on the comm stream; `stream` reads `work` next.
+        CUDA_CHECK(cudaStreamWaitEvent(stream, status.done_event, 0));
         return;
     }
 
     convert_to_work(entry->master, work, stream);
-    CUDA_CHECK(cudaEventRecord(mEmbeddingsStatus.done_event, stream));
+    CUDA_CHECK(cudaEventRecord(status.done_event, stream));
+}
+
+void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t stream) {
+    gather_non_block(mEmbeddingsStatus, mEmbeddingName, comm, stream);
 }
 
 void DslWeightManager::release_embeddings(cudaStream_t stream) {
@@ -1022,42 +1069,7 @@ void DslWeightManager::release_embeddings(cudaStream_t stream) {
 }
 
 void DslWeightManager::gather_final_norm(NCCLCommunicator& comm, cudaStream_t stream) {
-    if ((!mStreamWeights && !mConfig.offload_master) || mFinalNormName.empty()) {
-        return;
-    }
-    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mFinalNormStatus.version == mVersion) {
-        return;
-    }
-
-    auto* entry = find_entry_by_name(mFinalNormName);
-    if (!entry) {
-        return;
-    }
-
-    CUDA_CHECK(cudaStreamWaitEvent(stream, mFinalNormStatus.done_event, 0));
-    mFinalNormStatus.fetch_pending = true;
-    mFinalNormStatus.is_ready = false;
-    mFinalNormStatus.version = mVersion;
-
-    Tensor& work = entry->work;
-    if (entry->master_sharded) {
-        std::vector<long> shard_shape(entry->master.Sizes.begin(), entry->master.Sizes.begin() + entry->master.Rank);
-        Tensor staging = local_shard_slot(work, shard_shape, mConfig.shard_idx, mConfig.num_shards);
-        convert_to_work(entry->master, staging, stream);
-
-        std::vector<long> global_shape = entry->global_shape;
-        if (global_shape.empty()) {
-            global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
-        }
-        comm.begin_transaction(stream);
-        TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
-        comm.schedule_all_gather(local, work);
-        comm.execute_transaction(mFinalNormStatus.done_event);
-        return;
-    }
-
-    convert_to_work(entry->master, work, stream);
-    CUDA_CHECK(cudaEventRecord(mFinalNormStatus.done_event, stream));
+    gather_non_block(mFinalNormStatus, mFinalNormName, comm, stream);
 }
 
 void DslWeightManager::release_final_norm(cudaStream_t stream) {
@@ -1070,42 +1082,7 @@ void DslWeightManager::release_final_norm(cudaStream_t stream) {
 }
 
 void DslWeightManager::gather_lm_head(NCCLCommunicator& comm, cudaStream_t stream) {
-    if ((!mStreamWeights && !mConfig.offload_master) || mLmHeadName.empty()) {
-        return;
-    }
-    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mLmHeadStatus.version == mVersion) {
-        return;
-    }
-
-    auto* entry = find_entry_by_name(mLmHeadName);
-    if (!entry) {
-        return;
-    }
-
-    CUDA_CHECK(cudaStreamWaitEvent(stream, mLmHeadStatus.done_event, 0));
-    mLmHeadStatus.fetch_pending = true;
-    mLmHeadStatus.is_ready = false;
-    mLmHeadStatus.version = mVersion;
-
-    Tensor& work = entry->work;
-    if (entry->master_sharded) {
-        std::vector<long> shard_shape(entry->master.Sizes.begin(), entry->master.Sizes.begin() + entry->master.Rank);
-        Tensor staging = local_shard_slot(work, shard_shape, mConfig.shard_idx, mConfig.num_shards);
-        convert_to_work(entry->master, staging, stream);
-
-        std::vector<long> global_shape = entry->global_shape;
-        if (global_shape.empty()) {
-            global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
-        }
-        comm.begin_transaction(stream);
-        TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
-        comm.schedule_all_gather(local, work);
-        comm.execute_transaction(mLmHeadStatus.done_event);
-        return;
-    }
-
-    convert_to_work(entry->master, work, stream);
-    CUDA_CHECK(cudaEventRecord(mLmHeadStatus.done_event, stream));
+    gather_non_block(mLmHeadStatus, mLmHeadName, comm, stream);
 }
 
 void DslWeightManager::release_lm_head(cudaStream_t stream) {
