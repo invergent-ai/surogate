@@ -776,6 +776,24 @@ void DslWeightManager::sync_work_from_master(cudaStream_t stream) {
     }
 }
 
+namespace {
+
+// The sharded gathers are in-place all-gathers into the full `work` buffer, so this rank's shard must
+// be staged at its own slot (offset shard_idx * shard_bytes): NCCL's in-place convention, and the
+// memcpy all-gather copies every peer's slot by pointer too. Staging every rank at offset 0 sent
+// peer memory instead of the shard (NCCL) or overwrote it before it was copied (memcpy).
+Tensor local_shard_slot(const Tensor& work, const std::vector<long>& shard_shape, int shard_idx, int num_shards) {
+    const std::size_t total = work.bytes();
+    if (num_shards <= 0 || total % static_cast<std::size_t>(num_shards) != 0) {
+        throw std::logic_error("sharded gather: work buffer is not evenly divisible into shards");
+    }
+    const std::size_t shard_bytes = total / static_cast<std::size_t>(num_shards);
+    return Tensor::from_pointer(work.Data + static_cast<std::size_t>(shard_idx) * shard_bytes,
+                                work.Device, work.DType, shard_shape);
+}
+
+}  // namespace
+
 void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaStream_t stream) {
     if (!mStreamWeights && !mConfig.offload_master) {
         // No streaming - weights are already on device
@@ -832,13 +850,11 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
     status.fetch_pending = true;
     status.version = mVersion;
 
-    // Begin NCCL transaction for sharded gather
-    cudaEvent_t ready_event = nullptr;
-    if (mConfig.shard_weights && mConfig.num_shards > 1) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventRecord(ready_event, stream));
-        comm.begin_transaction(ready_event);
-    }
+    // Sharded weights: stage every local shard first, then open the transaction. The transaction's
+    // ready event gates the collective, so it must be recorded AFTER the staging copies are enqueued
+    // on `stream`; recording it first let the all-gather read the staging slots before they were
+    // written (NCCL path: stale weights).
+    std::vector<std::pair<TensorShard, Tensor*>> pending_gathers;
 
     // Copy/convert each weight in this layer
     for (const auto& name : mBlockParamNames[layer_idx]) {
@@ -856,15 +872,15 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
         if (entry.master_sharded) {
             // Sharded: copy/convert local shard into staging buffer, then all-gather into full work tensor.
             std::vector<long> shard_shape(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
-            Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+            Tensor staging = local_shard_slot(work, shard_shape, mConfig.shard_idx, mConfig.num_shards);
             convert_to_work(entry.master, staging, stream);
 
             std::vector<long> global_shape = entry.global_shape;
             if (global_shape.empty()) {
                 global_shape.assign(work.Sizes.begin(), work.Sizes.begin() + work.Rank);
             }
-            TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
-            comm.schedule_all_gather(local, work);
+            pending_gathers.emplace_back(TensorShard(staging, mConfig.shard_idx, mConfig.num_shards, global_shape),
+                                         &work);
         } else if (entry.ep_sliced) {
             // EP-local streaming: copy only this rank's expert row block out of the
             // global pinned master (dim0 is outermost, so the block is contiguous).
@@ -890,10 +906,15 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
 
     // Execute NCCL transaction and record completion
     if (mConfig.shard_weights && mConfig.num_shards > 1) {
-        comm.execute_transaction(status.done_event);
-        if (ready_event) {
-            cudaEventDestroy(ready_event);
+        cudaEvent_t ready_event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(ready_event, stream));
+        comm.begin_transaction(ready_event);
+        for (auto& [local, work] : pending_gathers) {
+            comm.schedule_all_gather(local, *work);
         }
+        comm.execute_transaction(status.done_event);
+        cudaEventDestroy(ready_event);
     } else {
         // Record completion event for non-sharded path
         CUDA_CHECK(cudaEventRecord(status.done_event, stream));
@@ -967,7 +988,7 @@ void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t st
     Tensor& work = entry->work;
     if (entry->master_sharded) {
         std::vector<long> shard_shape(entry->master.Sizes.begin(), entry->master.Sizes.begin() + entry->master.Rank);
-        Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+        Tensor staging = local_shard_slot(work, shard_shape, mConfig.shard_idx, mConfig.num_shards);
         convert_to_work(entry->master, staging, stream);
 
         std::vector<long> global_shape = entry->global_shape;
@@ -1015,7 +1036,7 @@ void DslWeightManager::gather_final_norm(NCCLCommunicator& comm, cudaStream_t st
     Tensor& work = entry->work;
     if (entry->master_sharded) {
         std::vector<long> shard_shape(entry->master.Sizes.begin(), entry->master.Sizes.begin() + entry->master.Rank);
-        Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+        Tensor staging = local_shard_slot(work, shard_shape, mConfig.shard_idx, mConfig.num_shards);
         convert_to_work(entry->master, staging, stream);
 
         std::vector<long> global_shape = entry->global_shape;
@@ -1063,7 +1084,7 @@ void DslWeightManager::gather_lm_head(NCCLCommunicator& comm, cudaStream_t strea
     Tensor& work = entry->work;
     if (entry->master_sharded) {
         std::vector<long> shard_shape(entry->master.Sizes.begin(), entry->master.Sizes.begin() + entry->master.Rank);
-        Tensor staging = Tensor::from_pointer(work.Data, work.Device, work.DType, shard_shape);
+        Tensor staging = local_shard_slot(work, shard_shape, mConfig.shard_idx, mConfig.num_shards);
         convert_to_work(entry->master, staging, stream);
 
         std::vector<long> global_shape = entry->global_shape;
