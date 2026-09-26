@@ -235,7 +235,9 @@ For a request at a level other than `none`, each question goes through these ste
 5. The model generates greedily (temperature 0) for at most the budget, stopping at the thought's
    close token `<channel|>` (or at a stop token of its own). The thought is every token before the
    first `<channel|>`, the channel opener the model writes included, cut at the budget. A thought
-   that did not close within its budget has `<channel|>` appended: the close is forced.
+   that did not close within its budget has `<channel|>` appended: the close is forced. Near the
+   model context the budget is cut to what still fits the readout; a question whose thinking
+   prompt leaves no room for it keeps its one-pass answer.
 6. The answer is read at the position right after `<channel|>`: the thinking prompt, the thought
    and `<channel|>` are prefilled whole, and the option letters' logits there go through v1's
    readout exactly -- the softmax over the option letters alone, in double, divided by the
@@ -280,7 +282,7 @@ timeout for the longest level it sends.
 which `<channel|>` (Gemma 4's thought close) and each option letter after it are single tokens;
 the endpoint checks both before any GPU work and otherwise refuses the request with HTTP 400
 `decisions_thinking_not_supported`, as it does a level on a request with `images` (not supported
-yet). The protocol was validated on Gemma 4 (Rune).
+yet). The protocol was designed and measured on Gemma 4 (Rune).
 
 **Retries.** A thinking readout whose logits come out non-finite is thought again from scratch,
 for the failed questions only, up to `--decision-attempts` rounds in all; each round after the
