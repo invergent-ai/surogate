@@ -426,6 +426,32 @@ int main() {
         const Json chat = Json::parse(format_request_start_json("serve-test", 3200, context));
         failures += check(!chat.at("request").contains("decisions"),
                           "a chat request record grew a decisions block");
+
+        // A thinking level logs its own counts beside the rest; a request without one logs
+        // exactly what it did before the levels existed.
+        failures += check(!start.at("request").at("decisions").contains("thinking") &&
+                              !done.at("request").at("decisions").contains("thinking") &&
+                              format_request_start(decisions).find("thinking=") == std::string::npos &&
+                              format_request_done(decisions, answered).find("thinking=") == std::string::npos,
+                          "a decisions request without a level grew a thinking record");
+        RequestLogContext thinking            = decisions;
+        thinking.decision_thinking            = "medium";
+        thinking.decision_thinking_questions  = 2;
+        thinking.decision_reasoning_tokens    = 300;
+        thinking.decision_thinking_attempts   = 1;
+        const Json thought = Json::parse(format_request_done_json("serve-test", 3250, thinking, answered));
+        failures += check(thought.at("request").at("decisions").at("thinking") ==
+                              Json{{"level", "medium"}, {"questions", 2}, {"reasoning_tokens", 300}, {"attempts", 1}},
+                          "a thinking decisions request does not log its level and counts");
+        failures += check(format_request_start(thinking).find(" questions=3 thinking=medium") != std::string::npos,
+                          "a thinking decisions request's start line lacks its level");
+        failures += check(format_request_done(thinking, answered).find(" thinking=medium thought=2 reasoning=300") !=
+                                  std::string::npos &&
+                              format_request_done(thinking, answered).find("thinking_rounds=") == std::string::npos,
+                          "a thinking decisions request's done line lacks its counts");
+        thinking.decision_thinking_attempts = 2;
+        failures += check(format_request_done(thinking, answered).find(" thinking_rounds=2") != std::string::npos,
+                          "a thinking round that was run again is not reported");
     }
 
     // X-Request-Id: the caller's id reaches every record type, and only a safe value is kept.
