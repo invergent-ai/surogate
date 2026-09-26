@@ -6,7 +6,6 @@
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
 #include "serve/decisions_schema.h"
-#include "serve/decisions_thinking.h"
 #include "serve/http_socket.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
@@ -1395,10 +1394,8 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.enable_thinking         = false;
     context.question_count          = request.questions.size();
     context.decision_temperature    = svc().options().decision_temperature;
-    // Empty for `none`, so a request without a level logs exactly what it always did.
-    if (request.thinking != DecisionThinkingLevel::None) {
-        context.decision_thinking = std::string(decision_thinking_level_name(request.thinking));
-    }
+    // Off unless asked for, so a request without it logs exactly what it always did.
+    context.decision_thinking       = request.thinking;
     context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {
@@ -1436,9 +1433,9 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
         OrderedJson usage      = OrderedJson::object();
         usage["input_tokens"]  = outcome.input_tokens;
         usage["output_tokens"] = outcome.output_tokens;
-        // Thinking levels only: the thought tokens, which output_tokens includes. A request
-        // without a level keeps v1's usage object exactly.
-        if (request.thinking != DecisionThinkingLevel::None) {
+        // Thinking only: the thought tokens, which output_tokens includes. A request without
+        // thinking keeps v1's usage object exactly.
+        if (request.thinking) {
             usage["reasoning_tokens"] = outcome.reasoning_tokens;
         }
         usage["cost"]          = 0;

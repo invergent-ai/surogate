@@ -9,7 +9,7 @@ namespace sinfer::serve {
 
 namespace {
 
-[[noreturn]] void invalid_level(std::string message) {
+[[noreturn]] void invalid_thinking(std::string message) {
     throw ApiException(ApiError{.status  = 400,
                                 .type    = "invalid_request_error",
                                 .message = std::move(message),
@@ -17,48 +17,24 @@ namespace {
                                 .code    = "invalid_decisions_request"});
 }
 
-std::string accepted_levels() {
-    std::string names = "none";
-    for (std::size_t i = 0; i < kDecisionThinkingLevels.size(); ++i) {
-        names += i + 1 == kDecisionThinkingLevels.size() ? " or " : ", ";
-        names += kDecisionThinkingLevels[i].name;
-    }
-    return names;
-}
-
 } // namespace
 
-std::string_view decision_thinking_level_name(DecisionThinkingLevel level) noexcept {
-    for (const DecisionThinkingLevelSpec& spec : kDecisionThinkingLevels) {
-        if (spec.level == level) { return spec.name; }
-    }
-    return "none";
-}
-
-const DecisionThinkingLevelSpec& decision_thinking_spec(DecisionThinkingLevel level) {
-    for (const DecisionThinkingLevelSpec& spec : kDecisionThinkingLevels) {
-        if (spec.level == level) { return spec; }
-    }
-    throw std::logic_error("thinking level 'none' has no gate or budget");
-}
-
-DecisionThinkingLevel parse_decision_thinking_level(const OrderedJson& body) {
-    if (!body.is_object()) { return DecisionThinkingLevel::None; }
+bool parse_decision_thinking(const OrderedJson& body) {
+    if (!body.is_object()) { return false; }
     const auto found = body.find("thinking");
-    if (found == body.end() || found->is_null()) { return DecisionThinkingLevel::None; }
-    if (!found->is_string()) { invalid_level("thinking must be a string, one of " + accepted_levels()); }
-    const std::string& value = found->get_ref<const std::string&>();
-    if (value == "none") { return DecisionThinkingLevel::None; }
-    for (const DecisionThinkingLevelSpec& spec : kDecisionThinkingLevels) {
-        if (value == spec.name) { return spec.level; }
+    if (found == body.end() || found->is_null()) { return false; }
+    if (found->is_boolean()) { return found->get<bool>(); }
+    // A string is named in the refusal when it is short and printable, like the rest of this
+    // endpoint's refusals; "low" and "true" are the likely ones.
+    std::string shown;
+    if (found->is_string()) {
+        const std::string& value = found->get_ref<const std::string&>();
+        if (value.size() <= 32 && std::all_of(value.begin(), value.end(), [](char c) { return c >= 0x20 && c < 0x7F; })) {
+            shown = " (got the string '" + value + "')";
+        }
     }
-    // The value is echoed only when it is short and printable, like the rest of this endpoint's
-    // refusals; a level is a short word.
-    const bool printable = value.size() <= 32 && std::all_of(value.begin(), value.end(), [](char c) {
-        return c >= 0x20 && c < 0x7F;
-    });
-    invalid_level(std::string("unknown thinking level") + (printable ? " '" + value + "'" : std::string()) +
-                  "; expected one of " + accepted_levels());
+    invalid_thinking("thinking must be a boolean: true to let unsure questions think, false (the default) "
+                     "for one-pass answers" + shown);
 }
 
 double decision_onepass_confidence(const OrderedJson& answer) {
@@ -71,10 +47,9 @@ double decision_onepass_confidence(const OrderedJson& answer) {
     return top;
 }
 
-bool decision_should_think(DecisionThinkingLevel level, const DecisionQuestion& question, double confidence) {
-    if (level == DecisionThinkingLevel::None) { return false; }
+bool decision_should_think(const DecisionQuestion& question, double confidence) {
     if (question.option_count() > kDecisionLetterOptions) { return false; }
-    return confidence < decision_thinking_spec(level).gate;
+    return confidence < kDecisionThinkingGate;
 }
 
 DecisionChat decision_thinking_chat(const DecisionsRequest& request, const DecisionQuestion& question) {
@@ -130,12 +105,10 @@ std::vector<TokenId> decision_thinking_readout(const std::vector<TokenId>& promp
 }
 
 OrderedJson decision_thinking_answer(const DecisionQuestion& question, const std::vector<float>& logits,
-                                     double temperature, DecisionThinkingLevel level, const DecisionThought& thought,
-                                     OrderedJson onepass) {
+                                     double temperature, const DecisionThought& thought, OrderedJson onepass) {
     // v1's own readout arithmetic, so a thinking answer means what a one-pass answer means.
     OrderedJson answer = resolve_decision_answer(question, logits, temperature);
     OrderedJson record = OrderedJson::object();
-    record["level"]    = std::string(decision_thinking_level_name(level));
     record["tokens"]   = thought.tokens.size();
     record["closed"]   = thought.closed;
     record["onepass"]  = std::move(onepass);

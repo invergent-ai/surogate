@@ -691,7 +691,7 @@ sinfer_add_test(sinfer_decisions_v1_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_decisions_v1_test PRIVATE -UNDEBUG -fno-fast-math)
 
-# Thinking levels (decisions_thinking.h): model-free, and held to the v1 golden set's messages.
+# Decisions thinking (decisions_thinking.h): model-free, and held to the v1 golden set's messages.
 sinfer_add_test(sinfer_decisions_thinking_test
   NEEDS_SOURCE_DIR
   SOURCES test_decisions_thinking.cpp

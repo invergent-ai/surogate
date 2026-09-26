@@ -1,11 +1,11 @@
-// Model-free checks of the decisions endpoint's thinking levels (decisions_thinking.h): the level
-// table, the request field, the thinking chat (system prompt, user message, thinking switch), the
-// gate, the thought cut and forced close, and the answer built after a thought. The protocol is
-// the client-side reference's (jev scripts/think_when_unsure_pilot_v1.py, _full_v1.py); the
+// Model-free checks of the decisions endpoint's thinking (decisions_thinking.h): the gate and budget
+// constants, the request field, the thinking chat (system prompt, user message, thinking switch),
+// the gate, the thought cut and forced close, and the answer built after a thought. The protocol
+// is the client-side reference's (jev scripts/think_when_unsure_pilot_v1.py, _full_v1.py); the
 // numbers it is held to here are written out from that reference's formulas.
 //
-// It also holds `none` to v1: a request without the field, with null or with "none" parses to
-// the same request, and nothing of the thinking path touches it.
+// It also holds thinking off to v1: a request without the field, with null or with false parses
+// to the same request, and nothing of the thinking path touches it.
 #include "serve/decisions_thinking.h"
 
 #include <algorithm>
@@ -36,13 +36,13 @@ void expect(bool condition, const std::string& what) {
 }
 
 /// The 400 a malformed `thinking` value gets: the endpoint's body-refusal code, pointed at the field.
-void refused_level(const std::string& body, const std::string& what) {
+void refused_thinking(const std::string& body, const std::string& what) {
     try {
         (void)parse_decisions_request(body);
         expect(false, "not refused: " + what);
     } catch (const ApiException& e) {
         expect(e.error().status == 400 && e.error().code == "invalid_decisions_request" &&
-                   e.error().param == "thinking" && e.error().message.find("none, low, medium or high") != std::string::npos,
+                   e.error().param == "thinking" && e.error().message.starts_with("thinking must be a boolean"),
                "refusal of " + what + " (got " + std::to_string(e.error().status) + " " + e.error().code + " " +
                    e.error().param + ": " + e.error().message + ")");
     }
@@ -111,53 +111,26 @@ OrderedJson reference_answer(const DecisionQuestion& question, const std::vector
 } // namespace
 
 int main() {
-    // ---- 1. The level table: one constant, the three levels the reference measured ----
+    // ---- 1. The setting: one gate and one budget, the reference's fast setting ----
     {
-        expect(kDecisionThinkingLevels.size() == 3, "three thinking levels");
-        const auto& low    = decision_thinking_spec(DecisionThinkingLevel::Low);
-        const auto& medium = decision_thinking_spec(DecisionThinkingLevel::Medium);
-        const auto& high   = decision_thinking_spec(DecisionThinkingLevel::High);
-        expect(low.name == "low" && low.gate == 0.7 && low.budget == 512, "low is gate 0.7, budget 512");
-        expect(medium.name == "medium" && medium.gate == 0.8 && medium.budget == 1024,
-               "medium is gate 0.8, budget 1024");
-        expect(high.name == "high" && high.gate == 0.9 && high.budget == 4096, "high is gate 0.9, budget 4096");
-        expect(decision_thinking_level_name(DecisionThinkingLevel::None) == "none" &&
-                   decision_thinking_level_name(DecisionThinkingLevel::Medium) == "medium",
-               "level names");
-        for (std::size_t i = 1; i < kDecisionThinkingLevels.size(); ++i) {
-            expect(kDecisionThinkingLevels[i].gate > kDecisionThinkingLevels[i - 1].gate &&
-                       kDecisionThinkingLevels[i].budget > kDecisionThinkingLevels[i - 1].budget,
-                   "each level thinks on more questions and for longer than the one before");
-        }
-        bool threw = false;
-        try {
-            (void)decision_thinking_spec(DecisionThinkingLevel::None);
-        } catch (const std::logic_error&) { threw = true; }
-        expect(threw, "none has no gate or budget");
+        expect(kDecisionThinkingGate == 0.7, "the gate is 0.7");
+        expect(kDecisionThinkingBudget == 512, "the budget is 512 thought tokens");
     }
 
     // ---- 2. The request field ----
     {
         const DecisionsRequest plain = parse_decisions_request(body_with(""));
-        expect(plain.thinking == DecisionThinkingLevel::None, "an absent field is none");
-        expect(parse_decisions_request(body_with(R"(, "thinking": null)")).thinking == DecisionThinkingLevel::None,
-               "null is none");
-        expect(parse_decisions_request(body_with(R"(, "thinking": "none")")).thinking == DecisionThinkingLevel::None,
-               "\"none\" is none");
-        expect(parse_decisions_request(body_with(R"(, "thinking": "low")")).thinking == DecisionThinkingLevel::Low,
-               "\"low\"");
-        expect(parse_decisions_request(body_with(R"(, "thinking": "medium")")).thinking ==
-                   DecisionThinkingLevel::Medium,
-               "\"medium\"");
-        expect(parse_decisions_request(body_with(R"(, "thinking": "high")")).thinking == DecisionThinkingLevel::High,
-               "\"high\"");
+        expect(!plain.thinking, "an absent field is off");
+        expect(!parse_decisions_request(body_with(R"(, "thinking": null)")).thinking, "null is off");
+        expect(!parse_decisions_request(body_with(R"(, "thinking": false)")).thinking, "false is off");
+        expect(parse_decisions_request(body_with(R"(, "thinking": true)")).thinking, "true is on");
         // The field sits anywhere in the body, like every other.
-        const std::string first = R"json({"thinking": "high", "model": "rune", "state": "s",
+        const std::string first = R"json({"thinking": true, "model": "rune", "state": "s",
             "questions": {"q": {"type": "noul", "instructions": "i", "criteria": {"true": "t", "false": "f"}}}})json";
-        expect(parse_decisions_request(first).thinking == DecisionThinkingLevel::High, "the field's place is free");
+        expect(parse_decisions_request(first).thinking, "the field's place is free");
 
-        // A level never changes what v1 parses: the state text and every question are the same.
-        for (const char* field : {R"(, "thinking": null)", R"(, "thinking": "none")", R"(, "thinking": "high")"}) {
+        // Thinking never changes what v1 parses: the state text and every question are the same.
+        for (const char* field : {R"(, "thinking": null)", R"(, "thinking": false)", R"(, "thinking": true)"}) {
             const DecisionsRequest with = parse_decisions_request(body_with(field));
             expect(with.state_text == plain.state_text && with.questions.size() == plain.questions.size() &&
                        with.model == plain.model && with.images.empty(),
@@ -171,24 +144,26 @@ int main() {
             }
         }
 
-        // Anything else is refused, never served silently as no thinking.
-        refused_level(body_with(R"(, "thinking": "Low")"), "a level in another case");
-        refused_level(body_with(R"(, "thinking": "max")"), "an unknown level");
-        refused_level(body_with(R"(, "thinking": "")"), "an empty level");
-        refused_level(body_with(R"(, "thinking": " low")"), "a level with spaces");
-        refused_level(body_with(R"(, "thinking": 1)"), "a number");
-        refused_level(body_with(R"(, "thinking": true)"), "a boolean");
-        refused_level(body_with(R"(, "thinking": {"level": "low"})"), "an object");
-        refused_level(body_with(R"(, "thinking": ["low"])"), "an array");
+        // Anything but a boolean is refused, never served silently with thinking off.
+        refused_thinking(body_with(R"(, "thinking": "low")"), "a former level name");
+        refused_thinking(body_with(R"(, "thinking": "high")"), "another former level name");
+        refused_thinking(body_with(R"(, "thinking": "none")"), "the former none");
+        refused_thinking(body_with(R"(, "thinking": "true")"), "the string true");
+        refused_thinking(body_with(R"(, "thinking": "")"), "an empty string");
+        refused_thinking(body_with(R"(, "thinking": 1)"), "the number 1");
+        refused_thinking(body_with(R"(, "thinking": 0)"), "the number 0");
+        refused_thinking(body_with(R"(, "thinking": {"enabled": true})"), "an object");
+        refused_thinking(body_with(R"(, "thinking": [true])"), "an array");
         try {
-            (void)parse_decisions_request(body_with(R"(, "thinking": "turbo")"));
+            (void)parse_decisions_request(body_with(R"(, "thinking": "low")"));
         } catch (const ApiException& e) {
-            expect(e.error().message == "unknown thinking level 'turbo'; expected one of none, low, medium or high",
-                   "the refusal names the value and the levels: " + e.error().message);
+            expect(e.error().message == "thinking must be a boolean: true to let unsure questions think, false (the "
+                                        "default) for one-pass answers (got the string 'low')",
+                   "the refusal says what is accepted and names the string: " + e.error().message);
         }
         // v1's own refusals keep their precedence: the body is judged as v1 judges it first.
         try {
-            (void)parse_decisions_request(R"json({"state": "s", "thinking": "turbo",
+            (void)parse_decisions_request(R"json({"state": "s", "thinking": "low",
                 "questions": {"q": {"type": "noul", "instructions": "i", "criteria": {"true": "t", "false": "f"}}}})json");
             expect(false, "a body without a model was answered");
         } catch (const ApiException& e) {
@@ -212,7 +187,7 @@ int main() {
                "the thinking prompt keeps v1's framing");
         expect(kDecisionThinkingClose == "<channel|>", "the thought closes on Gemma 4's <channel|>");
 
-        const DecisionsRequest request = parse_decisions_request(body_with(R"(, "thinking": "low")"));
+        const DecisionsRequest request = parse_decisions_request(body_with(R"(, "thinking": true)"));
         for (const DecisionQuestion& question : request.questions) {
             const DecisionChat chat = decision_thinking_chat(request, question);
             const RenderedDecisionQuestion onepass = render_decision_question(question, {});
@@ -240,7 +215,7 @@ int main() {
         std::size_t pinned = 0;
         for (const OrderedJson& item : golden.at("cases")) {
             const DecisionsRequest parsed = parse_decisions_request(item.at("body").get<std::string>());
-            expect(parsed.thinking == DecisionThinkingLevel::None, "no golden request names a level");
+            expect(!parsed.thinking, "no golden request asks for thinking");
             const OrderedJson& expected = item.at("questions");
             for (std::size_t i = 0; i < parsed.questions.size(); ++i) {
                 if (parsed.questions[i].extended()) {
@@ -274,13 +249,11 @@ int main() {
         OrderedJson made = OrderedJson::parse(R"({"type": "choice", "choice": "k0", "confidence": 0.05,
             "probabilities": {"k0": 0.35, "k1": 0.69, "k2": 0.0}})");
         expect(decision_onepass_confidence(made) == 0.69, "the maximum of the probabilities");
-        expect(decision_should_think(DecisionThinkingLevel::Low, choice, 0.69), "0.69 thinks at low (0.7)");
-        expect(!decision_should_think(DecisionThinkingLevel::Low, choice, 0.7), "the gate is strict: 0.7 keeps at low");
-        expect(decision_should_think(DecisionThinkingLevel::Medium, choice, 0.7), "0.7 thinks at medium");
-        expect(!decision_should_think(DecisionThinkingLevel::Medium, choice, 0.8), "0.8 keeps at medium");
-        expect(decision_should_think(DecisionThinkingLevel::High, choice, 0.8999999), "just under 0.9 thinks at high");
-        expect(!decision_should_think(DecisionThinkingLevel::High, choice, 0.9), "0.9 keeps at high");
-        expect(!decision_should_think(DecisionThinkingLevel::None, choice, 0.0), "none never thinks");
+        expect(decision_should_think(choice, 0.69), "0.69 thinks");
+        expect(decision_should_think(choice, 0.6999999999), "just under the gate thinks");
+        expect(!decision_should_think(choice, 0.7), "the gate is strict: 0.7 keeps its one-pass answer");
+        expect(!decision_should_think(choice, 0.8) && !decision_should_think(choice, 1.0), "sure answers keep");
+        expect(decision_should_think(choice, 1.0 / 3.0), "a uniform three-way answer thinks");
 
         // noul: max(p, 1 - p).
         DecisionQuestion noul;
@@ -299,10 +272,13 @@ int main() {
         const double p = noul_answer.at("noul").get<double>();
         expect(decision_onepass_confidence(noul_answer) == std::max(p, 1.0 - p), "noul from the answer object");
         const double eighty = decision_onepass_confidence(OrderedJson::parse(R"({"type": "noul", "noul": 0.2})"));
-        expect(!decision_should_think(DecisionThinkingLevel::Low, noul, eighty) &&
-                   !decision_should_think(DecisionThinkingLevel::Medium, noul, eighty) &&
-                   decision_should_think(DecisionThinkingLevel::High, noul, eighty),
-               "a 0.8-sure noul thinks at high only");
+        expect(!decision_should_think(noul, eighty), "a noul at 0.2 is 0.8 sure and keeps");
+        expect(decision_should_think(noul, decision_onepass_confidence(OrderedJson::parse(R"({"type": "noul", "noul": 0.35})"))),
+               "a noul at 0.35 is 0.65 sure and thinks");
+        expect(decision_should_think(noul, decision_onepass_confidence(OrderedJson::parse(R"({"type": "noul", "noul": 0.65})"))),
+               "a noul at 0.65 thinks");
+        expect(!decision_should_think(noul, decision_onepass_confidence(OrderedJson::parse(R"({"type": "noul", "noul": 0.3})"))),
+               "a noul at 0.3 is exactly 0.7 sure and keeps");
 
         // score: its top probability too, not its concentration `confidence`.
         DecisionQuestion score = choice_question(4);
@@ -314,13 +290,10 @@ int main() {
         expect(decision_onepass_confidence(scored) == peak && peak != scored.at("confidence").get<double>(),
                "a score answer's confidence is its top probability");
 
-        // Past 26 options a question keeps its one-pass answer at every level, however unsure.
-        const DecisionQuestion wide   = choice_question(27);
-        const DecisionQuestion widest = choice_question(26);
-        for (const auto& spec : kDecisionThinkingLevels) {
-            expect(!decision_should_think(spec.level, wide, 0.0), "27 options never think");
-            expect(decision_should_think(spec.level, widest, 0.0), "26 options think");
-        }
+        // Past 26 options a question keeps its one-pass answer, however unsure.
+        expect(!decision_should_think(choice_question(27), 0.0), "27 options never think");
+        expect(!decision_should_think(choice_question(255), 0.0), "255 options never think");
+        expect(decision_should_think(choice_question(26), 0.0), "26 options think");
     }
 
     // ---- 5. The thought: cut, forced close, readout, budget ----
@@ -330,7 +303,7 @@ int main() {
         const auto thought      = [&](Ids generated, std::size_t budget) {
             return decision_thought(generated, C, budget);
         };
-        expect(decision_thinking_generation_limit(512) == 513, "a thought may generate its budget and its close");
+        expect(decision_thinking_generation_limit(kDecisionThinkingBudget) == 513, "a thought may generate its budget and its close");
 
         DecisionThought t = thought({5, 6, 7, C, 8}, 10);
         expect(t.tokens == Ids{5, 6, 7} && t.closed, "a thought is what comes before its close");
@@ -363,17 +336,17 @@ int main() {
         expect(decision_thinking_readout({2, 3}, DecisionThought{.tokens = {}, .closed = true}, C) == Ids{2, 3, C},
                "an empty thought reads right after the close");
 
-        expect(decision_thinking_budget(512, 100, 8192) == std::optional<std::size_t>(512), "the budget fits");
-        expect(decision_thinking_budget(512, 8000, 8192) == std::optional<std::size_t>(190),
+        expect(decision_thinking_budget(kDecisionThinkingBudget, 100, 8192) == std::optional<std::size_t>(512), "the budget fits");
+        expect(decision_thinking_budget(kDecisionThinkingBudget, 8000, 8192) == std::optional<std::size_t>(190),
                "the budget is cut to the context: 8000 + 190 + close + answer = 8192");
-        expect(decision_thinking_budget(4096, 8190, 8192) == std::optional<std::size_t>(0),
+        expect(decision_thinking_budget(kDecisionThinkingBudget, 8190, 8192) == std::optional<std::size_t>(0),
                "only an empty thought fits");
-        expect(!decision_thinking_budget(4096, 8191, 8192).has_value(), "nothing fits: the one-pass answer stands");
+        expect(!decision_thinking_budget(kDecisionThinkingBudget, 8191, 8192).has_value(), "nothing fits: the one-pass answer stands");
     }
 
     // ---- 6. The answer after a thought ----
     {
-        const DecisionsRequest request = parse_decisions_request(body_with(R"(, "thinking": "medium")"));
+        const DecisionsRequest request = parse_decisions_request(body_with(R"(, "thinking": true)"));
         const DecisionQuestion& tone   = request.questions[0];
         const DecisionQuestion& refund = request.questions[1];
         const DecisionQuestion& urgency = request.questions[2];
@@ -382,7 +355,7 @@ int main() {
         const std::vector<float> after{-1.25F, 0.5F, 3.75F};
 
         const OrderedJson answer =
-            decision_thinking_answer(tone, after, 1.0, DecisionThinkingLevel::Medium, thought, onepass);
+            decision_thinking_answer(tone, after, 1.0, thought, onepass);
         OrderedJson bare = answer;
         bare.erase("thinking");
         expect(bare.dump() == reference_answer(tone, after).dump(),
@@ -398,20 +371,18 @@ int main() {
         const OrderedJson& record = answer.at("thinking");
         std::vector<std::string> record_keys;
         for (const auto& item : record.items()) { record_keys.push_back(item.key()); }
-        expect(record_keys == std::vector<std::string>{"level", "tokens", "closed", "onepass"}, "the record's keys");
-        expect(record.at("level") == "medium" && record.at("tokens") == 37 && record.at("closed") == true,
-               "level, tokens, closed");
+        expect(record_keys == std::vector<std::string>{"tokens", "closed", "onepass"}, "the record's keys");
+        expect(record.at("tokens") == 37 && record.at("closed") == true, "tokens, closed");
         expect(record.at("onepass").dump() == onepass.dump(), "the one-pass answer, unchanged");
 
         const OrderedJson forced = decision_thinking_answer(
-            tone, after, 1.0, DecisionThinkingLevel::High, DecisionThought{.tokens = {1, 2}, .closed = false}, onepass);
-        expect(forced.at("thinking").at("closed") == false && forced.at("thinking").at("tokens") == 2 &&
-                   forced.at("thinking").at("level") == "high",
+            tone, after, 1.0, DecisionThought{.tokens = {1, 2}, .closed = false}, onepass);
+        expect(forced.at("thinking").at("closed") == false && forced.at("thinking").at("tokens") == 2,
                "a forced close is recorded as not closed");
 
         // noul: p(true) = P(B), the reference's probs[1].
         const std::vector<float> noul_logits{0.3F, 1.1F};
-        const OrderedJson noul = decision_thinking_answer(refund, noul_logits, 1.0, DecisionThinkingLevel::Low, thought,
+        const OrderedJson noul = decision_thinking_answer(refund, noul_logits, 1.0, thought,
                                                           resolve_decision_answer(refund, {2.0F, 0.0F}));
         OrderedJson noul_bare = noul;
         noul_bare.erase("thinking");
@@ -420,8 +391,7 @@ int main() {
 
         // score: v1's score formulas (expected level, TypeSafe's concentration, legend).
         const std::vector<float> score_logits{0.2F, 1.4F, 0.9F};
-        const OrderedJson scored = decision_thinking_answer(urgency, score_logits, 1.0, DecisionThinkingLevel::Low,
-                                                            thought, resolve_decision_answer(urgency, {0.0F, 0.0F, 0.0F}));
+        const OrderedJson scored = decision_thinking_answer(urgency, score_logits, 1.0, thought, resolve_decision_answer(urgency, {0.0F, 0.0F, 0.0F}));
         OrderedJson scored_bare = scored;
         scored_bare.erase("thinking");
         expect(scored_bare.dump() == resolve_decision_answer(urgency, score_logits).dump(),
@@ -429,7 +399,7 @@ int main() {
 
         // The server's calibration temperature applies to a thinking readout as to a one-pass one.
         const OrderedJson tempered =
-            decision_thinking_answer(tone, after, 2.0, DecisionThinkingLevel::Medium, thought, onepass);
+            decision_thinking_answer(tone, after, 2.0, thought, onepass);
         OrderedJson tempered_bare = tempered;
         tempered_bare.erase("thinking");
         expect(tempered_bare.dump() == resolve_decision_answer(tone, after, 2.0).dump() &&
@@ -439,16 +409,16 @@ int main() {
         // A non-finite readout is refused, as v1's is (HTTP 500 after the retries).
         bool threw = false;
         try {
-            (void)decision_thinking_answer(tone, {0.0F, NAN, 1.0F}, 1.0, DecisionThinkingLevel::Low, thought, onepass);
+            (void)decision_thinking_answer(tone, {0.0F, NAN, 1.0F}, 1.0, thought, onepass);
         } catch (const std::runtime_error&) { threw = true; }
         expect(threw, "a non-finite thinking readout is refused");
     }
 
     if (failures != 0) {
-        std::cerr << failures << " thinking-level check(s) failed\n";
+        std::cerr << failures << " thinking check(s) failed\n";
         return 1;
     }
-    std::cout << "decisions thinking levels: table, request field, thinking chat, gate, forced close and answer "
+    std::cout << "decisions thinking: setting, request field, thinking chat, gate, forced close and answer "
                  "checks passed\n";
     return 0;
 }

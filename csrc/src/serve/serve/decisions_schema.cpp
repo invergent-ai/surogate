@@ -502,9 +502,9 @@ DecisionsRequest parse_decisions_request(std::string_view body) {
             request.images.push_back(std::move(part));
         }
     }
-    // Our extension (decisions_thinking.h): absent, null and "none" are v1, and nothing below
+    // Our extension (decisions_thinking.h): absent, null and false are v1, and nothing below
     // reads the field then.
-    request.thinking = parse_decision_thinking_level(root);
+    request.thinking = parse_decision_thinking(root);
     // provider, session_id, user and trace are accepted and ignored, as are unknown fields.
     return request;
 }

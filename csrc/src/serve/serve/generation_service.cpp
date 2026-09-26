@@ -1024,7 +1024,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         }
         check();
         // `as` is the template's switches (thinking off for every v1 prompt; on for a thinking
-        // level's), `with` the preparation's deadline and cancellation.
+        // prompt), `with` the preparation's deadline and cancellation.
         const auto prepare_chat_as = [&](const ResolvedPromptSemantics& as, const PreparationControl& with,
                                          std::string_view system, std::string user_text) {
             GenerationRequest turns = shape;
@@ -1150,9 +1150,9 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             items.push_back(std::move(item));
         }
 
-        // Thinking levels (decisions_thinking.h): what a level needs of this model and request is
+        // Thinking (decisions_thinking.h): what thinking needs of this model and request is
         // checked here, before any GPU work, so a request that cannot think is refused rather
-        // than answered in one pass. `none` skips all of it.
+        // than answered in one pass. With thinking off none of it runs.
         struct ThinkingSetup {
             ResolvedPromptSemantics semantics;
             TokenId close = -1;
@@ -1160,13 +1160,13 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             std::vector<TokenId> letters;
         };
         std::optional<ThinkingSetup> thinking;
-        if (request.thinking != DecisionThinkingLevel::None) {
+        if (request.thinking) {
             if (with_images) {
-                refuse("thinking levels do not support images yet; send this request with thinking none",
+                refuse("thinking does not support images yet; send this request with thinking false",
                        "thinking", "decisions_thinking_not_supported");
             }
             if (!prompt_capabilities_.enable_thinking) {
-                refuse("this model's chat template has no thinking switch, so it cannot serve thinking levels",
+                refuse("this model's chat template has no thinking switch, so it cannot think here",
                        "thinking", "decisions_thinking_not_supported");
             }
             // The close token and the letters after it, in context: the first question's prompt
@@ -1181,7 +1181,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             if (closed.size() != ids.size() + 1 || !std::equal(ids.begin(), ids.end(), closed.begin()) ||
                 decode({closed.back()}) != close_text) {
                 refuse("this model's tokenizer has no single '" + close_text +
-                           "' token to close a thought with, so it cannot serve thinking levels",
+                           "' token to close a thought with, so it cannot think here",
                        "thinking", "decisions_thinking_not_supported");
             }
             ThinkingSetup setup;
@@ -1198,7 +1198,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                     !std::equal(closed.begin(), closed.end(), appended.begin()) ||
                     !seen.insert(appended.back()).second) {
                     refuse("option letter '" + label + "' is not a single token after '" + close_text +
-                               "' for this model, so it cannot serve thinking levels",
+                               "' for this model, so it cannot think here",
                            "thinking", "decisions_thinking_not_supported");
                 }
                 setup.letters.push_back(appended.back());
@@ -1376,10 +1376,9 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         outcome.answers =
             resolve_decision_answers(request, readout.logits, options_.decision_temperature);
 
-        // Thinking levels (decisions_thinking.h). Everything above is v1 and ran as it always
-        // does; each question the level's gate lets through is now asked again with a thought.
+        // Thinking (decisions_thinking.h). Everything above is v1 and ran as it always does; each
+        // question the gate lets through is now asked again with a thought.
         if (thinking) {
-            const DecisionThinkingLevelSpec& spec = decision_thinking_spec(request.thinking);
             struct Thinker {
                 std::size_t question = 0;
                 std::vector<TokenId> prompt;
@@ -1398,7 +1397,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             for (std::size_t i = 0; i < request.questions.size(); ++i) {
                 const DecisionQuestion& question = request.questions[i];
                 const double confidence = decision_onepass_confidence(outcome.answers.at(question.name));
-                if (!decision_should_think(request.thinking, question, confidence)) { continue; }
+                if (!decision_should_think(question, confidence)) { continue; }
                 check_client();
                 const DecisionChat chat = decision_thinking_chat(request, question);
                 const PreparationControl thinking_control{
@@ -1407,7 +1406,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                 thinker.question = i;
                 thinker.prompt =
                     prepare_chat_as(thinking->semantics, thinking_control, chat.system, chat.user).token_ids();
-                const auto budget = decision_thinking_budget(spec.budget, thinker.prompt.size(), max_context);
+                const auto budget = decision_thinking_budget(kDecisionThinkingBudget, thinker.prompt.size(), max_context);
                 // Not even an empty thought fits the context: the one-pass answer stands.
                 if (!budget) { continue; }
                 thinker.budget = *budget;
@@ -1515,8 +1514,8 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                 const DecisionQuestion& question = request.questions[thinker.question];
                 OrderedJson onepass              = std::move(outcome.answers.at(question.name));
                 outcome.answers[question.name] =
-                    decision_thinking_answer(question, thinker.logits, options_.decision_temperature, request.thinking,
-                                             thinker.thought, std::move(onepass));
+                    decision_thinking_answer(question, thinker.logits, options_.decision_temperature, thinker.thought,
+                                             std::move(onepass));
                 const auto thought_tokens = static_cast<int>(thinker.thought.tokens.size());
                 outcome.reasoning_tokens += thought_tokens;
                 outcome.output_tokens += thought_tokens + 1;

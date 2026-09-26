@@ -81,23 +81,23 @@ struct GenerationOutcome {
 struct DecisionsOutcome {
     OrderedJson answers;
     /// The shared prefix once plus every question's suffix (every full prompt for an
-    /// image request, which shares no GPU state). With a thinking level, also every thinking
-    /// prompt and every thinking readout (prompt, thought and close token), all prefilled whole.
+    /// image request, which shares no GPU state). With thinking on, also every thinking prompt
+    /// and every thinking readout (prompt, thought and close token), all prefilled whole.
     int input_tokens  = 0;
-    /// One readout token per question; with a thinking level, also every thought token and one
-    /// more readout token for each question that thought.
+    /// One readout token per question; with thinking on, also every thought token and one more
+    /// readout token for each question that thought.
     int output_tokens = 0;
     std::size_t shared_prefix_tokens = 0;
     double prepare_seconds = 0.0;
     /// Every attempt's prefill time; `input_tokens` counts one attempt's tokens.
     double prefill_seconds = 0.0;
-    /// The thoughts' generation time (thinking levels only), wave by wave.
+    /// The thoughts' generation time (thinking on only), wave by wave.
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
     /// How many times the request ran (--decision-attempts): 1 unless an attempt returned
     /// non-finite option logits and was run again.
     std::uint32_t attempts = 1;
-    /// Thinking levels (decisions_thinking.h): how many questions thought, the thought tokens
+    /// Thinking (decisions_thinking.h): how many questions thought, the thought tokens
     /// their answers were read after (the sum of their `thinking.tokens`), and how many rounds
     /// the thinking took (above 1 when a thinking readout was non-finite and was thought again;
     /// 0 when nothing thought).
@@ -229,8 +229,8 @@ public:
     /// `--decision-attempts` times in all; `on_retry` is given the number of the attempt about
     /// to start and why, before each run after the first. Non-finite logits are the only reason
     /// to run again: any other failure ends the request at once, as it always has.
-    /// With a thinking level (decisions_thinking.h) the one-pass answers above come first,
-    /// unchanged; each question below the level's gate then thinks greedily within its budget
+    /// With thinking on (decisions_thinking.h) the one-pass answers above come first,
+    /// unchanged; each question below the gate then thinks greedily within the budget
     /// and is read again after the thought's close token. The thinking questions of a request
     /// run together, in waves like the readouts. A thinking readout that is non-finite is
     /// thought again, the failed questions only, up to `--decision-attempts` rounds in all;

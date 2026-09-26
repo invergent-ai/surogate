@@ -1,4 +1,4 @@
-"""Decisions thinking levels, end to end on a served Rune: the endpoint's thinking answers against the reference.
+"""Decisions thinking, end to end on a served Rune: the endpoint's thinking answers against the reference.
 
 GPU. Skipped unless a served Gemma 4 decision model is given, either
 - SUROGATE_DECISIONS_THINKING_URL=http://127.0.0.1:PORT: a running server, started with --no-prefix-reuse and
@@ -7,19 +7,19 @@ GPU. Skipped unless a served Gemma 4 decision model is given, either
   CUDA_VISIBLE_DEVICES selects, with --no-prefix-reuse and SUROGATE_DECISIONS_THINKING_ARGS (a JSON list) added.
 
 SUROGATE_DECISIONS_THINKING_TOKENIZER names the served model's tokenizer.json (default: google/gemma-4-26B-A4B-it's
-in the Hugging Face cache, which Rune shares); SUROGATE_DECISIONS_THINKING_LEVEL the level (default medium).
+in the Hugging Face cache, which Rune shares). Thinking is `"thinking": true`: gate 0.7, a 512-token budget.
 
 The questions are a built-in set chosen to be hard to answer in one pass, or the first SUROGATE_DECISIONS_THINKING_LIMIT
 (default 8) rows of SUROGATE_DECISIONS_THINKING_QUESTIONS, a JSONL of {"state", "q"} rows (jev's
 runs/think-when-unsure-v1 sample and full question files have that shape). Each question is its own request, one
 at a time, so the endpoint's thought runs alone as the reference's did. For each:
 
-1. /v1/decisions at `none` is the one-pass answer. At the level, a question at or above the gate (or past 26
-   options) must come back as exactly that answer, without a `thinking` object; one below it must carry
+1. /v1/decisions without thinking is the one-pass answer. With thinking, a question at or above the gate (or past
+   26 options) must come back as exactly that answer, without a `thinking` object; one below it must carry
    `thinking` with that answer as `onepass`.
 2. The reference, jev scripts/think_when_unsure_pilot_v1.py (`user_message`, `readout`, `think_one`) and
    think_when_unsure_full_v1.py (`v1_answer`), run through /v1/chat/completions on the same server: the teacher
-   system prompt with `chat_template_kwargs.enable_thinking`, a greedy thought of at most the budget, `<channel|>`
+   system prompt with `chat_template_kwargs.enable_thinking`, a greedy thought of at most 512 tokens, `<channel|>`
    forced when it did not close, and the letter distribution at the next position from the top-20
    log-probabilities plus prompt-scoring probes. Its thought length and natural close must be the endpoint's
    `thinking.tokens` and `thinking.closed`, its choice the endpoint's, and every probability (and noul, score)
@@ -27,8 +27,7 @@ at a time, so the endpoint's thought runs alone as the reference's did. For each
    of two forward passes, the endpoint the logits of one).
 3. usage.reasoning_tokens is the sum of the thinking answers' tokens, and the aliases answer identically.
 
-The run must think on at least one question to mean anything; it fails otherwise (pick a higher level or harder
-questions).
+The run must think on at least one question to mean anything; it fails otherwise (pick harder questions).
 """
 
 import json
@@ -46,8 +45,7 @@ pytestmark = pytest.mark.skipif(
     not (os.getenv("SUROGATE_DECISIONS_THINKING_URL") or os.getenv("SUROGATE_DECISIONS_THINKING_ARTIFACT")),
     reason="needs a served Gemma 4 decision model (Rune) and a free GPU")
 
-LEVELS = {"low": (0.7, 512), "medium": (0.8, 1024), "high": (0.9, 4096)}  # decisions_thinking.h
-LEVEL = os.getenv("SUROGATE_DECISIONS_THINKING_LEVEL", "medium")
+GATE, BUDGET = 0.7, 512  # kDecisionThinkingGate, kDecisionThinkingBudget (decisions_thinking.h)
 TOLERANCE = float(os.getenv("SUROGATE_DECISIONS_THINKING_TOLERANCE", "1e-4"))
 TIMEOUT = 1800
 ROUTES = ("/v1/decisions", "/api/alpha/decisions", "/api/v1/decisions")
@@ -246,6 +244,7 @@ def questions():
 
 
 def decide(url, model, state, q, thinking=None, route=ROUTES[0]):
+    """One question on its own; `thinking` None leaves the field out."""
     body = {"model": model, "state": state, "questions": {"x": q}}
     if thinking is not None:
         body["thinking"] = thinking
@@ -258,7 +257,6 @@ def close(a, b, where):
 
 def test_thinking_answers_match_the_reference(server):
     url, model = server
-    gate, budget = LEVELS[LEVEL]
     tokenizer = os.getenv("SUROGATE_DECISIONS_THINKING_TOKENIZER") or next(
         Path.home().glob(".cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/*/tokenizer.json"),
         None)
@@ -272,23 +270,24 @@ def test_thinking_answers_match_the_reference(server):
         assert list(onepass_response["usage"]) == ["input_tokens", "output_tokens", "cost"], where
         onepass = onepass_response["answers"]["x"]
         assert "thinking" not in onepass, where
-        response = decide(url, model, state, q, LEVEL)
+        response = decide(url, model, state, q, True)
+        assert decide(url, model, state, q, False)["answers"]["x"] == onepass, (where, "false is off")
         answer = response["answers"]["x"]
         confidence = max(onepass["noul"], 1 - onepass["noul"]) if q["type"] == "noul" else \
             max(onepass["probabilities"].values())
         wide = len(options_of(q)[0]) > 26
         for route in ROUTES[1:]:  # one endpoint: the same answers on an idle server
-            assert decide(url, model, state, q, LEVEL, route)["answers"] == response["answers"], (where, route)
-        if wide or confidence >= gate:
+            assert decide(url, model, state, q, True, route)["answers"] == response["answers"], (where, route)
+        if wide or confidence >= GATE:
             assert answer == onepass, (where, "at or above the gate the one-pass answer stands")
             assert response["usage"]["reasoning_tokens"] == 0, where
             continue
         thought += 1
         record = answer["thinking"]
-        assert record["level"] == LEVEL and record["onepass"] == onepass, where
+        assert list(record) == ["tokens", "closed", "onepass"] and record["onepass"] == onepass, where
         assert response["usage"]["reasoning_tokens"] == record["tokens"], where
         assert response["usage"]["output_tokens"] == 1 + record["tokens"] + 1, where
-        want, tokens, closed = reference_think(url, model, state, q, budget, vocab)
+        want, tokens, closed = reference_think(url, model, state, q, BUDGET, vocab)
         print(f"{where}: one-pass {confidence:.3f}, thought {record['tokens']} tokens "
               f"({'closed' if record['closed'] else 'forced'}); reference {tokens} ({'closed' if closed else 'forced'})")
         assert record["tokens"] == tokens and record["closed"] == closed, (where, "the thought differs from the reference's")
@@ -302,13 +301,14 @@ def test_thinking_answers_match_the_reference(server):
             assert list(answer["probabilities"]) == list(want["probabilities"]), where
             for key, value in want["probabilities"].items():
                 close(answer["probabilities"][key], value, (where, key))
-    assert thought > 0, f"no question thought at {LEVEL}; use a higher level or harder questions"
+    assert thought > 0, "no question thought; use harder questions"
 
 
-def test_unknown_level_is_refused(server):
+@pytest.mark.parametrize("value", ["low", "true", 1, {"enabled": True}])
+def test_a_thinking_value_that_is_not_a_boolean_is_refused(server, value):
     url, model = server
     response = requests.post(url + "/v1/decisions", timeout=60, json={
-        "model": model, "state": "s", "thinking": "turbo",
+        "model": model, "state": "s", "thinking": value,
         "questions": {"x": {"type": "noul", "instructions": "i", "criteria": {"true": "t", "false": "f"}}}})
     assert response.status_code == 400, response.text
     error = response.json()["error"]

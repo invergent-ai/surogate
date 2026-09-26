@@ -30,7 +30,7 @@ the server reports, which is how you keep a client's hard-coded model string wor
 | `POST` | `/v1/chat/completions` | Chat Completions, streaming or not |
 | `POST` | `/v1/chat/completions/tokens` | Chat completions with an optional `tokens` array for exact prompt ids |
 | `POST` | `/v1/completions` | Raw text completion without a chat template |
-| `POST` | `/v1/decisions` (stable v1; aliases `/api/alpha/decisions`, `/api/v1/decisions`) | Decisions API: several single-token questions over one shared state, with opt-in [thinking levels](decisions.md#thinking-levels); see [decisions.md](decisions.md) |
+| `POST` | `/v1/decisions` (stable v1; aliases `/api/alpha/decisions`, `/api/v1/decisions`) | Decisions API: several single-token questions over one shared state, with opt-in [thinking](decisions.md#thinking) for unsure questions; see [decisions.md](decisions.md) |
 | `POST` | `/tokenize` | Render and tokenize `messages` or a raw `prompt` without generating |
 | `POST` | `/v1/responses` | Responses API |
 | `POST` | `/v1/responses/input_tokens` | Count input tokens without generating |

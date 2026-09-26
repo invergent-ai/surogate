@@ -1,7 +1,7 @@
-// Thinking levels on Gemma 4's own chat template and tokenizer: the thinking prompt the decisions
+// Decisions thinking on Gemma 4's own chat template and tokenizer: the thinking prompt the decisions
 // endpoint renders for a question, beside the one-pass prompt v1 renders for it, built the way
 // GenerationService::decide builds both (a system and a user turn through `to_prompt_input`, the
-// template's thinking switch off for v1 and on for a level) and rendered by the serving frontend.
+// template's thinking switch off for v1 and on for thinking) and rendered by the serving frontend.
 //
 // It pins what the reference (jev scripts/think_when_unsure_pilot_v1.py) sent through
 // /v1/chat/completions with `chat_template_kwargs: {"enable_thinking": true}`: the two prompts
@@ -125,7 +125,7 @@ int main() {
     expect(capabilities.enable_thinking, "Gemma 4's template has a thinking switch the endpoint can drive");
 
     const DecisionsRequest request = parse_decisions_request(R"json({
-      "model": "rune", "thinking": "medium",
+      "model": "rune", "thinking": true,
       "state": {"ticket": "Comanda 8812 a ajuns târziu și cutia era strivită. Vreau banii înapoi.", "items": [1, 2.5]},
       "questions": {
         "tone": {"type": "choice", "instructions": "What is the tone?",
@@ -135,7 +135,7 @@ int main() {
         "urgency": {"type": "score", "instructions": "How urgent is this?",
                     "criteria": ["Not urgent", "Somewhat urgent", "Very urgent", "Critical"]}
       }})json");
-    expect(request.thinking == DecisionThinkingLevel::Medium, "the level parses");
+    expect(request.thinking, "thinking parses on");
 
     const std::string empty_thought = "<|channel>thought\n<channel|>";
     const std::string close(kDecisionThinkingClose);
@@ -153,7 +153,7 @@ int main() {
         const std::string onepass  = text_of(frontend, onepass_ids);
         const std::string thinking = text_of(frontend, thinking_ids);
 
-        // v1: thinking off ends on the empty thought block; a level: the template's thinking switch
+        // v1: thinking off ends on the empty thought block; thinking: the template's thinking switch
         // on, the generation prompt ends at the model turn and the model opens the thought itself.
         expect(onepass.ends_with("<|turn>model\n" + empty_thought), name + ": one-pass prompt ends on the empty thought");
         expect(thinking.ends_with("<|turn>model\n") && !thinking.ends_with(empty_thought),
