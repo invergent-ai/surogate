@@ -68,6 +68,16 @@ struct DecisionQuestion {
     [[nodiscard]] bool extended() const noexcept;
 };
 
+/// Our extension, opt-in per request: whether a question the model is unsure of may think before
+/// it answers (`"thinking"`, docs/inference/decisions.md "Thinking levels"). `None`, the default
+/// and what an absent or null field means, is v1 exactly; decisions_thinking.h has the rest.
+enum class DecisionThinkingLevel : std::uint8_t {
+    None,
+    Low,
+    Medium,
+    High,
+};
+
 struct DecisionsRequest {
     std::string model;
     /// The adapter `model` named, resolved by the HTTP layer; empty for the base model.
@@ -81,6 +91,8 @@ struct DecisionsRequest {
     std::vector<DecisionQuestion> questions;
     /// Our extension: images attached to the user turn ahead of the text, in order.
     std::vector<ContentPart> images;
+    /// Our extension: the request's thinking level. `None` leaves every answer v1's.
+    DecisionThinkingLevel thinking = DecisionThinkingLevel::None;
 };
 
 inline constexpr std::size_t kDecisionMinOptions = 2;
@@ -140,7 +152,8 @@ inline constexpr std::size_t kDecisionMinPrefillTokens = 47;
 
 /// Parse and validate a request body. Throws `ApiException` (400) for anything malformed:
 /// a missing or mistyped field, an unknown question type, fewer than 2 or more than 255
-/// options, a question named twice, a duplicate option label, an empty question set.
+/// options, a question named twice, a duplicate option label, an empty question set, a
+/// `thinking` value that is not a level (`parse_decision_thinking_level`, decisions_thinking.h).
 [[nodiscard]] DecisionsRequest parse_decisions_request(std::string_view body);
 
 /// The tokenizer-specific single-token label codebook: `A`..`Z` then `AA`, `AB`, .. `ZZ`,
