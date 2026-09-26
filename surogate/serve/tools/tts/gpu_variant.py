@@ -22,15 +22,15 @@ from pathlib import Path
 # checksums; tests/serve/test_tts.py checks the two agree). Another build must be qualified and
 # pinned in both places before a package can carry it.
 PINNED = {
-    "libnemo_speech_tts.so.1": "02fa87a8479ccde6b188b204c0086e87624034e5fb177c94b5ab0c2bb666e395",
-    "libggml-base.so.0": "5916a79c9ece31dcbef048992230d1edd75c585c5c8534fc4f94100a40639718",
-    "libggml-cuda.so.0": "285f960f40ade7e1ec7361d74ebbbb77809b8bfc2fdc34a355876a564c55dc2f",
+    "libnemo_speech_tts.so.1": "23fe4ad6149354d2f9f1940139a734d34deef85f47f478016b568b9be8b18f3f",
+    "libggml-base.so.0": "aa54f07d57a1d726b3a996f90a8d8adf51865b8a52555f5ac496643626fbf4a5",
+    "libggml-cuda.so.0": "68403109b62dc77ddc62dbe1fa33b17995d3c6582ce13805ed10fda3ad5bb247",
 }
 
+# Only the SONAMEs the runtime loads; the unversioned and full-version names would be byte copies.
 LIBRARIES = {
-    "libnemo_speech_tts": ["libnemo_speech_tts.so", "libnemo_speech_tts.so.1"],
-    **{base: [f"{base}.so", f"{base}.so.0", f"{base}.so.0.12.0"]
-       for base in ("libggml", "libggml-base", "libggml-cpu", "libggml-cuda")},
+    "libnemo_speech_tts": ["libnemo_speech_tts.so.1"],
+    **{base: [f"{base}.so.0"] for base in ("libggml", "libggml-base", "libggml-cpu", "libggml-cuda")},
 }
 
 
@@ -74,10 +74,10 @@ def assemble(cpu_package, cuda_lib_dir, out, *, check_pins=True):
     build_info = json.loads((cpu_package / "build_info.json").read_text(encoding="utf-8"))
     build_info = {
         "scope": "GPU variant: the CPU package's model, codec, tokenizer and voices with the same native "
-                 "runtime built with CUDA. It runs on compute capability 12.0 (RTX 50-series) only.",
+                 "runtime built with CUDA for Ampere, Ada, Hopper and Blackwell GPUs (sm_80 to sm_120).",
         "native_commit": build_info.get("native_commit"),
-        "cmake": {"GGML_CUDA": "ON", "CMAKE_CUDA_ARCHITECTURES": "120", "GGML_CUDA_NCCL": "OFF",
-                  "GGML_NATIVE": "ON", "GGML_OPENMP": "ON"},
+        "cmake": {"GGML_CUDA": "ON", "CMAKE_CUDA_ARCHITECTURES": "80;86;89;90;100;120", "GGML_CUDA_NCCL": "OFF",
+                  "GGML_NATIVE": "OFF", "GGML_AVX2": "ON", "GGML_FMA": "ON", "GGML_F16C": "ON", "GGML_OPENMP": "ON"},
         "native_library_sha256": {f"lib/{path.name}": sha256(path) for path in sorted(lib.iterdir())},
     }
     (out / "build_info.json").write_text(json.dumps(build_info, indent=2) + "\n", encoding="utf-8")
@@ -87,7 +87,7 @@ def assemble(cpu_package, cuda_lib_dir, out, *, check_pins=True):
     files["build_info.json"] = sha256(out / "build_info.json")
     profile["files"] = files
     profile["scope"] = ("GPU variant of the native package: the same voices, decoded by the Magpie runtime "
-                        "built with CUDA for compute capability 12.0.")
+                        "built with CUDA for Ampere, Ada, Hopper and Blackwell GPUs.")
     (out / "voices.json").write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return out
 
