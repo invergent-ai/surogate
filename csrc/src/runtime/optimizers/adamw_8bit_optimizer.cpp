@@ -685,9 +685,9 @@ void AdamW8BitOptimizer::prepare_for_graph(dsl::DslModel& model,
             did_work = true;
         }
     } else {
-        if (!mImpl->state) {
-            throw std::logic_error("AdamW8BitOptimizer::prepare_for_graph: optimizer state not allocated");
-        }
+        // A graphed run captures before any eager optimizer step, so the state the
+        // first step() would create lazily has to be created here.
+        mImpl->ensure_state();
         if (!mImpl->state->initialized) {
             init_state(model, stream);
             did_work = true;
