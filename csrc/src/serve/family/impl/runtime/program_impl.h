@@ -2153,8 +2153,17 @@ void ProgramImplCore::prepare_graphs() {
         // with a synchronous copy; force it now so no captured body ever
         // triggers that init mid-capture (capture would be invalidated).
         (void)ops::detail::w4fp4_alpha_one();
+        // SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB: what graphs captured after startup may
+        // hold (0 captures none after startup).
+        const std::size_t lazy_graph_budget = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB");
+            if (raw == nullptr || *raw == '\0') { return PrefillGraphFamily::kDefaultLazyBudgetBytes; }
+            const long mib = std::strtol(raw, nullptr, 10);
+            return static_cast<std::size_t>(mib > 0 ? mib : 0) << 20;
+        }();
         prefill_graphs.emplace(device, std::min(prefill_chunk, capacity), capacity,
-                               LinearStateSlots::prefill_scratch_state_slot(max_concurrency));
+                               LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
+                               lazy_graph_budget);
         const auto effective_chunk =
             static_cast<std::int32_t>(std::min(prefill_chunk, capacity));
 
@@ -2225,6 +2234,7 @@ void ProgramImplCore::prepare_graphs() {
         capture_card.precapture_prefill_graphs(effective_chunk);
         device.synchronize();
         work.reset();
+        prefill_graphs->finish_startup();
     }
 
     for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }

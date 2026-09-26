@@ -3418,8 +3418,9 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 // bucket) pair on first use, and replays it. The caller passes the decode
 // slice at the batch bucket with pad rows already duplicated from a live
 // row, and runs the eager epilogues (scatter, sample, egress) at the real
-// row count afterwards. Returns false when the family is dead or the bucket
-// does not fit the workspace window: the caller runs the eager mixed body.
+// row count afterwards. Returns false when the family is dead, the bucket
+// does not fit the workspace window, or a new graph does not fit the family's
+// budget: the caller runs the eager mixed body.
 bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                         std::uint32_t nominal, const MixedDecodeSlice& decode,
                                         std::int32_t batch_bucket,

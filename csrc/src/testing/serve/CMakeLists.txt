@@ -240,6 +240,9 @@ sinfer_add_test(sinfer_elastic_kv_region_test
 sinfer_add_test(sinfer_prefill_graph_reach_test
   SOURCES test_prefill_graph_reach.cpp
   LIBRARIES sinfer_core)
+sinfer_add_op_test(sinfer_prefill_graph_budget_test
+  SOURCES test_prefill_graph_budget.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_test(sinfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES sinfer_core)

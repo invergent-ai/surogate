@@ -540,3 +540,4 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | `SUROGATE_SERVE_CACHE` | Prepared-model cache directory; default `~/.cache/surogate/serve` |
 | `SUROGATE_CONVERT_DEVICE` | Override the preparation device, such as `cuda:1` or `cpu`; otherwise follows the serving GPU |
 | `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | GPU memory kept free when sharing caches across models; default 1024 MiB |
+| `SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB` | GPU memory for prefill and mixed-round CUDA graphs captured while serving; new shapes run without a graph once it is spent; default 512 MiB, 0 captures none |
