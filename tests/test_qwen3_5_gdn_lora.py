@@ -119,9 +119,22 @@ def _hv3_fixture(snapshot, out):
                                 num_position_embeddings=256)
     torch.manual_seed(353)
     model = transformers.Qwen3_5ForConditionalGeneration(transformers.AutoConfig.for_model(**cfg)).to(torch.bfloat16)
+    # Decay parameters come from the real checkpoint's layers. HF's init draws exp(A_log) from U(0, 16), up
+    # to 10^4 times the trained model's decay: the state then vanishes within a few tokens, the in_proj_a
+    # gradient shrinks to ~1e-5 and is bf16 noise (HF's own bf16 run lands at cosine 0.73 against its fp32).
+    from safetensors import safe_open
+
+    decay = {}
+    for shard in snapshot.glob("*.safetensors"):
+        with safe_open(str(shard), "pt") as f:
+            for key in f.keys():
+                if key.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+                    decay[key] = f.get_tensor(key)
     with torch.no_grad():
         for name, p in model.named_parameters():
-            if p.dim() == 1 and not name.endswith(("A_log", "dt_bias")):
+            if name.endswith(("A_log", "dt_bias")):
+                p.copy_(decay[name][: p.numel()].to(p.dtype))
+            elif p.dim() == 1:
                 p.copy_(0.1 * torch.randn_like(p, dtype=torch.float32).to(p.dtype))
     model.save_pretrained(out, safe_serialization=True)
     for f in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"):

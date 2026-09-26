@@ -1,3 +1,4 @@
+import json
 import os
 from collections import Counter
 from contextlib import contextmanager
@@ -17,6 +18,14 @@ from surogate.utils.seed import RAND_SEED
 logger = get_logger()
 
 _pair_keys = ["messages", "images", "videos", "audios", "tools", "objects"]
+
+# Message keys carried from preprocessing to the chat template. Everything else is dropped.
+# `tool_calls` travels as a JSON string: its arguments are free-form objects no fixed schema can
+# hold. Preprocessing runs in several processes and each shard's Arrow schema is inferred from
+# its own rows, so every message carries every optional field, "" when absent (dropped again
+# before rendering), or shards whose rows differ would not concatenate.
+MESSAGE_KEYS = ("role", "content", "loss", "reasoning_content", "tool_calls", "tool_call_id", "name")
+_MESSAGE_STRING_KEYS = ("reasoning_content", "tool_calls", "tool_call_id", "name")
 
 
 class MaxLengthError(ValueError):
@@ -249,10 +258,16 @@ class RowPreprocessor:
                         "role": Value(dtype="string"),
                         "content": Value(dtype="string"),
                         "loss": Value(dtype="float64"),
+                        "reasoning_content": Value(dtype="string"),
+                        "tool_calls": Value(dtype="string"),
+                        "tool_call_id": Value(dtype="string"),
+                        "name": Value(dtype="string"),
                     }
                 )
                 features["messages"] = messages_feature_with_loss
                 features["rejected_messages"] = messages_feature_with_loss
+                if "tools" in features:
+                    features["tools"] = Value(dtype="string")
                 features["positive_messages"] = Sequence(feature=messages_feature)
                 features["negative_messages"] = Sequence(feature=messages_feature)
                 features["images"] = Sequence(feature={"bytes": Value(dtype="binary"), "path": Value(dtype="string")})
@@ -329,15 +344,25 @@ class RowPreprocessor:
         messages = row["messages"]
         assert len(messages) > 0, f"messages: {messages}"
         for message in messages:
-            keys = set(message.keys()) - {"role", "content", "loss"}
+            keys = set(message.keys()) - set(MESSAGE_KEYS)
             for key in keys:
                 message.pop(key)
+            tool_calls = message.get("tool_calls")
+            if tool_calls and not isinstance(tool_calls, str):
+                message["tool_calls"] = json.dumps(tool_calls, ensure_ascii=False)
+            for key in _MESSAGE_STRING_KEYS:
+                if not isinstance(message.get(key), str):
+                    message[key] = ""
+        tools = row.get("tools")
+        if tools is not None and not isinstance(tools, str):
+            row["tools"] = json.dumps(tools, ensure_ascii=False) if tools else ""
 
         for message in messages:
-            role, content = message["role"], message["content"]
+            role, content = message["role"], message.get("content")
             # The terms 'tool' and 'tool_response' have the same meaning, ensuring compatibility.
             assert role in {"system", "user", "tool_call", "tool_response", "tool", "assistant"}, f"message: {message}"
-            assert content is not None, f"message: {message}"
+            # An assistant turn that only calls tools may carry no content.
+            assert content is not None or message.get("tool_calls"), f"message: {message}"
 
     @staticmethod
     def _cast_mm_data(row: dict[str, Any]) -> None:

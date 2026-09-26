@@ -316,6 +316,21 @@ class SurogateTrainerWrapper:
         config.runtime_config.dsl_ir_json = ir_json
         self._block_schema_summary = _summarize_block_schemas(ir_json)
 
+        # Packed documents restart the Gated DeltaNet state only in eager execution; a captured
+        # step would carry each document's recurrent state into the next one.
+        from surogate.train.row_packing import cuda_graphs_for_gated_delta_rule
+
+        keep_graphs, warning = cuda_graphs_for_gated_delta_rule(
+            ir_json,
+            use_cuda_graphs=bool(getattr(config, "use_cuda_graphs", False)),
+            packed=bool(config.sample_packing) or bool(getattr(config, "row_packing", False)),
+        )
+        if warning:
+            logger.warning(warning)
+        if not keep_graphs and getattr(config, "use_cuda_graphs", False):
+            config.use_cuda_graphs = False
+            config.runtime_config.use_cuda_graphs = False
+
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
 

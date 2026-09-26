@@ -534,6 +534,7 @@ private:
     // mPhaseArenas.unified_stack_ptr. The Stack must be unbound before the
     // arena is released.
     bool mStackRebasedToArena = false;
+    int mDumpRank = 0;  ///< This rank, for debug dump directories (rank_dump_dir)
 
     void init_compiled_execution();
     void compile_graphs(long B, long T);

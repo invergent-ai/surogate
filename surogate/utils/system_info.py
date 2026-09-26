@@ -21,18 +21,34 @@ class GPUInfo:
     compute_capability_minor: int
 
 
-gpu_info: list[GPUInfo] = _surogate.SystemInfo.get_gpu_info()
+_gpu_info: list[GPUInfo] | None = None
+
+
+def get_gpu_info() -> list[GPUInfo]:
+    """GPUs visible to this process, probed on first use (not at import).
+
+    A host without a usable GPU gets an empty list, so CPU-only tooling (e.g.
+    `surogate.train.tokenize`) can import this module.
+    """
+    global _gpu_info
+    if _gpu_info is None:
+        try:
+            _gpu_info = _surogate.SystemInfo.get_gpu_info()
+        except Exception as e:
+            logger.debug(f"GPU probe failed, treating the host as GPU-less: {e}")
+            _gpu_info = []
+    return _gpu_info
 
 
 def gpu_count() -> int:
-    return len(gpu_info)
+    return len(get_gpu_info())
 
 
 def cuda_is_available() -> bool:
     return (
-        _surogate.SystemInfo.get_cuda_driver_version() is not None
+        gpu_count() > 0
+        and _surogate.SystemInfo.get_cuda_driver_version() is not None
         and _surogate.SystemInfo.get_cuda_runtime_version() is not None
-        and gpu_count() > 0
     )
 
 
@@ -51,6 +67,7 @@ def get_system_info() -> dict[str, Any]:
             info["nccl_version"] = _surogate.SystemInfo.get_nccl_version()
             info["cudnn_version"] = _surogate.SystemInfo.get_cudnn_version()
 
+            gpu_info = get_gpu_info()
             info["gpu_count"] = len(gpu_info)
             info["gpu_name"] = gpu_info[0].name
             info["gpu_memory_gb"] = gpu_info[0].total_memory / 1e9
@@ -118,8 +135,7 @@ def print_system_diagnostics(system_info):
         )
         names = []
         values = []
-        for i in range(gpu_count()):
-            props = gpu_info[i]
+        for i, props in enumerate(get_gpu_info()):
             compute_cap = (props.compute_capability_major, props.compute_capability_minor)
             names.append(f"GPU{i}")
             values.append(f"{props.name}, sm_{compute_cap[0]}.{compute_cap[1]}, {props.total_memory / 1e9:.2f}GB")

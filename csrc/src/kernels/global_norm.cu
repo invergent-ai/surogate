@@ -157,8 +157,12 @@ __global__ void deterministic_sum_kernel(float* out, const floatX* data, std::si
  * @param valid_token_count Accumulated count of non-masked tokens across all micro-batches.
  * @param total_tokens Unused (kept for API compatibility).
  */
-__global__ void
-global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_clip, const int* valid_token_count, float total_tokens) {
+__global__ void global_norm_sqrt_kernel(float* out,
+                                        float* out_cpu,
+                                        float grad_clip,
+                                        const int* valid_token_count,
+                                        float total_tokens,
+                                        float reduction_scale) {
     (void)total_tokens;  // Unused in HuggingFace-style normalization
 
     float n_squared = out[0];
@@ -166,11 +170,13 @@ global_norm_sqrt_kernel(float* out, float* out_cpu, float grad_clip, const int* 
 
     // HuggingFace-style normalization: scale gradients by 1 / valid_token_count
     // This ensures each TOKEN contributes equally, not each accumulation step.
+    // reduction_scale undoes a data-parallel average of the gradients when the count is
+    // the sum over every rank.
     float token_scale = 1.0f;
     if (valid_token_count) {
         int valid = *valid_token_count;
         if (valid > 0) {
-            token_scale = 1.0f / static_cast<float>(valid);
+            token_scale = reduction_scale / static_cast<float>(valid);
         }
     }
 
@@ -447,8 +453,14 @@ void global_norm_sqrt(float* out,
                       const int* valid_token_count,
                       float total_tokens,
                       const cudaDeviceProp& dp,
-                      cudaStream_t stream) {
-    global_norm_sqrt_kernel<<<1, 1, 0, stream>>>(out, out_cpu, grad_clip, valid_token_count, total_tokens);
+                      cudaStream_t stream,
+                      float reduction_scale) {
+    global_norm_sqrt_kernel<<<1, 1, 0, stream>>>(out,
+                                                 out_cpu,
+                                                 grad_clip,
+                                                 valid_token_count,
+                                                 total_tokens,
+                                                 reduction_scale);
 }
 
 /**

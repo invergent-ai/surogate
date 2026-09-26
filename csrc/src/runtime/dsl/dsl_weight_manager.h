@@ -169,6 +169,12 @@ public:
     void gather_non_block_group(std::string_view group, NCCLCommunicator& comm, cudaStream_t stream);
     void release_non_block_group(std::string_view group, cudaStream_t stream);
 
+    /// Call right after cudaStreamBeginCapture(stream) for a graph that will be replayed
+    /// across optimizer steps: forget what the prefetch slots hold, so every gather lands
+    /// in the graph, and re-record the slot/non-block events inside the capture so the
+    /// gathers' waits on them are legal.
+    void begin_capture(cudaStream_t stream);
+
     // Synchronization helpers
     void wait_for_gather(int layer_idx, cudaStream_t stream);
     void invalidate();  ///< Invalidate all cached weights (call on optimizer update)
@@ -296,6 +302,9 @@ private:
     std::vector<WeightGatherStatus> mPrefetchStatus;
     std::vector<std::unordered_map<std::string, Tensor>> mPrefetchBuffers;
     int mCurrentPrefetchBuffer = 0;
+
+    void
+    gather_non_block(WeightGatherStatus& status, const std::string& name, NCCLCommunicator& comm, cudaStream_t stream);
 
     // Non-block weight status
     WeightGatherStatus mEmbeddingsStatus;

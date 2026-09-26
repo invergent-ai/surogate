@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -185,6 +186,19 @@ std::string debug_dump_sanitize(const std::string& name) {
         }
     }
     return result;
+}
+
+/// Where rank `rank` writes its debug dumps: the configured directory for rank 0 (and single-GPU
+/// runs), `<dir>/rank<r>` otherwise. Every rank dumps the same tensor names, and a shared
+/// directory kept whichever rank wrote last, so a multi-GPU dump mixed rows of different ranks.
+static std::string rank_dump_dir(const char* dir, int rank) {
+    std::string out(dir);
+    if (rank > 0) {
+        out += "/rank" + std::to_string(rank);
+        std::error_code ec;
+        std::filesystem::create_directories(out, ec);
+    }
+    return out;
 }
 
 void debug_dump_tensor(const std::string& name, const Tensor& t, const std::string& dump_dir, cudaStream_t stream) {
@@ -1098,7 +1112,7 @@ void GraphExecutor::init_compiled_execution() {
             CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
             for (const auto& name : names) {
                 if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
-                    debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
+                    debug_dump_tensor(name, *t, rank_dump_dir(dir_env, mDumpRank), mRunState.MainStream);
                 }
             }
         });
@@ -1137,7 +1151,7 @@ void GraphExecutor::init_compiled_execution() {
                 continue;
             }
             if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
-                debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
+                debug_dump_tensor(name, *t, rank_dump_dir(dump_dir_env, mDumpRank), mRunState.MainStream);
             }
         }
     });
@@ -1167,7 +1181,7 @@ void GraphExecutor::init_compiled_execution() {
                 continue;
             }
             if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
-                debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
+                debug_dump_tensor(name, *t, rank_dump_dir(dump_dir_env, mDumpRank), mRunState.MainStream);
             }
         }
     });
@@ -1391,7 +1405,17 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mPhaseArenas.accumulator_bytes > 0) {
                     mPhaseArenas.accumulator_bytes = mGrads.rebindable_accumulator_bytes(*mCompiledBackward);
                 }
-                dsl::allocate_phase_arenas(mPhaseArenas);
+                // The parameters' own storage goes before the arena that replaces it is allocated
+                // (nothing is loaded at the first compile), so the peak holds the weights once.
+                if (base_persistent_bytes > 0) {
+                    mWeights.release_storage_for_persistent_arena(*mCompiledForward, mPhaseArenas.persistent_bytes);
+                }
+                try {
+                    dsl::allocate_phase_arenas(mPhaseArenas);
+                } catch (...) {
+                    mWeights.restore_released_storage();
+                    throw;
+                }
                 // Shadow coverage report: of the tids the arena plan claims,
                 // how many actually fit (offset+bytes <= region capacity).
                 dsl::validate_arena_coverage(mPhaseArenas, *mCompiledForward);
@@ -1616,7 +1640,10 @@ void GraphExecutor::execute_forward(long B,
         !has_capture_unsafe_ops || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
     const bool use_split_attention =
         save_forward && needs_split && capture_unsafe_split_allowed && mOptions.UseCudaGraphs && !in_capture;
-    const bool use_graphs = save_forward && mGraphsEnabled && !in_capture && !needs_split;
+    // The internal forward graph skips every block gather while capturing (handle_layer_start),
+    // so with sharded weights it would replay whatever the prefetch slots held at capture time.
+    const bool sharded_weights = mWeightManager && mWeightManager->is_streaming_enabled();
+    const bool use_graphs = save_forward && mGraphsEnabled && !in_capture && !needs_split && !sharded_weights;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
@@ -1860,6 +1887,7 @@ void copy_runtime_inputs(const ExecutionRequest& request, cudaStream_t stream) {
 }  // namespace
 
 ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) {
+    mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     validate_execution_request(request);
     if (request.mode != ExecutionMode::Forward) {
         throw std::runtime_error("GraphExecutor::execute_forward received a non-forward execution request");
@@ -1989,6 +2017,7 @@ void GraphExecutor::zero_sequence_chunk_dkv() {
 }
 
 ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) {
+    mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     ExecutionRequest fwd = request;
     fwd.mode = ExecutionMode::Forward;
     execute_forward(fwd, comm);
@@ -2024,6 +2053,7 @@ ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCC
 }
 
 ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request, NCCLCommunicator& comm) {
+    mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     validate_execution_request(request);
     if (request.mode != ExecutionMode::Backward) {
         throw std::runtime_error("GraphExecutor::execute_backward received a non-backward execution request");

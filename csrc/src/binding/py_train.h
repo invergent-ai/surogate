@@ -521,6 +521,8 @@ private:
     std::unique_ptr<std::atomic<int>[]> mCtxDone;
     void init_async_slots(std::size_t n);
     void dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu);
+    // Rethrow a crashed worker's own exception (once); afterwards a generic "defunct" error.
+    [[noreturn]] void rethrow_worker_crash();
     void wait_gpu(int gpu);
 
     std::function<void(sThreadContext& ctx)> fetch_work(sThreadContext& ctx);

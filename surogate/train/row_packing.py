@@ -90,6 +90,35 @@ def _ir_ops(ir_json: str) -> set[str]:
     return ops
 
 
+def gated_delta_rule_in(ir_json: str | None) -> bool:
+    """True when the model has Gated DeltaNet layers. Their packed documents restart only in
+    eager execution: the op runs each document as its own launch sequence from host-side
+    offsets, which a replayed CUDA graph cannot follow (the graphed op runs the whole row)."""
+    return bool(ir_json) and "chunk_gated_delta_rule" in _ir_ops(ir_json)
+
+
+def cuda_graphs_for_gated_delta_rule(ir_json: str | None, *, use_cuda_graphs: bool, packed: bool) -> tuple[bool, str | None]:
+    """Whether a run keeps CUDA graphs, and the warning to show, for a model with Gated DeltaNet layers.
+
+    The two are incompatible for packed documents: a captured step runs the gated delta rule over
+    the whole row, so every document continues the previous one's recurrent state. Packed runs
+    therefore train eagerly; any other run on such a model keeps its graphs but is told why the
+    combination is restricted."""
+    if not use_cuda_graphs or not gated_delta_rule_in(ir_json):
+        return use_cuda_graphs, None
+    if packed:
+        return False, (
+            "CUDA graphs and Gated DeltaNet (linear-attention) layers are incompatible with packed documents: a "
+            "captured step carries each document's recurrent state into the next one. Disabling CUDA graphs for this "
+            "run; train with sample_packing: false to keep them."
+        )
+    return True, (
+        "CUDA graphs and Gated DeltaNet (linear-attention) layers are incompatible when documents are packed (a "
+        "captured step carries each document's recurrent state into the next one). This run does not pack "
+        "documents, so CUDA graphs stay on; set use_cuda_graphs: false to train eagerly."
+    )
+
+
 def document_isolation_problem(ir_json: str | None) -> str | None:
     """Why packed rows of this model would not be isolated documents, or None.
 

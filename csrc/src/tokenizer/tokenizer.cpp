@@ -11,7 +11,9 @@
 #include <minja/minja.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -1201,110 +1203,257 @@ std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector
 // ============================================================================
 
 TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& messages, LossStrategy strategy) const {
+    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+    for (const auto& m : messages) {
+        arr.push_back({{"role", m.role}, {"content", m.content}});
+    }
+    return encode_for_training_json(arr.dump(), {}, strategy);
+}
+
+TrainingEncoded Tokenizer::encode_for_training_json(const std::string& messages_json,
+                                                    const std::vector<std::string>& tool_jsons,
+                                                    LossStrategy strategy,
+                                                    const ChatTemplateVariables& variables) const {
     TokTimer _t(tok_profile().total_ns);
     if (tok_profile_enabled()) tok_profile().calls.fetch_add(1, std::memory_order_relaxed);
 
     TrainingEncoded result;
-    if (messages.empty()) return result;
-
+    const auto messages = nlohmann::ordered_json::parse(messages_json);
+    if (!messages.is_array()) {
+        throw std::invalid_argument("encode_for_training: chat messages must be a JSON array");
+    }
+    const std::size_t n = messages.size();
+    if (n == 0) return result;
     if (!impl_->chat_tmpl_root) {
         throw std::runtime_error("No chat template loaded. Required for encode_for_training().");
     }
 
-    // Find where the user/assistant pairs start (skip leading system messages).
-    size_t first_non_system = 0;
-    while (first_non_system < messages.size() && messages[first_non_system].role == "system") {
-        first_non_system++;
-    }
-
-    // Count complete user-assistant rounds.
-    size_t num_pairs = 0;
-    for (size_t i = first_non_system; i + 1 < messages.size(); i += 2) {
-        num_pairs++;
-    }
-    if (num_pairs == 0) return result;
-
-    // Build segments via incremental template rendering.
-    // For each round we render twice:
-    //   1. Up to user_i  (gen_prompt=true)  → everything before assistant's content
-    //   2. Up to asst_i  (gen_prompt=false) → adds assistant's content + suffix
-    // The diff between consecutive renders gives us a cleanly separated segment
-    // that we can tag as trainable or not.
-    struct Segment {
-        std::string text;
-        bool trainable;
+    auto role_of = [&](std::size_t i) -> std::string {
+        const auto& m = messages[i];
+        return m.contains("role") && m["role"].is_string() ? m["role"].get<std::string>() : std::string();
     };
-    std::vector<Segment> segments;
-    segments.reserve(num_pairs * 2);
+    auto first = [&](std::size_t count) {
+        nlohmann::ordered_json a = nlohmann::ordered_json::array();
+        for (std::size_t k = 0; k < count; ++k)
+            a.push_back(messages[k]);
+        return a;
+    };
+    auto render = [&](const nlohmann::ordered_json& msgs, bool add_generation_prompt, const ChatTemplateVariables& v) {
+        TokTimer _r(tok_profile().render_ns);
+        if (tok_profile_enabled()) tok_profile().renders.fetch_add(1, std::memory_order_relaxed);
+        return impl_->render_chat_template(msgs, add_generation_prompt, v, tool_jsons);
+    };
 
-    std::string prev_render;
-    size_t round_idx = 0;
+    const std::string full = render(messages, false, variables);
 
-    for (size_t i = first_non_system; i + 1 < messages.size(); i += 2) {
-        round_idx++;
-        bool is_last_round = (round_idx == num_pairs);
-
-        // Pick the generation-prompt mode from the assistant content: a "</think>"
-        // block means this is a THINKING turn (open "<think>\n" prompt); otherwise a
-        // no-think turn (empty "<think>\n\n</think>\n\n" block). Both renders below
-        // MUST use the same mode, or the byte-diff that defines the trainable span
-        // misaligns — which previously trained the model to emit reasoning after an
-        // already-closed think block (i.e. to "think" in no-think mode).
-        const ChatTemplateVariables variables{.enable_thinking =
-                                                  (messages[i + 1].content.find("</think>") != std::string::npos)};
-
-        // 1. Render up to user_i with gen_prompt=true → prefix/chrome segment
-        std::string render_with_user = impl_->render_prefix(messages, i + 1, /*add_generation_prompt=*/true, variables);
-
-        if (render_with_user.size() > prev_render.size()) {
-            std::string chrome = render_with_user.substr(prev_render.size());
-            bool trainable = (strategy == LossStrategy::ALL);
-            segments.push_back({std::move(chrome), trainable});
+    // Where message j's rendering ends inside `full`. A template may render a message
+    // differently once a later user turn exists (Qwen3.5 drops the reasoning of every turn
+    // before the last query), so when one follows, the prefix is rendered with it appended and
+    // the bytes that user message adds are subtracted. The prefix must then agree with `full`.
+    std::unordered_map<std::size_t, std::size_t> user_bytes;
+    auto end_of = [&](std::size_t j) -> std::size_t {
+        std::optional<std::size_t> next_user;
+        for (std::size_t u = j + 1; u < n; ++u) {
+            if (role_of(u) == "user") {
+                next_user = u;
+                break;
+            }
         }
-
-        // 2. Render up to asst_i with gen_prompt=false → response segment
-        std::string render_with_asst =
-            impl_->render_prefix(messages, i + 2, /*add_generation_prompt=*/false, variables);
-
-        if (render_with_asst.size() > render_with_user.size()) {
-            std::string response = render_with_asst.substr(render_with_user.size());
-            if (strategy == LossStrategy::THINKING_ONLY || strategy == LossStrategy::FINAL_ONLY) {
-                constexpr std::string_view close_tag = "</think>";
-                const size_t close_pos = response.find(close_tag);
-                if (close_pos != std::string::npos) {
-                    const size_t close_end = close_pos + close_tag.size();
-                    segments.push_back({response.substr(0, close_end), strategy == LossStrategy::THINKING_ONLY});
-                    if (close_end < response.size()) {
-                        segments.push_back({response.substr(close_end), strategy == LossStrategy::FINAL_ONLY});
-                    }
-                } else {
-                    segments.push_back({std::move(response), false});
+        std::string prefix;
+        std::size_t end = 0;
+        if (next_user) {
+            const std::size_t u = *next_user;
+            auto it = user_bytes.find(u);
+            if (it == user_bytes.end()) {
+                auto upto = first(u + 1);
+                const std::size_t base = render(upto, false, variables).size();
+                upto.push_back(messages[u]);
+                const std::size_t with = render(upto, false, variables).size();
+                if (with < base) {
+                    throw std::runtime_error("encode_for_training: appending a user message shortened the rendering");
                 }
-                prev_render = std::move(render_with_asst);
-                continue;
+                it = user_bytes.emplace(u, with - base).first;
             }
-            bool trainable = false;
-            switch (strategy) {
-                case LossStrategy::ALL:
-                case LossStrategy::DEFAULT: trainable = true; break;
-                case LossStrategy::LAST_ROUND: trainable = is_last_round; break;
-                case LossStrategy::THINKING_ONLY: break;
-                case LossStrategy::FINAL_ONLY: break;
+            auto head = first(j + 1);
+            head.push_back(messages[u]);
+            prefix = render(head, false, variables);
+            if (prefix.size() < it->second) {
+                throw std::runtime_error("encode_for_training: inconsistent user message rendering");
             }
-            segments.push_back({std::move(response), trainable});
+            end = prefix.size() - it->second;
+        } else {
+            prefix = render(first(j + 1), false, variables);
+            end = prefix.size();
+            if (end > full.size() || full.compare(0, end, prefix, 0, end) != 0) {
+                // A template may render the last message differently from the same message with
+                // another after it (Qwen3 opens an empty think block only on the final turn).
+                // Put an empty user turn after it and take that turn's own bytes back off.
+                const nlohmann::ordered_json filler = {{"role", "user"}, {"content", ""}};
+                auto head = first(j + 1);
+                head.push_back(filler);
+                prefix = render(head, false, variables);
+                const std::size_t one = prefix.size();
+                head.push_back(filler);
+                const std::size_t two = render(head, false, variables).size();
+                if (two < one || one < two - one) {
+                    throw std::runtime_error("encode_for_training: inconsistent user message rendering");
+                }
+                end = one - (two - one);
+            }
         }
+        if (end > full.size() || full.compare(0, end, prefix, 0, end) != 0) {
+            throw std::runtime_error("encode_for_training: the chat template renders the conversation up to message " +
+                                     std::to_string(j) +
+                                     " differently from the whole conversation; its turns "
+                                     "cannot be located");
+        }
+        return end;
+    };
 
-        prev_render = std::move(render_with_asst);
+    std::vector<std::size_t> assistants;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (role_of(k) == "assistant") assistants.push_back(k);
+    }
+    if (assistants.empty()) return result;
+
+    // The generation prompt a turn opens with, in its thinking and non-thinking forms
+    // ("<|im_start|>assistant\n<think>\n" / "...<think>\n\n</think>\n\n" on Qwen3.x; the same
+    // string twice on a template without a thinking switch), and the header they share.
+    std::string gen_think, gen_plain;
+    {
+        const std::size_t k0 = assistants.front();
+        const auto head = first(k0);
+        ChatTemplateVariables think = variables, plain = variables;
+        think.enable_thinking = true;
+        plain.enable_thinking = false;
+        gen_think = render(head, true, think);
+        gen_plain = render(head, true, plain);
+        const std::string base_think = render(head, false, think);
+        const std::string base_plain = render(head, false, plain);
+        if (gen_think.compare(0, base_think.size(), base_think) != 0 ||
+            gen_plain.compare(0, base_plain.size(), base_plain) != 0) {
+            throw std::runtime_error("encode_for_training: the generation prompt does not extend the rendering");
+        }
+        gen_think.erase(0, base_think.size());
+        gen_plain.erase(0, base_plain.size());
+    }
+    // What a turn opens with when it is rendered as history (before a later user turn, where
+    // Qwen3.5 drops the think block): found in a probe [user, assistant, user] as the text
+    // between the first user turn and the assistant's content. Without it, the part both
+    // generation prompts share (on Qwen3.5 that is the whole thinking prompt, which a history
+    // turn does not start with).
+    std::string gen_header;
+    try {
+        constexpr std::string_view probe = "SUROGATE_PROBE_4f1c";
+        nlohmann::ordered_json convo = nlohmann::ordered_json::array();
+        convo.push_back({{"role", "user"}, {"content", "u"}});
+        const std::size_t user_end = render(convo, false, variables).size();
+        convo.push_back({{"role", "assistant"}, {"content", std::string(probe)}});
+        convo.push_back({{"role", "user"}, {"content", "v"}});
+        const std::string rendered = render(convo, false, variables);
+        const std::size_t at = rendered.find(probe, user_end);
+        if (at != std::string::npos) gen_header = rendered.substr(user_end, at - user_end);
+    } catch (const std::exception&) {
+    }
+    if (gen_header.empty()) {
+        std::size_t header = 0;
+        while (header < gen_think.size() && header < gen_plain.size() && gen_think[header] == gen_plain[header]) {
+            ++header;
+        }
+        gen_header = gen_think.substr(0, header);
     }
 
-    // Tokenize each segment and build input_ids / labels.
-    for (const auto& seg : segments) {
-        auto tokens = impl_->encode_impl(seg.text, /*use_special=*/true);
-        result.input_ids.insert(result.input_ids.end(), tokens.begin(), tokens.end());
-        if (seg.trainable) {
-            result.labels.insert(result.labels.end(), tokens.begin(), tokens.end());
+    // Trainable byte spans of `full`.
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    std::unordered_map<std::size_t, std::size_t> ends;
+    auto end_cached = [&](std::size_t j) {
+        auto it = ends.find(j);
+        if (it == ends.end()) it = ends.emplace(j, end_of(j)).first;
+        return it->second;
+    };
+    for (std::size_t a = 0; a < assistants.size(); ++a) {
+        const std::size_t k = assistants[a];
+        const std::size_t turn_start = k == 0 ? 0 : end_cached(k - 1);
+        const std::size_t turn_end = end_cached(k);
+        if (turn_end < turn_start) {
+            throw std::runtime_error("encode_for_training: turn boundaries out of order");
+        }
+        const std::string_view turn(full.data() + turn_start, turn_end - turn_start);
+        std::size_t body = 0;
+        if (!gen_plain.empty() && turn.starts_with(gen_plain)) {
+            body = gen_plain.size();  // a closed empty think block is the prompt, not the answer
+        } else if (turn.starts_with(gen_think)) {
+            body = gen_think.size();
+        } else if (turn.starts_with(gen_header)) {
+            body = gen_header.size();
         } else {
-            result.labels.insert(result.labels.end(), tokens.size(), -100);
+            throw std::runtime_error("encode_for_training: assistant turn " + std::to_string(k) +
+                                     " does not start with the generation prompt");
+        }
+        const std::size_t body_start = turn_start + body;
+        const bool last = a + 1 == assistants.size();
+        switch (strategy) {
+            case LossStrategy::ALL: break;
+            case LossStrategy::DEFAULT: spans.emplace_back(body_start, turn_end); break;
+            case LossStrategy::LAST_ROUND:
+                if (last) spans.emplace_back(body_start, turn_end);
+                break;
+            case LossStrategy::THINKING_ONLY:
+            case LossStrategy::FINAL_ONLY: {
+                constexpr std::string_view close_tag = "</think>";
+                const std::size_t close = full.find(close_tag, body_start);
+                if (close == std::string::npos || close + close_tag.size() > turn_end) break;
+                const std::size_t close_end = close + close_tag.size();
+                if (strategy == LossStrategy::THINKING_ONLY) {
+                    spans.emplace_back(body_start, close_end);
+                } else {
+                    spans.emplace_back(close_end, turn_end);
+                }
+                break;
+            }
+        }
+    }
+    if (strategy == LossStrategy::ALL) spans.emplace_back(0, full.size());
+
+    std::vector<char> trainable(full.size(), 0);
+    for (const auto& [a, b] : spans) {
+        std::fill(trainable.begin() + static_cast<std::ptrdiff_t>(a),
+                  trainable.begin() + static_cast<std::ptrdiff_t>(b),
+                  1);
+    }
+
+    // One tokenization of the whole text (the template's token ids, not a concatenation of
+    // per-segment encodings), labelled by where each token starts. A tokenizer whose token
+    // bytes do not reassemble the text (SentencePiece normalisation) falls back to encoding
+    // the spans separately.
+    result.input_ids = impl_->encode_impl(full, /*use_special=*/true);
+    std::string reassembled;
+    reassembled.reserve(full.size());
+    std::vector<std::size_t> token_start(result.input_ids.size());
+    for (std::size_t i = 0; i < result.input_ids.size(); ++i) {
+        token_start[i] = reassembled.size();
+        reassembled += decode_single_token(result.input_ids[i]);
+    }
+    if (reassembled == full) {
+        result.labels.resize(result.input_ids.size());
+        for (std::size_t i = 0; i < result.input_ids.size(); ++i) {
+            result.labels[i] = trainable[token_start[i]] ? result.input_ids[i] : -100;
+        }
+    } else {
+        result.input_ids.clear();
+        std::size_t pos = 0;
+        while (pos < full.size()) {
+            std::size_t stop = pos + 1;
+            while (stop < full.size() && trainable[stop] == trainable[pos])
+                ++stop;
+            const auto tokens = impl_->encode_impl(full.substr(pos, stop - pos), /*use_special=*/true);
+            result.input_ids.insert(result.input_ids.end(), tokens.begin(), tokens.end());
+            if (trainable[pos]) {
+                result.labels.insert(result.labels.end(), tokens.begin(), tokens.end());
+            } else {
+                result.labels.insert(result.labels.end(), tokens.size(), -100);
+            }
+            pos = stop;
         }
     }
 
@@ -1320,12 +1469,36 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
 }
 
 // Thread-safe wrapper that catches exceptions per-example.
+static void report_first_encoding_failure(const char* what) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        std::fprintf(stderr, "[surogate] encode_for_training: dropping a conversation: %s\n", what);
+    });
+}
+
 static TrainingEncoded
 encode_for_training_safe(const Tokenizer& tok, const std::vector<ChatMessage>& messages, LossStrategy strategy) {
     try {
         return tok.encode_for_training(messages, strategy);
+    } catch (const std::exception& e) {
+        report_first_encoding_failure(e.what());
+        return TrainingEncoded{};  // empty = skipped
     } catch (...) {
         return TrainingEncoded{};  // empty = skipped
+    }
+}
+
+static TrainingEncoded encode_for_training_json_safe(const Tokenizer& tok,
+                                                     const Tokenizer::TrainingConversation& conversation,
+                                                     LossStrategy strategy,
+                                                     const ChatTemplateVariables& variables) {
+    try {
+        return tok.encode_for_training_json(conversation.messages_json, conversation.tool_jsons, strategy, variables);
+    } catch (const std::exception& e) {
+        report_first_encoding_failure(e.what());
+        return TrainingEncoded{};
+    } catch (...) {
+        return TrainingEncoded{};
     }
 }
 
@@ -1359,6 +1532,35 @@ std::vector<TrainingEncoded> Tokenizer::encode_for_training_batch(const std::vec
 
     for (size_t i = 0; i < batch.size(); i++) {
         results[i] = encode_for_training_safe(*this, batch[i], strategy);
+    }
+    return results;
+}
+
+std::vector<TrainingEncoded> Tokenizer::encode_for_training_json_batch(const std::vector<TrainingConversation>& batch,
+                                                                       LossStrategy strategy,
+                                                                       const ChatTemplateVariables& variables) const {
+    std::vector<TrainingEncoded> results(batch.size());
+    const unsigned num_threads =
+        std::max(1u, std::min(static_cast<unsigned>(batch.size()), std::thread::hardware_concurrency()));
+    if (num_threads > 1) {
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+        std::atomic<size_t> next_idx{0};
+        for (unsigned t = 0; t < num_threads; t++) {
+            threads.emplace_back([&]() {
+                while (true) {
+                    const size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= batch.size()) break;
+                    results[i] = encode_for_training_json_safe(*this, batch[i], strategy, variables);
+                }
+            });
+        }
+        for (auto& th : threads)
+            th.join();
+        return results;
+    }
+    for (size_t i = 0; i < batch.size(); i++) {
+        results[i] = encode_for_training_json_safe(*this, batch[i], strategy, variables);
     }
     return results;
 }

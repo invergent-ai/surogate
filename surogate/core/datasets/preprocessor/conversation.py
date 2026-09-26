@@ -2,7 +2,7 @@ import json
 from typing import Any
 
 from surogate.core.config.dataset_config import ConversationDatasetConfig
-from surogate.core.datasets.preprocessor.row import RowPreprocessor
+from surogate.core.datasets.preprocessor.row import MESSAGE_KEYS, RowPreprocessor
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -20,12 +20,17 @@ class ConversationPreprocessor(RowPreprocessor):
         self.columns[self.messages_field] = "messages"
         if self.completion_field:
             self.columns[self.completion_field] = "completion"
+        dropped = sorted(set(self.message_property_mappings) - set(MESSAGE_KEYS))
+        if dropped:
+            logger.warning(
+                f"message_property_mappings maps {dropped}, which training does not carry to the chat template "
+                f"(carried: {', '.join(MESSAGE_KEYS)}); those fields are dropped."
+            )
 
     def preprocess(self, row: dict[str, Any]) -> dict[str, Any] | None:
         row["messages"] = self.get_conversation_thread(row)
-        tools = self._get_tools(row)
-        if tools:
-            row["tools"] = tools
+        # Every row carries the column ("" without tools) so every shard has the same schema.
+        row["tools"] = self._get_tools(row) or ""
         return row
 
     def get_conversation_thread(self, row):
@@ -49,6 +54,21 @@ class ConversationPreprocessor(RowPreprocessor):
                 transformed_message[key] = message[value]
             else:
                 logger.debug(f"Could not find value for property {value} in message: {message}")
+
+        # Reasoning written inline ("<think>...</think>answer") becomes reasoning_content, split
+        # the way the Qwen3.5 template splits it. A template that reads only reasoning_content
+        # (Qwen3.8) would otherwise render the inline block inside a second think block.
+        content = transformed_message.get("content")
+        if (
+            transformed_message.get("role") == "assistant"
+            and not isinstance(transformed_message.get("reasoning_content"), str)
+            and isinstance(content, str)
+            and "</think>" in content
+        ):
+            transformed_message["reasoning_content"] = (
+                content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n")
+            )
+            transformed_message["content"] = content.split("</think>")[-1].lstrip("\n")
 
         # Map the role if necessary
         if "tool_calls" in transformed_message and transformed_message["tool_calls"]:
@@ -120,10 +140,8 @@ class ConversationPreprocessor(RowPreprocessor):
             messages = self.get_conversation_thread(row)
             result = {"messages": messages}
 
-            # Process tools if present
-            tools = self._get_tools(row)
-            if tools:
-                result["tools"] = tools
+            # Every row carries the column ("" without tools) so every shard has the same schema.
+            result["tools"] = self._get_tools(row) or ""
 
             results.append(result)
 

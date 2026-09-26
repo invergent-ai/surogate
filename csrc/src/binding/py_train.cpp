@@ -196,6 +196,9 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
     while (!mIsRunning && !mHasCrashed) {
         std::this_thread::yield();
     }
+    if (mHasCrashed) {
+        rethrow_worker_crash();
+    }
 }
 
 /**
@@ -273,6 +276,9 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
 
     while (!mIsRunning && !mHasCrashed) {
         std::this_thread::yield();
+    }
+    if (mHasCrashed) {
+        rethrow_worker_crash();
     }
 }
 
@@ -1589,6 +1595,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             gs.has_stack_checkpoint = true;
             cudaGraph_t graph = nullptr;
             CUDA_CHECK(cudaStreamBeginCapture(rs.MainStream, cudaStreamCaptureModeThreadLocal));
+            if (auto* wm = dsl_model->weight_manager()) {
+                wm->begin_capture(rs.MainStream);
+            }
             for (int j = 0; j < micro_steps; ++j) {
                 rs.Targets_CPU = gs.targets[j];
                 dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
@@ -1869,10 +1878,23 @@ void MultiGPUPyTrainer::init_async_slots(std::size_t n) {
 // Launch `work` on GPU `gpu` without blocking the caller; the worker thread for that
 // GPU picks it up via fetch_work and bumps mCtxDone when finished. Blocks only if that
 // GPU still has an outstanding async item (the natural is_idle backpressure).
+void MultiGPUPyTrainer::rethrow_worker_crash() {
+    // The worker sets mHasCrashed and rethrows; the launcher stores that exception just
+    // after. Give it a moment to land so the caller sees the root cause (an OOM, a
+    // CUDA error) rather than only the generic message below.
+    for (int i = 0; i < 2000 && mThreads && !mThreads->has_exception(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (mThreads) {
+        mThreads->rethrow_exception();  // Clears what it rethrows: only the first caller gets it.
+    }
+    throw std::runtime_error(
+        "MultiGPUPyTrainer: a worker crashed earlier; the trainer is defunct (restart the process)");
+}
+
 void MultiGPUPyTrainer::dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu) {
     if (mHasCrashed.load()) {
-        throw std::runtime_error(
-            "MultiGPUPyTrainer: a worker crashed earlier; the trainer is defunct (restart the process)");
+        rethrow_worker_crash();
     }
     wait_gpu(gpu);  // ensure the previous async item on this GPU has completed
     {
@@ -1946,11 +1968,9 @@ void MultiGPUPyTrainer::wait_gpu(int gpu) {
  */
 void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, int idx) {
     if (mHasCrashed.load()) {
-        // A worker died (its exception was already rethrown to the caller once);
-        // the surviving workers may be wedged in NCCL and will never process new
-        // work — fail fast instead of spinning on mWorkDone forever.
-        throw std::runtime_error(
-            "MultiGPUPyTrainer: a worker crashed earlier; the trainer is defunct (restart the process)");
+        // A worker died; the surviving workers may be wedged in NCCL and will never
+        // process new work — fail fast instead of spinning on mWorkDone forever.
+        rethrow_worker_crash();
     }
     static int work_id = 0;
     int current_work_id = work_id++;
