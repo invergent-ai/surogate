@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -185,6 +186,19 @@ std::string debug_dump_sanitize(const std::string& name) {
         }
     }
     return result;
+}
+
+/// Where rank `rank` writes its debug dumps: the configured directory for rank 0 (and single-GPU
+/// runs), `<dir>/rank<r>` otherwise. Every rank dumps the same tensor names, and a shared
+/// directory kept whichever rank wrote last, so a multi-GPU dump mixed rows of different ranks.
+static std::string rank_dump_dir(const char* dir, int rank) {
+    std::string out(dir);
+    if (rank > 0) {
+        out += "/rank" + std::to_string(rank);
+        std::error_code ec;
+        std::filesystem::create_directories(out, ec);
+    }
+    return out;
 }
 
 void debug_dump_tensor(const std::string& name, const Tensor& t, const std::string& dump_dir, cudaStream_t stream) {
@@ -1098,7 +1112,7 @@ void GraphExecutor::init_compiled_execution() {
             CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
             for (const auto& name : names) {
                 if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
-                    debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
+                    debug_dump_tensor(name, *t, rank_dump_dir(dir_env, mDumpRank), mRunState.MainStream);
                 }
             }
         });
@@ -1137,7 +1151,7 @@ void GraphExecutor::init_compiled_execution() {
                 continue;
             }
             if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
-                debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
+                debug_dump_tensor(name, *t, rank_dump_dir(dump_dir_env, mDumpRank), mRunState.MainStream);
             }
         }
     });
@@ -1167,7 +1181,7 @@ void GraphExecutor::init_compiled_execution() {
                 continue;
             }
             if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
-                debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
+                debug_dump_tensor(name, *t, rank_dump_dir(dump_dir_env, mDumpRank), mRunState.MainStream);
             }
         }
     });
@@ -1873,6 +1887,7 @@ void copy_runtime_inputs(const ExecutionRequest& request, cudaStream_t stream) {
 }  // namespace
 
 ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) {
+    mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     validate_execution_request(request);
     if (request.mode != ExecutionMode::Forward) {
         throw std::runtime_error("GraphExecutor::execute_forward received a non-forward execution request");
@@ -2002,6 +2017,7 @@ void GraphExecutor::zero_sequence_chunk_dkv() {
 }
 
 ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) {
+    mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     ExecutionRequest fwd = request;
     fwd.mode = ExecutionMode::Forward;
     execute_forward(fwd, comm);
@@ -2037,6 +2053,7 @@ ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCC
 }
 
 ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request, NCCLCommunicator& comm) {
+    mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     validate_execution_request(request);
     if (request.mode != ExecutionMode::Backward) {
         throw std::runtime_error("GraphExecutor::execute_backward received a non-backward execution request");

@@ -53,7 +53,9 @@ MODEL
 REFERENCE
     HF reference context: ``path``, ``hf_class``, ``dtype="bf16"``, ``device``.
 DIFF
-    One per layer. Fields: ``layer``, ``op`` (DSL slot name, usually ``res_ffn``),
+    One per layer (per layer and rank on a multi-GPU config, with a ``rank`` field:
+    each rank is compared against the HF rows it consumed). Fields: ``layer``,
+    ``op`` (DSL slot name, usually ``res_ffn``),
     ``slot`` (full ``blocks[N].<slot>``), ``hf_shape``, ``dsl_shape``, ``status``,
     plus diff stats: ``max_abs_diff``, ``mean_abs_diff``, ``cos_sim``, ``rel_err``,
     ``hf_max_abs``, ``dsl_max_abs``, ``hf_norm``, ``dsl_norm``.
@@ -336,7 +338,17 @@ def _run_with_dumps_root(
         if dsl_error:
             w.write(Tag.ERROR, severity=Severity.ERROR, phase="dsl_step", error=dsl_error)
 
-        dump_files = set(os.listdir(dump_dir)) if dump_dir.exists() else set()
+        # Each rank dumps its own rows: rank 0 into ``dump_dir``, rank r > 0 into
+        # ``dump_dir/rank<r>`` (the runtime suffixes the directory by rank). Rank r
+        # consumed host rows [row * B, (row + 1) * B) with row = r // ep_size, so it
+        # is compared against exactly those rows of the HF reference.
+        n_ranks = max(1, int(config.gpus or 1))
+        rows_per_rank = int(config.per_device_train_batch_size)
+        ep_size = max(1, int(getattr(config, "ep_size", 1) or 1))
+        rank_dumps: list[tuple[int, Path, set[str]]] = []
+        for rank in range(n_ranks):
+            rank_dir = dump_dir if rank == 0 else dump_dir / f"rank{rank}"
+            rank_dumps.append((rank, rank_dir, set(os.listdir(rank_dir)) if rank_dir.exists() else set()))
         # ``hf_layer_idx`` indexes HF's transformer block. We pair it with DSL
         # ``blocks[hf_layer_idx + layer_offset].<slot>``. The final HF layer's
         # output has no matched DSL block in fused-residual models (the final
@@ -362,19 +374,6 @@ def _run_with_dumps_root(
                 )
                 continue
 
-            dsl_t, dsl_shape, dsl_load_err = _load_dsl_dump(dump_dir, tensor_name, dump_files)
-            if dsl_load_err:
-                layers_missing += 1
-                w.write(
-                    Tag.DIFF,
-                    severity=Severity.WARN,
-                    layer=hf_layer_idx,
-                    op=dsl_slot,
-                    slot=tensor_name,
-                    status=dsl_load_err,
-                    hf_shape=list(hf_t.shape) if hf_t is not None else None,
-                )
-                continue
             if hf_t is None:
                 layers_missing += 1
                 w.write(
@@ -384,28 +383,51 @@ def _run_with_dumps_root(
                     op=dsl_slot,
                     slot=tensor_name,
                     status=DiffStatus.HF_OUTPUT_MISSING,
-                    dsl_shape=dsl_shape,
                 )
                 continue
 
-            stats, status = _diff_tensors(hf_t, dsl_t, seq_len)
-            severity = _severity_from_diff(stats, status, rtol, atol)
-            layers_compared += 1
+            layer_complete = True
+            for rank, rank_dir, rank_files in rank_dumps:
+                rank_fields = {"rank": rank} if n_ranks > 1 else {}
+                row0 = (rank // ep_size) * rows_per_rank
+                hf_rows = hf_t[row0 : row0 + rows_per_rank] if n_ranks > 1 else hf_t
+                dsl_t, dsl_shape, dsl_load_err = _load_dsl_dump(rank_dir, tensor_name, rank_files)
+                if dsl_load_err:
+                    layer_complete = False
+                    w.write(
+                        Tag.DIFF,
+                        severity=Severity.WARN,
+                        layer=hf_layer_idx,
+                        op=dsl_slot,
+                        slot=tensor_name,
+                        status=dsl_load_err,
+                        hf_shape=list(hf_rows.shape),
+                        **rank_fields,
+                    )
+                    continue
 
-            w.write(
-                Tag.DIFF,
-                severity=severity,
-                layer=hf_layer_idx,
-                op=dsl_slot,
-                slot=tensor_name,
-                dsl_layer=dsl_layer_idx,
-                status=status,
-                hf_shape=list(hf_t.shape),
-                dsl_shape=dsl_shape,
-                **stats,
-            )
-            if severity == Severity.ERROR and first_diff is None:
-                first_diff = _FirstDiff(layer=hf_layer_idx, max_abs_diff=stats.get("max_abs_diff", 0.0))
+                stats, status = _diff_tensors(hf_rows, dsl_t, seq_len)
+                severity = _severity_from_diff(stats, status, rtol, atol)
+
+                w.write(
+                    Tag.DIFF,
+                    severity=severity,
+                    layer=hf_layer_idx,
+                    op=dsl_slot,
+                    slot=tensor_name,
+                    dsl_layer=dsl_layer_idx,
+                    status=status,
+                    hf_shape=list(hf_rows.shape),
+                    dsl_shape=dsl_shape,
+                    **rank_fields,
+                    **stats,
+                )
+                if severity == Severity.ERROR and first_diff is None:
+                    first_diff = _FirstDiff(layer=hf_layer_idx, max_abs_diff=stats.get("max_abs_diff", 0.0))
+            if layer_complete:
+                layers_compared += 1
+            else:
+                layers_missing += 1
 
         if first_diff is not None:
             w.write(
