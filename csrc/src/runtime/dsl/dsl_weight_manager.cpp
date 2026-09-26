@@ -811,6 +811,51 @@ Tensor local_shard_slot(const Tensor& work, const std::vector<long>& shard_shape
 
 }  // namespace
 
+Tensor DslWeightManager::full_master_shape(const std::string& name) const {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        throw std::runtime_error("DslWeightManager: missing parameter " + name);
+    }
+    const DslWeightEntry& entry = it->second;
+    if (!entry.master_sharded || entry.global_shape.empty()) {
+        return entry.master;
+    }
+    // Where the tensor's dtype and shape are all a caller may read: nothing points at storage.
+    return Tensor::from_pointer(nullptr, entry.master.Device, entry.master.DType, entry.global_shape);
+}
+
+Tensor DslWeightManager::gather_full_master(const std::string& name, NCCLCommunicator& comm, cudaStream_t stream) {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        throw std::runtime_error("DslWeightManager: missing parameter " + name);
+    }
+    const DslWeightEntry& entry = it->second;
+    if (!entry.master_sharded || entry.global_shape.empty() || mConfig.num_shards <= 1) {
+        throw std::logic_error("DslWeightManager::gather_full_master: " + name + " is not sharded");
+    }
+    // A master in a storage format (FP8 with its scale, the NVFP4 stream blob) is not the weight
+    // an export writes; only plain floating-point masters are exported gathered.
+    const ETensorDType dtype = entry.master.DType;
+    if (dtype != ETensorDType::BF16 && dtype != ETensorDType::FP32 && dtype != ETensorDType::FP16) {
+        throw std::runtime_error("DslWeightManager: cannot export sharded weight " + name + " stored as " +
+                                 dtype_to_str(dtype) + "; export it from a run with --gpus 1");
+    }
+    Tensor full = mAllocator->allocate(dtype, ("export_" + name).c_str(), EAllocationType::ON_DEVICE, entry.global_shape);
+    std::vector<long> shard_shape(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
+    // In place, as gather_block does: this rank's shard sits in its own slot of the full buffer.
+    Tensor staging = local_shard_slot(full, shard_shape, mConfig.shard_idx, mConfig.num_shards);
+    CUDA_CHECK(cudaMemcpyAsync(staging.Data, entry.master.Data, entry.master.bytes(), cudaMemcpyDefault, stream));
+    cudaEvent_t done = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    comm.begin_transaction(stream);
+    comm.schedule_all_gather(TensorShard(staging, mConfig.shard_idx, mConfig.num_shards, entry.global_shape), full);
+    comm.execute_transaction(done);
+    CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventDestroy(done));
+    return full;
+}
+
 void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaStream_t stream) {
     if (!mStreamWeights && !mConfig.offload_master) {
         // No streaming - weights are already on device

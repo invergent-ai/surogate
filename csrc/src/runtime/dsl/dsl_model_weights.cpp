@@ -360,29 +360,39 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
     if (!mParams) {
         throw std::logic_error("DslModel::export_weights called before parameters are initialized");
     }
-    if (mWeightManager && mOptions.ShardWeights && mNumShards > 1) {
-        throw std::runtime_error("DslModel::export_weights: export is not supported for sharded weights; use --gpus 1");
-    }
 
     const auto& mapping = !mHfExport.empty() ? mHfExport : mHfMapping;
     SafeTensorWriter writer(file_name);
 
     struct ExportEntry {
         std::string name;
-        Tensor tensor;
+        Tensor tensor;  ///< a view of the parameter; for a transpose, only its shape
         bool needs_transpose = false;
         Tensor source;
     };
 
-    std::vector<ExportEntry> exports;
-    exports.reserve(mParams->param_names().size());
+    // Under ZeRO-3 the weight manager's masters are the weights: a block's work copy is a
+    // prefetch slot (holding whichever layer was gathered last) and a replicated non-block
+    // weight's is refreshed only by the next forward. Each rank holds a flat slice of a sharded
+    // master, and the HF tensors of one parameter (fused slices, transposes, per-expert blocks)
+    // cut across those slices, so such a parameter is gathered whole from every rank before its
+    // tensors are written -- one at a time: the export never holds two full parameters (#229).
+    const bool sharded_run = mWeightManager && mOptions.ShardWeights && mNumShards > 1;
+    auto is_gathered = [&](const std::string& name) {
+        return sharded_run && mWeightManager->has(name) && mWeightManager->is_sharded(name);
+    };
+    auto source_of = [&](const std::string& name) -> Tensor {
+        if (is_gathered(name)) return mWeightManager->full_master_shape(name);
+        if (sharded_run && mWeightManager->has(name)) return mWeightManager->get_master(name);
+        return mParams->get(name);
+    };
 
-    for (const auto& name : mParams->param_names()) {
-        Tensor& param = mParams->get(name);
+    // The HF tensors of one parameter, as views of `param`.
+    auto exports_of = [&](const std::string& name, const Tensor& param, std::vector<ExportEntry>& exports) {
         int layer_idx = -1;
         const MappingSpec* spec = internal::find_mapping_spec(mapping, name, layer_idx);
+        MappingSpec fallback;  // outlives the branch: `spec` points at it below
         if (!spec) {
-            MappingSpec fallback;
             fallback.kind = MappingSpec::Kind::Direct;
             fallback.source = name;
             spec = &fallback;
@@ -391,7 +401,7 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
         if (spec->kind == MappingSpec::Kind::Direct) {
             const std::string hf_name = internal::format_hf_name(spec->source.empty() ? name : spec->source, layer_idx);
             exports.push_back({hf_name, param, false, {}});
-            continue;
+            return;
         }
 
         if (spec->kind == MappingSpec::Kind::Fuse) {
@@ -425,7 +435,7 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
             if (offset != param.Sizes[0]) {
                 throw std::runtime_error("DSL model: fuse slices do not cover full tensor for " + name);
             }
-            continue;
+            return;
         }
 
         if (spec->kind == MappingSpec::Kind::Transform) {
@@ -436,12 +446,10 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
                 throw std::runtime_error("DSL model: transpose export expects 2D tensor for " + name);
             }
             const std::string hf_name = internal::format_hf_name(spec->source, layer_idx);
-            Tensor tmp = mAllocator->allocate(param.DType,
-                                              ("export_" + name).c_str(),
-                                              EAllocationType::ON_DEVICE,
-                                              {param.Sizes[1], param.Sizes[0]});
-            exports.push_back({hf_name, tmp, true, param});
-            continue;
+            Tensor transposed = Tensor::from_pointer(nullptr, param.Device, param.DType,
+                                                     std::vector<long>{param.Sizes[1], param.Sizes[0]});
+            exports.push_back({hf_name, transposed, true, param});
+            return;
         }
 
         if (spec->kind == MappingSpec::Kind::StackExperts) {
@@ -515,28 +523,57 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
                     exports.push_back({hf_name, slice, false, {}});
                 }
             }
-            continue;
+            return;
         }
 
         throw std::runtime_error("DSL model: unsupported HF export mapping for " + name);
-    }
+    };
 
+    // The header comes first: every tensor's name, dtype and shape.
+    std::vector<ExportEntry> exports;
+    for (const auto& name : mParams->param_names()) {
+        exports_of(name, source_of(name), exports);
+    }
     for (const auto& entry : exports) {
         writer.register_tensor(entry.name, TensorShard(entry.tensor));
     }
     writer.prepare_metadata(&comm);
 
     cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-    for (auto& entry : exports) {
-        if (entry.needs_transpose) {
-            transpose(entry.tensor,
+    for (const auto& name : mParams->param_names()) {
+        Tensor full;
+        if (is_gathered(name)) {
+            full = mWeightManager->gather_full_master(name, comm, stream);
+        } else if (const Tensor source = source_of(name); source.Data && source.Device < 0) {
+            // A master in host memory (offloaded): the writer and the transpose read device memory.
+            full = mAllocator->allocate(source.DType,
+                                        ("export_" + name).c_str(),
+                                        EAllocationType::ON_DEVICE,
+                                        std::vector<long>(source.Sizes.begin(), source.Sizes.begin() + source.Rank));
+            CUDA_CHECK(cudaMemcpyAsync(full.Data, source.Data, source.bytes(), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        std::vector<ExportEntry> param_exports;
+        exports_of(name, full.Data ? full : source_of(name), param_exports);
+        for (auto& entry : param_exports) {
+            if (!entry.needs_transpose) {
+                writer.write_tensor(entry.name, TensorShard(entry.tensor), &comm);
+                continue;
+            }
+            Tensor transposed = mAllocator->allocate(entry.source.DType,
+                                                     ("export_" + name).c_str(),
+                                                     EAllocationType::ON_DEVICE,
+                                                     {entry.source.Sizes[1], entry.source.Sizes[0]});
+            transpose(transposed,
                       entry.source,
                       static_cast<int>(entry.source.Sizes[0]),
                       static_cast<int>(entry.source.Sizes[1]),
                       stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
+            writer.write_tensor(entry.name, TensorShard(transposed), &comm);
+            mAllocator->free(transposed);
         }
-        writer.write_tensor(entry.name, TensorShard(entry.tensor), &comm);
+        if (full.Data) mAllocator->free(full);
     }
 
     writer.finalize(&comm);

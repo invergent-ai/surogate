@@ -214,6 +214,13 @@ public:
     }
     bool is_sharded(const std::string& name) const;
 
+    /// Export of a sharded weight. `full_master_shape` describes the whole tensor (its shape and
+    /// the master's dtype) without holding it; `gather_full_master` all-gathers it from every
+    /// rank into storage allocated here, for the caller to free with the allocator. The gather
+    /// is a collective: every rank calls it for the same names, in the same order.
+    [[nodiscard]] Tensor full_master_shape(const std::string& name) const;
+    [[nodiscard]] Tensor gather_full_master(const std::string& name, NCCLCommunicator& comm, cudaStream_t stream);
+
     /// True if `name`'s master lives in the cross-GPU SharedMasterStore (frozen base,
     /// offload_master + LoRA). Such masters are read + page-locked once by import_weights.
     bool is_shared_master(const std::string& name) const {
