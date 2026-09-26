@@ -3957,7 +3957,71 @@ NB_MODULE(_surogate, m) {
             "Batch encode conversations for training (multi-threaded).\n\n"
             "Parameters:\n"
             "- batch: List of conversations, each a list of message dicts.\n"
-            "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.");
+            "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.")
+        .def(
+            "encode_for_training_json_batch",
+            [](const tokenizer::Tokenizer& self,
+               std::vector<std::string> conversations,
+               std::optional<std::vector<std::optional<std::vector<std::string>>>> tools,
+               const std::string& strategy_str,
+               std::optional<bool> enable_thinking,
+               std::optional<std::string> reasoning_effort,
+               std::optional<bool> preserve_thinking) {
+                tokenizer::LossStrategy strategy;
+                if (strategy_str == "default")
+                    strategy = tokenizer::LossStrategy::DEFAULT;
+                else if (strategy_str == "last_round")
+                    strategy = tokenizer::LossStrategy::LAST_ROUND;
+                else if (strategy_str == "thinking_only")
+                    strategy = tokenizer::LossStrategy::THINKING_ONLY;
+                else if (strategy_str == "final_only")
+                    strategy = tokenizer::LossStrategy::FINAL_ONLY;
+                else if (strategy_str == "all")
+                    strategy = tokenizer::LossStrategy::ALL;
+                else
+                    throw std::invalid_argument(
+                        "strategy must be 'default', 'last_round', 'thinking_only', 'final_only', or 'all', got: " +
+                        strategy_str);
+                if (tools && tools->size() != conversations.size()) {
+                    throw std::invalid_argument("tools must hold one entry (or None) per conversation");
+                }
+                std::vector<tokenizer::Tokenizer::TrainingConversation> batch(conversations.size());
+                for (std::size_t i = 0; i < conversations.size(); ++i) {
+                    batch[i].messages_json = std::move(conversations[i]);
+                    if (tools && (*tools)[i]) batch[i].tool_jsons = std::move(*(*tools)[i]);
+                }
+                const tokenizer::ChatTemplateVariables variables{.enable_thinking = enable_thinking,
+                                                                 .reasoning_effort = reasoning_effort,
+                                                                 .preserve_thinking = preserve_thinking};
+                std::vector<tokenizer::TrainingEncoded> results;
+                {
+                    nb::gil_scoped_release release;
+                    results = self.encode_for_training_json_batch(batch, strategy, variables);
+                }
+                nb::list out;
+                for (auto& r : results) {
+                    nb::dict d;
+                    d["input_ids"] = nb::cast(r.input_ids);
+                    d["labels"] = nb::cast(r.labels);
+                    out.append(d);
+                }
+                return out;
+            },
+            nb::arg("conversations"),
+            nb::arg("tools") = nb::none(),
+            nb::arg("strategy") = "default",
+            nb::arg("enable_thinking") = nb::none(),
+            nb::arg("reasoning_effort") = nb::none(),
+            nb::arg("preserve_thinking") = nb::none(),
+            "Encode conversations for training, byte-exact with the model's chat template.\n\n"
+            "Parameters:\n"
+            "- conversations: one JSON string per conversation, a list of message objects with every key the\n"
+            "  template reads (role, content, reasoning_content, tool_calls, name, tool_call_id, ...).\n"
+            "- tools: per conversation, None or a list of JSON tool schemas.\n"
+            "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.\n"
+            "- enable_thinking / reasoning_effort / preserve_thinking: template variables; None leaves\n"
+            "  the template's own default, as apply_chat_template does.\n\n"
+            "A conversation the template cannot split into turns comes back with empty input_ids.");
 
     m.def("_decode_attention",
           [](nb::ndarray<nb::device::cuda, nb::c_contig> input,

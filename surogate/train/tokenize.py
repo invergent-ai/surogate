@@ -73,6 +73,7 @@ def compute_tokenize_hash(config: SFTConfig) -> str:
         "padding_free": config.padding_free,
         "datasets": [_dataset_config_to_dict(ds) for ds in config.datasets],
         "validation_datasets": [_dataset_config_to_dict(ds) for ds in config.validation_datasets],
+        "renderer_version": RENDERER_VERSION,
     }
 
     # Serialize to JSON with sorted keys for deterministic output
@@ -446,6 +447,33 @@ def debug_labels(input_ids, labels, tokenizer, text_only=False):
     console.print()
 
 
+# Bump when the rendering of a conversation changes, so cached tokenizations are rebuilt.
+# 2: rendered with every message field and the tools (byte-exact with apply_chat_template).
+RENDERER_VERSION = 2
+
+
+def _conversation_json(messages) -> str:
+    """One conversation as the JSON the native encoder renders: every carried message field the
+    row has (tool_calls decoded from the JSON string the Arrow schema stores it as)."""
+    out = []
+    for message in messages:
+        # "" marks a field the row does not have (see row.MESSAGE_KEYS); content is always kept.
+        m = {k: v for k, v in message.items() if v is not None and k != "loss" and (v != "" or k == "content")}
+        if isinstance(m.get("tool_calls"), str):
+            m["tool_calls"] = json.loads(m["tool_calls"])
+        m.setdefault("content", "")
+        out.append(m)
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _tool_jsons(tools) -> list[str] | None:
+    if not tools:
+        return None
+    if isinstance(tools, str):
+        tools = json.loads(tools)
+    return [json.dumps(t, ensure_ascii=False) for t in tools] if tools else None
+
+
 def _encode_and_prepare_native(
     native_tokenizer,
     dataset,
@@ -470,19 +498,12 @@ def _encode_and_prepare_native(
     n_empty = 0
     n_total = len(dataset)
 
-    def encode_batch(messages_batch):
-        """Submit to C++ encoder (releases GIL internally)."""
-        try:
-            return native_tokenizer.encode_for_training_batch(messages_batch, strategy=loss_strategy)
-        except Exception as e:
-            logger.warning(f"Batch encoding failed ({e}), falling back to row-by-row")
-            results = []
-            for msgs in messages_batch:
-                try:
-                    results.append(native_tokenizer.encode_for_training(msgs, strategy=loss_strategy))
-                except Exception:
-                    results.append(None)
-            return results
+    def encode_batch(messages_batch, tools_batch):
+        """Submit to C++ encoder (releases GIL internally). A conversation the chat template
+        cannot split into turns comes back empty (counted below as an empty result)."""
+        conversations = [_conversation_json(msgs) for msgs in messages_batch]
+        tools = [_tool_jsons(t) for t in tools_batch] if tools_batch is not None else None
+        return native_tokenizer.encode_for_training_json_batch(conversations, tools, strategy=loss_strategy)
 
     def collect_results(results):
         """Convert encoding results to numpy arrays."""
@@ -510,9 +531,10 @@ def _encode_and_prepare_native(
 
             for batch in dataset.iter(batch_size=batch_size):
                 messages_batch = batch["messages"]
+                tools_batch = batch.get("tools")
 
                 # Submit encoding to thread (C++ releases GIL)
-                future = executor.submit(encode_batch, messages_batch)
+                future = executor.submit(encode_batch, messages_batch, tools_batch)
 
                 # While C++ encodes current batch, collect previous results
                 if pending_future is not None:
@@ -628,8 +650,11 @@ class TokenizeDatasets(SurogateCommand):
                 if count >= 5:
                     break
                 msgs = batch["messages"][0]
-                result = native_tok.encode_for_training(msgs, strategy=loss_strategy)
-                if result is not None:
+                tools = batch.get("tools", [None])[0]
+                [result] = native_tok.encode_for_training_json_batch(
+                    [_conversation_json(msgs)], [_tool_jsons(tools)], strategy=loss_strategy
+                )
+                if result["input_ids"]:
                     debug_labels(result["input_ids"], result["labels"], native_tok)
                     count += 1
             return

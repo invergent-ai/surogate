@@ -172,7 +172,10 @@ class ConversationDatasetConfig(DatasetConfig):
         self.message_property_mappings = cfg["message_property_mappings"] or {
             "role": "role",
             "content": "content",
+            "reasoning_content": "reasoning_content",
             "tool_calls": "tool_calls",
+            "tool_call_id": "tool_call_id",
+            "name": "name",
         }
         self.__post_init__()
 

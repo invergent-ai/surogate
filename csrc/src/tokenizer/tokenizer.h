@@ -159,6 +159,29 @@ public:
     std::vector<TrainingEncoded> encode_for_training_batch(const std::vector<std::vector<ChatMessage>>& batch,
                                                            LossStrategy strategy = LossStrategy::DEFAULT) const;
 
+    // encode_for_training for a conversation given as a JSON array of message objects with
+    // every key the chat template reads (role, content, reasoning_content, tool_calls, name,
+    // tool_call_id, ...) and the tools it is offered. The text is the template's rendering of
+    // the whole conversation, byte for byte what apply_chat_template gives; each assistant
+    // turn is located in it by rendering prefixes, and every prefix is checked against it, so
+    // a conversation the template cannot split into turns throws rather than training on a
+    // misaligned mask. Trainable: an assistant turn after its generation prompt, through the
+    // end of the turn.
+    TrainingEncoded encode_for_training_json(const std::string& messages_json,
+                                             const std::vector<std::string>& tool_jsons,
+                                             LossStrategy strategy = LossStrategy::DEFAULT,
+                                             const ChatTemplateVariables& variables = {}) const;
+
+    struct TrainingConversation {
+        std::string messages_json;
+        std::vector<std::string> tool_jsons;
+    };
+    // Batch version (multi-threaded). A conversation that fails comes back empty; the first
+    // failure's reason is printed once.
+    std::vector<TrainingEncoded> encode_for_training_json_batch(const std::vector<TrainingConversation>& batch,
+                                                                LossStrategy strategy = LossStrategy::DEFAULT,
+                                                                const ChatTemplateVariables& variables = {}) const;
+
 private:
     Tokenizer();
     struct Impl;
