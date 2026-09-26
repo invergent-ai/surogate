@@ -301,7 +301,13 @@ void DslWeightManager::allocate_weights(const Module& module,
         }
 
         const ETensorDType param_dtype = info.dtype.value_or(mConfig.work_dtype);
-        const ETensorDType master_dtype = mConfig.master_dtype;
+        // A parameter the model declares FP32 (GDN A_log / dt_bias) keeps an FP32 master:
+        // narrowing it to a 16-bit master loses the precision it was declared for, and
+        // its FP32 gradient then has no matching optimizer path.
+        const bool keep_fp32_master =
+            param_dtype == ETensorDType::FP32 &&
+            (mConfig.master_dtype == ETensorDType::BF16 || mConfig.master_dtype == ETensorDType::FP16);
+        const ETensorDType master_dtype = keep_fp32_master ? ETensorDType::FP32 : mConfig.master_dtype;
         std::vector<long> shape = resolve_shape(info.shape, env);
 
         DslWeightEntry entry;
