@@ -496,6 +496,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
+        self._validation_split_ratio_explicit = "validation_split_ratio" in cfg
 
         self.loss_scale = cfg.get("loss_scale", "default")
         self.padding_free = cfg.get("padding_free", False)
@@ -872,6 +873,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 raise ValueError("candidate_only requires eval_steps=0; evaluate candidate loss separately")
         if d.teacher_batch_size < 1:
             raise ValueError(f"distillation.teacher_batch_size must be >= 1, got {d.teacher_batch_size}.")
+        if self.validation_split_ratio and self.validation_split_ratio > 0:
+            # The split moves training rows into eval-*.bin, which gets no .kd sidecar and is
+            # scored CE-only: those rows silently leave the distillation set.
+            if getattr(self, "_validation_split_ratio_explicit", False):
+                logger.warning(
+                    f"[distillation]: validation_split_ratio={self.validation_split_ratio} moves that share "
+                    "of the training rows into the eval split, which has no teacher sidecar: they are "
+                    "never distilled. Set validation_split_ratio: 0 (or use validation_datasets) to "
+                    "distill every row."
+                )
+            else:
+                self.validation_split_ratio = 0.0
         if d.teacher_api_concurrency < 1:
             raise ValueError(
                 f"distillation.teacher_api_concurrency must be >= 1, got {d.teacher_api_concurrency}."

@@ -6,7 +6,9 @@ metrics, and adaptive rollout-depth budgeting. The tiny step budget demonstrates
 wiring; it is not a claim of reward improvement or a paper reproduction.
 
 The teacher must score the **exact student token IDs** using the same tokenizer.
-Native Surogate serving does not score prompt tokens. The included
+Native Surogate serving can score prompt tokens too (`prompt_logprobs` on
+`/v1/chat/completions/tokens`, see [docs/inference/api.md](../../docs/inference/api.md));
+this recipe uses a vLLM teacher instead. The included
 [teacher_proxy.py](teacher_proxy.py) translates the orchestrator's token endpoint
 into a vLLM `/v1/completions` prompt-scoring request. It selects each actual input
 token's logprob and keeps the first-token placeholder so supervision stays aligned.
