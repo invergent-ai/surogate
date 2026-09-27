@@ -1164,7 +1164,9 @@ public:
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
         WorkspaceArena workspace(workspace_bytes);
         // Twice: the second call runs over a workspace the first one left populated, which
-        // is where a stale grouped column would come from.
+        // is where a stale grouped column would come from. On the vendored runner the two
+        // passes must also agree bit for bit: its routed sum is reduced in a fixed order.
+        std::vector<double> first_pass;
         for (int pass = 0; pass < 2; ++pass) {
             cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
                                   cudaMemcpyDeviceToDevice),
@@ -1172,8 +1174,13 @@ public:
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
                             workspace, nullptr);
             cuda_synchronize();
+            if (pass == 0 && runs_on_runner(tokens)) { first_pass = destination_storage.values(); }
         }
         int failures = compare_output(label, destination_storage.values(), reference, tolerance(tokens));
+        if (!first_pass.empty() && first_pass != destination_storage.values()) {
+            std::cerr << label << ": two identical runner passes produced different bits\n";
+            ++failures;
+        }
         failures += destination_storage.verify_guards(label);
         return failures;
     }

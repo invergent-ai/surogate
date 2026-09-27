@@ -39,6 +39,23 @@ constexpr std::int32_t kMaxTokens = 4096;
 /// vendored kernels, the ladder, or the timing method change.
 constexpr int kTuningVersion = 1;
 
+/// How the second GEMM folds a token's experts into the routed sum. The fused-finalize epilogue
+/// adds each (token, expert) row into the BF16 output with `red.global.add`, in whatever order the
+/// CTAs finish, so the same round can round differently from run to run, and the next layer's
+/// four-bit activation quantisation turns such an ulp into a whole code step now and then. Rune v3
+/// NVFP4, the same 500 decision requests served one at a time twice: 16 of 500 answers kept their
+/// bits and 2.2% of the choices changed. The unfused path writes every (token, expert) row and
+/// sums a token's experts in a fixed order in FP32: 500 of 500 kept their bits, for 0-3% less
+/// throughput. It is the default; SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE=1 opts back into the
+/// fused epilogue.
+bool fused_finalize() {
+    static const bool value = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE");
+        return raw != nullptr && std::string(raw) == "1";
+    }();
+    return value;
+}
+
 tkc::ActivationType activation_of(const Geometry& geometry) noexcept {
     return geometry.activation == Activation::GegluTanh ? tkc::ActivationType::GegluTanh
                                                         : tkc::ActivationType::Swiglu;
@@ -159,7 +176,11 @@ State& state(const Geometry& geometry) {
     const GeometryKey key = key_of(geometry);
     std::lock_guard<std::mutex> guard(registry_mutex);
     std::unique_ptr<State>& slot = registry[key];
-    if (!slot) { slot = std::make_unique<State>(); }
+    if (!slot) {
+        slot = std::make_unique<State>();
+        // Before anything lists tactics or sizes a workspace: both follow this flag.
+        slot->runner.use_fused_finalize_ = fused_finalize();
+    }
     return *slot;
 }
 
@@ -192,7 +213,8 @@ std::string cache_path(const Geometry& geometry) {
     // of the geometry stay valid; another gate gets a file of its own.
     path << directory << "/v" << kTuningVersion << "_" << name << "_h" << geometry.hidden << "_e"
          << geometry.experts << "_k" << geometry.experts_per_token << "_i" << geometry.intermediate
-         << (geometry.activation == Activation::GegluTanh ? "_geglu" : "") << ".tactics";
+         << (geometry.activation == Activation::GegluTanh ? "_geglu" : "")
+         << (fused_finalize() ? "" : "_unfused") << ".tactics";
     return path.str();
 }
 
