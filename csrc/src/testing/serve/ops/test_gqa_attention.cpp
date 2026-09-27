@@ -1567,7 +1567,7 @@ int verify_query_batch_invariance() {
                                       envelope, scratch, out, nullptr);
             cuda_synchronize();
             const auto reference = from_device<std::uint16_t>(out.data, out.numel());
-            for (const int width : {1, 4, 6, 8, 16, 31, 129}) {
+            for (const int width : {1, 4, 6, 7, 8, 9, 16, 31, 129}) {
                 const int begin = tokens - width;
                 Tensor queries = q.slice(2, begin, width);
                 Tensor query_pos = positions.slice(0, base + begin, width);

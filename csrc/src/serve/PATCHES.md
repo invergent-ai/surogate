@@ -3523,3 +3523,11 @@ launches bit for bit, including BF16/FP8 caches, both Rune head geometries, slid
 and partition boundaries. Added 63- and 65-token chunks beside the existing 64-token case
 exercise both sides of the dispatch threshold; the full attention and bidirectional
 attention suites pass on sm_120a.
+
+**Wide-head cached prompt attention (2026-09-27).** Dense BF16/FP8 cached prompt
+calls with 512-wide heads and token tiles of at least eight use two output groups
+across eight warps. Each warp accumulates 256 dimensions while both groups share
+one staged K/V tile. This reduces per-thread register spills and doubles the
+active warps sharing a block's shared memory. Query/softmax arithmetic and absolute
+key partitions remain unchanged; one output group owns the common partial maximum
+and normalization writes. Narrow decode, append, sparse and int8 routes are unchanged.
