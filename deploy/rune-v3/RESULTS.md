@@ -1,5 +1,9 @@
 # Rune v3 deployment measurements — 2026-09-27
 
+The subsequent [prefill reducer optimization](PREFILL_PERFORMANCE.md) adds a measured
+8.6% text throughput gain at eight clients while preserving the tested answer payloads.
+The measurements below describe the preceding image-scheduling/deployment baseline.
+
 One RTX PRO 6000 Blackwell, the same local NVFP4-experts/BF16-rest artifact from the handover,
 vision enabled, 64 scheduler lanes, 16,384-token context, automatic KV, 8,192-token prefill
 window, speculation off. No checkpoint or artifact was published or overwritten.

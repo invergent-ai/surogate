@@ -1604,7 +1604,8 @@ int verify_packed_prompt_invariance() {
     // partial and lone tiles, and chunks too short for the prompt route run on their own.
     // {50, 5} is short enough for the small-T route: it keeps its own call beside the packed ones.
     const std::vector<Chunk> chunks = {{0, 200}, {127, 41}, {3967, 385}, {300, 7},
-                                       {4095, 64}, {16319, 129}, {0, 33}, {1000, 200}, {50, 5}};
+                                       {4095, 64}, {0, 63}, {127, 65}, {16319, 129},
+                                       {0, 33}, {1000, 200}, {50, 5}};
     constexpr int pages_per_row = 264;
     const int rows = static_cast<int>(chunks.size());
     for (const Geometry geometry : {Geometry{"gemma4_26b_window", 16, 8, 256},
