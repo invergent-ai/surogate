@@ -1432,6 +1432,10 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.decision_temperature    = svc().options().decision_temperature;
     // Off unless asked for, so a request without it logs exactly what it always did.
     context.decision_thinking       = request.thinking;
+    context.decision_order_averaging = request.order_averaging;
+    if (request.order_averaging) {
+        context.decision_mirrored_questions = decision_mirrored_questions(request).size();
+    }
     context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {

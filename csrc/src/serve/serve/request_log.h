@@ -53,6 +53,10 @@ struct RequestLogContext {
     std::size_t decision_thinking_questions = 0;
     int decision_reasoning_tokens           = 0;
     std::uint32_t decision_thinking_attempts = 0;
+    /// Option-order averaging (decisions_schema.h): whether the request asked for it (when not,
+    /// nothing below is logged) and how many of its questions were also read mirrored.
+    bool decision_order_averaging = false;
+    std::size_t decision_mirrored_questions = 0;
     /// The caller's X-Request-Id (see client_request_id()); empty when none was sent.
     std::string client_request_id;
 };

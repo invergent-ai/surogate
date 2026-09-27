@@ -86,6 +86,11 @@ struct DecisionsRequest {
     /// the default and what an absent or null field means, is v1 exactly; decisions_thinking.h
     /// has the rest.
     bool thinking = false;
+    /// Our extension, opt-in per request (`"order_averaging": true`, docs/inference/decisions.md
+    /// "Option-order averaging"): every choice and noul question is also read with its options in
+    /// reverse order, and answered from the mean of the two readings' distributions. False, the
+    /// default and what an absent or null field means, is v1 exactly.
+    bool order_averaging = false;
 };
 
 inline constexpr std::size_t kDecisionMinOptions = 2;
@@ -146,8 +151,16 @@ inline constexpr std::size_t kDecisionMinPrefillTokens = 47;
 /// Parse and validate a request body. Throws `ApiException` (400) for anything malformed:
 /// a missing or mistyped field, an unknown question type, fewer than 2 or more than 255
 /// options, a question named twice, a duplicate option label, an empty question set, a
-/// `thinking` value that is not a boolean (`parse_decision_thinking`, decisions_thinking.h).
+/// `thinking` value that is not a boolean (`parse_decision_thinking`, decisions_thinking.h), an
+/// `order_averaging` value that is not a boolean (`parse_decision_order_averaging`), or both
+/// `thinking` and `order_averaging` true (not supported together yet; param `order_averaging`).
 [[nodiscard]] DecisionsRequest parse_decisions_request(std::string_view body);
+
+/// The body's `order_averaging` field: absent, null and `false` are off, `true` is on. Anything
+/// else -- a string such as "true", a number, an object -- is refused with HTTP 400
+/// `invalid_decisions_request`, param `order_averaging`, so a value meant to turn it on is never
+/// served silently with it off.
+[[nodiscard]] bool parse_decision_order_averaging(const OrderedJson& body);
 
 /// The tokenizer-specific single-token label codebook: `A`..`Z` then `AA`, `AB`, .. `ZZ`,
 /// keeping a candidate only when it encodes to exactly one token that decodes back to the
@@ -241,6 +254,47 @@ inline constexpr double kDecisionDefaultTemperature = 1.0;
 [[nodiscard]] OrderedJson resolve_decision_answers(const DecisionsRequest& request,
                                                    const std::vector<std::vector<float>>& logits,
                                                    double temperature = kDecisionDefaultTemperature);
+
+// Option-order averaging (`"order_averaging": true`, docs/inference/decisions.md "Option-order
+// averaging"): a model can prefer an option for its position rather than its content (option A,
+// say). A request that asks for it reads every choice and noul question twice on the same shared
+// state prefix -- once as sent and once with its options in reverse order (a noul question's
+// `false`, `true` become `true`, `false`) -- and answers it from the mean of the two readings'
+// distributions, which cancels a pure position preference. Score questions keep their single
+// reading: their levels are ordinal, and reversed levels would be another question.
+
+/// Whether an order-averaged request reads `question` a second time with its options reversed: a
+/// choice or noul question with at least two options.
+[[nodiscard]] bool decision_mirrors(const DecisionQuestion& question) noexcept;
+
+/// `question` with its options in reverse order -- keys, texts and values together -- and its name,
+/// kind and instructions unchanged: what the second reading renders, labels `A`.. (or the codebook's
+/// codes) in the new order.
+[[nodiscard]] DecisionQuestion decision_mirrored_question(const DecisionQuestion& question);
+
+/// The mirrored readings of an order-averaged request, in the order the engine appends them after
+/// the questions' own readings: the index of every question that `decision_mirrors`, in request
+/// order. Readout row `questions.size() + k` is the mirrored reading of question `result[k]`.
+[[nodiscard]] std::vector<std::size_t> decision_mirrored_questions(const DecisionsRequest& request);
+
+/// One question's two readings combined. `as_sent` is its option logits as sent, `mirrored` those
+/// of its mirrored reading (option `i` of the question is option `n - 1 - i` there). With `p` and
+/// `q` the two readings' untempered softmaxes (T = 1, in double) and `q` put back in the question's
+/// order, the result is `log((p + q) / 2)`, computed as a log-sum-exp so that it is finite for any
+/// finite readout and exactly `log p` where the two agree, then shifted so its maximum is 0 and
+/// rounded to float, the readout's row type. It is a row of logits: `resolve_decision_answer` on it
+/// answers from the averaged distribution, with the server's calibration temperature applied once,
+/// to that distribution. Throws `std::runtime_error` on an empty, mis-sized or non-finite readout,
+/// with v1's message for the last.
+[[nodiscard]] std::vector<float> decision_order_averaged_logits(const std::vector<float>& as_sent,
+                                                                const std::vector<float>& mirrored);
+
+/// Every row an order-averaged request answers from: `rows` is the readout, one row per question in
+/// request order and then one per mirrored reading (`decision_mirrored_questions`); each question
+/// that mirrors gets `decision_order_averaged_logits` of its pair, every other keeps its row as
+/// read. The result has one row per question, for `resolve_decision_answers`.
+[[nodiscard]] std::vector<std::vector<float>> decision_order_averaged_rows(const DecisionsRequest& request,
+                                                                           std::vector<std::vector<float>> rows);
 
 [[nodiscard]] std::string new_decision_id();
 

@@ -452,6 +452,28 @@ int main() {
         thinking.decision_thinking_attempts = 2;
         failures += check(format_request_done(thinking, answered).find(" thinking_rounds=2") != std::string::npos,
                           "a thinking round that was run again is not reported");
+
+        // Option-order averaging likewise: logged only when asked for.
+        failures += check(!start.at("request").at("decisions").contains("order_averaging") &&
+                              !done.at("request").at("decisions").contains("order_averaging") &&
+                              format_request_start(decisions).find("order_averaging=") == std::string::npos &&
+                              format_request_done(decisions, answered).find("order_averaging=") == std::string::npos,
+                          "a decisions request without order averaging grew an order averaging record");
+        RequestLogContext averaged           = decisions;
+        averaged.decision_order_averaging    = true;
+        averaged.decision_mirrored_questions = 2;
+        for (const Json& record : {Json::parse(format_request_start_json("serve-test", 3300, averaged)),
+                                   Json::parse(format_request_done_json("serve-test", 3350, averaged, answered))}) {
+            failures += check(record.at("request").at("decisions").at("order_averaging") ==
+                                  Json{{"enabled", true}, {"mirrored_questions", 2}},
+                              "an order-averaged decisions request does not log its mirrored questions");
+        }
+        failures += check(format_request_start(averaged).find(" questions=3 order_averaging=on mirrored=2") !=
+                              std::string::npos,
+                          "an order-averaged decisions request's start line does not say so");
+        failures += check(format_request_done(averaged, answered).find(" order_averaging=on mirrored=2") !=
+                              std::string::npos,
+                          "an order-averaged decisions request's done line does not say so");
     }
 
     // X-Request-Id: the caller's id reaches every record type, and only a safe value is kept.

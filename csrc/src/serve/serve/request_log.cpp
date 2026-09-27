@@ -215,6 +215,11 @@ Json request_json(const RequestLogContext& context) {
                                                {"reasoning_tokens", context.decision_reasoning_tokens},
                                                {"attempts", context.decision_thinking_attempts}};
     }
+    // Option-order averaging likewise; absent when the request did not ask for it.
+    if (context.protocol == "decisions" && context.decision_order_averaging) {
+        record["decisions"]["order_averaging"] =
+            Json{{"enabled", true}, {"mirrored_questions", context.decision_mirrored_questions}};
+    }
     return record;
 }
 
@@ -414,6 +419,9 @@ std::string format_request_start(const RequestLogContext& context) {
         out << " questions=" << context.question_count;
         // `thinking=` is the chat template's switch on every protocol's start line.
         if (context.decision_thinking) { out << " decision_thinking=on"; }
+        if (context.decision_order_averaging) {
+            out << " order_averaging=on mirrored=" << context.decision_mirrored_questions;
+        }
     }
     out << " \xE2\x86\x92 submitted";
     return out.str();
@@ -461,6 +469,9 @@ std::string format_request_done(const RequestLogContext& context,
             if (context.decision_thinking_attempts > 1) {
                 out << " thinking_rounds=" << context.decision_thinking_attempts;
             }
+        }
+        if (context.decision_order_averaging) {
+            out << " order_averaging=on mirrored=" << context.decision_mirrored_questions;
         }
     }
     return out.str();

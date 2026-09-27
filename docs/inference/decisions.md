@@ -51,6 +51,7 @@ one prefill of the state plus forty short suffixes rather than forty prompts.
 | `provider`, `session_id`, `user`, `trace` | Accepted and ignored. |
 | `images` | Our extension, optional: an array of data URLs (or `{"url": ...}` objects) attached to the user turn ahead of the text, in order, for every question. Needs a server started with `--vision`. |
 | `thinking` | Our extension, optional: `true` lets each question the model is unsure of think briefly before it answers; `false`, the default (also what an absent field or `null` means), answers every question in one pass. See [Thinking](#thinking). Any value that is not a boolean is refused with HTTP 400. |
+| `order_averaging` | Our extension, optional: `true` reads every choice and noul question a second time with its options in reverse order and answers it from the mean of the two readings, which removes the model's preference for an option's position; `false`, the default (also what an absent field or `null` means), reads each question once, as sent. See [Option-order averaging](#option-order-averaging). Any value that is not a boolean is refused with HTTP 400, and so, for now, is `true` together with `"thinking": true`. |
 | Any other field | Accepted and ignored. There is deliberately no per-request temperature; see [Calibration temperature](#calibration-temperature). |
 
 A question is one of:
@@ -98,7 +99,9 @@ that order preserved; a question named twice or a criteria key sent twice is ref
   zero). `legend` maps each index to the level as sent.
 - `usage.input_tokens` counts what was actually prefilled: the shared prefix once plus every
   question's suffix. `output_tokens` is the number of questions. `cost` is always 0. A request
-  with [thinking](#thinking) on adds its thoughts to both and reports `usage.reasoning_tokens`.
+  with [thinking](#thinking) on adds its thoughts to both and reports `usage.reasoning_tokens`;
+  one with [option-order averaging](#option-order-averaging) on adds its mirrored readings'
+  suffixes to `input_tokens`.
 
 ## Protocol details
 
@@ -140,7 +143,9 @@ to that route: the shared prefix gives tokens back until every suffix is at leas
 and when the prefix itself would be shorter (the mixed case above, or a very short state)
 nothing is shared and each question runs as the whole prompt a plain request would, with the
 prefix cache off. A one-question request and a request with images always run that way (the
-runtime keeps saved GPU prefix states for text prompts only). This is a reproducibility pin,
+runtime keeps saved GPU prefix states for text prompts only); with
+[option-order averaging](#option-order-averaging) a lone question and its mirrored reading are
+two whole prompts. This is a reproducibility pin,
 not an accuracy claim, and it has two limits: a whole prompt longer than the engine's prefill
 chunk (2,048 tokens by default) is chunked by the engine on its own terms (tail chunks of 10,
 30, 47 and 200 tokens and a 4,116-token prompt showed no divergence from the whole-prompt
@@ -183,7 +188,7 @@ ends the request at once, as before, and retries share the request's deadline.
 Errors use the server's standard `{"error": {...}}` envelope: HTTP 400 for a malformed body
 (missing or mistyped fields, an unknown question type, fewer than 2 or more than 255
 options, a repeated question name or option key, an empty question set, a prompt over the
-model context, a `thinking` value that is not a boolean), `vision_disabled` for images on a
+model context, a `thinking` or `order_averaging` value that is not a boolean, both of them `true`), `vision_disabled` for images on a
 server without `--vision`, `decisions_thinking_not_supported` for thinking this model or
 request cannot serve (see [Thinking](#thinking)), 404 for an unknown model,
 and the usual 429/503 when the queue is full.
@@ -294,6 +299,70 @@ with thinking off logs exactly what it did before.
 **The aliases.** The field means the same on `/v1/decisions`, `/api/alpha/decisions` and
 `/api/v1/decisions`, which are one endpoint.
 
+## Option-order averaging
+
+A decision model can prefer an option for where it stands rather than for what it says: shown the
+same options in another order, it moves probability towards whichever option is in the favoured
+position (option `A`, say). `"order_averaging": true` removes that preference, per request, by
+reading each question in both orders.
+
+```json
+{"model": "rune", "state": "...", "questions": {"...": {}}, "order_averaging": true}
+```
+
+With order averaging on:
+
+1. Every question is read as v1 reads it (the reading as sent).
+2. Every choice question and every noul question is read a second time with its options in
+   reverse order (the mirrored reading): the last option becomes `A` and the first the last one,
+   and a noul question shows its `true` description as `A` and its `false` one as `B`. In every
+   other respect the prompt is v1's -- the system prompt, the layout, the labels (letters, or the
+   codebook's codes past 26 options) and the check that every label is one token in context.
+   The mirrored readings are extra rows of the request's one readout: they continue from the same
+   shared state prefix, in the same waves, as the questions' own readings. Where v1 reads whole
+   prompts -- a request with one question, a request with images, a prefix below the floor -- the
+   mirrored readings are whole prompts too, in the same wave as the question's own.
+3. With `p` the distribution read as sent and `q` the mirrored reading's, both the softmax over the
+   option labels at `T = 1` and `q` put back in the question's option order, the question is
+   answered from their mean `m = (p + q) / 2` exactly as v1 answers from a readout: `log m` is
+   handed to v1's readout as the question's row of logits, so the server's
+   [calibration temperature](#calibration-temperature) is applied once, to the mean
+   (`softmax(log m / T)`), and `choice` (the first most probable key on a tie), `confidence`,
+   `noul` and `probabilities` come from v1's formulas. A `--decision-temperature` is fitted on
+   single readings, and the mean of two readings is a different distribution, so a server that
+   sets one may want to refit it on order-averaged answers.
+4. Score questions are read once, as v1 reads them: their levels are ordinal, and reversing them
+   would ask a different question.
+
+The answer objects have v1's shape; nothing is added to them. A pure position preference cancels:
+a noul question read as 0.8 `false` as sent and 0.8 `true` mirrored (option `A` both times)
+answers `"noul": 0.5`. Where the two readings agree the answer is the one-reading answer, to
+float precision.
+
+`log m` is computed in double as a log-sum-exp of the two readings' log-probabilities, so it
+stays finite even for an option both readings give a probability too small for a double, and is
+then rounded to float, the readout's row type. The returned probabilities therefore match the
+exact mean to float precision (a relative error of about `1e-7` for any option that is not
+vanishingly improbable).
+
+- **Usage.** `usage.input_tokens` counts what was prefilled, the mirrored readings' suffixes
+  included; `output_tokens` stays the number of questions.
+- **Latency.** A mirrored reading costs what a question's suffix costs: the state is still
+  prefilled once, and `n` choice and noul questions read `2n` suffixes instead of `n`, in waves of
+  `min(64, --max-num-seqs)`. A one-question request stays on the whole-prompt route, as in v1:
+  the question and its mirrored reading run as two whole prompts in one wave, with no warm step.
+- **With thinking.** Not yet: a request with both `"thinking": true` and `"order_averaging": true`
+  is refused with HTTP 400 `invalid_decisions_request` (param `order_averaging`), because a
+  question that thinks answers from one thinking readout, which is not order-averaged.
+- **Retries.** A mirrored reading is a row of the request's readout, so a non-finite mirrored row
+  runs the request again from scratch, as a non-finite question row does; the warning counts
+  readings rather than questions and names a mirrored one `<name> (options reversed)`.
+- **Logging.** The console start and done lines gain ` order_averaging=on mirrored=<questions read
+  mirrored>` and the JSONL records gain `decisions.order_averaging` with `enabled` and
+  `mirrored_questions`. A request with order averaging off logs exactly what it did before.
+- **The aliases.** The field means the same on `/v1/decisions`, `/api/alpha/decisions` and
+  `/api/v1/decisions`.
+
 ## Calibration temperature
 
 A model can rank the options well and still be overconfident: its peak probability runs
@@ -402,6 +471,15 @@ error messages, extra observability.
   refused with HTTP 400, and `"thinking": true` used to be ignored and now thinks. No v1 client
   sends the field; refusing a value that is not a boolean is what keeps a request meant to think
   from being served silently in one pass.
+
+[Option-order averaging](#option-order-averaging) is an opt-in extension beside v1 on the same
+terms. A request without `order_averaging`, or with `false` or `null`, is parsed into the same
+request (the field is read after `thinking`) and answered by v1's code path: no mirrored reading is
+made, the readout rows are v1's and so are the answers, the response and the log records byte for
+byte. With it on, the reading as sent is v1's prompt and readout, on v1's prefill route, and only
+the answer is taken from the mean with the mirrored reading. As with `thinking`, a value that is
+not a boolean, which v1 ignored, is now refused with HTTP 400, and so is `true` together with
+`"thinking": true`.
 
 A test pins v1 (`csrc/src/testing/serve/test_decisions_v1.cpp`). It holds a fixed set of
 requests, and their expected results come from an independent Python implementation of the

@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -505,8 +506,35 @@ DecisionsRequest parse_decisions_request(std::string_view body) {
     // Our extension (decisions_thinking.h): absent, null and false are v1, and nothing below
     // reads the field then.
     request.thinking = parse_decision_thinking(root);
+    // Our extension (option-order averaging): absent, null and false are v1 likewise.
+    request.order_averaging = parse_decision_order_averaging(root);
+    // Not with thinking yet: a thinking answer is read from one thinking readout, which would
+    // replace the averaged answer with one that is not order-averaged.
+    if (request.thinking && request.order_averaging) {
+        invalid("order_averaging cannot be combined with thinking yet: a question that thinks answers from one "
+                "thinking readout, which is not order-averaged",
+                "order_averaging");
+    }
     // provider, session_id, user and trace are accepted and ignored, as are unknown fields.
     return request;
+}
+
+bool parse_decision_order_averaging(const OrderedJson& body) {
+    if (!body.is_object()) { return false; }
+    const auto found = body.find("order_averaging");
+    if (found == body.end() || found->is_null()) { return false; }
+    if (found->is_boolean()) { return found->get<bool>(); }
+    // A short printable string is named in the refusal, like the rest of this endpoint's refusals.
+    std::string shown;
+    if (found->is_string()) {
+        const std::string& value = found->get_ref<const std::string&>();
+        const bool printable =
+            std::all_of(value.begin(), value.end(), [](char c) { return c >= 0x20 && c < 0x7F; });
+        if (value.size() <= 32 && printable) { shown = " (got the string '" + value + "')"; }
+    }
+    invalid("order_averaging must be a boolean: true to answer each choice and noul question from its options "
+            "as sent and in reverse order, false (the default) to read them as sent" + shown,
+            "order_averaging");
 }
 
 std::vector<std::string> decision_codebook(
@@ -697,6 +725,84 @@ OrderedJson resolve_decision_answers(const DecisionsRequest& request, const std:
         answers[request.questions[i].name] = resolve_decision_answer(request.questions[i], logits[i], temperature);
     }
     return answers;
+}
+
+bool decision_mirrors(const DecisionQuestion& question) noexcept {
+    return (question.kind == DecisionKind::Choice || question.kind == DecisionKind::Noul) &&
+           question.option_count() >= kDecisionMinOptions;
+}
+
+DecisionQuestion decision_mirrored_question(const DecisionQuestion& question) {
+    DecisionQuestion mirrored = question;
+    std::reverse(mirrored.option_keys.begin(), mirrored.option_keys.end());
+    std::reverse(mirrored.option_texts.begin(), mirrored.option_texts.end());
+    std::reverse(mirrored.option_values.begin(), mirrored.option_values.end());
+    return mirrored;
+}
+
+std::vector<std::size_t> decision_mirrored_questions(const DecisionsRequest& request) {
+    std::vector<std::size_t> mirrored;
+    for (std::size_t i = 0; i < request.questions.size(); ++i) {
+        if (decision_mirrors(request.questions[i])) { mirrored.push_back(i); }
+    }
+    return mirrored;
+}
+
+std::vector<float> decision_order_averaged_logits(const std::vector<float>& as_sent,
+                                                  const std::vector<float>& mirrored) {
+    const std::size_t n = as_sent.size();
+    if (n == 0 || mirrored.size() != n) { throw std::runtime_error("decision readout does not match its options"); }
+    const auto finite = [](const std::vector<float>& row) {
+        return std::all_of(row.begin(), row.end(), [](float value) { return std::isfinite(value); });
+    };
+    if (!finite(as_sent) || !finite(mirrored)) { throw std::runtime_error("model returned non-finite logits"); }
+    // log softmax at T = 1, in double, the sum in option order: finite for a finite row.
+    const auto log_distribution = [](const std::vector<float>& logits) {
+        const double maximum = *std::max_element(logits.begin(), logits.end());
+        double sum           = 0.0;
+        for (const float z : logits) { sum += std::exp(static_cast<double>(z) - maximum); }
+        const double log_sum = std::log(sum);
+        std::vector<double> out(logits.size());
+        for (std::size_t i = 0; i < logits.size(); ++i) {
+            out[i] = (static_cast<double>(logits[i]) - maximum) - log_sum;
+        }
+        return out;
+    };
+    const std::vector<double> p = log_distribution(as_sent);
+    const std::vector<double> q = log_distribution(mirrored);
+    // log((e^a + e^b) / 2) = hi + log((1 + e^(lo - hi)) / 2): no underflow to log(0), and exactly a
+    // when a == b (the log of exactly 1 is 0).
+    std::vector<double> mean(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const double a  = p[i];
+        const double b  = q[n - 1 - i];
+        const double hi = std::max(a, b);
+        const double lo = std::min(a, b);
+        mean[i]         = hi + std::log(0.5 * (1.0 + std::exp(lo - hi)));
+    }
+    // Shifted so the most probable option is exactly 0: the row keeps full float precision where
+    // the answer is decided. A value below float's range is an exact 0 of probability either way.
+    const double top = *std::max_element(mean.begin(), mean.end());
+    std::vector<float> out(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = static_cast<float>(std::max(mean[i] - top, static_cast<double>(std::numeric_limits<float>::lowest())));
+    }
+    return out;
+}
+
+std::vector<std::vector<float>> decision_order_averaged_rows(const DecisionsRequest& request,
+                                                             std::vector<std::vector<float>> rows) {
+    const std::vector<std::size_t> mirrored = decision_mirrored_questions(request);
+    const std::size_t questions             = request.questions.size();
+    if (rows.size() != questions + mirrored.size()) {
+        throw std::runtime_error("decision readouts do not match the questions and their mirrored readings");
+    }
+    for (std::size_t k = 0; k < mirrored.size(); ++k) {
+        const std::size_t i = mirrored[k];
+        rows[i]             = decision_order_averaged_logits(rows[i], rows[questions + k]);
+    }
+    rows.resize(questions);
+    return rows;
 }
 
 DecisionsFault classify_decisions_fault(const std::exception& fault, DecisionsFaultStage stage) {

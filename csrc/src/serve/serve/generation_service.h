@@ -81,7 +81,8 @@ struct GenerationOutcome {
 struct DecisionsOutcome {
     OrderedJson answers;
     /// The shared prefix once plus every question's suffix (every full prompt for an
-    /// image request, which shares no GPU state). With thinking on, also every thinking prompt
+    /// image request, which shares no GPU state), and with order averaging on every mirrored
+    /// reading's suffix likewise. With thinking on, also every thinking prompt
     /// and every thinking readout (prompt, thought and close token), all prefilled whole.
     int input_tokens  = 0;
     /// One readout token per question; with thinking on, also every thought token and one more
@@ -235,6 +236,10 @@ public:
     /// run together, in waves like the readouts. A thinking readout that is non-finite is
     /// thought again, the failed questions only, up to `--decision-attempts` rounds in all;
     /// `on_thinking_retry` is told why before each such round.
+    /// With order averaging on (decisions_schema.h) every choice and noul question is also read
+    /// with its options reversed, as one more row of the same readout on the same shared prefix,
+    /// and answered from the mean of its two readings' distributions. The request parser refuses
+    /// order averaging together with thinking.
     [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
         std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {},
         const std::function<void(std::uint32_t attempt, const std::string& reason)>& on_retry = {},

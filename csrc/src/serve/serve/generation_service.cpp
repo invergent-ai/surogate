@@ -1104,10 +1104,9 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         };
         const bool with_images = !request.images.empty();
         const std::size_t max_context = engine_->options().max_context;
-        std::vector<Item> items;
-        items.reserve(request.questions.size());
-        for (const DecisionQuestion& question : request.questions) {
-            check();
+        // One readout row: the question's prompt, rendered and checked. `quoted` names it in a
+        // refusal: `'name'` for a question as sent, with a note for its mirrored reading.
+        const auto make_item = [&](const DecisionQuestion& question, const std::string& quoted) {
             const RenderedDecisionQuestion rendered = render_decision_question(question, codebook);
             const Variant& variant = variant_for(rendered.extended);
             sinfer::PreparedPrompt prompt = prepare_chat(rendered.system, request.state_text + rendered.branch);
@@ -1118,38 +1117,60 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             item.user    = request.state_text + rendered.branch;
             if (item.ids.size() + 1 > max_context) {
                 throw ApiException(ApiError{.status = 400,
-                    .message = "question '" + question.name + "' renders to " + std::to_string(item.ids.size()) +
+                    .message = "question " + quoted + " renders to " + std::to_string(item.ids.size()) +
                                " tokens; with its answer that exceeds the model context of " + std::to_string(max_context),
                     .param = "questions", .code = "context_length_exceeded"});
             }
             const std::string text = decode(item.ids);
             if (encode(text) != item.ids) {
-                refuse("question '" + question.name + "' renders to text that does not re-tokenise to the same ids, "
+                refuse("question " + quoted + " renders to text that does not re-tokenise to the same ids, "
                        "so its option labels cannot be verified in context", "questions",
                        "decisions_tokenizer_roundtrip");
             }
             if (text != variant.before + rendered.branch + variant.after) {
-                refuse("the chat template did not render question '" + question.name +
-                       "' as a continuation of the shared state", "questions", "decisions_template_boundary");
+                refuse("the chat template did not render question " + quoted +
+                       " as a continuation of the shared state", "questions", "decisions_template_boundary");
             }
             std::set<TokenId> seen;
             for (const std::string& label : rendered.labels) {
                 const std::vector<TokenId> appended = encode(text + label);
                 if (appended.size() != item.ids.size() + 1 ||
                     !std::equal(item.ids.begin(), item.ids.end(), appended.begin())) {
-                    refuse("label '" + label + "' of question '" + question.name +
-                           "' is not a single continuation token for this template", "questions",
+                    refuse("label '" + label + "' of question " + quoted +
+                           " is not a single continuation token for this template", "questions",
                            "decisions_label_tokenization");
                 }
                 if (!seen.insert(appended.back()).second) {
-                    refuse("option labels of question '" + question.name + "' share a token", "questions",
+                    refuse("option labels of question " + quoted + " share a token", "questions",
                            "decisions_label_tokenization");
                 }
                 item.candidates.push_back(appended.back());
             }
             item.prompt = std::move(prompt);
-            items.push_back(std::move(item));
+            return item;
+        };
+        // Option-order averaging (decisions_schema.h): the mirrored readings come after every
+        // question's own, in `decision_mirrored_questions` order, which is how the rows are paired
+        // again after the readout. With it off there are none and the rows are v1's.
+        const std::vector<std::size_t> mirrored =
+            request.order_averaging ? decision_mirrored_questions(request) : std::vector<std::size_t>{};
+        std::vector<Item> items;
+        items.reserve(request.questions.size() + mirrored.size());
+        for (const DecisionQuestion& question : request.questions) {
+            check();
+            items.push_back(make_item(question, "'" + question.name + "'"));
         }
+        for (const std::size_t i : mirrored) {
+            check();
+            items.push_back(make_item(decision_mirrored_question(request.questions[i]),
+                                      "'" + request.questions[i].name + "' (options reversed)"));
+        }
+        // The question a readout row answers, for the messages below.
+        const auto row_name = [&](std::size_t row) {
+            return row < request.questions.size()
+                       ? request.questions[row].name
+                       : request.questions[mirrored[row - request.questions.size()]].name + " (options reversed)";
+        };
 
         // Thinking (decisions_thinking.h): what thinking needs of this model and request is
         // checked here, before any GPU work, so a request that cannot think is refused rather
@@ -1219,9 +1240,10 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         // (read_candidates) -- and each finished submission hands its place to the next. A busy
         // queue makes the decision wait for them here, until its deadline (then 503), rather than
         // refuse its questions after its shared prefix has run on the GPU. Only the client going
-        // away cuts the wait short; the deadline is reserve's own.
+        // away cuts the wait short; the deadline is reserve's own. A mirrored reading
+        // (order averaging) is a readout row like a question's own, so it is counted too.
         const auto places = static_cast<std::uint32_t>(std::max<std::size_t>(
-            1, std::min(request.questions.size(), candidate_wave_width())));
+            1, std::min(items.size(), candidate_wave_width())));
         const auto reservation = in_engine([&] {
             return engine_->reserve_submissions(places, deadline, CancellationView(is_cancelled));
         });
@@ -1265,8 +1287,11 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             std::vector<std::size_t> lengths;
             for (const Item& item : items) { lengths.push_back(item.ids.size()); }
             shared = decision_shared_prefix_floor(shared, lengths);
-            // One question has nothing to share with; the warm step would only cost.
-            if (items.size() == 1) { shared = 0; }
+            // One question has nothing to share with; the warm step would only cost. That holds
+            // for a question and its mirrored reading (order averaging) too: two whole prompts in
+            // one wave, rather than a serial warm step whose prefix may be little more than the
+            // system prompt when the state is short and the question long.
+            if (request.questions.size() == 1) { shared = 0; }
         }
         if (shared == 0) {
             // Each question is the full prompt a plain request would be, prefilled whole, with
@@ -1353,14 +1378,15 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             if (on_retry) {
                 std::string names;
                 for (std::size_t k = 0; k < nonfinite.size() && k < 8; ++k) {
-                    const std::string& name = request.questions[nonfinite[k]].name;
+                    const std::string name = row_name(nonfinite[k]);
                     names += (k == 0 ? "" : ",") + (name.size() > 64 ? name.substr(0, 64) + "..." : name);
                 }
                 if (nonfinite.size() > 8) { names += ",..."; }
                 on_retry(attempt + 1, "decisions attempt " + std::to_string(attempt) + " of " +
                                           std::to_string(attempts) + " returned non-finite logits for " +
                                           std::to_string(nonfinite.size()) + " of " +
-                                          std::to_string(readout.logits.size()) + " questions (" + names +
+                                          std::to_string(readout.logits.size()) +
+                                          (mirrored.empty() ? " questions (" : " readings (") + names +
                                           "); running the request again from scratch");
             }
             // The attempt's key, options and prompts go out of scope here, before the next
@@ -1370,6 +1396,12 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         outcome.shared_prefix_tokens = shared;
         outcome.input_tokens  = static_cast<int>(outcome.shared_prefix_tokens) + readout.suffix_tokens;
         outcome.output_tokens = static_cast<int>(request.questions.size());
+        // Option-order averaging: each question that was also read mirrored is answered from the
+        // mean of its two readings' distributions (decision_order_averaged_rows), which leaves one
+        // row per question again. With it off nothing here runs and the rows are v1's.
+        if (request.order_averaging) {
+            readout.logits = decision_order_averaged_rows(request, std::move(readout.logits));
+        }
         // Both routes above -- whole prompts, or suffixes on the shared GPU prefix -- and both
         // label schemes -- letters, or codebook codes past 26 options -- end in the same raw
         // candidate logits, one row per question. The server's calibration temperature is
