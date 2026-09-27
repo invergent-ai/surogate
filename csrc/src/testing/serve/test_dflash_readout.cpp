@@ -66,6 +66,7 @@ sinfer::PromptInput image_prompt(const char* path) {
     input.messages.push_back(std::move(message));
     return input;
 }
+
 } // namespace
 
 int main() {
@@ -74,45 +75,84 @@ int main() {
     const char* image_path = std::getenv("SUROGATE_DFLASH_READOUT_IMAGE");
     sinfer::EngineOptions config;
     config.artifact_path = artifact;
-    config.max_context = 2048;
-    config.kv_capacity = sinfer::KvCapacityPolicy::explicit_capacity(8192);
+    // Gemma's 1120 soft image tokens expand into more raw vision patches; the
+    // processor derives its patch budget from context, so 2048 is insufficient.
+    config.max_context = image_path ? 8192 : 2048;
+    config.kv_capacity = sinfer::KvCapacityPolicy::explicit_capacity(config.max_context * 4);
     config.max_concurrency = 4;
-    config.prefill_chunk = 256;
+    // Bidirectional image attention must fit its whole image span in one chunk.
+    config.prefill_chunk = image_path ? 2048 : 256;
     config.enable_vision = image_path != nullptr;
     config.gemma_image_tokens = image_path ? 1120 : 0;
     config.use_cuda_graph = !std::getenv("SUROGATE_DFLASH_READOUT_EAGER");
 
     // Both sides of the candidate-only head threshold, plus a full readout.
     const std::vector<std::size_t> counts{2, 16, 17, 256};
-    const std::vector<std::size_t> lengths{37, 127, 257, 511};
+    const std::vector<std::size_t> lengths{37, 127, config.prefill_chunk + 1,
+                                         config.prefill_chunk * 2 - 1};
     std::vector<std::vector<sinfer::TokenId>> prompts;
     for (std::size_t i = 0; i < counts.size(); ++i) {
         prompts.emplace_back(lengths[i], static_cast<sinfer::TokenId>(100 + i));
     }
     std::vector<std::vector<float>> reference;
     std::vector<float> image_reference;
+    // Packed BF16/NVFP4 GEMMs can round differently from serial prefill. Compare
+    // the two backends using matching readout batches, not a serial baseline.
+    std::vector<std::vector<float>> packed_reference[2][2];
     {
         sinfer::Engine ordinary(config);
         for (std::size_t i = 0; i < prompts.size(); ++i) {
+            std::cerr << "ordinary serial text " << i << '\n';
             auto result = ordinary.generate(ordinary.prepare_tokens(prompts[i]), readout_options(counts[i]));
             check_readout(result, counts[i]);
             reference.push_back(std::move(result.next_token_logits));
         }
         if (image_path) {
+            std::cerr << "ordinary serial image\n";
             const auto result = ordinary.generate(ordinary.prepare(image_prompt(image_path)), readout_options(2));
             check_readout(result, 2);
             image_reference = result.next_token_logits;
+        }
+        for (bool images : {false, true}) {
+            if (images && !image_path) { continue; }
+            for (bool thinking : {false, true}) {
+                std::vector<sinfer::PreparedPrompt> batch;
+                std::vector<sinfer::RequestOptions> options;
+                for (std::size_t i = thinking ? 1 : 0; i < prompts.size(); ++i) {
+                    batch.push_back(images ? ordinary.prepare(image_prompt(image_path))
+                                           : ordinary.prepare_tokens(prompts[i]));
+                    options.push_back(readout_options(images ? 2 : counts[i]));
+                }
+                auto handles = ordinary.submit_batch(std::move(batch), std::move(options));
+                auto& scores = packed_reference[images][thinking];
+                scores.resize(prompts.size());
+                for (std::size_t row = 0; row < handles.size(); ++row) {
+                    const auto i = row + (thinking ? 1 : 0);
+                    auto result = handles[row].wait();
+                    check_readout(result, images ? 2 : counts[i]);
+                    float worst = 0;
+                    const auto& serial = images ? image_reference : reference[i];
+                    for (std::size_t j = 0; j < serial.size(); ++j) {
+                        worst = std::max(worst, std::abs(serial[j] - result.next_token_logits[j]));
+                    }
+                    std::cerr << "ordinary packed images=" << images << " omit_thought=" << thinking
+                              << " row=" << i << " serial_delta=" << worst << '\n';
+                    scores[i] = std::move(result.next_token_logits);
+                }
+            }
         }
     }
     config.speculative.backend = sinfer::SpeculativeBackend::DFlash;
     config.speculative.draft_tokens = 3;
     sinfer::Engine engine(config);
     for (std::size_t i = 0; i < prompts.size(); ++i) {
+        std::cerr << "DFlash serial text " << i << '\n';
         const auto result = engine.generate(engine.prepare_tokens(prompts[i]), readout_options(counts[i]));
         check_readout(result, counts[i]);
         compare(reference[i], result.next_token_logits, 0);
     }
     if (image_path) {
+        std::cerr << "DFlash serial image\n";
         const auto result = engine.generate(engine.prepare(image_prompt(image_path)), readout_options(2));
         check_readout(result, 2);
         compare(image_reference, result.next_token_logits, 0);
@@ -123,6 +163,7 @@ int main() {
     for (bool images : {false, true}) {
         if (images && !image_path) { continue; }
         for (bool thinking : {false, true}) {
+            std::cerr << "DFlash batch images=" << images << " thinking=" << thinking << '\n';
             std::vector<sinfer::PreparedPrompt> batch;
             std::vector<sinfer::RequestOptions> options;
             for (std::size_t i = 0; i < prompts.size(); ++i) {
@@ -139,6 +180,7 @@ int main() {
             auto handles = engine.submit_batch(std::move(batch), std::move(options));
             for (std::size_t i = 0; i < handles.size(); ++i) {
                 const auto result = handles[i].wait();
+                std::cerr << "batch result " << i << '\n';
                 if (thinking && i == 0) {
                     assert(result.generated_token_ids.size() == 32);
                     assert(result.speculative.enabled);
@@ -147,12 +189,14 @@ int main() {
                     assert(result.speculative.rounds > 0);
                 } else {
                     check_readout(result, images ? 2 : counts[i]);
-                    // BF16 GEMMs use different widths in a pack. Match the existing
-                    // candidate-readout tolerance for serial versus packed execution.
-                    compare(images ? image_reference : reference[i], result.next_token_logits, .125f);
+                    compare(packed_reference[images][thinking][i], result.next_token_logits, .125f);
                 }
             }
             assert(engine.healthy());
+            // Recycling the lanes must not change a subsequent serial readout.
+            const auto recycled = engine.generate(engine.prepare_tokens(prompts[0]), readout_options(counts[0]));
+            check_readout(recycled, counts[0]);
+            compare(reference[0], recycled.next_token_logits, 0);
         }
     }
     std::cout << "DFlash readout parity, packed decisions and mixed generation passed"
