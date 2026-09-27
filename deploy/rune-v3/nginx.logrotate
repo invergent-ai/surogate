@@ -1,0 +1,15 @@
+/var/lib/rune-v3-proxy/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        if /bin/systemctl is-active --quiet nginx.service; then
+            /usr/sbin/nginx -s reopen
+        fi
+    endscript
+}

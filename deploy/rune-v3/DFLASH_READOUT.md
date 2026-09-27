@@ -119,7 +119,8 @@ The deployment default remains `RUNE_SPEC=none` for decision capacity. An operat
 select `RUNE_SPEC=dflash`, `RUNE_DRAFT_TOKENS=7` and the local paired artifact when the
 thinking latency benefit is more useful. The bypass is automatic in that configuration.
 Image budget1120, API-key authentication and the configurable proxy default of one
-request/second per IP remain unchanged; the public hostname is still a deployment-day input.
+request/second per IP remain unchanged. The subsequent public deployment is documented in
+[Cloudflare deployment](CLOUDFLARE.md).
 
 `sinfer_readout_policy_test` is CPU-only and checks agreement between admission and resolved
 request planning, decision/thinking phase selection, existing GPU-prefix behavior and the

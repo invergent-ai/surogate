@@ -1,9 +1,10 @@
 # Rune v3 deployment
 
 This bundle serves the local NVFP4 experts / BF16 dense-and-attention artifact with vision,
-without speculative decoding. The model and NVFP4 checkpoint remain on this box. It exposes
-only decisions, their two aliases, model discovery and health. The hostname and trusted TLS
-certificate are supplied on deployment day.
+without speculative decoding. The model and NVFP4 checkpoint remain on this box. The public
+endpoint is **https://rune.surogate.ai**, through Cloudflare and nginx. It exposes only
+decisions, their two aliases, model discovery and health. See [Cloudflare deployment](CLOUDFLARE.md)
+for the installed TLS, client-IP policy and verification records.
 
 The startup wrapper also supports `RUNE_SPEC=dflash` and `RUNE_DRAFT_TOKENS=7` when
 `RUNE_ARTIFACT` points to a local paired target/DFlash artifact. With the decision bypass,
@@ -34,9 +35,12 @@ The initial image budget is **1,120 soft tokens per image**. The engine flag is
 The concurrency limit bounds expensive image and thinking traffic even when the rate alone
 would admit work faster than that workload can finish. Excess requests get JSON HTTP 429 with
 `Retry-After`. Retry with jitter. The native limiter authenticates before consuming capacity;
-the edge also limits unauthenticated traffic. The proxy keys clients by the socket peer,
-ignoring client-supplied forwarding headers. If a CDN is added, configure its trusted address
-ranges before changing client-IP handling.
+the edge also limits unauthenticated traffic. The proxy normally keys clients by the socket
+peer, ignoring forwarded client addresses. With `--cloudflare-ips /path/to/cidrs.txt`, it
+accepts `CF-Connecting-IP` only from those networks and checks the original socket peer before
+admitting origin traffic. Direct origin access is limited to Cloudflare and local loopback;
+loopback is not trusted to supply forwarded addresses unless explicitly included in the
+CIDR file. This mode is active publicly, so the 1/s limit applies to actual callers.
 
 Set the per-IP policy when rendering nginx with `--per-ip-rps N` (a positive integer,
 default **1**) and `--per-ip-burst N` (default **0**, no extra immediate requests).
@@ -72,7 +76,7 @@ For local TLS checks, render with `--hostname localhost` and a temporary local c
 the default listener is **127.0.0.1:8443**. A self-signed staging certificate is only for these
 checks. The key is never printed by the provided commands.
 
-## Deployment day
+## Deployment on another host
 
 1. Point the chosen hostname at the box and obtain a valid certificate for it. Install nginx
    using the host's package manager. Keep the native engine on loopback.
@@ -95,6 +99,10 @@ checks. The key is never printed by the provided commands.
    This is a dedicated-box configuration. If nginx is already serving another application,
    integrate its `http`/`server` portions into that configuration instead of replacing it.
    Run the renderer as root for `--worker-user`; it assigns its temporary directories to that user.
+   When using the distribution's nginx systemd unit, set its `PIDFile` to the generated
+   prefix's `nginx.pid`; the installed override on this box is
+   `/etc/systemd/system/nginx.service.d/rune-pid.conf`. For a proxied Cloudflare record,
+   also pass `--cloudflare-ips` as described in [Cloudflare deployment](CLOUDFLARE.md).
 4. Check unauthenticated 401, authenticated text/image/thinking decisions, 429 with
    `Retry-After`, and health after a burst through the real hostname. Verify that ports 8460
    and 8443 are not public listeners. Distribute the API key through the normal secret channel.
@@ -114,7 +122,9 @@ source commit and validation records; `RUNE_RELEASE` in `/etc/rune-v3/environmen
 the active snapshot. Verification records are under `staging/`. The
 `rune-v3.service` systemd unit is installed, enabled at boot, and serves the model on
 **127.0.0.1:8460** with API-key authentication. It starts the validated runtime container;
-the model remains a read-only mount of the local artifact. The public proxy is still stopped,
-so the configurable per-IP proxy policy takes effect when the proxy is activated.
+the model remains a read-only mount of the local artifact. `nginx.service` is also active
+and enabled, accepting origin HTTPS on port443 behind Cloudflare. The configurable per-IP
+policy is active at **1 request/s, no burst**. Public validation is recorded in
+`staging/public-cloudflare-verification.json`.
 `staging/rate-policy-verification.json` records real nginx checks for the 1/s default and an
 override. Do not reuse the short-lived staging certificate for public deployment.

@@ -18,6 +18,9 @@ http {
     send_timeout 30s;
     keepalive_timeout 15s;
     reset_timedout_connection on;
+    @TRUSTED_PROXY_CONFIG@
+    proxy_hide_header Cache-Control;
+    add_header Cache-Control "no-store" always;
     limit_req_zone $binary_remote_addr zone=rune_ip_rate:10m rate=@PER_IP_RPS@r/s;
     limit_req_zone $server_name zone=rune_total_rate:1m rate=16r/s;
     limit_conn_zone $binary_remote_addr zone=rune_ip_conn:10m;
@@ -32,10 +35,13 @@ http {
         ssl_certificate_key @PRIVATE_KEY@;
         ssl_protocols TLSv1.2 TLSv1.3;
         ssl_session_cache shared:rune_tls:10m;
+        if ($host != "@HOSTNAME@") { return 404; }
+        @ORIGIN_PEER_CHECK@
         error_page 429 = @limited;
         location @limited {
             default_type application/json;
             add_header Retry-After 1 always;
+            add_header Cache-Control "no-store" always;
             return 429 '{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Server capacity reached; retry later"}}';
         }
         location = /health {
