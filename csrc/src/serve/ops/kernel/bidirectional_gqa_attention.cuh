@@ -123,7 +123,8 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const CacheT* __restrict__ context_k, const CacheT* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int context_stride, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
-    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out,
+    bool causal_block = false) {
     static_assert(Tokens >= 1 && Tokens <= 16);
     static_assert(WarpsPerCta == (Tokens + 3) / 4);
     static_assert(KeyBlock == 32 || KeyBlock == 64);
@@ -376,17 +377,26 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             const int col1       = col0 + 1;
             const bool row0_live = row0 < RowCount && row0 / kBidirectionalGqaGroup < valid;
             const bool row1_live = row1 < RowCount && row1 / kBidirectionalGqaGroup < valid;
+            // `causal_block`: a query column sees the block's own keys up to itself only (the
+            // query tile's key index is the column index within the block). Context keys are
+            // unaffected. Off, every column sees the whole block, which is the op's default.
+            const int query0 = row0 / kBidirectionalGqaGroup;
+            const int query1 = row1 / kBidirectionalGqaGroup;
             const bool allow00 =
                 row0_live && col0 < current_valid &&
+                (!causal_block || !current_is_query || col0 <= query0) &&
                 (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position0 - (Window - 1));
             const bool allow01 =
                 row0_live && col1 < current_valid &&
+                (!causal_block || !current_is_query || col1 <= query0) &&
                 (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position0 - (Window - 1));
             const bool allow10 =
                 row1_live && col0 < current_valid &&
+                (!causal_block || !current_is_query || col0 <= query1) &&
                 (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position1 - (Window - 1));
             const bool allow11 =
                 row1_live && col1 < current_valid &&
+                (!causal_block || !current_is_query || col1 <= query1) &&
                 (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position1 - (Window - 1));
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
@@ -551,11 +561,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
     const CacheT* __restrict__ context_k, const CacheT* __restrict__ context_v, int padded_context,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
-    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out,
+    bool causal_block) {
     noncausal_gqa_split_partial_body<true, Tokens, WarpsPerCta, KeyBlock, DirectOutput, CacheT, Window>(
         q, query_k, query_v, positions, valid_columns, lanes, context_k, context_v, nullptr,
         padded_context, 0, max_context, split_capacity, scale, partial_acc, partial_m, partial_l,
-        out);
+        out, causal_block);
 }
 
 template <bool CyclicSwa, int Tokens, int KeyBlock>

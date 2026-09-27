@@ -383,25 +383,42 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
 
 } // namespace
 
+family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
+    auto g = family::TextGeometry::resolved_gemma4(reader.geometry(), reader.layer_types(), false,
+                                                   true);
+    if (!reader.dflash_geometry().empty()) {
+        g.dflash = family::DFlashGeometry::resolved(reader.dflash_geometry(),
+                                                    reader.dflash_target_layers(), g.hidden,
+                                                    g.layers, g.output_rows);
+    }
+    return g;
+}
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, std::uint32_t host_moe_layers,
                                std::uint32_t gpu_layers, LoadProgress progress) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
-    out.geometry = family::TextGeometry::resolved_gemma4(
-        binder.reader().geometry(), binder.reader().layer_types(), false, true);
+    out.geometry = resolved_geometry(binder.reader());
     const family::TextGeometry& g = out.geometry;
     out.frontend = (binder.has("vision/patch_embedding") ? family::bind_frontend_resources(binder) : family::bind_text_only_frontend_resources(binder));
     out.features = features;
 
     family::bind_gemma_vision(binder,out,g,features.vision);
-    if (features.speculative_enabled()) {
+    if (features.mtp() || features.optimized_proposal()) {
         // Gemma 4 does publish a draft head -- every GGUF release ships an `mtp-*.gguf`
         // beside it -- but the safetensors checkpoint this target converts from carries
-        // none, so the artifact has nothing to draft with.
+        // none, so there is no MTP block and no draft vocabulary. A separate DFlash drafter is
+        // the speculation this target serves.
         throw std::runtime_error(
-            "gemma4_moe artifacts carry no draft head; run without --spec");
+            "gemma4_moe artifacts carry no MTP block or draft head; use --spec dflash with an "
+            "artifact converted with --dflash-model, or run without --spec");
     }
+    // Bound whatever was asked: the binder refuses an artifact with objects nobody consumed,
+    // and `bind_dflash` turns `--spec dflash` against an artifact without a drafter into a
+    // startup error that says so.
+    out.has_dflash = g.dflash.layers > 0;
+    out.dflash     = family::bind_dflash(binder, g, features);
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     // Stored unscaled. Gemma multiplies the looked-up row by sqrt(hidden) before the first
@@ -505,6 +522,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // reads back the one uploaded table rather than a second copy of it.
     runtime.output_head =
         materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
+    if (plan.features.dflash()) {
+        runtime.dflash = family::materialize_dflash(plan.dflash, backing, g);
+    }
 }
 
 } // namespace sinfer::targets::gemma4_moe::detail

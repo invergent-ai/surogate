@@ -56,6 +56,10 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    /// z-lab's Gemma 4 drafters attend causally inside the draft block in their sliding layers
+    /// (the reference sets `is_causal` for `sliding_attention`, and vLLM serves them so); the
+    /// final full-attention layer stays bidirectional. See `dflash_causal_local` in the family.
+    static constexpr bool dflash_causal_local                  = true;
     /// Rows of the compacted proposal head. This target has no draft head at
     /// all, and the family reaches this constant only when
     /// `proposal_head == Optimized`, which the plan validator already ties to an

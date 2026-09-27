@@ -85,7 +85,7 @@ void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& quer
                       const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
                       float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
                       Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, bool causal_block) {
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == SwaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
@@ -110,7 +110,7 @@ void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& quer
                     static_cast<int>(context.padded_capacity), plan.max_context, 1, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                    static_cast<__nv_bfloat16*>(out.data));
+                    static_cast<__nv_bfloat16*>(out.data), causal_block);
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -129,7 +129,7 @@ void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& quer
                 static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
                 scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                static_cast<__nv_bfloat16*>(out.data));
+                static_cast<__nv_bfloat16*>(out.data), causal_block);
         CUDA_CHECK(cudaGetLastError());
 
         constexpr int ReduceWarps = 1;
@@ -151,14 +151,16 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
                 float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
                 Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                cudaStream_t stream) {
+                cudaStream_t stream, bool causal_block) {
     const auto launch = [&]<int Window>() {
         if (context.k.dtype == DType::FP8_E4M3FN) {
             swa_launch_typed<std::uint8_t, Window>(q, query_k, query_v, positions, valid_columns,
-                lanes, scale, context, plan, partial_acc, partial_m, partial_l, out, stream);
+                lanes, scale, context, plan, partial_acc, partial_m, partial_l, out, stream,
+                causal_block);
         } else {
             swa_launch_typed<__nv_bfloat16, Window>(q, query_k, query_v, positions, valid_columns,
-                lanes, scale, context, plan, partial_acc, partial_m, partial_l, out, stream);
+                lanes, scale, context, plan, partial_acc, partial_m, partial_l, out, stream,
+                causal_block);
         }
     };
     if (context.capacity == 2048) { launch.template operator()<2048>(); }

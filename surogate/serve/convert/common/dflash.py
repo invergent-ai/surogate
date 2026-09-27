@@ -70,10 +70,23 @@ def geometry_from_config(config: Mapping, target) -> Geometry:
         raise ValueError("DFlash requires local attention layers with at most one final full attention layer")
     rope = config.get("rope_parameters")
     draft = config.get("dflash_config")
+    if rope is None and "rope_theta" in config:
+        # The older config spelling (z-lab's Gemma 4 drafters): a top-level `rope_theta`, with
+        # `rope_scaling` null for plain RoPE.
+        if config.get("rope_scaling") not in (None, {}):
+            raise ValueError("DFlash supports default RoPE only")
+        rope = {"rope_type": "default", "rope_theta": config["rope_theta"]}
     if not isinstance(rope, Mapping) or not isinstance(draft, Mapping):
         raise ValueError("DFlash rope_parameters and dflash_config are required")
     if rope.get("rope_type", "default") != "default":
         raise ValueError("DFlash supports default RoPE only")
+    if "block_size" not in draft and "block_size" in config:
+        # Where the draft block is stated beside the model rather than inside `dflash_config`
+        # (z-lab reads it from either).
+        draft = {**draft, "block_size": config["block_size"]}
+    scale = config.get("input_embedding_scale", draft.get("input_embedding_scale", 1.0))
+    if scale != 1.0:
+        raise ValueError("DFlash drafters that scale their input embedding are not served")
     for name, value in (("rms_norm_eps", config.get("rms_norm_eps")), ("rope_theta", rope.get("rope_theta"))):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"DFlash {name} must be finite and positive")

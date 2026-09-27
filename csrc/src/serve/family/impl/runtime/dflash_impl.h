@@ -25,11 +25,30 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 namespace {
+
+/// Whether the drafter's local layers attend causally inside the draft block. A target states it
+/// (`Variant::dflash_causal_local`) because it is a property of how that target's published
+/// drafters were trained: z-lab's Gemma 4 drafters are causal in their sliding layers, the
+/// Qwen 3.5 ones were served symmetric. `SUROGATE_SERVE_DFLASH_CAUSAL_LOCAL=0|1` overrides it, so
+/// acceptance can be measured both ways; anything else leaves the target's choice.
+template <class V>
+bool dflash_causal_local() {
+    static const bool value = [] {
+        bool causal = false;
+        if constexpr (requires { V::dflash_causal_local; }) { causal = V::dflash_causal_local; }
+        const char* raw = std::getenv("SUROGATE_SERVE_DFLASH_CAUSAL_LOCAL");
+        if (raw != nullptr && raw[0] == '0' && raw[1] == '\0') { causal = false; }
+        if (raw != nullptr && raw[0] == '1' && raw[1] == '\0') { causal = true; }
+        return causal;
+    }();
+    return value;
+}
 
 void require_dflash_state(const PrefillContext& state) {
     if (state.dflash == nullptr || !state.execution.model.dflash.has_value()) {
@@ -259,7 +278,7 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
                              config.attention_scale,
                              dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
                              envelopes.local, state.execution.work, attention_batch,
-                             state.execution.device.stream);
+                             state.execution.device.stream, dflash_causal_local<V>());
                 } else {
                     ops::bidirectional_gqa_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,

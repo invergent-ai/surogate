@@ -68,11 +68,17 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
     if (store.empty()) {
-        // The widest round an adapter can see. This target refuses speculation,
-        // so a decode round is one column per lane.
-        const std::uint32_t widest =
-            std::max<std::uint32_t>(std::max<std::uint32_t>(decode_batch_capacity(options.max_concurrency), 1),
-                                    std::max<std::uint32_t>(family::lora_prefill_columns(runtime.vision_geometry, options), 1));
+        // The widest round an adapter can see: a prefill chunk, or a decode round -- which
+        // under DFlash verifies the drafts too, so it is a lane's draft window wide.
+        const std::uint32_t window = options.speculative.backend == SpeculativeBackend::None
+                                         ? 1U
+                                         : options.speculative.draft_tokens + 1U;
+        const std::uint32_t widest = std::max<std::uint32_t>(
+            std::max<std::uint32_t>(
+                decode_batch_capacity(options.max_concurrency, options.speculative.backend) *
+                    window,
+                1),
+            std::max<std::uint32_t>(family::lora_prefill_columns(runtime.vision_geometry, options), 1));
         store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
                         static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),
                         static_cast<std::int32_t>(widest));
@@ -201,8 +207,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::resolved_gemma4(
-        reader.geometry(), reader.layer_types(), false, true);
+    return detail::resolved_geometry(reader);
 }
 
 std::unique_ptr<Package::Program>

@@ -1,4 +1,5 @@
 #pragma once
+#include "family/impl/load/dflash.h"
 #include "family/impl/load/gemma_vision.h"
 
 #include "family/impl/moe/banked_experts.h"
@@ -181,6 +182,11 @@ struct BindingPlan : family::GemmaVisionPlan {
     /// untied export.
     WeightPlan output_head;
 
+    /// The separate DFlash drafter, where the artifact carries one (`dflash/*`); bound (for
+    /// validation) whether or not `--spec dflash` asked for it.
+    family::DFlashPlan dflash;
+    bool has_dflash = false;
+
     /// Objects this stage put in pinned host memory instead of on the card.
     ///
     /// The experts are the only thing worth moving and the only thing a round can absorb the
@@ -194,6 +200,10 @@ struct ArtifactLoadPlan {
     BindingPlan bindings;
     artifact::MaterializationPlan materialization;
 };
+
+/// The artifact's text geometry over the compiled config, with the DFlash drafter's where the
+/// artifact carries one. Binding and planning both read it, so they agree on the drafter.
+family::TextGeometry resolved_geometry(const artifact::Reader& reader);
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features,

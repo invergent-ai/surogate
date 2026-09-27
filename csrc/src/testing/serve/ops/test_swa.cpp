@@ -24,6 +24,8 @@ constexpr int kQHeads  = 32;
 constexpr int kKVHeads = 8;
 constexpr int kGroup   = 4;
 int kWindow = 4096;
+// The op's `causal_block` mode: a query column sees the block's own keys up to itself only.
+bool kCausal = false;
 constexpr float kScale = 0.08838834764831844055f;
 
 constexpr ReductionCriterion kSwaBf16Criterion{
@@ -80,7 +82,7 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
         const int query_position = positions[static_cast<std::size_t>(token)];
         const int context_begin  = std::max(0, query_position - (kWindow - 1));
         const int context_keys   = context_length - context_begin;
-        const int key_count      = context_keys + tokens;
+        const int key_count      = context_keys + (kCausal ? token + 1 : tokens);
 
         for (int q_head = 0; q_head < kQHeads; ++q_head) {
             const int kv_head = q_head / kGroup;
@@ -221,7 +223,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     DeviceArena workspace(workspace_bytes);
 
     ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, valid_tensor, lane_tensor,
-             kScale, context, envelope, workspace, out_tensor, nullptr);
+             kScale, context, envelope, workspace, out_tensor, nullptr, kCausal);
     cuda_synchronize();
 
     std::string label = "swa T=" + std::to_string(tokens) + " L=" + std::to_string(context_length);
@@ -229,6 +231,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         label += " envelope=[0," + std::to_string(envelope_max) + "]";
     }
     if (profile == InputProfile::WindowBoundary) label += " window-boundary";
+    if (kCausal) label += " causal";
 
     if constexpr (sizeof(CacheBits) == 1) {
         label += " fp8";
@@ -252,7 +255,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
                  envelope,
                  workspace,
                  control_tensor,
-                 nullptr);
+                 nullptr,
+                 kCausal);
         cuda_synchronize();
         failures += verify_exact((label + " widened BF16 equivalence").c_str(),
                                  from_device<std::uint16_t>(d_out.data(), q_count),
@@ -405,6 +409,16 @@ int main() {
     failures += run_case(3, 4098);
     failures += run_case<std::uint8_t>(16, 4098);
     failures += run_batch_case();
+
+    // Causal inside the block, as z-lab's Gemma 4 drafters attend in their sliding layers.
+    kCausal = true;
+    failures += run_case(1, 0);
+    failures += run_case(16, 0);
+    failures += run_case(5, 97);
+    failures += run_case(16, 2048, InputProfile::WindowBoundary);
+    failures += run_case(16, 4098);
+    failures += run_case<std::uint8_t>(16, 4098);
+    kCausal = false;
     if (failures != 0) {
         std::cerr << "swa failures=" << failures << '\n';
         return 1;

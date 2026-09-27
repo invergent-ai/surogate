@@ -45,11 +45,16 @@ struct SwaContextExecutionEnvelope {
  * The caller guarantees min_context <= L <= max_context, sequential nonnegative positions, and
  * that the cyclic context contains the declared live interval. The execution envelope may affect
  * finite launch selection and workspace capacity, never the admitted key set.
+ *
+ * `causal_block` narrows the temporary segment to a causal one: query column i admits the
+ * segment's keys j <= i only (the context is unchanged). A block-diffusion drafter trained with
+ * causal sliding layers (z-lab's Gemma 4 DFlash drafters) attends this way; the default keeps the
+ * symmetric op every earlier drafter was served with.
  */
 void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
          const Tensor& valid_columns, const Tensor& lanes, float scale,
          const CyclicKVCacheLayerView& context, SwaContextExecutionEnvelope envelope,
-         WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+         WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, bool causal_block = false);
 
 /**
  * Returns the transient arena capacity required for every T in the inclusive optimized interval.

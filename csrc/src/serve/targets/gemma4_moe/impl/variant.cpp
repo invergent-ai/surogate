@@ -1,3 +1,4 @@
+#include "family/impl/dflash_profiles.h"
 #include "targets/gemma4_moe/impl/variant.h"
 
 #include "api/ops/gelu.h"
@@ -72,8 +73,8 @@ constexpr ops::GeluMode kMlpActivation = ops::GeluMode::Tanh;
 [[noreturn]] void no_speculation(const char* leaf) {
     throw std::logic_error(
         std::string("gemma4_moe: ") + leaf +
-        " was called, but this target has no MTP block and no DFlash tower; --spec is refused when "
-        "the artifact is bound. Reaching here means a speculative round started without one.");
+        " was called, but this target has no MTP block; --spec mtp is refused when the artifact "
+        "is bound. Reaching here means an MTP round started without one.");
 }
 
 /// The format of the dense matrices -- attention and the feed-forward beside the experts. The
@@ -172,9 +173,10 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t, st
     return {};
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
-                                                                  std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                  std::uint32_t draft_window,
+                                                                  std::uint32_t batch_size) {
+    return family::dflash_graph_profiles(capacity, draft_window, batch_size);
 }
 
 // ---- Attention -------------------------------------------------------------

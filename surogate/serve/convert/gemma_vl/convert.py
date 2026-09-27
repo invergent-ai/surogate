@@ -110,11 +110,24 @@ def _dense_replaces(name, dense_sources):
     return False
 
 
-def convert(model_dir, out_path, *, device="cpu", text_format=None):
+def convert(model_dir, out_path, *, device="cpu", text_format=None, dflash_model=None):
     model, output = Path(model_dir), Path(out_path)
     config = json.loads((model / "config.json").read_text())
     g = inventory.geometry_from_config(config)
     text_specs, text_recipes = inventory.text_specs_and_recipes(g)
+    # A separate DFlash drafter trained against this target (z-lab's Gemma 4 drafters): its
+    # objects come from its own checkpoint, and its geometry is written beside the target's.
+    dflash_geometry = None
+    dflash_specs, dflash_recipes = (), ()
+    if dflash_model is not None:
+        if g.target != "gemma4_moe":
+            raise ValueError(f"{g.target}: DFlash is served for the Gemma 4 mixture only")
+        from surogate.serve.convert.common import dflash as dflash_checkpoint
+
+        dflash_model = Path(dflash_model)
+        dflash_geometry = dflash_checkpoint.geometry_from_config(
+            json.loads((dflash_model / "config.json").read_text()), g.text)
+        dflash_specs, dflash_recipes = dflash_checkpoint.conversion_plan(dflash_geometry, g.text)
     # An NVFP4 export of the mixture quantises its routed experts, which the checkpoint stores
     # per expert rather than as the stacked tensors the base recipes read: those objects come
     # from `routed_nvfp4` instead, and every other text object keeps its recipe.
@@ -144,7 +157,8 @@ def convert(model_dir, out_path, *, device="cpu", text_format=None):
         text_format = "bf16" if convention is not None else "w8"
     text_specs = _text_storage(text_specs, text_format)
     vision_specs, vision_recipes = inventory.vision_recipes(g)
-    specs, recipes = (*text_specs, *vision_specs), (*text_recipes, *vision_recipes)
+    specs = (*text_specs, *dflash_specs, *vision_specs)
+    recipes = (*text_recipes, *dflash_recipes, *vision_recipes)
     if convention is not None:
         def owned(name):
             return routed_nvfp4.is_routed_object(name) or routed_nvfp4.owns_dense(name, dense_sources)
@@ -157,8 +171,15 @@ def convert(model_dir, out_path, *, device="cpu", text_format=None):
     recipe_map = {r.object_name: r for r in recipes}
     geometry = inventory.geometry_block(g, token_domain=tokenizer_domain(model))
     routed_summary = None
-    with ShardReader.for_directory(model) as reader:
-        preflight_source_reader(reader, recipes)
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        reader = stack.enter_context(ShardReader.for_directory(model))
+        dflash_reader = (stack.enter_context(ShardReader.for_directory(dflash_model))
+                         if dflash_model is not None else None)
+        preflight_source_reader(reader, tuple(r for r in recipes if not r.object_name.startswith("dflash/")))
+        if dflash_reader is not None:
+            preflight_source_reader(dflash_reader, dflash_recipes)
         routed = None
         if convention is not None:
             routed_nvfp4.preflight_source(reader, routed_geometry, convention)
@@ -172,6 +193,10 @@ def convert(model_dir, out_path, *, device="cpu", text_format=None):
             geometry=geometry,
             vision_geometry=g.vision,
             layer_types=g.text.layer_types,
+            dflash_geometry=(dflash_checkpoint.geometry_block(dflash_geometry)
+                             if dflash_geometry is not None else None),
+            dflash_target_layers=(dflash_geometry.target_feature_layers
+                                  if dflash_geometry is not None else None),
         ) as writer:
             for spec in plan.specs:
                 payload = resources.get(spec.name)
@@ -180,7 +205,8 @@ def convert(model_dir, out_path, *, device="cpu", text_format=None):
                 elif payload is None and owned(spec.name):
                     payload = routed.payload_for(spec.name)
                 elif payload is None:
-                    tensor = materialize_recipe(recipe_map[spec.name], reader)
+                    source = dflash_reader if spec.name.startswith("dflash/") else reader
+                    tensor = materialize_recipe(recipe_map[spec.name], source)
                     if spec.format == "FP32":
                         tensor = tensor.to(torch.float32)
                     payload = conversion.encode_tensor_payload(tensor, spec, pick_device(device))
@@ -193,6 +219,10 @@ def convert(model_dir, out_path, *, device="cpu", text_format=None):
               "weights_id": weights_id, "text_format": text_format}
     if routed_summary is not None:
         report["routed_nvfp4"] = routed_summary
+    if dflash_geometry is not None:
+        report["dflash"] = {"model": str(dflash_model),
+                            "geometry": dflash_checkpoint.geometry_block(dflash_geometry),
+                            "target_layers": list(dflash_geometry.target_feature_layers)}
     Path(str(output) + ".conversion.json").write_text(json.dumps(report, indent=2) + "\n")
     return output
 
@@ -205,8 +235,11 @@ def main(argv=None):
     parser.add_argument("--text-format", choices=TEXT_FORMATS, default=None,
                         help="storage of the non-quantised text matrices (attention, dense feed-forward); "
                              "default w8 for a BF16 checkpoint, bf16 (as stored) for an NVFP4 export")
+    parser.add_argument("--dflash-model", type=Path, default=None,
+                        help="a DFlash drafter checkpoint trained for this target, stored beside it")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device, text_format=args.text_format)
+    convert(args.model, args.out, device=args.device, text_format=args.text_format,
+            dflash_model=args.dflash_model)
 
 
 if __name__ == "__main__":

@@ -94,7 +94,7 @@ std::size_t swa_workspace_capacity_bytes(SwaContextExecutionEnvelope envelope,
 void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
          const Tensor& valid_columns, const Tensor& lanes, float scale,
          const CyclicKVCacheLayerView& context, SwaContextExecutionEnvelope envelope,
-         WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+         WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, bool causal_block) {
     constexpr const char* op = "swa";
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
@@ -138,7 +138,7 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
     const auto plan          = detail::swa_resolve_plan(tokens, envelope);
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     detail::swa_launch(q, query_k, query_v, positions, valid_columns, lanes, scale, context, plan,
-                       partial.acc, partial.m, partial.l, out, stream);
+                       partial.acc, partial.m, partial.l, out, stream, causal_block);
 }
 
 } // namespace sinfer::ops

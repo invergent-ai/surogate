@@ -35,6 +35,7 @@ from ..blocks.gemma4 import (
 from ..hf import fuse
 from ..block_schema import ServeObject
 from ..blocks.gemma4 import GEMMA4_MODEL_NAME_REMAP
+from .dflash import DFLASH_HEAD_OBJECTS, DFLASH_SERVE_SECTION, DFLASH_TAIL_OBJECTS
 from ..specs import ActivationScope
 
 
@@ -610,11 +611,22 @@ class Gemma4CausalModel(nn.Model):
         "model",
     )
     _hf_k_eq_v_overrides_ = _build_gemma4_k_eq_v_overrides("model.layers.{layer}")
-    #: Per-layer serve objects live on the block schemas; these are outside the stack.
-    _serve_objects_ = GEMMA4_MODEL_SERVE_OBJECTS
+    #: Per-layer serve objects live on the block schemas; these are outside the stack. The
+    #: DFlash scorer comes from its own checkpoint (`--dflash-model`), so its geometry is resolved
+    #: separately; with none, every one of its objects has a zero dimension and is left out.
+    _serve_objects_ = (*GEMMA4_MODEL_SERVE_OBJECTS, *DFLASH_HEAD_OBJECTS, *DFLASH_TAIL_OBJECTS)
+    _serve_sections_ = (DFLASH_SERVE_SECTION,)
     _serve_blocks_ = _GEMMA4_SERVE_BLOCKS
     _serve_windowed_blocks_ = _GEMMA4_WINDOWED_BLOCKS
     _serve_block_schedule_ = staticmethod(_gemma4_serve_schedule)
+    dflash_layers = 0
+    dflash_head_dim = 0
+    dflash_qkv_rows = 0
+    dflash_attn_cols = 0
+    dflash_kv_rows = 0
+    dflash_gate_up_rows = 0
+    dflash_ffn = 0
+    dflash_feature_rows = 0
 
     def __init__(
         self,
@@ -732,11 +744,22 @@ class Gemma4ConditionalModel(nn.Model):
         "model.language_model",
     )
     _hf_k_eq_v_overrides_ = _build_gemma4_k_eq_v_overrides("model.language_model.layers.{layer}")
-    #: Per-layer serve objects live on the block schemas; these are outside the stack.
-    _serve_objects_ = GEMMA4_MODEL_SERVE_OBJECTS
+    #: Per-layer serve objects live on the block schemas; these are outside the stack. The
+    #: DFlash scorer comes from its own checkpoint (`--dflash-model`), so its geometry is resolved
+    #: separately; with none, every one of its objects has a zero dimension and is left out.
+    _serve_objects_ = (*GEMMA4_MODEL_SERVE_OBJECTS, *DFLASH_HEAD_OBJECTS, *DFLASH_TAIL_OBJECTS)
+    _serve_sections_ = (DFLASH_SERVE_SECTION,)
     _serve_blocks_ = _GEMMA4_SERVE_BLOCKS
     _serve_windowed_blocks_ = _GEMMA4_WINDOWED_BLOCKS
     _serve_block_schedule_ = staticmethod(_gemma4_serve_schedule)
+    dflash_layers = 0
+    dflash_head_dim = 0
+    dflash_qkv_rows = 0
+    dflash_attn_cols = 0
+    dflash_kv_rows = 0
+    dflash_gate_up_rows = 0
+    dflash_ffn = 0
+    dflash_feature_rows = 0
 
     def __init__(
         self,

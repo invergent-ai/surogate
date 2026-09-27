@@ -138,17 +138,11 @@ struct VisionConfig : family::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 
+/// A separate block-diffusion drafter (z-lab's `gemma-4-26B-A4B-it-DFlash`), converted into the
+/// artifact beside the target with `--dflash-model`. Its geometry is the artifact's
+/// (`dflash_geometry`), so nothing about it is compiled here.
 struct DFlashConfig {
-    static constexpr bool supported     = false;
-    static constexpr int local_layers   = 0;
-    static constexpr int local_capacity = 0;
-    static constexpr int kv_heads       = 0;
-    static constexpr int head_dim       = 0;
-    static constexpr int feature_rows   = 0;
-    static constexpr int hidden         = 0;
-    static constexpr int intermediate   = 0;
-    static constexpr int query_size     = 0;
-    static constexpr int kv_size        = 0;
+    static constexpr bool supported = true;
 };
 
 /// **One, not `1/sqrt(head_dim)`.** As on the dense target: Gemma 4 sets `scaling = 1.0` and
@@ -157,7 +151,7 @@ inline constexpr float kAttentionScale                   = 1.0F;
 inline constexpr float kGdnScale                         = 0.0F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 0;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 /// What the router multiplies its normalised, per-channel-scaled input by before the
