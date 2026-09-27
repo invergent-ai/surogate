@@ -246,7 +246,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->vision_transient_bytes =
             schedule::VisionContext::encoding_transient_bytes(vision, max_merged,
-                vision.attention_mode ? std::size_t(prefill_chunk) * cfg.residual *
+                vision.attention_mode ? std::size_t(std::min(prefill_chunk, base->summary.prompt_tokens)) * cfg.residual *
                     dtype_size(cfg.residual_dtype()) : 0);
         base->vision_control         = std::move(control);
     }

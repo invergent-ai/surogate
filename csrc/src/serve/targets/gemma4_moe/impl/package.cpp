@@ -186,6 +186,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
             .media_cache_bytes        = options.media_cache_bytes,
             .media_live_bytes         = options.media_live_bytes,
             .media_preprocess_threads = options.media_preprocess_threads,
+            .gemma_image_tokens = options.gemma_image_tokens,
             .chat_template_override   = options.chat_template_override,
             // Gemma's tokenizer is its own 262,144-id SentencePiece domain; the family's
             // registered-checkpoint assertions describe a different tokenizer entirely.

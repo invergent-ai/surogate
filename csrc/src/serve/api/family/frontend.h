@@ -22,6 +22,7 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t gemma_image_tokens = 0;
     /// Replaces the artifact's chat template when non-empty (--chat-template).
     std::string chat_template_override;
     /// Whether the artifact's tokenizer is one of the family's registered

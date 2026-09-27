@@ -3033,8 +3033,11 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
     if (staged.vision && !staged.vision->chunk_ready(staged.cursor, prefill_chunk - reserved_columns)) {
         return false;
     }
-    if (staged.vision && speculative_backend == SpeculativeBackend::None &&
-        staged.vision->needs_text_slicing(staged.cursor, prefill_chunk - reserved_columns)) {
+    // A ready image may join a prefill-only pack. Preserve layer slicing beside decoders,
+    // and never restart a text block whose saved residual has already advanced.
+    if (staged.vision && (staged.vision->text_in_progress(staged.cursor) ||
+        (decode_rows > 0 && speculative_backend == SpeculativeBackend::None &&
+         staged.vision->needs_text_slicing(staged.cursor, prefill_chunk - reserved_columns)))) {
         return false;
     }
     if (staged.mtp_bridge != MtpBridgeMode::None ||

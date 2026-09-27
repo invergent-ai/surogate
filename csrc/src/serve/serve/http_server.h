@@ -137,6 +137,7 @@ private:
     ServeOptions options_;
     AdmissionLimit admission_;
     AdmissionLimit thinking_admission_;
+    AdmissionLimit image_admission_;
     std::string public_model_id_;
     /// Extra models by served id. Built at attach time, read-only afterwards.
     std::map<std::string, GenerationService*> extra_services_;

@@ -469,6 +469,12 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (options.gemma_image_tokens &&
+        (!options.enable_vision || identity.architecture != "gemma4_moe" ||
+         !reader.vision_geometry().contains("max_image_tokens") ||
+         reader.vision_geometry().at("max_image_tokens") < options.gemma_image_tokens)) {
+        throw std::invalid_argument("--gemma-image-tokens requires a Gemma 4 mixture with vision and a sufficient image budget");
+    }
     if (identity.architecture.empty()) {
         throw std::invalid_argument("artifact has no resolved architecture; rebuild the serving cache");
     }
@@ -877,6 +883,12 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
     const auto load_start = Clock::now();
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (options.gemma_image_tokens &&
+        (!options.enable_vision || identity.architecture != "gemma4_moe" ||
+         !reader.vision_geometry().contains("max_image_tokens") ||
+         reader.vision_geometry().at("max_image_tokens") < options.gemma_image_tokens)) {
+        throw std::invalid_argument("--gemma-image-tokens requires a Gemma 4 mixture with vision and a sufficient image budget");
+    }
     if (identity.architecture.empty()) {
         throw std::invalid_argument("artifact has no resolved architecture; rebuild the serving cache");
     }

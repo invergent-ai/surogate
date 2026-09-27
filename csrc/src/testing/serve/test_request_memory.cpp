@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <array>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
@@ -85,6 +86,22 @@ int main() {
     empty.activate(0, 1);
     failures += expect(empty.region().data == nullptr && empty.summary().capacity_bytes == 0,
                        "zero-capacity request memory exposed a device allocation");
+
+    memory.activate_lane(3, 256, 256);
+    memory.activate_lane(7, 512, 256);
+    const auto left = memory.region(3), right = memory.region(7);
+    CUDA_CHECK(cudaMemset(left.data, 0x37, left.size));
+    CUDA_CHECK(cudaMemset(right.data, 0x71, right.size));
+    memory.deactivate_lane(3);
+    memory.activate_lane(5, 256, 256);
+    CUDA_CHECK(cudaMemset(memory.region(5).data, 0x55, 256));
+    std::array<unsigned char, 512> surviving{};
+    CUDA_CHECK(cudaMemcpy(surviving.data(), right.data, right.size, cudaMemcpyDeviceToHost));
+    failures += expect(memory.region(7).data == right.data &&
+        std::all_of(surviving.begin(), surviving.end(), [](auto b) { return b == 0x71; }),
+        "reusing one image slot overwrote another active image");
+    failures += expect(!memory.can_activate_lane(9, 512, 256), "full transient pool over-admitted");
+    memory.deactivate();
 
     sinfer::set_sleepable_allocations(true);
     {

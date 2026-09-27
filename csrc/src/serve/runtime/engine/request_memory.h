@@ -12,7 +12,7 @@ struct DeviceContext;
 
 namespace runtime {
 
-// Owns the startup-frozen request transient allocation. Requests activate only a prefix; no
+// Owns the startup-frozen request transient pool. Each active lane owns a disjoint region; no
 // request-time device allocation or replacement is permitted.
 class RequestMemory {
 public:
@@ -28,8 +28,11 @@ public:
 
     void activate(std::size_t bytes, std::size_t alignment);
     void deactivate() noexcept;
+    bool can_activate_lane(std::uint32_t lane, std::size_t bytes, std::size_t alignment) const noexcept;
+    void activate_lane(std::uint32_t lane, std::size_t bytes, std::size_t alignment);
+    void deactivate_lane(std::uint32_t lane) noexcept;
 
-    [[nodiscard]] TransientRegion region() const noexcept;
+    [[nodiscard]] TransientRegion region(std::uint32_t lane = 0) const noexcept;
     [[nodiscard]] ArenaMemorySummary summary() const noexcept;
     void reset_peak() noexcept;
 

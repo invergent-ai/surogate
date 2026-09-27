@@ -34,16 +34,26 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"sinfer-serve", "model.sinfer"});
+    for (const auto* tokens : {"280", "560", "1120"}) {
+        const auto options = parse({"sinfer-serve", "model.sinfer", "--vision", "--gemma-image-tokens", tokens});
+        failures += check(options.gemma_image_tokens == std::stoul(tokens), "image budget was not parsed");
+    }
+    for (const auto* tokens : {"0", "281", "2240", "-1"}) {
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", "--gemma-image-tokens", tokens}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid image budget accepted");
+    }
     {
         const auto limits = parse({"sinfer-serve", "model.sinfer", "--rate-limit-rps", "12.5",
-            "--rate-limit-burst", "16", "--max-inflight-requests", "16", "--max-thinking-requests", "2"});
+            "--rate-limit-burst", "16", "--max-inflight-requests", "16", "--max-thinking-requests", "2", "--max-image-requests", "4"});
         failures += check(defaults.rate_limit_rps == 0 && defaults.max_inflight_requests == 0 &&
             defaults.max_thinking_requests == 0, "admission limits should be opt-in");
         failures += check(limits.rate_limit_rps == 12.5 && limits.rate_limit_burst == 16 &&
-            limits.max_inflight_requests == 16 && limits.max_thinking_requests == 2,
+            limits.max_inflight_requests == 16 && limits.max_thinking_requests == 2 && limits.max_image_requests == 4,
             "admission limit options were not parsed");
         for (const auto* flag : {"--rate-limit-rps", "--rate-limit-burst",
-                                "--max-inflight-requests", "--max-thinking-requests"}) {
+                                "--max-inflight-requests", "--max-thinking-requests", "--max-image-requests"}) {
             for (const auto* bad : {"0", "-1", "nan", "inf", "1x", ""}) {
                 bool rejected = false;
                 try { (void)parse({"sinfer-serve", "model.sinfer", flag, bad}); }

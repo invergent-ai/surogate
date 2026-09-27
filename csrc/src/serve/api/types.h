@@ -274,6 +274,7 @@ struct EngineOptions {
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t gemma_image_tokens = 0; // 0: artifact default; Gemma 4: 280, 560 or 1120
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;

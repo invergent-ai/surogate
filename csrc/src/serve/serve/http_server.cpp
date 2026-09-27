@@ -179,6 +179,7 @@ HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       admission_(options_.rate_limit_rps, options_.rate_limit_burst, options_.max_inflight_requests),
       thinking_admission_(0, 1, options_.max_thinking_requests),
+      image_admission_(0, 1, options_.max_image_requests),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     const HttpPoolSizes sizes = http_pool_sizes(options_);
     server_.new_task_queue = [sizes] {
@@ -1403,6 +1404,16 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
             res.set_header("Retry-After", "1");
             write_error(res, ApiError{.status = 429, .type = "rate_limit_error",
                 .message = "thinking request capacity reached; retry later", .code = "thinking_limit_exceeded"});
+            return;
+        }
+        if (admission.permit) { res.hold_resource(std::move(admission.permit)); }
+    }
+    if (!request.images.empty()) {
+        auto admission = image_admission_.acquire();
+        if (!admission.accepted) {
+            res.set_header("Retry-After", "1");
+            write_error(res, ApiError{.status = 429, .type = "rate_limit_error",
+                .message = "image request capacity reached; retry later", .code = "image_limit_exceeded"});
             return;
         }
         if (admission.permit) { res.hold_resource(std::move(admission.permit)); }

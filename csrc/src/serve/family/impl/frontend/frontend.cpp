@@ -143,7 +143,7 @@ void validate_pixel_pipeline(const Json& config, std::string_view resource) {
     }
 }
 
-fi::ProcessorOptions processor_options(const FrontendResources& resources) {
+fi::ProcessorOptions processor_options(const FrontendResources& resources, std::uint32_t image_tokens = 0) {
     // A text-only artifact publishes neither preprocessor config -- Qwen3-0.6B
     // ships no image or video preprocessor at all -- and the engine refuses to
     // load an artifact carrying an object no binder consumes, so the target
@@ -153,8 +153,15 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
         resources.video_preprocessor_config_json.empty()) {
         return fi::ProcessorOptions{};
     }
-    const Json image =
+    Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
+    if (image_tokens) {
+        if (image.value("gemma_version", 0) != 4 || image.value("muse_glimmer", false) ||
+            (image_tokens != 280 && image_tokens != 560 && image_tokens != 1120)) {
+            throw std::invalid_argument("Gemma image token override requires Gemma 4 and 280, 560 or 1120 tokens");
+        }
+        image["max_soft_tokens"] = image_tokens;
+    }
     if (image.value("gemma_version", 0) || image.value("muse_glimmer", false)) {
         fi::ProcessorOptions options;
         auto& g = options.gemma;
@@ -988,7 +995,7 @@ public:
                                              // build it exactly when this frontend has no hand-written
                                              // reproduction of the template to fall back on.
                                              .render_chat_template = chat_template.rendered_by_tokenizer()})),
-          processor(processor_options(resources)), reasoning(reasoning_syntax(resources)),
+          processor(processor_options(resources, options.gemma_image_tokens)), reasoning(reasoning_syntax(resources)),
           vision_enabled(options.vision_enabled),
           has_chat_template(!resources.chat_template_jinja.empty() ||
                             !options.chat_template_override.empty()) {

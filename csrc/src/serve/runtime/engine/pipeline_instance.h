@@ -63,7 +63,28 @@ public:
     void deactivate() noexcept {
         for (Stage* stage : stages_) { stage->request_memory.deactivate(); }
     }
-    [[nodiscard]] TransientRegion region() const noexcept { return stages_.front()->request_memory.region(); }
+    bool can_activate_lane(std::uint32_t lane, std::size_t bytes, std::size_t alignment) const noexcept {
+        return std::all_of(stages_.begin(), stages_.end(), [&](auto* s) {
+            return s->request_memory.can_activate_lane(lane, bytes, alignment);
+        });
+    }
+    void activate_lane(std::uint32_t lane, std::size_t bytes, std::size_t alignment) {
+        if (!can_activate_lane(lane, bytes, alignment)) {
+            throw std::invalid_argument("pipeline transient pool exhausted");
+        }
+        try {
+            for (Stage* s : stages_) { s->request_memory.activate_lane(lane, bytes, alignment); }
+        } catch (...) {
+            deactivate_lane(lane);
+            throw;
+        }
+    }
+    void deactivate_lane(std::uint32_t lane) noexcept {
+        for (Stage* s : stages_) { s->request_memory.deactivate_lane(lane); }
+    }
+    [[nodiscard]] TransientRegion region(std::uint32_t lane = 0) const noexcept {
+        return stages_.front()->request_memory.region(lane);
+    }
     [[nodiscard]] ArenaMemorySummary summary() const noexcept { return stages_.front()->request_memory.summary(); }
     void reset_peak() noexcept {
         for (Stage* stage : stages_) { stage->request_memory.reset_peak(); }
@@ -206,7 +227,7 @@ public:
             PreparedPrompt copy = (s + 1 == stages_.size()) ? std::move(prompt) : prompt.clone();
             trace("start_prefill_lane", s, defer_first_chunk ? 0 : 1);
             result = stages_[s]->program->start_prefill_lane(lane, std::move(copy), std::move(plan.stages[s]),
-                                                            stages_[s]->request_memory.region(),
+                                                            stages_[s]->request_memory.region(lane),
                                                             defer_first_chunk);
         }
         // A prompt that completed inside its first chunk sampled its token on the last stage

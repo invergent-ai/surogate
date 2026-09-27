@@ -869,10 +869,7 @@ private:
 
     void release_prefill_owner(std::uint32_t lane) noexcept {
         prefill_lanes_.erase(lane);
-        if (transient_owner_ == lane) {
-            instance_.request_memory.deactivate();
-            transient_owner_.reset();
-        }
+        instance_.request_memory.deactivate_lane(lane);
     }
 
     void
@@ -1030,6 +1027,13 @@ private:
         const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
+        // A tower/layer slice made progress without consuming prompt tokens. Let the other
+        // images reach their text stage too, so ready images can share the next packed round.
+        if (!step.complete && step.processed_prompt_tokens == 0 &&
+            instance_.request_memory.region(lane).data && prefill_lanes_.contains(lane)) {
+            prefill_lanes_.erase(lane);
+            prefill_lanes_.add(lane);
+        }
         publish_runtime_stats();
     }
 
@@ -1091,7 +1095,8 @@ private:
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
-            if (plan.summary().transient_bytes != 0 && transient_owner_) { continue; }
+            if (!instance_.request_memory.can_activate_lane(lane, plan.summary().transient_bytes,
+                                                           plan.summary().transient_alignment)) { continue; }
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
@@ -1105,7 +1110,8 @@ private:
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
-            if (plan.summary().transient_bytes != 0 && transient_owner_) { continue; }
+            if (!instance_.request_memory.can_activate_lane(lane, plan.summary().transient_bytes,
+                                                           plan.summary().transient_alignment)) { continue; }
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
@@ -1231,10 +1237,8 @@ private:
             TransientRegion transient;
             if (needs_prefill) {
                 if (summary.transient_bytes != 0) {
-                    if (transient_owner_) { throw std::logic_error("request transient already has an owner"); }
-                    instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
-                    transient_owner_ = lane;
-                    transient = instance_.request_memory.region();
+                    instance_.request_memory.activate_lane(lane, summary.transient_bytes, summary.transient_alignment);
+                    transient = instance_.request_memory.region(lane);
                 }
                 prefill_lanes_.add(lane);
             }
@@ -1346,13 +1350,13 @@ private:
             // the head simply waits for memory (retained lanes go back at the round boundary,
             // the other engines' reserves have been asked for) and retries next round.
             // The frozen media buffer is also outside the lane/page protection accounting.
-            // Its owner releases it when prefill finishes, so retry admission at that boundary.
-            if (instance_.program->kv_under_pressure() || transient_owner_) {
+            // Owners release their regions when prefill finishes; retry admission at that boundary.
+            if (instance_.program->kv_under_pressure() || instance_.request_memory.summary().used_bytes != 0) {
                 static const bool pack_trace = std::getenv("SUROGATE_SERVE_PACK_TRACE") != nullptr;
                 if (pack_trace) {
-                    std::fprintf(stderr, "pack-trace: head %llu waits: kv_pressure=%d transient_owner=%d\n",
+                    std::fprintf(stderr, "pack-trace: head %llu waits: kv_pressure=%d transient_bytes=%zu\n",
                                  static_cast<unsigned long long>(head->id),
-                                 int(instance_.program->kv_under_pressure()), transient_owner_ ? int(*transient_owner_) : -1);
+                                 int(instance_.program->kv_under_pressure()), instance_.request_memory.summary().used_bytes);
                 }
                 protection_.reset();
                 return control_progress ? AdmissionProgress::ControlProgress
@@ -1986,7 +1990,6 @@ private:
             std::scoped_lock execution_lock(execution_mutex_);
             if (!prefill_lanes_.empty()) {
                 instance_.request_memory.deactivate();
-                transient_owner_.reset();
                 prefill_lanes_.clear();
             }
             protection_.reset();
@@ -2072,7 +2075,6 @@ private:
         }
         if (!prefill_lanes_.empty()) {
             instance_.request_memory.deactivate();
-            transient_owner_.reset();
             prefill_lanes_.clear();
         }
         protection_.reset();
@@ -2510,8 +2512,6 @@ private:
         std::size_t size_ = 0;
     };
     PrefillLaneSet prefill_lanes_;
-    // Encoded media survives across prefill chunks in the single frozen transient buffer.
-    std::optional<std::uint32_t> transient_owner_;
     std::vector<std::uint64_t> lane_plan_versions_;
     std::vector<std::uint8_t> cancellation_snapshot_;
     std::uint32_t next_decode_lane_ = 0;

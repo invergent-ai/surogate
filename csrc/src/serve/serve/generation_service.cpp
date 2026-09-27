@@ -398,6 +398,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
+    engine_options.gemma_image_tokens       = options_.gemma_image_tokens;
     engine_options.chat_template_override   = options_.chat_template;
     engine_options.sleep_enable             = options_.enable_sleep_mode;
     // The adapter's tensors, decoded on the host. The target binds them to its own
