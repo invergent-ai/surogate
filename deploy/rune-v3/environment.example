@@ -2,6 +2,10 @@
 RUNE_RUNTIME_IMAGE=sha256:REPLACE_WITH_LOCAL_RUNTIME_IMAGE_ID
 RUNE_RELEASE=/home/flavius/work/deployment/rune-v3/release
 RUNE_ARTIFACT=/home/flavius/work/agent/artifacts/rune-v3-nvfp4-experts-bf16d.sinfer
+# DFlash requires the local paired *-dflash.sinfer artifact. Decision scoring bypasses
+# the drafter automatically; multi-token reasoning uses this configured draft window.
+RUNE_SPEC=none
+RUNE_DRAFT_TOKENS=7
 RUNE_API_KEY_FILE=/home/flavius/work/deployment/rune-v3/api-key
 RUNE_GPU_LOCK=/home/flavius/work/gpu.lock
 RUNE_UID=1001

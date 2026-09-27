@@ -5,6 +5,13 @@ without speculative decoding. The model and NVFP4 checkpoint remain on this box.
 only decisions, their two aliases, model discovery and health. The hostname and trusted TLS
 certificate are supplied on deployment day.
 
+The startup wrapper also supports `RUNE_SPEC=dflash` and `RUNE_DRAFT_TOKENS=7` when
+`RUNE_ARTIFACT` points to a local paired target/DFlash artifact. With the decision bypass,
+candidate scoring uses the target alone while multi-token reasoning retains speculation.
+DFlash mode also enables the measured packed-prefill setting. The default remains
+`RUNE_SPEC=none`. See [DFlash readout validation](DFLASH_READOUT.md)
+for measurements and numerical limits before selecting a serving configuration.
+
 The initial image budget is **1,120 soft tokens per image**. The engine flag is
 `--gemma-image-tokens 1120`; no artifact rewriting or new quantization is required. See the
 [measurement report](RESULTS.md) for the accuracy/latency comparison.
@@ -102,8 +109,9 @@ service. Preserve the local checkpoint, artifacts and benchmark results before r
 ## Validated files on this box
 
 `/home/flavius/work/deployment/rune-v3/` contains the filled environment, private API-key
-file, frozen release binaries and `release/provenance.json` with their hashes and source
-commit. `staging/verification.json` records the successful end-to-end check. The
+file and frozen binaries under `releases/`. Each release has `provenance.json` with hashes,
+source commit and validation records; `RUNE_RELEASE` in `/etc/rune-v3/environment` selects
+the active snapshot. Verification records are under `staging/`. The
 `rune-v3.service` systemd unit is installed, enabled at boot, and serves the model on
 **127.0.0.1:8460** with API-key authentication. It starts the validated runtime container;
 the model remains a read-only mount of the local artifact. The public proxy is still stopped,
