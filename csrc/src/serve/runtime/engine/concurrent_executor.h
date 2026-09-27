@@ -9,6 +9,7 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
+#include "runtime/generation/readout_policy.h"
 #include "api/family/frontend.h"
 
 #include <algorithm>
@@ -683,10 +684,10 @@ private:
         places_cv_.notify_all(); // reservations waiting for places (reserve)
     }
 
-    /// A GPU-prefix readout (a decision's shared prefix or one of its questions): a mixed round
-    /// takes readouts or plain prompts, never both (`target_only`, request_plan_impl.h).
-    static bool is_readout(const Request& request) noexcept {
-        return request.options.execution.gpu_prefix || request.options.execution.save_gpu_prefix;
+    /// Keep target-only readouts out of drafter prefill/verification rounds. Use the
+    /// same policy as request planning, including plain and image decision readouts.
+    bool is_readout(const Request& request) const noexcept {
+        return target_only_readout(speculative_backend_, request.options.execution);
     }
 
     /// A finished request's place: back to its reservation, or to the queue.
@@ -1258,9 +1259,11 @@ private:
             if (ran || cancel_at_boundary) {
                 resolve_prefill_step(request, first, cancel_at_boundary);
             }
-            // Pipelined and speculative engines keep counting an admission as a unit, and so
-            // stage one prompt per pass as before: staging many at once is not validated there.
-            ran_gpu_unit = ran || kPipelined || speculative_backend_ != SpeculativeBackend::None;
+            // Target-only admissions can be staged together even in a DFlash engine.
+            // Keep the pipeline and generating speculative admissions on their old route.
+            ran_gpu_unit = ran || kPipelined ||
+                           (speculative_backend_ != SpeculativeBackend::None &&
+                            !(speculative_backend_ == SpeculativeBackend::DFlash && is_readout(*request)));
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -2207,15 +2210,17 @@ private:
                         const char* value = std::getenv("SUROGATE_SERVE_DFLASH_PACKED_PREFILL");
                         return value != nullptr && std::string(value) == "1";
                     }();
-                    const bool packs = speculative_backend_ == SpeculativeBackend::None ||
-                                       (kPackDFlash && speculative_backend_ == SpeculativeBackend::DFlash);
-                    if (membership.empty() && packs) {
-                        // Nothing is decoding: prefill the staged prompts together (#14), in
+                    const bool target_only = is_readout(*slots_[prefill_lanes_.front()]);
+                    if (can_pack_prefill_only(speculative_backend_, target_only, kPackDFlash,
+                                             !membership.empty(), previous_unit_was_decode)) {
+                        // Prefill the staged prompts without a decode row. A DFlash readout
+                        // pack alternates with active reasoning instead of entering its verify
+                        // round. Prefill the staged prompts together (#14), in
                         // admission order. The first staged prompt decides: one a packed round
                         // cannot take -- at its end, waiting for the step that samples its first
                         // token, or a shape mixed rounds do not support -- takes a step of its
-                        // own; otherwise it and the staged prompts of its kind (plain, or GPU
-                        // prefix readouts) share a round. A prompt with no company keeps the
+                        // own; otherwise it and the staged prompts of its kind (generating,
+                        // or target-only readouts) share a round. A prompt with no company keeps the
                         // single-lane path and its prefill graphs. Other speculative engines keep
                         // the single-lane path: their packed shapes are not validated.
                         const std::uint32_t front = prefill_lanes_.front();
@@ -2238,7 +2243,7 @@ private:
                         if (packable >= 2) {
                             const auto t_packed = Clock::now();
                             last_round_ = LastRound{"packed", 0, front, last_round_.index + 1};
-                            const std::size_t prompts = run_mixed_round(membership);
+                            const std::size_t prompts = run_mixed_round(RoundMembership{});
                             seg_timer_.mixed +=
                                 std::chrono::duration<double>(Clock::now() - t_packed).count();
                             seg_timer_.mixed_rounds += 1;

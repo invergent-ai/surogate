@@ -843,8 +843,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         // begin and its first chunk, so the chunk started from the other prompt's recurrent
         // state — the "capital of France in a primes answer" blends, and (through an eager
         // mixed continuation reading the lane slot instead) the invalid-UTF-8 crashes.
-        const bool prefill_uses_graph = !request_plan.target_only && prefill_graphs.has_value() && !request_plan.vision &&
-                                        !request_plan.prepare_mtp && !prompt.has_media() &&
+        const bool prefill_uses_graph = prefill_graphs.has_value() &&
+                                        (speculative_backend == SpeculativeBackend::None || request_plan.target_only) &&
+                                        !request_plan.gpu_prefix && !request_plan.save_gpu_prefix &&
+                                        !request_plan.vision && !request_plan.prepare_mtp && !prompt.has_media() &&
                                         base < prompt_tokens;
 
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
@@ -1349,7 +1351,10 @@ void ProgramImplCore::finish_readout_prefills(std::span<const std::uint32_t> lan
     std::vector<std::size_t> ready;
     for (std::size_t i = 0; i < lanes.size(); ++i) {
         const auto& r = requests[lanes[i]];
-        if (r.target_only && r.prefill && r.prefill->cursor == r.prefill->prompt_tokens &&
+        // Saved GPU-prefix readouts use this batched head. An ordinary decision
+        // keeps its zero-suffix candidate-head path, including when DFlash is bypassed.
+        if (r.target_only && (r.gpu_prefix || r.save_gpu_prefix) && r.prefill &&
+            r.prefill->cursor == r.prefill->prompt_tokens &&
             !r.next_token_candidates.empty()) ready.push_back(i);
     }
     while (!ready.empty()) {
@@ -2148,7 +2153,10 @@ void ProgramImplCore::prepare_graphs() {
         const char* env = std::getenv("SUROGATE_SERVE_PREFILL_GRAPH");
         return env != nullptr && env[0] == '0';
     }();
-    if (!prefill_graph_vetoed && speculative_backend == SpeculativeBackend::None) {
+    // DFlash engines also serve target-only decision readouts. Capture the ordinary
+    // target prefill body for those requests; reasoning prefills keep their feature sink.
+    if (!prefill_graph_vetoed && (speculative_backend == SpeculativeBackend::None ||
+                                 speculative_backend == SpeculativeBackend::DFlash)) {
         // The fp4 cutlass epilogue's device alpha scalar initializes lazily
         // with a synchronous copy; force it now so no captured body ever
         // triggers that init mid-capture (capture would be invalidated).
@@ -2285,13 +2293,15 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
     update_constraint(sequence, request);
+    const auto request_backend = request.target_only ? SpeculativeBackend::None : speculative_backend;
+    const auto request_window = request.target_only ? 0U : draft_window;
     request.speculative_stats = SpeculativeStats{
-        .backend                 = speculative_backend,
-        .enabled                 = speculative_backend != SpeculativeBackend::None,
-        .draft_window            = draft_window,
-        .accepted_per_position   = std::vector<std::uint64_t>(draft_window, 0),
-        .rounds_per_draft_window = speculative_backend == SpeculativeBackend::DFlash
-                                       ? std::vector<std::uint64_t>(draft_window + 1, 0)
+        .backend                 = request_backend,
+        .enabled                 = request_backend != SpeculativeBackend::None,
+        .draft_window            = request_window,
+        .accepted_per_position   = std::vector<std::uint64_t>(request_window, 0),
+        .rounds_per_draft_window = request_backend == SpeculativeBackend::DFlash
+                                       ? std::vector<std::uint64_t>(request_window + 1, 0)
                                        : std::vector<std::uint64_t>{},
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
@@ -2634,9 +2644,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             // is cheaper.
             const bool candidate_only =
                 candidate_only_first_tokens() && stage_holds_head() &&
-                speculative_backend == SpeculativeBackend::None &&
+                (speculative_backend == SpeculativeBackend::None || request.target_only) &&
                 !request.next_token_candidates.empty() && request.next_token_candidates.size() <= 16 &&
-                !request.target_only &&
+                !request.gpu_prefix && !request.save_gpu_prefix &&
                 request.top_logprobs < 0 && request.prompt_logprobs < 0 &&
                 request.constraint == nullptr && request.logit_bias_host.empty() &&
                 request.lora_slot < 0;
@@ -3066,6 +3076,13 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
     // the head aligned on it, nothing proposed -- and the head is aligned over every prompt
     // segment as well, so a prompt rides the decode rounds instead of running alone.
     if (speculative_backend == SpeculativeBackend::DFlash && !verify && !lanes.empty()) {
+        // Reject before launching the drafter: a readout has no drafter context to
+        // append or verify, even if a caller bypasses the scheduler's eligibility check.
+        for (const auto lane : prefill_lanes) {
+            if (requests.at(lane).target_only) {
+                throw std::logic_error("target-only prefill cannot join a DFlash decode round");
+            }
+        }
         auto handle = launch_dflash_round(lanes, budgets, prefill_lanes);
         mixed_in_flight_.id = handle.id;
         return handle;
@@ -3094,7 +3111,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         }
         const RequestControl::Prefill& entry = *request.prefill;
         const SequenceState& staged_sequence = sequences[lane];
-        if (entry.prepare_mtp != head || entry.cursor >= entry.prompt_tokens ||
+        if (request.target_only != target_only || (target_only && !lanes.empty()) ||
+            entry.prepare_mtp != head || entry.cursor >= entry.prompt_tokens ||
             entry.mtp_bridge != MtpBridgeMode::None ||
             (head && (!staged_sequence.kv || !staged_sequence.kv->backend ||
                       staged_sequence.kv->backend->bound_row() < 0))) {
@@ -3246,7 +3264,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         const std::uint32_t graph_nominal =
             std::min(graph_cap, staged.prompt_tokens - staged.cursor);
         const auto boundary = staged.chunk_boundary();
-        const bool graph_planned = !kNoMixedGraph && !head && !flash && staged_count == 1 &&
+        // Target-only packs have no ordinary decode frame. Their lone-prompt graph
+        // route is advance_prefill; a packed chunk stays eager even if it fills the window.
+        const bool graph_planned = !kNoMixedGraph && !head && !flash && !target_only && staged_count == 1 &&
                                    staged.use_graph && prefill_graphs.has_value() &&
                                    batch_bucket == rows && graph_nominal > 0 &&
                                    (!boundary || staged.cursor >= *boundary ||

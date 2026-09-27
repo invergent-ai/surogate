@@ -7,6 +7,12 @@ target_compile_options(sinfer_adaptive_dflash_test PRIVATE -UNDEBUG -fno-fast-ma
 add_test(NAME sinfer_adaptive_dflash_test COMMAND sinfer_adaptive_dflash_test)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_adaptive_dflash_test)
 
+add_executable(sinfer_readout_policy_test test_readout_policy.cpp)
+target_include_directories(sinfer_readout_policy_test PRIVATE ${SERVE_ROOT})
+target_compile_options(sinfer_readout_policy_test PRIVATE -UNDEBUG)
+add_test(NAME sinfer_readout_policy_test COMMAND sinfer_readout_policy_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_readout_policy_test)
+
 add_executable(sinfer_lora_slots_test test_lora_slots.cpp)
 target_include_directories(sinfer_lora_slots_test PRIVATE ${SERVE_ROOT})
 target_link_libraries(sinfer_lora_slots_test PRIVATE Threads::Threads)
@@ -718,6 +724,12 @@ sinfer_add_test(sinfer_candidate_readout_test
   SOURCES test_candidate_readout.cpp
   LIBRARIES sinfer_engine)
 target_compile_options(sinfer_candidate_readout_test PRIVATE -UNDEBUG -fno-fast-math)
+
+sinfer_add_test(sinfer_dflash_readout_test
+  SOURCES test_dflash_readout.cpp
+  LIBRARIES sinfer_engine)
+target_compile_options(sinfer_dflash_readout_test PRIVATE -UNDEBUG -fno-fast-math)
+set_tests_properties(sinfer_dflash_readout_test PROPERTIES TIMEOUT 600)
 
 # The aggregate: `cmake --build <dir> --target serve-tests` builds every registered test,
 # and `ctest` then has a binary for each of them.
