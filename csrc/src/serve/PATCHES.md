@@ -3509,3 +3509,17 @@ Pipeline stages mirror the allocations. Image encoding/layer slices rotate among
 lanes so multiple images reach text prefill; ready image chunks may pack when no decode
 lanes need latency protection. A partially executed image text block must finish its sliced
 path before it can pack. The packed path already carries per-image attention boundaries.
+
+**Prefill attention reduction (2026-09-27).** Cached BF16/FP8 prompt tiles with at least
+64 query columns per launch now reduce up to 256 output values per block. The old
+256-thread block produced only 64 values and repeated the same maximum and ordered
+normalization sum for each 64-value chunk. Wider chunks give the remaining threads
+output work and reduce redundant blocks. Narrow decode/verification rounds and int8
+attention retain their existing route. Key partitions, FP32 partials, normalization
+order and workspace sizing are unchanged.
+
+The attention op tests compare independent queries, full prompts and differently packed
+launches bit for bit, including BF16/FP8 caches, both Rune head geometries, sliding windows
+and partition boundaries. Added 63- and 65-token chunks beside the existing 64-token case
+exercise both sides of the dispatch threshold; the full attention and bidirectional
+attention suites pass on sm_120a.

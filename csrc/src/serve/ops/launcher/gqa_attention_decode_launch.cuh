@@ -487,12 +487,12 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #undef SINFER_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = 64;
-    const dim3 reduce_grid(Geometry::QHeads, div_up(Geometry::HeadDim, kDChunk),
-                           invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset,
                                    bool LaneColumns = false>() {
-        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
+      const auto launch_chunk = [&]<int DChunk>() {
+        const dim3 reduce_grid(Geometry::QHeads, div_up(Geometry::HeadDim, DChunk),
+                               invocation.width * invocation.batch_size);
+        gqa_attention_small_t_reduce_output_kernel<Geometry, DChunk, Int8, MultiBatch, Masked,
                                                    Offset, LaneColumns>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
                 static_cast<const float*>(partial_acc.data),
@@ -505,6 +505,18 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 invocation.width, invocation.full_width, invocation.column_begin,
                 invocation.batch_size, splits, invocation.sliding_window,
                 static_cast<__nv_bfloat16*>(out.data), lane_columns_of(invocation));
+      };
+      // Prompt tiles supply enough query parallelism to give every reducer thread an
+      // output value. Four 64-value blocks otherwise repeat the same maximum and ordered
+      // normalization sum. The partials and each output's arithmetic stay identical.
+      // Keep narrow decode/verification rounds and the int8 reduction policy unchanged.
+      if constexpr (!Int8 && !CacheInput::writes_cache && Geometry::HeadDim > 64) {
+          if (invocation.width >= 8 && invocation.width * invocation.batch_size >= 64) {
+              launch_chunk.template operator()<std::min(Geometry::HeadDim, 256)>();
+              return;
+          }
+      }
+      launch_chunk.template operator()<64>();
     };
     const bool masked         = invocation.valid_columns != nullptr;
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
