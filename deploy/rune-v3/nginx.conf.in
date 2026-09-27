@@ -1,0 +1,72 @@
+@USER_DIRECTIVE@
+worker_processes 2;
+pid @PREFIX@/nginx.pid;
+error_log @PREFIX@/error.log warn;
+events { worker_connections 256; }
+http {
+    log_format rune '$remote_addr $request_method $uri $status $request_time';
+    access_log @PREFIX@/access.log rune;
+    client_body_temp_path @PREFIX@/body;
+    proxy_temp_path @PREFIX@/proxy;
+    fastcgi_temp_path @PREFIX@/fastcgi;
+    scgi_temp_path @PREFIX@/scgi;
+    uwsgi_temp_path @PREFIX@/uwsgi;
+    server_tokens off;
+    client_max_body_size 16m;
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    send_timeout 30s;
+    keepalive_timeout 15s;
+    reset_timedout_connection on;
+    limit_req_zone $binary_remote_addr zone=rune_ip_rate:10m rate=4r/s;
+    limit_req_zone $server_name zone=rune_total_rate:1m rate=16r/s;
+    limit_conn_zone $binary_remote_addr zone=rune_ip_conn:10m;
+    limit_conn_zone $server_name zone=rune_total_conn:1m;
+    limit_req_status 429;
+    limit_conn_status 429;
+    upstream rune_backend { server 127.0.0.1:8460; }
+    server {
+        listen @LISTEN@ ssl default_server;
+        server_name @HOSTNAME@;
+        ssl_certificate @CERTIFICATE@;
+        ssl_certificate_key @PRIVATE_KEY@;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_cache shared:rune_tls:10m;
+        error_page 429 = @limited;
+        location @limited {
+            default_type application/json;
+            add_header Retry-After 1 always;
+            return 429 '{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Server capacity reached; retry later"}}';
+        }
+        location = /health {
+            if ($request_method != GET) { return 405; }
+            limit_req zone=rune_ip_rate burst=4 nodelay;
+            proxy_pass http://rune_backend;
+        }
+        location = /v1/models {
+            if ($request_method != GET) { return 405; }
+            limit_req zone=rune_ip_rate burst=4 nodelay;
+            limit_conn rune_total_conn 16;
+            proxy_pass http://rune_backend;
+        }
+        location ~ ^/(v1/decisions|api/alpha/decisions|api/v1/decisions)$ {
+            if ($request_method != POST) { return 405; }
+            limit_req zone=rune_ip_rate burst=4 nodelay;
+            limit_req zone=rune_total_rate burst=16 nodelay;
+            limit_conn rune_ip_conn 8;
+            limit_conn rune_total_conn 16;
+            proxy_request_buffering on;
+            proxy_buffering off;
+            proxy_connect_timeout 2s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 600s;
+            proxy_http_version 1.1;
+            proxy_set_header Connection '';
+            proxy_set_header Authorization $http_authorization;
+            proxy_set_header X-Request-Id $request_id;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_pass http://rune_backend;
+        }
+        location / { return 404; }
+    }
+}

@@ -1,0 +1,8 @@
+# Fill with the validated snapshot, local image ID, and local key file; never put the key here.
+RUNE_RUNTIME_IMAGE=sha256:REPLACE_WITH_LOCAL_RUNTIME_IMAGE_ID
+RUNE_RELEASE=/home/flavius/work/deployment/rune-v3/release
+RUNE_ARTIFACT=/home/flavius/work/agent/artifacts/rune-v3-nvfp4-experts-bf16d.sinfer
+RUNE_API_KEY_FILE=/home/flavius/work/deployment/rune-v3/api-key
+RUNE_GPU_LOCK=/home/flavius/work/gpu.lock
+RUNE_UID=1001
+RUNE_GID=1001
