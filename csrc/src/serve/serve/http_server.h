@@ -3,6 +3,7 @@
 #include "serve/generation_service.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
+#include "serve/admission_limit.h"
 
 #include <httplib.h>
 #include <nlohmann/json_fwd.hpp>
@@ -134,6 +135,8 @@ private:
     GenerationService* service_ = nullptr;
     /// Adapters this server may serve; empty unless --enable-lora named some.
     ServeOptions options_;
+    AdmissionLimit admission_;
+    AdmissionLimit thinking_admission_;
     std::string public_model_id_;
     /// Extra models by served id. Built at attach time, read-only afterwards.
     std::map<std::string, GenerationService*> extra_services_;

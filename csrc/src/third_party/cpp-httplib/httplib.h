@@ -687,7 +687,7 @@ struct Response {
   void set_content(const std::string &s, const std::string &content_type);
   void set_content(std::string &&s, const std::string &content_type);
   void hold_resource(std::shared_ptr<void> resource) {
-    resource_guard_ = std::move(resource);
+    resource_guards_.push_back(std::move(resource));
   }
   // surogate vendor patch: switch protocols (WebSocket). The response is sent as
   // 101 Switching Protocols with the handler's headers and no body; `session` then
@@ -733,7 +733,7 @@ struct Response {
   bool content_provider_success_ = false;
   std::string file_content_path_;
   std::string file_content_content_type_;
-  std::shared_ptr<void> resource_guard_;
+  std::vector<std::shared_ptr<void>> resource_guards_;
   std::function<void(Stream &)> upgrade_session_;
 };
 

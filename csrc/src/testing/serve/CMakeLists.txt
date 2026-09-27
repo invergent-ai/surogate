@@ -196,6 +196,8 @@ target_compile_options(sinfer_model_wake_http_test PRIVATE -UNDEBUG)
 # rollouts cannot get a weight update's connection closed. No model or GPU.
 sinfer_add_test(sinfer_http_pool_capacity_test SOURCES test_http_pool_capacity.cpp
                 LIBRARIES sinfer_serve)
+sinfer_add_test(sinfer_http_admission_test SOURCES test_http_admission.cpp LIBRARIES sinfer_serve)
+target_compile_options(sinfer_http_admission_test PRIVATE -UNDEBUG)
 target_compile_options(sinfer_http_pool_capacity_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_pipeline_partition_test SOURCES test_pipeline_partition.cpp)
 sinfer_add_test(sinfer_pipeline_kv_test SOURCES test_pipeline_kv.cpp)

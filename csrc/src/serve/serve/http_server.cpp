@@ -177,6 +177,8 @@ HttpPoolSizes http_pool_sizes(const ServeOptions& options) {
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
+      admission_(options_.rate_limit_rps, options_.rate_limit_burst, options_.max_inflight_requests),
+      thinking_admission_(0, 1, options_.max_thinking_requests),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     const HttpPoolSizes sizes = http_pool_sizes(options_);
     server_.new_task_queue = [sizes] {
@@ -345,7 +347,7 @@ void HttpServer::register_routes() {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
              {"Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id"},
-             {"Access-Control-Expose-Headers", "X-Request-Id"},
+             {"Access-Control-Expose-Headers", "X-Request-Id, Retry-After"},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
@@ -361,7 +363,7 @@ void HttpServer::register_routes() {
         } else if (req.has_header(std::string(kClientRequestIdHeader))) {
             warn_rejected_request_id();
         }
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -370,7 +372,7 @@ void HttpServer::register_routes() {
         const bool bearer_ok =
             req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
         const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
-        if (!bearer_ok && !x_api_key_ok) {
+        if (!options_.api_key.empty() && !bearer_ok && !x_api_key_ok) {
             ApiError error;
             error.status  = 401;
             error.type    = "invalid_request_error";
@@ -383,6 +385,19 @@ void HttpServer::register_routes() {
                 write_error(res, error);
             }
             return httplib::Server::HandlerResponse::Handled;
+        }
+        if (req.method == "POST") {
+            auto admission = admission_.acquire();
+            if (!admission.accepted) {
+                ApiError error{.status = 429, .type = "rate_limit_error",
+                               .message = "server admission limit reached; retry later",
+                               .code = "rate_limit_exceeded"};
+                res.set_header("Retry-After", std::to_string(admission.retry_after));
+                if (req.path.rfind("/v1/messages", 0) == 0) { write_messages_error(res, error); }
+                else { write_error(res, error); }
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            if (admission.permit) { res.hold_resource(std::move(admission.permit)); }
         }
         return httplib::Server::HandlerResponse::Unhandled;
     });
@@ -1381,6 +1396,16 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
         log_request_rejected(rejection);
         write_error(res, e.error());
         return;
+    }
+    if (request.thinking) {
+        auto admission = thinking_admission_.acquire();
+        if (!admission.accepted) {
+            res.set_header("Retry-After", "1");
+            write_error(res, ApiError{.status = 429, .type = "rate_limit_error",
+                .message = "thinking request capacity reached; retry later", .code = "thinking_limit_exceeded"});
+            return;
+        }
+        if (admission.permit) { res.hold_resource(std::move(admission.permit)); }
     }
     // The same start/done/rejected records every other protocol writes, console and JSONL,
     // with the decisions-specific counts beside them.

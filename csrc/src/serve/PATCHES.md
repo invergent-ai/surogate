@@ -3494,3 +3494,8 @@ clients 52.9 -> 57.4 and 44.3 -> 48.4. Answers are bit-identical off and on and 
 decisions v1 golden set alone and under 8-client load, and at tolerance 0); the op test compares
 packed prompts with each prompt's own call bit for bit, output and cache, across Gemma-4 and other
 shapes, BF16 and FP8 caches, sliding windows and key-partition boundaries.
+
+**HTTP admission resources (2026-09-27).** `cpp-httplib::Response::hold_resource` retains
+multiple guards until response destruction. HTTP admission and model request lifetimes both
+use it; replacing the first guard would prematurely release a streaming admission slot.
+`test_http_admission.cpp` exercises composition and stream completion without a GPU.

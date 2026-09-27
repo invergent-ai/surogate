@@ -543,3 +543,27 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | `SUROGATE_SERVE_DFLASH_PACKED_PREFILL` | `1` lets a DFlash server prefill several waiting prompts in one round, as a server without speculation does; off by default. See [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair) |
 | `SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE` | `1` lets NVFP4 mixture experts add their outputs in the GEMM epilogue: up to about 3% faster, but the same request can then get slightly different answers from run to run; off by default |
 | `SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB` | GPU memory for prefill and mixed-round CUDA graphs captured while serving; new shapes run without a graph once it is spent; default 512 MiB, 0 captures none |
+
+## Public admission limits
+
+The server can reject excess POST requests with HTTP 429 and `Retry-After`, before JSON
+parsing or media preparation. Limits are shared by all models and route aliases in the process.
+Authentication runs first; unauthenticated requests do not consume the bucket. Health checks,
+model discovery and CORS preflights remain available.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--rate-limit-rps R` | disabled | Token bucket refill rate in requests/second (0.001–1,000,000) |
+| `--rate-limit-burst N` | 1 | Maximum accumulated requests; starts full |
+| `--max-inflight-requests N` | disabled | Concurrent POSTs, from admission through response delivery, including streams |
+| `--max-thinking-requests N` | disabled | Concurrent decisions with `thinking: true`, across all decisions aliases |
+
+Accepted malformed requests consume rate capacity but release their in-flight slot when their
+error response completes. A full concurrency gate does not spend a rate token. Thinking requests
+also consume the general bucket. `Retry-After` is an integer number of seconds; for concurrency
+rejections it is a retry hint of one second, not a reservation. Clients should retry with jitter.
+
+These limits protect preparation and inference. Place a reverse proxy with connection, body,
+timeout and per-client limits in front of the loopback server for public service: the native HTTP
+worker queue does not bound accepted sockets. Only expose the inference routes needed by clients;
+keep administration and metrics private. Use `--api-key-file` to keep the secret out of process args.

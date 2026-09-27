@@ -76,6 +76,10 @@ struct ServeOptions {
     float cpu_moe_prefill_share            = -1.0F; // --cpu-moe-prefill-share F (default 0.5 with the split; 0 = off)
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
+    double rate_limit_rps                  = 0; // 0 disables the process-wide token bucket
+    std::uint32_t rate_limit_burst         = 1;
+    std::uint32_t max_inflight_requests    = 0; // HTTP POSTs, including preprocessing/streaming
+    std::uint32_t max_thinking_requests    = 0; // decisions with thinking=true; 0 disables
     std::uint32_t pending_timeout_ms       = 30000;
     // --adapter-update-timeout-ms N (0 = inherit pending_timeout_ms, as this
     // shared one number for both jobs before the flag existed). Separate

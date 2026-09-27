@@ -149,6 +149,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
+           "[--rate-limit-rps R --rate-limit-burst N] [--max-inflight-requests N] "
+           "[--max-thinking-requests N] "
            "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] [--spec-adaptive] "
            "[--default-max-tokens N] "
@@ -334,6 +336,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
+        } else if (arg == "--rate-limit-rps") {
+            options.rate_limit_rps = parse_float_in(require_value("--rate-limit-rps"),
+                                                    "rate-limit-rps", 0.001F, 1000000.0F);
+        } else if (arg == "--rate-limit-burst") {
+            options.rate_limit_burst = parse_model_count(require_value("--rate-limit-burst"), "rate-limit-burst");
+        } else if (arg == "--max-inflight-requests") {
+            options.max_inflight_requests = parse_model_count(require_value("--max-inflight-requests"), "max-inflight-requests");
+        } else if (arg == "--max-thinking-requests") {
+            options.max_thinking_requests = parse_model_count(require_value("--max-thinking-requests"), "max-thinking-requests");
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
