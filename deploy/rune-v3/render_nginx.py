@@ -10,16 +10,27 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--hostname', required=True)
 parser.add_argument('--worker-user', help='nginx worker user when installing as root')
 parser.add_argument('--listen', default='127.0.0.1:8443')
+parser.add_argument('--per-ip-rps', type=int, default=1,
+                    help='requests/second per client IP (default: 1)')
+parser.add_argument('--per-ip-burst', type=int, default=0,
+                    help='extra immediate requests allowed per IP (default: 0)')
 parser.add_argument('--certificate', type=Path, required=True)
 parser.add_argument('--private-key', type=Path, required=True)
 parser.add_argument('--prefix', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 a = parser.parse_args()
+if not 1 <= a.per_ip_rps <= 1000000:
+    parser.error('--per-ip-rps must be between 1 and 1000000')
+if not 0 <= a.per_ip_burst <= 65535:
+    parser.error('--per-ip-burst must be between 0 and 65535')
 if not re.fullmatch(r'[A-Za-z0-9.-]+', a.hostname):
     parser.error('hostname must be a DNS name')
 if not re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}', a.listen):
     parser.error('listen must be an IPv4 address and port, e.g. 0.0.0.0:443')
-values = {'HOSTNAME': a.hostname, 'LISTEN': a.listen, 'USER_DIRECTIVE': ''}
+values = {'HOSTNAME': a.hostname, 'LISTEN': a.listen, 'USER_DIRECTIVE': '',
+          'PER_IP_RPS': str(a.per_ip_rps),
+          # nginx's zero-burst policy is expressed by omitting the burst parameter.
+          'PER_IP_BURST': f' burst={a.per_ip_burst} nodelay' if a.per_ip_burst else ''}
 worker = None
 if a.worker_user:
     if os.geteuid() != 0: parser.error('--worker-user requires root to own the temp directories')

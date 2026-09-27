@@ -7,7 +7,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/etc/rune-v3/run-engine.sh
-ExecStop=/usr/bin/docker stop --time 30 rune-v3
+ExecStop=/usr/bin/docker stop --timeout 30 rune-v3
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=45

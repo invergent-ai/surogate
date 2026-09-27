@@ -74,15 +74,28 @@ The profile waited for a real inference answer before driving load; records are 
   `/home/flavius/work/agent/logs/public-gpu-tests.log`.
 - The actual deployment container, read-only mounts and local TLS proxy passed authenticated
   text/image/thinking requests (HTTP 200) and rejected missing credentials (401). Five private
-  routes returned 404. An 80-request malformed-body burst produced 63 native and 75 edge
+  routes returned 404. With the original 4/s, burst-4 proxy policy, an 80-request malformed-body
+  burst produced 63 native and 75 edge
   rate-limit responses; every 429 carried `Retry-After`. Admitted malformed bodies returned
   400, as expected. Three simultaneous thinking requests produced two successes and one
   `thinking_limit_exceeded`; eight images produced four successes and four
   `image_limit_exceeded`. Health remained 200 after the burst. The native listener was
   127.0.0.1:8460 and TLS was 127.0.0.1:8443, with certificate verification enabled.
   Records: `/home/flavius/work/deployment/rune-v3/staging/verification.json`.
-  The staging services were stopped after verification; no public listener or system service
-  was enabled. Deployment still needs the chosen hostname, trusted TLS and activation.
+  The staging services were stopped after this verification. Subsequently the engine was
+  installed and enabled as `rune-v3.service`, still on loopback. Public deployment still
+  needs the chosen hostname, trusted TLS and proxy activation.
+- Per user request, the proxy default is now **1 request/s per IP, with no extra burst**.
+  `--per-ip-rps` and `--per-ip-burst` configure it when rendering. Real nginx checks with a
+  local HTTP stub confirmed: default admits one immediate request, rejects the next with
+  429 plus `Retry-After`, and admits after refill. A 2/s, burst-1 override admits two
+  immediate requests and then rejects excess. Both configs pass `nginx -t`; invalid
+  argument values are rejected. No GPU was needed for these proxy-specific checks.
+  Records: `/home/flavius/work/deployment/rune-v3/staging/rate-policy-verification.json`.
+- The installed systemd service is active and enabled at boot, with zero restarts during
+  verification. Authenticated real inference and model discovery pass; missing credentials
+  return 401 and health returns 200. Only 127.0.0.1:8460 is listening for this service.
+  Records: `/home/flavius/work/deployment/rune-v3/staging/systemd-verification.json`.
 
 ## Remaining performance work
 
@@ -114,4 +127,4 @@ Speculation remains off to preserve ordinary decision throughput. The handover's
 DFlash artifact remains local and available for a future latency-oriented serving tier.
 
 Engine changes are committed on `feat/rune-public-serving`: `75dcf3d4` (HTTP admission) and
-`a72f1b59` (image scheduling, image token budget, image admission cap). No PR was merged.
+`a72f1b59` (image scheduling, image token budget, image admission cap).

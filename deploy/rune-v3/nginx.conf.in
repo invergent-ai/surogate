@@ -18,7 +18,7 @@ http {
     send_timeout 30s;
     keepalive_timeout 15s;
     reset_timedout_connection on;
-    limit_req_zone $binary_remote_addr zone=rune_ip_rate:10m rate=4r/s;
+    limit_req_zone $binary_remote_addr zone=rune_ip_rate:10m rate=@PER_IP_RPS@r/s;
     limit_req_zone $server_name zone=rune_total_rate:1m rate=16r/s;
     limit_conn_zone $binary_remote_addr zone=rune_ip_conn:10m;
     limit_conn_zone $server_name zone=rune_total_conn:1m;
@@ -40,18 +40,18 @@ http {
         }
         location = /health {
             if ($request_method != GET) { return 405; }
-            limit_req zone=rune_ip_rate burst=4 nodelay;
+            limit_req zone=rune_ip_rate@PER_IP_BURST@;
             proxy_pass http://rune_backend;
         }
         location = /v1/models {
             if ($request_method != GET) { return 405; }
-            limit_req zone=rune_ip_rate burst=4 nodelay;
+            limit_req zone=rune_ip_rate@PER_IP_BURST@;
             limit_conn rune_total_conn 16;
             proxy_pass http://rune_backend;
         }
         location ~ ^/(v1/decisions|api/alpha/decisions|api/v1/decisions)$ {
             if ($request_method != POST) { return 405; }
-            limit_req zone=rune_ip_rate burst=4 nodelay;
+            limit_req zone=rune_ip_rate@PER_IP_BURST@;
             limit_req zone=rune_total_rate burst=16 nodelay;
             limit_conn rune_ip_conn 8;
             limit_conn rune_total_conn 16;

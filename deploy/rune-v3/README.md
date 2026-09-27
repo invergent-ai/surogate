@@ -15,7 +15,7 @@ The initial image budget is **1,120 soft tokens per image**. The engine flag is
 |---|---:|
 | Global request rate | 16 requests/s, burst 16 |
 | In-flight inference HTTP requests | 16 |
-| Per-IP rate at the proxy | 4 requests/s, burst 4 |
+| Per-IP rate at the proxy | 1 request/s, no extra burst (configurable) |
 | Per-IP in-flight requests | 8 |
 | Concurrent thinking decisions | 2 |
 | Concurrent image decisions | 4 |
@@ -30,6 +30,12 @@ would admit work faster than that workload can finish. Excess requests get JSON 
 the edge also limits unauthenticated traffic. The proxy keys clients by the socket peer,
 ignoring client-supplied forwarding headers. If a CDN is added, configure its trusted address
 ranges before changing client-IP handling.
+
+Set the per-IP policy when rendering nginx with `--per-ip-rps N` (a positive integer,
+default **1**) and `--per-ip-burst N` (default **0**, no extra immediate requests).
+For example, `--per-ip-rps 2 --per-ip-burst 1` allows two requests/second and one extra
+burst request. The limit is shared across the exposed routes for each peer IP. Re-render,
+run `nginx -t`, and reload nginx to apply a change to a running deployment.
 
 The proxy uses nginx's [request limiter](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html)
 and [connection limiter](https://nginx.org/en/docs/http/ngx_http_limit_conn_module.html).
@@ -64,13 +70,15 @@ checks. The key is never printed by the provided commands.
 1. Point the chosen hostname at the box and obtain a valid certificate for it. Install nginx
    using the host's package manager. Keep the native engine on loopback.
 2. Install `run-engine.sh` and the filled environment at `/etc/rune-v3/`, and the service at
-   `/etc/systemd/system/rune-v3.service`. Stop any local staging container first with `sudo docker stop --time 30 rune-v3`.
-   Run `systemctl daemon-reload` and `systemctl enable --now rune-v3`. The service restarts a failed engine; it does not launch
-   alongside a GPU benchmark holding the lock.
+   `/etc/systemd/system/rune-v3.service`. This is already installed and enabled on this box.
+   On a fresh installation, stop any manually launched staging container first, then run
+   `systemctl daemon-reload` and `systemctl enable --now rune-v3`. The service restarts a
+   failed engine; it does not launch alongside a GPU benchmark holding the lock.
 3. Render the nginx configuration with explicit public listening and the real certificate:
 
    ```bash
    python3 render_nginx.py --hostname YOUR_HOSTNAME --listen 0.0.0.0:443 --worker-user www-data \
+     --per-ip-rps 1 --per-ip-burst 0 \
      --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem \
      --prefix /var/lib/rune-v3-proxy --output /etc/nginx/nginx.conf
    nginx -t
@@ -84,7 +92,10 @@ checks. The key is never printed by the provided commands.
    `Retry-After`, and health after a burst through the real hostname. Verify that ports 8460
    and 8443 are not public listeners. Distribute the API key through the normal secret channel.
 
-To stop the local container, use `sudo docker stop --time 30 rune-v3`. Keep the release and
+Manage the engine with `sudo systemctl status rune-v3`, `sudo systemctl restart rune-v3`
+and `sudo systemctl stop rune-v3`. Logs are available with `sudo journalctl -u rune-v3 -f`.
+Stop the service before GPU benchmarks, and start it again afterwards. Its configuration
+is `/etc/rune-v3/environment`; restart the service after changing it. Keep the release and
 artifact for rollback; point `RUNE_RELEASE` at a previously validated snapshot and restart the
 service. Preserve the local checkpoint, artifacts and benchmark results before retiring the box.
 
@@ -92,7 +103,10 @@ service. Preserve the local checkpoint, artifacts and benchmark results before r
 
 `/home/flavius/work/deployment/rune-v3/` contains the filled environment, private API-key
 file, frozen release binaries and `release/provenance.json` with their hashes and source
-commit. `staging/verification.json` records the successful end-to-end check. The staging
-container and proxy are stopped and no system service is installed. Reuse the startup
-command above for another local check. Do not reuse the short-lived staging certificate for
-public deployment.
+commit. `staging/verification.json` records the successful end-to-end check. The
+`rune-v3.service` systemd unit is installed, enabled at boot, and serves the model on
+**127.0.0.1:8460** with API-key authentication. It starts the validated runtime container;
+the model remains a read-only mount of the local artifact. The public proxy is still stopped,
+so the configurable per-IP proxy policy takes effect when the proxy is activated.
+`staging/rate-policy-verification.json` records real nginx checks for the 1/s default and an
+override. Do not reuse the short-lived staging certificate for public deployment.
