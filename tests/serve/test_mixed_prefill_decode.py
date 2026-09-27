@@ -227,3 +227,39 @@ def test_dflash_rotates_more_than_eight_active_requests(server):
     for result in results:
         assert len(result["choices"][0]["token_ids"]) == 256
         assert all(math.isfinite(s["logprob"]) for s in result["choices"][0]["logprobs"]["content"])
+
+
+def test_dflash_packed_prefill_keeps_each_prompt(server):
+    # SUROGATE_SERVE_DFLASH_PACKED_PREFILL=1 (inherited by the server) packs waiting prompts
+    # into one prefill round on a DFlash engine. The prompts here are longer than the fixture's
+    # 256-token window, so while the first is still prefilling the others are staged beside it.
+    # Each must still score its first token as its own teacher-forced replay does, and its
+    # drafter context must carry it through generation.
+    options = json.loads(os.getenv("SUROGATE_MIXED_TEST_ARGS", "[]"))
+    if "dflash" not in options or os.getenv("SUROGATE_SERVE_DFLASH_PACKED_PREFILL") != "1":
+        pytest.skip("requires DFlash with SUROGATE_SERVE_DFLASH_PACKED_PREFILL=1")
+
+    def packed_prompts():
+        text = requests.get(server[0] + "/metrics", timeout=10).text
+        return sum(float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+                   if line.startswith("surogate_packed_prefill_prompts_total"))
+
+    before = packed_prompts()
+    payloads = [body("test", 20 + index, 200 + 9 * index, 16) for index in range(4)]
+    ready = threading.Barrier(len(payloads))
+
+    def run(payload):
+        ready.wait(timeout=30)
+        return ask(server, payload)
+
+    with ThreadPoolExecutor(max_workers=len(payloads)) as pool:
+        results = list(pool.map(run, payloads))
+    assert packed_prompts() > before, "no prompt was prefilled in a packed round"
+    for payload, result in zip(payloads, results):
+        choice = result["choices"][0]
+        assert len(choice["token_ids"]) == payload["max_tokens"]
+        prompt = result["prompt_token_ids"]
+        replay = ask(server, dict(payload, tokens=prompt + choice["token_ids"][:1], max_tokens=1,
+                                  prompt_logprobs=0))
+        expected = replay["prompt_logprobs"][len(prompt)][str(choice["token_ids"][0])]["logprob"]
+        assert choice["logprobs"]["content"][0]["logprob"] == pytest.approx(expected, abs=.02)

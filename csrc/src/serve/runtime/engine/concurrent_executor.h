@@ -2198,15 +2198,24 @@ private:
                         continue;
                     }
                     deferred_mixed_rounds_ = 0;
-                    if (membership.empty() && speculative_backend_ == SpeculativeBackend::None) {
+                    // SUROGATE_SERVE_DFLASH_PACKED_PREFILL=1 lets a DFlash engine pack too: its
+                    // zero-lane mixed round (the pipeline stages' prefill step) appends each
+                    // prompt's target features to that prompt's own drafter context.
+                    static const bool kPackDFlash = [] {
+                        const char* value = std::getenv("SUROGATE_SERVE_DFLASH_PACKED_PREFILL");
+                        return value != nullptr && std::string(value) == "1";
+                    }();
+                    const bool packs = speculative_backend_ == SpeculativeBackend::None ||
+                                       (kPackDFlash && speculative_backend_ == SpeculativeBackend::DFlash);
+                    if (membership.empty() && packs) {
                         // Nothing is decoding: prefill the staged prompts together (#14), in
                         // admission order. The first staged prompt decides: one a packed round
                         // cannot take -- at its end, waiting for the step that samples its first
                         // token, or a shape mixed rounds do not support -- takes a step of its
                         // own; otherwise it and the staged prompts of its kind (plain, or GPU
                         // prefix readouts) share a round. A prompt with no company keeps the
-                        // single-lane path and its prefill graphs. Speculative engines keep the
-                        // single-lane path: their packed shapes are not validated.
+                        // single-lane path and its prefill graphs. Other speculative engines keep
+                        // the single-lane path: their packed shapes are not validated.
                         const std::uint32_t front = prefill_lanes_.front();
                         std::size_t packable = 0;
                         if (instance_.program->mixed_round_supported(front, 0)) {
