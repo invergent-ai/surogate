@@ -3543,3 +3543,15 @@ Paired standalone checks found identical FP32 partials over 17 context/batch/win
 cases; Compute Sanitizer racecheck and memcheck passed a masked sliding-window case.
 The full attention and bidirectional suites passed, including added 7/9-query checks
 around the dispatch boundary. See deploy/rune-v3/ATTENTION_PARTIAL_PERFORMANCE.md.
+
+**DFlash decision bypass (2026-09-27, GPU validation pending).** One-token candidate-logit
+readouts in a DFlash engine use the target-only route, including image decisions and the
+initial/final scoring phases of thinking decisions. The reasoning generation still uses
+DFlash. GPU-prefix validation/storage is separate, so ordinary image readouts retain their
+vision memory plan. Target-only requests skip drafter resources and feature collection,
+use ordinary text prefill graphs and the small candidate head when eligible, and report no
+speculation. Admission stages readouts together; their prefill-only packs alternate with
+active reasoning decode rounds without entering verification. CPU policy tests cover phase
+selection and fair packing. An optional GPU regression covers ordinary/DFlash score parity,
+mixed traffic and images; it remains unrun while the user reserves the GPU. See
+deploy/rune-v3/DFLASH_READOUT.md before merging or deploying.

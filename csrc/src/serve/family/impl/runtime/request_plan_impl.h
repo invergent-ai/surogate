@@ -1,6 +1,7 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/prefill_graph.h"
 #include "family/impl/runtime/program.h"
+#include "runtime/generation/readout_policy.h"
 #include <cstdlib>
 
 #include "family/impl/runtime/schedule.h"
@@ -140,12 +141,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->cache_prompt = options.cache_prompt;
     base->gpu_prefix = options.gpu_prefix;
     base->save_gpu_prefix = options.save_gpu_prefix;
-    base->target_only = bool(options.gpu_prefix || options.save_gpu_prefix);
-    if (base->target_only && (prompt.has_media() || options.requested_output_tokens != 1)) {
+    const bool gpu_prefix_readout = bool(options.gpu_prefix || options.save_gpu_prefix);
+    base->target_only = runtime::target_only_readout(speculative_backend, options);
+    if (gpu_prefix_readout && (prompt.has_media() || options.requested_output_tokens != 1)) {
         throw InvalidRequest("GPU prefix readout requires one-token text requests");
     }
     prune_gpu_prefixes();
-    if (base->target_only) {
+    if (gpu_prefix_readout) {
         if (options.gpu_prefix) {
             const auto found = gpu_prefixes.find(options.gpu_prefix.get());
             // Deliberately not an `InvalidRequest`: the key is well formed and the caller is
@@ -338,6 +340,42 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->min_tokens                  = base.min_tokens;
     plan->stop_barrier_count          = base.stop_barrier_count;
 
+    // Even a target-only readout may contain images. Plan its transient memory and
+    // vision work before returning, just as for a generating request.
+    const auto finish_plan = [&]() {
+        if (base.vision_control != nullptr) {
+            VisionPrefillPlan vision;
+            vision.control = base.vision_control;
+            vision.uses.reserve(base.vision_control->items.size());
+            for (std::size_t index = 0; index < base.vision_control->items.size(); ++index) {
+                const family::VisionItemControl& item = base.vision_control->items[index];
+                const auto first          = static_cast<std::uint32_t>(item.scatter_indices.front());
+                const auto last           = static_cast<std::uint32_t>(item.scatter_indices.back());
+                const std::uint32_t begin = plan->prepare_mtp && first != 0 ? first - 1 : first;
+                const std::uint32_t end   = last + 1;
+                if (end <= plan->reuse_base) { continue; }
+                vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
+            }
+            if (!vision.uses.empty()) {
+                plan->summary.transient_alignment = 256;
+                plan->summary.transient_bytes     = base.vision_transient_bytes;
+                plan->vision                      = std::move(vision);
+            }
+        }
+
+        const std::size_t prefill_splits =
+            (plan->vision ? plan->vision->uses.size() : 0ULL) +
+            (plan->rewrite_checkpoint_capture &&
+                     plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
+                 ? 1ULL
+                 : 0ULL);
+        plan->summary.service_work_quanta =
+            projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits) +
+            projected_vision_work(model.vision_geometry, cfg.layers,
+                                  plan->vision ? plan->vision->uses.size() : 0);
+        return RequestPlan(std::move(plan));
+    };
+
     if (base.target_only) {
         if (base.gpu_prefix) {
             const auto frontier = sequence.execution_frontier;
@@ -350,8 +388,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
             plan->summary.reusable_prompt_tokens = frontier;
             plan->summary.admission.main_kv_pages -= frontier / kPagedKVPageSize;
         }
-        plan->summary.service_work_quanta = projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, 0);
-        return RequestPlan(std::move(plan));
+        return finish_plan();
     }
     if (!sequence.target_only && base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained && !sequence.cached_scores.empty()) {
         const auto limit = std::min({prompt.token_ids.size(), sequence.ledger.size(), sequence.cached_scores.size()});
@@ -516,37 +553,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         }
     }
 
-    if (base.vision_control != nullptr) {
-        VisionPrefillPlan vision;
-        vision.control = base.vision_control;
-        vision.uses.reserve(base.vision_control->items.size());
-        for (std::size_t index = 0; index < base.vision_control->items.size(); ++index) {
-            const family::VisionItemControl& item = base.vision_control->items[index];
-            const auto first          = static_cast<std::uint32_t>(item.scatter_indices.front());
-            const auto last           = static_cast<std::uint32_t>(item.scatter_indices.back());
-            const std::uint32_t begin = plan->prepare_mtp && first != 0 ? first - 1 : first;
-            const std::uint32_t end   = last + 1;
-            if (end <= plan->reuse_base) { continue; }
-            vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
-        }
-        if (!vision.uses.empty()) {
-            plan->summary.transient_alignment = 256;
-            plan->summary.transient_bytes     = base.vision_transient_bytes;
-            plan->vision                      = std::move(vision);
-        }
-    }
-
-    const std::size_t prefill_splits =
-        (plan->vision ? plan->vision->uses.size() : 0ULL) +
-        (plan->rewrite_checkpoint_capture &&
-                 plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
-             ? 1ULL
-             : 0ULL);
-    plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits) +
-        projected_vision_work(model.vision_geometry, cfg.layers,
-                              plan->vision ? plan->vision->uses.size() : 0);
-    return RequestPlan(std::move(plan));
+    return finish_plan();
 }
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS
