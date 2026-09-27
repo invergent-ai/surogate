@@ -185,6 +185,75 @@ For a GGUF, supply the matching projector with `--mmproj`. To save GPU memory, a
 `--offload-vision`, `--offload-embeddings`, or `--offload-output-head`. These options also
 work when the decoder spans multiple GPUs.
 
+## Gemma 4 mixture in NVFP4
+
+The Gemma 4 26B-A4B mixture (and fine-tunes of it) can be served from an NVFP4 export on a
+Blackwell GPU. The routed experts run in four-bit floating point on the FP4 tensor cores: from
+two tokens up a round's activations are quantised too (W4A4), and a single decoding token reads
+the four-bit weights with BF16 activations. Everything the export left unquantised is served
+as the export stores it. Serve NVIDIA's export directly:
+
+```bash
+surogate serve nvidia/Gemma-4-26B-A4B-NVFP4 --vision --port 8080 \
+  --max-model-len 16384 --kv-capacity auto --max-num-seqs 64
+```
+
+NVIDIA's export quantises the routed experts only, and so does the recipe below. The attention
+and the dense feed-forward beside the experts stay BF16, which is also the fast route on this
+model: its 2,112-wide dense feed-forward is not a shape the W8 tensor-core kernels take.
+
+For many short prompts, such as decision requests, add `--max-num-batched-tokens 8192` so each
+prefill round packs more of them. It raised decision throughput by about 10%.
+
+### Quantising your own Gemma 4 mixture
+
+To quantise a fine-tune, calibrate on the prompts it will serve. For a decision model that means
+decision prompts from its training data, not benchmark rows. NVIDIA ModelOpt (0.47 or newer)
+does the post-training quantisation:
+
+```bash
+pip install nvidia-modelopt
+python -m surogate.serve.tools.nvfp4.modelopt_ptq --model my-gemma4-26b --scope all \
+  --calibration corpus.txt --split bos --out my-gemma4-26b-nvfp4-all
+python -m surogate.serve.tools.nvfp4.assemble --export my-gemma4-26b-nvfp4-all \
+  --source my-gemma4-26b --scope experts --out my-gemma4-26b-nvfp4
+surogate serve my-gemma4-26b-nvfp4 --vision --port 8080
+```
+
+`--split bos` reads a corpus of rendered chats that each start with `<bos>`. `--split blank`
+reads one sample per blank-line-separated paragraph. ModelOpt collects its calibration
+statistics with quantisation off, so one `--scope all` run quantises everything and records
+every module's scales. `assemble` then writes a checkpoint of the scope you choose:
+
+- `experts`: the routed experts only (NVIDIA's recipe);
+- `mlp`: the experts plus the dense feed-forward;
+- `attention`: the experts, the dense feed-forward and the attention projections.
+
+Modules outside the scope keep the BF16 source's weights. On a GPU with room for the BF16
+model, calibration takes about an hour for 700 prompts.
+
+Start with `experts`. On a decision model, `mlp` answered a few percent more requests per second
+and changed slightly more answers; `attention` was about 15% faster than `experts` and lowered
+accuracy measurably. Compare a wider scope against `experts` on your own requests before you
+use it.
+
+The converter keeps each module as the checkpoint stores it: NVFP4 where the export
+quantised it, BF16 where it did not. To prepare the artifact yourself, for example to add a
+DFlash drafter, run the converter directly. `--text-format w8` stores the unquantised matrices
+as W8 instead of BF16. That saves about 2 GB but makes prefill about three times slower on this
+model.
+
+```bash
+python -m surogate.serve.convert.gemma_vl.convert --model my-gemma4-26b-nvfp4 \
+  --out my-gemma4-26b-nvfp4.sinfer
+```
+
+Answers from an NVFP4 export differ from the BF16 model's by the quantisation. The decisions
+endpoint's width pin does not apply to it (see [Decisions](decisions.md)): an answer can move
+slightly with what else the server is batching. Two loaded runs of a decision benchmark
+agreed on 99.4% of choices. Measure agreement on your own requests before replacing a BF16
+deployment.
+
 ## A model larger than the card
 
 Use system RAM for part of a model when its weights do not fit in GPU memory. This requires
@@ -259,7 +328,8 @@ See [Devices](cli.md#devices) for the supported families. DFlash also supports p
 ### Preparing a DFlash pair
 
 For Muse-Glimmer GGUF, pass the separate assistant with `--dflash-model` when starting
-the server; see [Muse-Glimmer](cli.md#muse-glimmer). The preparation example below is for Qwen3.5.
+the server; see [Muse-Glimmer](cli.md#muse-glimmer). The preparation example below is for Qwen3.5;
+the Gemma 4 mixture's follows it.
 
 Use a drafter trained for the exact target checkpoint. For example,
 [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) has a matching
@@ -281,6 +351,32 @@ the drafter, and cache. Sleep/wake and completed-turn cache reuse remain availab
 The example accepts text, images, and videos. For a smaller text-only artifact, add
 `--no-vision` during preparation and omit `--vision` when serving. Use `--kv-cache-dtype bf16`
 if you prefer higher cache precision.
+
+The Gemma 4 mixture pairs with
+[z-lab/gemma-4-26B-A4B-it-DFlash](https://huggingface.co/z-lab/gemma-4-26B-A4B-it-DFlash),
+for the base model, its fine-tunes, or an NVFP4 export of either:
+
+```bash
+python -m surogate.serve.convert.gemma_vl.convert \
+  --model /path/to/gemma-4-26B-A4B-it \
+  --dflash-model /path/to/gemma-4-26B-A4B-it-DFlash \
+  --out /path/to/gemma4-26b-dflash.sinfer
+
+SUROGATE_SERVE_DFLASH_PACKED_PREFILL=1 \
+  surogate serve /path/to/gemma4-26b-dflash.sinfer --vision --spec dflash --draft-tokens 7
+```
+
+The drafter was trained against the base model. A fine-tune accepts fewer of its drafts;
+measure acceptance on your own prompts. On a fine-tuned 26B-A4B, seven draft tokens were faster
+than three or fifteen, and faster than `--spec-adaptive`. Speculation speeds up generation,
+including the thinking of a decision request with `"thinking": true`. It does not speed up
+one-pass decisions, which generate one token.
+
+By default a speculative server prefills waiting prompts one at a time, so under load it answers
+fewer one-pass decisions per second than the same model without speculation.
+`SUROGATE_SERVE_DFLASH_PACKED_PREFILL=1`, as in the example above, lets a DFlash server prefill
+them together, as a server without speculation does. With experts stored as W8, its decisions
+match a server without speculation bit for bit.
 
 ## Several models on one GPU
 

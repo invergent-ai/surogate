@@ -114,7 +114,7 @@ The family is detected automatically. Available formats and optional features va
 | MiniCPM5 | Hugging Face safetensors and GGUF; thinking can be enabled or disabled |
 | Spark-X2.5 | Hugging Face safetensors; thinking can be enabled or disabled |
 | Gemma 3 | Text generation; images and sampled video frames on vision-enabled checkpoints |
-| Gemma 4 | Text, images and video with dense, E-series, and mixture-of-experts models |
+| Gemma 4 | Text, images and video with dense, E-series, and mixture-of-experts models; NVFP4 exports and DFlash speculation for the 26B-A4B mixture |
 | LFM2 / LFM2.5 | Dense text models from Hugging Face safetensors or GGUF |
 | LFM2-MoE | Hugging Face safetensors and GGUF |
 | LFM2-VL / LFM2.5-VL | Text, images and sampled video frames from safetensors or paired GGUF files; use `--vision` |

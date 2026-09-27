@@ -230,7 +230,7 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 | Flag | Meaning |
 |---|---|
 | `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
-| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and can be combined with `--vision` |
+| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and can be combined with `--vision`. Qwen3.5 and the Gemma 4 mixture take the drafter at preparation; see [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair) |
 | `--dflash-model PATH` | Matching separate Muse-Glimmer DFlash GGUF; see [Muse-Glimmer](#muse-glimmer) |
 | `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec`. With `--spec-adaptive`, sets the maximum |
 | `--spec-adaptive` | Adjust DFlash draft length to measured throughput. Can temporarily stop drafting and retry it later. Off by default |
@@ -540,4 +540,6 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | `SUROGATE_SERVE_CACHE` | Prepared-model cache directory; default `~/.cache/surogate/serve` |
 | `SUROGATE_CONVERT_DEVICE` | Override the preparation device, such as `cuda:1` or `cpu`; otherwise follows the serving GPU |
 | `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | GPU memory kept free when sharing caches across models; default 1024 MiB |
+| `SUROGATE_SERVE_DFLASH_PACKED_PREFILL` | `1` lets a DFlash server prefill several waiting prompts in one round, as a server without speculation does; off by default. See [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair) |
+| `SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE` | `1` lets NVFP4 mixture experts add their outputs in the GEMM epilogue: up to about 3% faster, but the same request can then get slightly different answers from run to run; off by default |
 | `SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB` | GPU memory for prefill and mixed-round CUDA graphs captured while serving; new shapes run without a graph once it is spent; default 512 MiB, 0 captures none |
