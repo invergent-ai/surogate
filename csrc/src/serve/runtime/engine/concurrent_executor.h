@@ -1259,11 +1259,12 @@ private:
             if (ran || cancel_at_boundary) {
                 resolve_prefill_step(request, first, cancel_at_boundary);
             }
-            // Target-only admissions can be staged together even in a DFlash engine.
-            // Keep the pipeline and generating speculative admissions on their old route.
+            // New candidate readouts can be staged together in a DFlash engine.
+            // Keep GPU-prefix admissions on their old route: changing their batch
+            // width also changes the arithmetic of their batched full-vocabulary head.
             ran_gpu_unit = ran || kPipelined ||
                            (speculative_backend_ != SpeculativeBackend::None &&
-                            !(speculative_backend_ == SpeculativeBackend::DFlash && is_readout(*request)));
+                            !dflash_candidate_readout(speculative_backend_, request->options.execution));
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -2210,8 +2211,9 @@ private:
                         const char* value = std::getenv("SUROGATE_SERVE_DFLASH_PACKED_PREFILL");
                         return value != nullptr && std::string(value) == "1";
                     }();
-                    const bool target_only = is_readout(*slots_[prefill_lanes_.front()]);
-                    if (can_pack_prefill_only(speculative_backend_, target_only, kPackDFlash,
+                    const bool candidate_readout = dflash_candidate_readout(
+                        speculative_backend_, slots_[prefill_lanes_.front()]->options.execution);
+                    if (can_pack_prefill_only(speculative_backend_, candidate_readout, kPackDFlash,
                                              !membership.empty(), previous_unit_was_decode)) {
                         // Prefill the staged prompts without a decode row. A DFlash readout
                         // pack alternates with active reasoning instead of entering its verify

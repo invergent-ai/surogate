@@ -6,6 +6,7 @@
 
 using sinfer::SpeculativeBackend;
 using sinfer::runtime::can_pack_prefill_only;
+using sinfer::runtime::dflash_candidate_readout;
 using sinfer::runtime::target_only_readout;
 
 template <class Options>
@@ -14,6 +15,7 @@ void decision_phases() {
     readout.requested_output_tokens = 1;
     readout.next_token_candidates = {17, 23};
     assert(target_only_readout(SpeculativeBackend::DFlash, readout));
+    assert(dflash_candidate_readout(SpeculativeBackend::DFlash, readout));
     // The policy must not change ordinary or MTP request planning.
     assert(!target_only_readout(SpeculativeBackend::None, readout));
     assert(!target_only_readout(SpeculativeBackend::Mtp, readout));
@@ -41,6 +43,11 @@ void decision_phases() {
     chat.gpu_prefix = chat.save_gpu_prefix;
     chat.save_gpu_prefix.reset();
     assert(target_only_readout(SpeculativeBackend::DFlash, chat));
+    chat.next_token_candidates = {17, 23};
+    assert(!dflash_candidate_readout(SpeculativeBackend::DFlash, chat));
+    chat.save_gpu_prefix = chat.gpu_prefix;
+    chat.gpu_prefix.reset();
+    assert(!dflash_candidate_readout(SpeculativeBackend::DFlash, chat));
 }
 
 int main() {
