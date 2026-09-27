@@ -62,8 +62,9 @@ struct GqaSmallTTcSmem {
 // compile-time choice, so every other instantiation is the code it was.
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput, typename CacheT = __nv_bfloat16, bool Sparse = false,
-          int SparseBlock = 4, bool LaneColumns = false>
-__launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
+          int SparseBlock = 4, bool LaneColumns = false, int OutputChunk = Geometry::HeadDim>
+__launch_bounds__(WarpsPerCta > 4 ? 256 : 128, WarpsPerCta > 4 ? 1 : 2)
+__global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheT* cache_k,
     CacheT* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
@@ -72,7 +73,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     float* partial_acc, float* partial_m, float* partial_l,
     GqaBlockMask block_mask = GqaBlockMask{}, const std::int32_t* lane_columns = nullptr) {
     static_assert(TokenTile >= 1 && TokenTile <= 32);
-    static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
+    static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 8);
+    static_assert(OutputChunk > 0 && Geometry::HeadDim % OutputChunk == 0);
+    static_assert(OutputChunk % 8 == 0);
+    static_assert(OutputChunk == Geometry::HeadDim || !CacheInput::writes_cache,
+                  "output slicing is only used over a populated cache");
     static_assert(!LaneColumns || (MultiBatch && !CacheInput::writes_cache && !Sparse),
                   "lane columns are for batched launches over a populated cache");
 
@@ -99,13 +104,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     };
 
     constexpr int Wc      = WarpsPerCta;
-    constexpr int Br      = Wc * 16;
+    // Output groups share staged K/V but retain independent, identically ordered QK
+    // and softmax work. Halving each warp's output accumulator reduces spilling on
+    // 512-wide prompt tiles and lets eight warps use one shared-memory allocation.
+    constexpr int OutputGroups = Geometry::HeadDim / OutputChunk;
+    static_assert(Wc % OutputGroups == 0);
+    constexpr int RowWarps = Wc / OutputGroups;
+    constexpr int Br      = RowWarps * 16;
     constexpr int Bc      = 32;
     constexpr int D       = Geometry::HeadDim;
     constexpr int Threads = Wc * 32;
     constexpr int QKNt    = Bc / 8;
     constexpr int QKKs    = D / 16;
-    constexpr int PVNt    = D / 8;
+    constexpr int PVNt    = OutputChunk / 8;
     constexpr int PVKs    = Bc / 16;
     // Absolute key partitions span at most 2048 keys (32 aligned cache pages),
     // independently of the total context length.
@@ -290,7 +301,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    const int warp_row0 = warp * 16;
+    const int warp_row0 = (warp % RowWarps) * 16;
+    const int output_begin = (warp / RowWarps) * OutputChunk;
     __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
 
     unsigned af_q[QKKs][4];
@@ -475,7 +487,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                             smem_addr(&p_sw[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
-                const int vcol = n * 8;
+                const int vcol = output_begin + n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
                 mma_bf16(tile_acc[0], tile_acc[1], tile_acc[2], tile_acc[3], pf[0], pf[1], pf[2], pf[3],
@@ -490,7 +502,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         __syncthreads();
     }
 
-    if (lid == 0) {
+    if (lid == 0 && warp < RowWarps) {
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {
@@ -513,7 +525,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // sum to BF16 here adds a second rounding absent from prompt attention.
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
-        const int d = n * 8 + 2 * lid;
+        const int d = output_begin + n * 8 + 2 * lid;
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {

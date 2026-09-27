@@ -170,12 +170,20 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         return;
     }
     const auto dense = [&]<bool LaneColumns>() {
+        // Wide cached prompt tiles otherwise spill their 512-wide output accumulator
+        // alongside the query fragments. Two output groups share the K/V tile while
+        // each warp accumulates only 256 dimensions. Decode and sparse calls stay as-is.
+        constexpr bool kSplitOutput = Geometry::HeadDim == 512 && TokenTile >= 8 &&
+                                      !CacheInput::writes_cache;
+        constexpr int kDenseWarps = kSplitOutput ? 8 : WarpsPerCta;
+        constexpr int kOutputChunk = kSplitOutput ? 256 : Geometry::HeadDim;
+        constexpr int kDenseSmem = GqaSmallTTcSmem<Geometry, kDenseWarps>::kBytes;
         const auto kernel = gqa_attention_small_t_tc_partial_bf16_kernel<
-            Geometry, TokenTile, WarpsPerCta, MultiBatch, Masked, CacheInput, CacheT, false, 4,
-            LaneColumns>;
+            Geometry, TokenTile, kDenseWarps, MultiBatch, Masked, CacheInput, CacheT, false, 4,
+            LaneColumns, kOutputChunk>;
         CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-        kernel<<<grid, kBlock, kSmemBytes, stream>>>(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDenseSmem));
+        kernel<<<grid, 32 * kDenseWarps, kDenseSmem, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
             static_cast<CacheT*>(cache_v.data),
