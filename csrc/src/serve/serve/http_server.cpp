@@ -8,6 +8,7 @@
 #include "serve/decisions_schema.h"
 #include "serve/http_socket.h"
 #include "serve/openai_schema.h"
+#include "serve/openrouter_catalog.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
 
@@ -177,6 +178,8 @@ HttpPoolSizes http_pool_sizes(const ServeOptions& options) {
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
+      openrouter_catalog_(options_.openrouter_models_file.empty()
+                              ? nlohmann::json() : load_openrouter_catalog(options_.openrouter_models_file)),
       admission_(options_.rate_limit_rps, options_.rate_limit_burst, options_.max_inflight_requests),
       thinking_admission_(0, 1, options_.max_thinking_requests),
       image_admission_(0, 1, options_.max_image_requests),
@@ -467,10 +470,22 @@ void HttpServer::register_routes() {
     // questions, with OpenRouter's field names. /v1/decisions is the stable path; OpenRouter's
     // own /api/alpha/decisions and /api/v1/decisions answer identically, so a client that swaps
     // the base URL for this host keeps working. A future protocol version gets its own path.
-    for (const char* path : {"/v1/decisions", "/api/alpha/decisions", "/api/v1/decisions"}) {
+    for (const char* path : {"/v1/decisions", "/api/alpha/decisions", "/api/v1/decisions",
+                             "/v1/systemone", "/api/v1/systemone"}) {
         server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
             handle_decisions(req, res);
         });
+    }
+    if (!openrouter_catalog_.is_null()) {
+        server_.Get("/openrouter/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(openrouter_catalog_.dump(), "application/json");
+        });
+        for (const char* path : {"/openrouter/v1/decisions", "/openrouter/api/alpha/decisions"}) {
+            server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
+                handle_decisions(req, res);
+            });
+        }
     }
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
@@ -1859,6 +1874,12 @@ bool HttpServer::listen() {
     if (service_ == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
+    }
+    if (!openrouter_catalog_.is_null()) {
+        auto ids = service_->lora_adapter_names();
+        ids.push_back(public_model_id_);
+        for (const auto& [id, service] : extra_services_) { ids.push_back(id); }
+        validate_openrouter_catalog_models(openrouter_catalog_, ids);
     }
     if (options_.log_stats_interval_ms != 0) {
         stats_stopping_ = false;

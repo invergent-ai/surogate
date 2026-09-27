@@ -31,6 +31,7 @@ or after the model, and value options accept both `--flag value` and `--flag=val
 | `--port N` | `8080` | HTTP port |
 | `--api-key KEY` | none | Require this key through a bearer token or `x-api-key` header |
 | `--api-key-file PATH` | none | Read that key from a file instead, keeping it out of the process's command line |
+| `--openrouter-models-file PATH` | none | Serve an operator-supplied [OpenRouter catalog](api.md#openrouter-provider-catalog) at `/openrouter/v1/models` |
 | `--served-model-name ID` | model argument | Name clients use in the `model` field |
 | `--cors` | off | Allow browser cross-origin requests |
 | `--max-request-mib N` | 384 | Maximum request body size |

@@ -93,7 +93,9 @@ struct DecisionsRequest {
     bool order_averaging = false;
 };
 
-inline constexpr std::size_t kDecisionMinOptions = 2;
+// A single option is a degenerate distribution: probability and confidence are 1,
+// and a single-level score is 0. No artificial alternative is introduced.
+inline constexpr std::size_t kDecisionMinOptions = 1;
 inline constexpr std::size_t kDecisionMaxOptions = 255;
 /// Up to this many options are labelled `A`..`Z`; beyond it the tokenizer's codebook is used
 /// and the system prompt asks for a code rather than a letter.

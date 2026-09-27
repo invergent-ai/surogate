@@ -283,8 +283,13 @@ DecisionQuestion parse_question(const std::string& name, const OrderedJson& spec
     }
     require_text_value(spec.at("instructions"), "question '" + name + "' instructions", param + ".instructions");
     question.instructions = rendered_text(spec.at("instructions"), literals, pointer + "/instructions");
-    if (!spec.contains("criteria")) { invalid("question '" + name + "' needs criteria", param + ".criteria"); }
-    const OrderedJson& criteria = spec.at("criteria");
+    // OpenRouter permits omitted noul criteria and null choice descriptions. Normalize them
+    // exactly as the SDK does, before rendering, so direct callers get the same prompt.
+    const OrderedJson default_noul = {{"false", "false"}, {"true", "true"}};
+    if (!spec.contains("criteria") && question.kind != DecisionKind::Noul) {
+        invalid("question '" + name + "' needs criteria", param + ".criteria");
+    }
+    const OrderedJson& criteria = spec.contains("criteria") ? spec.at("criteria") : default_noul;
     const std::string criteria_param = param + ".criteria";
     switch (question.kind) {
     case DecisionKind::Choice: {
@@ -293,6 +298,12 @@ DecisionQuestion parse_question(const std::string& name, const OrderedJson& spec
                     criteria_param);
         }
         for (auto it = criteria.begin(); it != criteria.end(); ++it) {
+            if (it.value().is_null()) {
+                question.option_keys.push_back(it.key());
+                question.option_texts.push_back(it.key());
+                question.option_values.push_back(it.key());
+                continue;
+            }
             require_text_value(it.value(), "option '" + it.key() + "' of question '" + name + "'",
                                criteria_param + "." + it.key());
             question.option_keys.push_back(it.key());

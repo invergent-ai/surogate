@@ -174,6 +174,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --api-key-file reads the key from a file, keeping it off the command line\n"
+           "       --openrouter-models-file PATH enables /openrouter/v1/models with an operator-supplied catalog\n"
            "       --served-model-name overrides the supplied model argument reported by the "
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -264,6 +265,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             api_key = require_value("--api-key");
         } else if (arg == "--api-key-file") {
             api_key_file = require_value("--api-key-file");
+        } else if (arg == "--openrouter-models-file") {
+            options.openrouter_models_file = require_value("--openrouter-models-file");
+            if (options.openrouter_models_file.empty()) {
+                throw std::invalid_argument("--openrouter-models-file must not be empty");
+            }
         } else if (arg == "--served-model-name") {
             options.model_id_override = require_value("--served-model-name");
             if (options.model_id_override->empty()) {

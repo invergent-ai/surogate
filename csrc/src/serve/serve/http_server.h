@@ -6,7 +6,7 @@
 #include "serve/admission_limit.h"
 
 #include <httplib.h>
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -135,6 +135,7 @@ private:
     GenerationService* service_ = nullptr;
     /// Adapters this server may serve; empty unless --enable-lora named some.
     ServeOptions options_;
+    nlohmann::json openrouter_catalog_; // null when provider discovery is disabled
     AdmissionLimit admission_;
     AdmissionLimit thinking_admission_;
     AdmissionLimit image_admission_;

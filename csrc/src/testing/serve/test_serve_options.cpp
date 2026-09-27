@@ -34,6 +34,15 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"sinfer-serve", "model.sinfer"});
+    failures += check(defaults.openrouter_models_file.empty(), "provider catalog should be opt-in");
+    failures += check(parse({"sinfer-serve", "model.sinfer", "--openrouter-models-file", "catalog.json"})
+                          .openrouter_models_file == "catalog.json", "provider catalog path not parsed");
+    for (auto args : {std::vector<std::string>{"sinfer-serve", "model.sinfer", "--openrouter-models-file"},
+                      std::vector<std::string>{"sinfer-serve", "model.sinfer", "--openrouter-models-file", ""}}) {
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "empty provider catalog path accepted");
+    }
     for (const auto* tokens : {"280", "560", "1120"}) {
         const auto options = parse({"sinfer-serve", "model.sinfer", "--vision", "--gemma-image-tokens", tokens});
         failures += check(options.gemma_image_tokens == std::stoul(tokens), "image budget was not parsed");

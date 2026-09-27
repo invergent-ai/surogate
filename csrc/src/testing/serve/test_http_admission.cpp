@@ -1,7 +1,11 @@
 #include "serve/http_server.h"
+#include "serve/openrouter_catalog.h"
 
 #include <cassert>
 #include <future>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <nlohmann/json.hpp>
 
 using namespace sinfer::serve;
@@ -76,6 +80,63 @@ int main() {
         server.stop();
         assert(listener.get());
     };
+    const auto catalog_path = std::filesystem::temp_directory_path() /
+                              ("sinfer-catalog-" + std::to_string(::getpid()) + ".json");
+    const auto catalog = nlohmann::json::parse(R"json({"data":[{
+        "schema_version":"2.4", "id":"test-model", "name":"Test model", "is_ready":false,
+        "input_modalities":[{"type":"text"}],
+        "output_modalities":[{"type":"decisions","supported_parameters":{}}]
+    }]})json");
+    std::ofstream(catalog_path) << catalog.dump();
+    assert(load_openrouter_catalog(catalog_path.string()) == catalog);
+    validate_openrouter_catalog_models(catalog, {"test-model"});
+    bool rejected_model = false;
+    try { validate_openrouter_catalog_models(catalog, {"other"}); }
+    catch (const std::invalid_argument&) { rejected_model = true; }
+    assert(rejected_model);
+
+    ServeOptions provider;
+    provider.api_key = "test-only";
+    provider.openrouter_models_file = catalog_path.string();
+    run(provider, [&](int port, auto&, auto&) {
+        httplib::Client client("127.0.0.1", port);
+        assert(client.Get("/openrouter/v1/models")->status == 401);
+        const httplib::Headers auth{{"Authorization", "Bearer test-only"}};
+        const auto models = client.Get("/openrouter/v1/models", auth);
+        assert(models && models->status == 200 && nlohmann::json::parse(models->body) == catalog);
+        for (const auto* path : {"/openrouter/v1/decisions", "/openrouter/api/alpha/decisions",
+                                 "/v1/systemone", "/api/v1/systemone"}) {
+            assert(client.Post(path, "{}", "application/json")->status == 401);
+            assert(client.Post(path, auth, "{}", "application/json")->status == 400);
+        }
+    });
+    provider.rate_limit_rps = 0.001;
+    provider.rate_limit_burst = 1;
+    run(provider, [](int port, auto&, auto&) {
+        httplib::Client client("127.0.0.1", port);
+        const httplib::Headers auth{{"Authorization", "Bearer test-only"}};
+        assert(client.Post("/v1/decisions", auth, "{}", "application/json")->status == 400);
+        for (const auto* path : {"/openrouter/v1/decisions", "/openrouter/api/alpha/decisions",
+                                 "/v1/systemone", "/api/v1/systemone"}) {
+            const auto limited = client.Post(path, auth, "{}", "application/json");
+            assert(limited && limited->status == 429 && limited->has_header("Retry-After"));
+        }
+        assert(client.Get("/openrouter/v1/models", auth)->status == 200);
+    });
+    // Bad catalogs fail before a server starts; errors must not disclose file contents.
+    for (const auto& bad : {std::string("secret-looking-invalid-json"), std::string("{\"data\":[]}"),
+                            std::string("{\"data\":[{\"id\":\"model\"}]}"),
+                            std::string((1U << 20) + 1, 'x')}) {
+        std::ofstream(catalog_path, std::ios::trunc) << bad;
+        bool rejected_catalog = false;
+        try { (void)load_openrouter_catalog(catalog_path.string()); }
+        catch (const std::invalid_argument& e) {
+            rejected_catalog = true;
+            assert(std::string(e.what()).find("secret-looking") == std::string::npos);
+        }
+        assert(rejected_catalog);
+    }
+    std::filesystem::remove(catalog_path);
     ServeOptions rate;
     rate.api_key = "test-only";
     rate.enable_cors = true;
@@ -95,6 +156,7 @@ int main() {
         }
         assert(client.Get("/health")->status == 200);
         assert(client.Options("/v1/decisions")->status == 204);
+        assert(client.Get("/openrouter/v1/models", auth)->status == 404);
     });
     ServeOptions inflight;
     inflight.max_inflight_requests = 1;

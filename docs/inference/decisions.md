@@ -56,12 +56,17 @@ one prefill of the state plus forty short suffixes rather than forty prompts.
 
 A question is one of:
 
-- `{"type": "choice", "instructions": ..., "criteria": {key: description, ...}}` with 2 to 255
+- `{"type": "choice", "instructions": ..., "criteria": {key: description, ...}}` with 1 to 255
   keys. The keys are the answer vocabulary, in the order sent: the first key is option `A`.
 - `{"type": "noul", "instructions": ..., "criteria": {"true": ..., "false": ...}}`. Option `A` is
   the `false` description and option `B` the `true` one, whichever order they were sent in.
-- `{"type": "score", "instructions": ..., "criteria": [level 0, level 1, ...]}` with 2 to 255
+- `{"type": "score", "instructions": ..., "criteria": [level 0, level 1, ...]}` with 1 to 255
   levels, in order.
+
+Noul criteria may be omitted; their default descriptions are the strings `"false"` and
+`"true"`. A null choice description defaults to its option key. A single-option choice or
+single-level score has probability 1 and confidence 1; the single-level score is 0. Empty
+choice/score criteria are invalid. Explicit noul criteria must still contain both sides.
 
 `instructions` and every description should be strings. A non-string value is accepted and
 rendered as JSON text the same way the state is, but strings are the form the models saw.

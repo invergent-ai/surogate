@@ -3531,3 +3531,14 @@ one staged K/V tile. This reduces per-thread register spills and doubles the
 active warps sharing a block's shared memory. Query/softmax arithmetic and absolute
 key partitions remain unchanged; one output group owns the common partial maximum
 and normalization writes. Narrow decode, append, sparse and int8 routes are unchanged.
+
+**OpenRouter decisions compatibility (2026-09-27).** Direct requests accept omitted noul
+criteria and null choice descriptions with the same defaults as the SDK. Choice and score
+questions accept one option; their existing probability/confidence formulas produce the
+degenerate distribution without an artificial alternative. Empty criteria remain invalid.
+An optional operator-supplied catalog adds authenticated provider discovery and decisions
+routes under `/openrouter`, while ordinary model discovery retains its OpenAI shape.
+Catalog loading is bounded and rejects malformed envelopes and unserved model IDs. Provider
+metadata and credentials stay outside the source tree. System One aliases share the same
+handler and admission policy. CPU contract/HTTP tests cover normalization, single-option
+arithmetic, catalog loading, route authentication and disabled catalog behavior.

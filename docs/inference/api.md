@@ -23,6 +23,42 @@ other users can read the file.
 `--cors` enables browser cross-origin requests. `--served-model-name ID` overrides the model id
 the server reports, which is how you keep a client's hard-coded model string working.
 
+## OpenRouter provider catalog
+
+`--openrouter-models-file PATH` enables `GET /openrouter/v1/models`, backed by a JSON
+document supplied by the operator. It uses the same API-key authentication as inference.
+The file is read once at startup; unreadable, oversized or malformed catalogs fail startup,
+as do entries naming models the server does not serve. Validate the entire document against
+the [OpenRouter provider schema](https://openrouter.ai/docs/assets/provider-monitor-schema-v2.openapi.json)
+before installing it. The engine checks the envelope and required modality fields; it does
+not implement the complete external JSON schema validator.
+
+For example, an unpublished text decisions model can start with:
+
+```json
+{"data": [{
+  "schema_version": "2.4",
+  "id": "my-model",
+  "name": "My decision model",
+  "input_modalities": [{"type": "text"}],
+  "output_modalities": [{"type": "decisions", "supported_parameters": {}}],
+  "is_ready": false
+}]}
+```
+
+The matching provider base path is `/openrouter`: `POST /openrouter/v1/decisions`
+and `/openrouter/api/alpha/decisions` use the ordinary Decisions handler, authentication,
+admission limits and usage accounting. These routes are enabled only with the catalog.
+`GET /v1/models` keeps its OpenAI response shape for existing clients. The System One
+compatibility aliases `/v1/systemone` and `/api/v1/systemone` also use the Decisions handler;
+they require an actual served model ID and do not rewrite another provider's model names.
+
+Supply real prices, capacity and policy declarations before launch; the server cannot infer
+them. `is_ready: false` stages the listing, not the inference route. Native image and thinking
+support does not prove OpenRouter forwards these extensions: test their adapter before
+advertising those capabilities through the router. See the
+[provider guide](https://openrouter.ai/docs/guides/community/for-providers) for onboarding.
+
 ## Endpoints
 
 | Method | Path | Purpose |

@@ -25,6 +25,7 @@ struct ServeOptions {
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
+    std::string openrouter_models_file;           // optional provider catalog; separate from /v1/models
     std::optional<std::string> model_id_override; // unset => original model argument
 
     /// Scheduler weight class for a model under multi-model overcommit.
