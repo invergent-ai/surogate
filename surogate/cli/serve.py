@@ -104,6 +104,8 @@ _VALUE_OPTIONS = {
         --host --port --api-key --api-key-file --served-model-name --max-model-len --max-num-seqs
         --max-pending-requests --pending-timeout-ms --adapter-update-timeout-ms
         --rate-limit-rps --rate-limit-burst --max-inflight-requests --max-thinking-requests
+        --gemma-image-tokens
+        --max-image-requests
         --max-num-batched-tokens
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers

@@ -80,6 +80,7 @@ struct ServeOptions {
     std::uint32_t rate_limit_burst         = 1;
     std::uint32_t max_inflight_requests    = 0; // HTTP POSTs, including preprocessing/streaming
     std::uint32_t max_thinking_requests    = 0; // decisions with thinking=true; 0 disables
+    std::uint32_t max_image_requests       = 0; // decisions with images; 0 disables
     std::uint32_t pending_timeout_ms       = 30000;
     // --adapter-update-timeout-ms N (0 = inherit pending_timeout_ms, as this
     // shared one number for both jobs before the flag existed). Separate
@@ -99,6 +100,7 @@ struct ServeOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t gemma_image_tokens = 0;
     int device                             = 0;
     std::vector<int> devices;                    // --devices a,b,c (pipeline stages, in order)
     KvCacheStorage kv_cache                = KvCacheStorage::Auto;

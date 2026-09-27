@@ -1103,6 +1103,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             schedule::VisionContext::encoding_transient_bytes(vision, merged,
                 vision.attention_mode ? std::size_t(impl->prefill_chunk) * impl->geometry.residual *
                     dtype_size(impl->geometry.residual_dtype()) : 0);
+        // Gemma images need independent encoder/text residuals to reach packed prefill.
+        // Freeze a bounded pool at startup; automatic KV sizing accounts for every byte.
+        if (vision.gemma_version == 4) {
+            impl->request_transient_capacity_bytes = checked_mul(
+                impl->request_transient_capacity_bytes, std::min(impl->max_concurrency, 8U),
+                "concurrent Gemma image transients");
+        }
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for

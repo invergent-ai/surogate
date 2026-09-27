@@ -56,6 +56,9 @@ public:
     [[nodiscard]] bool chunk_ready(std::uint32_t begin, std::uint32_t nominal_length) const;
     [[nodiscard]] bool advance_encoding(std::uint32_t begin, std::uint32_t nominal_length);
     [[nodiscard]] bool needs_text_slicing(std::uint32_t begin, std::uint32_t count) const;
+    [[nodiscard]] bool text_in_progress(std::uint32_t begin) const noexcept {
+        return text_ && text_->begin == begin && text_->next_layer > 0;
+    }
     ImageTextPrefillState& text_state(std::uint32_t begin, const Tensor& residual);
     void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;

@@ -557,6 +557,12 @@ model discovery and CORS preflights remain available.
 | `--rate-limit-burst N` | 1 | Maximum accumulated requests; starts full |
 | `--max-inflight-requests N` | disabled | Concurrent POSTs, from admission through response delivery, including streams |
 | `--max-thinking-requests N` | disabled | Concurrent decisions with `thinking: true`, across all decisions aliases |
+| `--max-image-requests N` | disabled | Concurrent decisions carrying images, across all decisions aliases |
+
+For a Gemma 4 mixture with `--vision`, `--gemma-image-tokens 280|560|1120` overrides the
+artifact's per-image soft-token budget. Omission preserves the artifact default. Video frame
+budgets are unchanged. Unsupported targets or an artifact with a smaller vision envelope are
+rejected at startup.
 
 Accepted malformed requests consume rate capacity but release their in-flight slot when their
 error response completes. A full concurrency gate does not spend a rate token. Thinking requests
