@@ -48,7 +48,7 @@ const char* usage =
     "  --request-timeout SECONDS   queue plus synthesis deadline (default 300)\n"
     "  --max-input-characters N    longest input, synthesized sentence by sentence (default 4096,\n"
     "                              maximum 16384)\n"
-    "Use surogate serve --tts surogate/surogate-ro-tts to download and verify assets.\n";
+    "Use surogate serve --tts surogate/amami-357m-ro to download and verify assets.\n";
 
 std::string base64(std::string_view bytes) {
     static constexpr char alphabet[] =
@@ -361,6 +361,11 @@ int main(int argc, char** argv) {
                               decoding.at("cfg_scale").get<float>()});
         }
         if (voices.empty()) throw std::invalid_argument("No named voices in TTS package");
+        // The generator GGUF is named by the profile; packages before the field used model.gguf.
+        const std::string model_file = profile.value("model", std::string("model.gguf"));
+        if (model_file.empty() || model_file.find('/') != std::string::npos || model_file.starts_with(".") ||
+            !model_file.ends_with(".gguf") || !profile.at("files").contains(model_file))
+            throw std::invalid_argument("Invalid model file in TTS package");
         auto voice = [&](const std::string& label) -> const Voice& {
             for (const auto& v : voices)
                 if (casefold(v.name) == casefold(label)) return v;
@@ -369,7 +374,8 @@ int main(int argc, char** argv) {
         if (!default_set) default_voice = voices.front().name;
         default_voice = voice(default_voice).name;
         if (name.empty()) name = artifact;
-        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device, max_num_seqs);
+        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device, max_num_seqs,
+                        model_file);
         const std::string device_name = device == "cpu" ? "cpu" : "cuda:" + device;
         // /metrics: requests in flight (queued ones included) and what was served -- what a
         // supervisor drains this server by.

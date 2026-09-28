@@ -121,7 +121,7 @@ def test_offline_preparation_handles_hf_arpa_blob_without_vad(tmp_path, monkeypa
     config = _offline_config()
     config["decoder"]["vocab_size"] = 5
     config["model_defaults"] = {"tdt_durations": [0, 1, 2, 3, 4]}
-    checkpoint = tmp_path / "Ib_final.nemo"
+    checkpoint = tmp_path / "jackrabbit-110m-ro.nemo"
     data = yaml.safe_dump(config).encode()
     with tarfile.open(checkpoint, "w") as archive:
         info = tarfile.TarInfo("model_config.yaml")
@@ -129,7 +129,7 @@ def test_offline_preparation_handles_hf_arpa_blob_without_vad(tmp_path, monkeypa
         archive.addfile(info, io.BytesIO(data))
     blob = tmp_path / "123456abcdef"
     blob.write_text("\\data\\\nngram 1=5\n")
-    lm = tmp_path / "ro_4gram.arpa"
+    lm = tmp_path / "lm-4gram-ro.arpa"
     lm.symlink_to(blob)
     binary = tmp_path / "surogate-stt"
     binary.with_name("surogate-stt-lm").touch()

@@ -9,15 +9,16 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-MODEL_ID = "surogate/surogate-ro-tts"
-REVISION = "2bf175b4edc7b3ca7261d80e4d4ad85117c4f0a4"
-PREFIX = "releases/2026-09-18/cpu-voices/native"
-PROFILE_SHA256 = "6c52964585162b516ab3ac6573ee5def535c80067300eb0ad06d0bb310642c9c"
+MODEL_ID = "surogate/amami-357m-ro"
+RENAMED_FROM = "surogate/surogate-ro-tts"
+REVISION = "5393e9bf69ec08ef2c89bf387bf3791c446fb26a"
+PREFIX = "cpu"
+PROFILE_SHA256 = "958dfcda804ebacb3e190963008433c3121cecc9b433646f595cd03b858f5581"
 # The GPU variant: the same model, codec, tokenizer and voices, with lib/ holding the runtime built with
-# CUDA (surogate.serve.tools.tts.gpu_variant), published as built.
-GPU_REVISION = "e6b1372cb1b3db6c205ebfc589fba8d630ed438b"
+# CUDA (surogate.serve.tools.tts.gpu_variant), published as built, in the same revision.
+GPU_REVISION = REVISION
 GPU_PREFIX = "gpu"
-GPU_PROFILE_SHA256 = "239ef640ec0fcb98297908ea2ff61be0de82c27cebbecf8c4718958afcced009"
+GPU_PROFILE_SHA256 = "66c6757589e1b7592e073fafffa18eecbcbaeca5ffad69c348eb64dc330152cb"
 
 
 def sha256(path):
@@ -83,9 +84,12 @@ def validate_bundle(root, *, expected_profile_sha256=None):
             raise ValueError(f"Invalid voice decoding settings for {name}")
         _policy({**profile["decoding"], **voice.get("decoding", {})})
     files = profile.get("files")
+    model_file = profile.get("model", "model.gguf")
+    if not isinstance(model_file, str) or Path(model_file).name != model_file or not model_file.endswith(".gguf"):
+        raise ValueError("The TTS profile names an invalid model file")
     required = {
         "bin/synthesize",
-        "model.gguf",
+        model_file,
         "codec.gguf",
         "lib/libnemo_speech_tts.so.1",
         "lib/libggml.so.0",
@@ -143,6 +147,8 @@ def prepare_bundle(model, *, reuse_cache=True, echo=print, device="cpu"):
                 raise ValueError(f"No voices.json in {path} or {package}")
             path = package
         return _for_device(validate_bundle(path), device)
+    if model == RENAMED_FROM:
+        raise ValueError(f"{RENAMED_FROM} was renamed to {MODEL_ID}")
     if model != MODEL_ID:
         raise ValueError(f"Use {MODEL_ID} or a local native TTS package containing voices.json")
     from filelock import FileLock

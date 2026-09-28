@@ -57,7 +57,7 @@ public:
     /// model (SUROGATE-CHANGES #7); `max_pending` more may wait.
     Runtime(std::filesystem::path root, int max_pending, double timeout, int threads = 4,
             int codec_threads = 4, std::string kernels = "auto", std::string device = "cpu",
-            int workers = 1);
+            int workers = 1, std::string model_file = "model.gguf");
     ~Runtime();
     Runtime(const Runtime&)            = delete;
     Runtime& operator=(const Runtime&) = delete;
@@ -107,6 +107,7 @@ private:
     void wait_fd(int fd, short event, Clock::time_point deadline,
                  const std::function<bool()>& cancelled);
     std::filesystem::path root_;
+    std::string model_file_;
     int max_pending_;
     int threads_, codec_threads_;
     std::string kernels_;

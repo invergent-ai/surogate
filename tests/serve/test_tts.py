@@ -144,8 +144,8 @@ for line in source:
     return validate_bundle(tmp_path)
 
 
-CPU_RUNTIME = "139c84abd9973d48c26112e51b310680ac13e1df4d4386cd875f40a7893d44a2"
-CPU_BASE = "5a46b8f5f84dfd5f1e86730ee9fd280e0acf6649e77c6519a3182f44b5b196de"
+CPU_RUNTIME = "d4c31a1234a8d4be4ea8ffd6343f7a3ea586ab510af9275d4e4b558bb76a8b0a"
+CPU_BASE = "aa54f07d57a1d726b3a996f90a8d8adf51865b8a52555f5ac496643626fbf4a5"
 
 
 @pytest.mark.parametrize("variant,device,message", [
@@ -224,7 +224,7 @@ def test_gpu_variant_tool_assembles_a_package_the_launcher_accepts_for_a_gpu(bun
     assert json.loads((variant / "build_info.json").read_text())["cmake"]["GGML_CUDA"] == "ON"
     prepared = assets.prepare_bundle(str(variant), device="0")
     assert prepared.profile["voices"] == bundle.profile["voices"]
-    assert (variant / "lib/libggml-cuda.so.0").read_bytes() == b"cuda libggml-cuda.so.0.12.0"
+    assert (variant / "lib/libggml-cuda.so.0").read_bytes() == b"cuda libggml-cuda.so.0"
     assert (variant / "model.gguf").read_bytes() == (bundle.root / "model.gguf").read_bytes()
 
 
@@ -249,6 +249,24 @@ def test_corrupt_bundle_is_rejected(bundle, fault):
         validate_bundle(bundle.root)
 
 
+def test_the_profile_names_the_model_file(bundle):
+    from surogate.serve.tts import assets
+
+    path = bundle.root / "voices.json"
+    profile = json.loads(path.read_text())
+    (bundle.root / "model.gguf").rename(bundle.root / "amami-357m-ro.gguf")
+    profile["model"] = "amami-357m-ro.gguf"
+    profile["files"]["amami-357m-ro.gguf"] = profile["files"].pop("model.gguf")
+    path.write_text(json.dumps(profile))
+    assert validate_bundle(bundle.root).profile["model"] == "amami-357m-ro.gguf"
+    for bad in ("../amami-357m-ro.gguf", "amami-357m-ro.bin", "missing.gguf"):
+        path.write_text(json.dumps({**profile, "model": bad}))
+        with pytest.raises(ValueError):
+            validate_bundle(bundle.root)
+    with pytest.raises(ValueError, match="renamed to surogate/amami-357m-ro"):
+        assets.prepare_bundle("surogate/surogate-ro-tts")
+
+
 def gpu_variant_of(bundle):
     """The fixture package with a CUDA runtime in lib/, as a GPU variant has."""
     cuda = bundle.root / "lib/libggml-cuda.so.0"
@@ -265,8 +283,10 @@ def published_download(bundle, variant):
 
     def download(model, *, revision, allow_patterns, local_dir, force_download):
         assert model == assets.MODEL_ID
-        prefix, source = {assets.REVISION: (assets.PREFIX, bundle), assets.GPU_REVISION: ("gpu", variant)}[revision]
+        prefix = allow_patterns[0].removesuffix("/*")
+        source = {assets.PREFIX: bundle, assets.GPU_PREFIX: variant}[prefix]
         assert allow_patterns == [prefix + "/*"]
+        assert revision == (assets.GPU_REVISION if prefix == assets.GPU_PREFIX else assets.REVISION)
         for name in ["voices.json", "README.md", *source.profile["files"]]:
             target = local_dir / prefix / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -313,7 +333,7 @@ def test_a_repository_copy_serves_each_device_its_package(bundle, tmp_path_facto
     shutil.copytree(bundle.root, cpu_root)
     cpu = validate_bundle(cpu_root)
     variant = gpu_variant_of(bundle)
-    repository = tmp_path / "surogate-ro-tts"
+    repository = tmp_path / "amami-357m-ro"
     for folder, source in ((assets.PREFIX, cpu), ("gpu", variant)):
         shutil.copytree(source.root, repository / folder)
     assert assets.prepare_bundle(str(repository), device="0").root == repository / "gpu"
@@ -346,17 +366,18 @@ def test_an_interrupted_download_is_completed(bundle, tmp_path_factory, monkeypa
 def test_the_gpu_variant_pins_are_well_formed():
     from surogate.serve.tts import assets
 
-    assert re.fullmatch(r"[0-9a-f]{40}", assets.GPU_REVISION) and assets.GPU_REVISION != assets.REVISION
+    # One published revision holds both packages.
+    assert re.fullmatch(r"[0-9a-f]{40}", assets.GPU_REVISION) and assets.GPU_REVISION == assets.REVISION
     assert re.fullmatch(r"[0-9a-f]{64}", assets.GPU_PROFILE_SHA256)
     assert assets.GPU_PREFIX == "gpu"
 
 
 def test_the_pinned_gpu_profile_is_the_published_one(tmp_path):
-    """Opt in with SUROGATE_TTS_TEST_MODEL=surogate/surogate-ro-tts (reads one small file from HF)."""
+    """Opt in with SUROGATE_TTS_TEST_MODEL=surogate/amami-357m-ro (reads one small file from HF)."""
     from surogate.serve.tts import assets
 
     if os.environ.get("SUROGATE_TTS_TEST_MODEL") != assets.MODEL_ID:
-        pytest.skip("set SUROGATE_TTS_TEST_MODEL=surogate/surogate-ro-tts to check the published pins")
+        pytest.skip("set SUROGATE_TTS_TEST_MODEL=surogate/amami-357m-ro to check the published pins")
     from huggingface_hub import hf_hub_download
 
     path = hf_hub_download(assets.MODEL_ID, "gpu/voices.json", revision=assets.GPU_REVISION, local_dir=tmp_path)

@@ -50,18 +50,19 @@ int main(int argc, char** argv) {
         auto profile = nlohmann::json::parse(profile_file);
         // The model download verifies these files before execution. This ABI
         // fingerprint prevents pairing our adapter with an unrelated runtime: the CPU runtime, or
-        // the same runtime built with CUDA for SM120 (a package's GPU variant, whose lib/ also
-        // holds libggml-cuda). Both share one GGML base build.
+        // the same runtime built with CUDA (a package's GPU variant, whose lib/ also holds
+        // libggml-cuda). Both share one GGML base build.
+        // nemo-speech-cpp 07003daa with the package's longform patch, GGML_NATIVE=OFF on an
+        // x86-64-v3 baseline (AVX2, FMA, F16C), source paths mapped, $ORIGIN RUNPATH.
         constexpr const char* cpu_runtime =
-            "139c84abd9973d48c26112e51b310680ac13e1df4d4386cd875f40a7893d44a2";
+            "d4c31a1234a8d4be4ea8ffd6343f7a3ea586ab510af9275d4e4b558bb76a8b0a";
         constexpr const char* cpu_base =
-            "5a46b8f5f84dfd5f1e86730ee9fd280e0acf6649e77c6519a3182f44b5b196de";
-        // The GPU variant's runtime: nemo-speech-cpp 07003daa with the package's longform patch,
-        // built with CUDA 13 for sm_120 (RTX 50-series, compute capability 12.0), without NCCL,
-        // with source paths mapped and an $ORIGIN RUNPATH (docs/inference/tts.md).
-        constexpr const char* cuda_runtime = "02fa87a8479ccde6b188b204c0086e87624034e5fb177c94b5ab0c2bb666e395";
-        constexpr const char* cuda_base    = "5916a79c9ece31dcbef048992230d1edd75c585c5c8534fc4f94100a40639718";
-        constexpr const char* cuda_backend = "285f960f40ade7e1ec7361d74ebbbb77809b8bfc2fdc34a355876a564c55dc2f";
+            "aa54f07d57a1d726b3a996f90a8d8adf51865b8a52555f5ac496643626fbf4a5";
+        // The GPU variant's runtime: the same build with CUDA 13 for sm_80, 86, 89, 90, 100 and 120
+        // (Ampere, Ada, Hopper, Blackwell), without NCCL (docs/inference/tts.md).
+        constexpr const char* cuda_runtime = "23fe4ad6149354d2f9f1940139a734d34deef85f47f478016b568b9be8b18f3f";
+        constexpr const char* cuda_base    = "aa54f07d57a1d726b3a996f90a8d8adf51865b8a52555f5ac496643626fbf4a5";
+        constexpr const char* cuda_backend = "68403109b62dc77ddc62dbe1fa33b17995d3c6582ce13805ed10fda3ad5bb247";
         const auto& files   = profile.at("files");
         const auto& runtime = files.at("lib/libnemo_speech_tts.so.1");
         const auto& base    = files.at("lib/libggml-base.so.0");

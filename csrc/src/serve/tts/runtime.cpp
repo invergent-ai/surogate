@@ -56,8 +56,9 @@ std::string worker_visible_devices(const std::string& device) {
 } // namespace
 
 Runtime::Runtime(std::filesystem::path root, int max_pending, double timeout, int threads,
-                 int codec_threads, std::string kernels, std::string device, int workers)
-    : root_(std::move(root)), max_pending_(max_pending), threads_(threads),
+                 int codec_threads, std::string kernels, std::string device, int workers,
+                 std::string model_file)
+    : root_(std::move(root)), model_file_(std::move(model_file)), max_pending_(max_pending), threads_(threads),
       codec_threads_(codec_threads), kernels_(std::move(kernels)), device_(std::move(device)),
       timeout_(timeout) {
     (void)worker_visible_devices(device_); // refused at startup, not at the first request
@@ -220,7 +221,7 @@ void Runtime::spawn(Worker& worker) {
     // Also permits a protocol worker for lifecycle tests, without loading weights.
     if (const char* override = std::getenv("SUROGATE_TTS_WORKER_BIN")) program = override;
     std::vector<std::string> arguments = {program.string(),
-                                          (root_ / "model.gguf").string(),
+                                          (root_ / model_file_).string(),
                                           (root_ / "codec.gguf").string(),
                                           "/dev/stdin",
                                           "-", // stream mode: audio frames on stdout, no files

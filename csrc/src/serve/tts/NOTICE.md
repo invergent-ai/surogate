@@ -1,7 +1,8 @@
 # TTS implementation provenance
 
-The C++ Romanian normalization is adapted from `ro_tts/frontend.py`, version
-2.2.2, in [invergent-ai/training_tts](https://github.com/invergent-ai/training_tts/tree/3df0c664a440527b6c4f339e275f43f5c4da1736).
+The C++ Romanian normalization is adapted from the Surogate Romanian text frontend,
+version 2.2.2, published as `src/surogate_speech/text/frontend.py` in
+[invergent-ai/surogate-speech](https://github.com/invergent-ai/surogate-speech).
 It uses the validated defaults with numeric-list boundaries enabled. Optional
 research respelling and legal-reference switches are not enabled in serving.
 Number spelling is implemented in C++; num2words is not a runtime dependency.
@@ -13,7 +14,8 @@ available at <https://www.apache.org/licenses/LICENSE-2.0>.
 The model package supplies the native synthesis libraries, based on
 [NVIDIA NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp), revision
 `07003daa7eefea542076310722ccaa89709ee3c3`, with the release's long-form history
-fix. The package includes runtime and GGML licenses, build provenance and patch
+fix, built for an x86-64-v3 CPU baseline and, in the GPU variant, with CUDA for
+Ampere, Ada, Hopper and Blackwell GPUs. The package includes runtime and GGML licenses, build provenance and patch
 sources. Surogate's persistent worker loads those libraries through the
 `native_bridge.cpp` adapter. `vendor/magpie_runtime.h` preserves the Apache-2.0
 header from that pinned runtime. This adapter uses its private C++ ABI, so the
