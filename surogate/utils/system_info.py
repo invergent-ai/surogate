@@ -6,10 +6,19 @@ from typing import Any
 
 import psutil
 
-from surogate import _surogate
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
+
+def _extension():
+    """The compiled extension, imported on first use. It links the CUDA driver (libcuda.so.1), so importing it
+    at module level made this module -- and with it `surogate.cli.main`, the console script's entry point --
+    fail to import on any host without a driver: `surogate --help`, CPU-only commands, the GPU-less runner of
+    docker.yml's import check."""
+    from surogate import _surogate
+
+    return _surogate
 
 
 @dataclass
@@ -33,7 +42,7 @@ def get_gpu_info() -> list[GPUInfo]:
     global _gpu_info
     if _gpu_info is None:
         try:
-            _gpu_info = _surogate.SystemInfo.get_gpu_info()
+            _gpu_info = _extension().SystemInfo.get_gpu_info()  # no driver: ImportError, caught below
         except Exception as e:
             logger.debug(f"GPU probe failed, treating the host as GPU-less: {e}")
             _gpu_info = []
@@ -47,8 +56,8 @@ def gpu_count() -> int:
 def cuda_is_available() -> bool:
     return (
         gpu_count() > 0
-        and _surogate.SystemInfo.get_cuda_driver_version() is not None
-        and _surogate.SystemInfo.get_cuda_runtime_version() is not None
+        and _extension().SystemInfo.get_cuda_driver_version() is not None
+        and _extension().SystemInfo.get_cuda_runtime_version() is not None
     )
 
 
@@ -62,10 +71,11 @@ def get_system_info() -> dict[str, Any]:
 
     if gpu_count() > 0:
         try:
-            info["cuda_runtime_version"] = _surogate.SystemInfo.get_cuda_runtime_version()
-            info["cuda_driver_version"] = _surogate.SystemInfo.get_cuda_driver_version()
-            info["nccl_version"] = _surogate.SystemInfo.get_nccl_version()
-            info["cudnn_version"] = _surogate.SystemInfo.get_cudnn_version()
+            ext = _extension()
+            info["cuda_runtime_version"] = ext.SystemInfo.get_cuda_runtime_version()
+            info["cuda_driver_version"] = ext.SystemInfo.get_cuda_driver_version()
+            info["nccl_version"] = ext.SystemInfo.get_nccl_version()
+            info["cudnn_version"] = ext.SystemInfo.get_cudnn_version()
 
             gpu_info = get_gpu_info()
             info["gpu_count"] = len(gpu_info)
