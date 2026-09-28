@@ -1,0 +1,90 @@
+# Surogate Speech Docker Image
+# `surogate serve --tts` and `surogate serve --stt`: text-to-speech and speech recognition over the OpenAI audio
+# API. Text-to-speech serves the native (Magpie) packages and pocket-tts packages such as surogate/amami-110m-ro;
+# a pocket-tts package brings its own Python worker (voices.json "worker"), and this image carries the
+# environment that worker runs in (SUROGATE_TTS_PYTHON). Pocket-tts packages run on CPU only and need surogate
+# 1.5.5 or later.
+#
+# Build Args:
+#   PACKAGE_VERSION: Surogate package version (e.g., 1.5.5)
+#
+# Build:
+#   docker build -f Dockerfile-speech.cu130 \
+#     --build-arg PACKAGE_VERSION=1.5.5 \
+#     -t ghcr.io/invergent-ai/surogate:1.5.5-speech-cu130 .
+#
+# Text-to-speech (the default command; the package mounted read-only at /model, checked against its
+# MANIFEST.sha256 before the server starts):
+#   hf download surogate/amami-110m-ro --local-dir ./amami-110m-ro
+#   docker run --rm -p 8080:8080 -v "$PWD/amami-110m-ro:/model:ro" ghcr.io/invergent-ai/surogate:1.5.5-speech-cu130
+#   curl -s localhost:8080/v1/audio/speech -H 'Content-Type: application/json' \
+#     -d '{"input": "Bună ziua!", "voice": "female"}' -o out.wav
+# Arguments replace the default command, which is `--tts /model --host 0.0.0.0 --port 8080`, e.g.
+#   ... ghcr.io/invergent-ai/surogate:1.5.5-speech-cu130 --tts /model --host 0.0.0.0 --port 8080 \
+#         --api-key-file /run/secrets/tts_key --max-num-seqs 4
+#
+# Speech recognition (the model is downloaded and prepared under /root/.cache: mount it to keep it across runs;
+# HF_TOKEN for a private model; add `--gpus all` and `--device 0` for a GPU):
+#   docker run --rm -p 8001:8001 -e HF_TOKEN -v surogate-cache:/root/.cache \
+#     ghcr.io/invergent-ai/surogate:1.5.5-speech-cu130 --stt surogate/surogate-ro-110m-tdt-ctc --device cpu \
+#     --host 0.0.0.0 --port 8001
+#   curl -s localhost:8001/v1/audio/transcriptions -F file=@out.wav
+# The health check probes port 8080 (the default command); a server on another port reports unhealthy.
+
+FROM ubuntu:noble-20260210.1
+LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate
+ARG PACKAGE_VERSION=1.5.5
+ARG CUDA_TAG=cu130
+ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${CUDA_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_LIB_ROOT="/root/.venv/lib/python3.12/site-packages/nvidia"
+ENV UV_NO_CACHE=1
+# torch pulls the full CUDA wheel set (cudnn/cublas are 350-400MB each); uv's 30s default request
+# timeout loses that race on a slow link.
+ENV UV_HTTP_TIMEOUT=600
+
+# As in Dockerfile.cu130: the wheel vendors the engine binaries' library closure, except the four
+# packages FFmpeg's closure expects every host to have (glib/gobject and the X11 client libraries), and
+# libexpat, which surogate-stt loads (Dockerfile.cu130 gets it through its compilers and git; without it
+# surogate-stt cannot start). curl is for the health check. Nothing here is for training.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+       libglib2.0-0t64 libx11-6 libxext6 libxrender1 libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "${CUDA_LIB_ROOT}/cu13/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && echo "${CUDA_LIB_ROOT}/cudnn/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && echo "${CUDA_LIB_ROOT}/nccl/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && echo "${CUDA_LIB_ROOT}/cufile/lib" >> /etc/ld.so.conf.d/cuda-13-1.conf \
+    && ldconfig
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/bin" sh
+
+WORKDIR /root
+RUN ~/.local/bin/uv venv /root/.venv --python=3.12
+ENV PATH="/root/.venv/bin:$PATH" \
+    VIRTUAL_ENV="/root/.venv"
+
+# The wheel and its torch, as in Dockerfile.cu130 (single RUN so the nvidia version overrides leave no
+# duplicates in lower layers; ldconfig last, once the libraries exist). Then what a pocket-tts package's
+# worker imports beyond them: its model code (pocket_tts), front end and code assembly ship inside the
+# package, and these are their third-party imports, measured by loading the worker and synthesizing.
+RUN ~/.local/bin/uv pip install "torch==2.11.0+${CUDA_TAG}" --index-url https://download.pytorch.org/whl/${CUDA_TAG} \
+ && ~/.local/bin/uv pip install ${WHEEL_URL} \
+ && ~/.local/bin/uv pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115" \
+ && ~/.local/bin/uv pip install "numpy>=2" scipy safetensors sentencepiece tokenizers pydantic soundfile pyyaml huggingface_hub requests \
+ && ldconfig
+
+# The pocket-tts worker runs in this environment. It never writes into its package (a stale stress-lexicon
+# cache is rebuilt in memory), and no bytecode is written either, so /model can be mounted read-only.
+ENV SUROGATE_TTS_PYTHON=/root/.venv/bin/python \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8080
+# Model load (about 5 s) and the server's warm-up come before /health answers.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fs http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["/root/.venv/bin/surogate", "serve"]
+CMD ["--tts", "/model", "--host", "0.0.0.0", "--port", "8080"]
