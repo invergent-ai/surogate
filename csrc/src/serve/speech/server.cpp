@@ -130,16 +130,23 @@ int main(int argc, char** argv) {
                 if (!q.has_file("file"))
                     throw std::invalid_argument("multipart audio file is required");
                 std::string format = "json";
+                // "beam" (the default): CTC with the language model. "greedy": the TDT decoder alone, which
+                // writes what was said without the language model's preferences -- what a check of
+                // dictated codes needs (a TTS worker verifying an IBAN it synthesized).
+                std::string decoding = "beam";
                 for (auto& [field, value] : q.files) {
                     if (field == "model" && value.content != name)
                         throw std::invalid_argument("unknown model");
                     if (field == "language" && value.content != "ro")
                         throw std::invalid_argument("this model supports Romanian (ro)");
                     if (field == "response_format") format = value.content;
+                    if (field == "decoding") decoding = value.content;
                     if (field != "file" && field != "model" && field != "language" &&
-                        field != "response_format")
+                        field != "response_format" && field != "decoding")
                         throw std::invalid_argument("unsupported transcription field: " + field);
                 }
+                if (decoding != "beam" && decoding != "greedy")
+                    throw std::invalid_argument("decoding must be beam or greedy");
                 if (format != "json" && format != "text" && format != "verbose_json")
                     throw std::invalid_argument("response_format must be json, text or verbose_json");
                 auto pcm = decode_audio(q.get_file_value("file").content);
@@ -154,10 +161,17 @@ int main(int argc, char** argv) {
                 } else {
                     // Full-context features and attention see the complete file.
                     // In particular, do not run VAD or normalize separate chunks.
-                    auto samples    = at::from_blob(pcm.data(), {int64_t(pcm.size())}, at::kFloat);
-                    auto transcript = pcm.size() < 320
-                                          ? std::string()
-                                          : model.beam(model.ctc(model.encode(model.mel(samples))));
+                    auto samples = at::from_blob(pcm.data(), {int64_t(pcm.size())}, at::kFloat);
+                    std::string transcript;
+                    if (pcm.size() >= 320) {
+                        auto encoded = model.encode(model.mel(samples));
+                        if (decoding == "greedy") {
+                            PredictorState predictor;
+                            transcript = model.tdt(encoded, predictor);
+                        } else {
+                            transcript = model.beam(model.ctc(encoded));
+                        }
+                    }
                     events.push_back({{"type", "final"}, {"text", transcript}});
                 }
                 std::string text;

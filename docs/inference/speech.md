@@ -107,6 +107,11 @@ Optional form fields:
 | `model` | The served model ID; omit to use the running model |
 | `language` | `ro` |
 | `response_format` | `json` (default), `text`, or `verbose_json` |
+| `decoding` | `beam` (default): CTC with the language model; `greedy`: the TDT decoder alone |
+
+`greedy` writes what was said, not what the language model finds likely; a
+text-to-speech worker uses it to check the codes it dictated (see
+[pocket-tts packages](tts.md#pocket-tts-packages)).
 
 `verbose_json` also returns duration and language. Translation, word
 alignment, subtitle formats, and prompting are unavailable. Unsupported fields

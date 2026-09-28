@@ -108,6 +108,23 @@ def test_file_and_validation(server):
     assert client.get(base + "/health", timeout=5).ok
 
 
+def test_greedy_decoding(server):
+    """decoding=greedy: the TDT decoder without the language model (a TTS worker checking the codes it
+    synthesized needs what was said, not what the language model prefers); beam stays the default."""
+    client, base, audio = server
+    greedy = client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()},
+                         data={"decoding": "greedy"}, timeout=120)
+    assert greedy.ok, greedy.text
+    assert greedy.json()["text"].strip()
+    beam = client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()},
+                       data={"decoding": "beam"}, timeout=120)
+    default = client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()}, timeout=120)
+    assert beam.ok and beam.json()["text"] == default.json()["text"]
+    r = client.post(base + "/v1/audio/transcriptions", files={"file": audio.read_bytes()},
+                    data={"decoding": "fast"}, timeout=10)
+    assert r.status_code == 400 and "decoding" in r.text
+
+
 def test_streams_are_independent_and_packet_sizes_do_not_change_text(server):
     import numpy as np
     import soundfile as sf

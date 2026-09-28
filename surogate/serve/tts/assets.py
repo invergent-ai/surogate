@@ -1,4 +1,5 @@
-"""Resolve and verify the published native packages (CPU, and its GPU variant) or a local voice export."""
+"""Resolve and verify the published native packages (CPU, and its GPU variant), a local voice export, or a local
+pocket-tts package (voices.json "method": "pocket_tts_python")."""
 
 import hashlib
 import json
@@ -52,12 +53,85 @@ def _policy(value):
             raise ValueError(f"Invalid voice setting: {key}")
 
 
+POCKET_METHOD = "pocket_tts_python"
+
+
+def _inside(root, name):
+    """The package file `name` names: relative, inside the package and present."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("Invalid TTS package file name")
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
+        raise ValueError("TTS asset paths must stay inside the package")
+    asset = (root / relative).resolve()
+    if not asset.is_relative_to(root):
+        raise ValueError(f"TTS asset escapes the package: {name}")
+    if not asset.is_file():
+        raise ValueError(f"TTS asset missing: {name}")
+    return asset
+
+
+def _pocket_policy(value):
+    """The server's rule for a pocket-tts package's decoding values; the worker reads the rest."""
+    if not isinstance(value, dict):
+        raise ValueError("Invalid native TTS decoding settings")
+    number = value.get("temperature")
+    if type(number) not in (int, float) or not math.isfinite(number) or not 0 < number <= 2:
+        raise ValueError("Invalid voice setting: temperature")
+    attempts = value.get("code_attempts", 1)
+    if type(attempts) is not int or not 1 <= attempts <= 8:
+        raise ValueError("code_attempts must be between 1 and 8")
+
+
+def _validate_pocket(root, profile):
+    """A pocket-tts package: a worker program it brings (run by the server in place of surogate-tts-worker, given
+    the input text), its model config, a recording per voice, and MANIFEST.sha256 when the package has one."""
+    rate = profile.get("sample_rate")
+    if type(rate) is not int or not 8000 <= rate <= 48000:
+        raise ValueError("Invalid TTS package sample rate")
+    _pocket_policy(profile.get("decoding"))
+    worker = _inside(root, profile.get("worker"))
+    model = profile.get("model")
+    if not isinstance(model, dict):
+        raise ValueError("The TTS package names no model config")
+    _inside(root, model.get("config"))
+    voices = profile.get("voices")
+    if not isinstance(voices, dict) or not voices:
+        raise ValueError("The TTS package has no named voices")
+    names = set()
+    for name, voice in voices.items():
+        if not isinstance(name, str) or not name.strip() or name != name.strip() or name.casefold() in names:
+            raise ValueError("Voice names must be nonempty and distinct ignoring case")
+        names.add(name.casefold())
+        if not isinstance(voice, dict) or set(voice) - {"id", "prompt", "decoding"}:
+            raise ValueError(f"Invalid voice profile: {name}")
+        if type(voice.get("id")) is not int or voice["id"] < 0:
+            raise ValueError(f"Invalid speaker index for {name}")
+        if not isinstance(voice.get("decoding", {}), dict):
+            raise ValueError(f"Invalid voice decoding settings for {name}")
+        _pocket_policy({**profile["decoding"], **voice.get("decoding", {})})
+        _inside(root, voice.get("prompt"))
+    manifest = root / "MANIFEST.sha256"
+    if manifest.is_file():
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            digest, _, name = line.partition("  ")
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(f"Invalid TTS checksum: {name}")
+            if sha256(_inside(root, name)) != digest:
+                raise ValueError(f"TTS asset checksum mismatch: {name}")
+    if not os.access(worker, os.X_OK):
+        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+    return Bundle(root, profile)
+
+
 def validate_bundle(root, *, expected_profile_sha256=None):
     root = Path(root).resolve()
     path = root / "voices.json"
     if expected_profile_sha256 and sha256(path) != expected_profile_sha256:
         raise ValueError("Published TTS voice profile checksum mismatch")
     profile = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(profile, dict) and profile.get("schema") == 1 and profile.get("method") == POCKET_METHOD:
+        return _validate_pocket(root, profile)
     if (
         not isinstance(profile, dict)
         or profile.get("schema") != 1
@@ -119,6 +193,8 @@ def validate_bundle(root, *, expected_profile_sha256=None):
 
 def _for_device(bundle, device):
     """A GPU needs the package's GPU variant: the same runtime built with CUDA (lib/libggml-cuda)."""
+    if device != "cpu" and bundle.profile["method"] == POCKET_METHOD:
+        raise ValueError("A pocket-tts package runs on CPU only; serve it with --device cpu")
     if device != "cpu" and "lib/libggml-cuda.so.0" not in bundle.profile["files"]:
         raise ValueError(
             "This TTS package has only the CPU runtime. Serving on a GPU needs its GPU variant, whose "

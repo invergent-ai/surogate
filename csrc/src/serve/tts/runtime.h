@@ -54,10 +54,12 @@ public:
 
     /// `device`: "cpu", or the CUDA device index the workers synthesize on. `workers`: how many
     /// requests are synthesized at once, each by its own worker process with its own copy of the
-    /// model (SUROGATE-CHANGES #7); `max_pending` more may wait.
+    /// model (SUROGATE-CHANGES #7); `max_pending` more may wait. `program`: the worker executable
+    /// a package brings (a pocket-tts package, voices.json "worker"); empty for the native
+    /// surogate-tts-worker next to this binary. `sample_rate`: what its audio must be.
     Runtime(std::filesystem::path root, int max_pending, double timeout, int threads = 4,
             int codec_threads = 4, std::string kernels = "auto", std::string device = "cpu",
-            int workers = 1);
+            int workers = 1, std::filesystem::path program = {}, int sample_rate = 22050);
     ~Runtime();
     Runtime(const Runtime&)            = delete;
     Runtime& operator=(const Runtime&) = delete;
@@ -83,6 +85,7 @@ public:
     std::string synthesize(const std::vector<std::vector<int32_t>>& chunks, const Voice& voice,
                            int seed, const std::function<bool()>& cancelled);
     int workers() const { return static_cast<int>(workers_.size()); }
+    int sample_rate() const { return sample_rate_; }
     /// The server is shutting down: a cancelled request's worker is stopped, not drained, and a
     /// stopped worker is not restarted.
     void shut_down() { stopping_ = true; }
@@ -107,6 +110,8 @@ private:
     void wait_fd(int fd, short event, Clock::time_point deadline,
                  const std::function<bool()>& cancelled);
     std::filesystem::path root_;
+    std::filesystem::path program_; ///< the package's worker, or empty for surogate-tts-worker
+    int sample_rate_;
     int max_pending_;
     int threads_, codec_threads_;
     std::string kernels_;

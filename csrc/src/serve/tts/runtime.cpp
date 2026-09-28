@@ -15,7 +15,7 @@ namespace sinfer::tts {
 using sinfer::serve::audio::HttpError;
 
 namespace {
-constexpr size_t max_audio = 96 * 1024 * 1024; // 38 minutes of 22,050 Hz 16-bit audio
+constexpr size_t max_audio = 96 * 1024 * 1024; // 38 minutes of 22,050 Hz 16-bit audio (35 at 24 kHz)
 
 /// The next field of a worker line as a byte count: decimal digits only (no sign, no space), so a
 /// malformed frame is refused rather than read as a huge or wrapped size.
@@ -56,8 +56,10 @@ std::string worker_visible_devices(const std::string& device) {
 } // namespace
 
 Runtime::Runtime(std::filesystem::path root, int max_pending, double timeout, int threads,
-                 int codec_threads, std::string kernels, std::string device, int workers)
-    : root_(std::move(root)), max_pending_(max_pending), threads_(threads),
+                 int codec_threads, std::string kernels, std::string device, int workers,
+                 std::filesystem::path program, int sample_rate)
+    : root_(std::move(root)), program_(std::move(program)), sample_rate_(sample_rate),
+      max_pending_(max_pending), threads_(threads),
       codec_threads_(codec_threads), kernels_(std::move(kernels)), device_(std::move(device)),
       timeout_(timeout) {
     (void)worker_visible_devices(device_); // refused at startup, not at the first request
@@ -215,8 +217,9 @@ void Runtime::spawn(Worker& worker) {
             if (fd >= 0) close(fd);
         throw HttpError(503, "Cannot create native TTS pipes");
     }
-    auto program =
-        std::filesystem::read_symlink("/proc/self/exe").parent_path() / "surogate-tts-worker";
+    auto program = program_.empty()
+                       ? std::filesystem::read_symlink("/proc/self/exe").parent_path() / "surogate-tts-worker"
+                       : program_;
     // Also permits a protocol worker for lifecycle tests, without loading weights.
     if (const char* override = std::getenv("SUROGATE_TTS_WORKER_BIN")) program = override;
     std::vector<std::string> arguments = {program.string(),
@@ -497,7 +500,7 @@ int Runtime::stream(Lease& lease, const std::vector<std::vector<int32_t>>& chunk
                 continue;
             }
             int sample_rate = 0;
-            if (kind != "done" || !(fields >> sample_rate) || sample_rate != 22050 || produced == 0)
+            if (kind != "done" || !(fields >> sample_rate) || sample_rate != sample_rate_ || produced == 0)
                 throw HttpError(503, "Native TTS returned invalid audio");
             worker.loaded = true; // also for a worker that sends no ready line
             worker.warm   = true;

@@ -270,6 +270,60 @@ exported with that pipeline's `ro_tts.export_native` command.
 loaded package. Adding a new voice requires a new native export and a server
 restart. It does not require a separate model process for every name.
 
+## pocket-tts packages
+
+A package whose `voices.json` has `"method": "pocket_tts_python"` holds a
+pocket-tts model and brings its own worker program, which the server runs in
+place of `surogate-tts-worker`. The worker gets the request text as UTF-8,
+prepares it itself (numbers, codes, stress) and returns audio at the package's
+`sample_rate` (24 kHz for pocket-tts), which the server reports in
+`X-Audio-Sample-Rate` and every WAV header. These packages run on CPU only.
+
+```bash
+SUROGATE_TTS_PYTHON=/path/to/venv/bin/python \
+SUROGATE_TTS_VERIFY_URL=http://127.0.0.1:8001/v1/audio/transcriptions \
+  surogate serve --tts /models/pocket-ro --port 8080
+```
+
+| `voices.json` field | Meaning |
+|---|---|
+| `sample_rate` | The worker's output rate, 8000–48000 |
+| `worker` | The worker program, relative to the package |
+| `model.config` | The model config, relative to the package |
+| `voices.NAME.prompt` | The voice's recording, relative to the package |
+| `decoding.temperature` | Sampling temperature, above 0 and at most 2 |
+| `decoding.code_attempts` | Attempts per generated code, 1–8 (default 1) |
+| `code_units` | Recorded character clips codes are assembled from |
+
+The launcher checks these files, and every hash in `MANIFEST.sha256` when the
+package has one.
+
+### Codes
+
+The Romanian package reads IBANs, phone numbers, CNPs and other codes one
+character at a time, and never generates them: its `units/` directory holds a
+recorded clip of every character in each voice, cut from the model's own
+readings, checked by speech recognition and approved by ear, and the worker
+joins those clips with fixed pauses (`voices.json` `code_units`). A join cannot
+skip, repeat or swap a character. Only the words around a code are generated.
+
+The worker finds most codes itself. To be sure a code is read as one, mark it
+as in SSML:
+
+```json
+{"input": "Contul este <say-as interpret-as=\"characters\">RO49 AAAA 1B31 0075 9384 0000</say-as>."}
+```
+
+A marked code holds 1 to 64 letters, digits, spaces, `+` and `-` (spaces and
+hyphens only group it for the eye). The tags are not billed. Any other use of
+`say-as` returns 400, so a mistyped tag is never read out as text.
+
+A character without a clip falls back to generating the code's sentence. With
+`SUROGATE_TTS_VERIFY_URL` set to a [speech recognition](speech.md) server, that
+sentence is transcribed with `decoding=greedy` and synthesized again with
+another seed when the code heard differs, up to `code_attempts` times.
+`SUROGATE_TTS_VERIFY_API_KEY` is sent as the bearer token.
+
 ## Queue, authentication and shutdown
 
 `--max-num-seqs N` (default 1, at most 16) synthesizes N requests at once. Each runs on its own

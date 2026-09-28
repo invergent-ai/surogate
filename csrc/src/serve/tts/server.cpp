@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <csignal>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <string_view>
 #include <system_error>
 #include <set>
@@ -48,6 +50,8 @@ const char* usage =
     "  --request-timeout SECONDS   queue plus synthesis deadline (default 300)\n"
     "  --max-input-characters N    longest input, synthesized sentence by sentence (default 4096,\n"
     "                              maximum 16384)\n"
+    "NATIVE_PACKAGE: a Magpie package, or a pocket-tts package (voices.json method\n"
+    "pocket_tts_python) whose worker program it names.\n"
     "Use surogate serve --tts surogate/surogate-ro-tts to download and verify assets.\n";
 
 std::string base64(std::string_view bytes) {
@@ -99,11 +103,12 @@ struct Production {
 void stream_speech(const httplib::Request& q, httplib::Response& r, Runtime& runtime,
                    Metrics& metrics, std::vector<std::vector<int32_t>> chunks, const Voice& voice,
                    int seed, const std::string& format, bool events, size_t characters) {
+    const int sample_rate = runtime.sample_rate();
     auto lease = std::shared_ptr<Runtime::Lease>(runtime.acquire([&q] {
         return interrupted != 0 || (q.is_connection_alive && !q.is_connection_alive());
     }).release());
     r.set_header("X-Usage-Characters", std::to_string(characters));
-    r.set_header("X-Audio-Sample-Rate", "22050");
+    r.set_header("X-Audio-Sample-Rate", std::to_string(sample_rate));
     r.set_header("Cache-Control", "no-store");
     r.set_header("X-Accel-Buffering", "no");
     const std::string content_type =
@@ -112,7 +117,7 @@ void stream_speech(const httplib::Request& q, httplib::Response& r, Runtime& run
     r.set_chunked_content_provider(
         content_type,
         [&runtime, &metrics, state, lease, chunks = std::move(chunks), voice, seed, format, events,
-         characters, started = false](size_t, httplib::DataSink& sink) mutable {
+         characters, sample_rate, started = false](size_t, httplib::DataSink& sink) mutable {
             if (started) {
                 sink.done();
                 return true;
@@ -135,7 +140,7 @@ void stream_speech(const httplib::Request& q, httplib::Response& r, Runtime& run
             // itself) lasts until the response ends.
             std::thread producer;
             try {
-                producer = std::thread([&runtime, state, lease, &chunks, &voice, seed, format] {
+                producer = std::thread([&runtime, state, lease, &chunks, &voice, seed, format, sample_rate] {
                     bool header = format == "wav";
                     std::optional<HttpError> error;
                     try {
@@ -143,7 +148,7 @@ void stream_speech(const httplib::Request& q, httplib::Response& r, Runtime& run
                             *lease, chunks, voice, seed,
                             [&] { return interrupted != 0 || state->gone.load(); },
                             [&](std::string_view pcm) {
-                                std::string out = header ? wav_header(22050, 0xFFFFFFFFu) : std::string();
+                                std::string out = header ? wav_header(sample_rate, 0xFFFFFFFFu) : std::string();
                                 header          = false;
                                 out.append(pcm);
                                 {
@@ -214,7 +219,7 @@ void stream_speech(const httplib::Request& q, httplib::Response& r, Runtime& run
                 return fail(HttpError(503, e.what()));
             }
             if (state->error) return fail(*state->error);
-            const double seconds = static_cast<double>(state->pcm_bytes) / (2.0 * 22050.0);
+            const double seconds = static_cast<double>(state->pcm_bytes) / (2.0 * sample_rate);
             if (events &&
                 !put(sse({{"type", "speech.audio.done"},
                           {"usage", {{"input_characters", characters}, {"audio_seconds", seconds}}}})))
@@ -241,6 +246,54 @@ int integer(const std::string& flag, const std::string& value) {
     } catch (const std::exception&) {
     }
     throw std::invalid_argument(flag + " must be an integer");
+}
+
+/// A pocket-tts package's input may mark a code to be read character by character, as in SSML:
+/// <say-as interpret-as="characters">RO49 AAAA 1B31</say-as>. Its worker dictates a marked code from the
+/// package's recorded character clips, never generating it. Returns the input without the tags (what is spoken
+/// and billed); anything else that looks like the tag is refused, so a code is never read as ordinary text
+/// because of a typo in its markup.
+std::string without_say_as(const std::string& text) {
+    static const std::regex tag(R"(<say-as interpret-as="characters">([A-Za-z0-9+ -]{1,64})</say-as>)");
+    static const std::regex stray(R"(<\s*/?\s*say-as)", std::regex::icase);
+    static const std::string usage =
+        "say-as: mark a code as <say-as interpret-as=\"characters\">CODE</say-as>, with 1 to 64 letters, "
+        "digits, spaces, + and -";
+    std::string out;
+    auto from = text.cbegin();
+    for (std::sregex_iterator it(text.begin(), text.end(), tag), end; it != end; ++it) {
+        const std::string code = (*it)[1];
+        if (std::none_of(code.begin(), code.end(), [](unsigned char c) { return std::isalnum(c); }))
+            throw std::invalid_argument(usage);
+        out.append(from, (*it)[0].first);
+        out += code;
+        from = (*it)[0].second;
+    }
+    out.append(from, text.cend());
+    if (std::regex_search(out, stray)) throw std::invalid_argument(usage);
+    return out;
+}
+
+/// A pocket-tts package's decoding values ("method": "pocket_tts_python"); the worker reads the rest.
+void validate_pocket_policy(const json& policy) {
+    const double v = policy.at("temperature").get<double>();
+    if (!std::isfinite(v) || v <= 0 || v > 2) throw std::invalid_argument("Invalid TTS decoding value");
+    if (policy.contains("code_attempts") &&
+        (!policy.at("code_attempts").is_number_integer() || policy.at("code_attempts").get<int>() < 1 ||
+         policy.at("code_attempts").get<int>() > 8))
+        throw std::invalid_argument("code_attempts must be between 1 and 8");
+}
+
+/// A file a package names, relative to its root: it must exist and stay inside the package.
+std::filesystem::path package_file(const std::filesystem::path& root, const json& relative) {
+    if (!relative.is_string() || relative.get<std::string>().empty())
+        throw std::invalid_argument("Invalid TTS package file name");
+    const auto path = std::filesystem::weakly_canonical(root / relative.get<std::string>());
+    const auto [end, _] = std::mismatch(root.begin(), root.end(), path.begin(), path.end());
+    if (end != root.end() || !std::filesystem::is_regular_file(path))
+        throw std::invalid_argument("TTS package file missing or outside the package: " +
+                                    relative.get<std::string>());
+    return path;
 }
 
 void validate_policy(const json& policy) {
@@ -339,26 +392,42 @@ int main(int argc, char** argv) {
         if (root.filename() == "voices.json") root = root.parent_path();
         std::ifstream file(root / "voices.json");
         json profile = json::parse(file);
+        // A Magpie package (the native runtime), or a pocket-tts package whose worker program it
+        // brings along; that worker gets the input as text (UTF-8 bytes) and prepares it itself.
+        const auto method = profile.value("method", std::string());
+        const bool pocket = method == "pocket_tts_python";
         if (profile.value("schema", 0) != 1 ||
-            profile.value("method", std::string()) != "experimental_magpie_native_cpu" ||
-            nlohmann::json(profile.at("tokenizer")) !=
-                nlohmann::json{{"profile", "v2607"}, {"offset", 96}, {"eos", 3358}})
+            (!pocket && (method != "experimental_magpie_native_cpu" ||
+                         nlohmann::json(profile.at("tokenizer")) !=
+                             nlohmann::json{{"profile", "v2607"}, {"offset", 96}, {"eos", 3358}})))
             throw std::invalid_argument("Unsupported native TTS package");
+        int sample_rate = 22050;
+        std::filesystem::path program;
+        if (pocket) {
+            if (!profile.at("sample_rate").is_number_integer() ||
+                profile.at("sample_rate").get<int>() < 8000 || profile.at("sample_rate").get<int>() > 48000)
+                throw std::invalid_argument("Invalid TTS package sample rate");
+            sample_rate = profile.at("sample_rate").get<int>();
+            program     = package_file(root, profile.at("worker"));
+        }
+        const auto check_policy = [&](const json& decoding) {
+            pocket ? validate_pocket_policy(decoding) : validate_policy(decoding);
+        };
         auto policy = profile.at("decoding");
-        validate_policy(policy);
+        check_policy(policy);
         std::vector<Voice> voices;
         std::set<std::string> names;
         for (auto& [label, entry] : profile.at("voices").items()) {
             auto decoding = policy;
             if (entry.contains("decoding")) decoding.update(entry.at("decoding"));
-            validate_policy(decoding);
+            check_policy(decoding);
+            if (pocket) (void)package_file(root, entry.at("prompt")); // the voice's recording
             if (label.empty() || !names.insert(casefold(label)).second ||
                 !entry.at("id").is_number_integer() || entry.at("id").get<int64_t>() < 0 ||
                 entry.at("id").get<int64_t>() > INT32_MAX)
                 throw std::invalid_argument("Invalid voice profile");
-            voices.push_back({label, entry.at("id").get<int>(),
-                              decoding.at("temperature").get<float>(),
-                              decoding.at("cfg_scale").get<float>()});
+            voices.push_back({label, entry.at("id").get<int>(), decoding.at("temperature").get<float>(),
+                              pocket ? 1.0f : decoding.at("cfg_scale").get<float>()});
         }
         if (voices.empty()) throw std::invalid_argument("No named voices in TTS package");
         auto voice = [&](const std::string& label) -> const Voice& {
@@ -369,7 +438,22 @@ int main(int argc, char** argv) {
         if (!default_set) default_voice = voices.front().name;
         default_voice = voice(default_voice).name;
         if (name.empty()) name = artifact;
-        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device, max_num_seqs);
+        Runtime runtime(root, max_pending, timeout, threads, codec_threads, kernels, device, max_num_seqs,
+                        program, sample_rate);
+        // What a job carries: Magpie tokens, or for a pocket-tts package the input's UTF-8 bytes (its
+        // worker normalizes, marks stress and chunks the text itself), within the same input limit.
+        const auto prepare = [&](const std::string& text) {
+            if (!pocket) return tokenize(text, size_t(max_characters));
+            const auto spoken = without_say_as(text);  // the tags count as nothing
+            if (input_characters(spoken) > size_t(max_characters))
+                throw std::invalid_argument("input exceeds " + std::to_string(max_characters) + " characters");
+            if (spoken.find_first_not_of(" \t\r\n") == std::string::npos)
+                throw std::invalid_argument("input must contain spoken text");
+            std::vector<int32_t> bytes;
+            bytes.reserve(text.size());
+            for (const char c : text) bytes.push_back(static_cast<uint8_t>(c));
+            return std::vector<std::vector<int32_t>>{std::move(bytes)};
+        };
         const std::string device_name = device == "cpu" ? "cpu" : "cuda:" + device;
         // /metrics: requests in flight (queued ones included) and what was served -- what a
         // supervisor drains this server by.
@@ -452,11 +536,11 @@ int main(int argc, char** argv) {
                 }
                 const auto& selected = voice(body.value("voice", default_voice));
                 const auto& input    = body.at("input").get_ref<const std::string&>();
-                auto chunks          = tokenize(input, size_t(max_characters));
+                auto chunks          = prepare(input);
                 // Counted like the input limit. A whole recording carries it only once synthesis has
                 // succeeded, so an error response never carries a billable count; a stream carries it
                 // from the start and is billable only when it completes (see stream_speech).
-                const auto characters = input_characters(input);
+                const auto characters = input_characters(pocket ? without_say_as(input) : input);
                 if (stream_format) {
                     stream_speech(q, r, runtime, metrics, std::move(chunks), selected, int(seed), format,
                                   *stream_format == "sse", characters);
@@ -476,8 +560,8 @@ int main(int argc, char** argv) {
                                                     return true;
                                                 });
                 lease->release_worker();
-                // 16-bit mono at 22,050 Hz.
-                const double seconds = static_cast<double>(pcm.size()) / (2.0 * 22050.0);
+                // 16-bit mono at the package's sample rate.
+                const double seconds = static_cast<double>(pcm.size()) / (2.0 * rate);
                 auto data            = std::make_shared<std::string>();
                 if (format == "wav") {
                     *data = wav_header(static_cast<uint32_t>(rate), static_cast<uint32_t>(pcm.size()));
@@ -485,7 +569,7 @@ int main(int argc, char** argv) {
                 data->append(pcm);
                 pcm = std::string();
                 r.set_header("X-Usage-Characters", std::to_string(characters));
-                r.set_header("X-Audio-Sample-Rate", "22050");
+                r.set_header("X-Audio-Sample-Rate", std::to_string(rate));
                 r.set_header("Cache-Control", "no-store");
                 r.set_content_provider(
                     data->size(), format == "wav" ? "audio/wav" : "audio/pcm",
@@ -516,7 +600,7 @@ int main(int argc, char** argv) {
             }
         });
         // Every worker loads its model and synthesizes once before the server answers.
-        const auto warmup_chunks = tokenize("Bună.");
+        const auto warmup_chunks = prepare("Bună.");
         runtime.start([&](Runtime::Lease& lease) {
             runtime.stream(lease, warmup_chunks, voice(default_voice), 9,
                            [] { return interrupted != 0; }, [](std::string_view) { return true; });
