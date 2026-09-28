@@ -6,6 +6,17 @@
 
 namespace sinfer::ops {
 
+__global__ void scatter_broadcast_bf16x8_kernel(const uint4* src, const std::int32_t* indices,
+                                               uint4* dst, int vectors, int streams) {
+    const auto col = static_cast<std::int32_t>(blockIdx.x);
+    const auto source = src + static_cast<std::int64_t>(col) * vectors;
+    auto destination = dst + static_cast<std::int64_t>(indices[col]) * vectors * streams;
+    for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
+        const uint4 value = source[i];
+        for (int s = 0; s < streams; ++s) { destination[s * vectors + i] = value; }
+    }
+}
+
 __global__ void scatter_bf16x8_kernel(const uint4* src, const std::int32_t* indices, uint4* dst,
                                       std::int32_t vectors_per_column) {
     const std::int32_t src_col  = static_cast<std::int32_t>(blockIdx.x);

@@ -271,7 +271,9 @@ def ple_table_recipe(g: inv.Geometry) -> TensorRecipe:
 
 
 def build_recipes(g: inv.Geometry) -> tuple[TensorRecipe, ...]:
+    from .vision import build_recipes as vision_recipes
     recipes = _build_text_recipes(g)
+    recipes += vision_recipes(g)
     if g.mtp_layers:
         recipes += _build_mtp_recipes(g)
     return recipes
@@ -287,7 +289,7 @@ def source_requirements(g: inv.Geometry):
 
 
 def validate_recipe_coverage(g: inv.Geometry) -> None:
-    specs, _ = inv.active_specs(geometry=g, vision=False)
+    specs, _ = inv.active_specs(geometry=g)
     inventory = {spec.name: spec for spec in specs}
     recipes = build_recipes(g)
     by_name = {item.object_name: item for item in recipes}

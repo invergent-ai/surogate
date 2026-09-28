@@ -56,7 +56,7 @@ inline constexpr std::string_view kDecisionThinkingSystemPrompt =
 
 /// The token that closes a thought, as Gemma 4 spells it (`<|channel>thought\n` ... `<channel|>`,
 /// its tokenizer_config's `response_template.fields.thinking.close`). The readout is taken at the
-/// position after it. A model whose tokenizer has no such single token cannot think here.
+/// position after it. Qwen uses the frontend's </think> marker and an answer separator.
 inline constexpr std::string_view kDecisionThinkingClose = "<channel|>";
 
 /// How sure a one-pass answer is, as the gate reads it: a choice or score answer's top option
@@ -78,10 +78,11 @@ struct DecisionChat {
 [[nodiscard]] DecisionChat decision_thinking_chat(const DecisionsRequest& request, const DecisionQuestion& question);
 
 /// The thought budget a prompt of `prompt_tokens` gets: `budget`, cut where the readout would no
-/// longer fit the context (the prompt, the thought, the close token and the answer position).
+/// longer fit the context (prompt, thought, closing_tokens and the answer position).
 /// None when not even an empty thought fits; that question keeps its one-pass answer.
 [[nodiscard]] std::optional<std::size_t> decision_thinking_budget(std::size_t budget, std::size_t prompt_tokens,
-                                                                  std::size_t max_context);
+                                                                  std::size_t max_context,
+                                                                  std::size_t closing_tokens = 1);
 
 /// How many tokens the thought's generation may produce for a budget: the budget and one more, so
 /// a thought that closes exactly at its budget is seen closing rather than forced.
@@ -97,10 +98,11 @@ struct DecisionThought {
 [[nodiscard]] DecisionThought decision_thought(const std::vector<TokenId>& generated, TokenId close,
                                                std::size_t budget);
 
-/// What the thinking answer is read from: the thinking prompt, the thought and the close token.
+/// What the thinking answer is read from: prompt, thought, close and optional answer separator.
 /// The option letters are read at the next position.
 [[nodiscard]] std::vector<TokenId> decision_thinking_readout(const std::vector<TokenId>& prompt,
-                                                             const DecisionThought& thought, TokenId close);
+                                                             const DecisionThought& thought, TokenId close,
+                                                             const std::vector<TokenId>& separator = {});
 
 /// The answer after a thought: v1's answer object from the thinking readout's option logits,
 /// through `resolve_decision_answer` at the server's calibration temperature, then

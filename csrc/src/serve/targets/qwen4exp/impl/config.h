@@ -120,7 +120,7 @@ static_assert(TextConfig::gdn_index(0) == 0 && TextConfig::gdn_index(4) == 3 &&
 static_assert(TextConfig::ple_embed == TextConfig::hidden);
 static_assert(TextConfig::gdn_projection_rows == 16384 && TextConfig::query_projection_rows == 13312);
 
-// The family's vision context is instantiated but never enabled for this target.
+// Runtime tower dimensions come from the paired projector's artifact metadata.
 struct VisionConfig : family::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };

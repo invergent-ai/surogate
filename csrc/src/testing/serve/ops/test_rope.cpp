@@ -336,8 +336,11 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
     Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta,
-              tensor, nullptr);
+    if (geometry.sections[0]) {
+        ops::rope_interleaved(position_tensor, geometry.rotary_dim, geometry.theta, geometry.sections, tensor, nullptr);
+    } else {
+        ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta, tensor, nullptr);
+    }
     cuda_synchronize();
 
     const auto got          = from_device<std::uint16_t>(device.data(), storage.size());
@@ -472,6 +475,7 @@ int main() {
     failures += run_vision_packed_case();
     failures += run_pair_case({"Muse vision", 96, 96, 2, 37, kVisionTheta}, 16, 16, 33);
     failures += run_pair_case({"qwen3-vl interleaved image", 128, 128, 3, 129, 5.0e6F, 0, {24,20,20}}, 16, 8, 4096);
+    failures += run_single_case({"qwen4exp indexer image", 128, 64, 3, 129, 1.0e7F, 0, {11,11,10}}, 4, 4096, 16);
     failures += run_pair_case({"qwen3-vl strided video", 128, 128, 3, 17, 5.0e6F, 0, {24,20,20}}, 32, 8, 262000, 16, 8);
     failures += run_pair_case({"configured interleaving", 128, 128, 3, 9, 700000.0F, 0, {32,17,15}}, 12, 4, 5000);
     failures += run_pair_case({"64-wide vision generic", 64, 64, 2, 19, kVisionTheta}, 8, 8, 23);

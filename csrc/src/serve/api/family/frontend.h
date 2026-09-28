@@ -55,6 +55,8 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     /// A deep copy (pipeline stages each start the same prompt on their own program).
     [[nodiscard]] PreparedPrompt clone() const;
+    /// Copy the prompt with a text continuation, retaining media and its position axes.
+    [[nodiscard]] PreparedPrompt with_suffix(std::span<const TokenId> suffix) const;
 
 private:
     explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;
@@ -156,6 +158,7 @@ public:
     /// endpoints have anything to render with.
     [[nodiscard]] bool supports_chat() const noexcept;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
+    [[nodiscard]] std::string reasoning_close() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
                                                     const StopPolicy& caller_stop,

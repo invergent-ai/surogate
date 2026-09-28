@@ -316,6 +316,27 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
                                  mmproj=mmproj, include_vision=include_vision, dflash_model=dflash_model)
     if dflash_model not in (None, "auto"):
         raise SystemExit("surogate serve: --dflash-model currently accepts Muse-Glimmer GGUF companions")
+    if architecture == "qwen4exp" and include_vision and (mmproj or list(gguf_path.parent.glob("*mmproj*.gguf"))):
+        from surogate.serve.convert.qwen4exp.vision import find_projector
+        from surogate.serve.convert.qwen4exp.convert import RECIPE_ID
+        from surogate.serve.convert.common.gguf_source import GgufSource
+        try:
+            projector = find_projector(gguf_path, mmproj)
+            mtp = _find_mtp_gguf(gguf_path)
+            source = GgufSource(gguf_path, extra=[p for p in (mtp, projector) if p is not None])
+            try:
+                fp = _gguf_fingerprint(*source.shards, generation_defaults=generation_defaults)
+                fp = hashlib.sha256((fp + RECIPE_ID + repr([str(p.resolve()) for p in source.shards])).encode()).hexdigest()[:24]
+                out = cache_dir() / f"qwen4exp-vl-gguf-{fp}.sinfer"
+                if reuse_cache and out.is_file() and out.stat().st_size > 0:
+                    echo(f"surogate serve: using cached engine weights ({out.name})")
+                    return out
+                return _convert_gguf_native(_sinfer_root(), gguf_path, out, target_key="qwen4exp",
+                                            mtp_path=mtp, mmproj=projector, reader=source.readers[0], echo=echo)
+            finally:
+                source.close()
+        except (ValueError, KeyError, OSError) as error:
+            raise SystemExit(f"surogate serve: {error}") from error
     vl = "qwen3_vl" if architecture in ("qwen3vl", "qwen3vlmoe") else None
     if architecture == "lfm2":
         if mmproj is not None:
@@ -466,7 +487,7 @@ def _native_gguf_frontend(reader, directory: Path, *, echo=print) -> Path:
 
 def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
                          target_key: str = "qwen4exp", mtp_path: Path | None = None,
-                         reader=None, echo=print) -> Path:
+                         mmproj: Path | None = None, reader=None, echo=print) -> Path:
     """Convert a native GGUF using its own tokenizer, chat template and special IDs."""
     if reader is None:
         from surogate.serve.gguf.bridge import open_gguf
@@ -483,6 +504,8 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
     if mtp_path is not None:
         echo(f"surogate serve: NextN draft head found, {mtp_path.name}")
         cmd += ["--mtp", str(mtp_path)]
+    if mmproj is not None:
+        cmd += ["--mmproj", str(mmproj)]
     if os.environ.get("SUROGATE_SERVE_DRY"):
         echo("DRY: cwd=" + str(root))
         echo("DRY: " + " ".join(cmd))

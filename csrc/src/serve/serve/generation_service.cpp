@@ -1178,15 +1178,12 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
         struct ThinkingSetup {
             ResolvedPromptSemantics semantics;
             TokenId close = -1;
+            std::vector<TokenId> separator;
             /// The option letters as the model writes them after the close token: A, B, ..
             std::vector<TokenId> letters;
         };
         std::optional<ThinkingSetup> thinking;
         if (request.thinking) {
-            if (with_images) {
-                refuse("thinking does not support images yet; send this request with thinking false",
-                       "thinking", "decisions_thinking_not_supported");
-            }
             if (!prompt_capabilities_.enable_thinking) {
                 refuse("this model's chat template has no thinking switch, so it cannot think here",
                        "thinking", "decisions_thinking_not_supported");
@@ -1198,7 +1195,11 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             // this holds after every thought.
             const std::vector<TokenId>& ids = items.front().ids;
             const std::string text          = decode(ids);
-            const std::string close_text(kDecisionThinkingClose);
+            const std::string close_text = engine_->reasoning_close();
+            if (close_text != kDecisionThinkingClose && close_text != "</think>") {
+                refuse("this model's reasoning format is not supported by decisions thinking",
+                       "thinking", "decisions_thinking_not_supported");
+            }
             const std::vector<TokenId> closed = encode(text + close_text);
             if (closed.size() != ids.size() + 1 || !std::equal(ids.begin(), ids.end(), closed.begin()) ||
                 decode({closed.back()}) != close_text) {
@@ -1208,6 +1209,15 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             }
             ThinkingSetup setup;
             setup.close = closed.back();
+            // Qwen's assistant answer starts after a blank line following </think>.
+            // Gemma's calibrated readout remains immediately after <channel|>.
+            const std::string separator = close_text == "</think>" ? "\n\n" : "";
+            const auto answer_prefix = encode(text + close_text + separator);
+            if (answer_prefix.size() < closed.size() || !std::equal(closed.begin(), closed.end(), answer_prefix.begin())) {
+                refuse("this model cannot tokenize the reasoning answer boundary",
+                       "thinking", "decisions_thinking_not_supported");
+            }
+            setup.separator.assign(answer_prefix.begin() + static_cast<std::ptrdiff_t>(closed.size()), answer_prefix.end());
             std::size_t letters = 0;
             for (const DecisionQuestion& question : request.questions) {
                 if (!question.extended()) { letters = std::max(letters, question.option_count()); }
@@ -1215,9 +1225,9 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             std::set<TokenId> seen;
             for (std::size_t i = 0; i < letters; ++i) {
                 const std::string label(1, static_cast<char>('A' + i));
-                const std::vector<TokenId> appended = encode(text + close_text + label);
-                if (appended.size() != closed.size() + 1 ||
-                    !std::equal(closed.begin(), closed.end(), appended.begin()) ||
+                const std::vector<TokenId> appended = encode(text + close_text + separator + label);
+                if (appended.size() != answer_prefix.size() + 1 ||
+                    !std::equal(answer_prefix.begin(), answer_prefix.end(), appended.begin()) ||
                     !seen.insert(appended.back()).second) {
                     refuse("option letter '" + label + "' is not a single token after '" + close_text +
                                "' for this model, so it cannot think here",
@@ -1415,6 +1425,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
             struct Thinker {
                 std::size_t question = 0;
                 std::vector<TokenId> prompt;
+                sinfer::PreparedPrompt prepared;
                 std::size_t budget = 0;
                 DecisionThought thought;
                 std::vector<float> logits;
@@ -1437,9 +1448,10 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                     .deadline = Clock::now() + pending_timeout, .cancellation = CancellationView(is_cancelled)};
                 Thinker thinker;
                 thinker.question = i;
-                thinker.prompt =
-                    prepare_chat_as(thinking->semantics, thinking_control, chat.system, chat.user).token_ids();
-                const auto budget = decision_thinking_budget(kDecisionThinkingBudget, thinker.prompt.size(), max_context);
+                thinker.prepared = prepare_chat_as(thinking->semantics, thinking_control, chat.system, chat.user);
+                thinker.prompt = thinker.prepared.token_ids();
+                const auto budget = decision_thinking_budget(kDecisionThinkingBudget, thinker.prompt.size(), max_context,
+                                                              1 + thinking->separator.size());
                 // Not even an empty thought fits the context: the one-pass answer stands.
                 if (!budget) { continue; }
                 thinker.budget = *budget;
@@ -1469,7 +1481,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                     for (std::size_t j = start; j < end; ++j) {
                         check_client();
                         const Thinker& thinker = thinkers[pending[j]];
-                        prompts.push_back(engine_->prepare_tokens(thinker.prompt));
+                        prompts.push_back(engine_->continue_prompt(thinker.prepared));
                         sinfer::RequestOptions row = generation;
                         row.execution.requested_output_tokens = decision_thinking_generation_limit(thinker.budget);
                         rows.push_back(std::move(row));
@@ -1498,7 +1510,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                     const std::size_t options = request.questions[thinker.question].option_count();
                     thought_queries.push_back(ParallelQuery{
                         .parent     = -1,
-                        .suffix     = decision_thinking_readout(thinker.prompt, thinker.thought, thinking->close),
+                        .suffix     = decision_thinking_readout({}, thinker.thought, thinking->close, thinking->separator),
                         .candidates = std::vector<TokenId>(thinking->letters.begin(),
                                                            thinking->letters.begin() + static_cast<std::ptrdiff_t>(options))});
                 }
@@ -1508,7 +1520,9 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                 CandidateReadout thought_readout = in_engine([&] {
                     return read_candidates(
                         thought_queries,
-                        [&](std::size_t k) { return engine_->prepare_tokens(thought_queries[k].suffix); }, base,
+                        [&](std::size_t k) {
+                            return engine_->continue_prompt(thinkers[pending[k]].prepared, thought_queries[k].suffix);
+                        }, base,
                         adapter.lifetime, readout_deadline, readout_cancellation,
                         [&] { check_preparation_control(readout_deadline, is_cancelled); }, "decisions were cancelled");
                 });
@@ -1552,7 +1566,7 @@ DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,
                 const auto thought_tokens = static_cast<int>(thinker.thought.tokens.size());
                 outcome.reasoning_tokens += thought_tokens;
                 outcome.output_tokens += thought_tokens + 1;
-                outcome.input_tokens += static_cast<int>(2 * thinker.prompt.size()) + thought_tokens + 1;
+                outcome.input_tokens += static_cast<int>(2 * thinker.prompt.size() + thinking->separator.size()) + thought_tokens + 1;
             }
             outcome.thinking_questions = thinkers.size();
             outcome.thinking_attempts  = round;

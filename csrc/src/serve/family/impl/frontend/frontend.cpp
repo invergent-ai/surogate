@@ -1229,6 +1229,35 @@ PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept            = default;
 PreparedPrompt PreparedPrompt::clone() const {
     return data_ ? PreparedPrompt(std::make_unique<PreparedPromptData>(*data_)) : PreparedPrompt();
 }
+
+PreparedPrompt PreparedPrompt::with_suffix(std::span<const TokenId> suffix) const {
+    if (!data_) { throw std::logic_error("prepared prompt is empty"); }
+    if (suffix.empty()) { return clone(); }
+    const std::size_t old_count = data_->token_ids.size();
+    const std::size_t count = old_count + suffix.size();
+    if (count < old_count || count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+        static_cast<std::int64_t>(count) + data_->rope_delta > std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument("continued prompt positions exceed int32");
+    }
+    if (std::any_of(suffix.begin(), suffix.end(), [](TokenId token) { return token < 0; })) {
+        throw std::invalid_argument("continued prompt tokens must be nonnegative");
+    }
+    auto result = std::make_unique<PreparedPromptData>(*data_);
+    result->token_ids.insert(result->token_ids.end(), suffix.begin(), suffix.end());
+    result->token_types.resize(count, 0);
+    result->positions.resize(count * 3);
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto old_axis = data_->position_axis(axis);
+        std::copy(old_axis.begin(), old_axis.end(), result->positions.begin() + axis * count);
+        for (std::size_t i = old_count; i < count; ++i) {
+            result->positions[axis * count + i] = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(i) + data_->rope_delta);
+        }
+    }
+    // Chat rewrite checkpoints describe the original rendering, not this raw continuation.
+    result->identity = {.reusable = false};
+    return PreparedPrompt(std::move(result));
+}
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
@@ -1675,6 +1704,11 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 
 PromptCapabilities Frontend::prompt_capabilities() const noexcept {
     return impl_ != nullptr ? impl_->capabilities : PromptCapabilities{};
+}
+
+std::string Frontend::reasoning_close() const {
+    if (!impl_) { throw std::logic_error("frontend is moved from"); }
+    return impl_->reasoning.close;
 }
 
 MediaCacheSummary Frontend::media_cache_summary() const {

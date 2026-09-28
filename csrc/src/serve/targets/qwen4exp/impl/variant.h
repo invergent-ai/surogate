@@ -64,6 +64,8 @@ struct Variant {
     // --- residual hooks (ResidualHooks<Variant> probes for these) ---
     static void embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,
                                WorkspaceArena& workspace, cudaStream_t stream);
+    static void scatter_visual(const ModelView& model, const Tensor& visual, const Tensor& indices,
+                                Tensor& residual, cudaStream_t stream);
     static void final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
                                    WorkspaceArena& workspace, cudaStream_t stream);
     static void attention_norm(const Tensor& residual, const FullAttentionProjectionWeights& weights,

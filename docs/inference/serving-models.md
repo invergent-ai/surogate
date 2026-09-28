@@ -303,13 +303,17 @@ of pinned system RAM**, even with all decoder layers on GPU. It is loaded from d
 startup, and the GPU fetches the selected rows over PCIe; the full table does not occupy VRAM.
 
 Keep the original GGUF shards available: the prepared artifact references their weight data.
-This Flash-Next GGUF path serves text generation. Adapters with native GGML shared experts
-are not currently supported.
+To accept images, also download the matching `mmproj-Qwen3.8-Flash-Next-BF16.gguf` from
+the same release and add `--vision --mmproj ~/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf`.
+The vision tower stays BF16. Both chat completions and decisions accept images, including
+multiple images and image requests with thinking enabled. Adapters with native GGML shared
+experts are not currently supported.
 
 The [Decisions API](decisions.md) accepts choice, noul and score questions, including shared
-state and option-order averaging. Decision `thinking: true` currently requires Gemma's
-thought-close protocol and is rejected for this Qwen model; ordinary chat generation uses
-Qwen's own thinking template.
+state and option-order averaging. Decision `thinking: true` uses Qwen's reasoning markers:
+uncertain questions generate a thought, then score the choices after `</think>\n\n`.
+Thinking and option-order averaging cannot be combined. Chat generation uses Qwen's own
+thinking template through `chat_template_kwargs.enable_thinking`.
 
 ### Using CPU cores and an expert cache
 

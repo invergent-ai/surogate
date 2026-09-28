@@ -127,7 +127,8 @@ template <class V>
         const std::size_t scores =
             ops::qsa_indexer_select_workspace_capacity_bytes(static_cast<std::int32_t>(columns),
                                                              keys, geometry);
-        return raw_keys + 2 * queries + mask + scores;
+        const auto positions = round_up_256(columns * 3 * sizeof(std::int32_t));
+        return raw_keys + 2 * queries + mask + std::max(scores, positions);
     }
 }
 

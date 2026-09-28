@@ -1160,6 +1160,26 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     image_input.messages.push_back(std::move(image_message));
     auto prepared             = frontend.prepare(std::move(image_input));
     const auto& prepared_data = FrontendFactory::inspect(prepared);
+    const std::array<sinfer::TokenId, 3> continuation{0, 248069, 32};
+    const auto extended = prepared.with_suffix(continuation);
+    const auto& extended_data = FrontendFactory::inspect(extended);
+    const auto original_count = prepared_data.token_ids.size();
+    failures += check(extended_data.token_ids.size() == original_count + continuation.size() &&
+                          std::equal(prepared_data.token_ids.begin(), prepared_data.token_ids.end(), extended_data.token_ids.begin()) &&
+                          std::equal(continuation.begin(), continuation.end(), extended_data.token_ids.begin() + original_count) &&
+                          extended_data.media_payloads == prepared_data.media_payloads &&
+                          extended_data.vision_items.size() == prepared_data.vision_items.size() &&
+                          extended_data.rope_delta == prepared_data.rope_delta &&
+                          !extended_data.identity.reusable && !extended_data.identity.rewrite_checkpoint,
+                      "image continuation lost tokens, media payloads or position identity");
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto old_positions = prepared_data.position_axis(axis);
+        const auto new_positions = extended_data.position_axis(axis);
+        failures += check(std::equal(old_positions.begin(), old_positions.end(), new_positions.begin()) &&
+                              new_positions[original_count] == static_cast<std::int64_t>(original_count) + prepared_data.rope_delta &&
+                              new_positions.back() == static_cast<std::int64_t>(original_count + 2) + prepared_data.rope_delta,
+                          "image continuation corrupted mRoPE axes or their decode offset");
+    }
     failures += check(prepared_data.has_media() && prepared_data.vision_items.size() == 1,
                       "image frontend did not retain one Vision item");
     if (!prepared_data.vision_items.empty()) {

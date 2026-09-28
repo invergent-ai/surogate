@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -342,6 +343,13 @@ int main() {
         expect(decision_thinking_budget(kDecisionThinkingBudget, 8190, 8192) == std::optional<std::size_t>(0),
                "only an empty thought fits");
         expect(!decision_thinking_budget(kDecisionThinkingBudget, 8191, 8192).has_value(), "nothing fits: the one-pass answer stands");
+        expect(decision_thinking_readout({2, 3}, DecisionThought{.tokens = {7}, .closed = true}, C, {99}) ==
+                   Ids{2, 3, 7, C, 99}, "Qwen readout includes its answer separator after the close");
+        expect(decision_thinking_budget(512, 8000, 8192, 2) == std::optional<std::size_t>(189),
+               "Qwen budget reserves both its close token and answer separator");
+        expect(!decision_thinking_budget(512, 8190, 8192, 2), "Qwen separator cannot exceed the context");
+        expect(!decision_thinking_budget(512, std::numeric_limits<std::size_t>::max(), 8192),
+               "oversized prompt cannot wrap the budget arithmetic");
     }
 
     // ---- 6. The answer after a thought ----

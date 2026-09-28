@@ -7,6 +7,14 @@
 
 namespace sinfer::ops::detail {
 
+void scatter_broadcast_launch(const Tensor& src, const Tensor& indices, Tensor& dst,
+                              std::int32_t streams, cudaStream_t stream) {
+    scatter_broadcast_bf16x8_kernel<<<src.ne[1], 128, 0, stream>>>(
+        static_cast<const uint4*>(src.data), static_cast<const std::int32_t*>(indices.data),
+        static_cast<uint4*>(dst.data), src.ne[0] / 8, streams);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     constexpr int block        = 256;
     constexpr int vector_block = 128;

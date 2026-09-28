@@ -342,6 +342,11 @@ void Variant::prepare_expert_split(const ModelView& model) {
 
 }
 
+void Variant::scatter_visual(const ModelView& model, const Tensor& visual, const Tensor& indices,
+                             Tensor& residual, cudaStream_t stream) {
+    ops::scatter_broadcast(visual, indices, residual, model.geometry.hc_streams, stream);
+}
+
 void Variant::prewarm_device_scratch(const family::TextGeometry& g) {
     InjectScratch& scratch = inject_scratch_for_current_device(g.hc_streams);
     if (scratch.data == nullptr) {

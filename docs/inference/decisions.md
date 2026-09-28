@@ -283,11 +283,15 @@ nothing extra, and a request with thinking off costs exactly what it did. The th
 bounded by the client, as a chat generation is, not by `--pending-timeout-ms`, which still
 bounds each queue wait; a client that disconnects cancels it.
 
-**What can think.** Thinking needs a chat template with a thinking switch and a tokenizer in
-which `<channel|>` (Gemma 4's thought close) and each option letter after it are single tokens;
-the endpoint checks both before any GPU work and otherwise refuses the request with HTTP 400
-`decisions_thinking_not_supported`, as it does thinking on a request with `images` (not
-supported yet). The protocol was designed and measured on Gemma 4 (Rune).
+**What can think.** Thinking supports Gemma 4's `<channel|>` boundary and Qwen's
+`</think>\n\n` boundary. The model must expose a thinking switch, a single close token,
+and single-token option letters after its answer boundary. The endpoint checks these before
+GPU work and otherwise returns HTTP 400 `decisions_thinking_not_supported`.
+The steps above describe Gemma 4 (Rune), where the gate and budget were originally measured.
+For Qwen, generation stops at `</think>` and readout follows the blank line after it;
+context budgeting reserves that separator too. Image requests support `thinking: true`
+when the server has vision enabled. Image patches and their positions are retained for both
+reasoning generation and the final choice readout.
 
 **Retries.** A thinking readout whose logits come out non-finite is thought again from scratch,
 for the failed questions only, up to `--decision-attempts` rounds in all; each round after the

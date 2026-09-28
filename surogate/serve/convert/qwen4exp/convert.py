@@ -28,12 +28,14 @@ from surogate.serve.convert.common.gguf_source import (
 from surogate.serve.convert.common import conversion as family_conversion
 
 from surogate.serve.convert.common.qwen4exp import geometry_block
+from surogate.serve.convert.common.qwen3_5 import vision_geometry_block
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
 
 from . import inventory as inv
 from . import recipe as rcp
+from . import vision
 
-RECIPE_ID = "qwen4exp-gguf-config-v4"
+RECIPE_ID = "qwen4exp-gguf-config-v5"
 _GROUP = 32
 
 
@@ -184,7 +186,8 @@ def validate_source_inventory(g: inv.Geometry, source: GgufSource) -> None:
 
 
 def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
-            *, device: str = "cuda", mtp: str | Path | None = None) -> Path:
+            *, device: str = "cuda", mtp: str | Path | None = None,
+            mmproj: str | Path | None = None) -> Path:
     """Write the artifact. `device` is accepted so the ingest path can call every converter
     the same way; nothing here needs a GPU, because nothing here quantises any more.
 
@@ -193,29 +196,25 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
     """
     started = time.perf_counter()
     del device
-    source = GgufSource(Path(gguf), (Path(mtp),) if mtp is not None else ())
+    projector = vision.find_projector(gguf, mmproj) if mmproj is not None else None
+    source = GgufSource(Path(gguf), tuple(Path(p) for p in (mtp, projector) if p is not None))
     try:
         output = Path(out_path)
         output.parent.mkdir(parents=True, exist_ok=True)
 
-        g = inv.geometry_from_gguf(source, token_domain=tokenizer_domain(frontend_dir))
+        vc = vision.config_from_gguf(source.readers[0], source.readers[-1]) if projector else None
+        g = inv.geometry_from_gguf(source, token_domain=tokenizer_domain(frontend_dir), vision_config=vc)
         inv.validate_inventory(g)
         rcp.validate_recipe_coverage(g)
         validate_source_inventory(g, source)
-        # The tower is not reachable from this source. Every published GGUF export of this model
-        # drops it (the four-shard Q4_K_XL set has 1,224 tensors and none of them vision), and the
-        # recipes name GGUF tensors, so an export that did carry one would need its own mapping
-        # rather than a silent text-only artifact.
-        if any(name.startswith(("v.", "mm.")) or "vision" in name for name in source.tensors):
-            raise NotImplementedError(
-                "this GGUF carries a vision tower; the qwen4exp recipes cover the text stack only"
-            )
+        if not projector and any(name.startswith(("v.", "mm.")) for name in source.tensors):
+            raise ValueError("pass the separate Flash-Next vision projector with --mmproj")
         # The head is present when its GGUF was passed; `blk.48` is the proof, since a trunk
         # shard stops at 47.
         has_mtp = f"blk.{g.layers}.nextn.eh_proj.weight" in source.tensors
         if mtp is not None and not has_mtp:
             raise ValueError(f"{mtp} carries no blk.{g.layers} NextN head")
-        tensor_specs, object_specs = inv.active_specs(geometry=g, vision=False)
+        tensor_specs, object_specs = inv.active_specs(geometry=g)
 
         recipes = {item.object_name: item for item in rcp.build_recipes(g)}
         if g.ple_ngram:
@@ -262,6 +261,12 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
 
         frontend = family_conversion.load_resources(frontend_dir, inv.RESOURCE_SPECS)
         resources = {item.name: item.data for item in frontend}
+        if projector:
+            resources["frontend/preprocessor_config.json"] = vision.preprocessor_config(source.readers[-1])
+            image_config = json.loads(resources["frontend/preprocessor_config.json"])
+            resources["frontend/video_preprocessor_config.json"] = json.dumps({
+                **image_config, "video_processor_type": "Qwen3VLVideoProcessor", "fps": 2.0,
+                "min_frames": 4, "max_frames": 768}).encode()
         plan = family_conversion.build_object_plan(object_specs, resources)
         reader = GgufRecipeReader(source)
 
@@ -274,6 +279,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             plan.specs,
             external=external,
             geometry=geometry_block(g),
+            vision_geometry=vision_geometry_block(g.declared.hf_config, text_hidden=g.hidden),
             layer_types=g.layer_types,
         ) as writer:
             for index, spec in enumerate(specs, start=1):
@@ -324,10 +330,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--mtp", default=None,
                         help="the NextN draft head's GGUF (mtp-*-shared-*.gguf), read in place")
+    parser.add_argument("--mmproj", help="matching Flash-Next vision projector GGUF")
     parser.add_argument("--device", default="cuda",
                         help="accepted for a uniform call across the converters; unused")
     args = parser.parse_args(argv)
-    convert(args.gguf, args.frontend, args.out, device=args.device, mtp=args.mtp)
+    convert(args.gguf, args.frontend, args.out, device=args.device, mtp=args.mtp, mmproj=args.mmproj)
     return 0
 
 

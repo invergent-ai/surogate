@@ -14,6 +14,7 @@
 #include "api/ops/linear.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scale.h"
+#include "api/ops/scatter.h"
 #include "api/ops/sigmoid_mul.h"
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -445,6 +446,16 @@ struct ResidualHooks {
             // Gemma casts its configured embedding factor to BF16 before multiplying.
             const float scale = as_bf16(model.geometry.embedding_scale);
             if (scale != 0.0F) { ops::scale(residual, scale, stream); }
+        }
+    }
+
+    /// Insert visual embeddings into each architecture's residual representation.
+    static void scatter_visual(const Model& model, const Tensor& visual, const Tensor& indices,
+                                Tensor& residual, cudaStream_t stream) {
+        if constexpr (requires { Variant::scatter_visual(model, visual, indices, residual, stream); }) {
+            Variant::scatter_visual(model, visual, indices, residual, stream);
+        } else {
+            ops::scatter(visual, indices, residual, stream);
         }
     }
 

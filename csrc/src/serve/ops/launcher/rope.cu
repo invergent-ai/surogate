@@ -239,6 +239,12 @@ void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, floa
     CUDA_CHECK(cudaGetLastError());
 }
 
+void rope_interleaved_single_launch(const Tensor& positions, int rotary_dim, float theta,
+                                    int height_pairs, int width_pairs, Tensor& x, cudaStream_t stream) {
+    launch_generic(positions, rotary_dim, rotary_dim / 2, theta, &x, nullptr, stream, height_pairs, width_pairs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                         Tensor& x, cudaStream_t stream) {
     const bool whole = active_pairs == rotary_dim / 2;

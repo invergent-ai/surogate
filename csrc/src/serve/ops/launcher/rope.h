@@ -12,6 +12,8 @@ namespace sinfer::ops::detail {
 void rope_interleaved_launch(const Tensor& positions, int rotary_dim, float theta,
                              int height_pairs, int width_pairs, Tensor& q, Tensor& k,
                              cudaStream_t stream);
+void rope_interleaved_single_launch(const Tensor& positions, int rotary_dim, float theta,
+                                    int height_pairs, int width_pairs, Tensor& x, cudaStream_t stream);
 
 void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                  Tensor& q, Tensor& k, cudaStream_t stream, float frequency_scale);

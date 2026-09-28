@@ -12,6 +12,8 @@ namespace sinfer::ops {
 // The sections sum to rotary_dim/2. Storage and arithmetic follow rope below.
 void rope_interleaved(const Tensor& positions, int rotary_dim, float theta,
                       std::array<int, 3> sections, Tensor& q, Tensor& k, cudaStream_t stream);
+void rope_interleaved(const Tensor& positions, int rotary_dim, float theta,
+                      std::array<int, 3> sections, Tensor& x, cudaStream_t stream);
 
 /**
  * Applies split-half NeoX RoPE in place. For pair i in [0,rotary_dim/2), angle phi(i,t), and

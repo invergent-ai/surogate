@@ -24,17 +24,19 @@ std::vector<std::uint16_t> bit_pattern(std::size_t count, std::uint32_t seed) {
 }
 
 int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
-                 std::int32_t destination_columns) {
+                 std::int32_t destination_columns, std::int32_t streams = 1) {
     const std::int32_t source_columns = static_cast<std::int32_t>(indices.size());
     const auto source = bit_pattern(static_cast<std::size_t>(rows) * source_columns, 0x1324'68acu);
     const auto destination =
-        bit_pattern(static_cast<std::size_t>(rows) * destination_columns, 0x9876'4321u);
+        bit_pattern(static_cast<std::size_t>(rows) * streams * destination_columns, 0x9876'4321u);
     auto expected = destination;
     for (std::int32_t source_column = 0; source_column < source_columns; ++source_column) {
         const std::int32_t destination_column = indices[static_cast<std::size_t>(source_column)];
         for (std::int32_t row = 0; row < rows; ++row) {
-            expected[static_cast<std::size_t>(destination_column) * rows + row] =
-                source[static_cast<std::size_t>(source_column) * rows + row];
+            for (int stream = 0; stream < streams; ++stream) {
+                expected[(static_cast<std::size_t>(destination_column) * streams + stream) * rows + row] =
+                    source[static_cast<std::size_t>(source_column) * rows + row];
+            }
         }
     }
 
@@ -48,8 +50,9 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
 
     Tensor source_tensor(device_source.data(), DType::BF16, {rows, source_columns});
     Tensor indices_tensor(device_indices.data(), DType::I32, {source_columns});
-    Tensor destination_tensor(device_destination.data(), DType::BF16, {rows, destination_columns});
-    ops::scatter(source_tensor, indices_tensor, destination_tensor, nullptr);
+    Tensor destination_tensor(device_destination.data(), DType::BF16, {rows * streams, destination_columns});
+    if (streams == 1) ops::scatter(source_tensor, indices_tensor, destination_tensor, nullptr);
+    else ops::scatter_broadcast(source_tensor, indices_tensor, destination_tensor, streams, nullptr);
     cuda_synchronize();
 
     const std::string label =
@@ -197,6 +200,8 @@ int main() {
     int failures = 0;
     failures += scatter_case(5120, {4, 0, 7, 2}, 9);
     failures += scatter_case(2048, {5, 1, 3}, 7);
+    failures += scatter_case(2560, {5, 1, 3}, 7, 4);
+    failures += scatter_case(96, {4, 0, 7, 2}, 9, 3);
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     failures += batch_prefix_case();

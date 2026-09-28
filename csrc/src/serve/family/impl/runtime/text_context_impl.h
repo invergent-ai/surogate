@@ -2089,6 +2089,8 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
             .rotary_dim = cfg_.rotary_dim,
             .rope_theta = cfg_.rope_theta,
             .rms_eps    = cfg_.rms_eps,
+            .mrope_height = cfg_geometry().mrope_height,
+            .mrope_width = cfg_geometry().mrope_width,
         };
         // Dependent on V so the discarded branch is never checked against a target whose
         // attention payload has no indexer.
@@ -2119,8 +2121,9 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         // pools them into a block key, so skipping the append below the budget would leave holes.
         Tensor raw_keys = work_.alloc(DType::BF16, {geometry.head_dim, tokens});
         ops::detail::bf16_cublaslt_gemm(indexer.key, hidden, raw_keys, s);
+        Tensor indexer_positions = rope_positions.numel() == tokens ? rope_positions.view({tokens}) : rope_positions;
         ops::qsa_indexer_append(raw_keys, cache_positions, table_rows, columns_per_row,
-                                indexer.key_norm, geometry, cache, s);
+                                indexer.key_norm, geometry, cache, s, indexer_positions);
         if (!sparse) { return ops::GqaBlockMask{}; }
 
         const std::int32_t width = geometry.head_dim * geometry.heads;
@@ -2130,8 +2133,22 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         Tensor heads      = queries.view({geometry.head_dim, geometry.heads, tokens});
         Tensor heads_norm = normalized.view({geometry.head_dim, geometry.heads, tokens});
         ops::rmsnorm(heads, indexer.query_norm, geometry.rms_eps, true, heads_norm, s);
-        Tensor rope_view = rope_positions.view({tokens});
-        ops::rope(rope_view, geometry.rotary_dim, geometry.rope_theta, heads_norm, s);
+        if (indexer_positions.ne[1] == 3) {
+            auto position_scope = work_.scope();
+            // A packed segment can be a strided slice of all three position axes.
+            // Compact only this small position array; the query heads stay in place.
+            Tensor rope_view = indexer_positions;
+            if (!rope_view.is_contiguous()) {
+                rope_view = work_.alloc(DType::I32, {tokens, 3});
+                CUDA_CHECK(cudaMemcpy2DAsync(rope_view.data, rope_view.nb[1], indexer_positions.data,
+                    indexer_positions.nb[1], tokens * sizeof(std::int32_t), 3, cudaMemcpyDeviceToDevice, s));
+            }
+            ops::rope_interleaved(rope_view, geometry.rotary_dim, geometry.rope_theta,
+                                  {cfg_geometry().mrope_temporal, geometry.mrope_height, geometry.mrope_width},
+                                  heads_norm, s);
+        } else {
+            ops::rope(indexer_positions, geometry.rotary_dim, geometry.rope_theta, heads_norm, s);
+        }
 
         ops::qsa_indexer_select(heads_norm, cache_positions, table_rows, columns_per_row, geometry,
                                 cache, keys, work_, mask, s);
@@ -2419,7 +2436,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         copy_i32(visual_indices[sg].data(), indices, s);
         Tensor embedding = segments[sg].vision->embeddings.slice(1, visual_begins[sg], visual_indices[sg].size());
         Tensor residual = x.slice(1, segment_begin[sg], segments[sg].ids.size());
-        ops::scatter(embedding, indices, residual, s);
+        Hooks::scatter_visual(weights_, embedding, indices, residual, s);
     }
     capture_per_layer_source(x, s);
     if constexpr (Hooks::per_layer_inputs) {
@@ -3739,7 +3756,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 copy_i32(local_scatter_indices.data(), indices_device, s);
                 Tensor embeddings = vision_chunk.embeddings.slice(
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, indices_device, x, s);
+                Hooks::scatter_visual(weights_, embeddings, indices_device, x, s);
             }
             capture_per_layer_source(x, s);
             if constexpr (Hooks::per_layer_inputs) {

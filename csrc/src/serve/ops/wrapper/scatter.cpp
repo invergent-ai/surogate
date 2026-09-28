@@ -8,6 +8,24 @@
 
 namespace sinfer::ops {
 
+void scatter_broadcast(const Tensor& src, const Tensor& indices, Tensor& dst,
+                       std::int32_t streams, cudaStream_t stream) {
+    if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32 ||
+        streams <= 0 || src.ne[0] <= 0 || src.ne[0] % 8 || src.ne[1] < 0 || dst.ne[1] < 0 ||
+        static_cast<std::int64_t>(src.ne[0]) * streams != dst.ne[0] ||
+        src.ne[2] != 1 || src.ne[3] != 1 || dst.ne[2] != 1 || dst.ne[3] != 1 ||
+        indices.ne[0] != src.ne[1] || indices.ne[1] != 1 || indices.ne[2] != 1 || indices.ne[3] != 1 ||
+        !src.is_contiguous() || !indices.is_contiguous() || !dst.is_contiguous()) {
+        throw std::invalid_argument("scatter_broadcast: expected contiguous BF16 [D,V] to [D*streams,T], D divisible by eight");
+    }
+    if (!src.ne[1]) { return; }
+    if (!src.data || !dst.data || !indices.data ||
+        ((reinterpret_cast<std::uintptr_t>(src.data) | reinterpret_cast<std::uintptr_t>(dst.data)) & 15U)) {
+        throw std::invalid_argument("scatter_broadcast: missing or unaligned data");
+    }
+    detail::scatter_broadcast_launch(src, indices, dst, streams, stream);
+}
+
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
         throw std::invalid_argument("scatter: src/dst must be BF16 and indices must be I32");

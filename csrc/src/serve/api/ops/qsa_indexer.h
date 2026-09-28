@@ -23,9 +23,9 @@
 
 namespace sinfer::ops {
 
-// 64 raw 128-wide keys and 16 pooled keys per page: 160 BF16 values per token
-// for the registered 128-wide, four-cell indexer.
-inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 160;
+// Per page: 64 raw keys, 16 pooled keys, and 16 aligned int32[4] block positions.
+// The latter retain the first member's three mRoPE axes across chunk boundaries.
+inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 162;
 
 struct QsaIndexerGeometry {
     std::int32_t head_dim   = 0; // indexer key/query width
@@ -35,6 +35,8 @@ struct QsaIndexerGeometry {
     std::int32_t rotary_dim = 0;
     float rope_theta        = 0.0F;
     float rms_eps           = 1.0e-6F;
+    std::int32_t mrope_height = 0;
+    std::int32_t mrope_width = 0;
 };
 
 /// Words of a per-row block bitmask covering `keys` cells: one bit per block, LSB first.
@@ -54,10 +56,12 @@ struct QsaIndexerGeometry {
 ///   table_rows I32 [S]  block-table row per sequence; column c belongs to sequence
 ///                       `c / columns_per_row` (one sequence for the whole call when
 ///                       `columns_per_row` is the column count, one column each when it is 1)
+///   rope_positions optional I32 [T] or axis-strided [T,3], defaults to cache positions;
+///                  the first member's coordinates are retained with each pooled block.
 void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
                         std::int32_t columns_per_row, const Tensor& key_norm,
                         const QsaIndexerGeometry& geometry, PagedKVBatchLayerView cache,
-                        cudaStream_t stream);
+                        cudaStream_t stream, const Tensor& rope_positions = {});
 
 /// Selects the visible blocks of every query row and writes its bitmask.
 ///   q          BF16 [head_dim, heads, rows]  normalised and roped indexer queries

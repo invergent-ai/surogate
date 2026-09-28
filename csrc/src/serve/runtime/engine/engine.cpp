@@ -390,6 +390,23 @@ std::vector<TokenId> Engine::encode_fragment(std::string_view text) const {
     }, impl_->active);
 }
 
+PreparedPrompt Engine::continue_prompt(const PreparedPrompt& prompt, std::span<const TokenId> suffix) const {
+    if (!impl_ || !prompt.impl_) { throw std::logic_error("engine or prepared prompt is empty"); }
+    const auto count = static_cast<std::uint64_t>(prompt.summary().prompt_tokens) + suffix.size();
+    if (count > impl_->options.max_context) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded, "continued prompt exceeds Engine max_context");
+    }
+    auto prepared = prompt.impl_->value.with_suffix(suffix);
+    auto summary = prepared.summary();
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+        summary, prompt.impl_->prepare, prompt.impl_->sampling_mode, std::move(prepared)));
+}
+
+std::string Engine::reasoning_close() const {
+    if (!impl_) { throw std::logic_error("Engine is moved from"); }
+    return std::visit([](const auto& target) { return target->loaded->frontend.reasoning_close(); }, impl_->active);
+}
+
 std::vector<std::string> Engine::token_texts(std::span<const TokenId> ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

@@ -66,10 +66,10 @@ DecisionChat decision_thinking_chat(const DecisionsRequest& request, const Decis
 }
 
 std::optional<std::size_t> decision_thinking_budget(std::size_t budget, std::size_t prompt_tokens,
-                                                    std::size_t max_context) {
+                                                    std::size_t max_context, std::size_t closing_tokens) {
     // The readout prefills prompt + thought + close and reads one position beyond them.
-    if (prompt_tokens + 2 > max_context) { return std::nullopt; }
-    return std::min(budget, max_context - prompt_tokens - 2);
+    if (prompt_tokens >= max_context || closing_tokens >= max_context - prompt_tokens) { return std::nullopt; }
+    return std::min(budget, max_context - prompt_tokens - closing_tokens - 1);
 }
 
 std::uint32_t decision_thinking_generation_limit(std::size_t budget) {
@@ -95,12 +95,13 @@ DecisionThought decision_thought(const std::vector<TokenId>& generated, TokenId 
 }
 
 std::vector<TokenId> decision_thinking_readout(const std::vector<TokenId>& prompt, const DecisionThought& thought,
-                                               TokenId close) {
+                                               TokenId close, const std::vector<TokenId>& separator) {
     std::vector<TokenId> tokens;
-    tokens.reserve(prompt.size() + thought.tokens.size() + 1);
+    tokens.reserve(prompt.size() + thought.tokens.size() + 1 + separator.size());
     tokens.insert(tokens.end(), prompt.begin(), prompt.end());
     tokens.insert(tokens.end(), thought.tokens.begin(), thought.tokens.end());
     tokens.push_back(close);
+    tokens.insert(tokens.end(), separator.begin(), separator.end());
     return tokens;
 }
 

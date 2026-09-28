@@ -43,6 +43,13 @@ __device__ __forceinline__ void rope_sincos(float position, int pair, int rotary
     sincosf(position * frequency, sine, cosine);
 }
 
+__device__ __forceinline__ std::int32_t* block_positions(__nv_bfloat16* plane,
+                                                        const std::int32_t* table, int position) {
+    const auto page = indexer_offset(table, position - position % kPagedKVPageSize);
+    const auto offset = page + kPagedKVPageSize * kHeadDim * (kBlock + 1) / kBlock;
+    return reinterpret_cast<std::int32_t*>(plane + offset) + (position % kPagedKVPageSize / kBlock) * 4;
+}
+
 // One warp per new column: writes the token's raw indexer key into its cell.
 __global__ void qsa_append_raw_kernel(const __nv_bfloat16* __restrict__ keys,
                                       const std::int32_t* __restrict__ positions,
@@ -50,7 +57,8 @@ __global__ void qsa_append_raw_kernel(const __nv_bfloat16* __restrict__ keys,
                                       std::int32_t columns_per_row,
                                       const std::int32_t* __restrict__ block_tables,
                                       std::int32_t table_stride, __nv_bfloat16* __restrict__ plane,
-                                      int tokens) {
+                                      int tokens, const std::int32_t* rope_positions,
+                                      std::int64_t rope_axis_stride, int rope_axes) {
     const int warp  = static_cast<int>(threadIdx.x) / kWarp;
     const int lane  = static_cast<int>(threadIdx.x) % kWarp;
     const int token = static_cast<int>(blockIdx.x) * kWarps + warp;
@@ -63,6 +71,10 @@ __global__ void qsa_append_raw_kernel(const __nv_bfloat16* __restrict__ keys,
     __nv_bfloat16* dst       = plane + indexer_offset(block_table, positions[token]) + d0;
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) { dst[i] = src[i]; }
+    if (positions[token] % kBlock == 0 && lane < 4) {
+        block_positions(plane, block_table, positions[token])[lane] = lane == 3 ? 0 :
+            rope_positions[token + (rope_axes == 3 ? lane * rope_axis_stride : 0)];
+    }
 }
 
 // One warp per new column: if the column completed a block, folds that block's raw keys into the
@@ -76,7 +88,8 @@ __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ position
                                        std::int32_t table_stride,
                                        const __nv_bfloat16* __restrict__ key_norm,
                                        __nv_bfloat16* __restrict__ plane, int tokens,
-                                       int rotary_dim, float theta, float eps) {
+                                       int rotary_dim, float theta, float eps,
+                                       int height_pairs, int width_pairs) {
     const int warp  = static_cast<int>(threadIdx.x) / kWarp;
     const int lane  = static_cast<int>(threadIdx.x) % kWarp;
     const int token = static_cast<int>(blockIdx.x) * kWarps + warp;
@@ -130,7 +143,10 @@ __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ position
         if (d >= rotary_dim) { continue; }
         const int pair = d < half ? d : d - half;
         float sin_a, cos_a;
-        rope_sincos(static_cast<float>(first), pair, rotary_dim, theta, &sin_a, &cos_a);
+        const int axis = pair % 3 == 1 && pair < 3 * height_pairs ? 1 :
+                         pair % 3 == 2 && pair < 3 * width_pairs ? 2 : 0;
+        const auto* axes = block_positions(plane, block_table, first);
+        rope_sincos(static_cast<float>(axes[axis]), pair, rotary_dim, theta, &sin_a, &cos_a);
         value[i] = d < half ? value[i] * cos_a - partner[i] * sin_a
                             : value[i] * cos_a + partner[i] * sin_a;
     }
@@ -290,7 +306,7 @@ std::size_t qsa_indexer_select_workspace_capacity_bytes(std::int32_t rows, std::
 void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
                         std::int32_t columns_per_row, const Tensor& key_norm,
                         const QsaIndexerGeometry& geometry, PagedKVBatchLayerView cache,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, const Tensor& rope_positions) {
     require(geometry.head_dim == kHeadDim && geometry.block == kBlock,
             "only the 128-wide, 4-cell indexer is registered");
     require(geometry.rotary_dim > 0 && geometry.rotary_dim <= kHeadDim &&
@@ -308,6 +324,13 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
     const int tokens = static_cast<int>(keys.ne[1]);
     if (tokens == 0) { return; }
     require(positions.ne[0] == tokens, "positions must match the columns");
+    const Tensor& rope = rope_positions.data ? rope_positions : positions;
+    require(rope.dtype == DType::I32 && rope.ne[0] == tokens &&
+                (rope.ne[1] == 1 || rope.ne[1] == 3) && rope.ne[2] == 1 && rope.ne[3] == 1 &&
+                rope.nb[0] == sizeof(std::int32_t), "rope positions must be I32 [T] or [T,3]");
+    require(geometry.mrope_height >= 0 && geometry.mrope_width >= 0 &&
+                geometry.mrope_height <= (geometry.rotary_dim / 2 + 1) / 3 &&
+                geometry.mrope_width <= geometry.rotary_dim / 6, "invalid mRoPE sections");
     const int blocks = (tokens + kWarps - 1) / kWarps;
     require(table_rows.data != nullptr && table_rows.dtype == DType::I32,
             "table rows must be a non-null I32 vector");
@@ -319,14 +342,15 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
         static_cast<const std::int32_t*>(positions.data),
         static_cast<const std::int32_t*>(table_rows.data), columns_per_row,
         static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
-        static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens);
+        static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens,
+        static_cast<const std::int32_t*>(rope.data), rope.nb[1] / sizeof(std::int32_t), rope.ne[1]);
     qsa_append_fold_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data),
         static_cast<const std::int32_t*>(table_rows.data), columns_per_row,
         static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
         static_cast<const __nv_bfloat16*>(key_norm.data),
         static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens, geometry.rotary_dim,
-        geometry.rope_theta, geometry.rms_eps);
+        geometry.rope_theta, geometry.rms_eps, geometry.mrope_height, geometry.mrope_width);
 }
 
 void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& table_rows,

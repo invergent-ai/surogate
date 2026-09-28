@@ -32,6 +32,12 @@ namespace sinfer::ops {
  */
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream);
 
+/// Copy each source column [D,V] into every residual stream of dst [D*streams,T]
+/// at indices[V]. Fused BF16x8 copies, no expanded intermediate; D must be divisible
+/// by eight. Shapes are contiguous, indices unique and in range, with no aliasing.
+void scatter_broadcast(const Tensor& src, const Tensor& indices, Tensor& dst,
+                       std::int32_t streams, cudaStream_t stream);
+
 /**
  * Scatter compact request-major BF16 blocks into lane-owned fixed storage.
  *

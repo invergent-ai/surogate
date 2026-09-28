@@ -85,6 +85,9 @@ public:
     // Raw token input is retained for parity tools and repeatable performance measurement.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+    /// Continue an already prepared prompt without losing image payloads or mRoPE positions.
+    [[nodiscard]] PreparedPrompt continue_prompt(const PreparedPrompt& prompt,
+                                                 std::span<const TokenId> suffix = {}) const;
 
     /// A prompt served exactly as written, with no chat template: what `/v1/completions` sends,
     /// and the only shape a base model can be asked anything in.
@@ -106,6 +109,7 @@ public:
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
+    [[nodiscard]] std::string reasoning_close() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its

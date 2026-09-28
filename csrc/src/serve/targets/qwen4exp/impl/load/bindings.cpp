@@ -483,6 +483,17 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;
+    if (plan.features.vision) {
+        const auto& vg = plan.vision_geometry;
+        runtime.vision_geometry = vg;
+        auto& vision = runtime.vision.emplace();
+        vision.common = family::materialize_vision_common(
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm, vg);
+        vision.merger_fc2 = artifact::materialized_linear(backing, plan.vision_merger_fc2,
+                                                          vg.output_hidden, vg.merger_hidden());
+        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
+                                                               NumericFormat::BF16, {g.hidden});
+    }
     runtime.token_embedding = artifact::materialized_linear(backing, plan.token_embedding, static_cast<std::int32_t>(g.output_rows),
         static_cast<std::int32_t>(g.hidden));
 

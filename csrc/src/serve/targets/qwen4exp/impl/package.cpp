@@ -66,9 +66,6 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                        static_cast<std::uint32_t>(options.pipeline_stage_first),
                        options.offload_vision, options.offload_embeddings, options.offload_output_head);
     const family::StartupFeatures features = family::startup_features(options);
-    if (features.vision) {
-        throw std::runtime_error("qwen3.8-flash-next: vision is not served by this target");
-    }
     if (features.dflash()) {
         throw std::runtime_error("qwen3.8-flash-next: DFlash is not served by this target");
     }
@@ -134,7 +131,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
     bind_lora(model.impl_->data.runtime, options);
     return family::make_frontend(model.impl_->data.frontend,
                                   family::FrontendOptions{
-                                      .vision_enabled = false,
+                                      .vision_enabled = model.impl_->data.runtime.features.vision,
                                       .max_context    = options.max_context,
                                       .media_cache_bytes        = options.media_cache_bytes,
                                       .media_live_bytes         = options.media_live_bytes,

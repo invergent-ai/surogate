@@ -115,7 +115,10 @@ def geometry_from_config(config: Mapping, *, ple_table_rows: int = 0,
 def geometry_block(g: Geometry) -> dict:
     from surogate.serve.artifact.geometry import validate_resolved_geometry
     values = hybrid.geometry_block(g)
-    values.update(residual=g.residual, draft_vocab=0, **{
+    # The shared checkpoint resolver validates this interleaved partition. Publish
+    # it explicitly so both decoder attention and the QSA indexer use the image axes.
+    values.update(residual=g.residual, draft_vocab=0,
+                  mrope_temporal=11, mrope_height=11, mrope_width=10, **{
         name: getattr(g, name) for name in (
             "hc_streams", "hc_low_rank", "indexer_heads", "indexer_head_dim",
             "indexer_top_k", "indexer_block", "ple_layer", "ple_ngram",
@@ -126,7 +129,7 @@ def geometry_block(g: Geometry) -> dict:
     return validate_resolved_geometry(values)
 
 
-def geometry_from_gguf(source, *, token_domain: int | None = None) -> Geometry:
+def geometry_from_gguf(source, *, token_domain: int | None = None, vision_config: Mapping | None = None) -> Geometry:
     # Resolve the trunk from the first shard; the optional NextN file has separate metadata.
     reader = source.readers[0]
     if reader.kv("general.architecture") != "qwen4exp":
@@ -187,6 +190,10 @@ def geometry_from_gguf(source, *, token_domain: int | None = None) -> Geometry:
         config["ple_embed_dim"] = (config["ngram_size"] - 1) * config["heads_per_ngram"] * head
     config["mtp_num_hidden_layers"] = int(
         f"blk.{config['num_hidden_layers']}.nextn.eh_proj.weight" in source.tensors)
+    if vision_config is not None:
+        config = {"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp",
+                  "text_config": config, "vision_config": dict(vision_config),
+                  "image_token_id": config.get("image_token_id")}
     g = geometry_from_config(config, ple_table_rows=table_rows, token_domain=token_domain)
     if ple:
         multipliers = required("ple.layer_multipliers")

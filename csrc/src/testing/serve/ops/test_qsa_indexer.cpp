@@ -52,7 +52,7 @@ float bf16_round(float value) {
 // The block key the kernel must produce: mean of the block's raw keys, RMS-normalised with the
 // gain, then split-half NeoX rope at the block's first position.
 std::vector<float> reference_block_key(const std::vector<float>& raw, int first,
-                                       const std::vector<float>& gain) {
+                                       const std::vector<float>& gain, bool mrope = false) {
     std::vector<float> value(kHeadDim, 0.0F);
     for (int c = 0; c < kBlock; ++c) {
         for (int d = 0; d < kHeadDim; ++d) {
@@ -69,7 +69,9 @@ std::vector<float> reference_block_key(const std::vector<float>& raw, int first,
     std::vector<float> out(value);
     const int half = kRotary / 2;
     for (int d = 0; d < half; ++d) {
-        const float angle = static_cast<float>(first) *
+        const int axis = d % 3 == 1 && d < 33 ? 1 : d % 3 == 2 && d < 30 ? 2 : 0;
+        const int coordinate = !mrope ? first : axis == 0 ? 17 + first / 40 : axis == 1 ? 23 + first / 7 : 31 + first % 19;
+        const float angle = static_cast<float>(coordinate) *
                             std::pow(kTheta, -2.0F * static_cast<float>(d) / kRotary);
         const float c = std::cos(angle), s = std::sin(angle);
         out[d]        = value[d] * c - value[d + half] * s;
@@ -128,7 +130,7 @@ void expect(bool condition, const std::string& what) {
 
 } // namespace
 
-int main() {
+int run_case(bool mrope) {
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
 
@@ -157,12 +159,24 @@ int main() {
         std::vector<int> rows(1, 0);
         DeviceBuffer d_rows = to_device_i32(rows);
         Tensor rows_t(d_rows.p, DType::I32, {1});
-        sinfer::ops::qsa_indexer_append(keys, pos_t, rows_t, count, gain_t, geometry(2048),
-                                        cache.batch_view(), nullptr);
+        auto g = geometry(2048);
+        g.mrope_height = mrope ? 11 : 0;
+        g.mrope_width = mrope ? 10 : 0;
+        std::vector<int> rope(3 * (count + 3), -999);
+        for (int i = 0; i < count; ++i) {
+            rope[i] = 17 + (begin + i) / 40;
+            rope[count + 3 + i] = 23 + (begin + i) / 7;
+            rope[2 * (count + 3) + i] = 31 + (begin + i) % 19;
+        }
+        DeviceBuffer d_rope = to_device_i32(rope);
+        Tensor rope_t(d_rope.p, DType::I32, {count, 3});
+        rope_t.nb[1] = (count + 3) * sizeof(int); // slice of a larger packed round
+        sinfer::ops::qsa_indexer_append(keys, pos_t, rows_t, count, gain_t, g,
+                                        cache.batch_view(), nullptr, mrope ? rope_t : Tensor{});
         cudaStreamSynchronize(nullptr);
     };
-    append(0, 256);
-    for (int t = 256; t < tokens; ++t) { append(t, 1); }
+    append(0, 257);
+    for (int t = 257; t < tokens; ++t) { append(t, 1); }
     expect(cudaGetLastError() == cudaSuccess, "append launched cleanly");
 
     // A rejected speculative suffix can start inside an already folded block.
@@ -185,7 +199,7 @@ int main() {
     // and a fixed floor where the value is near zero).
     double worst = 0.0;
     for (int b = 0; b * kBlock + kBlock <= tokens; ++b) {
-        const std::vector<float> want = reference_block_key(raw, b * kBlock, gain);
+        const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope);
         const std::size_t base        = cache.cell_offset(b * kBlock);
         for (int d = 0; d < kHeadDim; ++d) {
             const double tolerance = 0.008 * std::abs(want[d]) + 0.004;
@@ -194,7 +208,7 @@ int main() {
     }
     if (worst >= 1.0) { // report where it diverges before failing
         for (int b = 0; b * kBlock + kBlock <= tokens && b < 3; ++b) {
-            const std::vector<float> want = reference_block_key(raw, b * kBlock, gain);
+            const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope);
             const std::size_t base        = cache.cell_offset(b * kBlock);
             std::cerr << "block " << b << " (first " << b * kBlock << "):";
             for (int d = 0; d < 6; ++d) {
@@ -293,4 +307,11 @@ int main() {
 
     if (failures == 0) { std::cout << "qsa_indexer: all checks passed\n"; }
     return failures == 0 ? 0 : 1;
+}
+
+int main() {
+    if (cuda_unavailable()) { return 77; }
+    run_case(false);
+    run_case(true);
+    return failures ? 1 : 0;
 }

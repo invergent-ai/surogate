@@ -73,6 +73,7 @@ def test_ple_table_rows_are_not_guessed_from_vocab_base():
 
 def test_vision_uses_its_own_config():
     g = inv.geometry_from_config(config_for(vision=True), ple_table_rows=128)
+    recipe.validate_recipe_coverage(g)
     with_tower, _ = inv.active_specs(geometry=g)
     text, _ = inv.active_specs(geometry=g, vision=False)
     assert len(with_tower) - len(text) == len(inv.build_vision_specs(g)) > 0
@@ -107,8 +108,8 @@ def gguf_metadata(g):
     return {"qwen4exp." + k: v for k, v in values.items()}
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path, mixed):
+@pytest.mark.parametrize("mixed,vision", [(False, False), (True, False), (True, True)])
+def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path, mixed, vision):
     from gguf import GGUFWriter, GGMLQuantizationType
     from gguf.quants import quantize
     from surogate.serve.convert.qwen4exp.convert import convert
@@ -165,13 +166,57 @@ def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path, mixed):
     for name, value in resources.items():
         (front / name).write_text(json.dumps(value))
     (front / "chat_template.jinja").write_text("{{ messages }}")
-    out = convert(src, front, tmp_path / "model.sinfer", device="cpu")
+    projector = None
+    if vision:
+        from surogate.serve.convert.qwen4exp import vision as vl
+        from surogate.serve.convert.common.recipe import source_requirements
+        projector = tmp_path / "mmproj.gguf"
+        vc = dict(depth=2, hidden_size=96, intermediate_size=192, num_heads=3,
+                  in_channels=3, temporal_patch_size=2, patch_size=16, spatial_merge_size=2,
+                  num_position_embeddings=16, out_hidden_size=g.hidden)
+        vg = inv.geometry_from_config({**config, "vision_config": vc}, ple_table_rows=128)
+        pw = GGUFWriter(str(projector), "clip")
+        metadata = {"clip.projector_type": "qwen3vl_merger", "clip.use_gelu": True,
+                    "clip.vision.block_count": 2, "clip.vision.embedding_length": 96,
+                    "clip.vision.feed_forward_length": 192, "clip.vision.attention.head_count": 3,
+                    "clip.vision.patch_size": 16, "clip.vision.spatial_merge_size": 2,
+                    "clip.vision.projection_dim": g.hidden, "clip.vision.image_size": 64,
+                    "clip.vision.is_deepstack_layers": [False, False],
+                    "clip.vision.attention.layer_norm_epsilon": 1e-6,
+                    "clip.vision.image_mean": [0.5]*3, "clip.vision.image_std": [0.5]*3}
+        for name, value in metadata.items():
+            if isinstance(value, bool): pw.add_bool(name, value)
+            elif isinstance(value, str): pw.add_string(name, value)
+            elif isinstance(value, list): pw.add_array(name, value)
+            elif isinstance(value, float): pw.add_float32(name, value)
+            else: pw.add_uint32(name, value)
+        for name, requirement in source_requirements(vl.build_recipes(vg)).items():
+            value = np.zeros(requirement.shape, dtype=np.float32)
+            if name.startswith("v.patch_embd.weight"):
+                value.fill(2 if name.endswith(".1") else 1)
+            pw.add_tensor(name, value)
+        pw.write_header_to_file(); pw.write_kv_data_to_file(); pw.write_tensors_to_file(); pw.close()
+    out = convert(src, front, tmp_path / "model.sinfer", device="cpu", mmproj=projector)
     with Artifact(out) as artifact:
         assert artifact.identity.architecture == "qwen4exp"
+        if vision:
+            assert artifact.vision_geometry["hidden"] == 96
+            assert artifact.vision_geometry["patch_dim"] == 1536
+            assert artifact.find("vision/patch_embedding").format == "BF16"
+            assert artifact.find("vision/merger/fc2").shape == (g.hidden, 384)
+            # Two GGUF temporal planes become interleaved within each RGB channel,
+            # matching the processor's [channel,time,y,x] patch vectors.
+            patch = np.frombuffer(bytes(artifact.payload("vision/patch_embedding")), dtype=np.uint16).reshape(96, 3, 2, 16, 16)
+            assert np.all(patch[:, :, 0] == 0x3f80)
+            assert np.all(patch[:, :, 1] == 0x4000)
+            processor = json.loads(bytes(artifact.payload("frontend/preprocessor_config.json")))
+            assert processor["patch_size"] == 16 and processor["temporal_patch_size"] == 2
+            assert processor["image_std"] == [.5, .5, .5]
         assert artifact.geometry["hidden"] == g.hidden
         assert artifact.geometry["residual"] == g.residual
         assert artifact.geometry["gdn_value_head_dim"] == g.gdn_value_head_dim
         assert artifact.geometry["token_domain"] == 500
+        assert [artifact.geometry["mrope_" + axis] for axis in ("temporal", "height", "width")] == [11, 11, 10]
         assert artifact.geometry["ple_table_rows"] == 128
         assert tuple(artifact.layer_types) == g.layer_types
 
