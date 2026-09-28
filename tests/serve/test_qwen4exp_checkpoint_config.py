@@ -107,12 +107,14 @@ def gguf_metadata(g):
     return {"qwen4exp." + k: v for k, v in values.items()}
 
 
-def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path, mixed):
     from gguf import GGUFWriter, GGMLQuantizationType
     from gguf.quants import quantize
     from surogate.serve.convert.qwen4exp.convert import convert
     from surogate.serve.artifact.container import Artifact
-    g = inv.geometry_from_config(config_for(), ple_table_rows=128)
+    config = config_for(hidden=256 if mixed else 128)
+    g = inv.geometry_from_config(config, ple_table_rows=128)
     src = tmp_path / "renamed.gguf"
     writer = GGUFWriter(str(src), "qwen4exp")
     for name, value in gguf_metadata(g).items():
@@ -125,7 +127,27 @@ def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path):
             writer.add_tensor(name, np.zeros((128, 18), dtype=np.uint8), raw_dtype=GGMLQuantizationType.IQ4_NL)
         else:
             value = np.ones(shape, dtype=np.float32) * .01
-            if len(shape) >= 2 and shape[-1] % 32 == 0:
+            formats = {
+                "token_embd.weight": "Q3_K", "output.weight": "Q5_K",
+                "attn_qkv.weight": "IQ4_XS", "attn_gate.weight": "Q4_K",
+                "ssm_out.weight": "Q5_0", "ffn_gate_shexp.weight": "IQ4_XS",
+                "ffn_up_shexp.weight": "Q3_K", "ffn_down_shexp.weight": "Q5_0",
+                "ffn_gate_exps.weight": "Q2_0", "ffn_up_exps.weight": "Q2_0",
+                "ffn_down_exps.weight": "Q2_0", "hc_attn_down.weight": "Q2_0",
+            }
+            quant = next((q for suffix, q in formats.items() if name.endswith(suffix)), None) if mixed else None
+            if mixed and name == "blk.2.ffn_down_shexp.weight":
+                quant = "Q8_0"
+            if quant:
+                from gguf import GGML_QUANT_SIZES
+                qtype = 42 if quant == "Q2_0" else GGMLQuantizationType[quant]
+                block, size = (64, 18) if quant == "Q2_0" else GGML_QUANT_SIZES[qtype]
+                assert shape[-1] % block == 0
+                data = np.zeros((*shape[:-1], shape[-1] // block * size), dtype=np.uint8)
+                # Explicit logical shape and signed byte view also work with older
+                # gguf-py writers whose type enum does not yet name Q2_0.
+                writer.add_tensor(name, data.view(np.int8), raw_shape=shape, raw_dtype=qtype)
+            elif len(shape) >= 2 and shape[-1] % 32 == 0:
                 writer.add_tensor(name, quantize(value, GGMLQuantizationType.Q8_0), raw_dtype=GGMLQuantizationType.Q8_0)
             else:
                 writer.add_tensor(name, value)
@@ -138,7 +160,7 @@ def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path):
     writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_tensors_to_file(); writer.close()
     front = tmp_path / "frontend"
     front.mkdir()
-    resources = {"config.json": config_for(), "tokenizer.json": {
+    resources = {"config.json": config, "tokenizer.json": {
         "model": {"type": "BPE", "vocab": {str(i): i for i in range(500)}}}, "tokenizer_config.json": {}}
     for name, value in resources.items():
         (front / name).write_text(json.dumps(value))
@@ -152,3 +174,20 @@ def test_cpu_gguf_conversion_preserves_resolved_geometry(tmp_path):
         assert artifact.geometry["token_domain"] == 500
         assert artifact.geometry["ple_table_rows"] == 128
         assert tuple(artifact.layer_types) == g.layer_types
+
+        embedding = artifact.find("text/token_embedding")
+        shared = artifact.find("text/layers/0/mlp/shared_gate_up")
+        routed = artifact.find("text/layers/0/mlp/routed_gate_up")
+        if mixed:
+            assert embedding.format == "Q3_K" and embedding.runs
+            assert shared.segments == (("IQ4_XS", g.shared_intermediate), ("Q3_K", g.shared_intermediate))
+            assert shared.runs
+            assert routed.format == "Q2_0" and routed.runs
+            assert artifact.find("text/layers/0/mlp/shared_down").format == "Q5_0"
+            assert artifact.find("text/layers/2/mlp/shared_down").format == "Q8_0"
+            assert artifact.find("text/layers/2/mlp/shared_gate_up").segments
+            assert artifact.find("text/layers/0/gdn/query_key_value_z").segments
+            assert artifact.find("text/layers/0/gdn/output").group_map
+        else:
+            assert embedding.format == inv.W8
+            assert shared.format == inv.W8 and not shared.segments

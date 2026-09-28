@@ -1,4 +1,6 @@
 #include "api/ops/lora_store.h"
+#include "api/ops/linear_swiglu.h"
+#include "api/ops/silu_mul.h"
 #include "api/ops/lora_router.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "api/ops/sparse_moe.h"
@@ -220,9 +222,11 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
             "caller expects a router this geometry is not");
     }
     if (geometry.has_shared()) {
-        if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
-            weights.shared_down.qtype != QType::W8G32_F16S) {
-            throw std::invalid_argument("sparse_moe: shared weights must be W8");
+        if (detail::native_shared(weights) &&
+            (!detail::ggml::is_ggml_qtype(weights.shared_gate_up.qtype) ||
+             !detail::ggml::is_ggml_qtype(weights.shared_down.qtype) ||
+             geometry.activation != GatedActivation::Silu || geometry.swiglu_limit != 0)) {
+            throw std::invalid_argument("sparse_moe: shared weights require paired W8 or GGML SwiGLU projections");
         }
     } else if (weights.shared_gate_up.qdata != nullptr || weights.shared_down.qdata != nullptr) {
         // A routed-only geometry with shared weights attached is a caller that thinks this
@@ -288,10 +292,24 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
                           "routed_down", ranges);
     }
     if (geometry.has_shared()) {
-        require_quantized(weights.shared_gate_up, geometry.shared_rows(), geometry.hidden,
-                          "shared_gate_up", ranges);
-        require_quantized(weights.shared_down, geometry.hidden, geometry.shared_intermediate,
-                          "shared_down", ranges);
+        const auto shared = [&](const Weight& weight, int rows, int columns, const char* name) {
+            if (detail::ggml::is_ggml_qtype(weight.qtype)) {
+                require_matrix_metadata(weight, rows, columns, name);
+                detail::ggml::require_ggml_weight(weight, name);
+                if (weight.segment_count) {
+                    for (int i = 0; i < weight.segment_count; ++i) {
+                        const auto& segment = weight.segments[i];
+                        ranges.push_back(address_range(segment.qdata, segment.bytes, name));
+                    }
+                } else {
+                    ranges.push_back(address_range(weight.qdata, weight.payload_bytes, name));
+                }
+            } else {
+                require_quantized(weight, rows, columns, name, ranges);
+            }
+        };
+        shared(weights.shared_gate_up, geometry.shared_rows(), geometry.hidden, "shared_gate_up");
+        shared(weights.shared_down, geometry.hidden, geometry.shared_intermediate, "shared_down");
     }
 }
 
@@ -305,6 +323,18 @@ void require_registered(const SparseMoeGeometry& geometry) {
         std::to_string(geometry.experts_per_token) + ", intermediate " +
         std::to_string(geometry.intermediate) + ", shared " +
         std::to_string(geometry.shared_intermediate) + "} is not registered");
+}
+
+std::size_t native_shared_capacity(const SparseMoeGeometry& geometry, int first, int last) {
+    if (!geometry.has_shared()) { return 0; }
+    const auto plane = [last](int rows) { return round_up(std::size_t(rows) * last * 2, std::size_t(256)); };
+    // The single-format GGML SwiGLU query also covers mixed gate/up segments.
+    const auto gate = linear_swiglu_workspace_capacity_bytes(
+        QType::Q8_0, geometry.shared_rows(), geometry.hidden, first, last);
+    const auto down = linear_workspace_capacity_bytes(
+        QType::Q8_0, geometry.hidden, geometry.shared_intermediate,
+        LinearPolicy::A16Only, first, last);
+    return plane(geometry.hidden) + plane(geometry.shared_intermediate) + std::max(gate, down);
 }
 
 } // namespace
@@ -412,7 +442,7 @@ bool sparse_moe_prefill_routing_admitted(QType routed_gate_up, QType routed_down
 std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
                                                 QType routed_gate_up, QType routed_down,
                                                 std::int32_t min_tokens, std::int32_t max_tokens,
-                                                SparseMoeRouting routing) {
+                                                SparseMoeRouting routing, bool native_shared) {
     require_registered(geometry);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
@@ -460,7 +490,7 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
                                 geometry, max_tokens, nvfp4_profile,
                                 detail::sparse_moe_routed_int8_profile(routed_gate_up, routed_down)));
     }
-    return required;
+    return required + (native_shared ? native_shared_capacity(geometry, min_tokens, max_tokens) : 0);
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
@@ -522,6 +552,9 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         ? lora_store_for_current_device().bank_table(weights.router_shared_gate.qdata) : nullptr;
     const std::int32_t resolve_tokens = hook.max_resolve_tokens > 0
         ? hook.max_resolve_tokens : std::numeric_limits<std::int32_t>::max();
+    if (detail::native_shared(weights) && adapters) {
+        throw std::invalid_argument("sparse_moe: adapters on native shared experts are not supported");
+    }
     if (adapters && tokens > resolve_tokens) {
         // Adapter routing is batched too. Keep each hook invocation within the cache's
         // capacity and preserve the adapter column IDs when advancing through the request.
@@ -573,6 +606,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     } else {
         required = detail::sparse_moe_decode_workspace_bytes(geometry, adapters ? tokens : 1);
     }
+    const bool native_shared = detail::native_shared(weights);
+    if (native_shared) { required += native_shared_capacity(geometry, tokens, tokens); }
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("sparse_moe: insufficient workspace capacity");
@@ -581,6 +616,28 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
+    detail::PreparedSparseMoeWeights prepared(weights);
+    if (native_shared) {
+        prepared.shared_output = workspace.alloc(DType::BF16, {geometry.hidden, tokens});
+        auto shared_scope = workspace.scope();
+        Tensor activation = workspace.alloc(DType::BF16, {geometry.shared_intermediate, tokens});
+        if (routing == SparseMoeRouting::WidthInvariant) {
+            // Keep the shared path's rounding boundary fixed for packed prefill
+            // rounds too, including a final round containing just one token.
+            auto gate_scope = workspace.scope();
+            Tensor gate = workspace.alloc(DType::BF16, {geometry.shared_intermediate, tokens});
+            Tensor up = workspace.alloc(DType::BF16, {geometry.shared_intermediate, tokens});
+            linear_projections(x, {
+                {weights.shared_gate_up, gate, LinearPolicy::A16Only, 0},
+                {weights.shared_gate_up, up, LinearPolicy::A16Only, geometry.shared_intermediate},
+            }, &workspace, stream);
+            silu_mul(gate, up, activation, stream);
+        } else {
+            linear_swiglu(x, weights.shared_gate_up, activation, LinearPolicy::A16Only, workspace, stream);
+        }
+        linear(activation, weights.shared_down, prepared.shared_output, LinearPolicy::A16Only,
+               workspace, stream);
+    }
     if (use_prefill) {
         const detail::SparseMoePrefillPlan plan =
             detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down,
@@ -588,7 +645,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens,
                                                           plan.routed_trtllm, plan.routed_int8);
-        detail::sparse_moe_prefill_launch(geometry, x, router_x, weights, destination, plan,
+        detail::sparse_moe_prefill_launch(geometry, x, router_x, prepared, destination, plan,
                                           views, stream, round_hook);
         return;
     }
@@ -604,7 +661,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
             const Tensor x_slice      = x.slice(1, offset, slice);
             const Tensor router_slice = router_x.slice(1, offset, slice);
             Tensor destination_slice  = destination.slice(1, offset, slice);
-            detail::sparse_moe_small_t_launch(geometry, x_slice, router_slice, weights,
+            detail::sparse_moe_small_t_launch(geometry, x_slice, router_slice, prepared.slice(offset, slice),
                                               destination_slice, plan, views, stream, round_hook);
             offset += slice;
         }
@@ -628,7 +685,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                  c.geometry, c.banks, c.slots, c.stride, stream);
                 if (c.next) { c.next->resolve(c.next->context, ids, alpha, input, output, stream); }
             }, &correction};
-        detail::sparse_moe_decode_launch(geometry, x, router_x, weights, destination, views,
+        detail::sparse_moe_decode_launch(geometry, x, router_x, prepared, destination, views,
             stream, weights.router_bias ? &corrected : round_hook, adapters, slots);
         return;
     }
@@ -636,7 +693,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         const Tensor x_column      = x.slice(1, token, 1);
         const Tensor router_column = router_x.slice(1, token, 1);
         Tensor destination_column  = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(geometry, x_column, router_column, weights,
+        detail::sparse_moe_decode_launch(geometry, x_column, router_column, prepared.slice(token, 1),
                                          destination_column, views, stream, round_hook, adapters,
                                          !adapters ? nullptr : adapter_round.slots
                                             ? static_cast<const std::int32_t*>(adapter_round.slots->data) + token

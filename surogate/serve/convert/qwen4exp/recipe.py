@@ -12,7 +12,7 @@ from surogate.serve.convert.common.recipe import (
 from . import inventory as inv
 
 
-NATIVE_EXCLUDE_SUFFIXES = (
+W8_REPACK_SUFFIXES = (
     "text/token_embedding",
     "text/output_head",
     "attention/query_key_gate_value",

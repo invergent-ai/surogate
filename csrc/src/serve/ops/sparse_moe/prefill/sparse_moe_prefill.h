@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
+#include "ops/sparse_moe/shared.h"
 #include "ops/sparse_moe/trtllm/trtllm_moe.h"
 
 #include <cuda_runtime.h>
@@ -210,7 +211,7 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 [[nodiscard]] std::int32_t sparse_moe_fault_warp_skew_ns() noexcept;
 
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                               const Tensor& router_x, const SparseMoeWeights& weights,
+                               const Tensor& router_x, const PreparedSparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);

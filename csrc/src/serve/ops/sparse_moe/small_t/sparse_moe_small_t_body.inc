@@ -172,7 +172,7 @@ void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha,
     }
 }
 
-void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
+void launch_s3_tiled(const Tensor& x, const PreparedSparseMoeWeights& weights,
                      const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
                      cudaStream_t stream) {
     sparse_moe_decode_launch_d3_small_t(
@@ -180,7 +180,7 @@ void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
         static_cast<float*>(workspace.scratch.data), plan.tokens, plan.d3_schedule, stream);
 }
 
-void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
+void launch_s4_tiled(const PreparedSparseMoeWeights& weights, Tensor& destination,
                      const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
                      cudaStream_t stream) {
     sparse_moe_decode_launch_d4_small_t(
@@ -342,7 +342,7 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 // passes the same tensor twice. Gemma 4 does not: its router reads the post-attention residual
 // normalised with no weight and scaled by a learned per-channel vector, its experts the same
 // residual through `pre_feedforward_layernorm_2`. Two projections of one token.
-void small_t_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
+void small_t_launch(const Tensor& x, const Tensor& router_x, const PreparedSparseMoeWeights& weights,
                     Tensor& destination, const SparseMoeSmallTPlan& plan,
                     const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                     const SparseMoeRoundHook* hook) {

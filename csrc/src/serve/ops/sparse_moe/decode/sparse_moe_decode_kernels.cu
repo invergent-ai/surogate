@@ -82,7 +82,7 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe64Geometry)
 } // namespace geometry_lfm2_moe64
 
 void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,
-                                         const SparseMoeWeights& weights, const int* token_ids,
+                                         const PreparedSparseMoeWeights& weights, const int* token_ids,
                                          float* token_activations, std::int32_t tokens,
                                          SparseMoeSmallTD3Schedule schedule, cudaStream_t stream,
                                          const int* adaptive_route_jobs) {
@@ -137,7 +137,7 @@ void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, cons
 }
 
 void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
-                                         const SparseMoeWeights& weights, Tensor& destination,
+                                         const PreparedSparseMoeWeights& weights, Tensor& destination,
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
@@ -195,7 +195,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
 }
 
 void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                              const Tensor& router_x, const SparseMoeWeights& weights,
+                              const Tensor& router_x, const PreparedSparseMoeWeights& weights,
                               Tensor& destination, const SparseMoeDecodeWorkspace& workspace,
                               cudaStream_t stream, const SparseMoeRoundHook* hook,
                               const LoraBank* adapters, const std::int32_t* adapter_slot) {

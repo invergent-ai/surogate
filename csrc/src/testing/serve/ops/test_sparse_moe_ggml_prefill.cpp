@@ -203,8 +203,21 @@ std::vector<std::uint8_t> make_q5_1_blocks(std::int64_t rows, std::int32_t k, st
     return out;
 }
 
+std::vector<std::uint8_t> make_q2_0_blocks(std::int64_t rows, std::int32_t k, std::uint64_t seed) {
+    std::vector<std::uint8_t> out(std::size_t(rows) * (k / 64) * 18);
+    Rng rng(seed);
+    for (std::size_t offset = 0; offset < out.size(); offset += 18) {
+        const float sign = (rng.next() & 1) ? -1.0F : 1.0F;
+        const auto scale = __float2half(sign * 0.0625F * spread(rng));
+        std::memcpy(out.data() + offset, &scale, 2);
+        for (int j = 2; j < 18; ++j) { out[offset + j] = static_cast<std::uint8_t>(rng.next()); }
+    }
+    return out;
+}
+
 /// Values per stored block: 32 for the plain formats, 256 for a K-quant superblock.
 std::int32_t values_per_block(QType qtype) {
+    if (qtype == QType::Q2_0) { return 64; }
     return qtype == QType::Q8_0 || qtype == QType::Q5_0 || qtype == QType::Q5_1 ? 32 : 256;
 }
 
@@ -214,6 +227,7 @@ std::int32_t values_per_block(QType qtype) {
 std::vector<std::uint8_t> make_blocks(QType qtype, std::int64_t rows, std::int32_t k,
                                       std::uint64_t seed) {
     switch (qtype) {
+    case QType::Q2_0: return make_q2_0_blocks(rows, k, seed);
     case QType::Q3_K: return make_q3_k_blocks(rows, k, seed, 0.0030F);   // 128 d
     case QType::Q4_K: return make_q4_k_blocks(rows, k, seed, 0.00040F);  // 945 d
     case QType::Q5_K: return make_q5_k_blocks(rows, k, seed, 0.00020F);  // 1953 d
@@ -307,6 +321,10 @@ public:
             router[static_cast<std::size_t>(e) * g.hidden + e] = f32_to_bf16(1.0F);
         }
         router_ = to_device(router);
+        if (g.has_shared()) {
+            shared_gate_up_ = to_device(make_q2_0_blocks(g.shared_rows(), g.hidden, 0xBA17));
+            shared_down_ = to_device(make_q2_0_blocks(g.hidden, g.shared_intermediate, 0xCA28));
+        }
 
         if (mixture.per_expert_scaled) {
             std::vector<float> scale(static_cast<std::size_t>(g.experts));
@@ -334,8 +352,12 @@ public:
             .routed_down        = ggml_blocks_weight(down_.p, down_.bytes, mixture_.down,
                                                      g.experts * g.hidden, g.intermediate,
                                                      values_per_block(mixture_.down)),
-            .shared_gate_up     = Weight{},
-            .shared_down        = Weight{},
+            .shared_gate_up = g.has_shared()
+                ? ggml_blocks_weight(shared_gate_up_.p, shared_gate_up_.bytes, QType::Q2_0,
+                                     g.shared_rows(), g.hidden, 64) : Weight{},
+            .shared_down = g.has_shared()
+                ? ggml_blocks_weight(shared_down_.p, shared_down_.bytes, QType::Q2_0,
+                                     g.hidden, g.shared_intermediate, 64) : Weight{},
             .experts_per_token  = g.experts_per_token,
         };
         return w;
@@ -347,6 +369,8 @@ private:
     DeviceBuffer down_;
     DeviceBuffer router_;
     DeviceBuffer per_expert_scale_;
+    DeviceBuffer shared_gate_up_;
+    DeviceBuffer shared_down_;
 };
 
 /// Runs the op over `tokens` columns in chunks of `chunk`, into a destination seeded with zero.
@@ -355,12 +379,14 @@ private:
 std::vector<double> run_moe(const ops::SparseMoeWeights& weights,
                             const ops::SparseMoeGeometry& geometry, const DeviceBuffer& x,
                             const DeviceBuffer& router_x, std::int32_t tokens,
-                            std::int32_t chunk) {
+                            std::int32_t chunk,
+                            ops::SparseMoeRouting routing = ops::SparseMoeRouting::ByWidth) {
     const std::size_t values = static_cast<std::size_t>(geometry.hidden) * tokens;
     DeviceBuffer out(values * sizeof(std::uint16_t));
     out.fill(0);
     const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
-        geometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, 1, chunk);
+        geometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, 1, chunk,
+        routing, weights.shared_down.qdata && weights.shared_down.qtype != QType::W8G32_F16S);
     WorkspaceArena workspace(workspace_bytes);
     const Tensor x_all(x.p, DType::BF16, {geometry.hidden, tokens});
     const Tensor router_all(router_x.p, DType::BF16, {geometry.hidden, tokens});
@@ -371,7 +397,7 @@ std::vector<double> run_moe(const ops::SparseMoeWeights& weights,
         const Tensor rs          = router_all.slice(1, offset, width);
         Tensor os                = out_all.slice(1, offset, width);
         ops::sparse_moe(xs, rs, weights, ops::SparseMoeEpilogue::AddResidual, os, workspace,
-                        nullptr, ops::SparseMoeRoundHook{});
+                        nullptr, ops::SparseMoeRoundHook{}, routing);
     }
     cuda_synchronize();
     return from_device_bf16(out.p, values);
@@ -433,7 +459,8 @@ int run_mixture(const Mixture& mixture, const std::vector<std::int32_t>& token_c
         std::cerr << mixture.name << ": the plan refuses this pair; the comparison would be vacuous\n";
         return 1;
     }
-    if (ops::detail::sparse_moe_routed_int8_profile(mixture.gate_up, mixture.down) == bf16_route()) {
+    const bool expect_int8 = !bf16_route();
+    if (ops::detail::sparse_moe_routed_int8_profile(mixture.gate_up, mixture.down) != expect_int8) {
         std::cerr << mixture.name << ": the plan's route does not match this registration\n";
         return 1;
     }
@@ -463,12 +490,100 @@ int run_mixture(const Mixture& mixture, const std::vector<std::int32_t>& token_c
     return failures;
 }
 
+// A closed-form shared-expert reference at Flash-Next dimensions. Routed experts
+// contain zero weights, so their contribution is exactly zero. Shared rows carry
+// different scales; token-dependent sigmoid gates catch dropped/sliced outputs.
+int run_native_shared() {
+    const auto g = ops::kSparseMoeFlashNextGeometry;
+    std::vector<std::uint8_t> gate(std::size_t(g.shared_intermediate) * (g.hidden / 64) * 18);
+    std::vector<std::uint8_t> up(std::size_t(g.shared_intermediate) * (g.hidden / 32) * 18);
+    std::vector<std::uint8_t> down(std::size_t(g.hidden) * (g.shared_intermediate / 32) * 22);
+    for (int row = 0; row < g.shared_intermediate; ++row) {
+        for (int block = 0; block < g.hidden / 64; ++block) {
+            auto* p = gate.data() + (std::size_t(row) * (g.hidden / 64) + block) * 18;
+            const auto scale = __float2half(float(row % 7 + 1) / 2048);
+            std::memcpy(p, &scale, 2); std::memset(p + 2, 0xAA, 16); // Q2_0 code 2 -> +1
+        }
+        for (int block = 0; block < g.hidden / 32; ++block) {
+            auto* p = up.data() + (std::size_t(row) * (g.hidden / 32) + block) * 18;
+            const auto scale = __float2half(float(row % 5 + 1) / 1024);
+            std::memcpy(p, &scale, 2); std::memset(p + 2, 0x99, 16); // Q4_0 code 9 -> +1
+        }
+    }
+    for (int row = 0; row < g.hidden; ++row) {
+        for (int block = 0; block < g.shared_intermediate / 32; ++block) {
+            auto* p = down.data() + (std::size_t(row) * (g.shared_intermediate / 32) + block) * 22;
+            const auto scale = __float2half(float(row % 11 + 1) / 4096);
+            std::memcpy(p, &scale, 2); std::memset(p + 2, 0xFF, 4);
+            std::memset(p + 6, 0x11, 16); // Q5_0 code 17 -> +1
+        }
+    }
+    auto dg = to_device(gate), du = to_device(up), dd = to_device(down);
+    DeviceBuffer rg(std::size_t(g.shared_rows()) * (g.hidden / 64) * 18);
+    DeviceBuffer rd(std::size_t(g.hidden) * (g.intermediate / 64) * 18);
+    rg.fill(0); rd.fill(0);
+    std::vector<float> router(std::size_t(g.router_rows()) * g.hidden, 0);
+    router[std::size_t(g.experts) * g.hidden] = 32;
+    auto dr = to_device_bf16(router);
+    auto slots = to_device_i32(std::vector<int>(g.experts, 0));
+    WeightSegment segments[] = {{0, g.shared_intermediate, QType::Q2_0, dg.p, dg.bytes},
+        {g.shared_intermediate, g.shared_intermediate, QType::Q4_0, du.p, du.bytes}};
+    ops::SparseMoeWeights weights;
+    weights.router_shared_gate = dense_bf16_weight(dr.p, g.router_rows(), g.hidden);
+    weights.routed_gate_up = ggml_blocks_weight(rg.p, rg.bytes, QType::Q2_0, g.shared_rows(), g.hidden, 64);
+    weights.routed_down = ggml_blocks_weight(rd.p, rd.bytes, QType::Q2_0, g.hidden, g.intermediate, 64);
+    weights.shared_gate_up = ggml_blocks_weight(dg.p, dg.bytes + du.bytes, QType::Q2_0,
+                                               g.shared_rows(), g.hidden, 64);
+    weights.shared_gate_up.segments = segments;
+    weights.shared_gate_up.segment_count = 2;
+    weights.shared_down = ggml_blocks_weight(dd.p, dd.bytes, QType::Q5_0, g.hidden, g.shared_intermediate, 32);
+    weights.experts_per_token = g.experts_per_token;
+    weights.slot_of_expert = static_cast<const int*>(slots.p);
+    int failures = 0;
+    for (int tokens : {1, 2, 19, 20, 46, 47, 65, 130, 4101}) {
+        std::vector<float> x(std::size_t(tokens) * g.hidden);
+        std::vector<double> expected(x.size());
+        for (int t = 0; t < tokens; ++t) {
+            const double v = (t % 5 - 2) / 32.0;
+            std::fill_n(x.data() + std::size_t(t) * g.hidden, g.hidden, float(v));
+            double sum = 0;
+            for (int j = 0; j < g.shared_intermediate; ++j) {
+                const double gate_value = g.hidden * v * (j % 7 + 1) / 2048;
+                const double up_value = g.hidden * v * (j % 5 + 1) / 1024;
+                sum += gate_value / (1 + std::exp(-gate_value)) * up_value;
+            }
+            for (int row = 0; row < g.hidden; ++row) {
+                expected[std::size_t(t) * g.hidden + row] =
+                    sum * (row % 11 + 1) / 4096 / (1 + std::exp(-32 * v));
+            }
+        }
+        auto dx = to_device_bf16(x);
+        const auto actual = run_moe(weights, g, dx, dx, tokens, tokens);
+        failures += compare("native shared T=" + std::to_string(tokens), actual, expected, 0.015);
+        if (tokens == 65) {
+            const auto wide = run_moe(weights, g, dx, dx, tokens, tokens, ops::SparseMoeRouting::WidthInvariant);
+            const auto narrow = run_moe(weights, g, dx, dx, tokens, 1, ops::SparseMoeRouting::WidthInvariant);
+            if (wide != narrow) {
+                std::cerr << "native shared: prefill output depends on round width\n";
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+
+    const Mixture flash_next{"Flash-Next Q2_0/Q2_0", ops::kSparseMoeFlashNextGeometry,
+        QType::Q2_0, QType::Q2_0, ops::GatedActivation::Silu, false, 0.02};
+    if (std::getenv("SINFER_TEST_NATIVE_SHARED_ONLY")) {
+        return (run_native_shared() + run_mixture(flash_next, {47, 130, 801})) ? 1 : 0;
     }
 
     // Gemma 4 26B-A4B as its Q6_K artifact stores it: Q6_K gate/up beside a Q8_0 down, because
@@ -548,6 +663,8 @@ int main() {
                           /*per_expert_scaled=*/false,
                           relative_to_max};
 
+    failures += run_native_shared();
+    failures += run_mixture(flash_next, {47, 130, 801});
     failures += run_mixture(qwen3, {47, 130, 801});
     failures += run_mixture(control, {47, 130, 801});
 

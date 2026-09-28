@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
+#include "ops/sparse_moe/shared.h"
 
 #include <cuda_runtime.h>
 
@@ -94,7 +95,7 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
                                                                   QType routed_down);
 
 void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                               const Tensor& router_x, const SparseMoeWeights& weights,
+                               const Tensor& router_x, const PreparedSparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);

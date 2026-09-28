@@ -62,8 +62,8 @@ struct MoePlan {
     /// Q4_K gate/up reach Q4G32AM, its Q5_1 down reach Q5G32AM, its Q8_0 down stay W8.
     family::BankPlanes routed_gate_up_planes = family::BankPlanes::Native;
     family::BankPlanes routed_down_planes    = family::BankPlanes::Native;
-    artifact::ObjectHandle shared_gate_up;
-    artifact::ObjectHandle shared_down;
+    artifact::LinearBinding shared_gate_up;
+    artifact::LinearBinding shared_down;
 };
 
 struct IndexerPlan {
@@ -74,10 +74,10 @@ struct IndexerPlan {
 };
 
 struct FullAttentionPlan {
-    artifact::ObjectHandle query_key_gate_value;
+    artifact::LinearBinding query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    artifact::LinearBinding output;
     IndexerPlan indexer{};
 };
 
@@ -86,9 +86,9 @@ struct GdnPlan {
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
     artifact::ObjectHandle a_b_projection;
-    artifact::ObjectHandle query_key_value_z;
+    artifact::LinearBinding query_key_value_z;
     artifact::ObjectHandle norm;
-    artifact::ObjectHandle output;
+    artifact::LinearBinding output;
 };
 
 struct PlePlan {
@@ -126,7 +126,7 @@ struct MtpPlan {
     bool resident = false; ///< ...and this run asked for one, so its weights are on the device
     artifact::ObjectHandle embedding_norm;   // [hidden]
     artifact::ObjectHandle hidden_norm;      // [residual]
-    artifact::ObjectHandle input_projection; // [hidden, 2 * hidden]
+    artifact::LinearBinding input_projection; // [hidden, 2 * hidden]
     TextLayerPlan layer;
     HyperConnectionPlan head_mix;
 };
@@ -137,10 +137,10 @@ struct BindingPlan {
     family::VisionGeometry vision_geometry;
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
-    artifact::ObjectHandle token_embedding;
+    artifact::LinearBinding token_embedding;
     std::vector<TextLayerPlan> text_layers;
     HyperConnectionPlan output_mix;
-    artifact::ObjectHandle output_head;
+    artifact::LinearBinding output_head;
     artifact::ObjectHandle ple_table;
     // The hash constants are read out of the artifact at bind time (the reader is gone by
     // the time the model is constructed).
@@ -167,6 +167,8 @@ struct ArtifactLoadPlan {
 
 /// `stage_first/stage_last` (0/0 = every layer) restrict device residency to the layers of a
 /// pipeline stage.
+family::TextGeometry resolved_geometry(const artifact::Reader& reader);
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                int stage_first = 0, int stage_last = 0,
                                family::BankPlanes bank_planes = family::BankPlanes::Auto,

@@ -2,6 +2,8 @@
 #include "targets/qwen4exp/impl/variant.h"
 
 #include "family/impl/lora_hook.h"
+#include "family/impl/storage_workspace.h"
+#include "ops/sparse_moe/shared.h"
 #include "family/impl/moe/expert_cache.h"
 #include "family/impl/moe/moe_routing.h"
 #include "api/ops/causal_conv1d_silu.h"
@@ -191,10 +193,33 @@ std::size_t mix_capacity(const family::TextGeometry& g, std::int32_t first, std:
                                                               last);
 }
 
-std::size_t w8_capacity(std::int32_t rows, std::int32_t columns, std::int32_t first,
-                        std::int32_t last) {
-    return ops::linear_workspace_capacity_bytes(QType::W8G32_F16S, rows, columns, kPolicy, first,
-                                                last);
+std::size_t projection_capacity(const family::TextGeometry& g, const std::string& name,
+                                std::int32_t first, std::int32_t last) {
+    const auto& matrix = family::require_linear_storage(g, name);
+    std::size_t peak = family::matrix_workspace(g, name, [&](QType format, int rows, int columns) {
+        return ops::linear_workspace_capacity_bytes(format, rows, columns, kPolicy, first, last);
+    });
+    // GGUF's GDN output columns are un-tiled by permuting the input on device.
+    if (name.ends_with("gdn/output") && matrix.formats.front() != QType::W8G32_F16S) {
+        peak += plane_bytes(matrix.columns, last, DType::BF16);
+    }
+    return peak;
+}
+
+std::size_t layer_projection_capacity(const family::TextGeometry& g, const char* suffix,
+                                      family::WorkspaceLayers layers, int first, int last, bool fused = false) {
+    const auto capacity = [&](const std::string& prefix) {
+        const auto name = prefix + suffix;
+        const auto& matrix = family::require_linear_storage(g, name);
+        const auto temporary = fused && matrix.formats.front() == QType::W8G32_F16S
+            ? plane_bytes(matrix.rows, last, DType::BF16) : 0;
+        return temporary + projection_capacity(g, name, first, last);
+    };
+    auto peak = family::text_layers_workspace(g, layers, capacity);
+    if (g.mtp_layers && layers == family::WorkspaceLayers::Attention) {
+        peak = std::max(peak, capacity("mtp/layer/"));
+    }
+    return peak;
 }
 
 // Mixes the residual streams into `hidden` and keeps the inject gates for the combine.
@@ -412,14 +437,24 @@ void Variant::attention_projection(const Tensor& hidden,
     const auto& g = weights.geometry;
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
-    Tensor fused = workspace.alloc(DType::BF16, {(2 * g.query_size() + 2 * g.kv_size()), tokens});
-    ops::linear(hidden, weights.query_key_gate_value, fused, kPolicy, workspace, stream);
-    // Row order from the converter: q | k | gate | v.
-    ops::extract_bf16_columns(fused, 0, query, stream);
-    ops::extract_bf16_columns(fused, g.query_size(), key, stream);
-    ops::extract_bf16_columns(fused, g.query_size() + g.kv_size(), gate, stream);
-    ops::extract_bf16_columns(fused, 2 * g.query_size() + g.kv_size(), value,
-                              stream);
+    if (weights.query_key_gate_value.layout == QuantLayout::GgmlBlocks) {
+        // One activation preparation serves all typed runs, directly into their
+        // final outputs: no fused temporary and no extraction copies.
+        ops::linear_projections(hidden, {
+            {weights.query_key_gate_value, query, kPolicy, 0},
+            {weights.query_key_gate_value, key, kPolicy, g.query_size()},
+            {weights.query_key_gate_value, gate, kPolicy, g.query_size() + g.kv_size()},
+            {weights.query_key_gate_value, value, kPolicy, 2 * g.query_size() + g.kv_size()},
+        }, &workspace, stream);
+    } else {
+        Tensor fused = workspace.alloc(DType::BF16, {(2 * g.query_size() + 2 * g.kv_size()), tokens});
+        ops::linear(hidden, weights.query_key_gate_value, fused, kPolicy, workspace, stream);
+        // Row order from the converter: q | k | gate | v.
+        ops::extract_bf16_columns(fused, 0, query, stream);
+        ops::extract_bf16_columns(fused, g.query_size(), key, stream);
+        ops::extract_bf16_columns(fused, g.query_size() + g.kv_size(), gate, stream);
+        ops::extract_bf16_columns(fused, 2 * g.query_size() + g.kv_size(), value, stream);
+    }
     family::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
     family::apply_lora(weights.query_key_gate_value, family::kAttentionGatePort, hidden, gate, stream);
 }
@@ -497,7 +532,7 @@ std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometr
         return plane_bytes(rows, columns, DType::BF16);
     };
     return plane(g.hidden, last) + plane(g.residual, last) + plane(2 * g.hidden, g.hc_streams * last) +
-           w8_capacity(g.hidden, 2 * g.hidden, g.hc_streams * first, g.hc_streams * last);
+           projection_capacity(g, "mtp/input_projection", g.hc_streams * first, g.hc_streams * last);
 }
 
 std::size_t Variant::mtp_collapse_workspace_capacity_bytes(const family::TextGeometry& g,
@@ -530,13 +565,20 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     auto scope                = workspace.scope();
     const std::int32_t tokens = static_cast<std::int32_t>(hidden.ne[1] * hidden.ne[2]);
     Tensor flat_hidden        = hidden.view({g.hidden, tokens});
-    Tensor fused = workspace.alloc(DType::BF16, {(g.convolution_dim() + g.value_dim()), tokens});
-    ops::linear(flat_hidden, weights.query_key_value_z, fused, kPolicy, workspace, stream);
-    maybe_dump_block("gdn_fused", fused, stream);
     Tensor qkv_flat  = qkv.view({g.convolution_dim(), tokens});
     Tensor gate_flat = output_gate.view({g.value_dim(), tokens});
-    ops::extract_bf16_columns(fused, 0, qkv_flat, stream);
-    ops::extract_bf16_columns(fused, g.convolution_dim(), gate_flat, stream);
+    if (weights.query_key_value_z.layout == QuantLayout::GgmlBlocks) {
+        ops::linear_projections(flat_hidden, {
+            {weights.query_key_value_z, qkv_flat, kPolicy, 0},
+            {weights.query_key_value_z, gate_flat, kPolicy, g.convolution_dim()},
+        }, &workspace, stream);
+    } else {
+        Tensor fused = workspace.alloc(DType::BF16, {(g.convolution_dim() + g.value_dim()), tokens});
+        ops::linear(flat_hidden, weights.query_key_value_z, fused, kPolicy, workspace, stream);
+        maybe_dump_block("gdn_fused", fused, stream);
+        ops::extract_bf16_columns(fused, 0, qkv_flat, stream);
+        ops::extract_bf16_columns(fused, g.convolution_dim(), gate_flat, stream);
+    }
     family::apply_lora_gdn_input(weights, flat_hidden, qkv_flat, gate_flat, stream);
 }
 
@@ -639,7 +681,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         const ops::SparseMoeRouting routing = family::moe_routing(phase);
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype,
-            weights.op.routed_down.qtype, tokens, tokens, routing));
+            weights.op.routed_down.qtype, tokens, tokens, routing, ops::detail::native_shared(weights.op)));
         WorkspaceArena leaf(storage);
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
                         stream, ops::SparseMoeRoundHook{}, routing);
@@ -672,8 +714,8 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
                                                                    std::int32_t last) {
     // The mix hook's planes live in the same mixer scope as the projection.
     return mix_capacity(g, first, last) +
-           plane_bytes((2 * g.query_size() + 2 * g.kv_size()), last, DType::BF16) +
-           w8_capacity((2 * g.query_size() + 2 * g.kv_size()), g.hidden, first, last);
+           layer_projection_capacity(g, "attention/query_key_gate_value", family::WorkspaceLayers::Attention,
+                                     first, last, true);
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile,
@@ -681,15 +723,15 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
     return plane_bytes(g.hidden, last, DType::BF16) +
-           w8_capacity(g.hidden, g.query_size(), first, last);
+           layer_projection_capacity(g, "attention/output", family::WorkspaceLayers::Attention, first, last);
 }
 
 std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
-    return plane_bytes((g.convolution_dim() + g.value_dim()), last, DType::BF16) +
-           w8_capacity((g.convolution_dim() + g.value_dim()), g.hidden, first, last);
+    return layer_projection_capacity(g, "gdn/query_key_value_z", family::WorkspaceLayers::Linear,
+                                      first, last, true);
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile profile, family::TextPhase phase, std::int32_t batch_size,
@@ -711,7 +753,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     return plane_bytes(g.hidden, last, DType::BF16) +
-           w8_capacity(g.hidden, g.value_dim(), first, last);
+           layer_projection_capacity(g, "gdn/output", family::WorkspaceLayers::Linear, first, last);
 }
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t first,
@@ -723,10 +765,24 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const 
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile, family::TextPhase phase,
                                                          std::int32_t first, std::int32_t last) {
-    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) +
-           round_up(ops::sparse_moe_workspace_capacity_bytes(moe_geometry(g),
-                                                             QType::W8G32_F16S, QType::W8G32_F16S,
-                                                             first, last, family::moe_routing(phase)));
+    const auto geometry = moe_geometry(g);
+    const auto capacity = [&](const std::string& prefix) {
+        const auto& gate = family::require_linear_storage(g, prefix + "mlp/routed_gate_up");
+        const auto& down = family::require_linear_storage(g, prefix + "mlp/routed_down");
+        const bool native_shared =
+            family::require_linear_storage(g, prefix + "mlp/shared_gate_up").formats.front() != QType::W8G32_F16S ||
+            family::require_linear_storage(g, prefix + "mlp/shared_down").formats.front() != QType::W8G32_F16S;
+        const auto bytes = [&](QType a, QType b) {
+            return ops::sparse_moe_workspace_capacity_bytes(geometry, a, b, first, last,
+                                                           family::moe_routing(phase), native_shared);
+        };
+        // Offloaded experts may use the W8 slot pool; device-resident ones keep their formats.
+        return std::max(bytes(gate.formats.front(), down.formats.front()),
+                        bytes(QType::W8G32_F16S, QType::W8G32_F16S));
+    };
+    auto peak = family::text_layers_workspace(g, family::WorkspaceLayers::All, capacity);
+    if (g.mtp_layers) { peak = std::max(peak, capacity("mtp/layer/")); }
+    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) + round_up(peak);
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {

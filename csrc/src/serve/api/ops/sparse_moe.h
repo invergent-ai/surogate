@@ -281,7 +281,8 @@ enum class SparseMoeRouting : std::uint8_t {
 /**
  * Returns the transient capacity required by SparseMoe for every T in the inclusive
  * [min_tokens,max_tokens] interval under `routing`. The routed QTypes are the fixed
- * implementation profile. A WidthInvariant capacity covers the ByWidth one, since a call may
+ * implementation profile. Set native_shared when the shared weights use GGML blocks.
+ * A WidthInvariant capacity covers the ByWidth one, since a call may
  * fall back to it. Invalid profiles or intervals throw.
  */
 [[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
@@ -290,7 +291,8 @@ enum class SparseMoeRouting : std::uint8_t {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens,
                                                               SparseMoeRouting routing =
-                                                                  SparseMoeRouting::ByWidth);
+                                                                  SparseMoeRouting::ByWidth,
+                                                              bool native_shared = false);
 
 /**
  * Closed sparse-MoE Op over the registered geometries (kSparseMoeQwen36Geometry,
@@ -311,7 +313,9 @@ enum class SparseMoeRouting : std::uint8_t {
  * The five weights have the exact registered shapes: BF16 router/shared gate [257,2048], routed
  * gate/up [256*1024,2048], routed down [256*2048,512], shared gate/up [1024,2048], and shared down
  * [2048,512]. Admitted codec profiles are Q4+Q5, Q4+Q6, and W8+W8 for the two routed banks; both
- * shared banks are W8. Expert e directly selects its stored row spans; no selected-weight gather
+ * shared banks are paired W8 projections or native GGML projections (including mixed-format
+ * gate/up row segments). Native shared experts currently require SiLU without clamping and
+ * do not admit adapters. Expert e directly selects its stored row spans; no selected-weight gather
  * or repack occurs.
  *
  * Every positive T is supported.

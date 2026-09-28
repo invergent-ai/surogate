@@ -87,3 +87,25 @@ def test_payload_view_dequantizes_identically(sample):
         assert np.array_equal(np.asarray(got).reshape(-1), np.asarray(want).reshape(-1)), (
             expected.name
         )
+
+
+def test_q2_0_source_decodes_packed_values_without_gguf_enum(tmp_path):
+    from surogate.serve.convert.common.gguf_source import GgufSource
+
+    # Each byte lists four consecutive values, low pair first. These four
+    # patterns exercise every lane position; blocks use different signed scales.
+    blocks = np.zeros((4, 18), dtype=np.uint8)
+    blocks[:, :2] = np.array([0.5, -2, 0.125, 4], dtype="<f2").view(np.uint8).reshape(4, 2)
+    blocks[:, 2:] = np.array([0xE4, 0x1B, 0x00, 0xFF], dtype=np.uint8)[:, None]
+    expected = np.array([[-0.5, 0, 0.5, 1] * 16, [-4, -2, 0, 2] * 16,
+                         [-0.125] * 64, [8] * 64], dtype=np.float32).reshape(2, 128)
+    path = tmp_path / "q2.gguf"
+    writer = GGUFWriter(str(path), "test")
+    writer.add_tensor("packed.weight", blocks.view(np.int8), raw_shape=(2, 128), raw_dtype=42)
+    writer.write_header_to_file(); writer.write_kv_data_to_file(); writer.write_tensors_to_file(); writer.close()
+    source = GgufSource(path)
+    try:
+        assert source.tensor("packed.weight").type_name == "Q2_0"
+        np.testing.assert_array_equal(source.float32("packed.weight"), expected)
+    finally:
+        source.close()

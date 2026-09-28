@@ -56,8 +56,8 @@ bool is_ggml_k_hand(QType qtype) noexcept {
 /// enough: a K-quant tensor exists only where K is a multiple of 256 (ggml refuses to write
 /// one otherwise), and every registered geometry's reduction axes are multiples of 64.
 ///
-/// Only the seven formats the op test has fixtures for (`test_sparse_moe_ggml_prefill.cpp`) --
-/// the ones the published Gemma 4 artifacts hold. Q2_K, Q4_0, Q4_1, IQ4_NL and F16 decode on
+/// Only formats covered by `test_sparse_moe_ggml_prefill.cpp`: the published
+/// Gemma 4 mixtures and Flash-Next's Q2_0 routed experts. Q2_K, Q4_0, Q4_1, IQ4_NL and F16 decode on
 /// the same generic codec and would very likely be right, but no artifact here holds experts
 /// in them and nothing measures them, so they keep the small-T slices; to admit one, add its
 /// fixture and mixture to that test and its case here.
@@ -68,6 +68,7 @@ std::int32_t ggml_prefill_k_multiple(QType qtype) noexcept {
     case QType::Q5_K:
     case QType::Q6_K:
         return 256;
+    case QType::Q2_0:
     case QType::Q8_0:
     case QType::Q5_0:
     case QType::Q5_1:
@@ -120,6 +121,7 @@ std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcep
 /// pair-level ones in `prefill_min_tokens`; each later codec carries its own.
 bool int8_codec_admitted(QType qtype, bool gate_up_side) noexcept {
     switch (qtype) {
+    case QType::Q2_0:
     case QType::Q4_K:
     case QType::Q5_K:
     case QType::Q6_K:

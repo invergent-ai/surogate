@@ -2,6 +2,7 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 
 #include "artifact/reader.h"
+#include "artifact/linear_storage.h"
 #include "artifact/typed_binding.h"
 
 #include <algorithm>
@@ -28,6 +29,11 @@ thread_local TensorPlacement g_layer_placement = TensorPlacement::Device;
 artifact::ObjectHandle device(artifact::Binder& binder, const std::string& name,
                               NumericFormat format, std::initializer_list<std::uint64_t> shape) {
     return artifact::bind_tensor(binder, name, format, shape, g_layer_placement);
+}
+
+artifact::LinearBinding linear(artifact::Binder& binder, const std::string& name,
+                               std::int32_t rows, std::int32_t columns) {
+    return artifact::bind_linear(binder, name, rows, columns, g_layer_placement);
 }
 
 // As `host`, but marks the object for W8→Q4G32AM requantisation at bank load.
@@ -73,14 +79,12 @@ HyperConnectionPlan bind_hc(const family::TextGeometry& g, artifact::Binder& bin
 void bind_full_attention(const family::TextGeometry& g, artifact::Binder& binder, const std::string& prefix,
                          FullAttentionPlan& out) {
     out.query_key_gate_value =
-        device(binder, prefix + "query_key_gate_value", NumericFormat::W8G32_F16S,
-               {(2 * g.query_size() + 2 * g.kv_size()), g.hidden});
+        linear(binder, prefix + "query_key_gate_value", (2 * g.query_size() + 2 * g.kv_size()), g.hidden);
     out.query_norm = device(binder, prefix + "query_norm", NumericFormat::BF16,
                             {g.head_dim});
     out.key_norm   = device(binder, prefix + "key_norm", NumericFormat::BF16,
                             {g.head_dim});
-    out.output     = device(binder, prefix + "output", NumericFormat::W8G32_F16S,
-                            {g.hidden, g.query_size()});
+    out.output     = linear(binder, prefix + "output", g.hidden, g.query_size());
     // QSA indexer (design/INFERENCE.md, phase 4): resident on the layers this program runs;
     // the selection only engages past `dense_exact_context`.
     out.indexer.query =
@@ -142,10 +146,9 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
         .routed_down_format    = down_format,
         .routed_gate_up_planes = gate_up_planes,
         .routed_down_planes    = down_planes,
-        .shared_gate_up = device(binder, prefix + "shared_gate_up", NumericFormat::W8G32_F16S,
-                                 {2 * static_cast<std::uint64_t>(g.shared_intermediate), static_cast<std::uint64_t>(g.hidden)}),
+        .shared_gate_up = linear(binder, prefix + "shared_gate_up", 2 * static_cast<std::uint64_t>(g.shared_intermediate), static_cast<std::uint64_t>(g.hidden)),
         .shared_down =
-            device(binder, prefix + "shared_down", NumericFormat::W8G32_F16S, {static_cast<std::uint64_t>(g.hidden), static_cast<std::uint64_t>(g.shared_intermediate)}),
+            linear(binder, prefix + "shared_down", static_cast<std::uint64_t>(g.hidden), static_cast<std::uint64_t>(g.shared_intermediate)),
     };
 }
 
@@ -218,11 +221,9 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
                                    plan.routed_down_format,
                                    static_cast<std::int32_t>(g.experts * g.hidden),
                                    static_cast<std::int32_t>(g.intermediate));
-    out.op.shared_gate_up = artifact::materialized_weight(
-        backing, plan.shared_gate_up, NumericFormat::W8G32_F16S, 2 * g.shared_intermediate,
+    out.op.shared_gate_up = artifact::materialized_linear(backing, plan.shared_gate_up, 2 * g.shared_intermediate,
         g.hidden);
-    out.op.shared_down = artifact::materialized_weight(backing, plan.shared_down,
-                                                       NumericFormat::W8G32_F16S,
+    out.op.shared_down = artifact::materialized_linear(backing, plan.shared_down,
                                                        g.hidden, g.shared_intermediate);
     out.op.experts_per_token = g.experts_per_token;
     out.mix                  = std::move(mix);
@@ -235,6 +236,12 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
 
 } // namespace
 
+family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
+    auto geometry = family::TextGeometry::resolved_qwen4exp(reader.geometry(), reader.layer_types());
+    artifact::resolve_linear_storage(reader, geometry);
+    return geometry;
+}
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                int stage_first, int stage_last, family::BankPlanes bank_planes,
                                LoadProgress progress) {
@@ -243,7 +250,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     BindingPlan& out    = load_plan.bindings;
     out.host_bank.progress = std::move(progress);
     // Required checkpoint metadata controls every shape bound below.
-    out.geometry        = family::TextGeometry::resolved_qwen4exp(binder.reader().geometry(), binder.reader().layer_types());
+    out.geometry        = resolved_geometry(binder.reader());
     const auto& g = out.geometry;
     out.text_layers.resize(g.layers);
     out.ple_multipliers.resize(g.ple_ngram);
@@ -267,8 +274,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     const bool keep_native = std::getenv("SUROGATE_SERVE_HOST_BANK_NATIVE") != nullptr;
     const family::BankPlanes planes =
         (routed_is_ggml && keep_native) ? family::BankPlanes::Native : bank_planes;
-    out.token_embedding = device(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
-                                 {g.output_rows, g.hidden});
+    out.token_embedding = linear(binder, "text/token_embedding", g.output_rows, g.hidden);
 
     for (std::size_t layer = 0; layer < g.layers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
@@ -293,12 +299,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
                 device(binder, prefix + "gdn/a_b_projection", NumericFormat::BF16,
                        {2 * g.gdn_value_heads, g.hidden});
             target.gdn.query_key_value_z =
-                device(binder, prefix + "gdn/query_key_value_z", NumericFormat::W8G32_F16S,
-                       {(g.convolution_dim() + g.value_dim()), g.hidden});
+                linear(binder, prefix + "gdn/query_key_value_z", (g.convolution_dim() + g.value_dim()), g.hidden);
             target.gdn.norm   = device(binder, prefix + "gdn/norm", NumericFormat::BF16,
                                        {g.gdn_value_head_dim});
-            target.gdn.output = device(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S,
-                                       {g.hidden, g.value_dim()});
+            target.gdn.output = linear(binder, prefix + "gdn/output", g.hidden, g.value_dim());
         }
         target.has_ple = g.ple_ngram > 0 && static_cast<int>(layer) == g.ple_layer;
         if (target.has_ple) {
@@ -320,7 +324,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     g_layer_placement = TensorPlacement::Device;
 
     out.output_mix  = bind_hc(g, binder, "text/output_hc/", false);
-    out.output_head = device(binder, "text/output_head", NumericFormat::W8G32_F16S, {g.output_rows, g.hidden});
+    out.output_head = linear(binder, "text/output_head", g.output_rows, g.hidden);
 
     // The NextN draft head. Bound whenever the artifact carries one, because every object an
     // artifact holds has to be consumed by the target that reads it -- but resident only when
@@ -339,8 +343,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         mtp.hidden_norm    = device(binder, "mtp/hidden_norm", NumericFormat::FP32, {g.residual});
         // fc_embedding and fc_hidden fused side by side, so one matmul over
         // concat(embedding_norm(e), hidden_norm(h)) is fc_embedding@e + fc_hidden@h.
-        mtp.input_projection = device(binder, "mtp/input_projection", NumericFormat::W8G32_F16S,
-                                      {g.hidden, 2 * g.hidden});
+        mtp.input_projection = linear(binder, "mtp/input_projection", g.hidden, 2 * g.hidden);
         mtp.layer.is_full_attention = true;
         mtp.layer.hc_attention      = bind_hc(g, binder, "mtp/layer/hc_attn/", true);
         bind_full_attention(g, binder, "mtp/layer/attention/", mtp.layer.attention);
@@ -443,8 +446,7 @@ void load_full_attention(const family::TextGeometry& g, artifact::MaterializedAr
                          ops::HyperConnectionWeights mix_attn, FullAttentionWeights& target) {
     target.projection.geometry = g;
     target.projection.mix                  = std::move(mix_attn);
-    target.projection.query_key_gate_value = artifact::materialized_weight(
-        backing, attention.query_key_gate_value, NumericFormat::W8G32_F16S,
+    target.projection.query_key_gate_value = artifact::materialized_linear(backing, attention.query_key_gate_value,
         (2 * g.query_size() + 2 * g.kv_size()), static_cast<std::int32_t>(g.hidden));
     target.query_norm = artifact::materialized_tensor(backing, attention.query_norm,
                                                       NumericFormat::BF16, {g.head_dim});
@@ -461,8 +463,7 @@ void load_full_attention(const family::TextGeometry& g, artifact::MaterializedAr
         backing, attention.indexer.query_norm, NumericFormat::BF16, {g.indexer_head_dim});
     target.projection.indexer.key_norm = artifact::materialized_tensor(
         backing, attention.indexer.key_norm, NumericFormat::BF16, {g.indexer_head_dim});
-    target.output = artifact::materialized_weight(backing, attention.output,
-                                                  NumericFormat::W8G32_F16S,
+    target.output = artifact::materialized_linear(backing, attention.output,
                                                   static_cast<std::int32_t>(g.hidden),
                                                   g.query_size());
 }
@@ -482,8 +483,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;
-    runtime.token_embedding = artifact::materialized_weight(
-        backing, plan.token_embedding, NumericFormat::W8G32_F16S, static_cast<std::int32_t>(g.output_rows),
+    runtime.token_embedding = artifact::materialized_linear(backing, plan.token_embedding, static_cast<std::int32_t>(g.output_rows),
         static_cast<std::int32_t>(g.hidden));
 
     std::size_t full_index = 0;
@@ -516,14 +516,12 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.projection.a_b_projection = artifact::materialized_weight(
                 backing, source.gdn.a_b_projection, NumericFormat::BF16,
                 2 * g.gdn_value_heads, static_cast<std::int32_t>(g.hidden));
-            target.projection.query_key_value_z = artifact::materialized_weight(
-                backing, source.gdn.query_key_value_z, NumericFormat::W8G32_F16S,
+            target.projection.query_key_value_z = artifact::materialized_linear(backing, source.gdn.query_key_value_z,
                 (g.convolution_dim() + g.value_dim()), static_cast<std::int32_t>(g.hidden));
             target.projection.mix = std::move(mix_attn);
             target.norm = artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16,
                                                         {g.gdn_value_head_dim});
-            target.output = artifact::materialized_weight(
-                backing, source.gdn.output, NumericFormat::W8G32_F16S,
+            target.output = artifact::materialized_linear(backing, source.gdn.output,
                 static_cast<std::int32_t>(g.hidden), static_cast<std::int32_t>(g.value_dim()));
             target.post_mixer = load_moe(g, backing, *host_bank, source.moe, std::move(mix_mlp));
             target.post_mixer.layer = static_cast<std::int32_t>(layer);
@@ -568,8 +566,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         head.hidden_norm = artifact::materialized_tensor(
             backing, plan.mtp.hidden_norm, NumericFormat::FP32,
             {static_cast<std::int32_t>(g.residual)});
-        head.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S,
+        head.input_projection = artifact::materialized_linear(backing, plan.mtp.input_projection,
             static_cast<std::int32_t>(g.hidden), static_cast<std::int32_t>(2 * g.hidden));
         head.head_mix = load_hc(g, backing, plan.mtp.head_mix, false);
         load_full_attention(g, backing, plan.mtp.layer.attention,
@@ -583,8 +580,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 
     runtime.output_mix  = load_hc(g, backing, plan.output_mix, false);
-    runtime.output_head = artifact::materialized_weight(backing, plan.output_head,
-                                                        NumericFormat::W8G32_F16S,
+    runtime.output_head = artifact::materialized_linear(backing, plan.output_head,
                                                         static_cast<std::int32_t>(g.output_rows),
                                                         static_cast<std::int32_t>(g.hidden));
 

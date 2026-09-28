@@ -1707,9 +1707,11 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     // is what the plain route would have used, so the leaf is cut for the larger of the two.
     const std::size_t bytes = std::max(
         ops::sparse_moe_workspace_capacity_bytes(cache.geometry, op.routed_gate_up.qtype,
-                                                 op.routed_down.qtype, tokens, tokens),
+                                                 op.routed_down.qtype, tokens, tokens, ops::SparseMoeRouting::ByWidth,
+                                                 op.shared_gate_up.qtype != QType::W8G32_F16S || op.shared_down.qtype != QType::W8G32_F16S),
         ops::sparse_moe_workspace_capacity_bytes(cache.geometry, QType::W8G32_F16S,
-                                                 QType::W8G32_F16S, tokens, tokens));
+                                                 QType::W8G32_F16S, tokens, tokens, ops::SparseMoeRouting::ByWidth,
+                                                 op.shared_gate_up.qtype != QType::W8G32_F16S || op.shared_down.qtype != QType::W8G32_F16S));
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(bytes);
     WorkspaceArena leaf(storage);

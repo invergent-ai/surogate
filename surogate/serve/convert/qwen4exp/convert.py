@@ -33,7 +33,7 @@ from surogate.serve.convert.common.checkpoint import tokenizer_domain
 from . import inventory as inv
 from . import recipe as rcp
 
-RECIPE_ID = "qwen4exp-gguf-config-v3"
+RECIPE_ID = "qwen4exp-gguf-config-v4"
 _GROUP = 32
 
 
@@ -222,13 +222,19 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             recipes[inv.PLE_TABLE_RESOURCE] = rcp.ple_table_recipe(g)
         repack = GgufRepackSource.from_sources(source.shards, candidate_sources(g, source))
 
-        # Two ways to read a weight where it lies. A K-quant or a 32-value block the kernels
-        # already decode is served in the file's own format; a Q8_0 whose op wants the row-split
-        # W8 planes is read just the same and rearranged on the device, which is why the exclude
-        # list and the in-place list are one list.
-        native = repack.plan_native(recipes, tensor_specs,
-                                    exclude_suffixes=rcp.NATIVE_EXCLUDE_SUFFIXES)
-        in_place = repack.plan_repack_in_place(recipes, tensor_specs, rcp.NATIVE_EXCLUDE_SUFFIXES)
+        # Keep the Q8_0 -> W8 fast path where the source permits an exact repack.
+        # RCO also quantises these projections to other GGML formats; preserve those
+        # blocks natively instead of excluding their object names unconditionally.
+        in_place = repack.plan_repack_in_place(recipes, tensor_specs, rcp.W8_REPACK_SUFFIXES)
+        # Shared experts use either the fused W8 pair or a native GGML pair.
+        # If only one half is Q8, keep it native alongside its companion.
+        for name in recipes:
+            if name.endswith("mlp/shared_gate_up"):
+                down = name.removesuffix("shared_gate_up") + "shared_down"
+                if (name in in_place) != (down in in_place):
+                    in_place.pop(name, None)
+                    in_place.pop(down, None)
+        native = repack.plan_native(recipes, tensor_specs, exclude_suffixes=tuple(in_place))
         check_every_quantised_object_is_planned(tensor_specs, set(native) | set(in_place), inv.W8)
 
         native_specs = {spec.name: spec for spec in

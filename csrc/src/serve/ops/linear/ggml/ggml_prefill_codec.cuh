@@ -90,6 +90,39 @@ struct GgmlBlockPrefill {
     }
 };
 
+/// Q2_0 stores four consecutive signed 2-bit values per byte. A warp owns
+/// the block's 32 pairs, so each lane reads exactly its two values instead of
+/// calling the generic eight-value decoder and discarding six results.
+struct GgmlQ20Prefill : GgmlBlockPrefill<GgmlType::Q2_0> {
+    static constexpr int kTileStride = 20; // whole words, with nine halfword staging units
+    static constexpr int kHeaderStride = 16;
+    static constexpr int kScaleGroups = 2;
+    static constexpr int kScaleWidth = 32;
+    static constexpr int kScaleTiles = 1;
+    static constexpr bool kScalesInTile = true;
+    static constexpr bool kHasMin = false;
+
+    __device__ static __forceinline__ unsigned quad(unsigned packed) {
+        const unsigned lanes = (packed & 3) | ((packed & 12) << 6) |
+                               ((packed & 48) << 12) | ((packed & 192) << 18);
+        return __vsub4(lanes, 0x01010101u); // independent signed bytes: code - 1
+    }
+    __device__ static __forceinline__ void unpack(
+        const std::uint8_t* tile, const std::uint8_t*, int, int q, unsigned& lo, unsigned& hi) {
+        lo = quad(tile[2 + q]);
+        hi = quad(tile[10 + q]);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* tile, int) {
+        return make_float2(__half2float(*reinterpret_cast<const __half*>(tile)), 0.0F);
+    }
+    __device__ static __forceinline__ __nv_bfloat162 decode(
+        const std::uint8_t* tile, const std::uint8_t*, int lane, int) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(tile));
+        const int codes = tile[2 + lane / 2] >> (4 * (lane & 1));
+        return __floats2bfloat162_rn(d * ((codes & 3) - 1), d * (((codes >> 2) & 3) - 1));
+    }
+};
+
 /// Q4_K. A 64-value tile is exactly the 32 `qs` bytes of quarter `c`: their low nibbles are the
 /// tile's first thirty-two values, their high nibbles the last thirty-two. The pair a lane owns
 /// is two consecutive values, so it never straddles that halfway point and both of its values
@@ -748,6 +781,11 @@ struct PrefillCodecFor {
     using Codec     = GgmlBlockPrefill<type>;
     using Int8Codec = Codec;
     static constexpr bool kInt8Route = false;
+};
+template <> struct PrefillCodecFor<GgmlType::Q2_0> {
+    using Codec = GgmlQ20Prefill;
+    using Int8Codec = Codec;
+    static constexpr bool kInt8Route = true;
 };
 template <> struct PrefillCodecFor<GgmlType::Q4_K> { using Codec = GgmlQ4KPrefill; using Int8Codec = Codec; static constexpr bool kInt8Route = true; };
 template <> struct PrefillCodecFor<GgmlType::Q5_K> { using Codec = GgmlQ5KPrefill; using Int8Codec = Codec; static constexpr bool kInt8Route = true; };

@@ -73,7 +73,7 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe64Geometry)
 } // namespace geometry_lfm2_moe64
 
 void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                               const Tensor& router_x, const SparseMoeWeights& weights,
+                               const Tensor& router_x, const PreparedSparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook) {

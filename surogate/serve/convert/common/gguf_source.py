@@ -169,6 +169,14 @@ class GgufSource:
         if t.type_name == "BF16":
             words = rows.view(np.uint16).astype(np.uint32) << 16
             return words.view(np.float32).reshape(t.shape)
+        if t.type_name == "Q2_0":
+            # GGML type 42 is newer than some gguf-py releases. Each 18-byte
+            # block stores a half scale followed by 16 bytes of consecutive
+            # four-value packs; its signed alphabet is {-1, 0, 1, 2}.
+            blocks = rows.reshape(-1, 18)
+            scales = blocks[:, :2].copy().view("<f2").astype(np.float32)
+            codes = (blocks[:, 2:, None] >> np.arange(0, 8, 2, dtype=np.uint8)) & 3
+            return ((codes.reshape(-1, 64).astype(np.float32) - 1) * scales).reshape(t.shape)
         decoded = dequantize(rows, GGMLQuantizationType(t.type_id))
         return np.asarray(decoded, dtype=np.float32).reshape(t.shape)
 
