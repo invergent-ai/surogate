@@ -85,7 +85,10 @@ scripts = { "surogate" = "surogate.cli.main:cli_main" }
 speech = ["silero-vad==6.2.1"]
 
 [build-system]
-requires = ["scikit-build-core>=0.11", "nanobind", "torch>=2.11"]
+# The exact torch the wheel installs (.github/scripts/set_cuda_version_tag.py CUDA_DEPS): surogate-stt compiles
+# against the build environment's libtorch and loads the installed one. A newer torch here built it against
+# 2.13 while installs got 2.11.0, and every transcription failed ("... has different size in shared object").
+requires = ["scikit-build-core>=0.11", "nanobind", "torch==2.11.0"]
 build-backend = "scikit_build_core.build"
 
 [tool.setuptools_scm]

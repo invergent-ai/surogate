@@ -12,9 +12,12 @@ import tomlkit
 #
 # `torch==2.11.0` without a local version: the pin used to carry one -- `torch==2.11.0+cu130` --
 # which exists only on download.pytorch.org, so the install died in resolution unless the caller
-# passed --index-url. Nothing here links torch (there is no find_package(Torch); the extensions
-# pull libcudart, libcublasLt, libcuda and libgomp only), so its CUDA variant is not our
-# concern -- and PyPI's torch 2.11.0 is itself a CUDA 13 build, which is the one that matches.
+# passed --index-url. PyPI's torch 2.11.0 is itself a CUDA 13 build, which is the one that matches.
+# The version is our concern: surogate-stt links libtorch (csrc/src/serve/speech: headers and
+# libraries of the build environment's torch, RPATH to the installed one), so the torch it is built
+# against must be the torch this pin installs. Built against a newer one, it loads with "... has
+# different size in shared object" and every transcription fails. add_cuda_version_tag therefore
+# writes this same pin into [build-system] requires.
 #
 # The CUDA runtime *is* our concern, because our own binaries link it, so we name it rather
 # than hope torch's transitive set covers the right major. Bounds stay loose: the cu13 packages
@@ -88,6 +91,12 @@ def add_cuda_version_tag(cuda_tag: str):
     existing_deps = [dep for dep in existing_deps if not dep.startswith("torch")]
 
     data["project"]["dependencies"] = existing_deps + CUDA_DEPS[cuda_tag]
+
+    # Build against the torch the wheel installs (see CUDA_DEPS).
+    torch_pin = next(dep for dep in CUDA_DEPS[cuda_tag] if dep.startswith("torch=="))
+    requires = [req for req in data["build-system"]["requires"] if not req.startswith("torch")]
+    data["build-system"]["requires"] = requires + [torch_pin]
+    print(f"Build requires {torch_pin}")
 
     with open("pyproject.toml", "w") as f:
         tomlkit.dump(data, f)

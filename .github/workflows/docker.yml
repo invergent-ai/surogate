@@ -19,7 +19,7 @@ on:
 
 jobs:
   docker:
-    name: Build Docker image (CUDA ${{ matrix.wheel_tag }})
+    name: Build Docker image (${{ matrix.variant }}CUDA ${{ matrix.wheel_tag }})
     runs-on: ubuntu-latest
     # After a wheel build, only when that build was for a release tag: a manual wheel run
     # (workflow_dispatch on a branch) publishes nothing, so there is nothing to put in an image.
@@ -36,6 +36,12 @@ jobs:
           # CUDA 13.0 or newer.
           - wheel_tag: "cu130"
             dockerfile: "Dockerfile.cu130"
+            variant: ""
+          # `surogate serve --tts/--stt` with a pocket-tts worker's environment; tagged
+          # <version>-speech-cu130 and latest-speech-cu130 only.
+          - wheel_tag: "cu130"
+            dockerfile: "Dockerfile-speech.cu130"
+            variant: "speech-"
 
     steps:
       - name: Check if this CUDA version should be built
@@ -116,14 +122,15 @@ jobs:
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.version.outputs.version }}
+          # The general image also takes <version> and latest; a variant only its own names.
           tags: |
-            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}
-            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}
-            ghcr.io/invergent-ai/surogate:latest-${{ matrix.wheel_tag }}
-            ghcr.io/invergent-ai/surogate:latest
+            ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.variant }}${{ matrix.wheel_tag }}
+            ghcr.io/invergent-ai/surogate:latest-${{ matrix.variant }}${{ matrix.wheel_tag }}
+            ${{ matrix.variant == '' && format('ghcr.io/invergent-ai/surogate:{0}', steps.version.outputs.version) || '' }}
+            ${{ matrix.variant == '' && 'ghcr.io/invergent-ai/surogate:latest' || '' }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.wheel_tag }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.wheel_tag }}
+          cache-from: type=gha,scope=${{ matrix.variant }}${{ matrix.wheel_tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}${{ matrix.wheel_tag }}
 
       # The image is the last place the packaging can go wrong, and the first place a user
       # meets it. Two questions, and neither answers the other.
@@ -138,7 +145,7 @@ jobs:
       # -- libcudart and libcublasLt out of the pip CUDA wheels included -- is a live check on
       # the ld.so.conf.d paths written above, which is the other thing that has no test.
       - name: The engine is whole in the image
-        if: steps.should_build.outputs.build == 'true'
+        if: steps.should_build.outputs.build == 'true' && matrix.variant == ''
         run: |
           set -euo pipefail
           image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
@@ -194,7 +201,7 @@ jobs:
       # hidden for a year. Catching that class needs a resolve of the declared
       # set alone, not an import in the assembled image.
       - name: The package can import what a run will import
-        if: steps.should_build.outputs.build == 'true'
+        if: steps.should_build.outputs.build == 'true' && matrix.variant == ''
         run: |
           set -euo pipefail
           image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
@@ -247,7 +254,7 @@ jobs:
       # dependency. This is the only place it runs unattended: no workflow runs
       # pytest, which is why the drift went unnoticed in the first place.
       - name: vf-eval still binds against the pinned verifiers
-        if: steps.should_build.outputs.build == 'true'
+        if: steps.should_build.outputs.build == 'true' && matrix.variant == ''
         run: |
           set -euo pipefail
           image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
@@ -257,3 +264,66 @@ jobs:
               /root/.local/bin/uv pip install --python /root/.venv/bin/python3 --quiet pytest
               /root/.venv/bin/python -m pytest /t/test_vf_eval_signature.py -q
             "
+
+      # surogate-stt links libtorch: built against one torch and run against another, the loader warns
+      # "... has different size in shared object" and every transcription fails on garbage tensor shapes.
+      # Published images shipped that way (built against 2.13, installed 2.11.0) because nothing ran
+      # speech recognition here, and a model-based check needs a Hugging Face token this workflow does
+      # not have. The warning is the tell and needs no model: the loader prints it before main(), so
+      # starting the binary without arguments is enough.
+      - name: surogate-stt loads against the torch it was built with
+        if: steps.should_build.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.variant }}${{ matrix.wheel_tag }}"
+          docker run --rm -i --entrypoint python3 "$image" - <<'PY'
+          import subprocess, sys
+          from surogate.cli.serve import _resolve_binary
+
+          stt = _resolve_binary("stt")
+          run = subprocess.run([stt], capture_output=True, text=True)
+          clash = [ln for ln in (run.stdout + run.stderr).splitlines() if "different size" in ln]
+          if clash:
+              print("::error::surogate-stt was built against another torch than the image installs: " + clash[0])
+              sys.exit(1)
+          print(f"ok: {stt} loads cleanly")
+          PY
+
+      # The speech image serves pocket-tts packages, whose worker runs in the image's Python
+      # (SUROGATE_TTS_PYTHON): the TTS binaries must load, and the worker's third-party imports resolve.
+      - name: The speech servers and the pocket-tts worker environment are whole
+        if: steps.should_build.outputs.build == 'true' && matrix.variant == 'speech-'
+        run: |
+          set -euo pipefail
+          image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.variant }}${{ matrix.wheel_tag }}"
+          docker run --rm -i --entrypoint python3 "$image" - <<'PY'
+          import os, subprocess, sys
+          from pathlib import Path
+          from surogate.cli.serve import _resolve_binary
+
+          problems = []
+          tts = _resolve_binary("tts")
+          for path in (tts, str(Path(tts).with_name("surogate-tts-worker")), _resolve_binary("stt")):
+              ldd = subprocess.run(["ldd", path], capture_output=True, text=True).stdout
+              missing = [ln.split("=>")[0].strip() for ln in ldd.splitlines()
+                         if "not found" in ln and "libcuda.so.1" not in ln]
+              if missing:
+                  problems.append(f"{path} cannot load " + ", ".join(missing))
+              else:
+                  print(f"ok: {path}")
+          # What the server runs the worker with: its imports must resolve there, numpy 2 included.
+          worker_python = os.environ.get("SUROGATE_TTS_PYTHON")
+          probe = ("import numpy, scipy, safetensors, sentencepiece, tokenizers, pydantic, soundfile, yaml, "
+                   "huggingface_hub, requests, torch; "
+                   "assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy ' + numpy.__version__ + ' < 2'")
+          if not worker_python:
+              problems.append("SUROGATE_TTS_PYTHON is not set")
+          else:
+              run = subprocess.run([worker_python, "-c", probe], capture_output=True, text=True)
+              if run.returncode:
+                  problems.append(f"the worker's Python ({worker_python}): " + (run.stderr.strip().splitlines() or ["?"])[-1])
+          if problems:
+              print("::error::" + "; ".join(problems))
+              sys.exit(1)
+          print("ok: the pocket-tts worker environment")
+          PY
