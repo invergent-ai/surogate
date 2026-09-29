@@ -191,11 +191,12 @@ public:
     /// Bytes needed for non-graph persistent buffers that don't have a tid
     /// in the compiled graph (today: the `output` logits scratch used by
     /// `fused_lm_head_loss`). Used by `GraphExecutor` to grow the Persistent
-    /// arena beyond the `ForwardParam` / wm / lora slabs.
+    /// arena beyond the `ForwardParam` / wm / lora slabs. Includes the padding
+    /// needed to keep every buffer aligned to 256 bytes.
     std::size_t non_graph_persistent_extras_bytes() const;
 
     /// Rebind non-graph-tid persistent buffers (`output`) into the arena
-    /// slab at `base`. Bump-allocated in a fixed order; caller must have
+    /// slab at a 256-byte-aligned `base`. Bump-allocated in a fixed order; caller must have
     /// reserved exactly `non_graph_persistent_extras_bytes()`.
     void rebind_non_graph_persistent_to_arena(std::byte* base, std::size_t bytes, cudaStream_t stream);
 

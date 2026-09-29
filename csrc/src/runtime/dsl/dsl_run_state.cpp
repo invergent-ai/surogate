@@ -38,6 +38,17 @@ namespace dsl {
 namespace {
 constexpr double kPi = 3.14159265358979323846;
 
+// GraphExecutor aligns the extras slab to 256 bytes. Preserve that alignment for
+// every buffer inside it as well: e.g. the two FP32 matmul scales otherwise put
+// encoder_bwd_scratch eight bytes off alignment, but its kernel loads int4s.
+constexpr std::size_t kPersistentExtraAlignment = 256;
+
+std::size_t persistent_extra_slot_bytes(const Tensor& tensor) {
+    return tensor.has_value()
+               ? div_ceil(tensor.bytes(), kPersistentExtraAlignment) * kPersistentExtraAlignment
+               : 0;
+}
+
 struct RopeInvFreq {
     std::vector<float> inv_freq;
     float attention_scale = 1.0f;
@@ -816,10 +827,9 @@ std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
     // via `.has_value()` to avoid throwing "Invalid dtype" from
     // get_dtype_size. Quant-grad tensors are skipped because their `.Stats`
     // field is pointer arithmetic into mGradQuantStats — rebinding would
-    // orphan the Stats link.
-    auto safe_bytes = [](const Tensor& t) -> std::size_t {
-        return t.has_value() ? t.bytes() : 0;
-    };
+    // orphan the Stats link. Include the same per-buffer alignment padding
+    // that the rebinding walk consumes.
+    auto safe_bytes = persistent_extra_slot_bytes;
     total += safe_bytes(mNonBlockActivations.output);
     total += safe_bytes(mNonBlockActivations.ln_final_rstd);
     total += safe_bytes(mNonBlockActivations.freq_cis);
@@ -853,7 +863,8 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
     auto rebind_into = [&](Tensor& t) {
         if (t.Data == nullptr) return;
         const std::size_t tbytes = t.bytes();
-        if (tbytes == 0 || consumed + tbytes > bytes) return;
+        const std::size_t slot_bytes = persistent_extra_slot_bytes(t);
+        if (tbytes == 0 || consumed + slot_bytes > bytes) return;
         std::byte* slot = base + consumed;
         CUDA_CHECK(cudaMemcpyAsync(slot, t.Data, tbytes, cudaMemcpyDeviceToDevice, stream));
         float* preserved_stats = t.Stats;
@@ -862,7 +873,7 @@ void DslRunState::rebind_non_graph_persistent_to_arena(std::byte* base, std::siz
         t.Data = slot;
         t.Device = device;
         t.Stats = preserved_stats;
-        consumed += tbytes;
+        consumed += slot_bytes;
     };
 
     // Order must match `non_graph_persistent_extras_bytes`.

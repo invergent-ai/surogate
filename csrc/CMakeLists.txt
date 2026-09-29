@@ -823,6 +823,10 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     target_link_libraries(dsl-weight-loader-tests PRIVATE surogate-common Catch2::Catch2WithMain)
     add_test(NAME dsl-weight-loader-tests COMMAND dsl-weight-loader-tests)
 
+    add_executable(dsl-run-state-tests src/testing/runtime/test-run-state-arena.cpp)
+    target_link_libraries(dsl-run-state-tests PRIVATE surogate-common Catch2::Catch2WithMain)
+    add_test(NAME dsl-run-state-tests COMMAND dsl-run-state-tests)
+
     add_executable(integration-tests
         src/testing/utilities/test_main.cpp
         src/testing/distributed/test-nccl.cpp
