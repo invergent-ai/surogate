@@ -1,7 +1,9 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
+#include "api/ops/batch_invariant.h"
 #include "core/device.h"
 #include "core/engine_context.h"
+#include "ops/linear/bf16/bf16_invariant_gemm.h"
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
@@ -190,6 +192,14 @@ namespace {
 void gemm_with_beta(const Weight& weight, const Tensor& x, Tensor& out, float beta,
                     cudaStream_t stream) {
     require_operands(weight, x, out);
+    // --batch-invariant: cuBLASLt chooses its algorithm per width, so a token's bits would follow
+    // the round it shares. The invariant route's reduction order is fixed by k alone.
+    if (batch_invariant() && (beta == 0.0F || beta == 1.0F) &&
+        bf16_invariant_gemm_supports(weight.n, weight.k, weight.n)) {
+        bf16_invariant_gemm(weight.qdata, weight.n, weight.k, x.data, x.ne[1], out.data, weight.n,
+                            beta != 0.0F, stream);
+        return;
+    }
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);
     const Plan& plan  = plan_for(state, PlanKey{weight.n, weight.k, x.ne[1], weight.n});
@@ -221,6 +231,11 @@ void bf16_cublaslt_gemm_raw(const void* weight, std::int32_t n, std::int32_t k, 
         (ldc % 8) != 0 || !aligned(weight) || !aligned(x) || !aligned(out)) {
         throw std::invalid_argument("bf16 cuBLASLt raw: n, k and ldc must be positive multiples "
                                     "of 8 with ldc >= n and every operand 16-byte aligned");
+    }
+    if (batch_invariant() && (beta == 0.0F || beta == 1.0F) &&
+        bf16_invariant_gemm_supports(n, k, ldc)) {
+        bf16_invariant_gemm(weight, n, k, x, tokens, out, ldc, beta != 0.0F, stream);
+        return;
     }
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);

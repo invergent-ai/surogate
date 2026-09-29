@@ -1233,6 +1233,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/linear/bf16/bf16_gemm_mma.cu
   ${SERVE_ROOT}/ops/linear/bf16/bf16_small_t.cu
   ${SERVE_ROOT}/ops/linear/bf16/bf16_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_invariant_gemm.cu
   ${SERVE_ROOT}/ops/linear/fp8/fp8_format.cpp
   ${SERVE_ROOT}/ops/linear/fp8/fp8_gemv.cu
   ${SERVE_ROOT}/ops/linear/fp8/fp8_generic.cu

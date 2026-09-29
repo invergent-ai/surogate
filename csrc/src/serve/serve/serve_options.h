@@ -113,6 +113,10 @@ struct ServeOptions {
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    // --batch-invariant: a request's logits, log-probabilities and greedy tokens do not depend
+    // on what else shares its rounds (api/ops/batch_invariant.h). Off by default: it trades
+    // throughput for reproducibility.
+    bool batch_invariant = false;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

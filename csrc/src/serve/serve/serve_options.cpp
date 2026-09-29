@@ -155,7 +155,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] [--spec-adaptive] "
            "[--default-max-tokens N] "
            "[--vision] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
-           "[--enforce-eager] [--no-prefix-reuse] "
+           "[--enforce-eager] [--no-prefix-reuse] [--batch-invariant] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
            "[--gpu-memory-limit-mib N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
@@ -186,6 +186,9 @@ std::string serve_usage_text(const char* argv0) {
            "hybrids.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --batch-invariant makes each request's logits, log-probabilities and greedy\n"
+           "         tokens independent of what else is batched with it (BF16 text models), at a\n"
+           "         throughput cost. Implies --enforce-eager and --no-prefix-reuse; refuses --spec.\n"
            "       --no-elastic-kv reserves the full cache; --elastic-kv grows it with demand.\n"
            "       --gpu-memory-limit-mib N caps everything this server holds on each of its GPUs\n"
            "                    (weights, cache, workspaces, CUDA context); auto sizing fits in it\n"
@@ -471,6 +474,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--batch-invariant") {
+            options.batch_invariant = true;
         } else if (arg == "--enable-prefix-caching") {
             // vLLM's spelling for what this engine has done by default since it
             // shipped; accepted so a command line written for vLLM runs unchanged.
@@ -848,6 +853,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--max-num-batched-tokens must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.batch_invariant) {
+        // Speculative verification scores several positions per row and replays GDN state from
+        // records; neither path is batch-invariant, so refuse rather than promise it.
+        if (options.speculative.backend != SpeculativeBackend::None) {
+            throw std::invalid_argument("--batch-invariant cannot be combined with --spec");
+        }
+        for (const auto& extra : options.extra_models) {
+            if (extra.speculative.backend != SpeculativeBackend::None) {
+                throw std::invalid_argument("--batch-invariant cannot be combined with a --model spec");
+            }
+        }
+        // Captured graphs pad a prompt chunk to its bucket, which changes a recurrent layer's
+        // kernel and chunking against the eager rounds a prompt takes when it shares them.
+        options.use_cuda_graph = false;
+        // A prefix hit continues from state another request left behind, so the answer would
+        // depend on what was served before.
+        options.allow_prefix_reuse = false;
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

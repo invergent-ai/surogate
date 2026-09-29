@@ -1,4 +1,5 @@
 #include "api/ops/gdn_gating_proj.h"
+#include "api/ops/batch_invariant.h"
 #include "api/ops/rmsnorm.h"
 
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
@@ -115,7 +116,10 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_bf16_weight(a_weight, heads, rows, "a_weight");
     require_bf16_weight(b_weight, heads, rows, "b_weight");
 
-    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+    // --batch-invariant: the registered routes split k by the token count (16-way below 128
+    // tokens, 8-way to 1024, ...), so a token's gates would follow its round's width. The generic
+    // kernel reduces each (head, token) in one warp with a fixed order.
+    if (!batch_invariant() && detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
         detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
     } else {
         detail::bf16_gdn_gating_proj_generic_launch(x, a_weight, b_weight, A_log, dt_bias,
@@ -137,7 +141,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
-    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+    if (!batch_invariant() && detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
         detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
     } else {
         detail::bf16_gdn_gating_proj_generic_launch(x, a_weight, b_weight, A_log, dt_bias,
@@ -169,7 +173,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_bf16_weight(a_weight, heads, rows, "a_weight");
     require_bf16_weight(b_weight, heads, rows, "b_weight");
 
-    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+    if (!batch_invariant() && detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
         detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                               dt_bias, ws, g, beta, stream);
     } else {
@@ -199,7 +203,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
-    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+    if (!batch_invariant() && detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
         detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                               dt_bias, ws, g, beta, stream);
     } else {

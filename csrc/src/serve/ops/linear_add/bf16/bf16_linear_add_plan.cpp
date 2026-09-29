@@ -2,6 +2,8 @@
 
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
+#include "api/ops/batch_invariant.h"
+
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
@@ -44,6 +46,12 @@ const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noex
 
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                               cudaStream_t stream) {
+    // --batch-invariant: the registered shape's schedules change with T; the cuBLASLt entry
+    // point carries the invariant GEMM in that mode.
+    if (batch_invariant()) {
+        bf16_cublaslt_gemm_accumulate(weight, x, residual, stream);
+        return;
+    }
     switch (bf16_linear_add_select(weight.n, weight.k, x.ne[1])) {
     case Bf16LinearAddScheduleId::Decode:
         bf16_linear_add_decode_launch(x, weight, residual, stream);

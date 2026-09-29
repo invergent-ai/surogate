@@ -10,6 +10,7 @@
 #include <cstdlib>
 
 #include "family/impl/runtime/schedule.h"
+#include "api/ops/batch_invariant.h"
 #include "api/ops/lora_store.h"
 #include "api/ops/sampled_logprob.h"
 #include "api/ops/gdn_replay.h"
@@ -2532,6 +2533,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // --batch-invariant: the same fixed cuts a shared round would make.
+            if (ops::batch_invariant() && !staged.vision) { nominal = invariant_prefill_piece(staged); }
             if (const auto boundary = staged.chunk_boundary(); boundary && staged.cursor < *boundary) {
                 nominal = std::min(nominal, *boundary - staged.cursor);
             }
@@ -3023,6 +3026,28 @@ std::string ProgramImplCore::last_mixed_round_description(std::size_t row) const
     return out;
 }
 
+std::uint32_t ProgramImplCore::invariant_prefill_chunk() const noexcept {
+    if (!ops::batch_invariant()) { return 0; }
+    // A mixed round's window is prefill_chunk less one column per decode row. Leaving room for
+    // the widest decode batch means a staged prompt's next piece always fits beside it, so the
+    // cut never has to move to where that round's window happens to end. The reserve is rounded
+    // up to the 128-token alignment, so every --max-num-seqs up to 128 cuts at the same places
+    // (1920 tokens apart under the default 2048-token window).
+    constexpr std::uint32_t kAlignment = 128;
+    const std::uint32_t decode_rows    = std::min(batch_capacity, prefill_chunk);
+    const std::uint32_t reserve        = (decode_rows + kAlignment - 1) / kAlignment * kAlignment;
+    const std::uint32_t chunk          = prefill_chunk > reserve ? prefill_chunk - reserve : 0;
+    return std::max(chunk, kAlignment);
+}
+
+std::uint32_t
+ProgramImplCore::invariant_prefill_piece(const RequestControl::Prefill& staged) const noexcept {
+    const std::uint32_t chunk = invariant_prefill_chunk();
+    const std::uint32_t left  = staged.prompt_tokens - staged.cursor;
+    if (chunk == 0) { return left; }
+    return std::min(chunk - staged.cursor % chunk, left);
+}
+
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept {
     if (prefill_lane >= max_concurrency) {
         return false;
@@ -3032,6 +3057,12 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
     const RequestControl::Prefill& staged = *request.prefill;
     if (request.target_only && decode_rows > 0) return false;
     if (prefill_chunk <= decode_rows * (speculative_backend == SpeculativeBackend::DFlash ? draft_window + 1 : 1)) {
+        return false;
+    }
+    // --batch-invariant: the prompt's next piece must fit whole beside the decode rows; a
+    // smaller window would cut it where this round, not the prompt, decides.
+    if (ops::batch_invariant() && staged.cursor < staged.prompt_tokens &&
+        invariant_prefill_piece(staged) > prefill_chunk - decode_rows) {
         return false;
     }
     const auto reserved_columns = decode_rows *
@@ -3227,10 +3258,19 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         std::array<schedule::VisionChunk, runtime::kMaximumMixedPrefills> vision_chunks{};
         std::uint32_t window_left = mixed_chunk_cap;
         std::size_t staged_count  = 0;
+        const bool invariant_cuts = ops::batch_invariant();
         for (std::size_t i = 0; i < prefill_lanes.size() && window_left > 0; ++i) {
             const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
             const std::uint32_t want = entry.prompt_tokens - entry.cursor;
             nominals[i]              = std::min(window_left, want);
+            if (invariant_cuts && !entry.vision) {
+                // --batch-invariant: a prompt advances by whole pieces between its own fixed
+                // cuts. One that does not fit in what is left of the window waits for a later
+                // round instead of being cut where this round's company leaves off.
+                const std::uint32_t piece = invariant_prefill_piece(entry);
+                if (piece > window_left) { break; }
+                nominals[i] = piece;
+            }
             if (const auto boundary = entry.chunk_boundary(); boundary && entry.cursor < *boundary) {
                 nominals[i] = std::min(nominals[i], *boundary - entry.cursor);
             }

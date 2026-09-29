@@ -1,6 +1,8 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
+#include "api/ops/batch_invariant.h"
+
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_launch.h"
 
@@ -22,7 +24,9 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
     const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
-    if (!supported_problem) {
+    // --batch-invariant: the registered shapes change kernels (and reduction trees) with T; the
+    // cuBLASLt entry point carries the invariant GEMM in that mode.
+    if (!supported_problem || batch_invariant()) {
         if ((n % 8) != 0 || ((k % 8) != 0 && k != 588)) {
             throw std::invalid_argument("bf16 linear: unsupported shape or T");
         }

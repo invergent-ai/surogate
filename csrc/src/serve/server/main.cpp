@@ -1,3 +1,4 @@
+#include "api/ops/batch_invariant.h"
 #include "product/load_progress/load_progress.h"
 #include "product/cuda_visibility/cuda_visibility.h"
 #include "core/sleep.h"
@@ -93,6 +94,13 @@ int main(int argc, char** argv) {
         }
         for (std::size_t i = 0; i < placements.size(); ++i) { *placements[i] = requested[i]; }
         if (!options.devices.empty()) { options.device = options.devices.front(); }
+
+        // Before any model loads or kernel runs: every op reads it from the first forward on.
+        sinfer::ops::set_batch_invariant(options.batch_invariant);
+        if (options.batch_invariant) {
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
+                                             "batch-invariant numerics enabled");
+        }
 
         using Clock = std::chrono::steady_clock;
         sinfer::serve::HttpServer server(options);

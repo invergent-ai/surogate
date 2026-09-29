@@ -52,6 +52,9 @@ Common server options (full list: surogate serve --engine-help):
                                  softmax(option logits / T); default 1 (unchanged)
   --decision-attempts N          run a decisions request up to N times while its option
                                  logits come out non-finite (default 3; 1 = no retry)
+  --batch-invariant              a request's logits, log-probabilities and greedy tokens do
+                                 not depend on what else is batched with it (BF16 text
+                                 models; implies --enforce-eager and --no-prefix-reuse)
 
 --generate runs one shot and has its own spellings for a few options
 (--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
@@ -124,7 +127,7 @@ _VALUE_OPTIONS = {
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""
         --elastic-kv --no-elastic-kv
-        --elastic-kv-overcommit --enforce-eager --no-prefix-reuse
+        --elastic-kv-overcommit --enforce-eager --no-prefix-reuse --batch-invariant
         --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
         --enable-sleep-mode --enable-lora --preserve-thinking --cors
     """.split()),

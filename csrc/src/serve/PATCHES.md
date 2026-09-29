@@ -3542,3 +3542,59 @@ Catalog loading is bounded and rejects malformed envelopes and unserved model ID
 metadata and credentials stay outside the source tree. System One aliases share the same
 handler and admission policy. CPU contract/HTTP tests cover normalization, single-option
 arithmetic, catalog loading, route authentication and disabled catalog behavior.
+
+## 99
+
+**Batch-invariant numerics, `--batch-invariant` (2026-09-29, on v1.5.7).**
+
+Qwen3.5-0.8B served from its safetensors (BF16, GDN hybrid) returned different prompt
+log-probabilities for the same sentence depending on what it was batched with: 120 sentences
+scored sixteen at a time differed from the same sentences scored one at a time in 113-120 cases,
+by up to 1.0 nat on one token and 4 nats over a sentence, and greedy chat answers changed. One
+request at a time was bit-reproducible. Three causes, each sufficient on its own:
+
+- Every BF16 projection of a checkpoint outside the registered 27B shapes runs cuBLASLt
+  (`ops/linear/bf16/bf16_dispatch.cpp`, `bf16_cublaslt.cpp`), whose plan is cached per
+  `(rows, k, tokens)` and whose heuristic picks tile and split-K by the token count. A token's
+  bits therefore follow the width of the round it lands in. The narrow-output projections
+  (GDN/attention output, MLP down: 1024 rows, k 2048/3584) differ between widths; the K-quant
+  and GGML routes were already width-invariant by construction (#96, #97), BF16 was not.
+- The fused GDN norm + gating projection (`ops/gdn_gating_proj`, the 0.8B rides the 3.5-35B
+  routes, #13) splits k 16 ways below 128 tokens, 8 ways to 1024, and so on.
+- A prompt that shares a round is cut where the round's window runs out (#80), which for a
+  recurrent layer moves the GDN chunking and the BF16 state hand-off. The prompt log-probability
+  head also slices by the workspace that is left.
+
+None of it was a correctness bug: with the three removed, packed and mixed rounds reproduce the
+sequential results bit for bit (short and long prompts, decode rows beside prompt chunks), so no
+state, position, page or mask leaks between requests. Against an FP32 transformers forward of the
+same snapshot, sequential and batched results were equally close (mean |error| 0.054 and
+0.055-0.058 nats a token; HF's own BF16 forward 0.052), and cutting a prompt at an arbitrary
+position did not raise the error after the cut.
+
+`--batch-invariant` (`api/ops/batch_invariant.h`, process-wide, set before the model loads):
+
+- BF16 projections run `bf16_invariant_gemm` (new): each output is one FP32 accumulator over
+  m16n8k16 MMAs in increasing k, k zero-padded to 64, no split-K. Three tiles (16x8, 32x32,
+  64x64) are picked by width for speed; none changes that chain. Linear, Linear-add, the
+  registered 27B kernels and the raw cuBLASLt entry all take it.
+- The GDN gating projection takes its generic kernel (one warp per head and token).
+- Prompts are cut only at multiples of `prefill_chunk - round_up(decode rows, 128)` from position
+  zero (`invariant_prefill_piece`), in single-lane and mixed rounds alike; a piece that does not
+  fit what a round has left waits for a later round instead of being cut.
+- It implies `--enforce-eager` (graph buckets pad a prompt chunk) and `--no-prefix-reuse` (a hit
+  continues from state another request left), and refuses `--spec`.
+
+`sinfer_batch_invariant_test` compares every token of launches 1-300 wide, at several offsets,
+with the same token alone, for each BF16 entry point and the gating projection, plus FP64
+oracles; with the switch off it fails on cuBLASLt and on the gating routes.
+`tests/serve/test_batch_invariance.py` (GPU, opt-in) serves short and long prompts and chat
+answers alone and sixteen at a time and requires identical bits.
+
+Measured on an RTX 5090, Qwen3.5-0.8B, eager and without prefix reuse in both: repro sets of 120
+sentences, 16 long documents (340-2900 tokens) and a staggered mixed workload are bit-identical at
+concurrency 1, 4, 8 and 16 (were 62-120 of 120, 9-12 of 16 and 25-29 of 32 differing). Throughput
+against the same server without the flag: short scoring 133.7 -> 126.8 req/s alone and 374.7 ->
+341.5 at 16 clients, long-document scoring 42.4k -> 37.3k tok/s, 16 concurrent generations 4465 ->
+4465 tok/s, one generation stream 443 -> 328 tok/s (the decode GEMMs cannot split k).
+

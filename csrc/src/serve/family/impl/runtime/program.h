@@ -389,6 +389,12 @@ public:
     advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept;
+    /// --batch-invariant (api/ops/batch_invariant.h): prompts are cut only at multiples of this
+    /// many tokens from position zero, whatever else shares their rounds. Zero when off.
+    [[nodiscard]] std::uint32_t invariant_prefill_chunk() const noexcept;
+    /// The prompt tokens a staged prefill advances by next under --batch-invariant: up to its
+    /// next invariant cut, or to its end.
+    [[nodiscard]] std::uint32_t invariant_prefill_piece(const RequestControl::Prefill& staged) const noexcept;
     [[nodiscard]] std::string last_mixed_round_description(std::size_t row) const;
     void set_round_burst_limit(std::uint32_t limit) noexcept { round_burst_limit = limit; }
     [[nodiscard]] std::uint32_t reusable_append_frontier(const SequenceState& sequence) const noexcept;

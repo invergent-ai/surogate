@@ -377,6 +377,24 @@ int main() {
     failures +=
         check(serve_usage_text("sinfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    {
+        // --batch-invariant is opt-in, and pins what it cannot keep invariant: captured graphs
+        // (bucket-padded prompt chunks) and prefix reuse (state another request left behind).
+        failures += check(!defaults.batch_invariant, "batch invariance should be opt-in");
+        const auto invariant = parse({"sinfer-serve", "model.sinfer", "--batch-invariant"});
+        failures += check(invariant.batch_invariant, "--batch-invariant was not parsed");
+        failures += check(!invariant.use_cuda_graph, "--batch-invariant kept CUDA graphs");
+        failures += check(!invariant.allow_prefix_reuse, "--batch-invariant kept prefix reuse");
+        bool rejected = false;
+        try {
+            (void)parse({"sinfer-serve", "model.sinfer", "--batch-invariant", "--spec", "mtp",
+                         "--draft-tokens", "3"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--batch-invariant accepted speculative decoding");
+        failures +=
+            check(serve_usage_text("sinfer-serve").find("--batch-invariant") != std::string::npos,
+                  "serve help omits --batch-invariant");
+    }
     failures +=
         check(serve_usage_text("sinfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");

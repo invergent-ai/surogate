@@ -57,6 +57,7 @@ from earlier tokens; its capacity affects how many requests can run together.
 | `--no-prefix-reuse` | off | Disable reuse of compatible earlier prompts |
 | `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
 | `--enforce-eager` | off | Disable CUDA graphs for debugging |
+| `--batch-invariant` | off | Make each request's results independent of the other requests batched with it (see [Reproducible results](#reproducible-results)) |
 
 With `auto`, the cache grows with demand up to the capacity it was sized for. The 1024 MiB left
 over stays free for CUDA graphs and working buffers. The cache goes past its capacity only when
@@ -79,6 +80,31 @@ models such as Qwen3.5/3.6/3.8, including with DFlash. FP8 uses half the cache s
 
 With `--elastic-kv-overcommit`, `--kv-capacity` becomes a guaranteed minimum; `auto` guarantees
 enough for one full-context request per model. See [Serving models](serving-models.md#several-models-on-one-gpu).
+
+### Reproducible results
+
+By default a request's logits, and so its log-probabilities and greedy tokens, can change in the
+last bits with the other requests the server batches it with: a BF16 projection's algorithm
+follows the number of tokens in the step, some fused kernels split their sums by it, and a long
+prompt that shares a step is cut where the step's token budget runs out. The differences are
+rounding-level, but a sensitive model turns them into visible ones: on Qwen3.5-0.8B, scoring
+sentences sixteen at a time moved sentence log-probabilities by up to 4 nats against scoring
+them one at a time, and changed some greedy answers.
+
+`--batch-invariant` removes that dependence for BF16 text models. Every BF16 projection runs a
+kernel whose per-value reduction order is fixed by the matrix alone; the GDN gating projection
+takes a fixed-order kernel; and prompts are cut at fixed positions (every
+`--max-num-batched-tokens` less 128 tokens, 1920 by default, for up to 128 sequences) whatever
+shares their steps.
+A request then returns the same bits alone, among sixteen, or in any arrival order. It implies
+`--enforce-eager` and `--no-prefix-reuse` (a prefix hit continues from another request's state),
+and cannot be combined with `--spec`. Other weight formats keep their own kernels (the GGUF ones
+already compute a token the same way at every width; FP8, NVFP4 and W8 are not verified), and
+images and pipelines across several GPUs are not covered.
+
+Measured on an RTX 5090 with Qwen3.5-0.8B, against the same eager, no-reuse server without the
+flag: short-prompt scoring 5% slower one at a time and 9% slower sixteen at a time, long-prompt
+scoring 12% slower, sixteen concurrent generations unchanged, one generation stream 26% slower.
 
 ### Sharing a GPU
 

@@ -460,6 +460,7 @@ target_link_libraries(sinfer_cpu_embed_cli PRIVATE sinfer_shared)
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(sinfer_op_tests
   spark_numerics
+  batch_invariant
   add_bias
   gelu
   gelu_mul
