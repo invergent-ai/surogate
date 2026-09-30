@@ -208,7 +208,7 @@ set(CUTLASS_ENABLE_PROFILER OFF CACHE BOOL "Enable CUTLASS profiler")
 # set(CUTLASS_ENABLE_LIBRARY OFF CACHE BOOL "Enable CUTLASS library")
 # set(CUTLASS_LIBRARY_KERNELS "" CACHE STRING "Comma-separated list of kernel name filters")
 # Only build for SM89+ (Ada/Hopper/Blackwell/Next-gen): 89, 90, 90a, 100a, 103a, 120a, 121a
-# SM89: Ada (RTX 40x0/L40/L4), SM90/90a: Hopper, SM100a: Blackwell B200, SM103a: Blackwell B300, SM120a: RTX 50x0/DGX Spark
+# SM89: Ada (RTX 40x0/L40/L4), SM90/90a: Hopper, SM100a: Blackwell B200, SM103a: Blackwell B300, SM120a: RTX 50x0, SM121a: GB10 (DGX Spark)
 # Note: SM100/103/120 require 'a' suffix for tcgen05.mma and block-scaled MMA features (FP4)
 set(CUTLASS_NVCC_ARCHS "89;90;90a;100a;103a;120a;121a" CACHE STRING "CUDA architectures for CUTLASS")
 set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "NVCC archs to build library kernels")
@@ -992,7 +992,11 @@ target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
 # sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
 # other architectures link a loud-failure stub instead.
-if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+# The NVFP4 kernel families (TMA, TensorRT-LLM MoE) need the arch-specific Blackwell feature
+# set: sm_120a (RTX 50 / RTX PRO) or sm_121a (GB10 / DGX Spark).
+set(SINFER_FP4_ARCHS "${SUROGATE_SERVE_CUDA_ARCHS}")
+list(FILTER SINFER_FP4_ARCHS INCLUDE REGEX "^12[01]a$")
+if(SINFER_FP4_ARCHS)
   set(SINFER_NVFP4_TMA_REAL ON)
   add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
@@ -1010,7 +1014,7 @@ set_target_properties(sinfer_nvfp4_tma PROPERTIES
 # an sm_89 cubin of a kernel sm_89 cannot run is fatbin weight and a compile that has to be
 # guarded instruction by instruction. `w4fp4_plane` admits these routes at CC 120 and above.
 if(SINFER_NVFP4_TMA_REAL)
-  set_target_properties(sinfer_nvfp4_tma PROPERTIES CUDA_ARCHITECTURES 120a)
+  set_target_properties(sinfer_nvfp4_tma PROPERTIES CUDA_ARCHITECTURES "${SINFER_FP4_ARCHS}")
 endif()
 target_compile_options(sinfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(sinfer_nvfp4_tma PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
@@ -1039,7 +1043,7 @@ target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA
 # unchanged. sm_120-only, non-RDC, like the W4A4 TMA archive above; other architectures link a
 # loud-failure stub.
 set(TRTLLM_MOE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/trtllm_moe)
-if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+if(SINFER_FP4_ARCHS)
   set(SINFER_TRTLLM_MOE_REAL ON)
   file(GLOB TRTLLM_MOE_GENERATED ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120/gemm_grouped/120/*.generated.cu)
   add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
@@ -1097,7 +1101,7 @@ set_target_properties(sinfer_trtllm_moe PROPERTIES
 # The instantiations vendored here are FlashInfer's for architecture 120, and the kernels are
 # NVFP4: sm_120 alone, like the TMA archive above, whatever else the binary is built for.
 if(SINFER_TRTLLM_MOE_REAL)
-  set_target_properties(sinfer_trtllm_moe PROPERTIES CUDA_ARCHITECTURES 120a)
+  set_target_properties(sinfer_trtllm_moe PROPERTIES CUDA_ARCHITECTURES "${SINFER_FP4_ARCHS}")
 endif()
 target_link_libraries(sinfer_trtllm_moe PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
