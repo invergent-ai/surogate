@@ -17,6 +17,19 @@
 #include <execinfo.h>
 #include <cxxabi.h>
 #include <sys/ucontext.h>
+
+// Program counter / stack pointer / frame pointer from the signal context, per architecture.
+#if defined(__x86_64__)
+#define SUROGATE_MC_PC(mc) ((mc)->gregs[REG_RIP])
+#define SUROGATE_MC_SP(mc) ((mc)->gregs[REG_RSP])
+#define SUROGATE_MC_FP(mc) ((mc)->gregs[REG_RBP])
+#elif defined(__aarch64__)
+#define SUROGATE_MC_PC(mc) ((mc)->pc)
+#define SUROGATE_MC_SP(mc) ((mc)->sp)
+#define SUROGATE_MC_FP(mc) ((mc)->regs[29])
+#else
+#error "crash_handler: unsupported architecture"
+#endif
 #include <dlfcn.h>
 
 // libdw for DWARF debug info resolution (source file/line info)
@@ -238,15 +251,15 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
         mcontext_t* mc = &uc->uc_mcontext;
 
         safe_write("\nCPU Registers: RIP=");
-        safe_write_ptr((void*)mc->gregs[REG_RIP]);
+        safe_write_ptr((void*)SUROGATE_MC_PC(mc));
         safe_write(" RSP=");
-        safe_write_ptr((void*)mc->gregs[REG_RSP]);
+        safe_write_ptr((void*)SUROGATE_MC_SP(mc));
         safe_write(" RBP=");
-        safe_write_ptr((void*)mc->gregs[REG_RBP]);
+        safe_write_ptr((void*)SUROGATE_MC_FP(mc));
         safe_write("\n");
 
         // Resolve crash location
-        void* rip = (void*)mc->gregs[REG_RIP];
+        void* rip = (void*)SUROGATE_MC_PC(mc);
         Dl_info dl_info;
         memset(&dl_info, 0, sizeof(dl_info));
 
@@ -287,10 +300,10 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
         mcontext_t* mc = &uc->uc_mcontext;
 
         // Start with crash location (RIP)
-        buffer[num_frames++] = (void*)mc->gregs[REG_RIP];
+        buffer[num_frames++] = (void*)SUROGATE_MC_PC(mc);
 
         // Walk the frame pointer chain
-        void** rbp = (void**)mc->gregs[REG_RBP];
+        void** rbp = (void**)SUROGATE_MC_FP(mc);
         while (num_frames < MAX_FRAMES && rbp != nullptr) {
             // Validate pointer is in a reasonable range
             if ((uintptr_t)rbp < 0x1000 || (uintptr_t)rbp > 0x7fffffffffff) break;

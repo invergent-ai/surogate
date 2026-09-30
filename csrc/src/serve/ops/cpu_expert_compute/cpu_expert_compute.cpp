@@ -678,6 +678,20 @@ void dot_tile_block_two_tokens_vnni(const std::byte*, int, const std::uint8_t*, 
 void dot_two_rows_two_tokens_vnni(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
                                   const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
                                   const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_two_tokens_q4_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                     const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_q4_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*, const std::uint8_t*,
+                          const std::uint16_t*, const std::uint16_t*, const std::int8_t*, const float*,
+                          const std::int32_t*, int, float&, float&) {}
+void dot_two_rows_two_tokens_q5_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                     const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_q5_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*, const std::uint8_t*,
+                          const std::uint16_t*, const std::uint16_t*, const std::int8_t*, const float*,
+                          const std::int32_t*, int, float&, float&) {}
 #endif
 
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c,fma")))
@@ -700,6 +714,20 @@ void dot_tile_block_two_tokens_vnni(const std::byte*, int, const std::uint8_t*, 
 void dot_two_rows_two_tokens_vnni(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
                                   const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
                                   const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_two_tokens_q4_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                     const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_q4_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*, const std::uint8_t*,
+                          const std::uint16_t*, const std::uint16_t*, const std::int8_t*, const float*,
+                          const std::int32_t*, int, float&, float&) {}
+void dot_two_rows_two_tokens_q5_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                     const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_q5_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*, const std::uint8_t*,
+                          const std::uint16_t*, const std::uint16_t*, const std::int8_t*, const float*,
+                          const std::int32_t*, int, float&, float&) {}
 float dot_row_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const float*, int) {
     return 0.0F;
 }

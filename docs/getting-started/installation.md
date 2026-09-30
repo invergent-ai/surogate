@@ -51,6 +51,24 @@ From the repository root:
 uv pip install -e .
 ```
 
+## aarch64 (NVIDIA DGX Spark / GB10)
+
+The published wheel and container are x86_64 only. On an aarch64 host with CUDA 13 the
+source build above works, with these settings (the GB10 is compute capability 12.1):
+
+```bash
+export CUDAARCHS=121a
+export SKBUILD_CMAKE_DEFINE="SUROGATE_SERVE_CUDA_ARCHS=121a"
+uv pip install -e . --no-build-isolation
+```
+
+`SUROGATE_SERVE_CUDA_ARCHS` must name the device's architecture-specific target
+(`120a` for RTX 50 / RTX PRO, `121a` for GB10): the NVFP4 kernel families are built for
+exactly that target and refuse other devices at runtime. The CPU expert-compute and
+CPU embedding paths have no NEON port, so they run their reference code on aarch64.
+`SUROGATE_BUILD_SPEECH=OFF` skips the STT server on a host without FFmpeg development
+libraries; `SINFER_ENABLE_FFMPEG=OFF` does the same for media decoding in the engine.
+
 ## Verify installation
 
 After install, these should work:

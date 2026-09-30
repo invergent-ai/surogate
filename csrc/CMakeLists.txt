@@ -1472,7 +1472,13 @@ endif()
 # --embed` execs it, so it has to exist after `make serve-build` like the engine
 # does. Same source as the old serve_tests target, which is now gone.
 add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
-add_subdirectory(${SERVE_ROOT}/speech)
+option(SUROGATE_BUILD_SPEECH "Build the speech (STT) server; needs FFmpeg dev libraries" ON)
+if(SUROGATE_BUILD_SPEECH)
+  add_subdirectory(${SERVE_ROOT}/speech)
+  set(SUROGATE_STT_TARGETS surogate-stt surogate-stt-lm)
+else()
+  set(SUROGATE_STT_TARGETS)
+endif()
 add_subdirectory(${SERVE_ROOT}/tts)
 target_include_directories(surogate-embed PRIVATE
   ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
@@ -1486,8 +1492,10 @@ sinfer_internal_includes(sinfer_ops)
 set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # The CPU expert-compute kernels carry their own AVX-512 code path (runtime-detected); the
 # rest of the engine stays generic x86-64.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
 set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
   COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
+endif()
 sinfer_cuda_archive(sinfer_ops)
 target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe CUDA::cublasLt)
 
@@ -1771,7 +1779,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 INSTALL_RPATH "${SINFER_LIB_RPATH}"
                 BUILD_WITH_INSTALL_RPATH OFF
                 INSTALL_RPATH_USE_LINK_PATH FALSE)
-            install(TARGETS surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
+            install(TARGETS ${SUROGATE_STT_TARGETS} surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer sinfer-serve surogate-embed
                     RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
                     COMPONENT serve)
@@ -1790,7 +1798,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
             endif()
         else()
             install(TARGETS sinfer_tts_bridge LIBRARY DESTINATION bin COMPONENT serve)
-            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker sinfer_shared
+            install(TARGETS sinfer sinfer-serve surogate-embed ${SUROGATE_STT_TARGETS} surogate-tts surogate-tts-worker sinfer_shared
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib
                     COMPONENT serve)
