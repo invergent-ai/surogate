@@ -67,16 +67,17 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
     // prefill-width call takes W4A4 and traps; refusing up front beats proving
     // a given call stays on A16.
     //
-    // `!= 120`, not `< 120`: the FP4 archives are pinned `120a`, which loads
-    // on exactly sm_120. On sm_121 or sm_100 the driver JITs the fatbin's only
-    // other PTX, compute_89, whose W4A4 body is __trap(). cuobjdump on the
-    // built library shows the arch set is exactly {sm_89, sm_120a}.
+    // An exact match, not `< 120`: the FP4 archives are built for the
+    // architecture-specific `120a` and/or `121a` (SINFER_FP4_ARCHS), which load
+    // on exactly sm_120 or sm_121 (GB10 / DGX Spark). On sm_100 the driver JITs
+    // the fatbin's only other PTX, compute_89, whose W4A4 body is __trap().
     //
     // This is the chokepoint: every NVFP4 wrapper (linear, linear_swiglu,
     // attn_input_proj, linear_add, gdn_input_proj) calls this before any NVFP4
     // kernel runs. `w4fp4_plane_for` next door guards the same way, though it
     // still spells the test `< 120` and inherits the sm_121 hole.
-    if (weight.qtype == QType::NVFP4 && w8_device_compute_capability() != 120) {
+    if (weight.qtype == QType::NVFP4 && w8_device_compute_capability() != 120 &&
+        w8_device_compute_capability() != 121) {
         throw std::invalid_argument(
             std::string(operation) +
             ": NVFP4 weights need compute capability 12.0 or newer; this device cannot run them");

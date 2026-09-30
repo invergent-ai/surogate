@@ -54,7 +54,7 @@ __device__ __forceinline__ void w4fp4_mma_16n8k64(float& d0, float& d1, float& d
                                                   unsigned a0, unsigned a1, unsigned a2,
                                                   unsigned a3, unsigned b0, unsigned b1,
                                                   unsigned sfa, unsigned sfb) {
-#if !defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM120_ALL)
+#if !defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1"
         ".f32.ue4m3 "
@@ -82,7 +82,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
     const float* __restrict__ row_scales, const std::uint8_t* __restrict__ x_codes,
     const std::uint8_t* __restrict__ x_sf, const float* __restrict__ x_scales, int rows, int k,
     int tokens, RowMap row_map, Epilogue epilogue) {
-#if defined(__CUDA_ARCH__) && !defined(__CUDA_ARCH_FEAT_SM120_ALL)
+#if defined(__CUDA_ARCH__) && !defined(__CUDA_ARCH_FEAT_SM120_ALL) && !defined(__CUDA_ARCH_FEAT_SM121_ALL)
     // sm_120a-only (block-scale mma + >48KB static smem tiles); runtime CC
     // gating keeps this unreachable on other architectures.
     (void)codes; (void)sf; (void)row_scales; (void)x_codes; (void)x_sf; (void)x_scales;
