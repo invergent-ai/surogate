@@ -227,6 +227,22 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphTopology> topologies;
 };
 
+/// A decode graph family and its base-round twin.
+///
+/// A graph records the launches its capture saw, and a base round -- one none of whose rows
+/// selects an adapter, run under ops::ScopedLoraBaseRound -- launches the base routes where
+/// any other round of an adapter-serving engine launches the adapter-capable ones. They are
+/// different graphs over the same profiles, so an engine that carries adapters captures both
+/// and each round replays the one of its own flavor. `rounds` is the family every engine has;
+/// `base_rounds` stays empty unless the engine's rounds can be base rounds.
+struct DecodeGraphFlavors {
+    DecodeGraphFamily rounds;
+    DecodeGraphFamily base_rounds;
+    [[nodiscard]] DecodeGraphFamily& of(bool base_round) noexcept {
+        return base_round ? base_rounds : rounds;
+    }
+};
+
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
@@ -592,12 +608,12 @@ public:
                              const std::shared_ptr<GpuPrefixStorage>& storage);
     void restore_gpu_prefix(SequenceState& sequence, const RequestPlanImpl& plan);
 
-    DecodeGraphFamily ordinary_graphs;
+    DecodeGraphFlavors ordinary_graphs;
     // Round chaining (PATCHES.md #32): the chained flavor of every ordinary
     // profile, plus the device 1-scalar its in-graph increments read and the
     // host-side burst plumbing (per-round egress copies via stream host
     // functions, row-major token assembly for the ragged round result).
-    DecodeGraphFamily ordinary_chained_graphs;
+    DecodeGraphFlavors ordinary_chained_graphs;
     void* chain_one_storage = nullptr;
     Tensor chain_one;
     static constexpr std::uint32_t kChainBurstLimit = 8;
@@ -663,10 +679,25 @@ public:
     // Prefill CUDA graphs (PATCHES.md #27); engaged in prepare_graphs when the
     // backend is plain decode and SUROGATE_SERVE_PREFILL_GRAPH != 0.
     std::optional<PrefillGraphFamily> prefill_graphs;
-    DecodeGraphFamily mtp_graphs;
+    DecodeGraphFlavors mtp_graphs;
     /// The narrow round's graphs, captured only when a width limit makes them reachable.
-    DecodeGraphFamily mtp_narrow_graphs;
-    std::array<DecodeGraphFamily, 16> dflash_graphs;
+    DecodeGraphFlavors mtp_narrow_graphs;
+    std::array<DecodeGraphFlavors, 16> dflash_graphs;
+    /// Whether this program runs base rounds (ops::ScopedLoraBaseRound): it carries adapters,
+    /// so a round that selects none has a cheaper flavor to take. Decided once, before the
+    /// graphs are captured, because it decides which graphs exist.
+    ///
+    /// Not under --batch-invariant: the two flavors are the same model through different
+    /// kernels, so a base request's bits would depend on whether an adapter request shared
+    /// its round -- exactly what that mode promises they do not. Not on a pipeline stage,
+    /// where every stage must take the same flavor for a round and that has not been proven.
+    /// And not with in-place Marlin residency opted into (SUROGATE_SERVE_MARLIN_FP8): a base
+    /// round's fused MLP would adopt a weight the adapter route then could not read.
+    bool base_rounds_ = false;
+    /// Whether a round over these lanes is a base round: none of their requests selects an
+    /// adapter. `more` is a mixed round's other half (its staged prompts beside its decoders).
+    [[nodiscard]] bool base_round_for(std::span<const std::uint32_t> lanes,
+                                      std::span<const std::uint32_t> more = {}) const noexcept;
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;

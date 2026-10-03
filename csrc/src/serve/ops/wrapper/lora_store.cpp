@@ -739,13 +739,21 @@ LoraStore& lora_store_for_current_device() {
 
 namespace {
 thread_local LoraRound t_round;
+thread_local bool t_base_round = false;
 } // namespace
 
-bool lora_active() {
+bool lora_enabled() {
     const LoraStore* store = engine_slot<LoraStoreSet>().peek(LoraStore::current_device());
     return store != nullptr && store->active();
 }
+bool lora_active() { return !t_base_round && lora_enabled(); }
 void lora_set_active(bool active) { lora_store_for_current_device().set_active(active); }
+
+ScopedLoraBaseRound::ScopedLoraBaseRound(bool base) noexcept : previous_(t_base_round) {
+    t_base_round = base;
+}
+ScopedLoraBaseRound::~ScopedLoraBaseRound() { t_base_round = previous_; }
+bool lora_base_round() noexcept { return t_base_round; }
 
 void lora_set_round(const LoraRound& round) { t_round = round; }
 void lora_clear_round() { t_round = LoraRound{}; }

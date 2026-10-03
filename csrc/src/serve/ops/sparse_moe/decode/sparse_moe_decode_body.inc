@@ -74,6 +74,12 @@ __global__ void moe_lora_low_kernel(const __nv_bfloat16* x, const float* act, co
     if (threadIdx.x == 0) { low[blockIdx.y * kMoeLoraMaxRank + r] = sum; }
 }
 
+// The rank rows `moe_lora_low_kernel` launches over (SparseMoeDecodeWorkspace::lora_rank),
+// held to the low vector's stride.
+inline unsigned moe_lora_rank_rows(const SparseMoeDecodeWorkspace& workspace) {
+    return static_cast<unsigned>(std::clamp(workspace.lora_rank, 1, kMoeLoraMaxRank));
+}
+
 __device__ float moe_lora_expand(const LoraBank* banks, int index, const int* slot,
                                   int row, const float* low) {
     if (!banks || !slot || *slot < 0) { return 0; }
@@ -885,7 +891,7 @@ void launch_d2_d3(const Tensor& x, const PreparedSparseMoeWeights& weights, Tens
     }
 
     if (adapters) {
-        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, 2 * kPaths, x.ne[1]), 32, 0, stream>>>(
+        moe_lora_low_kernel<<<dim3(moe_lora_rank_rows(workspace), 2 * kPaths, x.ne[1]), 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), nullptr, ids, adapters, adapter_slot,
             static_cast<float*>(workspace.lora_low.data), false, workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
@@ -1200,7 +1206,7 @@ void decode_launch(const Tensor& x, const Tensor& router_x, const PreparedSparse
     }
     launch_d2_d3(x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
     if (adapters) {
-        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, kPaths, x.ne[1]), 32, 0, stream>>>(
+        moe_lora_low_kernel<<<dim3(moe_lora_rank_rows(workspace), kPaths, x.ne[1]), 32, 0, stream>>>(
             nullptr, static_cast<const float*>(workspace.scratch.data),
             static_cast<const int*>(workspace.ids.data), adapters, adapter_slot,
             static_cast<float*>(workspace.lora_low.data), true, workspace.slot_stride);

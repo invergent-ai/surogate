@@ -3598,3 +3598,75 @@ against the same server without the flag: short scoring 133.7 -> 126.8 req/s alo
 341.5 at 16 clients, long-document scoring 42.4k -> 37.3k tok/s, 16 concurrent generations 4465 ->
 4465 tok/s, one generation stream 443 -> 328 tok/s (the decode GEMMs cannot split k).
 
+
+## 100
+
+**Base rounds: `--enable-lora` no longer slows the requests that select no adapter (#262, 2026-10-03, on v1.5.7 + 2).**
+
+Qwen3.6-35B-A3B (`qwen3_5_moe`, groupwise-int artifact, FP8 KV, MTP 2) served for GRPO rollouts ran 2-4x slower
+with `--enable-lora` than without it, before any adapter was loaded. Arming an engine for adapters is cheap on the
+device and expensive on the host:
+
+- The delta kernels read a slot id and exit for a base token: one launch per site. That part was fine.
+- The *routes* are chosen at launch. `finish_lora_bind` marks the store active and preallocates a bank for every
+  module, so from then on `lora_bound()` is true everywhere and `sparse_moe` sees a bank table: a sparse-MoE round
+  takes the per-token decode kernels at every width instead of the small-T and prefill families
+  (`ops/wrapper/sparse_moe.cpp`), a GDN layer leaves `gdn_input_proj_conv_snapshot` and `gdn_norm_gating_proj` for
+  the un-fused sequences, and the dense targets leave `linear_swiglu`.
+- Those choices are frozen into every decode graph at startup, which is captured with the round published. No slot
+  id read on the device can undo a choice of kernel.
+
+So the cost was on prefill above all -- a whole prompt chunk through per-token expert kernels -- and the rollouts
+felt it as decode, because a prompt chunk shares its round with the decode rows (a mixed round): while a slow
+chunk runs, the decoders advance one token.
+
+The host knows which rows of a round select an adapter. A round in which none does is now a **base round**
+(`ops::ScopedLoraBaseRound`, `api/ops/lora_store.h`): `lora_active()` answers false on the launching thread, so every
+hook, `lora_bound` and round publication stands down together and the round runs as an engine without adapters
+runs it. It is a property of the launch, so:
+
+- every decode graph family is captured in both flavors on an engine that carries adapters (`DecodeGraphFlavors`,
+  `prepare_graphs`), each flavor warmed eagerly before anything is captured (a warmup derives planes and settles
+  scratch that captures bake), and a round replays the family of its own flavor;
+- prefill graph keys carry the flavor; the base flavor's buckets are captured on first use inside the budget for
+  graphs captured while serving (issue #228), so startup graph memory grows only by the decode twins;
+- `launch_ordinary_round`, `launch_mtp_round`, `launch_dflash_round`, `launch_mixed_round` and `advance_prefill`
+  open the scope from their rows' slots. One adapter row anywhere keeps the round on the adapter-capable routes,
+  where its base rows contribute no delta, as before.
+
+Not under `--batch-invariant` (the two flavors are one model through different kernels, so a base request's bits
+would follow its company), not on a pipeline stage (not proven there), and not with `SUROGATE_SERVE_MARLIN_FP8=1`
+(a base round's fused MLP would adopt a weight the adapter route cannot then read). The dense-MLP workspace plan
+holds both routes when adapters are enabled (`family/impl/ggml_mlp_workspace.h`, qwen3_5), since both now run.
+
+Separately, the sparse-MoE adapter kernels launched `kMoeLoraMaxRank` (256) rank rows per path and token whatever
+the store's rank; they now launch the store's (`SparseMoeDecodeWorkspace::lora_rank`). At rank 16 that removes
+fifteen blocks in sixteen from the two widest adapter launches of every layer.
+
+Measured on one RTX PRO 6000 Blackwell, 16 concurrent tool-use conversations over ~29k-token contexts (465k prompt
+tokens, prefix reuse between turns, 768 generated tokens a turn), `--max-num-seqs 32`:
+
+| build | `--enable-lora` | requests | prefill tok/s | decode tok/s, 16 wide | per-request decode tok/s | startup graphs |
+|---|---|---|---|---|---|---|
+| before | off | base | 8958 | 662 | 43.0 | 146 MiB |
+| before | on | base | 1976 | 554-560 | 35.9 | 304 MiB |
+| before | on | adapter, rank 16 | 1324 | 424-429 | 28.1 | |
+| after | off | base | 8958 | 666 | 43.3 | 146 MiB |
+| after | on | base | 8935 | 664-669 | 43.4 | 446 MiB |
+| after | on | adapter, rank 16 | 1592 | 448-458 | 28.9 | |
+
+A base request on the armed engine is now bit-identical to the engine without adapters (greedy tokens, generated
+and prompt log-probabilities); before, it differed from it by what two kernel families differ by (same tokens,
+up to 0.13 nats on a generated token). Adapter requests are bit-identical before and after, zero and non-zero
+adapters alike.
+
+**What this does not fix.** A round with an adapter row still runs every column on the per-token expert kernels
+and the un-fused GDN routes: adapter requests prefill at 0.18x and decode at 0.68x of the base model. That is the
+rollout path once a trainer has published its first adapter, and it needs the wide expert family to take a
+low-rank delta -- a kernel change, not a scheduling one.
+
+Tests: `sinfer_lora_coverage_test` runs the expert adapters' call as a base round, eagerly and through a graph
+captured as one, with the adapters resident and the round published (no token carries a delta; the adapter graph
+is unchanged beside it). `sinfer_lora_base_rounds_test` (opt-in, real weights) serves a base request alone, beside
+an adapter request in both orders, and alone again, against the same engine without adapters; on the engine before
+this change its first comparison fails by 0.018 nats.

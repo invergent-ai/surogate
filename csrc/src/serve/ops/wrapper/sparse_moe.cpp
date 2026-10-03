@@ -670,6 +670,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     auto views = detail::allocate_sparse_moe_decode_workspace(workspace, geometry, adapters ? tokens : 1);
     if (adapters) {
         views.slot_stride = adapter_round.slots ? 1 : 0;
+        views.lora_rank   = lora_store_for_current_device().max_rank();
         const auto* slots = adapter_round.slots ? static_cast<const std::int32_t*>(adapter_round.slots->data)
                                                 : adapter_round.uniform_cell;
         struct Correction {

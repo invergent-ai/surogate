@@ -723,13 +723,22 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         }
         const auto& gate_up = family::require_linear_storage(geometry, prefix + "mlp/gate_up");
         const auto& down = family::require_linear_storage(geometry, prefix + "mlp/down");
-        const bool known_ggml = !lora_enabled && std::all_of(gate_up.formats.begin(), gate_up.formats.end(),
+        const bool ggml = std::all_of(gate_up.formats.begin(), gate_up.formats.end(),
             [](QType type) { return ops::detail::ggml::is_ggml_qtype(type); });
+        // The stored-format fused route is every round of an engine without adapters, and a
+        // base round (ops::ScopedLoraBaseRound) of one with them; an adapter-serving engine
+        // holds both reservations.
         std::size_t peak = 0;
         for (const auto a : gate_up.formats) {
             for (const auto b : down.formats) {
-                peak = std::max(peak, post_mixer_workspace_bytes(geometry, a, b, text_policy(a), text_policy(b),
-                                                                 first, last, known_ggml ? &gate_up : nullptr));
+                if (ggml) {
+                    peak = std::max(peak, post_mixer_workspace_bytes(geometry, a, b, text_policy(a), text_policy(b),
+                                                                     first, last, &gate_up));
+                }
+                if (lora_enabled || !ggml) {
+                    peak = std::max(peak, post_mixer_workspace_bytes(geometry, a, b, text_policy(a), text_policy(b),
+                                                                     first, last, nullptr));
+                }
             }
         }
         return peak;

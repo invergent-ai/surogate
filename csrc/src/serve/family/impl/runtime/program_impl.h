@@ -486,10 +486,25 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // state is a 32 MiB workspace, and allocating that inside the capture window charges it
     // to the graph allowance. qwen4exp already prewarms it for the same reason.
     ops::detail::bf16_cublaslt_prewarm();
+    // Adapters are bound by now (the target binds them with its frontend), so this is the
+    // engine's answer for its whole life: which flavors its rounds take and, below, which
+    // graphs it captures for them.
+    base_rounds_ = ops::lora_enabled() && !ops::batch_invariant() && !pipeline_stage() &&
+                   !ops::detail::marlin_fp8_adoption_opted_in();
     prepare_graphs();
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+}
+
+bool ProgramImplCore::base_round_for(std::span<const std::uint32_t> lanes,
+                                     std::span<const std::uint32_t> more) const noexcept {
+    if (!base_rounds_) { return false; }
+    const auto selects_none = [&](std::uint32_t lane) {
+        return lane < max_concurrency && requests[lane].lora_slot < 0;
+    };
+    return std::all_of(lanes.begin(), lanes.end(), selects_none) &&
+           std::all_of(more.begin(), more.end(), selects_none);
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -1857,6 +1872,22 @@ void ProgramImplCore::prepare_graphs() {
                                        proposal_head, &decoder->ple, stage};
     };
 
+    // An engine whose rounds can be base rounds (ops::ScopedLoraBaseRound) captures every
+    // family in both flavors: a graph records the launches its capture saw, and a base round
+    // launches different kernels from any other round of an adapter-serving engine.
+    //
+    // Each flavor's routes run once eagerly before *anything* is captured. A warmup is what
+    // derives the quant planes a route reads and settles the scratch they stage through, and a
+    // capture bakes those addresses -- so a plane first derived for one flavor after the other
+    // flavor's graphs exist could move scratch those graphs already hold.
+    constexpr std::array<bool, 2> kRoundFlavors{false, true};
+    const std::size_t round_flavors = base_rounds_ ? kRoundFlavors.size() : 1;
+    const auto warm_base_rounds = [&](const auto& warm) {
+        if (!base_rounds_) { return; }
+        ops::ScopedLoraBaseRound base_round(true);
+        warm();
+    };
+
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
@@ -1866,27 +1897,31 @@ void ProgramImplCore::prepare_graphs() {
                                                       *ordinary_host_egress, tail_hidden_store,
                                                       chain_one};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
-        prepare_representative(code_warm.min, 1);
-        device.synchronize();
-        schedule::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
-                                        nullptr);
-        device.synchronize();
-        // Marlin band (PATCHES.md #33): derived planes must exist before the
-        // captures, and only a band-sized round derives them (a capturing
-        // stream may look one up but never derive). Warm one, then freeze the
-        // shared scratch so the captures can bake its addresses.
-        if (ordinary_batch_limit >= ops::detail::marlin_min_band_tokens()) {
-            const std::uint32_t band =
-                std::min<std::uint32_t>(ordinary_batch_limit,
-                                        ops::detail::marlin_fixed_m());
-            prepare_representative(code_warm.min, band);
-            device.synchronize();
-            schedule::ordinary_decode_batch(ordinary_state, static_cast<std::int32_t>(band),
-                                            {code_warm.min + 1, code_warm.max + 1}, nullptr);
-            device.synchronize();
+        const auto warm_ordinary = [&] {
             prepare_representative(code_warm.min, 1);
             device.synchronize();
-        }
+            schedule::ordinary_decode_batch(ordinary_state, 1,
+                                            {code_warm.min + 1, code_warm.max + 1}, nullptr);
+            device.synchronize();
+            // Marlin band (PATCHES.md #33): derived planes must exist before the
+            // captures, and only a band-sized round derives them (a capturing
+            // stream may look one up but never derive). Warm one, then freeze the
+            // shared scratch so the captures can bake its addresses.
+            if (ordinary_batch_limit >= ops::detail::marlin_min_band_tokens()) {
+                const std::uint32_t band =
+                    std::min<std::uint32_t>(ordinary_batch_limit,
+                                            ops::detail::marlin_fixed_m());
+                prepare_representative(code_warm.min, band);
+                device.synchronize();
+                schedule::ordinary_decode_batch(ordinary_state, static_cast<std::int32_t>(band),
+                                                {code_warm.min + 1, code_warm.max + 1}, nullptr);
+                device.synchronize();
+                prepare_representative(code_warm.min, 1);
+                device.synchronize();
+            }
+        };
+        warm_ordinary();
+        warm_base_rounds(warm_ordinary);
 
         // Warmup above has run every op once, so every weight that can adopt
         // Marlin residency already has. Close adoption HERE — before the first
@@ -1894,20 +1929,25 @@ void ProgramImplCore::prepare_graphs() {
         // adopts between two captures leaves them disagreeing and the next exec
         // update fails with cudaErrorGraphExecUpdateFailure.
         ops::detail::marlin_fp8_close_adoption();
-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
-                ordinary_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
-                schedule::capture_ordinary_decode_batch(ordinary_state,
-                                                        static_cast<std::int32_t>(batch_size),
-                                                        envelope, profile.definition);
+        for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+            const bool base_round = kRoundFlavors[flavor];
+            ops::ScopedLoraBaseRound flavor_scope(base_round);
+            DecodeGraphFamily& graphs = ordinary_graphs.of(base_round);
+            graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+            for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+                for (const GraphExecutionProfile planned : ordinary_profiles) {
+                    graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                    const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+                    schedule::capture_ordinary_decode_batch(ordinary_state,
+                                                            static_cast<std::int32_t>(batch_size),
+                                                            envelope, profile.definition);
+                }
             }
         }
 
@@ -1916,23 +1956,28 @@ void ProgramImplCore::prepare_graphs() {
         // has no sampled tokens to chain (the head lives on the last stage), so it keeps
         // the family empty and always runs single rounds.
         if (!pipeline_stage()) {
-        schedule::ordinary_decode_batch_chained(ordinary_state, 1,
-                                                {code_warm.min + 1, code_warm.max + 1}, nullptr);
-        device.synchronize();
-        ordinary_chained_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
-                ordinary_chained_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = ordinary_chained_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
-                schedule::capture_ordinary_decode_batch_chained(
-                    ordinary_state, static_cast<std::int32_t>(batch_size), envelope,
-                    profile.definition);
+        for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+            const bool base_round = kRoundFlavors[flavor];
+            ops::ScopedLoraBaseRound flavor_scope(base_round);
+            schedule::ordinary_decode_batch_chained(ordinary_state, 1,
+                                                    {code_warm.min + 1, code_warm.max + 1}, nullptr);
+            device.synchronize();
+            DecodeGraphFamily& graphs = ordinary_chained_graphs.of(base_round);
+            graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+            for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+                for (const GraphExecutionProfile planned : ordinary_profiles) {
+                    graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                    const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+                    schedule::capture_ordinary_decode_batch_chained(
+                        ordinary_state, static_cast<std::int32_t>(batch_size), envelope,
+                        profile.definition);
+                }
             }
         }
         } // !pipeline_stage
@@ -1946,31 +1991,18 @@ void ProgramImplCore::prepare_graphs() {
             *mtp_host_ingress, *mtp_host_egress, tail_hidden_store, chain_one};
         mtp_state.execution.constraints = speculative_constraints.get();
         const GraphExecutionProfile code_warm = planned_profiles.front();
-        prepare_representative(code_warm.min, 1);
-        device.synchronize();
-        schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                   nullptr);
-        device.synchronize();
-
-        mtp_graphs.profiles.reserve(planned_profiles.size() * batch_capacity);
-        for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                mtp_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * batch_capacity + (batch_size - 1U);
-                schedule::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
-            }
-        }
         // The narrow round's family, when a width limit can reach it. Its ingress shape is
         // the round's own: nothing drafted, one valid column, rope positions at stride one.
-        if (speculative_max_lanes != kSpeculateAtAnyWidth) {
+        const bool narrow_reachable = speculative_max_lanes != kSpeculateAtAnyWidth;
+        const auto warm_wide = [&] {
+            prepare_representative(code_warm.min, 1);
+            device.synchronize();
+            schedule::mtp_decode_batch(mtp_state, 1, draft_window,
+                                       mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                       nullptr);
+            device.synchronize();
+        };
+        const auto warm_narrow = [&] {
             prepare_representative(code_warm.min, 1);
             for (std::uint32_t row = 0; row < batch_capacity; ++row) {
                 mtp_host_ingress->current_extents[row]      = 0;
@@ -1983,11 +2015,40 @@ void ProgramImplCore::prepare_graphs() {
                                        mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
                                        nullptr, /*narrow=*/true);
             device.synchronize();
-            mtp_narrow_graphs.profiles.reserve(planned_profiles.size() * batch_capacity);
+        };
+        warm_base_rounds([&] {
+            warm_wide();
+            if (narrow_reachable) { warm_narrow(); }
+        });
+
+        for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+            const bool base_round = kRoundFlavors[flavor];
+            ops::ScopedLoraBaseRound flavor_scope(base_round);
+            warm_wide();
+            DecodeGraphFamily& graphs = mtp_graphs.of(base_round);
+            graphs.profiles.reserve(planned_profiles.size() * batch_capacity);
             for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
                 for (const GraphExecutionProfile planned : planned_profiles) {
-                    mtp_narrow_graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = mtp_narrow_graphs.profiles.back();
+                    graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * batch_capacity + (batch_size - 1U);
+                    schedule::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+                }
+            }
+            if (!narrow_reachable) { continue; }
+            warm_narrow();
+            DecodeGraphFamily& narrow_graphs = mtp_narrow_graphs.of(base_round);
+            narrow_graphs.profiles.reserve(planned_profiles.size() * batch_capacity);
+            for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    narrow_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = narrow_graphs.profiles.back();
                     profile.batch_size             = batch_size;
                     profile.min_execution_frontier = planned.min;
                     profile.max_execution_frontier = planned.max;
@@ -2004,7 +2065,6 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::DFlash) {
         for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value())) {
             bind_dflash_window(window);
-            auto& graphs                  = dflash_graphs[window];
             const auto batch_one_profiles = dflash_graph_profiles(capacity, window, 1);
             validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
             schedule::DFlashBatchContext dflash_state{
@@ -2015,69 +2075,94 @@ void ProgramImplCore::prepare_graphs() {
             const ops::GqaExecutionEnvelope code_warm_target{
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(code_warm.max) + window + 1ULL))};
-            prepare_representative(code_warm.min, 1);
-            device.synchronize();
-            schedule::dflash_decode_batch(dflash_state, 1, window,
-                                          dflash_envelopes(code_warm.min, code_warm.max, window),
-                                          code_warm_target, nullptr);
-            device.synchronize();
+            const auto warm = [&] {
+                prepare_representative(code_warm.min, 1);
+                device.synchronize();
+                schedule::dflash_decode_batch(dflash_state, 1, window,
+                                              dflash_envelopes(code_warm.min, code_warm.max, window),
+                                              code_warm_target, nullptr);
+                device.synchronize();
+            };
+            warm_base_rounds(warm);
 
-            graphs.profiles.reserve(batch_one_profiles.size() * batch_capacity);
-            for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
-                const auto planned_profiles =
-                    batch_size == 1 ? batch_one_profiles
-                                    : dflash_graph_profiles(capacity, window, batch_size);
-                validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = graphs.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    profile.topology_class =
-                        planned.topology_class * batch_capacity + (batch_size - 1U);
-                    const ops::GqaExecutionEnvelope target_envelope{
-                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                               capacity, static_cast<std::uint64_t>(planned.max) + window + 1ULL))};
+            for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+                const bool base_round = kRoundFlavors[flavor];
+                ops::ScopedLoraBaseRound flavor_scope(base_round);
+                warm();
+                DecodeGraphFamily& graphs = dflash_graphs[window].of(base_round);
+                graphs.profiles.reserve(batch_one_profiles.size() * batch_capacity);
+                for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
+                    const auto planned_profiles =
+                        batch_size == 1 ? batch_one_profiles
+                                        : dflash_graph_profiles(capacity, window, batch_size);
+                    validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                    for (const GraphExecutionProfile planned : planned_profiles) {
+                        graphs.profiles.emplace_back();
+                        DecodeGraphProfile& profile    = graphs.profiles.back();
+                        profile.batch_size             = batch_size;
+                        profile.min_execution_frontier = planned.min;
+                        profile.max_execution_frontier = planned.max;
+                        profile.topology_class =
+                            planned.topology_class * batch_capacity + (batch_size - 1U);
+                        const ops::GqaExecutionEnvelope target_envelope{
+                            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                   capacity, static_cast<std::uint64_t>(planned.max) + window + 1ULL))};
 
-                    schedule::capture_dflash_decode_batch(
-                        dflash_state, static_cast<std::int32_t>(batch_size), window,
-                        dflash_envelopes(planned.min, planned.max, window), target_envelope,
-                        profile.definition);
+                        schedule::capture_dflash_decode_batch(
+                            dflash_state, static_cast<std::int32_t>(batch_size), window,
+                            dflash_envelopes(planned.min, planned.max, window), target_envelope,
+                            profile.definition);
+                    }
                 }
             }
         }
     }
 
-    if (!ordinary_graphs.profiles.empty()) {
-        instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
-    }
-    if (!ordinary_chained_graphs.profiles.empty()) {
-        instantiate_graph_family(ordinary_chained_graphs, "ordinary chained", device,
-                                 prepare_representative);
+    for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+        DecodeGraphFamily& graphs = ordinary_graphs.of(kRoundFlavors[flavor]);
+        if (!graphs.profiles.empty()) {
+            instantiate_graph_family(graphs, flavor == 0 ? "ordinary" : "ordinary base",
+                                     device, prepare_representative);
+        }
+        DecodeGraphFamily& chained = ordinary_chained_graphs.of(kRoundFlavors[flavor]);
+        if (!chained.profiles.empty()) {
+            instantiate_graph_family(chained,
+                                     flavor == 0 ? "ordinary chained" : "ordinary chained base",
+                                     device, prepare_representative);
+        }
     }
     ops::detail::marlin_plane_freeze_scratch();
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
-        if (!mtp_narrow_graphs.profiles.empty()) {
-            // The narrow round's representative: the same batch, in the narrow ingress shape.
-            const auto prepare_narrow = [&](std::uint32_t frontier, std::uint32_t batch_size) {
-                prepare_representative(frontier, batch_size);
-                for (std::uint32_t row = 0; row < batch_capacity; ++row) {
-                    mtp_host_ingress->current_extents[row]      = 0;
-                    mtp_host_ingress->target_valid_columns[row] = 1;
-                    mtp_host_ingress->target_rope_positions[row] =
-                        checked_i32(frontier, "graph representative narrow rope position");
-                }
-            };
-            instantiate_graph_family(mtp_narrow_graphs, "MTP narrow", device, prepare_narrow);
+        // The narrow round's representative: the same batch, in the narrow ingress shape.
+        const auto prepare_narrow = [&](std::uint32_t frontier, std::uint32_t batch_size) {
+            prepare_representative(frontier, batch_size);
+            for (std::uint32_t row = 0; row < batch_capacity; ++row) {
+                mtp_host_ingress->current_extents[row]      = 0;
+                mtp_host_ingress->target_valid_columns[row] = 1;
+                mtp_host_ingress->target_rope_positions[row] =
+                    checked_i32(frontier, "graph representative narrow rope position");
+            }
+        };
+        for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+            instantiate_graph_family(mtp_graphs.of(kRoundFlavors[flavor]),
+                                     flavor == 0 ? "MTP" : "MTP base", device,
+                                     prepare_representative);
+            DecodeGraphFamily& narrow_graphs = mtp_narrow_graphs.of(kRoundFlavors[flavor]);
+            if (!narrow_graphs.profiles.empty()) {
+                instantiate_graph_family(narrow_graphs,
+                                         flavor == 0 ? "MTP narrow" : "MTP narrow base", device,
+                                         prepare_narrow);
+            }
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value())) {
             bind_dflash_window(window);
-            instantiate_graph_family(dflash_graphs[window], "DFlash", device,
-                                     prepare_representative);
+            for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
+                instantiate_graph_family(dflash_graphs[window].of(kRoundFlavors[flavor]),
+                                         flavor == 0 ? "DFlash" : "DFlash base", device,
+                                         prepare_representative);
+            }
         }
         bind_dflash_window(draft_window);
     }
@@ -2224,7 +2309,7 @@ void ProgramImplCore::prepare_graphs() {
                 if (held) { ops::lora_clear_round(); }
             }
         } lora_capture(static_cast<std::int32_t>(effective_chunk), device.stream);
-        {
+        const auto warm_prefill = [&] {
             const std::vector<int> warm_ids(static_cast<std::size_t>(effective_chunk), 0);
             const schedule::PrefillChunkResult warm = capture_card.prefill_chunk(
                 std::span<const int>(warm_ids), 0,
@@ -2233,12 +2318,24 @@ void ProgramImplCore::prepare_graphs() {
                 throw std::logic_error("prefill graph warmup chunk made no progress");
             }
             device.synchronize();
-        }
+        };
+        warm_prefill();
+        // The base flavor's prefill routes read planes of their own (the wide sparse-MoE
+        // family, the fused projections). Derive them now as well: its buckets are captured
+        // on first use, under a live request, and a capture may look a plane up but never
+        // derive one.
+        warm_base_rounds(warm_prefill);
 
         // Now precapture every bucket so first requests replay instead of
         // paying capture. The capture card mirrors the decode one — empty KV
         // view, base 0 — the captured body reaches KV only through the pool
         // plus device-side table rows.
+        //
+        // Only the flavor every engine has is pinned here. A base round's buckets
+        // (the key carries the flavor) are captured on first use, inside the budget
+        // #228 put on graphs captured while serving, so an adapter-serving engine
+        // starts with the graph memory it always had and a bucket that does not
+        // fit runs the eager base body.
         capture_card.set_prefill_graph_family(&*prefill_graphs);
         capture_card.precapture_prefill_graphs(effective_chunk);
         device.synchronize();
@@ -2421,6 +2518,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
+    // A prompt that selects no adapter prefills on the base routes (#262), through the prefill
+    // graphs of that flavor (PrefillGraphFamily::Key) where it replays one.
+    ops::ScopedLoraBaseRound base_scope(base_rounds_ && request.lora_slot < 0);
 
     RequestControl::Prefill& staged = *request.prefill;
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
@@ -2812,6 +2912,12 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // No row selects an adapter: the round takes the base routes, eagerly or through the
+    // graphs captured for them (#262). Held to the end of the launch, which is where the body
+    // runs when no graph replays it.
+    const bool base_round = base_round_for(lanes);
+    ops::ScopedLoraBaseRound base_scope(base_round);
+
     const auto start = Clock::now();
     round_trace_state(decoder->linear_attention, device.stream, "pre-ordinary");
     try {
@@ -2832,19 +2938,21 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* chained    = nullptr;
         ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + burst};
         if (use_cuda_graph) {
+            DecodeGraphFamily& graphs = ordinary_graphs.of(base_round);
             DecodeGraphProfile& profile =
-                select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
+                select_graph_profile(graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
-            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch", device.stream);
+            executable = &install_graph_profile(graphs, profile, "ordinary batch", device.stream);
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
             burst      = std::min(burst,
                                   profile.max_execution_frontier - maximum_frontier + 1);
             if (burst > 1) {
+                DecodeGraphFamily& chained_graphs = ordinary_chained_graphs.of(base_round);
                 DecodeGraphProfile& chained_profile = select_graph_profile(
-                    ordinary_chained_graphs, static_cast<std::uint32_t>(lanes.size()),
+                    chained_graphs, static_cast<std::uint32_t>(lanes.size()),
                     maximum_frontier, "ordinary chained batch");
                 chained =
-                    &install_graph_profile(ordinary_chained_graphs, chained_profile, "ordinary chained batch", device.stream);
+                    &install_graph_profile(chained_graphs, chained_profile, "ordinary chained batch", device.stream);
             }
         }
 
@@ -3178,6 +3286,12 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // Neither a staged prompt nor a decode row selects an adapter: the base routes, as in
+    // launch_ordinary_round. One adapter row anywhere keeps the whole round on the
+    // adapter-capable ones, where its base rows contribute no delta.
+    const bool base_round = base_round_for(lanes, prefill_lanes);
+    ops::ScopedLoraBaseRound base_scope(base_round);
+
     const auto start        = Clock::now();
     const std::int32_t rows = static_cast<std::int32_t>(lanes.size());
     last_mixed_round.maximum_frontier = maximum_frontier;
@@ -3436,8 +3550,10 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 // staged prompt asynchronously) has no decode band: the decode
                 // blocks of the body are skipped for batch 0, so the envelope
                 // and band are placeholders and the key carries bucket 0.
+                // (Both flavors of the ordinary family hold the same profile list; the band is
+                // read off the one every engine has.)
                 DecodeGraphProfile* mixed_profile =
-                    rows > 0 ? &select_graph_profile(ordinary_graphs,
+                    rows > 0 ? &select_graph_profile(ordinary_graphs.rounds,
                                                      static_cast<std::uint32_t>(rows),
                                                      maximum_frontier, "mixed round")
                              : nullptr;
@@ -3461,7 +3577,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 // clean. The profile's index identifies the band exactly.
                 const auto mixed_band =
                     mixed_profile ? static_cast<std::int32_t>(mixed_profile -
-                                                              ordinary_graphs.profiles.data())
+                                                              ordinary_graphs.rounds.profiles.data())
                                   : 0;
                 last_mixed_round.band = mixed_band;
                 // Chunk-atomic scratch ownership (see advance_prefill): the captured mixed
@@ -3867,12 +3983,15 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
 
     // Too many lanes in flight to pay for a verify: the narrow round, one column per lane.
     const bool narrow  = narrow_round_for(lanes.size());
+    // No row selects an adapter: the base routes, as in launch_ordinary_round.
+    const bool base_round = base_round_for(lanes);
+    ops::ScopedLoraBaseRound base_scope(base_round);
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
-        DecodeGraphFamily& family = narrow ? mtp_narrow_graphs : mtp_graphs;
+        DecodeGraphFamily& family = (narrow ? mtp_narrow_graphs : mtp_graphs).of(base_round);
         if (use_cuda_graph && !family.profiles.empty()) {
             DecodeGraphProfile& profile =
                 select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
@@ -4303,6 +4422,10 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }
 
+    // No row selects an adapter, staged prompts included: the base routes, as in
+    // launch_ordinary_round.
+    const bool base_round = base_round_for(lanes, prefill_lanes);
+    ops::ScopedLoraBaseRound base_scope(base_round);
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable   = nullptr;
@@ -4310,10 +4433,11 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             dflash_envelopes(0, maximum_frontier, active_dflash_window);
         ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph && prefill_lanes.empty()) {
+            DecodeGraphFamily& graphs = dflash_graphs[active_dflash_window].of(base_round);
             DecodeGraphProfile& profile = select_graph_profile(
-                dflash_graphs[active_dflash_window], static_cast<std::uint32_t>(lanes.size()),
+                graphs, static_cast<std::uint32_t>(lanes.size()),
                 maximum_frontier, "DFlash batch");
-            executable      = &install_graph_profile(dflash_graphs[active_dflash_window], profile,
+            executable      = &install_graph_profile(graphs, profile,
                                                      "DFlash batch", device.stream);
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
                                                profile.max_execution_frontier, active_dflash_window);

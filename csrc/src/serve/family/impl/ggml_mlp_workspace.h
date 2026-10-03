@@ -47,7 +47,11 @@ inline std::size_t stored_mlp_workspace_capacity_bytes(const TextGeometry& geome
             const bool ggml =
                 std::all_of(parent.formats.begin(), parent.formats.end(),
                             [](QType type) { return ops::detail::ggml::is_ggml_qtype(type); });
-            if (!lora_enabled && ggml) {
+            // The fused route is every round of an engine without adapters, and a base
+            // round (ops::ScopedLoraBaseRound) of one with them -- so an adapter-serving
+            // engine holds both routes' reservations, the larger of the two.
+            if (ggml) {
+                auto fused_scope = layout.scope();
                 std::size_t bytes = 0;
                 for (auto gate : parent.formats)
                     for (auto up : parent.formats) {
@@ -56,7 +60,8 @@ inline std::size_t stored_mlp_workspace_capacity_bytes(const TextGeometry& geome
                                        gate, up, parent.rows, parent.columns, policy, first, last));
                     }
                 (void)layout.alloc_bytes(bytes);
-            } else {
+            }
+            if (lora_enabled || !ggml) {
                 for (auto type : parent.formats) {
                     swiglu_mlp_layout(layout, geometry.intermediate, geometry.hidden, type, policy,
                                       first, last);

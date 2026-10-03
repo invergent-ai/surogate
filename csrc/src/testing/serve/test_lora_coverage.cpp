@@ -283,6 +283,43 @@ static void expert_adapters(bool shared, int tokens = 3, bool cpu = false,
     test::cuda_check(cudaGraphLaunch(executable, stream), "replay");
     test::cuda_synchronize(stream);
     close(test::from_device_bf16(output, h * tokens), expected);
+    if (!cache) {
+        // A base round (#262): the adapters stay resident and the round's selection stays
+        // published, yet the same call takes the base routes -- the small-T and prefill
+        // families at these widths, which an adapter round never reaches -- and no token
+        // carries a delta. Eagerly and through a graph captured as a base round.
+        const std::vector<double> base(h * tokens, 0.125);
+        test::cuda_check(cudaMemcpy(output.p, reset.p, output.bytes, cudaMemcpyDeviceToDevice), "reset");
+        cudaGraph_t base_graph;
+        cudaGraphExec_t base_executable;
+        {
+            ops::ScopedLoraBaseRound base_round(true);
+            assert(ops::lora_enabled() && ops::lora_base_round() && !ops::lora_active());
+            assert(!family::lora_bound(weights.router_shared_gate, 32));
+            run(nullptr);
+            test::cuda_synchronize();
+            close(test::from_device_bf16(output, h * tokens), base);
+            test::cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "base capture");
+            run(stream);
+            test::cuda_check(cudaStreamEndCapture(stream, &base_graph), "base capture end");
+        }
+        // The scope is a property of the launch: once it closes the engine is armed again,
+        // and the graph it captured still replays the base routes.
+        assert(ops::lora_active() && !ops::lora_base_round());
+        assert(family::lora_bound(weights.router_shared_gate, 32));
+        test::cuda_check(cudaMemcpy(output.p, reset.p, output.bytes, cudaMemcpyDeviceToDevice), "reset");
+        test::cuda_check(cudaGraphInstantiate(&base_executable, base_graph, nullptr, nullptr, 0), "base instantiate");
+        test::cuda_check(cudaGraphLaunch(base_executable, stream), "base replay");
+        test::cuda_synchronize(stream);
+        close(test::from_device_bf16(output, h * tokens), base);
+        test::cuda_check(cudaGraphExecDestroy(base_executable), "destroy base graph");
+        test::cuda_check(cudaGraphDestroy(base_graph), "destroy base graph source");
+        // And the adapter round is unchanged by having run beside it.
+        test::cuda_check(cudaMemcpy(output.p, reset.p, output.bytes, cudaMemcpyDeviceToDevice), "reset");
+        test::cuda_check(cudaGraphLaunch(executable, stream), "replay after base round");
+        test::cuda_synchronize(stream);
+        close(test::from_device_bf16(output, h * tokens), expected);
+    }
     if (tokens == 129 && !cpu && std::getenv("SUROGATE_LORA_BENCH")) {
         const auto measure = [&](auto&& body) {
             cudaEvent_t begin, end;

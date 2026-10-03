@@ -400,21 +400,21 @@ void* marlin_fused_parent(std::size_t bytes, cudaStream_t stream) {
     return g_fused_parent;
 }
 
-std::size_t marlin_fused_parent_bytes(std::int32_t parent_rows, std::int32_t columns) noexcept {
+bool marlin_fp8_adoption_opted_in() noexcept {
     static const bool adopt_opt_in = [] {
         const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
         return env != nullptr && env[0] == '1';
     }();
-    if (!adopt_opt_in || parent_rows <= 0 || columns <= 0) { return 0; }
+    return adopt_opt_in;
+}
+
+std::size_t marlin_fused_parent_bytes(std::int32_t parent_rows, std::int32_t columns) noexcept {
+    if (!marlin_fp8_adoption_opted_in() || parent_rows <= 0 || columns <= 0) { return 0; }
     return static_cast<std::size_t>(parent_rows) * static_cast<std::size_t>(columns) * 2;
 }
 
 bool marlin_fp8_maybe_adopt(const Weight& weight, cudaStream_t stream) {
-    static const bool adopt_opt_in = [] {
-        const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
-        return env != nullptr && env[0] == '1';
-    }();
-    if (!adopt_opt_in) { return false; }
+    if (!marlin_fp8_adoption_opted_in()) { return false; }
     if (weight.layout == QuantLayout::MarlinTiles) { return true; }
     // Adoption changes which kernels an op runs, so it changes a captured
     // graph's topology. Adopting a weight after any graph exists makes the next

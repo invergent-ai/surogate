@@ -527,6 +527,14 @@ Waiting for active requests is bounded by `--pending-timeout-ms`. An update that
 and leaves the current adapter unchanged. An incompatible replacement also leaves it
 unchanged. Replacing an adapter works with `--max-loras 1`.
 
+Requests for the base model cost what they cost without `--enable-lora`: a round in which no
+request selects an adapter runs the base model's own kernels, as a server started without the
+flag does. A round that includes an adapter request runs on the adapter-capable routes for
+every request in it, base requests included: the same model through different kernels, so a
+base request's scores there can differ slightly from the ones it gets alone, and the round is
+slower than a base round. `--batch-invariant` and `--devices` pipelines keep every round on
+the adapter-capable routes.
+
 ## Responses API
 
 `POST /v1/responses` accepts `input` (string or typed items), `instructions`,

@@ -30,6 +30,13 @@ struct SparseMoeDecodeWorkspace {
     Tensor scratch;
     Tensor lora_low;
     std::int32_t slot_stride = 0;
+    /// Rank rows the adapter kernels launch a block for. Every bank of a store is padded to
+    /// the store's own max rank, so that is all there is to compute -- kMoeLoraMaxRank is the
+    /// stride of `lora_low`, the most a store may ask for, and launching over it put
+    /// (256 - rank) blocks per path and token on the device to read a rank and exit: with a
+    /// rank-16 store, fifteen blocks in sixteen of the two widest launches of every layer.
+    /// A caller that does not know the store's rank leaves the stride and loses nothing but time.
+    std::int32_t lora_rank = kMoeLoraMaxRank;
 };
 
 template <class Arena>

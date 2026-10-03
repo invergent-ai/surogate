@@ -329,8 +329,51 @@ private:
 
 /// True when any adapter is resident, so the projection hooks skip the lookup in
 /// the common case. Re-read after a load or unload.
+///
+/// False on a thread that has a base round open (`ScopedLoraBaseRound`), whatever
+/// the engine holds: that is the whole mechanism of a base round.
 [[nodiscard]] bool lora_active();
 void lora_set_active(bool active);
+
+/// Whether this engine carries the adapter machinery at all -- `lora_active()`
+/// without regard to a base round. The schedules ask this to decide whether a
+/// round *can* be a base round; nothing on the projection path does.
+[[nodiscard]] bool lora_enabled();
+
+/// A base round: a round none of whose tokens selects an adapter, run exactly as
+/// an engine started without adapters runs it.
+///
+/// Arming an engine for adapters is not free for the tokens that select none.
+/// The delta kernels read a slot id and exit, which is cheap, but the *routes*
+/// are chosen on the host: a bound projection leaves its fused kernel for the
+/// one that materialises what a delta is added to, and a sparse-MoE round with
+/// a bank table takes the per-token decode kernels at every width instead of
+/// the small-T and prefill families. Those choices are made at launch -- and
+/// frozen into a captured graph -- so no slot id read on the device can undo
+/// them, and a deployment that enabled adapters paid for them on every round,
+/// including the ones serving the base model (#262).
+///
+/// The host does know which rows of a round selected an adapter. When none did,
+/// the schedule opens one of these around the launch: `lora_active()` answers
+/// false on this thread, so every hook, `lora_bound` and round publication on
+/// the path stands down together and the round takes the base routes. It is a
+/// property of the launch, so graphs are captured per flavor and a replay is
+/// only ever handed a round of the flavor it was captured for.
+///
+/// Thread-local for the reason `LoraRound` is: the hooks sit inside variant
+/// methods whose signatures the family shares.
+class ScopedLoraBaseRound {
+public:
+    explicit ScopedLoraBaseRound(bool base) noexcept;
+    ~ScopedLoraBaseRound();
+    ScopedLoraBaseRound(const ScopedLoraBaseRound&)            = delete;
+    ScopedLoraBaseRound& operator=(const ScopedLoraBaseRound&) = delete;
+
+private:
+    bool previous_;
+};
+/// Whether the calling thread has a base round open.
+[[nodiscard]] bool lora_base_round() noexcept;
 
 /// The round's adapter selection, published by the decode schedule and read by
 /// the projection hooks.

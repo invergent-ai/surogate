@@ -37,6 +37,7 @@
 #include "core/elastic_kv_region.h"
 #include "core/tensor.h"
 
+#include "api/ops/lora_store.h"
 #include "api/ops/position.h"
 
 #include <cuda_runtime.h>
@@ -173,11 +174,16 @@ public:
     struct Key {
         bool mixed;
         std::int32_t chunk, batch, band;
+        // A graph records the launches its capture saw, and a base round (no row selects an
+        // adapter; ops::ScopedLoraBaseRound) launches the base routes where an adapter round
+        // launches the adapter-capable ones. They are different graphs of the same shape, so
+        // the flavor is part of the key. Always false on an engine without adapters.
+        bool base = false;
         auto operator<=>(const Key&) const = default;
     };
 
     [[nodiscard]] static Key prefill_key(std::int32_t chunk_bucket) noexcept {
-        return {false, chunk_bucket, 0, 0};
+        return {false, chunk_bucket, 0, 0, ops::lora_base_round()};
     }
 
     [[nodiscard]] static Key mixed_key(std::int32_t chunk_bucket,
@@ -186,7 +192,7 @@ public:
         // The captured chunk width and decode envelope are independent. Keep
         // their full values and the graph kind rather than overlapping bit fields.
         // `band` is the ordinary profile's index, not its shared topology class.
-        return {true, chunk_bucket, batch_bucket, band};
+        return {true, chunk_bucket, batch_bucket, band, ops::lora_base_round()};
     }
     // Round the decode batch up to the next multiple of 8, never past the
     // concurrency ceiling. The bucket must be >= the real row count: a bucket
@@ -227,8 +233,9 @@ public:
         }
         if (!startup_ && !admit_lazy_capture(key, now)) { return nullptr; }
         if (log_enabled()) {
-            std::fprintf(stderr, "prefill-graph: capturing %s chunk %d batch %d band %d\n",
-                         key.mixed ? "mixed" : "prefill", key.chunk, key.batch, key.band);
+            std::fprintf(stderr, "prefill-graph: capturing %s chunk %d batch %d band %d%s\n",
+                         key.mixed ? "mixed" : "prefill", key.chunk, key.batch, key.band,
+                         key.base ? " (base round)" : "");
         }
         try {
             // A prefill bucket is captured lazily, under a live request, on whichever thread

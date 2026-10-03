@@ -46,6 +46,11 @@ bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream);
 // adoption is not enabled. Returns true when the weight holds Marlin tiles.
 bool marlin_fp8_maybe_adopt(const Weight& weight, cudaStream_t stream);
 
+// Whether adoption is opted into at all (SUROGATE_SERVE_MARLIN_FP8=1). An adopted
+// weight is readable by Marlin routes only, so a deployment that would run one weight
+// through two routes asks this before it lets the Marlin-capable one go first.
+bool marlin_fp8_adoption_opted_in() noexcept;
+
 // Staging bytes a fused projection needs when its weight holds Marlin tiles:
 // Marlin emits the whole [parent_rows, T] parent and the fusion splits it
 // afterwards. Zero when adoption is not enabled, so the plan does not carry
