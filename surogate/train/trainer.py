@@ -1728,6 +1728,15 @@ class SurogateTrainerWrapper:
             # window (128 padded rows per document per dQ split), so the first step's peak is
             # not the run's; keep the upfront sizing.
             return
+        if int(getattr(getattr(self, "config", None), "sequence_chunks", 1) or 1) > 1:
+            # Chunked training: a chunk's attention backward takes dK/dV scratch for the whole
+            # KV prefix it attends to (`kvprefix_dk_exp`/`kvprefix_dv_exp`: prefix tokens x
+            # heads x head_dim, BF16, each) and trailing all-padding chunks are skipped, so
+            # the stack peak grows with the occupied length of the step's longest row. The
+            # first step's peak is the run's only if that step held the longest row; a later,
+            # longer row would overflow the shrunk stack ("[Stack OOM] ... 'kvprefix_dv_exp'").
+            # Keep the upfront sizing.
+            return
         if getattr(self, "_dispatch_pp", False):
             # The dispatch-PP per-stage gated-delta backward peaks right at the
             # measured high-water mark; trimming the stack to it leaves no arena
