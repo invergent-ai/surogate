@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cerrno>
+#include <memory>
 #include <string_view>
 
 #include <cuda_runtime.h>
@@ -53,22 +54,24 @@ bool cufile_disabled_by_env() {
 }
 
 void posix_read_bytes(int fd,
-                      std::byte* d_target,
+                      std::byte* target,
                       std::ptrdiff_t begin,
                       std::ptrdiff_t end,
-                      std::string_view file_name) {
+                      std::string_view file_name,
+                      bool host_target) {
     if (end < begin) {
         throw std::logic_error(fmt::format("Invalid range {} - {} in posix_read_bytes for {}", begin, end, file_name));
     }
 
     const std::size_t nbytes = static_cast<std::size_t>(end - begin);
-    std::byte* hbuf = staging_buffer();
+    // A host destination is filled by pread() itself; only device memory needs the staging hop.
+    std::byte* hbuf = host_target ? nullptr : staging_buffer();
 
     std::size_t done = 0;
     while (done < nbytes) {
         const std::size_t want = std::min(kStagingChunk, nbytes - done);
         const off_t off = static_cast<off_t>(begin + done);
-        ssize_t r = ::pread(fd, hbuf, want, off);
+        ssize_t r = ::pread(fd, host_target ? target + done : hbuf, want, off);
         if (r < 0) {
             throw std::runtime_error(fmt::format("posix pread error ({}) for {}, range {} - {}: {}",
                                                  errno,
@@ -79,7 +82,9 @@ void posix_read_bytes(int fd,
         }
         if (r == 0) break;
 
-        CUDA_CHECK(cudaMemcpy(d_target + done, hbuf, static_cast<std::size_t>(r), cudaMemcpyHostToDevice));
+        if (!host_target) {
+            CUDA_CHECK(cudaMemcpy(target + done, hbuf, static_cast<std::size_t>(r), cudaMemcpyHostToDevice));
+        }
         done += static_cast<std::size_t>(r);
     }
 
@@ -123,7 +128,11 @@ cuFileRef::cuFileRef(std::string file_name)
  * Staged through @p d_buffer in chunks of @p buffer_size; each chunk is fetched via
  * read_bytes(), so this works unchanged on both the GDS and POSIX paths.
  *
- * @param target Destination tensor buffer (device pointer) in dtype @p t_type.
+ * The conversion kernels write device memory only. For a host @p target each chunk is
+ * converted into a device temporary and copied back, so that no kernel is ever handed a
+ * host pointer (which faults unless the memory happens to be pinned and mapped).
+ *
+ * @param target Destination tensor buffer in dtype @p t_type.
  * @param begin Start offset in the file (inclusive), in bytes.
  * @param end End offset in the file (exclusive), in bytes.
  * @param file_name File name used for diagnostics only.
@@ -131,6 +140,7 @@ cuFileRef::cuFileRef(std::string file_name)
  * @param s_type Source tensor element dtype (as stored in the file).
  * @param d_buffer Temporary device buffer used for staged reads.
  * @param buffer_size Size of @p d_buffer in bytes; also the maximum chunk size per iteration.
+ * @param host_target Whether @p target is host memory rather than a device pointer.
  * @throws std::logic_error / std::runtime_error as propagated from reads and conversion.
  */
 void cuFileRef::read_and_convert(std::byte* target,
@@ -140,16 +150,33 @@ void cuFileRef::read_and_convert(std::byte* target,
                                  ETensorDType t_type,
                                  ETensorDType s_type,
                                  std::byte* d_buffer,
-                                 std::size_t buffer_size) {
+                                 std::size_t buffer_size,
+                                 bool host_target) {
     (void)file_name;  // diagnostics come from mFileName via read_bytes()
+    const std::size_t t_size = get_dtype_size(t_type);
+    const std::size_t s_size = get_dtype_size(s_type);
+
+    // Device temporary holding one converted chunk; only needed for a host destination.
+    std::unique_ptr<std::byte, void (*)(std::byte*)> d_converted(nullptr, [](std::byte* p) { cudaFree(p); });
+    if (host_target && end > begin) {
+        const std::size_t chunk = std::min(static_cast<std::size_t>(end - begin), buffer_size);
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, chunk / s_size * t_size));
+        d_converted.reset(static_cast<std::byte*>(p));
+    }
+
     for (std::ptrdiff_t p = 0; p < end - begin; p += static_cast<std::ptrdiff_t>(buffer_size)) {
         std::ptrdiff_t amount = std::min(end - begin - p, static_cast<std::ptrdiff_t>(buffer_size));
         read_bytes(d_buffer, begin + p, begin + p + amount);
-        convert_tensor_dispatch(target + p * get_dtype_size(t_type) / get_dtype_size(s_type),
+        std::byte* chunk_target = target + p * t_size / s_size;
+        convert_tensor_dispatch(host_target ? d_converted.get() : chunk_target,
                                 d_buffer,
-                                amount / get_dtype_size(s_type),
+                                amount / s_size,
                                 t_type,
                                 s_type);
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (host_target) {
+            CUDA_CHECK(cudaMemcpy(chunk_target, d_converted.get(), amount / s_size * t_size, cudaMemcpyDeviceToHost));
+        }
     }
 }

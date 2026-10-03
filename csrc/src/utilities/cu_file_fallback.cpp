@@ -49,17 +49,18 @@ cuFileRef::~cuFileRef() noexcept {
 }
 
 /**
- * @brief Read a byte range from the file into device memory.
+ * @brief Read a byte range from the file into device or host memory.
  *
  * Range semantics: [begin, end) in bytes.
  *
- * @param target Destination pointer in device memory; must be valid for (end - begin) bytes.
+ * @param target Destination pointer; must be valid for (end - begin) bytes.
  * @param begin Starting byte offset within the file (inclusive).
  * @param end Ending byte offset within the file (exclusive).
+ * @param host_target Whether @p target is host memory rather than a device pointer.
  *
  * @throws std::logic_error If @p end < @p begin.
  * @throws std::runtime_error On POSIX/CUDA errors or short reads.
  */
-void cuFileRef::read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff_t end) {
-    posix_read_bytes(mFileDescriptor, target, begin, end, mFileName);
+void cuFileRef::read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff_t end, bool host_target) {
+    posix_read_bytes(mFileDescriptor, target, begin, end, mFileName, host_target);
 }

@@ -210,20 +210,35 @@ cuFileRef::~cuFileRef() noexcept {
         close(mFileDescriptor);
         mFileDescriptor = -1;
     }
+    if (mHostFileDescriptor >= 0) {
+        close(mHostFileDescriptor);
+        mHostFileDescriptor = -1;
+    }
 }
 
 /**
- * @brief Read a byte range from the underlying file into device memory.
+ * @brief Read a byte range from the underlying file into device or host memory.
  *
  * The interval is treated as [begin, end) in file offsets (bytes). Dispatches to
  * GPUDirect Storage or the buffered POSIX path depending on how the file was opened.
+ * A host destination always takes the buffered path: GDS is a file-to-device transfer.
  *
- * @param target Destination buffer (device pointer) receiving (end - begin) bytes.
+ * @param target Destination buffer receiving (end - begin) bytes.
  * @param begin Start offset in the file (inclusive), in bytes.
  * @param end End offset in the file (exclusive), in bytes. Must be >= begin.
+ * @param host_target Whether @p target is host memory rather than a device pointer.
  * @throws std::logic_error / std::runtime_error as propagated from the selected read path.
  */
-void cuFileRef::read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff_t end) {
+void cuFileRef::read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff_t end, bool host_target) {
+    if (uses_gds() && host_target) {
+        // mFileDescriptor is O_DIRECT here (aligned offsets and sizes only), so the plain
+        // pread() into the host buffer goes through a buffered descriptor of its own.
+        if (mHostFileDescriptor < 0) {
+            mHostFileDescriptor = open_buffered_fd(mFileName);
+        }
+        posix_read_bytes(mHostFileDescriptor, target, begin, end, mFileName, true);
+        return;
+    }
     if (uses_gds()) {
         try {
             cufile_read_bytes(mHandle, target, begin, end, mFileName);
@@ -236,7 +251,7 @@ void cuFileRef::read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff
             degrade_to_buffered();
         }
     }
-    posix_read_bytes(mFileDescriptor, target, begin, end, mFileName);
+    posix_read_bytes(mFileDescriptor, target, begin, end, mFileName, host_target);
 }
 
 /**

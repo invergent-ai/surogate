@@ -36,9 +36,11 @@ public:
     //! \param target Pointer to the target buffer
     //! \param begin Offset into the file for the beginning of the read range (inclusive)
     //! \param end Offset into the file for the end of the read range (exclusive)
+    //! \param host_target Whether `target` is host memory (`Tensor::Device < 0`, e.g. a shared frozen master
+    //! that is still pageable while it is read) rather than a device pointer
     //! \throws std::runtime_error If the range cannot be read
     //! \throws std::logic_error If `[begin, end)` does not form a valid range
-    void read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff_t end);
+    void read_bytes(std::byte* target, std::ptrdiff_t begin, std::ptrdiff_t end, bool host_target = false);
 
     void read_and_convert(std::byte* target,
                           std::ptrdiff_t begin,
@@ -47,7 +49,8 @@ public:
                           ETensorDType t_type,
                           ETensorDType s_type,
                           std::byte* d_buffer,
-                          std::size_t buffer_size);
+                          std::size_t buffer_size,
+                          bool host_target = false);
 
 private:
     //! \brief Drop this ref off the GDS path: deregister, then reopen the file buffered.
@@ -57,6 +60,9 @@ private:
 
     CUfileHandle_t mHandle;
     int mFileDescriptor;
+    //! Buffered descriptor for host destinations while this ref is on the GDS path (whose
+    //! descriptor is O_DIRECT); opened on first use.
+    int mHostFileDescriptor = -1;
     std::string mFileName;
 };
 

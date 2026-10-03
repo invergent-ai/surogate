@@ -99,7 +99,8 @@ SafeTensorEntry::SafeTensorEntry(const std::string& name,
  * Bounds are validated against the entry size, and the target tensor byte size
  * must match the requested element count at the target dtype.
  *
- * @param target Destination tensor (device memory) to fill.
+ * @param target Destination tensor to fill: device memory, or host memory (`Device < 0`, e.g. the
+ *               pageable buffer of a shared frozen master under `cpu_training`).
  * @param offset Element offset (not bytes) from the start of this entry.
  * @param elements Number of elements to read.
  * @param allow_cast If true, allow dtype conversion from file dtype to target dtype.
@@ -130,8 +131,12 @@ void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset, std::ptrdi
                                              dtype_to_str(target.DType),
                                              dtype_to_str(mDType)));
 
+    // The reader has to know: a host buffer is neither a valid cudaMemcpy(HostToDevice)
+    // destination nor writable by the conversion kernels.
+    const bool host_target = target.Device < 0;
+
     if (mDType == target.DType) {
-        mHandle->read_bytes(target.Data, start, end);
+        mHandle->read_bytes(target.Data, start, end, host_target);
     } else {
         // Need conversion buffer
         if (mReader->mConversionBufferSize < end - start) {
@@ -146,7 +151,8 @@ void SafeTensorEntry::read_raw(Tensor& target, std::ptrdiff_t offset, std::ptrdi
                                   target.DType,
                                   mDType,
                                   mReader->mConversionBuffer,
-                                  mReader->mConversionBufferSize);
+                                  mReader->mConversionBufferSize,
+                                  host_target);
     }
 }
 

@@ -10,12 +10,15 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <numeric>
 #include <vector>
 
 #include "config/pretrained_config.h"
 #include "runtime/dsl/dsl_weight_loader.h"
+#include "runtime/dsl/shared_master_store.h"
 #include "utilities/allocator.h"
+#include "utilities/cu_file.h"
 #include "utilities/safetensors.h"
 
 namespace {
@@ -277,4 +280,59 @@ TEST_CASE("DSL ties resolve after source updates and skip external endpoints", "
     REQUIRE_THROWS(bad_tie.resolve_tied_params([&](const std::string& name) -> Tensor& {
         return name == "source" ? source : small;
     }));
+}
+
+// cpu_training + LoRA: frozen masters are malloc'ed host buffers (dsl::SharedMasterStore) that are
+// page-locked only after the read, so the reader must not hand them to CUDA as device memory.
+TEST_CASE("DSL loads fill pageable host masters, with and without a cast", "[weight-loader]") {
+    require_gpu();
+    Checkpoint checkpoint({{"plain", {2, 3}, sequence(6)}, {"cast", {3, 2}, sequence(6, 10)}});
+    SafeTensorsReader reader(checkpoint.path);
+    TensorAllocator allocator;
+    PretrainedConfig config;
+    dsl::MappingTable mapping;
+    dsl::DslWeightLoader loader(reader, mapping, config, allocator);
+    auto host = [](auto& buffer, ETensorDType dtype, const std::vector<long>& shape) {
+        return Tensor::from_pointer(reinterpret_cast<std::byte*>(buffer.data()), /*device=*/-1, dtype, shape);
+    };
+    auto floats = [](const std::vector<nv_bfloat16>& raw) {
+        std::vector<float> result(raw.size());
+        std::transform(raw.begin(), raw.end(), result.begin(), [](nv_bfloat16 x) { return float(x); });
+        return result;
+    };
+
+    std::vector<float> plain_data(6, -1.0f);
+    auto plain = host(plain_data, ETensorDType::FP32, {2, 3});
+    REQUIRE(loader.load_param("plain", plain, false));
+    REQUIRE(plain_data == sequence(6));
+
+    std::vector<nv_bfloat16> cast_data(6);
+    auto cast = host(cast_data, ETensorDType::BF16, {3, 2});
+    REQUIRE_THROWS(loader.load_param("cast", cast, false));
+    REQUIRE(loader.load_param("cast", cast, true));
+    REQUIRE(floats(cast_data) == sequence(6, 10));
+
+    // Converting read staged in chunks smaller than the tensor (4 + 2 elements).
+    std::uint64_t header_size = 0;
+    std::ifstream(checkpoint.path, std::ios::binary).read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+    const auto begin = static_cast<std::ptrdiff_t>(sizeof(header_size) + header_size);  // "plain" is stored first
+    auto staging = allocate(allocator, {4});
+    std::vector<nv_bfloat16> chunked(6);
+    cuFileRef file(checkpoint.path);
+    file.read_and_convert(reinterpret_cast<std::byte*>(chunked.data()), begin, begin + 6 * sizeof(float),
+                          checkpoint.path, ETensorDType::BF16, ETensorDType::FP32, staging.Data, staging.bytes(),
+                          /*host_target=*/true);
+    REQUIRE(floats(chunked) == sequence(6));
+}
+
+TEST_CASE("Shared master store releases waiters when the claimer's read fails", "[weight-loader]") {
+    dsl::SharedMasterStore store;
+    store.reserve("weight", 16);
+    REQUIRE(store.try_claim("weight"));
+    auto waiter = std::async(std::launch::async, [&] { store.wait_populated("weight"); });
+    store.fail("weight");
+    REQUIRE_THROWS(waiter.get());
+    REQUIRE_FALSE(store.try_claim("weight"));
+    REQUIRE_THROWS(store.wait_populated("weight"));
+    store.clear();
 }

@@ -247,8 +247,11 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         // Cross-GPU shared frozen base master: populate (read + page-lock) exactly once.
         // The first GPU manager to reach `name` claims it and reads/registers below; the
         // others wait for it and skip the redundant read (they share the same buffer).
-        // The scope guard runs register_and_finish at iteration end for the claimer, no
-        // matter which mapping branch does the read.
+        // The claimer runs register_and_finish at iteration end, no matter which mapping
+        // branch does the read. If the read throws instead, the scope guard marks the
+        // entry failed: a half-read buffer is not page-locked, the read error is the one
+        // reported (a guard that registered while unwinding would throw from its
+        // destructor and terminate the process), and no other rank waits for it forever.
         const bool shared_master = mWeightManager && mWeightManager->is_shared_master(name);
         if (shared_master && !dsl::shared_master_store().try_claim(name)) {
             // Another rank is reading this shared master. Don't wait here — keep
@@ -258,13 +261,13 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             // tied-weight copies, which read these buffers.
             continue;
         }
-        struct FinishGuard {
+        struct FailGuard {
             const std::string& n;
             bool active;
-            ~FinishGuard() {
-                if (active) dsl::shared_master_store().register_and_finish(n);
+            ~FailGuard() {
+                if (active) dsl::shared_master_store().fail(n);
             }
-        } finish_guard{name, shared_master};
+        } fail_guard{name, shared_master};
 
         const bool param_sharded = sharded_weights && mWeightManager->is_sharded(name);
         DslWeightLoader::ExpertLoadedCallback on_expert_loaded;
@@ -285,6 +288,10 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             // already been merged by the per-expert callback. apply skips both.
             adapter_merger->apply(name, param, adapter_stream);
             CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
+        }
+        if (shared_master) {
+            dsl::shared_master_store().register_and_finish(name);
+            fail_guard.active = false;
         }
     }
 

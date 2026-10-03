@@ -36,15 +36,22 @@ public:
     void* reserve(const std::string& name, std::size_t bytes);
 
     /// Try to become the single populator of `name`. Returns true for exactly one
-    /// caller (which must then read the data, call register_and_finish); all other
-    /// callers get false and should wait_populated() then reuse the buffer.
+    /// caller (which must then read the data, call register_and_finish -- or fail if
+    /// the read did not complete); all other callers get false and should
+    /// wait_populated() then reuse the buffer.
     bool try_claim(const std::string& name);
 
     /// Mark `name` populated and page-lock its buffer for DMA streaming. Called by
     /// the populator after the file read completes (data resident). Wakes waiters.
     void register_and_finish(const std::string& name);
 
+    /// Mark `name` as failed: its claimer could not populate it. The buffer is left
+    /// unregistered and waiters are woken (wait_populated throws for them). Never throws,
+    /// so it can run while the claimer's own exception unwinds.
+    void fail(const std::string& name) noexcept;
+
     /// Block until `name` has been populated by its claimer.
+    /// \throws std::runtime_error If the claimer failed instead (see fail()).
     void wait_populated(const std::string& name);
 
     /// In-place FP8 quantization latch (dispatch-PP + fp8_hybrid): the shared buffer is
@@ -69,6 +76,7 @@ private:
         std::size_t bytes = 0;
         bool claimed = false;
         bool populated = false;
+        bool failed = false;
         bool fp8_claimed = false;
         bool fp8_populated = false;
     };

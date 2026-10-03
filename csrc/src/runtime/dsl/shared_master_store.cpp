@@ -54,9 +54,25 @@ void SharedMasterStore::register_and_finish(const std::string& name) {
     mCond.notify_all();
 }
 
+void SharedMasterStore::fail(const std::string& name) noexcept {
+    {
+        std::lock_guard<std::mutex> lk(mMutex);
+        auto it = mEntries.find(name);
+        if (it == mEntries.end()) return;
+        it->second.failed = true;
+    }
+    mCond.notify_all();
+}
+
 void SharedMasterStore::wait_populated(const std::string& name) {
     std::unique_lock<std::mutex> lk(mMutex);
-    mCond.wait(lk, [&] { return mEntries.at(name).populated; });
+    mCond.wait(lk, [&] {
+        const auto& e = mEntries.at(name);
+        return e.populated || e.failed;
+    });
+    if (!mEntries.at(name).populated) {
+        throw std::runtime_error("SharedMasterStore: '" + name + "' was not populated: the rank reading it failed");
+    }
 }
 
 bool SharedMasterStore::try_claim_fp8(const std::string& name) {

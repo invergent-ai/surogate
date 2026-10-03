@@ -15,19 +15,22 @@
 
 #include "utilities/dtype.h"
 
-//! \brief Read `[begin, end)` from `fd` into device memory through a pinned host staging buffer.
+//! \brief Read `[begin, end)` from `fd` into device memory through a pinned host staging buffer,
+//! or straight into host memory.
 //! \param fd POSIX file descriptor opened for reading (buffered, i.e. without O_DIRECT).
-//! \param d_target Destination device pointer, valid for `end - begin` bytes.
+//! \param target Destination pointer, valid for `end - begin` bytes.
 //! \param begin Start offset in the file (inclusive), in bytes.
 //! \param end End offset in the file (exclusive), in bytes.
 //! \param file_name Name used for diagnostics only.
+//! \param host_target `target` is host memory (pageable or pinned): pread() fills it, no CUDA copy.
 //! \throws std::logic_error If `end < begin`.
 //! \throws std::runtime_error On pread() failure, short reads, or CUDA copy failures.
 void posix_read_bytes(int fd,
-                      std::byte* d_target,
+                      std::byte* target,
                       std::ptrdiff_t begin,
                       std::ptrdiff_t end,
-                      std::string_view file_name);
+                      std::string_view file_name,
+                      bool host_target);
 
 //! \brief Convert `size` elements from `s_type` to `t_type`; both buffers are device pointers.
 //! \throws std::runtime_error If the conversion pair is unsupported.
