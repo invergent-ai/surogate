@@ -1800,6 +1800,7 @@ void extract_logprobs(const Tensor& logits,
 
 void compute_grpo_custom_dloss(float* custom_dloss,
                                float* metrics,
+                               float* sample_metrics,
                                const float* losses,
                                const float* inference_logprobs,
                                const float* advantages,

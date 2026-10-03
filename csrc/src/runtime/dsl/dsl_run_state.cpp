@@ -1099,6 +1099,8 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mAllocator->allocate(ETensorDType::FP32, "grpo_inv_temperature", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.metrics =
         mAllocator->allocate(ETensorDType::FP32, "grpo_metrics", EAllocationType::ON_DEVICE, {11});
+    mGrpoNativeScratch.sample_metrics =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_sample_metrics", EAllocationType::ON_DEVICE, {BT_grpo * 11});
     mGrpoNativeScratch.host_metrics =
         mAllocator->allocate(ETensorDType::FP32, "grpo_host_metrics", EAllocationType::PINNED, {11});
     for (int slot = 0; slot < modules::GrpoNativeScratch::kHostStagingSlots; ++slot) {

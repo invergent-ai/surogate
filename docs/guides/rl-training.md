@@ -346,6 +346,12 @@ dK/dV across chunks. Gradients are exact; memory stays at the single-chunk
 footprint. All-padding tail chunks are detected from the per-sample end offsets
 and skipped.
 
+The update is normalized by the step's loss-token total, and `loss`, `kl` and
+`masked` are per-sample means over all of a sample's loss tokens, so none of
+them depends on where the chunk boundaries fall. A prompt longer than one chunk
+— the usual shape of an agentic rollout, where the first chunks of every sample
+hold no loss token at all — needs no special handling.
+
 Pair it with `single_sample_bins: true`. Chunked-training attention carries no
 packed-document isolation, so a row holding several samples would let them
 attend across each other.
@@ -782,7 +788,7 @@ The trainer logs these GRPO-specific metrics at each step:
 | `masked`     | Fraction of loss-eligible tokens that were masked       |
 | `tokens`     | Total loss-eligible tokens in the step                  |
 | `loss`       | Training loss (from the backward pass)                  |
-| `grad_norm`  | Gradient norm after clipping                            |
+| `grad_norm`  | Norm of the step's gradient, before clipping            |
 | `teacher_kl` | KL from teacher to student (only when `teacher_tau > 0`) |
 
 A healthy training run shows:
@@ -790,7 +796,7 @@ A healthy training run shows:
 - `kl` gradually increasing from near-zero (policy is improving)
 - `masked` staying below 30-40% (policy isn't drifting too fast)
 - `loss` trending downward
-- `grad_norm` staying within the clip threshold
+- `grad_norm` settling rather than growing from step to step. Values above `max_grad_norm` are clipped to it before the update
 
 ---
 

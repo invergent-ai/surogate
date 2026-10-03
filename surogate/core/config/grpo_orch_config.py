@@ -434,16 +434,18 @@ class GRPOBufferConfig:
     midband_sampling_boost: float | None = None
     gradient_std_high: float | None = 0.15   # >= this -> boost (real dispersion)
     gradient_std_low: float | None = 0.12    # <  this -> demote (carpet; measured carpets sit at 0.088)
-    # vtc rescue (2026-08-22, MEASURED): chunked GRPO reads the step's
-    # ValidTokenCount from the LAST micro's CHUNK 0 (upstream issue #74). If
-    # EVERY sample in a batch has a prompt longer than the chunk (1792 tok),
-    # chunk 0 holds only prompt tokens, vtc reads 0 and the ENTIRE STEP IS
+    # vtc rescue (2026-08-22, MEASURED) — a workaround the trainer no longer
+    # needs; leave it unset. Chunked GRPO reads the step's ValidTokenCount
+    # from the LAST micro's CHUNK 0 (upstream issue #74), and the trainer
+    # used to scale gradients by that count and discard the step when it
+    # read 0. If EVERY sample in a batch had a prompt longer than the chunk
+    # (1792 tok), chunk 0 held only prompt tokens and the ENTIRE STEP WAS
     # DISCARDED — step 103 lost ~2h of generation this way (0/256 samples
-    # under 1792, vs 64/256 on the healthy step 102). The FACET blend made
-    # this reachable: its prompts run 2,752-4,044 tokens, and terminal+swe
-    # is ~56% of draws, so ~1 step in 10 would be silently wasted.
+    # under 1792, vs 64/256 on the healthy step 102).
     # When set, sampling guarantees at least one short-prompt example per
-    # batch so the trainer's reorder guard always has a rescue micro.
+    # batch. Since #264 the trainer normalizes by the step's loss-token total
+    # and never reads that count, so this only skews the sampled mix towards
+    # short prompts. The keys still load and still act, for existing configs.
     vtc_min_short_prompt_examples: int | None = None
     vtc_short_prompt_max_chars: int | None = 6000
     vtc_rescue_window: int | None = 4

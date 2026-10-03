@@ -50,47 +50,6 @@ def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
     return out
 
 
-def reorder_micros_for_vtc_guard(micro_batches: list, chunk_tokens: int) -> int | None:
-    """Move the micro with the largest chunk-0 valid-token count to the last slot.
-
-    In chunked GRPO the engine's step-end ValidTokenCount is the LAST micro's
-    CHUNK-0 count (per-invocation loss-buffer zeroing x reverse phase-B chunk
-    order — see upstream issue #74):
-      * a multi-chunk sample whose prompt fills chunk 0 packed last makes vtc
-        read 0 and corrupts the step (metrics garbage + exploded norm), and
-      * any small last micro shrinks the grad token-scale denominator, so the
-        reported grad norm is packing noise (measured corr(grad_norm, 1/vtc)
-        = 0.83 over 76 steps) and a grad clip suppresses real updates.
-    Batch order within an optimizer step is gradient-neutral (per-token grads
-    are computed python-side and summed), so pinning the max-count micro last
-    stabilizes the denominator without touching the update.
-
-    Returns the index swapped from, or None if no reorder was needed.
-    """
-    if chunk_tokens <= 0 or not micro_batches:
-        return None
-
-    def _chunk0_valid(mb) -> int:
-        # loss_mask arrives (1, T) from the packer — flatten before slicing or
-        # [:chunk_tokens] slices ROWS and sums the WHOLE sample, which selects
-        # multi-chunk long-completion micros whose chunk 0 is empty — i.e. it
-        # manufactures the exact vtc=0 corruption this guard exists to prevent.
-        return int(np.asarray(mb["loss_mask"]).reshape(-1)[:chunk_tokens].sum())
-
-    best = max(range(len(micro_batches)), key=lambda i: _chunk0_valid(micro_batches[i]))
-    if best == len(micro_batches) - 1:
-        return None
-    last_valid = _chunk0_valid(micro_batches[-1])
-    micro_batches[best], micro_batches[-1] = micro_batches[-1], micro_batches[best]
-    logger.info(
-        "vtc guard: moved micro %d (chunk0_valid=%d) to last slot (previous last had %d)",
-        best,
-        _chunk0_valid(micro_batches[-1]),
-        last_valid,
-    )
-    return best
-
-
 def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, int]]:
     """Find sample boundaries in packed position_ids.
 
@@ -327,7 +286,7 @@ class GRPOTrainer:
             if src.exists():
                 shutil.copy(src, dst_path / filename)
 
-    def _log_step(self, *, step, orch_step, step_metrics, result, lr, n_mb, vtc,
+    def _log_step(self, *, step, orch_step, step_metrics, result, lr, n_mb,
                   expected_loss_scale, step_time, turn_acc) -> None:
         """Turn diagnostics + step logging + metrics; shared by the native,
         diagnostic and dispatch-PP micro-step paths so all three report identically."""
@@ -361,7 +320,7 @@ class GRPOTrainer:
                 f"masked={step_metrics.get('is_masked', 0):.2%} "
                 f"tokens={step_metrics.get('total_tokens', 0)} "
                 f"micro_batches={n_mb} "
-                f"vtc={vtc} expected={expected_loss_scale} "
+                f"expected={expected_loss_scale} "
                 f"time={step_time:.2f}s"
             )
 
@@ -385,7 +344,6 @@ class GRPOTrainer:
                         "train/grad_norm": float(result["norm"]),
                         "train/lr": float(lr),
                         "train/micro_batches": float(n_mb),
-                        "train/vtc": float(vtc),
                         "train/expected_loss_scale": float(expected_loss_scale),
                         "train/duration_ms": duration_ms,
                         "train/tokens_per_second": tps,
@@ -751,10 +709,6 @@ class GRPOTrainer:
             # Accumulate ALL micro-batches from one pack into a single optimizer step.
             # No fixed gradient_accumulation_steps — the count is determined dynamically by the packer each step.
             seq_len = config.sequence_len
-
-
-            chunk_tokens = seq_len // max(1, int(getattr(config, "sequence_chunks", 1) or 1))
-            reorder_micros_for_vtc_guard(micro_batches, chunk_tokens)
             n_mb = len(micro_batches)
 
             # Tell the C++ engine how many micro-steps this optimizer step has.
@@ -762,8 +716,8 @@ class GRPOTrainer:
 
             # Divide total loss by the sum of loss_mask
             # across all micro-batches in this optimizer step.
-            loss_scale = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))
-            loss_scale = max(loss_scale, 1)
+            loss_tokens = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))
+            loss_scale = max(loss_tokens, 1)
 
             step_start = time.time()
 
@@ -787,7 +741,6 @@ class GRPOTrainer:
                 # dispatch-PP folds forward+backward+optimizer into one staged pass
                 # over all micro-batches, so it replaces both the loop below and the
                 # update_with_config call further down.
-                vtc = 0
                 expected_loss_scale = loss_scale
                 result = self._dispatch_pp_step(micro_batches, float(loss_scale), opt_config, step, turn_acc)
                 step_metrics = dict(self._diag_metrics or {})
@@ -799,7 +752,6 @@ class GRPOTrainer:
                     result=result,
                     lr=lr,
                     n_mb=n_mb,
-                    vtc=vtc,
                     expected_loss_scale=expected_loss_scale,
                     step_time=step_time,
                     turn_acc=turn_acc,
@@ -932,23 +884,25 @@ class GRPOTrainer:
                 )
 
             # 5. Optimizer step — one per orchestrator step (lr/opt_config built above)
-            # Read VTC before optimizer step for diagnostics
-            vtc = self.trainer.get_valid_token_count(0)
             expected_loss_scale = loss_scale
 
-            # vtc==0 with work done means the step's loss accounting is
-            # corrupt (observed 2026-08-03 on a chunked-GRPO run: the loss op
-            # skipped all step, so ValidTokenCount — which is ALSO the
-            # gradient normalization denominator — stayed 0 and gradients
-            # came out ~1e5x too large; only max_grad_norm bounded the
-            # damage; the step also reported masked=2198% because the metric
-            # denominators share the same accounting). Never apply such a
-            # step: flush the poisoned accumulation through the normal
-            # optimizer path at lr=0 so state resets without moving the
-            # policy.
-            if vtc == 0 and n_mb > 0:
+            # A step without a single loss token has nothing to learn from:
+            # every per-token gradient is zero, yet AdamW would still move the
+            # policy along its momentum. Never apply such a step: flush it
+            # through the normal optimizer path at lr=0 so state resets without
+            # moving the policy.
+            #
+            # The key is the step's own loss-token total — the number the
+            # gradients are normalized by — and not the engine's
+            # ValidTokenCount. This guard used to read that count, which in
+            # chunked GRPO is the chunk-0 count of the LAST micro-batch
+            # (per-invocation loss-buffer zeroing x reverse chunk order): it is
+            # 0 whenever that sample's prompt fills chunk 0, so on agentic data
+            # the guard discarded every step (issue #264). The native step no
+            # longer scales gradients by that count either.
+            if loss_tokens == 0 and n_mb > 0:
                 logger.error(
-                    f"vtc=0 with {n_mb} micro-batches — corrupt step accounting; "
+                    f"no loss tokens in {n_mb} micro-batches — nothing to learn from; "
                     f"applying ZERO-LR update to flush gradients without moving the policy")
                 opt_config = _surogate.OptimizerConfig(
                     optimizer=config.optimizer,
@@ -973,7 +927,7 @@ class GRPOTrainer:
 
             self._log_step(
                 step=step, orch_step=orch_step, step_metrics=step_metrics, result=result, lr=lr,
-                n_mb=n_mb, vtc=vtc, expected_loss_scale=expected_loss_scale,
+                n_mb=n_mb, expected_loss_scale=expected_loss_scale,
                 step_time=step_time, turn_acc=turn_acc,
             )
 

@@ -469,14 +469,18 @@ class Buffer:
     def _ensure_short_prompt_example(self, sampled: list[dict], envs: list[str]) -> None:
         """Guarantee >=1 short-prompt example per STEP (vtc rescue, issue #74).
 
+        A workaround the trainer no longer needs (#264): it is off unless
+        `vtc_min_short_prompt_examples` is set, and kept only so configs that
+        set it keep behaving as they did.
+
         Chunked GRPO takes the step's ValidTokenCount from the LAST micro's
         CHUNK 0. If every sample's prompt is longer than the chunk, chunk 0
-        contains no completion tokens, vtc reads 0 and the WHOLE STEP is
-        discarded (measured: step 103, 0/256 samples under 1792 tokens, ~2h
-        of generation lost; healthy step 102 had 64/256). The trainer's
-        reorder guard can only pin the best micro last — it cannot create one.
-        So the fix belongs here: swap a drawn example for a short-prompt one
-        when a whole step's worth of draws has produced none.
+        contains no completion tokens and the count reads 0. The trainer used
+        to discard such a step (measured: step 103, 0/256 samples under 1792
+        tokens, ~2h of generation lost; healthy step 102 had 64/256), so a
+        drawn example was swapped for a short-prompt one whenever a whole
+        step's worth of draws had produced none. The trainer now normalizes by
+        the step's loss-token total and never reads that count.
 
         The window is what makes this safe. The orchestrator draws ONE example
         per group, so a per-draw guarantee silently becomes "every group must
@@ -484,8 +488,8 @@ class Buffer:
         single worker (~24h ETA, two GPUs idle) before this was caught. Forcing
         at most `need` swaps per `vtc_rescue_window` issued examples keeps the
         real guarantee (any window of `window` consecutive groups holds a short
-        one, so every step has its valid chunk-0 micro) while costing ~1 group
-        in `window` of env-ratio distortion instead of the entire mix.
+        one) while costing ~1 group in `window` of env-ratio distortion instead
+        of the entire mix.
         """
         need = self.config.vtc_min_short_prompt_examples
         if not need:
@@ -508,7 +512,7 @@ class Buffer:
         if not candidates:
             logger.warning(
                 "vtc rescue: batch has %d/%d short-prompt examples (<=%d chars) and the "
-                "buffer holds NONE — the step may be discarded (issue #74)",
+                "buffer holds NONE — nothing to swap in (the trainer no longer needs one)",
                 short_n, need, max_chars)
             return
         for slot in range(len(sampled)):
@@ -521,7 +525,7 @@ class Buffer:
             self._long_draw_streak = 0
             logger.info(
                 "vtc rescue: swapped a long-prompt example for a short one (<=%d chars) "
-                "after %d all-long draws so the step keeps a valid chunk-0 micro",
+                "after %d all-long draws",
                 max_chars, window)
 
     def update(self, rollouts: list[vf.RolloutOutput]):

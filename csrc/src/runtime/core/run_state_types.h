@@ -129,6 +129,7 @@ struct GrpoNativeScratch {
     Tensor custom_dloss;        ///< Device FP32 [B*T], shifted for LM-head backward
     Tensor inv_temperature;     ///< Device FP32 [B*T]
     Tensor metrics;             ///< Device FP32 metric accumulators
+    Tensor sample_metrics;      ///< Device FP32 [max_samples * 11], per-sample sums carried across chunk windows
 
     std::array<Tensor, kHostStagingSlots> host_inference_logprobs;  ///< Pinned FP32 [B*T]
     std::array<Tensor, kHostStagingSlots> host_advantages;          ///< Pinned FP32 [B*T]

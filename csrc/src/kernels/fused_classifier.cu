@@ -1688,6 +1688,7 @@ enum GrpoMetricOffset {
 
 __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          float* metrics,
+                                         float* sample_metrics,
                                          const float* losses,
                                          const float* inference_logprobs,
                                          const float* advantages,
@@ -1805,8 +1806,7 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     reductions[GRPO_METRIC_IS_MASKED_LOW][threadIdx.x] = is_masked_low_sum;
     reductions[GRPO_METRIC_IS_MASKED_HIGH][threadIdx.x] = is_masked_high_sum;
     reductions[GRPO_METRIC_TEACHER_KL][threadIdx.x] = teacher_kl_sum;
-    reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] =
-        (total_count > 0.0f && static_cast<long>(start) >= window_start) ? 1.0f : 0.0f;
+    reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] = 0.0f;  // counted below, once per sample
     reductions[GRPO_METRIC_KEEP_TOKENS][threadIdx.x] = keep_count;
     reductions[GRPO_METRIC_TOTAL_TOKENS][threadIdx.x] = total_count;
     __syncthreads();
@@ -1820,32 +1820,46 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         __syncthreads();
     }
 
-    if (threadIdx.x == 0 && reductions[GRPO_METRIC_TOTAL_TOKENS][0] > 0.0f) {
-        const float sample_total = reductions[GRPO_METRIC_TOTAL_TOKENS][0];
-        const float sample_masked = reductions[GRPO_METRIC_MASKED_MISMATCH_KL][0];
-        const float sample_unmasked = reductions[GRPO_METRIC_UNMASKED_MISMATCH_KL][0];
-        const float masked_denom = fmaxf(reductions[GRPO_METRIC_IS_MASKED][0], 1.0f);
-        const float unmasked_denom = fmaxf(reductions[GRPO_METRIC_KEEP_TOKENS][0], 1.0f);
-        atomicAdd(metrics + GRPO_METRIC_POLICY_LOSS, reductions[GRPO_METRIC_POLICY_LOSS][0] / sample_total);
-        atomicAdd(metrics + GRPO_METRIC_MISMATCH_KL, reductions[GRPO_METRIC_MISMATCH_KL][0] / sample_total);
+    if (threadIdx.x != 0) {
+        return;
+    }
+    // The reported metrics are per-sample means over ALL of a sample's loss tokens, and a
+    // chunked sample reaches this kernel one window at a time. Carry the window sums per
+    // sample (the caller zeroes sample_metrics once per micro-batch) and fold them into the
+    // step metrics only from the window that holds the sample's first token: the chunked
+    // path walks the windows in reverse, so that window is the last one to see the sample;
+    // unchunked it is the only one. Dividing each window's sums by that window's own token
+    // count instead reported a sum of per-chunk means, over a sample count that skipped
+    // every sample whose first chunk is all prompt.
+    float* sample_sums = sample_metrics + static_cast<long>(sample_idx) * GRPO_METRIC_COUNT;
+    for (int metric_idx = 0; metric_idx < GRPO_METRIC_COUNT; ++metric_idx) {
+        sample_sums[metric_idx] += reductions[metric_idx][0];
+    }
+    if (static_cast<long>(start) >= window_start && sample_sums[GRPO_METRIC_TOTAL_TOKENS] > 0.0f) {
+        const float sample_total = sample_sums[GRPO_METRIC_TOTAL_TOKENS];
+        const float sample_masked = sample_sums[GRPO_METRIC_MASKED_MISMATCH_KL];
+        const float sample_unmasked = sample_sums[GRPO_METRIC_UNMASKED_MISMATCH_KL];
+        const float masked_denom = fmaxf(sample_sums[GRPO_METRIC_IS_MASKED], 1.0f);
+        const float unmasked_denom = fmaxf(sample_sums[GRPO_METRIC_KEEP_TOKENS], 1.0f);
+        atomicAdd(metrics + GRPO_METRIC_POLICY_LOSS, sample_sums[GRPO_METRIC_POLICY_LOSS] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_MISMATCH_KL, sample_sums[GRPO_METRIC_MISMATCH_KL] / sample_total);
         atomicAdd(metrics + GRPO_METRIC_MASKED_MISMATCH_KL, sample_masked / masked_denom);
         atomicAdd(metrics + GRPO_METRIC_UNMASKED_MISMATCH_KL, sample_unmasked / unmasked_denom);
-        atomicAdd(metrics + GRPO_METRIC_IS_MASKED, reductions[GRPO_METRIC_IS_MASKED][0] / sample_total);
-        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_LOW, reductions[GRPO_METRIC_IS_MASKED_LOW][0] / sample_total);
-        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_HIGH, reductions[GRPO_METRIC_IS_MASKED_HIGH][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED, sample_sums[GRPO_METRIC_IS_MASKED] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_LOW, sample_sums[GRPO_METRIC_IS_MASKED_LOW] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_HIGH, sample_sums[GRPO_METRIC_IS_MASKED_HIGH] / sample_total);
         if (teacher_logprobs) {
-            atomicAdd(metrics + GRPO_METRIC_TEACHER_KL, reductions[GRPO_METRIC_TEACHER_KL][0] / sample_total);
+            atomicAdd(metrics + GRPO_METRIC_TEACHER_KL, sample_sums[GRPO_METRIC_TEACHER_KL] / sample_total);
         }
-        if (static_cast<long>(start) >= window_start) {
-            atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
-        }
-        atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, reductions[GRPO_METRIC_KEEP_TOKENS][0]);
+        atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
+        atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, sample_sums[GRPO_METRIC_KEEP_TOKENS]);
         atomicAdd(metrics + GRPO_METRIC_TOTAL_TOKENS, sample_total);
     }
 }
 
 void compute_grpo_custom_dloss(float* custom_dloss,
                                float* metrics,
+                               float* sample_metrics,
                                const float* losses,
                                const float* inference_logprobs,
                                const float* advantages,
@@ -1871,6 +1885,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
     const float inv_loss_scale = (loss_scale == 0.0f) ? 1.0f : (1.0f / loss_scale);
     grpo_custom_dloss_kernel<<<sample_count, 256, 0, stream>>>(custom_dloss,
                                                                metrics,
+                                                               sample_metrics,
                                                                losses,
                                                                inference_logprobs,
                                                                advantages,

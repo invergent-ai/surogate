@@ -346,9 +346,10 @@ def _buffer_long(**overrides) -> Buffer:
 
 
 def test_vtc_rescue_guarantees_a_short_prompt_example(monkeypatch):
-    """Every sample's prompt longer than the chunk => engine vtc=0 => the whole
-    step is discarded (measured: step 103 lost ~2h). Sampling must swap in a
-    short-prompt example so the trainer's reorder guard has a rescue micro."""
+    """With the knob set, sampling must swap a short-prompt example into an
+    all-long batch. The trainer needed one while it discarded steps whose last
+    micro had an all-prompt chunk 0 (measured: step 103 lost ~2h); it no longer
+    does (#264), but configs that set the knob must keep getting the swap."""
     import random as _random
     buffer = _buffer_long(vtc_min_short_prompt_examples=1, vtc_short_prompt_max_chars=6000)
     # force the draw toward the two LONG examples
@@ -387,12 +388,12 @@ def test_vtc_rescue_does_not_hijack_every_single_example_draw(monkeypatch):
     drawn = [buffer.sample_examples(n=1)[0] for _ in range(8)]
     shorts = sum(1 for e in drawn if Buffer._prompt_chars(e) <= 6000)
     assert shorts <= 2, f"window=4 over 8 draws must force <=2 short, got {shorts}"
-    assert shorts >= 1, "but the step must still get its valid chunk-0 micro"
+    assert shorts >= 1, "but the window must still get its short-prompt example"
 
 
 def test_vtc_rescue_still_fires_within_a_window_of_single_draws(monkeypatch):
-    """Every window of `window` consecutive groups must hold a short example,
-    otherwise the step that spans them is discarded for vtc=0."""
+    """Every window of `window` consecutive groups must hold a short example:
+    that is the guarantee the knob makes."""
     import random as _random
     buffer = _buffer_long(vtc_min_short_prompt_examples=1, vtc_short_prompt_max_chars=6000,
                           vtc_rescue_window=4)

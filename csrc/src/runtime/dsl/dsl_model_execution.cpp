@@ -1461,6 +1461,11 @@ void DslModel::grpo_native_upload_full(const float* inference_logprobs_cpu,
                                    static_cast<std::size_t>(GRPO_METRIC_COUNT) * sizeof(float),
                                    main_stream));
     }
+    // Per-sample metric sums are carried across this micro-batch's chunk windows.
+    CUDA_CHECK(cudaMemsetAsync(scratch.sample_metrics.Data,
+                               0,
+                               static_cast<std::size_t>(sample_count) * GRPO_METRIC_COUNT * sizeof(float),
+                               main_stream));
 
     const int staging_slot = scratch.next_host_slot;
     scratch.next_host_slot = (scratch.next_host_slot + 1) % modules::GrpoNativeScratch::kHostStagingSlots;
@@ -1534,6 +1539,12 @@ void DslModel::step_grpo_native_window(Tensor inputs,
     if (!(loss_config.loss_scale > 0.0f) || !std::isfinite(loss_config.loss_scale)) {
         throw std::invalid_argument("step_grpo_native_window loss_scale must be finite and positive");
     }
+    // GRPO normalizes explicitly via loss_scale (the step's loss-token total, folded
+    // into custom_dloss), like step_with_custom_loss / forward_for_grpo / step_dpo_native,
+    // so the optimizer must not divide by ValidTokenCount as well. That count is not a
+    // step total here anyway: every window's forward re-zeroes it, which leaves the loss
+    // tokens of the last window run — chunk 0 of the last micro-batch when chunked.
+    mUseTokenScale = false;
 
     auto& rs = *mRunState;
     auto& scratch = rs.grpo_native_scratch();
@@ -1576,6 +1587,7 @@ void DslModel::step_grpo_native_window(Tensor inputs,
 
     compute_grpo_custom_dloss(scratch.custom_dloss.get<float>(),
                               scratch.metrics.get<float>(),
+                              scratch.sample_metrics.get<float>(),
                               rs.Losses.get<float>(),
                               scratch.inference_logprobs.get<float>(),
                               scratch.advantages.get<float>(),
