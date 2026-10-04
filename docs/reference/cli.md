@@ -174,6 +174,14 @@ Options:
 - `--checkpoint-dir <path>`: required, path to a LoRA checkpoint directory (e.g. `output/step_00000050`)
 - `--output <path>`: required, output directory for the merged model
 
+Every LoRA pair of the adapter must land on a tensor of the base model. Per-expert adapters merge into
+checkpoints that store their routed experts fused per layer (`experts.gate_up_proj` / `experts.down_proj`,
+as Qwen3.5/3.6-MoE and GPT-OSS ship them), and the adapter's `model.layers.*` / `mlp.shared_experts.*`
+names are matched to the checkpoint's own (`model.language_model.layers.*`, `mlp.shared_expert.*`). If any
+pair has no target, or does not fit the tensor it names, the merge exits non-zero and writes nothing:
+the output is assembled next to `--output` and moved into place only when complete. Tensors no pair
+targets keep their exact bytes.
+
 ### `quantize`
 
 Quantize a checkpoint into a GGUF the engine serves. A downloaded model already is a GGUF and
