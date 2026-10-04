@@ -92,7 +92,8 @@ def _config():
 
 
 def _state_bytes(trainer, gpu: int) -> int:
-    return int(trainer.get_allocator_info(gpu)["adamw8bit_state1"]["device"])
+    """Device bytes of the 8-bit AdamW state (moments and scales) on one rank."""
+    return int(trainer.get_allocator_info(gpu)["AdamW8bit_OptState"]["device"])
 
 
 def _release(trainer):
@@ -100,7 +101,7 @@ def _release(trainer):
     torch.cuda.empty_cache()
 
 
-def _assert_same_model(path_a, path_b, steps: int = 1):
+def _assert_same_model(path_a, path_b):
     """Both runs reduce the same gradient, in a different order. Adam's first step is sign-like, so an
     element whose gradient is ~0 may step either way: a few elements are a learning rate or two apart,
     the rest at most a bf16 rounding. A slice that missed the all-gather would hold the imported value,
@@ -115,7 +116,7 @@ def _assert_same_model(path_a, path_b, steps: int = 1):
         a, b = b_all[name].float(), tensor.float()
         far = ~torch.isclose(a, b, rtol=2**-7, atol=1e-6)
         assert int(far.sum()) <= max(2, 0.05 * far.numel()), (name, int(far.sum()), far.numel())
-        assert float((a - b).abs().max()) <= (0.5 + 2 * steps) * LR, name
+        assert float((a - b).abs().max()) <= 2.5 * LR, name
 
 
 @pytest.fixture(scope="module")
@@ -126,8 +127,6 @@ def single_gpu(model_dir, tmp_path_factory):
     trainer.train_step_graphed(*_rows(1), _config(), 1)
     state = _state_bytes(trainer, 0)
     trainer.export_model(str(out / "step1"))
-    trainer.train_step_graphed(*_rows(1, seed=1), _config(), 2)
-    trainer.export_model(str(out / "step2"))
     _release(trainer)
     return state, out
 
@@ -155,18 +154,31 @@ def test_zero1_cuda_graph_step_gathers_the_slices(model_dir, single_gpu, tmp_pat
     _assert_same_model(single_out / "step1", tmp_path / "step1")
 
 
-def test_zero1_resume_restores_each_ranks_slice_of_the_state(model_dir, single_gpu, tmp_path):
-    """Each rank writes and reads back its own slice of the state: a step after a resume matches the
-    single-GPU run's second step."""
-    _, single_out = single_gpu
+def _optimizer_state_files(ckpt) -> dict[str, bytes]:
+    return {str(f.relative_to(ckpt)): f.read_bytes() for f in sorted(ckpt.rglob("adam.*")) if f.is_file()}
+
+
+def test_zero1_resume_restores_each_ranks_slice_of_the_state(model_dir, tmp_path):
+    """Each rank writes its own slice of the state and reads it back: a resumed run saves the same state
+    files again, and its next step matches the step of the run that wrote the checkpoint.
+
+    The reference is that run itself rather than a single-GPU run: a second step compounds the
+    run-to-run spread of the first (an element that stepped the other way changes every gradient)."""
     trainer = _build(model_dir, ngpu=2, level="zero1")
     trainer.train_step_graphed(*_rows(2), _config(), 1)
     trainer.save_checkpoint(str(tmp_path / "ckpt"), 1)
+    trainer.train_step_graphed(*_rows(2, seed=1), _config(), 2)
+    trainer.export_model(str(tmp_path / "continued"))
     _release(trainer)
 
     trainer = _build(model_dir, ngpu=2, level="zero1")
     trainer.load_checkpoint(str(tmp_path / "ckpt"), 1)
+    trainer.save_checkpoint(str(tmp_path / "resaved"), 1)
     trainer.train_step_graphed(*_rows(2, seed=1), _config(), 2)
-    trainer.export_model(str(tmp_path / "step2"))
+    trainer.export_model(str(tmp_path / "resumed"))
     _release(trainer)
-    _assert_same_model(single_out / "step2", tmp_path / "step2", steps=2)
+
+    saved = _optimizer_state_files(tmp_path / "ckpt")
+    assert len(saved) == 4, sorted(saved)  # moments and variances, one file per rank
+    assert _optimizer_state_files(tmp_path / "resaved") == saved
+    _assert_same_model(tmp_path / "continued", tmp_path / "resumed")

@@ -275,6 +275,8 @@ void AdamW8BitOptimizer::init_state(dsl::DslModel& model, cudaStream_t stream) {
         }
     }
 
+    // Its own allocator segment, so the per-rank state size shows up in the allocator stats.
+    auto alloc_ctx = model.mAllocator->with_context("AdamW8bit_OptState");
     state.state1 =
         model.mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state1", alloc_kind, {(long)state.total_state_elems});
     state.state2 =
