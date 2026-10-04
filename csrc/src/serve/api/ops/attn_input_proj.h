@@ -49,9 +49,9 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      cudaStream_t stream);
 
 /// Whether the fused W8 query/key/gate/value route serves a parent of this shape. The route is a
-/// set of tuned kernels per registered (parent rows, hidden) pair; a target asks before sizing
-/// a workspace for it, so a profile whose W8 parent this route does not serve -- the 27B's
-/// byte-wide draft block -- is not refused at plan time on behalf of a route it never binds.
+/// set of tuned kernels per registered (parent rows, hidden) pair. A W8 parent of any other
+/// shape is projected one row range at a time at A16, as the row-addressable formats are, so
+/// a size of the family the fused kernels were never registered for still serves (#239).
 [[nodiscard]] bool attn_input_proj_w8_admits(std::int32_t parent_rows, std::int32_t input_rows) noexcept;
 
 /**
@@ -72,6 +72,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16_CTRL.
  * - FP8_E4M3FN_ROW_BF16S RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL.
+ *
+ * A W8G32_F16S parent outside attn_input_proj_w8_admits(), like a K-quant, block-FP8 or
+ * unregistered BF16 parent, is projected one row range at a time at A16, with the row counts
+ * read from the four outputs.
  *
  * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
  * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits the private resolver to

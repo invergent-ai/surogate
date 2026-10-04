@@ -270,7 +270,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
                      std::int32_t z_rows, std::int32_t width, std::int32_t batch,
                      std::vector<std::int32_t> valid_columns, const std::vector<float>& conv_weight,
                      std::size_t workspace_bytes, const ReductionCriterion& criterion,
-                     ProjectQkv&& project_qkv, ProjectZ&& project_z, Launch&& launch) {
+                     ProjectQkv&& project_qkv, ProjectZ&& project_z, Launch&& launch,
+                     bool exact_workspace = true) {
     const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
     const std::int32_t aggregate_columns = width * batch;
     const std::int32_t slots             = aggregate_columns + batch;
@@ -417,7 +418,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
         failures +=
             verify_preserved(std::string(label) + " valid columns", device_valid, valid_columns);
     }
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes ||
+        (exact_workspace && workspace.peak_used() != workspace_bytes)) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -561,7 +563,8 @@ int run_q4_q5() {
     return failures;
 }
 
-int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t initial_slot) {
+int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t initial_slot,
+                bool exact_workspace) {
     const std::int32_t kHidden              = parent.host.weight.k;
     const std::int32_t kValueRows           = (parent.host.weight.n - kQueryRows - kKeyRows) / 2;
     const std::int32_t kZRows               = kValueRows;
@@ -639,14 +642,18 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     failures +=
         verify_preserved("snapshot base slot" + suffix, device_snapshot_base, snapshot_base_value);
     failures += parent.verify_preserved("snapshot parent weight" + suffix);
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes ||
+        (exact_workspace && workspace.peak_used() != workspace_bytes)) {
         std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
     return failures;
 }
 
-int run_w8(std::int32_t kHidden, std::int32_t kValueRows) {
+// A parent the fused W8 kernels are not registered for is projected by row range (#239). Its
+// plan knows the parent rows but not the split, so it sizes the projected plane for every
+// parent row, z included: execution must stay within it rather than meet it exactly.
+int run_w8(std::int32_t kHidden, std::int32_t kValueRows, bool registered = true) {
     const std::int32_t parent_rows = kQueryRows + kKeyRows + 2 * kValueRows;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, parent_rows, kHidden, 727U));
@@ -654,7 +661,7 @@ int run_w8(std::int32_t kHidden, std::int32_t kValueRows) {
     // Representative registered T values around every current execution boundary.
     for (const std::int32_t tokens : {1, 2, 16, 17, 32, 33}) {
         const std::int32_t initial_slot = tokens == 2 ? 0 : tokens + 1;
-        failures += run_w8_case(parent, tokens, initial_slot);
+        failures += run_w8_case(parent, tokens, initial_slot, registered);
     }
     const std::int32_t kZRows        = kValueRows;
     const std::int32_t kChannels     = kQueryRows + kKeyRows + kValueRows;
@@ -684,7 +691,8 @@ int run_w8(std::int32_t kHidden, std::int32_t kValueRows) {
             Tensor& z, WorkspaceArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
                                               snapshot_base, q, k, v, z, workspace, nullptr);
-        });
+        },
+        registered);
     failures += parent.verify_preserved("batched W8 parent weight");
     return failures;
 }
@@ -1055,6 +1063,7 @@ int main() {
     failures += run_w8(2048, 2048);
     failures += run_w8(2048, 4096);
     failures += run_w8(2560, 4096);
+    failures += run_w8(4096, 4096, false); // qwen3.5-9b: no fused W8 kernels
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";

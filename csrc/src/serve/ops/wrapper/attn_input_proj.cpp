@@ -42,6 +42,12 @@ std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t r
                ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
                : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
 }
+// A W8 parent of a shape the fused W8 kernels were never registered for -- a size of the family
+// nobody tuned, the 9B's [10240,4096] say -- is split by row range the same way: W8 rows are
+// independently addressable and the plain W8 linear serves any shape (#239).
+bool w8_row_projected(QType qtype, std::int32_t parent_rows, std::int32_t input_rows) {
+    return qtype == QType::W8G32_F16S && !attn_input_proj_w8_admits(parent_rows, input_rows);
+}
 } // namespace
 namespace {
 
@@ -121,9 +127,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
     const bool fused_bf16 = weight.qtype == QType::BF16_CTRL && weight.n == 14336 && weight.k == 5120 &&
                              q.ne[0] == 6144 && gate.ne[0] == 6144 && k.ne[0] == 1024 && v.ne[0] == 1024;
-    if (row_projectable(weight.qtype) && !fused_bf16) {
-        // A K-quant or block-FP8 parent is split by row range straight into the four outputs:
-        // physical row order query, key, output gate, value. Any width.
+    if ((row_projectable(weight.qtype) && !fused_bf16) ||
+        w8_row_projected(weight.qtype, weight.n, weight.k)) {
+        // A K-quant, block-FP8 or unregistered W8 parent is split by row range straight into
+        // the four outputs: physical row order query, key, output gate, value. Any width.
         const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_gate = gate.ne[0], rows_v = v.ne[0];
         if (rows_q + rows_k + rows_gate + rows_v != weight.n) {
             throw std::invalid_argument("attn_input_proj: row-projected parent rows must equal q+k+gate+v");
@@ -289,8 +296,13 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
-        if (!attn_input_proj_w8_admits(parent_rows, input_rows) ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
+        if (w8_row_projected(parent_qtype, parent_rows, input_rows)) {
+            // Split by row range at A16, as dispatch_single_parent runs it; the widest range is
+            // the parent itself.
+            return linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
+                                                   LinearPolicy::A16Only, min_tokens, max_tokens);
+        }
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }
         {

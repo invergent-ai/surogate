@@ -140,7 +140,7 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
              std::int32_t z_rows, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::size_t snapshot_workspace_bytes,
              std::size_t record_workspace_bytes, SnapshotLaunch&& snapshot_launch,
-             RecordLaunch&& record_launch, std::uint32_t seed) {
+             RecordLaunch&& record_launch, std::uint32_t seed, bool exact_workspace = true) {
     const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
     const std::int32_t aggregate_columns = width * batch;
     const std::int32_t slots             = aggregate_columns + batch + 1;
@@ -241,11 +241,13 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     failures += record_z.verify_guards(std::string(label) + " record z");
     failures += conv_record.verify_guards(std::string(label) + " conv record");
     if (snapshot_workspace.used() != 0 ||
-        snapshot_workspace.peak_used() != snapshot_workspace_bytes) {
+        snapshot_workspace.peak_used() > snapshot_workspace_bytes ||
+        (exact_workspace && snapshot_workspace.peak_used() != snapshot_workspace_bytes)) {
         std::cerr << label << ": snapshot workspace query/execution mismatch\n";
         ++failures;
     }
-    if (record_workspace.used() != 0 || record_workspace.peak_used() != record_workspace_bytes) {
+    if (record_workspace.used() != 0 || record_workspace.peak_used() > record_workspace_bytes ||
+        (exact_workspace && record_workspace.peak_used() != record_workspace_bytes)) {
         std::cerr << label << ": record workspace query/execution mismatch\n";
         ++failures;
     }
@@ -298,7 +300,9 @@ int run_q4_q5() {
     return failures;
 }
 
-int run_w8(std::int32_t hidden, std::int32_t value_rows) {
+// `registered` is false for a parent the fused W8 kernels do not serve, which is projected by
+// row range (#239) and whose snapshot plan sizes the projected plane for every parent row.
+int run_w8(std::int32_t hidden, std::int32_t value_rows, bool registered = true) {
     const std::int32_t parent_rows = kQueryRows + kKeyRows + 2 * value_rows;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, parent_rows, hidden, 1501U));
@@ -328,7 +332,7 @@ int run_w8(std::int32_t hidden, std::int32_t value_rows) {
                 ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
                                                 initial, record, q, k, v, z, workspace, nullptr);
             },
-            seed);
+            seed, registered);
     };
     failures += run(2, 1, {1}, 1511U);
     failures += run(16, 1, {}, 1521U);
@@ -597,6 +601,7 @@ int main() {
     failures += run_w8(2048, 2048);
     failures += run_w8(2048, 4096);
     failures += run_w8(2560, 4096);
+    failures += run_w8(4096, 4096, false); // qwen3.5-9b: no fused W8 kernels
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
