@@ -150,6 +150,8 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
         } else {
             model.mGrads->reduce_all(comm, stream);
         }
+        // ZeRO-2/3 can leave a layer gradient reduce-scattered; an unsharded master reads it whole.
+        model.mGrads->gather_scattered(comm, stream, [&](const std::string& name) { return !param_is_sharded(name); });
     }
 
     const bool grad_mask_enabled = gradient_mask::enabled();
@@ -384,6 +386,8 @@ void AdamWOptimizer::step_graph(dsl::DslModel& model,
         } else {
             model.mGrads->reduce_all(comm, stream);
         }
+        // ZeRO-2/3 can leave a layer gradient reduce-scattered; an unsharded master reads it whole.
+        model.mGrads->gather_scattered(comm, stream, [&](const std::string& name) { return !param_is_sharded(name); });
     }
 
     const bool grad_mask_enabled = gradient_mask::enabled();

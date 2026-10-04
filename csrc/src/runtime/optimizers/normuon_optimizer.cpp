@@ -274,6 +274,8 @@ void NorMuonOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const 
         } else {
             model.mGrads->reduce_all(comm, stream);
         }
+        // ZeRO-2/3 can leave a layer gradient reduce-scattered; an unsharded master reads it whole.
+        model.mGrads->gather_scattered(comm, stream, [&](const std::string& name) { return !param_is_sharded(name); });
     }
 
     model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
@@ -511,6 +513,8 @@ void NorMuonOptimizer::step_graph(dsl::DslModel& model,
         } else {
             model.mGrads->reduce_all(comm, stream);
         }
+        // ZeRO-2/3 can leave a layer gradient reduce-scattered; an unsharded master reads it whole.
+        model.mGrads->gather_scattered(comm, stream, [&](const std::string& name) { return !param_is_sharded(name); });
     }
 
     model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
