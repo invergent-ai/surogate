@@ -553,7 +553,7 @@ Keys most often set; see the [RL Training guide](../guides/rl-training.md) for t
 | Option                   | Type   | Default        | Description                                                                             |
 | ------------------------ | ------ | -------------- | ----------------------------------------------------------------------------------------- |
 | `model`                  | string | (required)     | HuggingFace model ID or local path. Must match `train.yaml` and `orch.yaml`.              |
-| `tp` / `dp`              | int    | `1` / `1`      | Tensor and data parallelism degrees.                                                      |
+| `tp` / `dp`              | int    | `1` / `1`      | GPUs per replica (the engine splits the layers across them) and replicas (one whole model per GPU). At most one of them may exceed 1. |
 | `max_model_len`          | int    | `null`         | Maximum context length.                                                                   |
 | `max_num_seqs`           | int    | `null`         | Cap on concurrent sequences. Sizes the CUDA-graph and activation buffers, so it is the knob that decides whether a large model plus LoRA fits. `null` uses the engine's default. |
 | `kv_cache_dtype`         | string | `null`         | KV cache dtype. `fp8` halves KV bytes per token and raises sustainable concurrency, at the cost of perturbing sampled logprobs — watch `mismatch_kl`. `null` uses the engine's default. |

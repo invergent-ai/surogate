@@ -293,7 +293,7 @@ where $\mu$ is the rollout policy, $\pi_\theta$ is the current trainer policy, $
 
 The `--infer-gpus` and `--trainer-gpus` CLI flags use **driver-level GPU indices** (the same values you would put in `CUDA_VISIBLE_DEVICES`). The two sets must be disjoint.
 
-- `--infer-gpus N0,N1,...` count must equal `infer.dp * infer.tp`.
+- `--infer-gpus N0,N1,...` count must equal `infer.dp * infer.tp`. The server uses every one: `dp > 1` loads a whole replica on each GPU and spreads rollouts over them, `tp > 1` splits one replica's layers across the GPUs. The engine's replicas are one GPU each, so `dp` and `tp` cannot both exceed 1.
 - `--trainer-gpus M0,M1,...` count overrides `train.gpus`. The YAML field is ignored when present.
 - For MoE models, `ep_size` is set to the trainer GPU count automatically. The runner re-validates that `num_experts` is divisible by `ep_size`; if not, the run fails fast with a clear error.
 
@@ -814,8 +814,8 @@ Key inference options:
 | `max_model_len`           | `null`         | Maximum context length                                 |
 | `max_num_seqs`            | `null`         | Max concurrent sequences (null = engine default)       |
 | `kv_cache_dtype`          | `null`         | KV cache dtype, e.g. `fp8` (null = engine default)     |
-| `tp`                      | `1`            | GPUs per replica                                       |
-| `dp`                      | `1`            | Replicas                                               |
+| `tp`                      | `1`            | GPUs per replica; the engine splits the layers across them |
+| `dp`                      | `1`            | Replicas, one whole model per GPU; not with `tp > 1`   |
 | `enable_lora`             | `true`         | Enable LoRA hot-loading                                |
 | `max_lora_rank`           | `null`         | Largest adapter rank the server accepts                |
 | `max_loras`               | `8`            | Max simultaneously loaded LoRA adapters                |

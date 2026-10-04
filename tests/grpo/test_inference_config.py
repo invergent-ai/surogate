@@ -27,14 +27,81 @@ def _value(argv: list[str], flag: str) -> str:
 def test_max_num_seqs_and_kv_cache_dtype_reach_the_engine():
     argv = _argv({"model": "m", "max_num_seqs": 16, "kv_cache_dtype": "fp8"})
     assert _value(argv, "--max-num-seqs") == "16"
-    assert _value(argv, "--kv-dtype") == "fp8"
+    # The server's spelling. `--kv-dtype` is `--generate`'s, and server mode
+    # exits 2 on it, which aborted every split run that set this (#260).
+    assert _value(argv, "--kv-cache-dtype") == "fp8"
+    assert "--kv-dtype" not in argv
 
 
 def test_unset_scalars_are_left_to_the_engine():
     """None is not a value for either flag -- the flag must be absent."""
     argv = _argv({"model": "m"})
     assert "--max-num-seqs" not in argv
-    assert "--kv-dtype" not in argv
+    assert "--kv-cache-dtype" not in argv
+
+
+def test_every_engine_flag_is_one_the_server_accepts():
+    """Each flag build_argv emits must be one `surogate serve` takes in server
+    mode; checked against the wrapper's own inventory, which tests pin to the
+    native parser."""
+    from surogate.cli.serve import _parse_invocation
+
+    argv = _argv({
+        "model": "m", "port": 8000, "host": "0.0.0.0", "max_model_len": 4096, "max_num_seqs": 8,
+        "max_pending_requests": 4, "pending_timeout_ms": 1000, "adapter_update_timeout_ms": 2000,
+        "kv_cache_dtype": "fp8", "enable_lora": True, "max_lora_rank": 16,
+        "enable_auto_tool_choice": True, "tool_call_parser": "hermes", "seed": 1, "dp": 2,
+    })
+    mode, model, native, _, _ = _parse_invocation(argv[2:])
+    assert mode == "server" and model == "m"
+
+
+# ── Placement ─────────────────────────────────────────────────────────
+#
+# split.py hands the server exactly dp * tp cards in CUDA_VISIBLE_DEVICES, so
+# they are 0..N-1 in the child; the engine must be told to use all of them.
+
+
+def test_one_gpu_is_device_zero():
+    argv = _argv({"model": "m"})
+    assert _value(argv, "--device") == "0"
+    assert "--devices" not in argv and "--data-parallel" not in argv
+
+
+def test_dp_runs_a_replica_on_every_card():
+    """dp: 6 on six cards served from one of them and left five idle (#260)."""
+    argv = _argv({"model": "m", "dp": 6})
+    assert _value(argv, "--devices") == "0,1,2,3,4,5"
+    assert "--data-parallel" in argv
+    assert "--device" not in argv
+
+
+def test_tp_splits_one_replica_across_the_cards():
+    argv = _argv({"model": "m", "tp": 2})
+    assert _value(argv, "--devices") == "0,1"
+    assert "--data-parallel" not in argv
+    assert "--device" not in argv
+
+
+def test_dp_and_tp_together_are_refused_before_launch():
+    """Each engine replica runs on one GPU, so there is no layout for this."""
+    with pytest.raises(ValueError, match="cannot both exceed 1"):
+        GRPOInferenceConfig(DictDefault({"model": "m", "dp": 2, "tp": 2}))
+
+
+@pytest.mark.parametrize("name,value", [("dp", 0), ("tp", -1), ("dp", 1.5), ("tp", True), ("dp", "two")])
+def test_invalid_parallel_degrees_are_refused(name, value):
+    with pytest.raises(ValueError, match=name):
+        GRPOInferenceConfig(DictDefault({"model": "m", name: value}))
+
+
+def test_parallel_degrees_from_yaml(tmp_path, monkeypatch):
+    """An explicit null keeps 1, and an interpolated value arrives as a string."""
+    path = tmp_path / "infer.yaml"
+    path.write_text("model: m\ndp: ${INFER_DP}\ntp: null\n")
+    monkeypatch.setenv("INFER_DP", "4")
+    config = load_config(GRPOInferenceConfig, str(path))
+    assert (config.dp, config.tp) == (4, 1)
 
 
 def test_lora_flags_follow_enable_lora():
