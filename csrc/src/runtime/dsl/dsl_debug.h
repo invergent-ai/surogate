@@ -308,6 +308,16 @@ struct DebugAliasingPair {
     std::uint64_t overlap_bytes = 0;  //!< byte count in [max(start), min(end))
 };
 
+//! A Mapped-slot output that took the {B,T,C} shape default (see ShapeFallback).
+struct DebugShapeFallback {
+    DebugGraphKind graph = DebugGraphKind::Forward;
+    std::string op_id;
+    std::string op_type;
+    std::uint64_t output_index = 0;
+    std::string output;
+    bool consumed = false;
+};
+
 //! Single-tensor provenance — what `tensor-resolve` emits.
 struct DebugTensorResolution {
     bool found = false;
@@ -356,6 +366,9 @@ DebugPhaseTree collect_phase_tree(const DslModel& model, bool is_backward);
 //! / SaveForBwd); bucketing ensures pairs can only form within a single
 //! coloring frame. Covers both graphs.
 std::vector<DebugAliasingPair> collect_static_aliasing(const DslModel& model);
+
+//! Outputs of both compiled graphs that took the {B,T,C} shape default.
+std::vector<DebugShapeFallback> collect_shape_fallbacks(const DslModel& model);
 
 //! Resolve a tensor by name or by tid in a specified graph (forward or
 //! backward). If `name` is non-empty, `tid` is ignored and the lookup goes

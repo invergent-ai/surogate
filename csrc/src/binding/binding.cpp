@@ -3152,6 +3152,27 @@ NB_MODULE(_surogate, m) {
             "Tid pairs whose arena byte ranges overlap within the same coloring bucket.\n"
             "Under correct compilation this is empty (modulo intentional `alias_of`).")
         .def(
+            "get_debug_shape_fallbacks",
+            [](MultiGPUPyTrainer* trainer) {
+                auto fallbacks = trainer->get_debug_shape_fallbacks();
+                nb::list out;
+                for (const auto& f : fallbacks) {
+                    nb::dict r;
+                    r["graph"] = dsl::debug_graph_kind_name(f.graph);
+                    r["op_id"] = f.op_id;
+                    r["op_type"] = f.op_type;
+                    r["output_index"] = f.output_index;
+                    r["output"] = f.output;
+                    r["consumed"] = f.consumed;
+                    out.append(std::move(r));
+                }
+                return out;
+            },
+            "Mapped-slot outputs of the forward + backward graphs that have no shape rule and took\n"
+            "the {B,T,C} default. Each entry is a dict {graph, op_id, op_type, output_index, output,\n"
+            "consumed}; the compile fails on a consumed one or a named backward output unless\n"
+            "SUROGATE_ALLOW_SHAPE_FALLBACK=1.")
+        .def(
             "get_debug_tensor_resolution",
             [](MultiGPUPyTrainer* trainer, const std::string& name, int tid, bool is_backward) {
                 auto res = trainer->get_debug_tensor_resolution(name, tid, is_backward);

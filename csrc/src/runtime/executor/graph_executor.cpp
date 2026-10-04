@@ -1239,8 +1239,9 @@ void GraphExecutor::compile_graphs(long B, long T) {
         // TensorRef leaks into backward execution.
         mCompiler->reset_tid_namespace();
         if (mForward) {
-            mCompiledForward =
-                std::make_unique<CompiledGraph>(mCompiler->compile(*mForward, B, T, /*is_backward=*/false));
+            // The backward reads the forward's tensors: an output it reads must have a real shape.
+            mCompiledForward = std::make_unique<CompiledGraph>(
+                mCompiler->compile(*mForward, B, T, /*is_backward=*/false, /*reader=*/mBackward));
             mCompiledForward->compute_layer_segments();
             mCompiledExecutor->set_forward_graph(mCompiledForward.get());
         }
