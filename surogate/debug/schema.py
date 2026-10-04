@@ -87,6 +87,7 @@ class DiffStatus(str, Enum):
     COMPARED = "compared"
     SHAPE_MISMATCH = "shape_mismatch"
     NONFINITE = "nonfinite"  # hf or dsl tensor had NaN/Inf; numeric diff skipped
+    HF_ZERO = "hf_all_zero"  # hf reference is exactly zero (broken reference); numeric diff skipped
     DSL_DUMP_MISSING = "dsl_dump_missing"
     DSL_READ_FAILED = "dsl_read_failed"
     DSL_RESHAPE_FAILED = "dsl_reshape_failed"

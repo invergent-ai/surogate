@@ -16,6 +16,7 @@ line, tagged for grep; see ``surogate/debug/schema.py`` for the vocabulary.
 
 Example:
     surogate debug weights        examples/sft/gemma4/gemma4-e2b-lora-bf16.yaml
+    surogate debug diff           examples/sft/qwen3/qwen3-lora-bf16.yaml --packed
     surogate debug tensor-layout  examples/sft/qwen3/qwen3-lora-bf16.yaml
     surogate debug tensor-resolve examples/sft/qwen3/qwen3-lora-bf16.yaml --name blocks[3].ln1
 """
@@ -108,10 +109,26 @@ def prepare_command_parser(parser=None):
         "--ref-device-map",
         dest="ref_device_map",
         type=str,
-        default="auto",
-        help="Device placement for the HF reference model. 'auto' shards across "
-        "every visible GPU via accelerate (required for models that don't fit "
-        "one GPU). 'cuda' forces single-device load. Default: 'auto'.",
+        default=None,
+        help="Device placement for the HF reference model. Default: cuda:0 when its bf16 "
+        "weights fit that card, otherwise (or when that load runs out of memory) 'auto'. "
+        "'auto' shards across every visible GPU via accelerate, which depends on the "
+        "peer-to-peer path between the cards. Any other value ('cuda', 'cuda:1') is "
+        "passed to from_pretrained as is.",
+    )
+    p_diff.add_argument(
+        "--packed",
+        action="store_true",
+        help="Pack two documents into every row (position ids restart at the second) and "
+        "compare each with its own HF reference, to catch state or attention crossing a "
+        "packed document boundary. DIFF records carry doc=doc1|doc2.",
+    )
+    p_diff.add_argument(
+        "--pack-split",
+        dest="pack_split",
+        type=int,
+        default=None,
+        help="With --packed: tokens in the first document. Default: half of --max-tokens.",
     )
 
     # =========================================================================
@@ -209,6 +226,8 @@ def _dispatch(args: argparse.Namespace) -> int:
             rtol=args.rtol,
             atol=args.atol,
             ref_device_map=args.ref_device_map,
+            packed=args.packed,
+            pack_split=args.pack_split,
         )
 
     if args.subcommand == "tensor-layout":
