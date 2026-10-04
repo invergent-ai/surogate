@@ -183,7 +183,22 @@ public:
     /// `rebindable_accumulator_bytes()` returns 0.
     void rebind_to_accumulator_arena(const CompiledGraph& graph, const PhaseArenas& arenas, cudaStream_t stream);
 
+    /// Free, before the Accumulator arena is allocated, the storage of every gradient
+    /// rebind_to_accumulator_arena() will move into it, while no gradient has been written yet
+    /// (the first compile runs before any step). The rebind then binds those gradients in place
+    /// instead of copying uninitialised bytes. Without this the peak holds the full fine-tune
+    /// gradients twice, the per-tensor allocations plus the arena. Returns the bytes released.
+    std::size_t release_storage_for_accumulator_arena(const CompiledGraph& graph, std::size_t arena_bytes);
+    /// Re-allocate what release_storage_for_accumulator_arena() freed (the arena allocation failed).
+    void restore_released_storage();
+
 private:
+    /// The Accumulator arena offset `name`'s gradient is rebound to, or nothing when it keeps its own storage.
+    std::optional<std::size_t> accumulator_arena_offset(const CompiledGraph& graph,
+                                                        const std::string& name,
+                                                        const Tensor& grad,
+                                                        std::size_t arena_bytes) const;
+
     void build_layer_grad_map();
     void build_zero_segments();
     void scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
@@ -221,6 +236,16 @@ private:
     Tensor mZeroPtrs;    ///< Device array of gradient data pointers (uint64_t)
     Tensor mZeroSizes;   ///< Device array of gradient byte sizes (uint64_t)
     int mZeroCount = 0;  ///< Number of segments
+
+    /// A gradient released for the Accumulator arena, bound to `offset` by the rebind. `owner`
+    /// names the entry whose storage it is: itself, or the tied embedding gradient it aliases.
+    struct ArenaPending {
+        std::string name;
+        std::string owner;
+        std::size_t offset = 0;
+    };
+    std::vector<ArenaPending> mArenaPending;
+    bool mContentsWritten = false;  ///< zero_all() ran: from now on a rebind must copy
 
     // ZeRO-2 double-buffering state (for deferred accumulation)
     struct BlockState {

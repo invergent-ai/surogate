@@ -128,10 +128,9 @@ public:
     std::size_t release_storage_for_persistent_arena(const CompiledGraph& graph, std::size_t arena_bytes);
     /// Re-allocate what release_storage_for_persistent_arena() freed (the arena allocation failed).
     void restore_released_storage();
-    /// Parameter contents were written: from now on a rebind must copy them.
-    void mark_contents_valid() {
-        mContentsValid = true;
-    }
+    /// Parameter contents were written: from now on a rebind must copy them (the weight
+    /// manager's too, when it holds the parameters).
+    void mark_contents_valid();
 
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 

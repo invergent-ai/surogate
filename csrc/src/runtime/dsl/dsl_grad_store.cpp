@@ -355,6 +355,7 @@ Tensor* DslGradStore::get_param_grad(const std::string& name, bool& accumulate) 
 }
 
 void DslGradStore::zero_all(cudaStream_t stream) {
+    mContentsWritten = true;
     if (mZeroCount > 0 && mZeroPtrs.Data && mZeroSizes.Data) {
         zero_device_segments(reinterpret_cast<const std::uint64_t*>(mZeroPtrs.Data),
                              reinterpret_cast<const std::uint64_t*>(mZeroSizes.Data),
@@ -1052,10 +1053,86 @@ std::size_t DslGradStore::rebindable_accumulator_bytes(const CompiledGraph& grap
     return high_water;
 }
 
+std::optional<std::size_t> DslGradStore::accumulator_arena_offset(const CompiledGraph& graph,
+                                                                  const std::string& name,
+                                                                  const Tensor& grad,
+                                                                  std::size_t arena_bytes) const {
+    const int tid = graph.find_tensor_id("d_" + name);
+    if (tid < 0) return std::nullopt;
+    const auto& meta = graph.tensor_meta[static_cast<std::size_t>(tid)];
+    if (meta.region != RegionKind::Accumulator || meta.offset == SIZE_MAX) return std::nullopt;
+    const std::size_t tensor_bytes = grad.bytes();
+    if (tensor_bytes == 0 || meta.bytes < tensor_bytes || meta.offset + tensor_bytes > arena_bytes) {
+        return std::nullopt;
+    }
+    return meta.offset;
+}
+
+std::size_t DslGradStore::release_storage_for_accumulator_arena(const CompiledGraph& graph, std::size_t arena_bytes) {
+    if (mContentsWritten || !mArenaPending.empty()) return 0;  // written gradients: the rebind copies them
+    if (mStreamGrads || mCpuTraining || mOffloadGrads || !mShardedGrads.empty()) return 0;
+
+    // Slot every storage before freeing any: a tied lm_head gradient aliases the embedding's
+    // storage and goes where the first entry sharing it goes.
+    std::unordered_map<const std::byte*, std::pair<std::string, std::size_t>> slots;  // storage -> (owner, offset)
+    for (const auto& name : mParamOrder) {
+        auto it = mGrads.find(name);
+        if (it == mGrads.end()) continue;
+        const Tensor& grad = it->second;
+        if (!is_device_resident_grad(grad) || slots.contains(grad.Data)) continue;
+        if (const auto offset = accumulator_arena_offset(graph, name, grad, arena_bytes)) {
+            slots.emplace(grad.Data, std::make_pair(name, *offset));
+        }
+    }
+    for (const auto& name : mParamOrder) {
+        auto it = mGrads.find(name);
+        if (it == mGrads.end() || !is_device_resident_grad(it->second)) continue;
+        auto slot = slots.find(it->second.Data);
+        if (slot == slots.end()) continue;
+        mArenaPending.push_back({name, slot->second.first, slot->second.second});
+    }
+
+    std::size_t released = 0;
+    for (const auto& pending : mArenaPending) {
+        Tensor& grad = mGrads.at(pending.name);
+        if (pending.name != pending.owner) {
+            grad.Data = nullptr;  // the owner frees the storage
+            continue;
+        }
+        released += grad.bytes();
+        float* preserved_stats = grad.Stats;
+        const int device = grad.Device;
+        mAllocator->free(grad);  // clears Data
+        grad.Device = device;
+        grad.Stats = preserved_stats;
+    }
+    return released;
+}
+
+void DslGradStore::restore_released_storage() {
+    if (mArenaPending.empty()) return;
+    for (const auto& pending : mArenaPending) {
+        if (pending.name != pending.owner) continue;
+        Tensor& grad = mGrads.at(pending.name);
+        std::vector<long> shape(grad.Sizes.begin(), grad.Sizes.begin() + grad.Rank);
+        float* preserved_stats = grad.Stats;
+        grad = mAllocator->allocate(grad.DType, ("d_" + pending.name).c_str(), EAllocationType::ON_DEVICE, shape);
+        grad.Stats = preserved_stats;
+    }
+    for (const auto& pending : mArenaPending) {
+        if (pending.name != pending.owner) mGrads.at(pending.name).Data = mGrads.at(pending.owner).Data;
+    }
+    mArenaPending.clear();
+    build_zero_segments();
+}
+
 void DslGradStore::rebind_to_accumulator_arena(const CompiledGraph& graph,
                                                const PhaseArenas& arenas,
                                                cudaStream_t stream) {
-    if (!arenas.allocated || arenas.accumulator_ptr == nullptr || arenas.accumulator_bytes == 0) return;
+    if (!arenas.allocated || arenas.accumulator_ptr == nullptr || arenas.accumulator_bytes == 0) {
+        restore_released_storage();
+        return;
+    }
     if (mStreamGrads || mCpuTraining || mOffloadGrads || !mShardedGrads.empty()) return;
 
     std::size_t rebound = 0;
@@ -1111,20 +1188,29 @@ void DslGradStore::rebind_to_accumulator_arena(const CompiledGraph& graph,
         ++rebound;
     }
 
+    // Released before the arena existed, with nothing written yet: bind in place. These were
+    // null above, so the copy loop left them alone.
+    std::size_t bound_in_place = 0;
+    for (const auto& pending : mArenaPending) {
+        mGrads.at(pending.name).Data = arenas.accumulator_ptr + pending.offset;
+        if (pending.name == pending.owner) ++bound_in_place;
+    }
+    mArenaPending.clear();
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Grad pointers were rebound; the cached pointer/size packed arrays
     // in mZeroPtrs / mZeroSizes (used by the bulk-zero kernel) still
     // hold pre-rebind addresses, which are now freed. Rebuild from the
     // current mGrads state.
-    if (rebound > 0) {
+    if (rebound > 0 || bound_in_place > 0) {
         build_zero_segments();
     }
 
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
-            std::cerr << "[arena-consume accumulator] rebound=" << rebound << " skipped_no_tid=" << skipped_no_tid
-                      << " skipped_non_accumulator=" << skipped_non_accumulator
+            std::cerr << "[arena-consume accumulator] rebound=" << rebound << " bound_in_place=" << bound_in_place
+                      << " skipped_no_tid=" << skipped_no_tid << " skipped_non_accumulator=" << skipped_non_accumulator
                       << " skipped_size_mismatch=" << skipped_size_mismatch
                       << " arena_bytes=" << arenas.accumulator_bytes << "\n";
         }
