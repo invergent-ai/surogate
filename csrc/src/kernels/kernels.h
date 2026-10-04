@@ -59,34 +59,29 @@ void encoder_forward(Tensor& out,
                      int V,
                      cudaStream_t stream);
 
+/// Device scratch bytes encoder_backward needs for `tokens` (B * T) token positions.
+std::size_t encoder_backward_scratch_bytes(long tokens);
+
 void encoder_backward(float* dwte,
-                      int* scratch,
-                      int* workload_indices,
-                      int4* bucket_info,
+                      std::byte* scratch,
+                      std::size_t scratch_bytes,
                       const float* dout,
                       const int* inp,
-                      const int* inputs_cpu,
                       int B,
                       int T,
                       int C,
                       unsigned int seed,
-                      cudaStream_t stream,
-                      cudaEvent_t sync_event,
-                      cudaStream_t copy_stream);
+                      cudaStream_t stream);
 void encoder_backward(nv_bfloat16* dwte,
-                      int* scratch,
-                      int* workload_indices,
-                      int4* bucket_info,
+                      std::byte* scratch,
+                      std::size_t scratch_bytes,
                       const nv_bfloat16* dout,
                       const int* inp,
-                      const int* inputs_cpu,
                       int B,
                       int T,
                       int C,
                       unsigned int seed,
-                      cudaStream_t stream,
-                      cudaEvent_t sync_event,
-                      cudaStream_t copy_stream);
+                      cudaStream_t stream);
 void encoder_backward_atomic(float* dwte,
                              const nv_bfloat16* dout,
                              const int* inp,
@@ -96,22 +91,17 @@ void encoder_backward_atomic(float* dwte,
                              cudaStream_t stream);
 void encoder_backward_atomic(float* dwte, const half* dout, const int* inp, int B, int T, int C, cudaStream_t stream);
 
-// The kernel runs on `stream`, but the bucket info that gets generated on CPU to enable efficient determinism
-// can be copied using `copy_stream`, so the kernel launch does not have to wait.
+// Groups the token positions by token on the GPU (no host work), so a CUDA graph that captured the
+// call reads the tokens in `inp` when it replays. `scratch` holds encoder_backward_scratch_bytes(B * T).
 void encoder_backward(Tensor& dwte,
                       Tensor& scratch,
-                      Tensor& workload_indices,
-                      Tensor& bucket_info,
                       const Tensor& dout,
                       const Tensor& inp,
-                      const Tensor& inputs_cpu,
                       int B,
                       int T,
                       int C,
                       unsigned int seed,
-                      cudaStream_t stream,
-                      cudaEvent_t sync_event,
-                      cudaStream_t copy_stream);
+                      cudaStream_t stream);
 
 void rmsnorm_forward(float* out,
                      float* rms,

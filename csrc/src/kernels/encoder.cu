@@ -13,15 +13,19 @@
  * - Backward pass: Computes gradients for token embeddings using deterministic bucketing
  *
  * The backward pass uses a bucketing strategy for deterministic gradient accumulation,
- * sorting tokens by vocabulary index to enable parallel reduction without race conditions.
+ * sorting token positions by vocabulary index on the GPU to enable parallel reduction without
+ * race conditions.
  *
  * Based on llm.c https://github.com/karpathy/llm.c
  */
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <unordered_map>
-#include <vector>
+#include <cstddef>
+#include <stdexcept>
+#include <string>
+
+#include <cub/cub.cuh>
 
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
@@ -237,64 +241,81 @@ void encoder_forward(nv_bfloat16* out,
 }
 
 /**
+ * @brief Fills out[i] = i.
+ */
+__global__ void encoder_backward_iota_kernel(int* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = i;
+    }
+}
+
+/**
  * @brief CUDA kernel for deterministic token embedding gradient computation.
  *
  * Computes gradients for token embeddings (dwte) using a bucketing strategy for
- * determinism. Tokens are grouped into buckets by vocabulary index, allowing
+ * determinism. Token positions are grouped into buckets by vocabulary index, allowing
  * parallel reduction without race conditions or non-deterministic atomics.
  *
  * Algorithm:
- * - Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocab token
+ * - The positions arrive sorted by token, in order within each token (a stable sort)
+ * - The block at a token's first sorted position handles its bucket; the others exit
+ * - Each block handles (WARP_SIZE * x128::size) channels (blockIdx.y picks the group)
  * - Each thread handles x128::size channels (e.g., 8 for BF16)
  * - Each block processes (BLOCK_SIZE / WARP_SIZE) bucket elements in parallel
- * - Buckets are sorted by size (largest first) on CPU for load balancing
  * - Uses shared memory for intra-block reduction, then read-modify-write to dwte
  *
  * @tparam floatX Data type (float or nv_bfloat16).
  * @tparam BLOCK_SIZE Number of threads per block (default 256).
  * @param[in,out] dwte Token embedding gradients of shape (V, C), accumulated in-place.
- * @param[in] bucket_info Bucket metadata: (start_idx, size, vocab_idx, channel_group).
- * @param[in] workload_indices Flattened list of (batch*T) indices per bucket.
+ * @param[in] sorted_tokens The (B*T) token ids in ascending order.
+ * @param[in] sorted_positions The (B*T) positions of those tokens.
  * @param[in] dout Upstream gradients of shape (B, T, C).
- * @param[in] inp Input token indices of shape (B, T).
  * @param seed Random seed for stochastic rounding (currently disabled).
- * @param B Batch size.
- * @param T Sequence length.
+ * @param N Number of positions (B*T).
  * @param C Embedding dimension.
  */
 template <typename floatX, int BLOCK_SIZE = 256>
 __global__ void wte_backward_kernel(floatX* dwte,
-                                    const int4* bucket_info,
-                                    const int* workload_indices,
+                                    const unsigned int* sorted_tokens,
+                                    const int* sorted_positions,
                                     const floatX* dout,
-                                    const int* inp,
                                     unsigned int seed,
-                                    int B,
-                                    int T,
+                                    int N,
                                     int C) {
-    // In order to be deterministic, we preprocess the inputs on the cpu into "buckets"
     // Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocabulary token
     // Each thread handles x128::size channels, e.g. 256 per warp for BF16
     // Each block handles (BLOCK_SIZE / WARP_SIZE) elements in a single bucket in parallel
     // If a bucket has less than 8 elements, some warps will return immediately
     // If a bucket has more than 8 elements, we will loop over all of them
-    // The buckets are sorted on the CPU so the largest buckets start 1st
     using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
-    int bucket = blockIdx.x;
+    const int bucket_start_idx = blockIdx.x;
+    const unsigned int bucket_ix = sorted_tokens[bucket_start_idx];
+    // Only the block at the token's first position works on it
+    if (bucket_start_idx > 0 && sorted_tokens[bucket_start_idx - 1] == bucket_ix) {
+        return;
+    }
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int c_per_warp = 32 * x128::size;
-
-    int bucket_start_idx = bucket_info[bucket].x;
-    int bucket_size = bucket_info[bucket].y;
-    int bucket_ix = bucket_info[bucket].z;
-    int c = bucket_info[bucket].w * c_per_warp + (lane_id * x128::size);
+    int c = blockIdx.y * c_per_warp + (lane_id * x128::size);
 
     // Each thread handles "x128::size" channels, so at fp8, each warp would handle 512 channels
     // If C is not a multiple of this (e.g. 768), some buckets/c_groups cannot use the entire warp
     if (c >= C) {
         return;
     }
+    // The bucket ends at the first sorted position that holds a larger token
+    int bucket_end_idx = bucket_start_idx + 1;
+    for (int hi = N; bucket_end_idx < hi;) {
+        const int mid = bucket_end_idx + (hi - bucket_end_idx) / 2;
+        if (sorted_tokens[mid] == bucket_ix) {
+            bucket_end_idx = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const int bucket_size = bucket_end_idx - bucket_start_idx;
     // Exit early if this is a small bucket and this warp doesn't have any items to process
     if (warp_id >= bucket_size) {
         return;
@@ -304,7 +325,7 @@ __global__ void wte_backward_kernel(floatX* dwte,
     __shared__ float accum_shared[x128::size * BLOCK_SIZE];
 
     for (int item = warp_id; item < bucket_size; item += BLOCK_SIZE / 32) {
-        int bt = workload_indices[bucket_start_idx + item];
+        const long bt = sorted_positions[bucket_start_idx + item];
 
         const floatX* dout_btc = dout + bt * C + c;
         x128 packed_inp1 = x128::load_cs(dout_btc);
@@ -322,7 +343,7 @@ __global__ void wte_backward_kernel(floatX* dwte,
     }
 
     // Read dwte for warp 0 even if other warps are not finished yet to maximise latency tolerance
-    floatX* dwte_ix = dwte + bucket_ix * C + c;
+    floatX* dwte_ix = dwte + static_cast<long>(bucket_ix) * C + c;
     x128 packed_in_out = x128::load(dwte_ix);
 
     // note: threads which have returned are considered synchronised by CUDA so no risk of deadlock
@@ -348,117 +369,117 @@ __global__ void wte_backward_kernel(floatX* dwte,
     packed_in_out.store(dwte_ix);
 }
 
+namespace {
+
+constexpr std::size_t kEncoderScratchAlignment = 256;
+
+std::size_t encoder_scratch_align(std::size_t bytes) {
+    return div_ceil(bytes, kEncoderScratchAlignment) * kEncoderScratchAlignment;
+}
+
+/// Where encoder_backward keeps its arrays in the scratch buffer: the radix sort's temporary
+/// storage, the sorted tokens, the positions 0..N-1 and the positions in token order.
+struct EncoderBackwardScratch {
+    std::size_t sort_bytes = 0;
+    std::size_t tokens = 0;
+    std::size_t positions_in = 0;
+    std::size_t positions = 0;
+    std::size_t total = 0;
+};
+
+EncoderBackwardScratch encoder_backward_scratch_layout(int n) {
+    EncoderBackwardScratch layout;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(nullptr,
+                                               layout.sort_bytes,
+                                               static_cast<const unsigned int*>(nullptr),
+                                               static_cast<unsigned int*>(nullptr),
+                                               static_cast<const int*>(nullptr),
+                                               static_cast<int*>(nullptr),
+                                               n,
+                                               0,
+                                               32,
+                                               cudaStream_t{}));
+    const std::size_t array_bytes = encoder_scratch_align(static_cast<std::size_t>(n) * sizeof(int));
+    layout.tokens = encoder_scratch_align(layout.sort_bytes);
+    layout.positions_in = layout.tokens + array_bytes;
+    layout.positions = layout.positions_in + array_bytes;
+    layout.total = layout.positions + array_bytes;
+    return layout;
+}
+
+}  // namespace
+
+std::size_t encoder_backward_scratch_bytes(long tokens) {
+    return tokens > 0 ? encoder_backward_scratch_layout(static_cast<int>(tokens)).total : 0;
+}
+
 /**
  * @brief Template implementation for deterministic encoder backward pass.
  *
- * Computes token embedding gradients using a three-step bucketing algorithm:
- * 1. CPU: Sort input tokens into buckets by (vocab_index, channel_group)
- * 2. CPU: Sort buckets by size (largest first) for GPU load balancing
- * 3. GPU: Process buckets in parallel with deterministic reduction
+ * Computes token embedding gradients in two GPU steps:
+ * 1. Sort the token positions by token (a stable radix sort, so in order within a token)
+ * 2. Sum each token's positions in one thread block per (token, channel group)
  *
- * This approach avoids non-deterministic atomics by ensuring each output
- * location is written by exactly one thread block.
+ * This avoids non-deterministic atomics by ensuring each output location is written by exactly one
+ * thread block. Nothing runs on the host, so a CUDA graph that captured the call reads the tokens
+ * in @p inp when it replays.
  *
  * @tparam floatX Data type (float or nv_bfloat16).
  * @param[in,out] dwte Token embedding gradients of shape (V, C), accumulated in-place.
- * @param scratch GPU scratch buffer for bucket info and workload indices.
- * @param workload_indices CPU buffer for flattened bucket indices.
- * @param bucket_info CPU buffer for bucket metadata.
+ * @param scratch GPU scratch buffer of at least encoder_backward_scratch_bytes(B * T) bytes, 256-byte aligned.
+ * @param scratch_bytes Size of @p scratch.
  * @param[in] dout Upstream gradients of shape (B, T, C).
  * @param[in] inp Input token indices on GPU of shape (B, T).
- * @param[in] inputs_cpu Input token indices on CPU of shape (B, T).
  * @param B Batch size.
  * @param T Sequence length.
  * @param C Embedding dimension.
  * @param seed Random seed for stochastic rounding.
- * @param stream Main CUDA stream for kernel execution.
- * @param sync_event Event for synchronizing with copy stream.
- * @param copy_stream Separate stream for async host-to-device copies.
+ * @param stream CUDA stream.
  */
 template <class floatX>
 void encoder_backward_imp(floatX* dwte,
-                          int* scratch,  // gpu outputs & scratch
-                          int* workload_indices,
-                          int4* bucket_info,  // cpu scratch buffers
+                          std::byte* scratch,
+                          std::size_t scratch_bytes,
                           const floatX* dout,
                           const int* inp,
-                          const int* inputs_cpu,  // cpu/gpu inputs
                           int B,
                           int T,
                           int C,
                           unsigned int seed,
-                          cudaStream_t stream,
-                          cudaEvent_t sync_event,
-                          cudaStream_t copy_stream) {
+                          cudaStream_t stream) {
     using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
-
-    // CUDA graph capture: avoid cross-stream sync by copying on the main stream.
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    const bool capturing = (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
-                            capture_status != cudaStreamCaptureStatusNone);
-    if (capturing) {
-        copy_stream = stream;
-        sync_event = nullptr;
+    const int n = B * T;
+    if (n <= 0) {
+        return;
     }
-
-    int num_c_groups = div_ceil((size_t)C, x128::size * 32);
-    assert(B * T * num_c_groups * (sizeof(int4) + sizeof(int)) <= B * T * 3 * C * sizeof(floatX));
-
-    // Step 1: Sort inputs into buckets
-    int total_items = 0;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
-    for (uint64_t bt = 0; bt < B * T; bt++) {
-        for (uint64_t c_group = 0; c_group < num_c_groups; c_group++) {
-            // todo - passing c_group/inputs_cpu[bt] in data to avoid a second hash lookup is a bit hacky
-            uint64_t data = bt + (c_group << 32ULL) + ((uint64_t)inputs_cpu[bt] << 42ULL);
-            buckets[c_group + num_c_groups * inputs_cpu[bt]].push_back(data);
-            total_items++;
-        }
+    const EncoderBackwardScratch layout = encoder_backward_scratch_layout(n);
+    if (scratch_bytes < layout.total) {
+        throw std::runtime_error("encoder_backward: scratch holds " + std::to_string(scratch_bytes) + " bytes, " +
+                                 std::to_string(layout.total) + " needed for " + std::to_string(n) + " tokens");
     }
+    auto* sorted_tokens = reinterpret_cast<unsigned int*>(scratch + layout.tokens);
+    auto* positions_in = reinterpret_cast<int*>(scratch + layout.positions_in);
+    auto* sorted_positions = reinterpret_cast<int*>(scratch + layout.positions);
 
-    // Step 2: Sort buckets by size in descending order
-    // this is so the largest buckets are processed first by the GPU
-    // otherwise, if they started late, they would still be running with the rest of the GPU idle
-    std::vector<std::pair<uint64_t, std::vector<uint64_t>>> sortedBuckets(buckets.begin(), buckets.end());
-    std::sort(sortedBuckets.begin(),
-              sortedBuckets.end(),  // ugly because we don't have a typedef for the std::pair
-              [](const std::pair<uint64_t, std::vector<uint64_t>>& a,
-                 const std::pair<uint64_t, std::vector<uint64_t>>& b) { return a.second.size() > b.second.size(); });
+    // Step 1: Sort the positions by token. Token ids are non-negative, so they sort as unsigned.
+    encoder_backward_iota_kernel<<<div_ceil(n, 256), 256, 0, stream>>>(positions_in, n);
+    CUDA_CHECK(cudaGetLastError());
+    std::size_t sort_bytes = layout.sort_bytes;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(scratch,
+                                               sort_bytes,
+                                               reinterpret_cast<const unsigned int*>(inp),
+                                               sorted_tokens,
+                                               positions_in,
+                                               sorted_positions,
+                                               n,
+                                               0,
+                                               32,
+                                               stream));
 
-    int num_buckets = buckets.size();
-    int bucket_index = 0;
-    int workload_index = 0;
-    for (const auto& bucket : sortedBuckets) {
-        bucket_info[bucket_index].x = workload_index;                                       // bucket start
-        bucket_info[bucket_index].y = bucket.second.size();                                 // bucket size
-        bucket_info[bucket_index].z = (bucket.second[0] >> 42ULL) & ((1ULL << 20ULL) - 1);  // bucket ix
-        bucket_info[bucket_index].w = (bucket.second[0] >> 32ULL) & ((1ULL << 10ULL) - 1);  // bucket c
-
-        for (uint64_t idx : bucket.second) {
-            workload_indices[workload_index++] = (int)(idx & ((1ULL << 31ULL) - 1ULL));
-        }
-        bucket_index++;
-    }
-
-    // Step 3: Copy data from host to device (async on a different stream unless capturing)
-    int4* d_bucket_info = (int4*)scratch;
-    int* d_workload_indices = (int*)(scratch + B * T * num_c_groups * 4);
-    CUDA_CHECK(
-        cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, copy_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_workload_indices,
-                               workload_indices,
-                               total_items * sizeof(int),
-                               cudaMemcpyHostToDevice,
-                               copy_stream));
-    if (sync_event) {
-        CUDA_CHECK(cudaEventRecord(sync_event, copy_stream));
-        CUDA_CHECK(cudaStreamWaitEvent(stream, sync_event, 0));
-    }
-
-    // Launch wte kernel
-    // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
+    // Step 2: one block per sorted position and channel group
+    const int num_c_groups = div_ceil(C, static_cast<int>(x128::size * 32));
     wte_backward_kernel<floatX, 256>
-        <<<num_buckets, 256, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
+        <<<dim3(n, num_c_groups), 256, 0, stream>>>(dwte, sorted_tokens, sorted_positions, dout, seed, n, C);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -468,48 +489,27 @@ void encoder_backward_imp(floatX* dwte,
  * Computes deterministic token embedding gradients.
  *
  * @param[in,out] dwte Token embedding gradients of shape (V, C) in FP32.
- * @param scratch GPU scratch buffer.
- * @param workload_indices CPU scratch buffer for bucket workloads.
- * @param bucket_info CPU scratch buffer for bucket metadata.
+ * @param scratch GPU scratch buffer of at least encoder_backward_scratch_bytes(B * T) bytes.
+ * @param scratch_bytes Size of @p scratch.
  * @param[in] dout Upstream gradients of shape (B, T, C) in FP32.
  * @param[in] inp Input token indices on GPU.
- * @param[in] inputs_cpu Input token indices on CPU.
  * @param B Batch size.
  * @param T Sequence length.
  * @param C Embedding dimension.
  * @param seed Random seed for stochastic rounding.
- * @param stream Main CUDA stream.
- * @param sync_event Synchronization event.
- * @param copy_stream Stream for async copies.
+ * @param stream CUDA stream.
  */
 void encoder_backward(float* dwte,
-                      int* scratch,  // gpu outputs & scratch
-                      int* workload_indices,
-                      int4* bucket_info,  // cpu scratch buffers
+                      std::byte* scratch,
+                      std::size_t scratch_bytes,
                       const float* dout,
                       const int* inp,
-                      const int* inputs_cpu,  // cpu/gpu inputs
                       int B,
                       int T,
                       int C,
                       unsigned int seed,
-                      cudaStream_t stream,
-                      cudaEvent_t sync_event,
-                      cudaStream_t copy_stream) {
-    encoder_backward_imp(dwte,
-                         scratch,
-                         workload_indices,
-                         bucket_info,
-                         dout,
-                         inp,
-                         inputs_cpu,
-                         B,
-                         T,
-                         C,
-                         seed,
-                         stream,
-                         sync_event,
-                         copy_stream);
+                      cudaStream_t stream) {
+    encoder_backward_imp(dwte, scratch, scratch_bytes, dout, inp, B, T, C, seed, stream);
 }
 
 /**
@@ -518,48 +518,27 @@ void encoder_backward(float* dwte,
  * Computes deterministic token embedding gradients.
  *
  * @param[in,out] dwte Token embedding gradients of shape (V, C) in BF16.
- * @param scratch GPU scratch buffer.
- * @param workload_indices CPU scratch buffer for bucket workloads.
- * @param bucket_info CPU scratch buffer for bucket metadata.
+ * @param scratch GPU scratch buffer of at least encoder_backward_scratch_bytes(B * T) bytes.
+ * @param scratch_bytes Size of @p scratch.
  * @param[in] dout Upstream gradients of shape (B, T, C) in BF16.
  * @param[in] inp Input token indices on GPU.
- * @param[in] inputs_cpu Input token indices on CPU.
  * @param B Batch size.
  * @param T Sequence length.
  * @param C Embedding dimension.
  * @param seed Random seed for stochastic rounding.
- * @param stream Main CUDA stream.
- * @param sync_event Synchronization event.
- * @param copy_stream Stream for async copies.
+ * @param stream CUDA stream.
  */
 void encoder_backward(nv_bfloat16* dwte,
-                      int* scratch,  // gpu outputs & scratch
-                      int* workload_indices,
-                      int4* bucket_info,  // cpu scratch buffers
+                      std::byte* scratch,
+                      std::size_t scratch_bytes,
                       const nv_bfloat16* dout,
                       const int* inp,
-                      const int* inputs_cpu,  // cpu/gpu inputs
                       int B,
                       int T,
                       int C,
                       unsigned int seed,
-                      cudaStream_t stream,
-                      cudaEvent_t sync_event,
-                      cudaStream_t copy_stream) {
-    encoder_backward_imp(dwte,
-                         scratch,
-                         workload_indices,
-                         bucket_info,
-                         dout,
-                         inp,
-                         inputs_cpu,
-                         B,
-                         T,
-                         C,
-                         seed,
-                         stream,
-                         sync_event,
-                         copy_stream);
+                      cudaStream_t stream) {
+    encoder_backward_imp(dwte, scratch, scratch_bytes, dout, inp, B, T, C, seed, stream);
 }
 
 template <typename InT>

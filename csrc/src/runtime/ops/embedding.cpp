@@ -105,31 +105,17 @@ void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
         return;
     }
 
-    // encoder_backward requires CPU-side inputs for deterministic bucketing
-    if (!mLastInputsCpu || !mLastInputsCpu->Data) {
-        throw std::runtime_error("CompiledExecutor: embedding_backward requires CPU inputs (set_last_inputs_cpu)");
-    }
-
-    const int vocab = mConfig.VocabSize;
-    const int total_tokens = static_cast<int>(mB * mT);
-    const long hidden = (d_emb.Rank > 1) ? d_emb.Sizes[1] : 0;
-
     unsigned int seed = mRngSeedFn ? mRngSeedFn() : 0;
 
     encoder_backward(d_emb,
                      mRunState.scratch().encoder_bwd_scratch,
-                     mRunState.scratch().encoder_bwd_indices,
-                     mRunState.scratch().encoder_bwd_info,
                      d_out,
                      mRunState.Inputs,
-                     *mLastInputsCpu,
                      static_cast<int>(mB),
                      static_cast<int>(mT),
                      mConfig.HiddenSize,
                      seed,
-                     mRunState.MainStream,
-                     mRunState.side_stream_event(),
-                     mRunState.side_stream());
+                     mRunState.MainStream);
 }
 
 namespace {

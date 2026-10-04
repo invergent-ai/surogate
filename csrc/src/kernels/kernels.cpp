@@ -1342,50 +1342,35 @@ void encoder_forward(Tensor& out,
  */
 void encoder_backward(Tensor& dwte,
                       Tensor& scratch,
-                      Tensor& workload_indices,
-                      Tensor& bucket_info,
                       const Tensor& dout,
                       const Tensor& inp,
-                      const Tensor& inputs_cpu,
                       int B,
                       int T,
                       int C,
                       unsigned int seed,
-                      cudaStream_t stream,
-                      cudaEvent_t sync_event,
-                      cudaStream_t copy_stream) {
-    assert(workload_indices.Device == -1);
-    assert(bucket_info.Device == -1);
+                      cudaStream_t stream) {
     if (dwte.DType == ETensorDType::FP32) {
         encoder_backward(dwte.get<float>(),
-                         scratch.get<int>(),
-                         workload_indices.get<int>(),
-                         (int4*)bucket_info.get<int>(),
+                         scratch.Data,
+                         scratch.bytes(),
                          dout.get<float>(),
                          inp.get<std::int32_t>(),
-                         inputs_cpu.get<std::int32_t>(),
                          B,
                          T,
                          C,
                          seed,
-                         stream,
-                         sync_event,
-                         copy_stream);
+                         stream);
     } else if (dwte.DType == ETensorDType::BF16) {
         encoder_backward(dwte.get<nv_bfloat16>(),
-                         scratch.get<int>(),
-                         workload_indices.get<int>(),
-                         (int4*)bucket_info.get<int>(),
+                         scratch.Data,
+                         scratch.bytes(),
                          dout.get<nv_bfloat16>(),
                          inp.get<std::int32_t>(),
-                         inputs_cpu.get<std::int32_t>(),
                          B,
                          T,
                          C,
                          seed,
-                         stream,
-                         sync_event,
-                         copy_stream);
+                         stream);
     } else {
         throw std::logic_error("encoder_backward: unsupported dtype");
     }

@@ -1149,20 +1149,9 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
     if (mRunStateRequirements.encoder_backward_scratch && !mLoraOnlyMode) {
-        const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);
-        const long num_c_groups = (C + group_width - 1) / group_width;
-        mScratch.encoder_bwd_scratch = mAllocator->allocate(ETensorDType::INT32,
-                                                            "encoder_bwd_scratch",
-                                                            EAllocationType::ON_DEVICE,
-                                                            {B, T, num_c_groups * 5});
-        mScratch.encoder_bwd_indices = mAllocator->allocate(ETensorDType::INT32,
-                                                            "encoder_bwd_indices",
-                                                            EAllocationType::PINNED,
-                                                            {B, T, num_c_groups});
-        mScratch.encoder_bwd_info = mAllocator->allocate(ETensorDType::INT32,
-                                                         "encoder_bwd_info",
-                                                         EAllocationType::PINNED,
-                                                         {B, T, 4 * num_c_groups});
+        const long bytes = static_cast<long>(encoder_backward_scratch_bytes(B * T));
+        mScratch.encoder_bwd_scratch =
+            mAllocator->allocate(ETensorDType::BYTE, "encoder_bwd_scratch", EAllocationType::ON_DEVICE, {bytes});
     }
 
     if (mRunStateRequirements.attention_workspace) {
