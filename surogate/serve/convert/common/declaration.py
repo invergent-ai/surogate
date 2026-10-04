@@ -421,7 +421,8 @@ class Declaration:
 
     @cached_property
     def hf_mapping(self) -> dict[str, Any]:
-        return self.module.get("hf_mapping") or self.ir.get("hf_mapping") or {}
+        mapping = self.module.get("hf_mapping") or self.ir.get("hf_mapping") or {}
+        return {name: _as_stored(value) for name, value in mapping.items()}
 
     @cached_property
     def model(self) -> Any:
@@ -770,6 +771,15 @@ def flat_name(name: str) -> str:
     if name.startswith(_NESTED_TEXT_PREFIX):
         return "model." + name[len(_NESTED_TEXT_PREFIX):]
     return name
+
+
+def _as_stored(mapping: Any) -> Any:
+    """A `direct` record names one checkpoint tensor, as a plain path does. Its flags describe
+    the training runtime's layout -- `gate_first` experts are reordered for the trainer's SwiGLU
+    -- while the engine reads routed experts gate-first, as the checkpoint stores them."""
+    if isinstance(mapping, dict) and mapping.get("type") == "direct":
+        return mapping["source"]
+    return mapping
 
 
 def _substitute(mapping: Any, placeholder: str, value: str) -> Any:

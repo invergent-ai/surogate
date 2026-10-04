@@ -305,6 +305,14 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             adapter_merger->apply(name, param, adapter_stream);
             CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
         }
+        // Fused experts the model's DSL declares gate-first (Qwen3.5/3.6 MoE) into the runtime's
+        // [up | gate] order, as the QLoRA import does, after the adapter merge (whose rows are
+        // the checkpoint's). Read as stored, every routed expert computed gate * silu(up).
+        if (int map_layer = -1; const MappingSpec* spec = internal::find_mapping_spec(mHfMapping, name, map_layer)) {
+            if (spec->gate_first) {
+                swap_expert_gate_up_halves(param, adapter_stream);
+            }
+        }
         if (shared_master) {
             dsl::shared_master_store().register_and_finish(name);
             fail_guard.active = false;
@@ -575,6 +583,21 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
                                         std::vector<long>(source.Sizes.begin(), source.Sizes.begin() + source.Rank));
             CUDA_CHECK(cudaMemcpyAsync(full.Data, source.Data, source.bytes(), cudaMemcpyDefault, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        // Gate-first fused experts go back to the checkpoint's order (see import_weights), on a
+        // copy: the live weights keep the runtime's.
+        if (int map_layer = -1; const MappingSpec* spec = internal::find_mapping_spec(mapping, name, map_layer)) {
+            if (spec->gate_first) {
+                if (!full.Data) {
+                    const Tensor source = source_of(name);
+                    full = mAllocator->allocate(source.DType,
+                                                ("export_" + name).c_str(),
+                                                EAllocationType::ON_DEVICE,
+                                                std::vector<long>(source.Sizes.begin(), source.Sizes.begin() + source.Rank));
+                    CUDA_CHECK(cudaMemcpyAsync(full.Data, source.Data, source.bytes(), cudaMemcpyDefault, stream));
+                }
+                swap_expert_gate_up_halves(full, stream);
+            }
         }
         std::vector<ExportEntry> param_exports;
         exports_of(name, full.Data ? full : source_of(name), param_exports);

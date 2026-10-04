@@ -84,21 +84,28 @@ def _hf_name(hf_mapping: dict[str, Any], dsl_name: str) -> str | None:
 
     Per-layer params arrive as `blocks[7].full_q_proj_weight`; the mapping may
     carry that exact key (the hybrid expansion emits physical indices) or the
-    bare name with a `{layer}` placeholder. Only plain-string mappings resolve to
-    a single path — `fuse`/`split`/`stack_experts` specs describe a
+    bare name with a `{layer}` placeholder. Only plain paths and `direct` records
+    resolve to a single path — `fuse`/`split`/`stack_experts` specs describe a
     transformation, and flattening them to one name here would be a lie.
     """
 
-    direct = hf_mapping.get(dsl_name)
-    if isinstance(direct, str):
+    direct = _path(hf_mapping.get(dsl_name))
+    if direct is not None:
         return direct
     match = _LAYER_INDEX.match(dsl_name)
     if match:
         layer, field = match.group(1), match.group(2)
-        template = hf_mapping.get(field)
-        if isinstance(template, str):
+        template = _path(hf_mapping.get(field))
+        if template is not None:
             return template.replace("{layer}", layer)
     return None
+
+
+def _path(mapping: Any) -> str | None:
+    """A plain path, or a `direct` record's (one tensor, read as stored: see gate_first_experts())."""
+    if isinstance(mapping, dict) and mapping.get("type") == "direct":
+        mapping = mapping.get("source")
+    return mapping if isinstance(mapping, str) else None
 
 
 def window_schedule(architecture: str, config: dict[str, Any]) -> tuple[bool, ...]:

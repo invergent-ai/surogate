@@ -288,6 +288,11 @@ DslModel::MappingSpec parse_mapping_spec(const AttrValue& value) {
             spec.optional = *opt;
         }
     }
+    if (const auto* gate_first_val = find_key(map, "gate_first")) {
+        if (auto gate_first = as_bool(*gate_first_val)) {
+            spec.gate_first = *gate_first;
+        }
+    }
 
     std::string type;
     if (const auto* type_val = find_key(map, "type")) {

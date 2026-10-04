@@ -447,6 +447,7 @@ def _mapping_kind(mapping: Any) -> str:
     if isinstance(mapping, dict):
         t = mapping.get("type")
         if t in {
+            MappingKind.DIRECT,
             MappingKind.FUSE,
             MappingKind.SPLIT,
             MappingKind.TRANSFORM,

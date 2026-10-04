@@ -805,6 +805,7 @@ MappingSpec to_pipeline_mapping(const DslModel::MappingSpec& src) {
     dst.dim = src.dim;
     dst.optional = src.optional;
     dst.fuse_gate_up = src.fuse_gate_up;
+    dst.gate_first = src.gate_first;
     dst.num_experts = src.num_experts;
     return dst;
 }

@@ -60,6 +60,12 @@ struct MappingSpec {
 
     /// For StackExperts: fuse gate+up projections into interleaved gate_up format.
     bool fuse_gate_up = false;
+
+    /// For Direct: the tensor is routed experts fused GATE-first, [E, 2M, ...] (the model's DSL
+    /// declares it with gate_first_experts(); Qwen3.5/3.6 MoE). The runtime's SwiGLU reads
+    /// [up | gate], so imports exchange each expert's halves (swap_expert_gate_up_halves) and
+    /// exports exchange them back.
+    bool gate_first = false;
     /// The up-projection pattern for a fused stack_experts mapping. Empty keeps
     /// the default derivation (the literal "gate_proj" in `source` replaced by
     /// "up_proj"); checkpoints that name the pair otherwise -- LFM2-MoE uses

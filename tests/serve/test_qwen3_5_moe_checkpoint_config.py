@@ -58,6 +58,17 @@ def test_inventory_and_recipes_follow_checkpoint(hidden, experts, width, shared,
     assert metadata["shared_intermediate"] == shared
 
 
+def test_routed_experts_are_read_as_the_checkpoint_stores_them():
+    """The DSL declares the fused routed experts gate_first_experts(), so the trainer reorders
+    their halves for its SwiGLU. That is the trainer's layout, not the engine's: the engine reads
+    routed experts gate-first, so the artifact takes the checkpoint tensor as stored."""
+    g = inv.geometry_from_config(config_for(), token_domain=500)
+    recipes = {r.object_name: r for r in recipe.build_recipes(g)}
+    sources = source_requirements((recipes["text/layers/0/moe/routed_gate_up"],))
+    assert list(sources) == ["model.layers.0.mlp.experts.gate_up_proj"]
+    assert sources["model.layers.0.mlp.experts.gate_up_proj"].shape == (4, 2 * 64, g.hidden)
+
+
 @pytest.mark.parametrize("layers,head,targets", [(3, 64, (0, 2)), (4, 128, (1, 3, 0))])
 def test_dflash_uses_separate_config(layers, head, targets):
     g = inv.geometry_from_config(config_for(), token_domain=500)
