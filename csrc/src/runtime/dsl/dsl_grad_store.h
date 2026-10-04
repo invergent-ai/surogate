@@ -215,6 +215,9 @@ private:
     std::optional<ETensorDType> mGradDtypeOverride;
     bool mAccumulate = false;
     bool mReducePending = false;  ///< True if async reduce has been started
+    /// notify_block reduced the layer gradients this step, so reduce_all_async only reduces the rest.
+    /// A CUDA graph capture skips notify_block (eager-only), and then every gradient is reduced at the end.
+    bool mLayerGradsReduced = false;
     int mMicroStep = 0;
     bool mIsLastMicroStep = false;
 

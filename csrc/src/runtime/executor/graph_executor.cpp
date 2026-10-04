@@ -2206,7 +2206,8 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
 
     grads.end_micro_step(rs.MainStream, comm);
     if (last_step && comm.world_size() > 1 && !mSkipGradReduce) {
-        if (grads.is_overlapped_enabled()) {
+        // The per-layer reductions run on the side stream, eagerly only (a capture skips them).
+        if (grads.is_overlapped_enabled() && !in_capture) {
             CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
             CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
         }

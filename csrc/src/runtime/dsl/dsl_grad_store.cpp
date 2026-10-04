@@ -416,9 +416,11 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
         return;
     }
 
-    // If overlapped reduction is enabled and we have layer gradients that were already reduced,
-    // only reduce non-layer gradients (embeddings, lm_head, final_norm)
-    if (is_overlapped_enabled() && mHasLayerGrads && !ep_only) {
+    // If notify_block already reduced the layer gradients, only reduce non-layer gradients
+    // (embeddings, lm_head, final_norm). Under a CUDA graph capture it did not run.
+    const bool layer_grads_reduced = mLayerGradsReduced;
+    mLayerGradsReduced = false;
+    if (is_overlapped_enabled() && mHasLayerGrads && layer_grads_reduced && !ep_only) {
         // Collect non-layer gradient names (those not in any layer)
         const auto layer_grads = collect_layer_grads();
 
@@ -457,6 +459,7 @@ void DslGradStore::notify_block(int layer_idx, cudaStream_t stream, NCCLCommunic
         // ZeRO-1: reduce-scatter once per optimizer step (on the last micro-step)
         if (!mIsLastMicroStep) return;
         scatter_reduce_layer(layer_idx, stream, comm);
+        mLayerGradsReduced = true;
         return;
     }
 
@@ -473,6 +476,7 @@ void DslGradStore::notify_block(int layer_idx, cudaStream_t stream, NCCLCommunic
     state.LayerIdx = layer_idx;
     scatter_reduce_layer(layer_idx, stream, comm);
     state.NeedsAccumulation = true;
+    mLayerGradsReduced = true;
 }
 
 void DslGradStore::wait_for_block_reduce(int layer_idx, cudaStream_t stream) {
