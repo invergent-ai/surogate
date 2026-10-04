@@ -9,8 +9,8 @@ A qwen3_5_moe core wrapped in hyper-connections:
   MRoPE, QK-Norm with weight+1);
 * linear layers use :class:`GatedDeltaNetMixer` with ``gate_activation="sigmoid"`` — the
   one numerical difference from Qwen3.5's GDN (SiLU there);
-* the MoE is softmax top-k WITH renormalisation (``norm_topk_prob=True`` — note
-  Qwen3.5-MoE uses False) plus a sigmoid-gated shared expert, identical layout.
+* the MoE is softmax top-k WITH renormalisation (``norm_topk_prob=True``, as Qwen3.5-MoE)
+  plus a sigmoid-gated shared expert, identical layout.
 
 Deliberately NOT expressed here (v1 scope, tracked in the model docstring): the PLE
 n-gram memory of layer 1, the QSA indexer (training runs dense attention, which is the
