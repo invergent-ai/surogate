@@ -7,11 +7,13 @@
 #define SUROGATE_SRC_DSL_DSL_GRAD_STORE_H
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -91,6 +93,16 @@ public:
     bool is_overlapped_enabled() const {
         return mConfig.num_shards > 1 && mHasLayerGrads;
     }
+
+    /// The last reduce_all_async left this gradient reduce-scattered (ZeRO-2/3, reduced at its layer's
+    /// end): each rank holds its own scatter_grad slice of it reduced and the rest of it unreduced.
+    [[nodiscard]] bool is_reduce_scattered(const std::string& name) const;
+
+    /// All-gathers in place every reduce-scattered gradient `needs_whole` names, so an optimizer that
+    /// reads that gradient whole reads it reduced. `needs_whole` must answer the same on every rank.
+    void gather_scattered(NCCLCommunicator& comm,
+                          cudaStream_t stream,
+                          const std::function<bool(const std::string&)>& needs_whole);
 
     [[nodiscard]] bool is_first_micro_step() const {
         return mMicroStep == 0;
@@ -218,6 +230,15 @@ private:
     /// notify_block reduced the layer gradients this step, so reduce_all_async only reduces the rest.
     /// A CUDA graph capture skips notify_block (eager-only), and then every gradient is reduced at the end.
     bool mLayerGradsReduced = false;
+    bool mLayerGradsScattered = false;               ///< reduce_all_async left the layer gradients reduce-scattered
+    bool mScatterSkipsExperts = false;               ///< ... except the expert ones, all-reduced over the DP group (EP)
+    std::unordered_set<std::string> mGatheredGrads;  ///< scattered gradients gather_scattered made whole
+    /// NCCL's reduce-scatter splits a gradient into world equal slices; the rest of a size that does not
+    /// divide would stay unreduced on every rank, so such a gradient is all-reduced instead.
+    [[nodiscard]] bool scatters_evenly(const Tensor& grad) const {
+        return mConfig.num_shards > 0 && grad.nelem() % mConfig.num_shards == 0;
+    }
+    cudaEvent_t mGatherDone = nullptr;
     int mMicroStep = 0;
     bool mIsLastMicroStep = false;
 

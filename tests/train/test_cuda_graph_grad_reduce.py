@@ -1,4 +1,5 @@
-"""A CUDA-graphed multi-GPU step reduces every gradient, as the eager step does.
+"""A CUDA-graphed multi-GPU step reduces every gradient, as the eager step does, and both clip and
+report the norm of the averaged gradient.
 
 The eager backward reduces each layer's gradients at the layer's end (DslGradStore::notify_block), and
 the reduction at the end of the step then skips them. A CUDA graph capture skips the layer-end work,
@@ -6,6 +7,12 @@ so the end of the step has to reduce the layer gradients too. Since layer gradie
 their DSL names ("blocks[N].<name>"), a graphed ZeRO-1 or ZeRO-2 step failed to capture
 (cudaErrorStreamCaptureIsolation), and a graphed ZeRO-3 step updated each rank's shard from that
 rank's own gradient.
+
+Under ZeRO-2/3 the eager step leaves each layer gradient reduce-scattered: a rank holds its own slice
+reduced and the rest unreduced. The norm summed every rank's whole buffers, so it differed from rank to
+rank and from the graphed step's, which reduces every gradient whole. 32-bit AdamW read the unreduced
+rest of the buffer. With two micro-steps the reduce-scatter ran on each, so the second one accumulated
+onto the first one's reduced slice.
 
 Each rank gets a different row here: with the same row everywhere, an unreduced gradient equals the
 reduced one. Needs two GPUs. On a host whose GPU peer-to-peer path is broken, run with
@@ -45,7 +52,7 @@ def model_dir():
     return onboarding.prepare_mini_model(snapshot)
 
 
-def _build(model_dir, level: str, graphs: bool):
+def _build(model_dir, level: str, graphs: bool, grad_accum: int):
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
     from surogate.utils.hf import get_model_weights_path
@@ -71,7 +78,7 @@ def _build(model_dir, level: str, graphs: bool):
         options=opts,
         batch_size=1,
         seq_len=SEQ,
-        grad_accum=1,
+        grad_accum=grad_accum,
         memcpy_all_gather=False,
         memcpy_send_recv=False,
         lora_config=None,
@@ -81,19 +88,20 @@ def _build(model_dir, level: str, graphs: bool):
     return trainer
 
 
-def _rows():
-    """A different row on each rank."""
+def _rows(grad_accum: int):
+    """A different row on each rank in each micro-step."""
+    rows = 2 * grad_accum
     rng = np.random.default_rng(0)
-    x = rng.integers(10, 8000, size=(2, SEQ), dtype=np.int32)
-    y = np.concatenate([x[:, 1:], np.full((2, 1), -100, np.int32)], axis=1).astype(np.int32)
-    pos = np.tile(np.arange(SEQ, dtype=np.int32), (2, 1))
+    x = rng.integers(10, 8000, size=(rows, SEQ), dtype=np.int32)
+    y = np.concatenate([x[:, 1:], np.full((rows, 1), -100, np.int32)], axis=1).astype(np.int32)
+    pos = np.tile(np.arange(SEQ, dtype=np.int32), (rows, 1))
     return x, y, pos
 
 
-def _step(model_dir, level: str, graphs: bool, out):
-    trainer = _build(model_dir, level, graphs)
-    config = _surogate.OptimizerConfig(optimizer="adamw_8bit", learning_rate=LR, grad_clip=0.0)
-    result = dict(trainer.train_step_graphed(*_rows(), config, 1))
+def _step(model_dir, level: str, optimizer: str, grad_accum: int, graphs: bool, out):
+    trainer = _build(model_dir, level, graphs, grad_accum)
+    config = _surogate.OptimizerConfig(optimizer=optimizer, learning_rate=LR, grad_clip=0.0)
+    result = dict(trainer.train_step_graphed(*_rows(grad_accum), config, 1))
     trainer.export_model(str(out))
     del trainer
     torch.cuda.empty_cache()
@@ -116,13 +124,26 @@ def _assert_same_model(path_a, path_b):
         assert float((a - b).abs().max()) <= 2.5 * LR, name
 
 
-@pytest.mark.parametrize("level", list(LEVELS))
-def test_graphed_step_reduces_every_gradient(model_dir, level, tmp_path):
-    eager_loss, eager_norm = _step(model_dir, level, graphs=False, out=tmp_path / "eager")
-    graphed_loss, graphed_norm = _step(model_dir, level, graphs=True, out=tmp_path / "graphed")
+@pytest.mark.parametrize(
+    "level,optimizer",
+    [(level, "adamw_8bit") for level in LEVELS] + [("zero2", "adamw")],
+)
+def test_graphed_step_reduces_every_gradient(model_dir, level, optimizer, tmp_path):
+    eager_loss, eager_norm = _step(model_dir, level, optimizer, 1, graphs=False, out=tmp_path / "eager")
+    graphed_loss, graphed_norm = _step(model_dir, level, optimizer, 1, graphs=True, out=tmp_path / "graphed")
     assert abs(graphed_loss - eager_loss) <= 1e-2 * abs(eager_loss), (graphed_loss, eager_loss)
-    if level == "zero1":
-        # ZeRO-2/3 sum each rank's whole gradient buffers into the norm, unreduced remainder included,
-        # so only ZeRO-1's eager norm is the global one.
-        assert abs(graphed_norm - eager_norm) <= 5e-2 * eager_norm, (graphed_norm, eager_norm)
+    assert abs(graphed_norm - eager_norm) <= 3e-2 * eager_norm, (graphed_norm, eager_norm)
     _assert_same_model(tmp_path / "eager", tmp_path / "graphed")
+
+
+def test_zero2_accumulates_micro_steps_as_zero1(model_dir, tmp_path):
+    """ZeRO-2 reduce-scatters a layer's gradients once, on the last micro-step, as ZeRO-1 all-reduces them.
+
+    The reference is the eager ZeRO-1 step rather than a graphed one: a captured embedding backward keeps
+    the token layout it computed on the host at capture time, so a graphed step with two micro-steps
+    sends the first micro-step's embedding gradient to the second one's token rows."""
+    zero1_loss, zero1_norm = _step(model_dir, "zero1", "adamw_8bit", 2, graphs=False, out=tmp_path / "zero1")
+    zero2_loss, zero2_norm = _step(model_dir, "zero2", "adamw_8bit", 2, graphs=False, out=tmp_path / "zero2")
+    assert abs(zero2_loss - zero1_loss) <= 1e-2 * abs(zero1_loss), (zero2_loss, zero1_loss)
+    assert abs(zero2_norm - zero1_norm) <= 3e-2 * zero1_norm, (zero2_norm, zero1_norm)
+    _assert_same_model(tmp_path / "zero1", tmp_path / "zero2")

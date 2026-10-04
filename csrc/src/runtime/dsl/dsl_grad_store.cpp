@@ -280,6 +280,10 @@ void DslGradStore::destroy_layer_events() noexcept {
             state.Event = nullptr;
         }
     }
+    if (mGatherDone) {
+        cudaEventDestroy(mGatherDone);
+        mGatherDone = nullptr;
+    }
 }
 
 void DslGradStore::start_micro_step(cudaStream_t stream, int micro_step, int total_steps) {
@@ -353,6 +357,8 @@ void DslGradStore::zero_all(cudaStream_t stream) {
 
 void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
     const bool ep_active = comm.ep_enabled();
+    mLayerGradsScattered = false;
+    mGatheredGrads.clear();
     for (auto& kv : mGrads) {
         if (!kv.second.Data || kv.second.nelem() == 0) continue;
         // EP: expert weight gradients average across DP group only (same experts),
@@ -399,6 +405,8 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
         return layer_grads;
     };
 
+    mLayerGradsScattered = false;
+    mGatheredGrads.clear();
     if (mStreamGrads && mHasLayerGrads) {
         // Layer grads were reduced and offloaded at layer end through the
         // streaming path. The map still contains metadata-only placeholders, so
@@ -420,7 +428,11 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
     // (embeddings, lm_head, final_norm). Under a CUDA graph capture it did not run.
     const bool layer_grads_reduced = mLayerGradsReduced;
     mLayerGradsReduced = false;
-    if (is_overlapped_enabled() && mHasLayerGrads && layer_grads_reduced && !ep_only) {
+    const bool skip_layer_grads = is_overlapped_enabled() && mHasLayerGrads && layer_grads_reduced && !ep_only;
+    mLayerGradsScattered = skip_layer_grads && mConfig.shard_gradients;
+    mScatterSkipsExperts = ep_active;
+    mGatheredGrads.clear();
+    if (skip_layer_grads) {
         // Collect non-layer gradient names (those not in any layer)
         const auto layer_grads = collect_layer_grads();
 
@@ -444,6 +456,56 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
     mReducePending = true;
 }
 
+bool DslGradStore::is_reduce_scattered(const std::string& name) const {
+    if (!mLayerGradsScattered) return false;
+    const int layer = decoder_layer_of(name);
+    if (layer < 0 || layer >= mConfig.num_layers) return false;
+    if (mScatterSkipsExperts && use_expert_parallel_grad_route(name, "DslGradStore::is_reduce_scattered")) {
+        return false;
+    }
+    const auto it = mGrads.find(name);
+    if (it == mGrads.end() || !it->second.Data || !scatters_evenly(it->second)) return false;
+    return mGatheredGrads.find(name) == mGatheredGrads.end();
+}
+
+void DslGradStore::gather_scattered(NCCLCommunicator& comm,
+                                    cudaStream_t stream,
+                                    const std::function<bool(const std::string&)>& needs_whole) {
+    if (!mLayerGradsScattered) return;
+    std::vector<std::string> names;
+    std::unordered_set<const std::byte*> seen;
+    for (const auto& name : mParamOrder) {
+        if (!is_reduce_scattered(name) || !needs_whole(name)) continue;
+        if (seen.insert(mGrads.at(name).Data).second) names.push_back(name);
+    }
+    if (names.empty()) return;
+    if (!mGatherDone) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&mGatherDone, cudaEventDisableTiming));
+    }
+    const int world = comm.world_size();
+    const int rank = comm.rank();
+    // Bounds the collectives in one NCCL group.
+    constexpr std::size_t kPerTransaction = 64;
+    for (std::size_t begin = 0; begin < names.size(); begin += kPerTransaction) {
+        const std::size_t end = std::min(names.size(), begin + kPerTransaction);
+        comm.begin_transaction(stream);
+        for (std::size_t i = begin; i < end; ++i) {
+            Tensor& grad = mGrads.at(names[i]);
+            const long shard = static_cast<long>(grad.nelem()) / world;
+            const Tensor own = Tensor::from_pointer(grad.Data + shard * rank * get_dtype_size(grad.DType),
+                                                    grad.Device,
+                                                    grad.DType,
+                                                    std::array<long, 1>{shard});
+            comm.schedule_all_gather(
+                TensorShard(own, rank, world, std::array<long, 1>{static_cast<long>(grad.nelem())}),
+                grad);
+        }
+        comm.execute_transaction(mGatherDone);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, mGatherDone, 0));
+    }
+    mGatheredGrads.insert(names.begin(), names.end());
+}
+
 void DslGradStore::notify_block(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm) {
     // Single-GPU: nothing to reduce
     if (mConfig.num_shards == 1) return;
@@ -455,15 +517,18 @@ void DslGradStore::notify_block(int layer_idx, cudaStream_t stream, NCCLCommunic
     // Layer-end overlap can race with late gradient writes in EP backward paths.
     if (comm.ep_enabled() && comm.dp_size() == 1) return;
 
+    // Reduce once per optimizer step, on the last micro-step. A reduce-scatter leaves the other ranks'
+    // slices of the buffer unreduced, and the next micro-step would accumulate onto both.
+    if (!mIsLastMicroStep) return;
+
     if (!mConfig.shard_gradients) {
-        // ZeRO-1: reduce-scatter once per optimizer step (on the last micro-step)
-        if (!mIsLastMicroStep) return;
+        // ZeRO-1: all-reduce
         scatter_reduce_layer(layer_idx, stream, comm);
         mLayerGradsReduced = true;
         return;
     }
 
-    // ZeRO-2: reduce-scatter on every micro-step
+    // ZeRO-2/3: reduce-scatter
     // Use double-buffering to overlap reduction with next layer's compute
     auto& state = mBlockStates[layer_idx % 2];
 
@@ -532,7 +597,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
                 if (use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.dense")) continue;
                 auto it = mGrads.find(name);
                 if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
-                    if (mConfig.shard_gradients) {
+                    if (mConfig.shard_gradients && scatters_evenly(it->second)) {
                         comm.schedule_reduce_scatter(it->second);
                     } else {
                         comm.schedule_all_reduce_avg(it->second);
@@ -556,7 +621,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         for (const auto& name : grad_names) {
             auto it = mGrads.find(name);
             if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
-                if (mConfig.shard_gradients) {
+                if (mConfig.shard_gradients && scatters_evenly(it->second)) {
                     comm.schedule_reduce_scatter(it->second);
                 } else {
                     comm.schedule_all_reduce_avg(it->second);

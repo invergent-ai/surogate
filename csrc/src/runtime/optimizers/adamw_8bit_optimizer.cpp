@@ -488,6 +488,17 @@ void AdamW8BitOptimizer::update(dsl::DslModel& model,
         throw std::logic_error(caller + ": the optimizer state is partitioned over " +
                                std::to_string(model.mNumShards) + " GPUs, but this update does not run on all of them");
     }
+    if (grads_reduced && !dispatch_local) {
+        // ZeRO-2/3 can leave a layer gradient reduce-scattered; a master that is neither weight-sharded
+        // nor partitioned reads it whole.
+        std::unordered_set<std::string> reads_whole;
+        for (const auto& slot : mImpl->slots) {
+            if (!slot.wm_sharded && !slot.partitioned) reads_whole.insert(slot.name);
+        }
+        model.mGrads->gather_scattered(comm, stream, [&](const std::string& name) {
+            return reads_whole.count(name) > 0;
+        });
+    }
 
     auto& state = *mImpl->state;
     constexpr size_t GROUP_SIZE = FLASH_ADAMW8BIT_GROUP_SIZE;

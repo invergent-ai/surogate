@@ -6,6 +6,7 @@
 #include "runtime/dsl/dsl_model.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -1781,26 +1782,58 @@ void DslModel::calculate_gradient_norm(NCCLCommunicator& comm,
                                        bool grads_reduced) {
     auto& rs = *mRunState;
 
-    fill_zero(rs.scratch().norm_buffer, stream);
+    Tensor& norm_buffer = rs.scratch().norm_buffer;
+    fill_zero(norm_buffer, stream);
+
+    // Under ZeRO-2/3 the eager step reduce-scatters the layer gradients at each layer's end: a rank
+    // holds its own slice of each reduced and the rest of the buffer unreduced. Their squares are
+    // summed over the own slices and then across the ranks. The other gradients are reduced whole on
+    // every rank and are summed locally on top, so every rank computes the same norm.
+    const int world = comm.world_size();
+    const bool scattered_grads = grads_reduced && world > 1 && !mDispatchPpLocalGrads;
+    auto is_scattered = [&](const std::string& name) {
+        return scattered_grads && mGrads->is_reduce_scattered(name);
+    };
+    std::unordered_set<void*> seen_ptrs;
+    bool any_scattered = false;
+    for (const auto& [name, grad] : mGrads->grads()) {
+        if (!grad.Data || grad.nelem() == 0 || !is_scattered(name)) continue;
+        if (!seen_ptrs.insert(grad.Data).second) continue;
+        // A reduce-scattered gradient splits evenly (DslGradStore::scatters_evenly).
+        const long shard = static_cast<long>(grad.nelem()) / world;
+        const Tensor own = Tensor::from_pointer(grad.Data + shard * comm.rank() * get_dtype_size(grad.DType),
+                                                grad.Device,
+                                                grad.DType,
+                                                std::array<long, 1>{shard});
+        global_norm_squared(norm_buffer, own, shard, rs.DeviceProp, stream);
+        any_scattered = true;
+    }
+    if (any_scattered) {
+        deterministic_sum(norm_buffer.template get<float>(),
+                          norm_buffer.template get<float>(),
+                          norm_buffer.nelem(),
+                          stream);
+        comm.reduce_norm(norm_buffer.template get<float>(), stream);
+        // Keep the sum in [0]; the whole gradients add their per-block partials to the rest.
+        CUDA_CHECK(cudaMemsetAsync(norm_buffer.template get<float>() + 1,
+                                   0,
+                                   (static_cast<std::size_t>(norm_buffer.nelem()) - 1) * sizeof(float),
+                                   stream));
+    }
 
     // Track seen Data pointers to avoid double-counting tied gradients (e.g., embedding/lm_head)
-    std::unordered_set<void*> seen_ptrs;
-    for (const auto& kv : mGrads->grads()) {
-        const Tensor& grad = kv.second;
-        if (!grad.Data || grad.nelem() == 0) continue;
-        if (seen_ptrs.count(grad.Data) > 0) {
-            continue;
-        }
-        seen_ptrs.insert(grad.Data);
-        global_norm_squared(rs.scratch().norm_buffer, grad, grad.nelem(), rs.DeviceProp, stream);
+    for (const auto& [name, grad] : mGrads->grads()) {
+        if (!grad.Data || grad.nelem() == 0 || is_scattered(name)) continue;
+        if (!seen_ptrs.insert(grad.Data).second) continue;
+        global_norm_squared(norm_buffer, grad, grad.nelem(), rs.DeviceProp, stream);
     }
-    deterministic_sum(rs.scratch().norm_buffer.template get<float>(),
-                      rs.scratch().norm_buffer.template get<float>(),
-                      rs.scratch().norm_buffer.nelem(),
+    deterministic_sum(norm_buffer.template get<float>(),
+                      norm_buffer.template get<float>(),
+                      norm_buffer.nelem(),
                       stream);
 
-    if (!grads_reduced && comm.world_size() > 1) {
-        comm.reduce_norm(rs.scratch().norm_buffer.template get<float>(), stream);
+    if (!grads_reduced && world > 1) {
+        comm.reduce_norm(norm_buffer.template get<float>(), stream);
     }
 
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T) *
