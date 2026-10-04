@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/replica_router.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 #include "serve/admission_limit.h"
@@ -14,8 +15,10 @@
 #include <cstdint>
 #include <mutex>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace sinfer::serve {
 
@@ -62,6 +65,10 @@ public:
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
     void attach(GenerationService& service);
+    /// Another data-parallel replica of the primary model (--data-parallel): the same model on
+    /// its own GPU, under the primary's id. Requests for that id are spread over the primary
+    /// and its replicas.
+    void attach_replica(GenerationService& service);
     /// An additional model served from this process; routed by its served id.
     void attach_extra(GenerationService& service);
     /// Overcommit mode: the scheduler wakes and evicts models per request.
@@ -133,6 +140,13 @@ private:
     void stop_stats_reporter();
 
     GenerationService* service_ = nullptr;
+    /// The primary model's engines: the primary itself first, then its data-parallel replicas.
+    std::vector<GenerationService*> replicas_;
+    /// Spreads the primary's requests over `replicas_`; null with a single engine.
+    std::unique_ptr<ReplicaRouter> router_;
+    /// The routing reservation of the request this worker thread is handling; wake_gate() hands
+    /// it to the preparation gate, which drops it once the replica has admitted the request.
+    static thread_local std::shared_ptr<void> t_route_reservation;
     /// Adapters this server may serve; empty unless --enable-lora named some.
     ServeOptions options_;
     nlohmann::json openrouter_catalog_; // null when provider discovery is disabled
@@ -154,10 +168,21 @@ private:
         return t_routed_service != nullptr ? *t_routed_service : *service_;
     }
     /// Routes `model`: an extra's id, the primary id, or a primary adapter
-    /// (writes `lora_adapter`). Throws ApiException 404 otherwise.
-    GenerationService& route_model(const std::string& model, std::string* lora_adapter);
+    /// (writes `lora_adapter`). Throws ApiException 404 otherwise. A request for the primary
+    /// goes to one of its replicas: the one `X-data-parallel-rank` names, else the router's
+    /// choice for a prompt with these `prefixes` (conversation_prefix_hashes).
+    GenerationService& route_model(const std::string& model, std::string* lora_adapter,
+                                   const httplib::Request* http = nullptr,
+                                   const std::vector<std::uint64_t>& prefixes = {});
+    /// One of the primary's replicas for a request (see route_model).
+    GenerationService& route_primary(const httplib::Request* http, const std::vector<std::uint64_t>& prefixes);
     /// The service a management endpoint (?model=) addresses; primary default.
     GenerationService& routed_management_service(const httplib::Request& req);
+    /// Every engine a management endpoint (?model=) addresses: all the primary's replicas for
+    /// the primary, else the one extra.
+    std::vector<GenerationService*> routed_management_services(const httplib::Request& req);
+    /// Whether `service` is one of the primary's replicas (the primary included).
+    [[nodiscard]] bool is_primary_replica(const GenerationService* service) const;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     /// Set by stop(); every in-flight request's cancellation predicate reads it.

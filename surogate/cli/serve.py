@@ -114,7 +114,7 @@ _VALUE_OPTIONS = {
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
         --model-priority --model --lora-modules --max-loras --max-lora-rank
-        --decision-temperature --decision-attempts --gpu-memory-limit-mib
+        --decision-temperature --decision-attempts --gpu-memory-limit-mib --openrouter-models-file
     """.split()),
     "generate": _COMMON_VALUES | frozenset("""
         --prompt --messages --max-new --max-context --prefill-chunk --kv-dtype
@@ -129,7 +129,7 @@ _SWITCH_OPTIONS = {
         --elastic-kv --no-elastic-kv
         --elastic-kv-overcommit --enforce-eager --no-prefix-reuse --batch-invariant
         --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
-        --enable-sleep-mode --enable-lora --preserve-thinking --cors
+        --enable-sleep-mode --enable-lora --preserve-thinking --cors --data-parallel
     """.split()),
     "generate": _COMMON_SWITCHES | frozenset("""
         --raw-output --print-token-ids --prefill-warmup --no-cuda-graph

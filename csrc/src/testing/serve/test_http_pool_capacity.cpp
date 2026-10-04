@@ -62,6 +62,21 @@ int main() {
         assert(sizes.queued == 0);
     }
 
+    // Data-parallel replicas (--data-parallel) are engines of their own with the primary's bounds,
+    // so each adds the primary's capacity. A pipeline over the same GPUs is still one engine.
+    {
+        ServeOptions options = options_for(8, 16);
+        options.devices = {0, 1, 2};
+        assert(http_pool_sizes(options).workers == 8 + 16 + 1 && "a pipeline is one engine");
+        options.data_parallel = true;
+        const HttpPoolSizes sizes = http_pool_sizes(options);
+        assert(sizes.workers == 3 * (8 + 16) + 1 && "each replica adds the primary's capacity");
+        assert(sizes.queued == 0);
+        options.extra_models.emplace_back();
+        options.extra_models.back().max_num_seqs = 4;
+        assert(http_pool_sizes(options).workers == 3 * (8 + 16) + 4 + 16 + 1);
+    }
+
     // `max_num_seqs == 0` on an extra model means "same as the primary" (serve_options.h), and the
     // worker count has to honour that rather than add nothing.
     {

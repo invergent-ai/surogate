@@ -143,7 +143,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--adapter-update-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices "
-           "A,B,...] "
+           "A,B,...] [--data-parallel] "
            "[--reasoning-parser NAME] [--tool-call-parser NAME] [--enable-auto-tool-choice] "
            "[--chat-template FILE] [--enable-prefix-caching|--no-enable-prefix-caching] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -212,6 +212,11 @@ std::string serve_usage_text(const char* argv0) {
            "FILE.\n"
            "       --enable-prefix-caching is this engine's default; the flag is accepted for\n"
            "         command-line compatibility, and --no-enable-prefix-caching turns it off.\n"
+           "       --devices A,B,... splits the model into one pipeline stage per GPU; with\n"
+           "         --data-parallel each GPU runs a whole replica instead, all under one model id,\n"
+           "         and requests are spread across them (a conversation stays on the replica that\n"
+           "         holds its prefix). For a model that fits one GPU, --data-parallel is the\n"
+           "         throughput layout; X-data-parallel-rank: N sends a request to replica N.\n"
            "       --gpu-layers N (aliases -ngl, --n-gpu-layers) keeps the first N decoder layers\n"
            "         on the GPU; 0 offloads them all, all keeps them resident.\n"
            "       --model adds a prepared model with optional device=N or devices=A:B:C,\n"
@@ -605,6 +610,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.extra_models.push_back(std::move(extra));
         } else if (arg == "--enable-sleep-mode") {
             options.enable_sleep_mode = true;
+        } else if (arg == "--data-parallel") {
+            options.data_parallel = true;
         } else if (arg == "--enable-lora") {
             options.enable_lora = true;
         } else if (arg == "--lora-modules") {
@@ -690,6 +697,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         }
         options.device = options.devices.front();
+    }
+    if (options.data_parallel) {
+        if (options.devices.size() < 2) {
+            throw std::invalid_argument(
+                "--data-parallel needs --devices with at least two GPUs (one replica on each)");
+        }
+        for (const auto& extra : options.extra_models) {
+            // An extra without a placement inherits the primary's, which is several replicas
+            // here and not one placement an extra could take.
+            if (!extra.device && extra.devices.empty()) {
+                throw std::invalid_argument("--model " + extra.name +
+                                            ": give device= or devices= under --data-parallel");
+            }
+        }
+        if (options.enable_sleep_mode && !options.extra_models.empty()) {
+            // The multi-model scheduler parks and wakes whole models; it does not know replicas.
+            throw std::invalid_argument(
+                "--data-parallel with --enable-sleep-mode cannot also serve --model extras");
+        }
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = options.max_context == 0
@@ -889,11 +915,24 @@ std::string resolve_public_model_id(const ServeOptions& options,
     return std::string(artifact_model_id);
 }
 
+ServeOptions replica_options(const ServeOptions& primary, std::size_t replica) {
+    if (!primary.data_parallel || replica >= primary.devices.size()) {
+        throw std::logic_error("replica_options: no data-parallel replica " + std::to_string(replica));
+    }
+    ServeOptions out = primary;
+    out.device = primary.devices[replica];
+    out.devices.clear();
+    out.data_parallel = false;
+    out.extra_models.clear();
+    return out;
+}
+
 ServeOptions extra_model_options(const ServeOptions& primary, const ServeOptions::ExtraModel& extra) {
     ServeOptions out = primary;
     out.artifact_path = extra.artifact_path;
     out.model_id_override = extra.name;
     out.extra_models.clear();
+    out.data_parallel = false; // the primary's replicas; an extra is one engine
     if (extra.device) {
         out.device = *extra.device;
         out.devices.clear();

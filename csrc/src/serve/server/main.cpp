@@ -20,6 +20,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -111,6 +112,12 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (options.devices.size() > 1 && !options.data_parallel) {
+            sinfer::serve::write_console_log(
+                sinfer::serve::ConsoleLogLevel::Info,
+                "--devices: one pipeline stage per GPU. For a model that fits one GPU, "
+                "--data-parallel runs a whole replica on each instead, for several times the throughput");
+        }
         sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, "loading model...");
         auto load_progress_options        = sinfer::product::stderr_load_progress_options();
         load_progress_options.line_prefix = [] {
@@ -119,8 +126,28 @@ int main(int argc, char** argv) {
         sinfer::product::LoadProgressRenderer load_progress(std::cerr,
                                                             std::move(load_progress_options));
         const auto load_start = Clock::now();
-        sinfer::serve::GenerationService service(options, load_progress.callback());
+        // --data-parallel: the primary is replica 0, alone on the first listed GPU.
+        sinfer::serve::GenerationService service(
+            options.data_parallel ? sinfer::serve::replica_options(options, 0) : options,
+            load_progress.callback());
         server.attach(service);
+        // Its other replicas: the same model, each alone on the next listed GPU. Built one after
+        // another, as the extras below are and for the same reason.
+        std::vector<std::unique_ptr<sinfer::serve::GenerationService>> replica_services;
+        for (std::size_t replica = 1; options.data_parallel && replica < options.devices.size();
+             ++replica) {
+            const auto replica_start = Clock::now();
+            replica_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
+                sinfer::serve::replica_options(options, replica), load_progress.callback()));
+            server.attach_replica(*replica_services.back());
+            std::ostringstream replica_loaded;
+            replica_loaded << "replica " << replica << " loaded on GPU " << options.devices[replica]
+                           << " in " << std::chrono::duration<double>(Clock::now() - replica_start).count()
+                           << " s (KV capacity " << replica_services.back()->memory_summary().kv_capacity
+                           << " tokens)";
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
+                                             replica_loaded.str());
+        }
         // Extra models: each its own Engine in this process, constructed
         // SEQUENTIALLY -- startup accounting (KV auto-size, the graph
         // allowance) measures free-VRAM deltas and assumes it owns the GPU
@@ -218,6 +245,7 @@ int main(int argc, char** argv) {
 
         sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
+        for (auto& replica : replica_services) { replica->warmup(); }
 
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);

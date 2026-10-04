@@ -141,7 +141,8 @@ server may still allocate.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--device N` | 0 | Use one GPU |
-| `--devices A,B,...` | — | Split a supported model across the listed GPUs |
+| `--devices A,B,...` | — | Split a supported model across the listed GPUs, one pipeline stage per GPU |
+| `--data-parallel` | off | With `--devices`, run a whole copy of the model on each listed GPU instead |
 
 `--devices` takes precedence over `--device`; its first GPU is also used for model preparation.
 With one GPU, preparation follows `--device`. `SUROGATE_CONVERT_DEVICE` overrides the preparation
@@ -163,9 +164,40 @@ surogate serve /path/to/primary.sinfer --devices 0,1 --enable-sleep-mode \
 Within `--model`, separate GPU indices with colons. Sleep and wake apply to every GPU used
 by the selected model. The scheduler accounts for available memory on each GPU.
 
-For independent replicas in one server, add the same artifact under different model names
-with `--model replica=/path/to/primary.sinfer,device=2`. Select the replica with the request's
-`model` field; each replica has its own request capacity and cache.
+#### Pipeline or data-parallel
+
+`--devices` on its own is pipeline parallelism: each GPU holds a contiguous range of layers,
+and every token passes through all of them in turn. It is how a model too large for one GPU is
+served, and it gives the longest context, because every card's memory left after the weights
+holds cache. It does not add throughput: at any moment most of the cards wait for the one
+working on the current layers.
+
+When the model fits one GPU, add `--data-parallel`. Each listed GPU then runs its own complete
+engine, all under one model name, and requests are spread across them:
+
+```bash
+surogate serve /path/to/model --devices 0,1,2,3,4,5 --data-parallel --max-num-seqs 16
+```
+
+- A conversation goes back to the replica that served its previous turn, which holds that
+  prompt in its cache. Without that, a later turn of a long agentic conversation would be
+  prefilled again on another card. A replica that already carries more than 1.25 times the
+  average load gives the request to the least busy replica instead.
+- A client that manages its own placement can send `X-data-parallel-rank: N` (vLLM's header)
+  to send a request to replica N, counted from 0 in `--devices` order.
+- Each replica has its own `--max-num-seqs`, request queue and cache: six replicas with
+  `--max-num-seqs 16` serve 96 requests at once.
+- Adapter loads, `/sleep` and `/wake_up` apply to every replica. `/v1/models` lists the model
+  once; `/kv_stats` and `/metrics` report each replica separately, with a `replica` field or label.
+- Extra models need an explicit `device=` or `devices=` placement under `--data-parallel`.
+
+For a model that fits one GPU, this is much faster than a pipeline: measured on six RTX PRO
+6000 cards with an agentic workload, six single-GPU engines decoded about 40 times more tokens
+per second than one six-stage pipeline.
+
+For independent replicas under separate names, add the same artifact as an extra model,
+for example `--model replica=/path/to/primary.sinfer,device=2`. Select the replica with the
+request's `model` field; each replica has its own request capacity and cache.
 
 ### Host offload
 

@@ -441,6 +441,9 @@ generation requests until you call `/wake_up`. A server with several models can 
 and wake the requested model automatically while the request waits. Send the empty body
 (`-d ''`) shown above with sleep and wake requests to avoid a read-timeout delay.
 
+With `--data-parallel`, sleep and wake apply to every replica of the model at once, and
+`/is_sleeping` reports `true` only when all of them are asleep.
+
 ## Monitoring memory and requests
 
 Use `/kv_stats` to check cache memory use and how many requests are running or waiting:
@@ -449,7 +452,9 @@ Use `/kv_stats` to check cache memory use and how many requests are running or w
 curl http://127.0.0.1:8080/kv_stats
 ```
 
-The response has a `models` array with an entry for each served model. Useful fields include:
+The response has a `models` array with an entry for each served model; a model served with
+`--data-parallel` has one entry per replica, each with a `replica` index (`/metrics` labels its
+series the same way). Useful fields include:
 
 | Field | Meaning |
 |---|---|

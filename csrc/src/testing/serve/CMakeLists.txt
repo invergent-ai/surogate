@@ -405,6 +405,11 @@ sinfer_add_test(sinfer_tool_call_parser_test
 sinfer_add_test(sinfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES sinfer_serve)
+# --data-parallel routing: replica choice, prefix affinity, bounded load. No model or GPU.
+sinfer_add_test(sinfer_replica_router_test
+  SOURCES test_replica_router.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_replica_router_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_host_offload_test
   SOURCES test_host_offload.cpp
   LIBRARIES sinfer_engine CUDA::cudart)
