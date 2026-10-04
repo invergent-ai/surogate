@@ -643,7 +643,15 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                 ok = false;
             if (ok) return out_ref;
         }
-        Tensor tmp = mRunState.temp_alloc(dtype, shape, ("gated_delta_rule_bwd_out" + std::to_string(out_idx)).c_str());
+        // The stack keeps the name pointer for its high-mark stats, so it must outlive this call.
+        static constexpr const char* kTempNames[] = {"gated_delta_rule_bwd_out0",
+                                                     "gated_delta_rule_bwd_out1",
+                                                     "gated_delta_rule_bwd_out2",
+                                                     "gated_delta_rule_bwd_out3",
+                                                     "gated_delta_rule_bwd_out4",
+                                                     "gated_delta_rule_bwd_out5"};
+        const char* tmp_name = out_idx < std::size(kTempNames) ? kTempNames[out_idx] : "gated_delta_rule_bwd_out";
+        Tensor tmp = mRunState.temp_alloc(dtype, shape, tmp_name);
         mTemps.push_back(tmp);
         return tmp;
     };

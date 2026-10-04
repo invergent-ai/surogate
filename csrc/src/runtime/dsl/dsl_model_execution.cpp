@@ -428,6 +428,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                               &mBlockSchemaPlanRecords,
                                               causal_lm_profile().run_state_requirements());
     mRunState->WorldSize = comm.world_size();
+    mNumNodes = comm.num_nodes();
     if (mParams) {
         mParams->set_default_stream(mRunState->MainStream);
         if (mQLoRAProvider) {

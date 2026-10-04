@@ -726,6 +726,9 @@ private:
     modules::QLoRAConfig mQLoRAConfig;
     int mShardIdx = 0;
     int mNumShards = 1;
+    // Nodes the data-parallel world spans (set by allocate_run_state). Only the first node
+    // writes checkpoints, so state that differs between nodes would not survive a resume.
+    int mNumNodes = 1;
     std::unique_ptr<QLoRAWeightProvider> mQLoRAProvider;
 
     std::unordered_map<std::string, MappingSpec> mHfMapping;
