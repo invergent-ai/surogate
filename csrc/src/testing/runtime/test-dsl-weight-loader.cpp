@@ -8,15 +8,20 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <numeric>
+#include <optional>
+#include <random>
 #include <vector>
 
 #include "config/pretrained_config.h"
 #include "runtime/dsl/dsl_weight_loader.h"
 #include "runtime/dsl/shared_master_store.h"
+#include "runtime/qlora/adapter_merger.h"
 #include "utilities/allocator.h"
 #include "utilities/cu_file.h"
 #include "utilities/safetensors.h"
@@ -35,9 +40,14 @@ struct Weight {
     std::string name;
     std::vector<long> shape;
     std::vector<float> values;
+    ETensorDType dtype = ETensorDType::FP32; ///< FP32 or BF16 on disk
 };
 
-// Write independent, tiny FP32 SafeTensors fixtures; no model download or exporter needed.
+std::size_t disk_bytes(const Weight& weight) {
+    return weight.values.size() * (weight.dtype == ETensorDType::BF16 ? sizeof(nv_bfloat16) : sizeof(float));
+}
+
+// Write independent FP32 / BF16 SafeTensors fixtures; no model download or exporter needed.
 struct Checkpoint {
     std::filesystem::path directory;
     std::string path;
@@ -52,8 +62,9 @@ struct Checkpoint {
         for (const auto& weight : weights) {
             REQUIRE(std::accumulate(weight.shape.begin(), weight.shape.end(), 1L, std::multiplies<>()) ==
                     weight.values.size());
-            const auto end = offset + weight.values.size() * sizeof(float);
-            metadata[weight.name] = {{"dtype", "F32"}, {"shape", weight.shape}, {"data_offsets", {offset, end}}};
+            const auto end = offset + disk_bytes(weight);
+            metadata[weight.name] = {{"dtype", weight.dtype == ETensorDType::BF16 ? "BF16" : "F32"},
+                                     {"shape", weight.shape}, {"data_offsets", {offset, end}}};
             offset = end;
         }
         auto header = metadata.dump();
@@ -63,7 +74,14 @@ struct Checkpoint {
         file.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
         file.write(header.data(), header.size());
         for (const auto& weight : weights) {
-            file.write(reinterpret_cast<const char*>(weight.values.data()), weight.values.size() * sizeof(float));
+            if (weight.dtype == ETensorDType::BF16) {
+                std::vector<nv_bfloat16> raw(weight.values.size());
+                std::transform(weight.values.begin(), weight.values.end(), raw.begin(),
+                               [](float x) { return __float2bfloat16(x); });
+                file.write(reinterpret_cast<const char*>(raw.data()), disk_bytes(weight));
+            } else {
+                file.write(reinterpret_cast<const char*>(weight.values.data()), disk_bytes(weight));
+            }
         }
         REQUIRE(file.good());
     }
@@ -96,6 +114,21 @@ std::vector<float> sequence(int count, int start = 0) {
     std::iota(result.begin(), result.end(), float(start));
     return result;
 }
+
+// Sets (or, with nullptr, removes) one environment variable for a scope.
+struct ScopedEnv {
+    std::string name;
+    std::optional<std::string> previous;
+    ScopedEnv(std::string variable, const char* value) : name(std::move(variable)) {
+        if (const char* old = std::getenv(name.c_str())) previous = old;
+        if (value) ::setenv(name.c_str(), value, 1);
+        else ::unsetenv(name.c_str());
+    }
+    ~ScopedEnv() {
+        if (previous) ::setenv(name.c_str(), previous->c_str(), 1);
+        else ::unsetenv(name.c_str());
+    }
+};
 
 } // namespace
 
@@ -335,4 +368,199 @@ TEST_CASE("Shared master store releases waiters when the claimer's read fails", 
     REQUIRE_FALSE(store.try_claim("weight"));
     REQUIRE_THROWS(store.wait_populated("weight"));
     store.clear();
+}
+
+// cpu_training's shared masters are pageable while they are read: a transpose must not be
+// written into them by the kernel, and the loader's device temporaries must not outlive the load.
+TEST_CASE("DSL transposes into pageable host masters match device loads", "[weight-loader]") {
+    require_gpu();
+    const auto dtype = GENERATE(ETensorDType::FP32, ETensorDType::BF16);
+    Checkpoint checkpoint({{"matrix", {2, 4}, sequence(8)}, {"experts", {4, 2, 3}, sequence(24)}});
+    SafeTensorsReader reader(checkpoint.path);
+    TensorAllocator allocator;
+    PretrainedConfig config;
+    dsl::MappingTable mapping{
+        {"matrix", {.kind = Kind::Transform, .source = "matrix", .fn = "transpose"}},
+        {"experts", {.kind = Kind::Transform, .source = "experts", .fn = "transpose"}}};
+    for (bool batched : {false, true}) {
+        CAPTURE(batched);
+        const std::string name = batched ? "experts" : "matrix";
+        const std::vector<long> shape = batched ? std::vector<long>{4, 3, 2} : std::vector<long>{4, 2};
+        dsl::DslWeightLoader loader(reader, mapping, config, allocator);
+        auto device = allocate(allocator, shape, dtype);
+        REQUIRE(loader.load_param(name, device, true));
+        std::vector<std::byte> buffer(device.bytes(), std::byte{0xAB});
+        auto host = Tensor::from_pointer(buffer.data(), /*device=*/-1, dtype, shape);
+        const auto device_bytes = allocator.total_allocation(EAllocationType::ON_DEVICE);
+        REQUIRE(loader.load_param(name, host, true));
+        REQUIRE(values(host) == values(device));
+        REQUIRE(allocator.total_allocation(EAllocationType::ON_DEVICE) == device_bytes);
+    }
+}
+
+// #270: what a host master holds after the load must be the file's contents, on every element,
+// whichever read route filled it -- not only on sampled slices. Sizes straddle the 8 MiB staging
+// chunk, and the BF16 tensor takes the converting read that host masters stage on the device.
+TEST_CASE("DSL host-master loads equal device loads and the file on full tensors", "[weight-loader]") {
+    require_gpu();
+    const bool disable_cufile = GENERATE(false, true);
+    CAPTURE(disable_cufile);
+    std::mt19937 rng(270);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    const auto random_values = [&](long count) {
+        std::vector<float> result(static_cast<std::size_t>(count));
+        for (float& x : result) x = normal(rng);
+        return result;
+    };
+    const long plain_count = 2 * (8L << 20) / long(sizeof(float)) + 12345;
+    const long cast_count = 3 * (8L << 20) / long(sizeof(nv_bfloat16)) + 777;
+    const Weight plain{"plain", {plain_count}, random_values(plain_count)};
+    const Weight cast{"cast", {cast_count}, random_values(cast_count), ETensorDType::BF16};
+    Checkpoint checkpoint({plain, cast});
+    ScopedEnv cufile("SUROGATE_DISABLE_CUFILE", disable_cufile ? "1" : nullptr);
+    SafeTensorsReader reader(checkpoint.path);
+    TensorAllocator allocator;
+    PretrainedConfig config;
+    dsl::MappingTable mapping;
+    dsl::DslWeightLoader loader(reader, mapping, config, allocator);
+
+    for (const Weight* weight : {&plain, &cast}) {
+        CAPTURE(weight->name);
+        // What an independent reader of the file gets: the stored floats, or the stored BF16
+        // values widened exactly.
+        std::vector<float> expected = weight->values;
+        if (weight->dtype == ETensorDType::BF16) {
+            for (float& x : expected) x = __bfloat162float(__float2bfloat16(x));
+        }
+        auto device = allocate(allocator, weight->shape);
+        REQUIRE(loader.load_param(weight->name, device, true));
+        std::vector<float> from_device(expected.size());
+        CUDA_CHECK(cudaMemcpy(from_device.data(), device.Data, device.bytes(), cudaMemcpyDeviceToHost));
+        std::vector<float> host_buffer(expected.size(), std::numeric_limits<float>::quiet_NaN());
+        auto host = Tensor::from_pointer(reinterpret_cast<std::byte*>(host_buffer.data()), /*device=*/-1,
+                                         ETensorDType::FP32, weight->shape);
+        REQUIRE(loader.load_param(weight->name, host, true));
+        const std::size_t bytes = expected.size() * sizeof(float);
+        REQUIRE(std::memcmp(from_device.data(), expected.data(), bytes) == 0);
+        REQUIRE(std::memcmp(host_buffer.data(), expected.data(), bytes) == 0);
+    }
+}
+
+// A stacked adapter is merged into the base weights during import; under cpu_training the base
+// weight is a pageable host master that cuBLAS cannot write.
+TEST_CASE("Stacked adapters merge into pageable host masters", "[weight-loader]") {
+    require_gpu();
+    // W [3, 4], lora_A [2, 4], lora_B [3, 2]; small integers keep every BF16 value exact.
+    const std::vector<float> w = sequence(12);
+    const std::vector<float> a{1, 0, 2, 1, 0, 1, 1, 2};
+    const std::vector<float> b{1, 2, 0, 1, 3, 0};
+    Checkpoint base({{"layer.proj.weight", {3, 4}, w}});
+    Checkpoint adapter({{"base_model.model.layer.proj.lora_A.weight", {2, 4}, a},
+                        {"base_model.model.layer.proj.lora_B.weight", {3, 2}, b}});
+    std::filesystem::rename(adapter.path, adapter.directory / "adapter_model.safetensors");
+    adapter.path = (adapter.directory / "adapter_model.safetensors").string();
+    std::ofstream(adapter.directory / "adapter_config.json") << R"({"r": 2, "lora_alpha": 4})";
+    SafeTensorsReader base_reader(base.path);
+    dsl::MappingTable mapping{{"proj", {.kind = Kind::Direct, .source = "layer.proj.weight"}}};
+    qlora::AdapterMerger merger(adapter.directory.string(), mapping, base_reader);
+
+    std::vector<float> expected = w;  // W + (alpha / r) * B @ A
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            for (int k = 0; k < 2; ++k) expected[row * 4 + col] += 2.0f * b[row * 2 + k] * a[k * 4 + col];
+        }
+    }
+
+    std::vector<nv_bfloat16> host_buffer(12);
+    std::transform(w.begin(), w.end(), host_buffer.begin(), [](float x) { return __float2bfloat16(x); });
+    TensorAllocator allocator;
+    auto device = allocate(allocator, {3, 4}, ETensorDType::BF16);
+    CUDA_CHECK(cudaMemcpy(device.Data, host_buffer.data(), device.bytes(), cudaMemcpyHostToDevice));
+    auto host = Tensor::from_pointer(reinterpret_cast<std::byte*>(host_buffer.data()), /*device=*/-1,
+                                     ETensorDType::BF16, std::vector<long>{3, 4});
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    merger.apply("proj", device, stream);
+    merger.apply("proj", host, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    REQUIRE(values(device) == expected);
+    REQUIRE(values(host) == expected);
+}
+
+// #270's check on a real checkpoint, run by hand:
+//   SUROGATE_LOAD_CHECK_PATH=/path/to/model dsl-weight-loader-tests "[load-check]"
+// Every tensor of every *.safetensors file is read in full into a pageable host buffer, as a
+// cpu_training shared master is, on the buffered route and the cuFile route, and compared byte for
+// byte with an independent read of the file (its own header parse and plain reads). BF16 tensors
+// are also read with the BF16 -> FP32 conversion and compared with the exact widening.
+TEST_CASE("Host-master loads of a real checkpoint equal the file on every tensor", "[.][load-check]") {
+    const char* root = std::getenv("SUROGATE_LOAD_CHECK_PATH");
+    if (root == nullptr) SKIP("set SUROGATE_LOAD_CHECK_PATH to a checkpoint file or directory");
+    require_gpu();
+    std::vector<std::filesystem::path> files;
+    if (std::filesystem::is_directory(root)) {
+        for (const auto& item : std::filesystem::directory_iterator(root)) {
+            if (item.path().extension() == ".safetensors") files.push_back(item.path());
+        }
+        std::sort(files.begin(), files.end());
+    } else {
+        files.emplace_back(root);
+    }
+    REQUIRE_FALSE(files.empty());
+    const bool disable_cufile = GENERATE(true, false);
+    ScopedEnv cufile("SUROGATE_DISABLE_CUFILE", disable_cufile ? "1" : nullptr);
+    std::size_t tensors = 0, converted = 0, mismatches = 0;
+    std::uint64_t bytes = 0;
+    for (const auto& file : files) {
+        std::ifstream in(file, std::ios::binary);
+        std::uint64_t header_size = 0;
+        in.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+        std::string header(header_size, '\0');
+        in.read(header.data(), static_cast<std::streamsize>(header_size));
+        const auto metadata = nlohmann::json::parse(header);
+        const std::uint64_t data_start = sizeof(header_size) + header_size;
+        SafeTensorsReader reader(file.string());
+        for (const auto& [name, info] : metadata.items()) {
+            if (name == "__metadata__") continue;
+            const auto& entry = reader.find_entry(name);
+            const std::uint64_t begin = info.at("data_offsets").at(0).get<std::uint64_t>();
+            const std::uint64_t end = info.at("data_offsets").at(1).get<std::uint64_t>();
+            std::vector<std::byte> expected(end - begin);
+            in.seekg(static_cast<std::streamoff>(data_start + begin));
+            in.read(reinterpret_cast<char*>(expected.data()), static_cast<std::streamsize>(expected.size()));
+            REQUIRE(in.good());
+
+            std::vector<std::byte> host(expected.size(), std::byte{0x5A});
+            auto target = Tensor::from_pointer(host.data(), /*device=*/-1, entry.dtype(), entry.shape());
+            entry.read_tensor(target, false);
+            if (host != expected) {
+                ++mismatches;
+                WARN("mismatch: " << file.filename().string() << " " << name);
+            }
+            if (entry.dtype() == ETensorDType::BF16) {
+                const std::size_t count = expected.size() / sizeof(std::uint16_t);
+                std::vector<float> widened(count, std::numeric_limits<float>::quiet_NaN());
+                auto wide = Tensor::from_pointer(reinterpret_cast<std::byte*>(widened.data()), /*device=*/-1,
+                                                 ETensorDType::FP32, entry.shape());
+                entry.read_tensor(wide, true);
+                std::vector<std::uint32_t> exact(count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    std::uint16_t raw;
+                    std::memcpy(&raw, expected.data() + i * sizeof(raw), sizeof(raw));
+                    exact[i] = std::uint32_t{raw} << 16;
+                }
+                if (std::memcmp(widened.data(), exact.data(), count * sizeof(float)) != 0) {
+                    ++mismatches;
+                    WARN("BF16 -> FP32 mismatch: " << file.filename().string() << " " << name);
+                }
+                ++converted;
+            }
+            ++tensors;
+            bytes += expected.size();
+        }
+    }
+    INFO(tensors << " tensors (" << converted << " also widened), " << bytes << " bytes, route "
+                 << (disable_cufile ? "buffered" : "cuFile"));
+    REQUIRE(mismatches == 0);
 }
