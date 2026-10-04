@@ -203,6 +203,61 @@ int run_w8_q2b() {
     return failures;
 }
 
+// A parent the fused W8 kernels are not registered for is projected by row range (#239): the
+// 9B's [12288,4096]. Its workspace plan must not refuse the profile, and both public forms must
+// write qkv and z.
+int run_w8_generic_case(DevicePackedWeight& parent, std::int32_t qkv_rows, std::int32_t tokens,
+                        bool with_workspace) {
+    const std::int32_t hidden           = parent.host.weight.k;
+    const std::int32_t z_rows           = parent.host.weight.n - qkv_rows;
+    const std::vector<float> activation = make_bf16_activation(hidden, tokens, 801U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(qkv_rows, tokens);
+    GuardedBf16Tensor z(z_rows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+    Tensor qkv_output = qkv.tensor();
+    Tensor z_output   = z.tensor();
+    if (with_workspace) {
+        const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::W8G32_F16S, parent.host.weight.n, hidden, ops::LinearPolicy::A16Only, tokens,
+            tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, ops::LinearPolicy::A16Only,
+                            workspace, nullptr);
+    } else {
+        ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string suffix = std::string(" W8 generic K=") + std::to_string(hidden) +
+                               (with_workspace ? " workspace" : "") +
+                               " A16 T=" + std::to_string(tokens);
+    int failures = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    failures += verify_output_range("gdn qkv" + suffix, qkv, qkv_rows, 0, qkv_rows, parent.host, 0,
+                                    activation, hidden, tokens, kGdnInputProjW8UlpTolerance);
+    failures += verify_output_range("gdn z" + suffix, z, z_rows, 0, z_rows, parent.host, qkv_rows,
+                                    activation, hidden, tokens, kGdnInputProjW8UlpTolerance);
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("gdn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8_generic() {
+    // qwen3.5-9b: q 2048 | k 2048 | v 4096 | z 4096 over hidden 4096.
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, 4096, 811U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 17, 97}) {
+        failures += run_w8_generic_case(parent, 8192, tokens, false);
+    }
+    failures += run_w8_generic_case(parent, 8192, 33, true);
+    return failures;
+}
+
 int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor& output,
                                 std::int32_t full_rows, std::int32_t output_row_offset,
                                 std::int32_t output_rows,
@@ -410,6 +465,7 @@ int main() {
     failures += run_w8();
     failures += run_w8_q08();
     failures += run_w8_q2b();
+    failures += run_w8_generic();
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";

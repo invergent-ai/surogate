@@ -678,6 +678,81 @@ int run_w8_ungated() {
     return failures;
 }
 
+// A gated W8 parent the fused route has no kernels for is projected one row range at a time
+// (#239): the 9B's [10240,4096] and the 27B's [14336,5120]. Planning its workspace must not
+// refuse the profile, and both public forms must write all four outputs.
+int run_w8_generic_gated_case(DevicePackedWeight& parent, std::int32_t hidden, std::int32_t q_rows,
+                              std::int32_t kv_rows, const char* name, std::int32_t tokens,
+                              bool with_workspace) {
+    const std::vector<float> activation = make_bf16_activation(hidden, tokens, 701U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(q_rows, tokens);
+    GuardedBf16Tensor gate(q_rows, tokens);
+    GuardedBf16Tensor key(kv_rows, tokens);
+    GuardedBf16Tensor value(kv_rows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    if (with_workspace) {
+        const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+            QType::W8G32_F16S, 2 * q_rows + 2 * kv_rows, hidden, ops::LinearPolicy::A16Only,
+            tokens, tokens);
+        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::attn_input_proj(x, parent.view(), q, g, k, v, ops::LinearPolicy::A16Only, workspace,
+                             nullptr);
+    } else {
+        ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string suffix = std::string(" W8 ") + name + (with_workspace ? " workspace" : "") +
+                               " A16 T=" + std::to_string(tokens);
+    int failures = 0;
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, q_rows, activation, hidden,
+                              tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_output("attn k" + suffix, key, parent.host, q_rows, kv_rows, activation,
+                              hidden, tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_output("attn gate" + suffix, gate, parent.host, q_rows + kv_rows, q_rows,
+                              activation, hidden, tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_output("attn value" + suffix, value, parent.host, 2 * q_rows + kv_rows,
+                              kv_rows, activation, hidden, tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8_generic_gated() {
+    struct Shape {
+        std::int32_t hidden;
+        std::int32_t q_rows;
+        std::int32_t kv_rows;
+        const char* name;
+    };
+    int failures = 0;
+    for (const Shape& shape : {Shape{4096, 4096, 1024, "qwen3.5-9b"},
+                               Shape{5120, 6144, 1024, "qwen3.5-27b"}}) {
+        const std::int32_t parent_rows = 2 * shape.q_rows + 2 * shape.kv_rows;
+        if (ops::attn_input_proj_w8_admits(parent_rows, shape.hidden)) {
+            std::cerr << "FAIL W8 " << shape.name << " parent is registered; pick another shape\n";
+            ++failures;
+            continue;
+        }
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(
+            QType::W8G32_F16S, parent_rows, shape.hidden, 703U));
+        for (const std::int32_t tokens : {1, 2, 17, 129}) {
+            failures += run_w8_generic_gated_case(parent, shape.hidden, shape.q_rows,
+                                                  shape.kv_rows, shape.name, tokens, false);
+        }
+        failures += run_w8_generic_gated_case(parent, shape.hidden, shape.q_rows, shape.kv_rows,
+                                              shape.name, 65, true);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -696,6 +771,7 @@ int main() {
     failures += run_w8_q2b();
     failures += run_w8_companion();
     failures += run_w8_ungated();
+    failures += run_w8_generic_gated();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

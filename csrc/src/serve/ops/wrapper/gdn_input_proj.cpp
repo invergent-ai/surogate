@@ -40,9 +40,25 @@ bool row_projectable(QType qtype) {
     return qtype == QType::BF16_CTRL || detail::ggml::is_ggml_qtype(qtype) ||
            detail::fp8_block::is_fp8_block_qtype(qtype);
 }
+// The parents the fused W8 GDN kernels are registered for: 12288 rows over hidden 2048 (35B) or
+// 2560 (4B), and 8192 rows over hidden 1024 (0.8B) or 2048 (2B).
+bool w8_fused_admits(std::int32_t parent_rows, std::int32_t input_rows) {
+    return (parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
+           (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048));
+}
+// A W8 parent of any other shape -- the 9B's [12288,4096], say -- is split by row range like the
+// formats above: W8 rows are independently addressable and the plain W8 linear serves any
+// shape, so a size of the family nobody registered still serves (#239).
+bool w8_row_projected(QType qtype, std::int32_t parent_rows, std::int32_t input_rows) {
+    return qtype == QType::W8G32_F16S && !w8_fused_admits(parent_rows, input_rows);
+}
 std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
                                                      std::int32_t max_tokens) {
     if (qtype == QType::BF16_CTRL) { return 0; }
+    if (qtype == QType::W8G32_F16S) {
+        // Row ranges run at A16; the widest range is the parent itself.
+        return linear_workspace_capacity_bytes(qtype, rows, k, LinearPolicy::A16Only, 1, max_tokens);
+    }
     return detail::fp8_block::is_fp8_block_qtype(qtype)
                ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
                : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
@@ -325,9 +341,9 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
-    if (row_projectable(weight.qtype)) {
-        // A K-quant or block-FP8 parent splits by row range straight into the two outputs:
-        // qkv rows first, z rows after, the split read off the output views.
+    if (row_projectable(weight.qtype) || w8_row_projected(weight.qtype, weight.n, weight.k)) {
+        // A K-quant, block-FP8 or unregistered W8 parent splits by row range straight into the
+        // two outputs: qkv rows first, z rows after, the split read off the output views.
         if (qkv.ne[0] + z.ne[0] != weight.n) {
             throw std::invalid_argument("gdn_input_proj: row-projected parent rows must equal qkv + z rows");
         }
@@ -485,9 +501,10 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         throw std::invalid_argument("BF16 input projection admits only A16");
     }
 
-    if (row_projectable(weight.qtype)) {
-        // K-quant or block-FP8 parent: the row split comes from the output views, the projection is the
-        // plain single-parent form, and the conv is the shared projected-conv tail.
+    if (row_projectable(weight.qtype) || w8_row_projected(weight.qtype, weight.n, weight.k)) {
+        // K-quant, block-FP8 or unregistered W8 parent: the row split comes from the output views,
+        // the projection is the plain single-parent form, and the conv is the shared
+        // projected-conv tail.
         const std::int32_t kQueryRows = query.ne[0];
         const std::int32_t kKeyRows   = key.ne[0];
         const std::int32_t kValueRows = value.ne[0];
@@ -715,7 +732,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         throw std::invalid_argument("BF16 input projection admits only A16");
     }
 
-    if (row_projectable(weight.qtype)) {
+    if (row_projectable(weight.qtype) || w8_row_projected(weight.qtype, weight.n, weight.k)) {
         const std::int32_t kQueryRows = query.ne[0];
         const std::int32_t kKeyRows   = key.ne[0];
         const std::int32_t kValueRows = value.ne[0];
@@ -945,7 +962,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
-    if (row_projectable(parent_qtype)) {
+    if (row_projectable(parent_qtype) || w8_row_projected(parent_qtype, parent_rows, input_rows)) {
         return row_projectable_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
@@ -970,19 +987,9 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     // surogate vendor patches (PATCHES.md #13/#16/#17): W8 fused parents
     // (35B 12288/2048; 0.8b 8192/1024; 2b 8192/2048) at A16 or AllowA8;
     // AllowA8 large-T sizes the quantized-activation workspace.
-    // A parent shape the fused W8 GDN kernels are not registered for takes no workspace from
-    // them: the profile is sized for what it binds (the 27B's parents are groupwise Q4/Q5 or
-    // native K-quants), and a W8 parent of such a shape is refused where it would run.
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        !((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
-          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
-        return 0;
-    }
-    if (parent_qtype == QType::W8G32_F16S &&
-        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
-         (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
+        w8_fused_admits(parent_rows, input_rows)) {
         const std::int32_t qkv_rows = parent_rows == 12288 ? 8192 : 6144;
         const std::int32_t z_rows   = parent_rows == 12288 ? 4096 : 2048;
         (void)detail::w8_gdn_input_resolve_plan(
@@ -1493,7 +1500,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         throw std::invalid_argument("BF16 input projection admits only A16");
     }
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (row_projectable(parent_qtype)) {
+    if (row_projectable(parent_qtype) || w8_row_projected(parent_qtype, parent_rows, input_rows)) {
         // The split is read off the output views at run time; here only the parent is known,
         // so the projected plane is sized for every parent row (z included) -- sufficient,
         // and a few MiB over at most -- plus the int8 activation scratch.
@@ -1513,8 +1520,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     // qwen3.5-0.8b 8192/1024) size through the split-dimension path.
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
-         (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
+        w8_fused_admits(parent_rows, input_rows)) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
         return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, value_rows,
                                                                      batch_size, min_width,
@@ -1590,7 +1596,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         throw std::invalid_argument("BF16 input projection admits only A16");
     }
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (row_projectable(parent_qtype)) {
+    if (row_projectable(parent_qtype) || w8_row_projected(parent_qtype, parent_rows, input_rows)) {
         return row_projectable_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
                                                           batch_size * max_width);
     }
@@ -1606,8 +1612,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     // record path, mirroring the snapshot overload above.
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
-         (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
+        w8_fused_admits(parent_rows, input_rows)) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
         return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, value_rows,
                                                                    batch_size, min_width,

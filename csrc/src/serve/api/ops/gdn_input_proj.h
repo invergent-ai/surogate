@@ -51,6 +51,9 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  *   [2048,2048,6144,6144].
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
+ * A W8G32_F16S parent of any other shape (the 9B's [12288,4096], say), like a K-quant,
+ * block-FP8 or BF16 parent, is projected one row range at a time at A16, with the split read
+ * from the output views (#239); the snapshot and record forms below do the same.
  * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 permits private activation
  * quantization at every positive T. FP8 admits A16Only and AllowA8 at every positive T; AllowA8
  * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
