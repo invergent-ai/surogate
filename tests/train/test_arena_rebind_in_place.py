@@ -52,7 +52,8 @@ trainer.import_weights(get_model_weights_path(model_dir))
 x = np.random.default_rng(0).integers(10, 8000, size=(1, SEQ), dtype=np.int32)
 y = np.concatenate([x[:, 1:], np.full((1, 1), -100, np.int32)], axis=1).astype(np.int32)
 pos = np.arange(SEQ, dtype=np.int32)[None, :].copy()
-config = _surogate.OptimizerConfig(optimizer="adamw_8bit", learning_rate=0.0, grad_clip=0.0)
+# adamw: the 8-bit optimizer has no FP32-master/BF16-gradient kernel.
+config = _surogate.OptimizerConfig(optimizer="adamw", learning_rate=0.0, grad_clip=0.0)
 result = trainer.train_step_graphed(x, y, pos, config, 0)
 print("STEP", json.dumps({"loss": float(result["loss"]), "norm": float(result["norm"])}))
 """.replace("SEQ", str(SEQ))
@@ -114,7 +115,9 @@ def reference(model_dir):
 def test_slabs_bind_in_place_and_step_unchanged(model_dir, reference, cfg, owner):
     step, counts = _step(model_dir, **cfg)
     _bound_in_place(counts, owner)
+    # Tolerances, not equality: on main too, the same step lands on one of two results from run to
+    # run (on this row, losses 3.5e-4 apart and norms 2.8% apart). A tensor on the wrong slot is far off.
     assert abs(step["loss"] - reference["loss"]) <= 1e-3 * abs(reference["loss"]), (step, reference)
     if not cfg.get("lora"):  # a LoRA step's norm is the adapters'
         _bound_in_place(counts, "accumulator")
-        assert abs(step["norm"] - reference["norm"]) <= 2e-2 * reference["norm"], (step, reference)
+        assert abs(step["norm"] - reference["norm"]) <= 5e-2 * reference["norm"], (step, reference)
