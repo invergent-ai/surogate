@@ -71,7 +71,8 @@ public:
     /// at the correct row offset within the fused buffer.
     ///
     /// @param dsl_param_name  Internal param name (e.g., "blocks[0].qkv_weight").
-    /// @param bf16_weight     BF16 tensor on GPU (modified in-place).
+    /// @param bf16_weight     BF16 tensor (modified in-place): device memory, or host memory
+    ///                        (`Device < 0`), whose rows are merged on the device and copied back.
     /// @param stream          CUDA stream for the merge operations.
     void apply(const std::string& dsl_param_name, Tensor& bf16_weight, cudaStream_t stream);
 
@@ -142,6 +143,11 @@ private:
     void* mLoraBBuf = nullptr;
     size_t mLoraABufBytes = 0;
     size_t mLoraBBufBytes = 0;
+
+    /// Device copy of the rows being merged when the weight is host memory (cpu_training's
+    /// shared frozen masters): cuBLAS writes device memory only.
+    void* mWeightBuf = nullptr;
+    size_t mWeightBufBytes = 0;
 };
 
 }  // namespace qlora

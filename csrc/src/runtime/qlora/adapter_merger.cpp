@@ -14,6 +14,7 @@
 
 #include "utilities/safetensors.h"
 #include "utilities/tensor.h"
+#include "utilities/utils.h"
 
 namespace fs = std::filesystem;
 
@@ -112,6 +113,7 @@ AdapterMerger::AdapterMerger(const std::string& adapter_dir,
 AdapterMerger::~AdapterMerger() {
     if (mLoraABuf) cudaFree(mLoraABuf);
     if (mLoraBBuf) cudaFree(mLoraBBuf);
+    if (mWeightBuf) cudaFree(mWeightBuf);
     if (mCublasHandle) cublasDestroy(mCublasHandle);
 }
 
@@ -205,6 +207,11 @@ void AdapterMerger::merge_component(const std::string& hf_base_name,
     }
     const long local_M = shard_row_end - shard_row_start;
 
+    // The scratch below is about to be overwritten by synchronous reads, and the previous
+    // component's GEMM may still be reading it on `stream` (a non-blocking stream does not order
+    // after those reads), as for the up/gate pair of one expert.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     // Allocate/grow GPU scratch for lora_A [R, K] and lora_B [local_M, R]
     const size_t a_bytes = R * K * sizeof(nv_bfloat16);
     const size_t b_bytes = local_M * R * sizeof(nv_bfloat16);
@@ -251,6 +258,17 @@ void AdapterMerger::merge_component(const std::string& hf_base_name,
     auto* A_ptr = reinterpret_cast<nv_bfloat16*>(mLoraABuf);
     auto* B_ptr = reinterpret_cast<nv_bfloat16*>(mLoraBBuf);
 
+    // A host weight (cpu_training's shared frozen master, pageable while it is read) cannot be
+    // the GEMM's output. Merge its rows in a device copy and write them back.
+    const bool host_weight = bf16_weight.Device < 0;
+    const size_t rows_bytes = static_cast<size_t>(local_M) * lda_W * sizeof(nv_bfloat16);
+    nv_bfloat16* gemm_W = W_ptr;
+    if (host_weight) {
+        ensure_buf(mWeightBuf, mWeightBufBytes, rows_bytes);
+        CUDA_CHECK(cudaMemcpyAsync(mWeightBuf, W_ptr, rows_bytes, cudaMemcpyDefault, stream));
+        gemm_W = static_cast<nv_bfloat16*>(mWeightBuf);
+    }
+
     auto gemm_status = cublasGemmEx(mCublasHandle,
                                     CUBLAS_OP_N,
                                     CUBLAS_OP_N,
@@ -265,7 +283,7 @@ void AdapterMerger::merge_component(const std::string& hf_base_name,
                                     CUDA_R_16BF,
                                     static_cast<int>(R),  // B^T [R, M]
                                     &beta_val,
-                                    W_ptr,
+                                    gemm_W,
                                     CUDA_R_16BF,
                                     static_cast<int>(lda_W),  // W^T [K, M]
                                     CUBLAS_COMPUTE_32F,
@@ -275,6 +293,10 @@ void AdapterMerger::merge_component(const std::string& hf_base_name,
         throw std::runtime_error(fmt::format("AdapterMerger: cuBLAS GEMM failed for '{}' (status={})",
                                              hf_base_name,
                                              static_cast<int>(gemm_status)));
+    }
+    if (host_weight) {
+        CUDA_CHECK(cudaMemcpyAsync(W_ptr, mWeightBuf, rows_bytes, cudaMemcpyDefault, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 }
 

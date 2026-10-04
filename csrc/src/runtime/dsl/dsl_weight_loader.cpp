@@ -659,8 +659,12 @@ bool DslWeightLoader::load_transform(const MappingSpec& spec,
     Tensor tmp_src = mAllocator.allocate(target.DType, ("wl_tmp_src_" + name).c_str(),
                                          EAllocationType::ON_DEVICE, shape);
     entry.read_tensor(tmp_src, allow_cast);
+    // The transpose kernel writes device memory only. A shard is transposed whole and sliced; a
+    // host target (cpu_training's shared frozen master, pageable while it is read) is transposed
+    // on the device too. Both are copied into place afterwards.
+    const bool host_target = target.Device < 0;
     Tensor output = target;
-    if (param_sharded) {
+    if (param_sharded || host_target) {
         output = mAllocator.allocate(target.DType, ("wl_tmp_full_" + name).c_str(),
                                       EAllocationType::ON_DEVICE, transposed_shape);
     }
@@ -682,11 +686,17 @@ bool DslWeightLoader::load_transform(const MappingSpec& spec,
         dst_view.Data += batch * matrix_bytes;
         transpose(dst_view, src_view, static_cast<int>(rows), static_cast<int>(cols), stream);
     }
-    if (param_sharded) {
-        Tensor slice = slice_dim0(output, shard_start, shard_end - shard_start);
+    if (param_sharded || host_target) {
+        Tensor slice = param_sharded ? slice_dim0(output, shard_start, shard_end - shard_start) : output;
         CUDA_CHECK(cudaMemcpyAsync(target.Data, slice.Data, target.bytes(), cudaMemcpyDefault, stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    // The allocator would otherwise hold both temporaries for the rest of the run: it is the
+    // model's own, and it frees only what it is told to.
+    mAllocator.free(tmp_src);
+    if (param_sharded || host_target) {
+        mAllocator.free(output);
+    }
     return true;
 }
 
