@@ -408,8 +408,11 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
     const std::size_t interval =
         ops::gdn_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, last);
+    // Every width up to the last endpoint, not the endpoints alone: on a device with fewer SMs
+    // than the catalog's the planner steps SplitK down inside a route, and the maximum moves to
+    // the width just below that step.
     std::size_t witness = 0;
-    for (const std::int32_t tokens : route_endpoints) {
+    for (std::int32_t tokens = 1; tokens <= last; ++tokens) {
         witness = std::max(witness, ops::gdn_gating_proj_workspace_capacity_bytes(
                                         geometry.heads, geometry.hidden, tokens, tokens));
     }

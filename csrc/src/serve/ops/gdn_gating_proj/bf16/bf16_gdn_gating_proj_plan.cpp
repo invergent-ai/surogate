@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
@@ -142,20 +144,42 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
+// The device the route catalogs below were sized on: an RTX 5090.
+inline constexpr std::int32_t kCatalogSmCount = 170;
+
+// SM count of the current device. A cooperative grid must be co-resident, and how many CTAs
+// that allows scales with it: 170 SMs on an RTX 5090, 48 on a GB10. The planner runs on every
+// dispatch, so the attribute is read once per device. With no device to ask -- capacity
+// planning on a host without one -- it plans as the catalog device does, as it always has.
+std::int32_t device_sm_count() noexcept {
+    static std::mutex mutex;
+    static std::map<int, std::int32_t> counts;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { return kCatalogSmCount; }
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (const auto found = counts.find(device); found != counts.end()) { return found->second; }
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return kCatalogSmCount;
+    }
+    counts.emplace(device, sms);
+    return sms;
+}
+
 bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
                                   std::int32_t tile_cols, std::int32_t row_tiles,
-                                  std::int32_t resident_ctas) noexcept {
+                                  std::int32_t ctas_per_sm) noexcept {
     const std::int64_t column_tiles = (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
     const std::int64_t grid_ctas =
         column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
-    return grid_ctas <= resident_ctas;
+    return grid_ctas <= static_cast<std::int64_t>(ctas_per_sm) * device_sm_count();
 }
 
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
     // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
-    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
+    // 340 resident CTAs on a 170-SM device. There are three 16-row tiles per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, 2);
 }
 
 bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
@@ -163,9 +187,9 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
     // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
     // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
     // device-wide limits are 340 and 680 CTAs respectively.
-    const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
-    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
+    const std::int32_t ctas_per_sm =
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 2 : 4;
+    return cooperative_grid_is_resident(schedule, cols, 64, 2, ctas_per_sm);
 }
 
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
@@ -209,6 +233,20 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         return false;
     }
     return false;
+}
+
+// The route catalogs are sized for a 170-SM device. Where the current device keeps fewer CTAs
+// co-resident, halve SplitK until the cooperative grid fits; the unsplit grid always does.
+Bf16GdnGatingScheduleId resident_schedule(Bf16GdnGatingScheduleId schedule,
+                                          const Bf16GdnGatingProblem& problem) {
+    using S = Bf16GdnGatingScheduleId;
+    constexpr std::array kSplitLadder{S::MmaCooperativeSplit32, S::MmaCooperativeSplit16,
+                                      S::MmaCooperativeSplit8,  S::MmaCooperativeSplit4,
+                                      S::MmaCooperativeSplit2,  S::MmaUnsplit};
+    auto step = std::find(kSplitLadder.begin(), kSplitLadder.end(), schedule);
+    if (step == kSplitLadder.end()) { return schedule; }
+    while (*step != S::MmaUnsplit && !candidate_is_legal(*step, problem)) { ++step; }
+    return *step;
 }
 
 std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std::int32_t cols) {
@@ -307,10 +345,18 @@ std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16Gdn
     std::size_t maximum = 0;
     for (const RouteSpec& route : routes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
-        const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(
-            maximum,
-            bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, endpoint}).workspace_bytes);
+        if (schedule_split_k(route.schedule) == 1) { continue; }
+        // Where SplitK steps down inside a route (resident_schedule), the wider split just below
+        // the step can need more workspace than the route endpoint. The split changes only on a
+        // token-tile boundary, so the maximum is at the endpoint or at one of those.
+        const std::int64_t first = std::max(route.cols.first, min_cols);
+        const std::int64_t tile  = mma_tile_cols(base);
+        for (std::int64_t cols = std::min(route.cols.last, max_cols); cols >= first;
+             cols = (cols - 1) / tile * tile) {
+            const Bf16GdnGatingProblem problem{base.heads, base.input_rows,
+                                               static_cast<std::int32_t>(cols)};
+            maximum = std::max(maximum, bf16_gdn_gating_resolve_plan(problem).workspace_bytes);
+        }
     }
     return maximum;
 }
@@ -382,14 +428,16 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
     if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                return bf16_gdn_gating_resolve_candidate(
+                    resident_schedule(route.schedule, problem), problem);
             }
         }
     } else {
         const auto& routes = is_4b(problem) ? k4BRoutes : k35Routes;
         for (const RouteSpec& route : routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                return bf16_gdn_gating_resolve_candidate(
+                    resident_schedule(route.schedule, problem), problem);
             }
         }
     }
@@ -413,12 +461,15 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_35(problem) && problem.cols <= 16) {
-        // surogate vendor patch (PATCHES.md #18): 4b fuses at split-8 (k 2560 has
-        // 40 K-tiles); the executor branches on weight.k.
-        const Bf16GdnGatingScheduleId control_schedule =
-            is_4b(problem) ? Bf16GdnGatingScheduleId::MmaCooperativeSplit8
-                           : Bf16GdnGatingScheduleId::MmaCooperativeSplit32;
+    // surogate vendor patch (PATCHES.md #18): 4b fuses at split-8 (k 2560 has
+    // 40 K-tiles); the executor branches on weight.k.
+    const Bf16GdnGatingScheduleId control_schedule =
+        is_4b(problem) ? Bf16GdnGatingScheduleId::MmaCooperativeSplit8
+                       : Bf16GdnGatingScheduleId::MmaCooperativeSplit32;
+    // The fused kernel is registered at this one SplitK, and it reduces the norm in its
+    // cooperative epilogue, so there is nothing to step down to: a device that cannot keep the
+    // grid resident composes instead.
+    if (is_35(problem) && problem.cols <= 16 && candidate_is_legal(control_schedule, problem)) {
         control     = bf16_gdn_gating_resolve_candidate(control_schedule, problem);
         schedule    = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = is_4b(problem) ? 8 : 32;

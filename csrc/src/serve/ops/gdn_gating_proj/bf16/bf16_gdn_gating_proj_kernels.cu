@@ -320,28 +320,6 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                                                  NormalizeInput, NormTokenCapacity>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
         if constexpr (SplitK > 1) {
-            // A cooperative launch needs every block co-resident. These split-K grids were
-            // sized for a 170-SM RTX 5090; on a 48-SM GB10 (DGX Spark) they exceed the limit
-            // (cudaErrorCooperativeLaunchTooLarge), so fall back to the plain SplitK=1 kernel.
-            // Dropping straight to SplitK=1 is the simple option; a smaller SplitK that still
-            // fits would keep more of the split-K speed-up on small GPUs.
-            int device = 0;
-            CUDA_CHECK(cudaGetDevice(&device));
-            int sms = 0;
-            CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-            int blocks_per_sm = 0;
-            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &blocks_per_sm,
-                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                     NormalizeInput, NormTokenCapacity>,
-                static_cast<int>(block.x), kSmemBytes));
-            if (static_cast<long long>(grid.x) * grid.y * grid.z >
-                static_cast<long long>(blocks_per_sm) * sms) {
-                launch_bf16_prefill_mma<Geometry, 1, Warps, NormalizeInput, NormTokenCapacity>(
-                    variant, x, norm_weight, norm_eps, normalized_x, a_weight, b_weight, A_log,
-                    dt_bias, workspace, g, beta, stream);
-                return;
-            }
             cudaLaunchConfig_t config{};
             config.gridDim          = grid;
             config.blockDim         = block;
