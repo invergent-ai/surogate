@@ -227,6 +227,12 @@ public:
     ExecutionResult execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) override;
     ExecutionResult execute_backward(const ExecutionRequest& request, NCCLCommunicator& comm) override;
 
+    /// What the first forward of an optimizer step does before anything runs: wait for the
+    /// previous optimizer update, initialize (once) and re-arm the FP8 delayed-scaling state,
+    /// reset the MoE statistics. execute_forward runs it at micro-step 0; a step whose windows do
+    /// not start at micro-step 0 (chunked GRPO with unoccupied chunks) runs it explicitly.
+    void begin_step();
+
     void set_hook_context(void* context) override {
         mHookContext = context;
     }

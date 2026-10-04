@@ -1899,6 +1899,23 @@ void copy_runtime_inputs(const ExecutionRequest& request, cudaStream_t stream) {
 
 }  // namespace
 
+void GraphExecutor::begin_step() {
+    auto& rs = mRunState;
+    if (!stream_is_capturing(rs.MainStream)) {
+        CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
+    }
+    if (rs.has_fp8_delayed_scaling()) {
+        if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+            if (!mFP8ScalingInitialized) {
+                fp8_state->reset(rs.MainStream);
+                mFP8ScalingInitialized = true;
+            }
+            fp8_state->zero_recorded_amaxes(rs.MainStream);
+        }
+    }
+    rs.reset_moe_stats();
+}
+
 ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) {
     mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     validate_execution_request(request);
@@ -1907,21 +1924,8 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
     }
 
     auto& rs = mRunState;
-    const bool in_capture = stream_is_capturing(rs.MainStream);
     if (request.micro_step == 0) {
-        if (!in_capture) {
-            CUDA_CHECK(cudaStreamWaitEvent(rs.side_stream(), rs.OptimizerDone, 0));
-        }
-        if (rs.has_fp8_delayed_scaling()) {
-            if (auto* fp8_state = rs.get_fp8_scaling_state()) {
-                if (!mFP8ScalingInitialized) {
-                    fp8_state->reset(rs.MainStream);
-                    mFP8ScalingInitialized = true;
-                }
-                fp8_state->zero_recorded_amaxes(rs.MainStream);
-            }
-        }
-        rs.reset_moe_stats();
+        begin_step();
     }
 
     if (request.initialize_loss_buffers) {

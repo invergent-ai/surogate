@@ -4007,6 +4007,22 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
                                            teacher_logprobs);
     });
 
+    // The step's start-of-step work. Micro-step 0 normally does it, but here no window may get
+    // micro-step 0: Phase B numbers its windows from the end (so the last one closes the step)
+    // and skips unoccupied tail chunks, and Phase A is empty when one chunk is occupied. Without
+    // this the LoRA gradients were never zeroed -- step 0 accumulated onto uninitialised memory
+    // and every later step onto the previous step's gradients -- and the FP8 delayed-scaling
+    // state was never initialised (#270).
+    if (mTrainMicroStep == 0) {
+        run_work([](sThreadContext& ctx) {
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) {
+                throw std::runtime_error("step_grpo_native_chunked: model is not a DslModel");
+            }
+            dsl_model->begin_training_step();
+        });
+    }
+
     // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
     // attention KV caches (saved-tensor persistence skipped).
     //

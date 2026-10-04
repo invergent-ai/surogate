@@ -560,6 +560,19 @@ void DslModel::zero_grads(cudaStream_t stream) {
     }
 }
 
+void DslModel::begin_training_step() {
+    if (!mRunState) {
+        throw std::logic_error("DslModel::begin_training_step called before allocate_run_state()");
+    }
+    if (GraphExecutor* executor = graph_executor()) {
+        executor->begin_step();
+    }
+    cudaStream_t stream = mRunState->MainStream;
+    // The previous step's update reads the gradients; zero them only after it.
+    CUDA_CHECK(cudaStreamWaitEvent(stream, mRunState->OptimizerDone, 0));
+    zero_grads(stream);
+}
+
 void DslModel::set_internal_graphs_enabled(bool enabled) {
     if (mExecutor) {
         mExecutor->set_internal_graphs_enabled(enabled);
