@@ -356,6 +356,11 @@ surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
   --max-num-seqs 64 --max-model-len 2048 --kv-capacity auto
 ```
 
+This splits the model into one pipeline stage per card, which is what a model too large for one
+card needs. If the model fits one card, add `--data-parallel` instead: every card then serves a
+whole copy of the model under the same name, which multiplies throughput rather than dividing the
+layers. See [Pipeline or data-parallel](cli.md#pipeline-or-data-parallel).
+
 Memory requirements depend on the model, context length, and concurrency. Add
 `--host-moe-layers auto` when the model needs additional system RAM. Supported models can
 also use MTP across multiple GPUs if their checkpoints include the required draft weights.

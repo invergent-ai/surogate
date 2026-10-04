@@ -16,14 +16,19 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <cuda_runtime.h>
 #include <cstdlib>
@@ -130,6 +135,98 @@ ThroughputReport make_throughput_report(const sinfer::RuntimeStats& previous,
     };
 }
 
+/// Runs `action` on every engine in `targets` -- the primary's data-parallel replicas, or one
+/// extra -- at once (each moves its own memory over its own link), and rethrows the first
+/// failure once every engine has finished, so one failing replica does not leave the rest
+/// untried.
+template <typename Action>
+void on_every_engine(const std::vector<GenerationService*>& targets, const Action& action) {
+    if (targets.size() == 1) {
+        action(*targets.front());
+        return;
+    }
+    std::vector<std::future<void>> runs;
+    runs.reserve(targets.size());
+    for (GenerationService* target : targets) {
+        runs.push_back(std::async(std::launch::async, [&action, target] { action(*target); }));
+    }
+    std::exception_ptr failure;
+    for (auto& run : runs) {
+        try {
+            run.get();
+        } catch (...) {
+            if (!failure) { failure = std::current_exception(); }
+        }
+    }
+    if (failure) { std::rethrow_exception(failure); }
+}
+
+/// Loads (or replaces) adapter `name` on every engine in `targets` -- the primary's data-parallel
+/// replicas, or one extra -- at once: an update waits for each engine's admitted requests to let
+/// go of the adapter, and those waits overlap instead of adding up. If any engine fails, an
+/// adapter that was new is unloaded again from the engines that took it, so the replicas never
+/// disagree about whether it exists, and the first failure is rethrown as it was raised.
+void load_lora_adapter_everywhere(const std::vector<GenerationService*>& targets,
+                                  const std::string& name, const std::string& path) {
+    if (targets.size() == 1) {
+        targets.front()->load_lora_adapter(name, path);
+        return;
+    }
+    std::vector<bool> existed(targets.size());
+    for (std::size_t i = 0; i < targets.size(); ++i) { existed[i] = targets[i]->lora_slot(name) >= 0; }
+    std::vector<std::atomic<bool>> loaded(targets.size());
+    std::exception_ptr failure;
+    try {
+        on_every_engine(targets, [&](GenerationService& target) {
+            target.load_lora_adapter(name, path);
+            const auto at = std::find(targets.begin(), targets.end(), &target) - targets.begin();
+            loaded[static_cast<std::size_t>(at)].store(true);
+        });
+        return;
+    } catch (...) { failure = std::current_exception(); }
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        if (loaded[i] && !existed[i]) {
+            try {
+                targets[i]->unload_lora_adapter(name);
+            } catch (const std::exception& e) {
+                write_console_log(ConsoleLogLevel::Warning,
+                                  "lora: adapter '" + name + "' could not be rolled back on replica " +
+                                      std::to_string(i) + ": " + e.what());
+            }
+        }
+    }
+    std::rethrow_exception(failure);
+}
+
+/// The primary's counters across its data-parallel replicas: counters and request counts add up,
+/// and the page geometry is the same on each.
+sinfer::RuntimeStats sum_runtime_stats(const std::vector<GenerationService*>& services) {
+    if (services.empty()) { return {}; }
+    sinfer::RuntimeStats total = services.front()->runtime_stats();
+    for (std::size_t i = 1; i < services.size(); ++i) {
+        const sinfer::RuntimeStats s = services[i]->runtime_stats();
+        total.computed_prefill_tokens += s.computed_prefill_tokens;
+        total.committed_decode_tokens += s.committed_decode_tokens;
+        total.decode_rounds += s.decode_rounds;
+        total.decode_row_rounds += s.decode_row_rounds;
+        total.packed_prefill_rounds += s.packed_prefill_rounds;
+        total.packed_prefill_prompts += s.packed_prefill_prompts;
+        total.running_requests += s.running_requests;
+        total.prefilling_requests += s.prefilling_requests;
+        total.decode_ready_requests += s.decode_ready_requests;
+        total.waiting_requests += s.waiting_requests;
+        total.reserving_requests += s.reserving_requests;
+        total.kv_pages_mapped += s.kv_pages_mapped;
+        total.kv_pages += s.kv_pages;
+        total.kv_pages_entitled += s.kv_pages_entitled;
+        total.kv_pages_in_use += s.kv_pages_in_use;
+        total.kv_pages_resident_at_granule += s.kv_pages_resident_at_granule;
+        total.admission_unblocked_heads += s.admission_unblocked_heads;
+        total.device_oom_rounds += s.device_oom_rounds;
+    }
+    return total;
+}
+
 bool report_has_activity(const ThroughputReport& report) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
            report.decode_rounds != 0 || report.scheduler.running_requests != 0 ||
@@ -169,6 +266,11 @@ HttpPoolSizes http_pool_sizes(const ServeOptions& options) {
     // request which gets a worker is then admitted or refused with a 429 by that bound.
     std::size_t serving =
         static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+    // Each data-parallel replica is an engine of its own with the primary's bounds
+    // (`replica_options()`).
+    if (options.data_parallel && options.devices.size() > 1) {
+        serving *= options.devices.size();
+    }
     for (const auto& extra : options.extra_models) {
         serving += (extra.max_num_seqs != 0 ? extra.max_num_seqs : options.max_concurrency)
                    + static_cast<std::size_t>(options.max_pending_requests);
@@ -304,7 +406,8 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    sinfer::RuntimeStats previous   = service_->runtime_stats();
+    // One line for the primary model, summed over its data-parallel replicas.
+    sinfer::RuntimeStats previous   = sum_runtime_stats(replicas_);
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
 
@@ -314,7 +417,7 @@ void HttpServer::run_stats_reporter() {
             if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
         }
 
-        const sinfer::RuntimeStats current = service_->runtime_stats();
+        const sinfer::RuntimeStats current = sum_runtime_stats(replicas_);
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -323,7 +426,7 @@ void HttpServer::run_stats_reporter() {
         previous_time = now;
     }
 
-    const sinfer::RuntimeStats current = service_->runtime_stats();
+    const sinfer::RuntimeStats current = sum_runtime_stats(replicas_);
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -516,7 +619,7 @@ void HttpServer::register_routes() {
             return;
         }
         try {
-            routed_management_service(req).sleep();
+            on_every_engine(routed_management_services(req), [](GenerationService& target) { target.sleep(); });
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(e.what(), "text/plain");
@@ -527,7 +630,7 @@ void HttpServer::register_routes() {
     });
     server_.Post("/wake_up", [this](const httplib::Request& req, httplib::Response& res) {
         try {
-            routed_management_service(req).wake_up();
+            on_every_engine(routed_management_services(req), [](GenerationService& target) { target.wake_up(); });
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(e.what(), "text/plain");
@@ -537,9 +640,12 @@ void HttpServer::register_routes() {
         res.set_content("{\"is_sleeping\": false}", "application/json");
     });
     server_.Get("/is_sleeping", [this](const httplib::Request& req, httplib::Response& res) {
-        res.set_content(routed_management_service(req).is_sleeping()
-                            ? "{\"is_sleeping\": true}"
-                            : "{\"is_sleeping\": false}",
+        // Asleep only once every replica is: a caller waiting to reuse the memory must not
+        // proceed while one still holds it.
+        const auto targets = routed_management_services(req);
+        const bool asleep  = std::all_of(targets.begin(), targets.end(),
+                                         [](const GenerationService* target) { return target->is_sleeping(); });
+        res.set_content(asleep ? "{\"is_sleeping\": true}" : "{\"is_sleeping\": false}",
                         "application/json");
     });
 
@@ -571,7 +677,8 @@ void HttpServer::register_routes() {
             return;
         }
         try {
-            GenerationService& target = routed_management_service(req);
+            const std::vector<GenerationService*> targets = routed_management_services(req);
+            GenerationService& target = *targets.front();
             std::lock_guard namespace_lock(adapter_management_mutex_);
             // The flat namespace holds at runtime too: refuse a name any other
             // service already answers to.
@@ -587,7 +694,7 @@ void HttpServer::register_routes() {
                                                 id + "'");
                 }
             }
-            target.load_lora_adapter(name, path);
+            load_lora_adapter_everywhere(targets, name, path);
         } catch (const sinfer::RequestError& e) {
             write_error(res, request_error_to_api_error(e));
             return;
@@ -629,7 +736,8 @@ void HttpServer::register_routes() {
         }
         try {
             std::lock_guard namespace_lock(adapter_management_mutex_);
-            routed_management_service(req).unload_lora_adapter(name);
+            on_every_engine(routed_management_services(req),
+                            [&name](GenerationService& target) { target.unload_lora_adapter(name); });
         } catch (const sinfer::RequestError& e) {
             write_error(res, request_error_to_api_error(e));
             return;
@@ -706,7 +814,13 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
     };
 
     nlohmann::json models = nlohmann::json::array();
-    models.push_back(model_json(public_model_id_, *service_));
+    // Data-parallel replicas share the primary's id; each reports its own pool and says which
+    // replica it is.
+    for (std::size_t i = 0; i < replicas_.size(); ++i) {
+        nlohmann::json model = model_json(public_model_id_, *replicas_[i]);
+        if (replicas_.size() > 1) { model["replica"] = i; }
+        models.push_back(std::move(model));
+    }
     for (const auto& [name, service] : extra_services_) {
         models.push_back(model_json(name, *service));
     }
@@ -745,34 +859,41 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
         out += kind;
         out += '\n';
     };
-    const auto metric = [&out](std::string_view name, const std::string& model,
+    // `labels` is a row's label set: `model="..."`, plus `replica="N"` for a data-parallel replica.
+    const auto metric = [&out](std::string_view name, const std::string& labels,
                                std::uint64_t value) {
         out += "surogate_";
         out += name;
-        out += "{model=\"";
-        out += model;
-        out += "\"} ";
+        out += '{';
+        out += labels;
+        out += "} ";
         out += std::to_string(value);
         out += '\n';
     };
 
     struct Row {
-        std::string model;
+        std::string labels;
         sinfer::RuntimeStats stats;
         bool sleeping = false;
         std::uint64_t kv_capacity = 0;
         std::uint64_t weights_bytes = 0;
     };
     std::vector<Row> rows;
-    const auto collect = [&](const std::string& name, const GenerationService& service) {
+    const auto collect = [&](const std::string& name, const GenerationService& service,
+                             std::optional<std::size_t> replica = std::nullopt) {
         const auto found = attached_memory_.find(&service);
+        std::string labels = "model=\"" + label(name) + '"';
+        if (replica) { labels += ",replica=\"" + std::to_string(*replica) + '"'; }
         rows.push_back(Row{
-            label(name), service.runtime_stats(), service.is_sleeping(),
+            std::move(labels), service.runtime_stats(), service.is_sleeping(),
             found == attached_memory_.end() ? 0U : found->second.kv_capacity,
             found == attached_memory_.end() ? 0UL : found->second.weights.capacity_bytes,
         });
     };
-    collect(public_model_id_, *service_);
+    for (std::size_t i = 0; i < replicas_.size(); ++i) {
+        collect(public_model_id_, *replicas_[i],
+                replicas_.size() > 1 ? std::optional<std::size_t>(i) : std::nullopt);
+    }
     for (const auto& [name, service] : extra_services_) { collect(name, *service); }
 
     help("up", "gauge", "1 when the server is answering.");
@@ -784,30 +905,30 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
     // Counters first: these are what a rate() is taken over, and the two that matter are the
     // prompt tokens actually computed (prefix hits excluded) and the tokens decode committed.
     help("prefill_tokens_total", "counter", "Prompt tokens evaluated by prefill.");
-    for (const Row& r : rows) { metric("prefill_tokens_total", r.model, r.stats.computed_prefill_tokens); }
+    for (const Row& r : rows) { metric("prefill_tokens_total", r.labels, r.stats.computed_prefill_tokens); }
     help("decode_tokens_total", "counter", "Tokens committed by decode rounds.");
-    for (const Row& r : rows) { metric("decode_tokens_total", r.model, r.stats.committed_decode_tokens); }
+    for (const Row& r : rows) { metric("decode_tokens_total", r.labels, r.stats.committed_decode_tokens); }
     help("decode_rounds_total", "counter", "Decode batch executions.");
-    for (const Row& r : rows) { metric("decode_rounds_total", r.model, r.stats.decode_rounds); }
+    for (const Row& r : rows) { metric("decode_rounds_total", r.labels, r.stats.decode_rounds); }
     help("decode_rows_total", "counter", "Summed batch size over decode rounds; over rounds it is the mean batch.");
-    for (const Row& r : rows) { metric("decode_rows_total", r.model, r.stats.decode_row_rounds); }
+    for (const Row& r : rows) { metric("decode_rows_total", r.labels, r.stats.decode_row_rounds); }
     help("packed_prefill_rounds_total", "counter",
          "Prefill rounds that packed several waiting prompts while nothing was decoding.");
-    for (const Row& r : rows) { metric("packed_prefill_rounds_total", r.model, r.stats.packed_prefill_rounds); }
+    for (const Row& r : rows) { metric("packed_prefill_rounds_total", r.labels, r.stats.packed_prefill_rounds); }
     help("packed_prefill_prompts_total", "counter",
          "Prompts advanced by packed prefill rounds; over rounds it is the mean packing.");
-    for (const Row& r : rows) { metric("packed_prefill_prompts_total", r.model, r.stats.packed_prefill_prompts); }
+    for (const Row& r : rows) { metric("packed_prefill_prompts_total", r.labels, r.stats.packed_prefill_prompts); }
     help("admission_unblocked_heads_total", "counter",
          "Times the queue head was refused a lane although the admission ledger found it "
          "unblocked (KV committed to a retained GPU prefix); a benign retry.");
     for (const Row& r : rows) {
-        metric("admission_unblocked_heads_total", r.model, r.stats.admission_unblocked_heads);
+        metric("admission_unblocked_heads_total", r.labels, r.stats.admission_unblocked_heads);
     }
 
     help("requests", "gauge", "Requests in each scheduler state.");
     for (const Row& r : rows) {
         const auto state = [&](std::string_view which, std::uint64_t value) {
-            out += "surogate_requests{model=\"" + r.model + "\",state=\"";
+            out += "surogate_requests{" + r.labels + ",state=\"";
             out += which;
             out += "\"} " + std::to_string(value) + "\n";
         };
@@ -824,7 +945,7 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
     help("kv_pages", "gauge", "KV pages by kind: the pool, what is entitled, live demand, resident, mapped.");
     for (const Row& r : rows) {
         const auto pages = [&](std::string_view kind, std::uint64_t value) {
-            out += "surogate_kv_pages{model=\"" + r.model + "\",kind=\"";
+            out += "surogate_kv_pages{" + r.labels + ",kind=\"";
             out += kind;
             out += "\"} " + std::to_string(value) + "\n";
         };
@@ -835,11 +956,11 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
         pages("mapped", r.stats.kv_pages_mapped);
     }
     help("kv_page_bytes", "gauge", "Bytes in one KV page.");
-    for (const Row& r : rows) { metric("kv_page_bytes", r.model, r.stats.kv_page_bytes); }
+    for (const Row& r : rows) { metric("kv_page_bytes", r.labels, r.stats.kv_page_bytes); }
     help("kv_bytes", "gauge", "KV pool bytes by kind.");
     for (const Row& r : rows) {
         const auto bytes = [&](std::string_view kind, std::uint32_t page_count) {
-            out += "surogate_kv_bytes{model=\"" + r.model + "\",kind=\"";
+            out += "surogate_kv_bytes{" + r.labels + ",kind=\"";
             out += kind;
             out += "\"} " +
                    std::to_string(static_cast<std::uint64_t>(page_count) * r.stats.kv_page_bytes) +
@@ -851,11 +972,11 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
         bytes("mapped", r.stats.kv_pages_mapped);
     }
     help("kv_capacity_tokens", "gauge", "Tokens the KV pool was sized for.");
-    for (const Row& r : rows) { metric("kv_capacity_tokens", r.model, r.kv_capacity); }
+    for (const Row& r : rows) { metric("kv_capacity_tokens", r.labels, r.kv_capacity); }
     help("weights_bytes", "gauge", "Device bytes this model's weights occupy.");
-    for (const Row& r : rows) { metric("weights_bytes", r.model, r.weights_bytes); }
+    for (const Row& r : rows) { metric("weights_bytes", r.labels, r.weights_bytes); }
     help("sleeping", "gauge", "1 while a model's weights are released to host memory.");
-    for (const Row& r : rows) { metric("sleeping", r.model, r.sleeping ? 1U : 0U); }
+    for (const Row& r : rows) { metric("sleeping", r.labels, r.sleeping ? 1U : 0U); }
 
     res.set_content(out, "text/plain; version=0.0.4; charset=utf-8");
 }
@@ -878,9 +999,16 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 }
 
 PreparationGate HttpServer::wake_gate() {
-    if (scheduler_ == nullptr) { return {}; }
-    return [scheduler = scheduler_, service = &svc()](const PreparationControl& control) {
-        scheduler->ensure_awake(service, control);
+    // The route's reservation rides in the gate: the service runs it once it has admitted the
+    // request, when its own count takes over, and destroying the gate releases it on any path
+    // that never gets that far.
+    // Shared by every copy of the gate, so running any one of them releases it.
+    auto reservation = std::make_shared<std::shared_ptr<void>>(std::move(t_route_reservation));
+    t_route_reservation.reset();
+    if (scheduler_ == nullptr && *reservation == nullptr) { return {}; }
+    return [scheduler = scheduler_, service = &svc(), reservation](const PreparationControl& control) {
+        if (scheduler != nullptr) { scheduler->ensure_awake(service, control); }
+        reservation->reset();
     };
 }
 
@@ -898,6 +1026,7 @@ std::function<bool()> HttpServer::request_cancelled(const httplib::Request& requ
 // is exactly what preparing the prompt produces.
 void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr;
+    t_route_reservation.reset();
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -925,7 +1054,8 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
             completed.contains("messages")
                 ? parse_chat_completion_request(completed, limits)
                 : parse_completion_request(completed, limits);
-        t_routed_service = &route_model(request.model, &request.lora_adapter);
+        t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
+                                        conversation_prefix_hashes(request));
         const std::vector<sinfer::TokenId> ids =
             svc().tokenize(request, request_cancelled(req), wake_gate());
         nlohmann::json out{{"count", ids.size()},
@@ -947,6 +1077,7 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr; // keep-alive threads must not inherit a route
+    t_route_reservation.reset();
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -965,7 +1096,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         request                   = parse_chat_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
         // `model` selects a served model or one of the primary's adapters.
-        t_routed_service = &route_model(request.model, &request.lora_adapter);
+        t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
+                                        conversation_prefix_hashes(request));
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -1215,6 +1347,7 @@ static TokenDetail completion_detail(const GenerationOutcome& outcome, const Pre
 
 void HttpServer::handle_completions(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr; // keep-alive threads must not inherit a route
+    t_route_reservation.reset();
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -1232,7 +1365,8 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
-        t_routed_service          = &route_model(request.model, &request.lora_adapter);
+        t_routed_service          = &route_model(request.model, &request.lora_adapter, &req,
+                                                 conversation_prefix_hashes(request));
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -1395,11 +1529,12 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
 
 void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr; // keep-alive threads must not inherit a route
+    t_route_reservation.reset();
     const std::uint64_t req_id = ++request_seq_;
     DecisionsRequest request;
     try {
         request          = parse_decisions_request(req.body);
-        t_routed_service = &route_model(request.model, &request.lora_adapter);
+        t_routed_service = &route_model(request.model, &request.lora_adapter, &req);
     } catch (const ApiException& e) {
         // Unlike a chat request, a decisions request is fully validated here rather than in
         // preparation, so most refusals are this one: log them like any other rejection.
@@ -1522,6 +1657,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr;
+    t_route_reservation.reset();
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -1538,7 +1674,9 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         const GenerationRequest request = parse_messages_request(body, limits);
         // Match /v1/messages soft routing before constructing its wake gate.
         const auto extra = extra_services_.find(request.model);
-        if (extra != extra_services_.end()) { t_routed_service = extra->second; }
+        t_routed_service = extra != extra_services_.end()
+                               ? extra->second
+                               : &route_primary(&req, conversation_prefix_hashes(request));
         const int input_tokens          = svc().count_prompt_tokens(
             request, request_cancelled(req), wake_gate());
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
@@ -1555,6 +1693,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
 
 void HttpServer::handle_messages(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr;
+    t_route_reservation.reset();
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -1575,9 +1714,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         request = parse_messages_request(body, limits);
         request.client_request_id = request_id_of(req);
         // Soft routing: an extra's served id selects it; anything else stays on
-        // the primary, preserving this endpoint's never-404 contract.
+        // the primary (one of its replicas), preserving this endpoint's never-404 contract.
         const auto extra = extra_services_.find(request.model);
-        if (extra != extra_services_.end()) { t_routed_service = extra->second; }
+        t_routed_service = extra != extra_services_.end()
+                               ? extra->second
+                               : &route_primary(&req, conversation_prefix_hashes(request));
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -1790,7 +1931,12 @@ bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.po
 
 std::vector<std::string> HttpServer::failed_models() const {
     std::vector<std::string> failed;
-    if (service_ != nullptr && !service_->healthy()) { failed.push_back(public_model_id_); }
+    for (std::size_t i = 0; i < replicas_.size(); ++i) {
+        if (!replicas_[i]->healthy()) {
+            failed.push_back(replicas_.size() == 1 ? public_model_id_
+                                                   : public_model_id_ + " (replica " + std::to_string(i) + ")");
+        }
+    }
     for (const auto& [name, service] : extra_services_) {
         if (!service->healthy()) { failed.push_back(name); }
     }
@@ -1798,6 +1944,55 @@ std::vector<std::string> HttpServer::failed_models() const {
 }
 
 thread_local GenerationService* HttpServer::t_routed_service = nullptr;
+thread_local std::shared_ptr<void> HttpServer::t_route_reservation;
+
+void HttpServer::attach_replica(GenerationService& service) {
+    if (service_ == nullptr) { throw std::logic_error("attach the primary before its replicas"); }
+    const std::string id = resolve_public_model_id(service.options(), service.load_summary().model_id);
+    if (id != public_model_id_) {
+        throw std::logic_error("data-parallel replica serves '" + id + "', not '" + public_model_id_ + "'");
+    }
+    attached_memory_.emplace(&service, service.memory_summary());
+    replicas_.push_back(&service);
+    router_ = std::make_unique<ReplicaRouter>(
+        replicas_.size(),
+        [this](std::size_t replica) { return replicas_[replica]->active_requests(); },
+        [this](std::size_t replica) {
+            return replicas_[replica]->healthy() && !replicas_[replica]->is_sleeping();
+        });
+}
+
+bool HttpServer::is_primary_replica(const GenerationService* service) const {
+    return std::find(replicas_.begin(), replicas_.end(), service) != replicas_.end();
+}
+
+GenerationService& HttpServer::route_primary(const httplib::Request* http,
+                                             const std::vector<std::uint64_t>& prefixes) {
+    if (router_ == nullptr) { return *service_; }
+    // vLLM's data-parallel pin: a client that keeps its own affinity (one rank per rollout)
+    // names the replica outright.
+    const std::string rank =
+        http != nullptr ? http->get_header_value("X-data-parallel-rank") : std::string();
+    ReplicaRouter::Route route;
+    if (rank.empty()) {
+        route = router_->pick(prefixes);
+    } else {
+        std::size_t replica = 0;
+        const auto [end, error] = std::from_chars(rank.data(), rank.data() + rank.size(), replica);
+        if (error != std::errc() || end != rank.data() + rank.size() || replica >= replicas_.size()) {
+            ApiError api_error;
+            api_error.status  = 400;
+            api_error.type    = "invalid_request_error";
+            api_error.code    = "invalid_data_parallel_rank";
+            api_error.message = "X-data-parallel-rank must be a replica index below " +
+                                std::to_string(replicas_.size()) + ", got '" + rank + "'";
+            throw ApiException(std::move(api_error));
+        }
+        route = router_->pin(replica, prefixes);
+    }
+    t_route_reservation = std::move(route.reservation);
+    return *replicas_[route.replica];
+}
 
 void HttpServer::attach_extra(GenerationService& service) {
     const sinfer::LoadSummary load = service.load_summary();
@@ -1816,6 +2011,12 @@ void HttpServer::attach_extra(GenerationService& service) {
     extra_services_.emplace(id, &service);
 }
 
+std::vector<GenerationService*> HttpServer::routed_management_services(const httplib::Request& req) {
+    GenerationService& target = routed_management_service(req);
+    if (&target == service_) { return replicas_; }
+    return {&target};
+}
+
 GenerationService& HttpServer::routed_management_service(const httplib::Request& req) {
     const std::string model = req.get_param_value("model");
     if (model.empty()) { return *service_; }
@@ -1825,16 +2026,18 @@ GenerationService& HttpServer::routed_management_service(const httplib::Request&
     throw std::invalid_argument("unknown model '" + model + "'");
 }
 
-GenerationService& HttpServer::route_model(const std::string& model, std::string* lora_adapter) {
-    if (model == public_model_id_) { return *service_; }
+GenerationService& HttpServer::route_model(const std::string& model, std::string* lora_adapter,
+                                          const httplib::Request* http,
+                                          const std::vector<std::uint64_t>& prefixes) {
+    if (model == public_model_id_) { return route_primary(http, prefixes); }
     const auto extra = extra_services_.find(model);
     if (extra != extra_services_.end()) { return *extra->second; }
     // Adapter names share one flat namespace across every service (uniqueness
     // is enforced at startup and at runtime load), so the first owner is the
-    // only owner.
+    // only owner. The primary's replicas all hold the primary's adapters.
     if (service_->lora_slot(model) >= 0) {
         if (lora_adapter != nullptr) { *lora_adapter = model; }
-        return *service_;
+        return route_primary(http, prefixes);
     }
     for (auto& [name, service] : extra_services_) {
         if (service->lora_slot(model) >= 0) {
@@ -1863,6 +2066,7 @@ void HttpServer::attach(GenerationService& service) {
     }
     public_model_id_               = id;
     service_                       = &service;
+    replicas_                      = {&service};
     const sinfer::MemorySummary memory = service.memory_summary();
     device_                            = memory.device;
     attached_memory_.emplace(&service, memory);

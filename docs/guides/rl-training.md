@@ -875,6 +875,13 @@ Key orchestrator settings:
 | `client.elastic.port`          | `8000`                         | Port for elastic pool servers           |
 | `client.elastic.sync_interval` | `5.0`                          | Discovery re-check interval (seconds)   |
 
+To roll out on several GPUs with a model that fits one, serve it once with
+`surogate serve <model> --devices 0,1,... --data-parallel` and give that one URL, or start one
+server per GPU and list every URL in `client.base_url`. Either way, each GPU runs a whole copy
+of the model. A `--devices` server without `--data-parallel` is a pipeline, which is for models
+too large for one GPU and is many times slower for rollouts
+([Pipeline or data-parallel](../inference/cli.md#pipeline-or-data-parallel)).
+
 **Buffer** (`buffer.*`):
 
 | Key                                  | Default              | Description                                             |

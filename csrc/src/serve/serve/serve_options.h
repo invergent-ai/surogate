@@ -104,6 +104,11 @@ struct ServeOptions {
     std::uint32_t gemma_image_tokens = 0;
     int device                             = 0;
     std::vector<int> devices;                    // --devices a,b,c (pipeline stages, in order)
+    /// --data-parallel: with --devices, one whole engine per listed GPU instead of a layer
+    /// pipeline across them, every one serving the same model id; requests are spread over them
+    /// (serve/replica_router.h). For a model that fits one GPU this is the throughput layout: a
+    /// pipeline gives each round to one stage at a time and leaves the other cards idle.
+    bool data_parallel = false;
     KvCacheStorage kv_cache                = KvCacheStorage::Auto;
     std::vector<std::uint32_t> kv_cache_skip_layers;
     bool elastic_kv          = true;  // default; --no-elastic-kv puts the Main KV planes in the arena
@@ -176,6 +181,9 @@ struct ServeOptions {
 
 ServeOptions parse_serve_options(int argc, char** argv);
 ServeOptions extra_model_options(const ServeOptions& primary, const ServeOptions::ExtraModel& extra);
+/// The options of data-parallel replica `replica` of the primary model: the primary's, on
+/// `primary.devices[replica]` alone.
+ServeOptions replica_options(const ServeOptions& primary, std::size_t replica);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);

@@ -259,6 +259,39 @@ int main() {
                                    "--model", "other=other.sinfer"});
     failures += check(sinfer::serve::extra_model_options(inherited_placement, inherited_placement.extra_models[0]).devices ==
                           inherited_placement.devices, "extra model did not inherit device placement");
+    failures += check(!inherited_placement.data_parallel, "--devices alone did not keep the pipeline layout");
+
+    // --data-parallel: one whole replica per listed GPU, each on its own card.
+    const auto replicated = parse({"sinfer-serve", "model.sinfer", "--devices", "4,1,6", "--data-parallel",
+                                   "--model", "other=other.sinfer,device=2"});
+    failures += check(replicated.data_parallel && replicated.devices == std::vector<int>({4, 1, 6}),
+                      "--data-parallel was not parsed");
+    bool replicas_placed = true;
+    for (std::size_t i = 0; i < replicated.devices.size(); ++i) {
+        const auto replica_i = sinfer::serve::replica_options(replicated, i);
+        replicas_placed &= replica_i.device == replicated.devices[i] && replica_i.devices.empty() &&
+                           !replica_i.data_parallel && replica_i.extra_models.empty() &&
+                           replica_i.model_id_override == replicated.model_id_override;
+    }
+    failures += check(replicas_placed, "a data-parallel replica was not placed alone on its GPU");
+    failures += check(!sinfer::serve::extra_model_options(replicated, replicated.extra_models[0]).data_parallel,
+                      "an extra model inherited --data-parallel");
+    bool out_of_range = false;
+    try { (void)sinfer::serve::replica_options(replicated, 3); } catch (const std::logic_error&) { out_of_range = true; }
+    failures += check(out_of_range, "replica_options accepted a replica past the device list");
+    for (const std::vector<std::string>& invalid : std::vector<std::vector<std::string>>{
+             {"sinfer-serve", "model.sinfer", "--data-parallel"},
+             {"sinfer-serve", "model.sinfer", "--devices", "0", "--data-parallel"},
+             {"sinfer-serve", "model.sinfer", "--devices", "0,1", "--data-parallel", "--model", "x=m.sinfer"},
+             {"sinfer-serve", "model.sinfer", "--devices", "0,1", "--data-parallel", "--enable-sleep-mode",
+              "--model", "x=m.sinfer,device=2"}}) {
+        bool rejected = false;
+        try { (void)parse(invalid); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid --data-parallel configuration was accepted");
+    }
+    failures += check(parse({"sinfer-serve", "model.sinfer", "--devices", "0,1", "--data-parallel",
+                             "--enable-sleep-mode"}).data_parallel,
+                      "--data-parallel with sleep mode and no extras was refused");
     for (bool enabled : {false, true}) {
         for (bool startup_adapter : {false, true}) {
             auto primary = defaults;

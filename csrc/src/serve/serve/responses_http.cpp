@@ -129,6 +129,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         request.generation.client_request_id =
             client_request_id(req.get_header_value(std::string(kClientRequestIdHeader)));
         t_routed_service = nullptr;
+        t_route_reservation.reset();
         if (request.generation.model != public_model_id_) {
             const auto extra = extra_services_.find(request.generation.model);
             if (extra == extra_services_.end()) {
@@ -136,6 +137,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             } else {
                 t_routed_service = extra->second;
             }
+        }
+        if (t_routed_service == nullptr) {
+            t_routed_service = &route_primary(&req, conversation_prefix_hashes(request.generation));
         }
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
@@ -288,6 +292,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
         t_routed_service = nullptr;
+        t_route_reservation.reset();
         if (request.generation.model != public_model_id_) {
             const auto extra = extra_services_.find(request.generation.model);
             if (extra == extra_services_.end()) {
@@ -295,6 +300,9 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
             } else {
                 t_routed_service = extra->second;
             }
+        }
+        if (t_routed_service == nullptr) {
+            t_routed_service = &route_primary(&req, conversation_prefix_hashes(request.generation));
         }
         const int tokens =
             svc().count_prompt_tokens(request.generation, request_cancelled(req), wake_gate());
