@@ -1688,6 +1688,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             }
         }
         CUDA_CHECK(cudaGraphLaunch(gs.graph_exec, rs.MainStream));
+        if (auto* wm = dsl_model->weight_manager()) {
+            wm->after_graph_launch(rs.MainStream);
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Refresh loss/norm on host after full-step graph launch.

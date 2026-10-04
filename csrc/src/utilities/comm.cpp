@@ -1114,6 +1114,7 @@ private:
     std::shared_ptr<SharedState> mShare;
     int mLocalRank;
     bool mAllGatherUseMemcpy = false;
+    bool mGatherUseMemcpy = false;  ///< This transaction's choice: false inside a CUDA graph capture
     bool mSendRecvUseMemcpy = true;
 
     // transaction status
@@ -1347,7 +1348,7 @@ void NCCLCommunicatorImpl::recv(std::byte* tgt, int peer, std::size_t size) {
 }
 
 void NCCLCommunicatorImpl::gather_weight(const std::byte* src, std::byte* tgt, std::size_t size) {
-    if (mAllGatherUseMemcpy) {
+    if (mGatherUseMemcpy) {
         auto wgt_list = host_all_gather(src);
         std::size_t shard_size = size / world_size();
         for (int i = 0; i < world_size(); ++i) {
@@ -1364,6 +1365,21 @@ void NCCLCommunicatorImpl::gather_weight(const std::byte* src, std::byte* tgt, s
 void NCCLCommunicatorImpl::on_execute_transaction(const NCCLCommunicator::CommandBuffer& cmd) {
     mUseMemcpy = false;
     mUseNCCL = false;
+    // The memcpy all-gather makes this rank's comm stream wait on the ready events of the other
+    // ranks, each recorded in that rank's own capture when the step is a CUDA graph (ZeRO-3 under
+    // train_step_graphed), and a capture cannot depend on another capture. Inside a capture the
+    // gather goes through NCCL instead, which captures. Waiting on our own ready event pulls the
+    // comm stream into the capture it was recorded in, if any, which is how we tell. Every rank
+    // captures the same step, so they all take the same path.
+    mGatherUseMemcpy = mAllGatherUseMemcpy;
+    if (mAllGatherUseMemcpy && std::any_of(cmd.Commands.begin(), cmd.Commands.end(), [](const auto& c) {
+            return std::holds_alternative<CommandBuffer::Gather>(c);
+        })) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream(), cmd.Ready, 0));
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream(), &status));
+        mGatherUseMemcpy = status == cudaStreamCaptureStatusNone;
+    }
     for (auto& c : cmd.Commands) {
         if (std::holds_alternative<CommandBuffer::ScatterReduce>(c)) {
             mUseNCCL = true;
@@ -1372,8 +1388,8 @@ void NCCLCommunicatorImpl::on_execute_transaction(const NCCLCommunicator::Comman
             mUseNCCL = true;
         }
         if (std::holds_alternative<CommandBuffer::Gather>(c)) {
-            if (!mAllGatherUseMemcpy) mUseNCCL = true;
-            if (mAllGatherUseMemcpy) mUseMemcpy = true;
+            if (!mGatherUseMemcpy) mUseNCCL = true;
+            if (mGatherUseMemcpy) mUseMemcpy = true;
         }
         if (std::holds_alternative<CommandBuffer::Send>(c)) {
             if (!mSendRecvUseMemcpy) mUseNCCL = true;

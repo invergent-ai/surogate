@@ -992,12 +992,20 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
 }
 
 void DslWeightManager::begin_capture(cudaStream_t stream) {
+    // A layer left resident by the eager warmup would otherwise be read in place by the captured
+    // forward, which replays after every optimizer step with the stale slot.
+    reset_gathers(stream);
+}
+
+void DslWeightManager::after_graph_launch(cudaStream_t stream) {
+    reset_gathers(stream);
+}
+
+void DslWeightManager::reset_gathers(cudaStream_t stream) {
     if (!mStreamWeights && !mConfig.offload_master) {
         return;
     }
     for (auto& status : mPrefetchStatus) {
-        // A layer left resident by the eager warmup would otherwise be read in place by the
-        // captured forward, which replays after every optimizer step with the stale slot.
         status.layer_idx = -1;
         status.version = -1;
         status.fetch_pending = false;
