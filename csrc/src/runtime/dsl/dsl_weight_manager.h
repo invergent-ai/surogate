@@ -261,7 +261,32 @@ public:
     /// (<= max_bytes).
     std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
 
+    /// Free, before the Persistent arena is allocated, every tensor rebind_to_persistent_arena()
+    /// will move into its `max_bytes` slab, while nothing has been written to them (the first
+    /// compile runs before import_weights). The rebind then binds them in place instead of
+    /// copying uninitialised bytes. Without this the peak holds the device masters, work copies
+    /// and prefetch slots twice, the per-tensor allocations plus the slab: under ZeRO-3 or with
+    /// FP32 masters that is the order of the weights. Returns the bytes released.
+    std::size_t release_storage_for_persistent_arena(std::size_t max_bytes);
+    /// Re-allocate what release_storage_for_persistent_arena() freed (the arena allocation failed).
+    void restore_released_storage();
+    /// Weight contents were written: from now on a rebind must copy them.
+    void mark_contents_valid() {
+        mContentsValid = true;
+    }
+
 private:
+    /// A device buffer released for the Persistent arena: its slot in the slab, and what restoring
+    /// it re-allocates.
+    struct ArenaStorage {
+        std::size_t offset = 0;
+        std::size_t bytes = 0;
+        std::string name;
+    };
+    std::vector<ArenaStorage> mArenaStorages;                  ///< In slab order
+    std::vector<std::pair<Tensor*, std::size_t>> mArenaUsers;  ///< Each tensor on a released buffer, and its index
+    bool mContentsValid = false;
+
     // Names of masters backed by the cross-GPU SharedMasterStore (frozen offloaded base).
     std::unordered_set<std::string> mSharedMasterNames;
 

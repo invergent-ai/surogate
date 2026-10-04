@@ -1182,6 +1182,7 @@ const std::vector<std::string>& DslWeightManager::block_param_names(int layer_id
 }
 
 void DslWeightManager::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
+    mContentsValid = true;  // the callback may write (load_safetensors)
     for (const auto& name : mParamOrder) {
         auto it = mWeights.find(name);
         if (it == mWeights.end()) continue;
@@ -1264,11 +1265,93 @@ int DslWeightManager::prefetch_slot_count() const {
     return (mStreamWeights || mConfig.offload_master) ? mNumPrefetchBuffers : 0;
 }
 
+std::size_t DslWeightManager::release_storage_for_persistent_arena(std::size_t max_bytes) {
+    if (mContentsValid || !mArenaStorages.empty() || max_bytes == 0) return 0;
+
+    // Lay the slab out before freeing anything, in the rebind's order. Tensors on one buffer (a
+    // master that is its own work copy, the layers sharing a prefetch buffer, the shared
+    // embedding/lm_head staging buffer) share its slot.
+    std::vector<std::byte*> storage_data;
+    std::unordered_map<const std::byte*, std::size_t> storage_index;
+    std::size_t cursor = 0;
+    auto plan = [&](Tensor& t, std::string name) {
+        if (!is_device_resident(t)) return;
+        auto it = storage_index.find(t.Data);
+        if (it == storage_index.end()) {
+            const std::size_t bytes = tensor_storage_bytes(t);
+            if (bytes == 0) return;
+            cursor = align_up_bytes(cursor, 256);
+            it = storage_index.emplace(t.Data, mArenaStorages.size()).first;
+            mArenaStorages.push_back({cursor, bytes, std::move(name)});
+            storage_data.push_back(t.Data);
+            cursor += bytes;
+        }
+        mArenaUsers.emplace_back(&t, it->second);
+    };
+    for (const auto& name : mParamOrder) {
+        auto it = mWeights.find(name);
+        if (it == mWeights.end()) continue;
+        plan(it->second.master, name);
+        plan(it->second.work, name + "_work");
+    }
+    for (std::size_t i = 0; i < mPrefetchBuffers.size(); ++i) {
+        for (auto& kv : mPrefetchBuffers[i]) {
+            plan(kv.second, "prefetch_" + std::to_string(i) + "_" + kv.first);
+        }
+    }
+    if (cursor > max_bytes) {
+        // Leave everything in place: the rebind reports the shortfall.
+        mArenaStorages.clear();
+        mArenaUsers.clear();
+        return 0;
+    }
+
+    for (auto& [tensor, index] : mArenaUsers) {
+        tensor->Data = nullptr;  // Device and Stats stay; the rebind restores Data
+    }
+    std::size_t released = 0;
+    for (std::size_t i = 0; i < storage_data.size(); ++i) {
+        Tensor storage{};
+        storage.Data = storage_data[i];
+        mAllocator->free(storage);
+        released += mArenaStorages[i].bytes;
+    }
+    return released;
+}
+
+void DslWeightManager::restore_released_storage() {
+    if (mArenaStorages.empty()) return;
+    std::vector<std::byte*> data;
+    data.reserve(mArenaStorages.size());
+    for (const auto& storage : mArenaStorages) {
+        data.push_back(mAllocator
+                           ->allocate(ETensorDType::BYTE,
+                                      storage.name.c_str(),
+                                      EAllocationType::ON_DEVICE,
+                                      {static_cast<long>(storage.bytes)})
+                           .Data);
+    }
+    for (auto& [tensor, index] : mArenaUsers) {
+        tensor->Data = data[index];
+    }
+    mArenaStorages.clear();
+    mArenaUsers.clear();
+}
+
 std::size_t
 DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream) {
-    if (arena_base == nullptr || max_bytes == 0) return 0;
+    if (arena_base == nullptr || max_bytes == 0) {
+        restore_released_storage();
+        return 0;
+    }
 
-    std::size_t cursor = 0;
+    // Released tensors keep the slots release_storage_for_persistent_arena() gave them, at the
+    // front of the slab; anything still in its own storage is copied in after them.
+    std::size_t cursor = mArenaStorages.empty() ? 0 : mArenaStorages.back().offset + mArenaStorages.back().bytes;
+    if (cursor > max_bytes) {
+        throw std::logic_error("DslWeightManager::rebind_to_persistent_arena: released tensors need " +
+                               std::to_string(cursor) + " bytes, slab is " + std::to_string(max_bytes));
+    }
     std::size_t rebound_master = 0;
     std::size_t rebound_work = 0;
     std::size_t skipped_offloaded = 0;
@@ -1351,14 +1434,24 @@ DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t 
         }
     }
 
+    // Released before the arena existed, with nothing written yet: bind in place. These were
+    // null above, so the copy loop left them alone.
+    const std::size_t bound_in_place = mArenaStorages.size();
+    for (auto& [tensor, index] : mArenaUsers) {
+        tensor->Data = arena_base + mArenaStorages[index].offset;
+    }
+    mArenaStorages.clear();
+    mArenaUsers.clear();
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
             std::cerr << "[arena-consume dsl_wm_persistent] rebound_master=" << rebound_master
                       << " rebound_work=" << rebound_work << " rebound_prefetch=" << rebound_prefetch
-                      << " skipped_offloaded=" << skipped_offloaded << " skipped_streaming=" << skipped_streaming
-                      << " bytes_used=" << cursor << " slab_bytes=" << max_bytes << "\n";
+                      << " bound_in_place=" << bound_in_place << " skipped_offloaded=" << skipped_offloaded
+                      << " skipped_streaming=" << skipped_streaming << " bytes_used=" << cursor
+                      << " slab_bytes=" << max_bytes << "\n";
         }
     }
 

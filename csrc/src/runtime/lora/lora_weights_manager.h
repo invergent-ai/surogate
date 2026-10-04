@@ -193,6 +193,15 @@ public:
     /// actual bytes consumed (<= max_bytes).
     std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
 
+    /// Free, before the Persistent arena is allocated, every adapter tensor
+    /// rebind_to_persistent_arena() will move into its `max_bytes` slab, while none has been
+    /// written yet (the first compile runs before random_init or an adapter import). The rebind
+    /// then binds them in place instead of copying uninitialised bytes, so the peak holds the
+    /// adapters once. Returns the bytes released.
+    std::size_t release_storage_for_persistent_arena(std::size_t max_bytes);
+    /// Re-allocate what release_storage_for_persistent_arena() freed (the arena allocation failed).
+    void restore_released_storage();
+
     // ITensorContainer interface
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
@@ -226,6 +235,14 @@ private:
     // the first sync.
     std::uint64_t mSyncGeneration = 1;
     std::vector<std::uint64_t> mBlockSyncGen;  // Per-block last-synced generation
+
+    /// An adapter tensor released for the Persistent arena, and its slot in the slab.
+    struct ArenaPending {
+        Tensor* tensor = nullptr;
+        std::size_t offset = 0;
+    };
+    std::vector<ArenaPending> mArenaPending;  ///< In slab order
+    bool mContentsValid = false;              ///< Adapters were written: from now on a rebind must copy
 
     void allocate_layer_weights(LoRALayerWeights<TensorShard>& shard,
                                 LoRALayerWeights<Tensor>& work,

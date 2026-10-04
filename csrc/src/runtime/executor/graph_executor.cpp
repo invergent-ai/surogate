@@ -1432,15 +1432,29 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 if (mPhaseArenas.accumulator_bytes > 0) {
                     mPhaseArenas.accumulator_bytes = mGrads.rebindable_accumulator_bytes(*mCompiledBackward);
                 }
-                // The parameters' own storage goes before the arena that replaces it is allocated
-                // (nothing is loaded at the first compile), so the peak holds the weights once.
+                // Each owner's storage goes before the arena that replaces it is allocated (nothing
+                // is loaded or computed at the first compile), so the peak holds it once: the
+                // parameters, the weight manager's masters, work copies and prefetch slots, the
+                // LoRA adapters and the gradients.
                 if (base_persistent_bytes > 0) {
                     mWeights.release_storage_for_persistent_arena(*mCompiledForward, mPhaseArenas.persistent_bytes);
+                }
+                if (mWeightManager && wm_slab_bytes > 0) {
+                    mWeightManager->release_storage_for_persistent_arena(wm_slab_bytes);
+                }
+                if (mLoRAWeights && lora_slab_bytes > 0) {
+                    mLoRAWeights->release_storage_for_persistent_arena(lora_slab_bytes);
+                }
+                if (mPhaseArenas.accumulator_bytes > 0) {
+                    mGrads.release_storage_for_accumulator_arena(*mCompiledBackward, mPhaseArenas.accumulator_bytes);
                 }
                 try {
                     dsl::allocate_phase_arenas(mPhaseArenas);
                 } catch (...) {
                     mWeights.restore_released_storage();
+                    if (mWeightManager) mWeightManager->restore_released_storage();
+                    if (mLoRAWeights) mLoRAWeights->restore_released_storage();
+                    mGrads.restore_released_storage();
                     throw;
                 }
                 // Shadow coverage report: of the tids the arena plan claims,

@@ -369,6 +369,7 @@ void ModularLoRAWeightsManager::allocate_expert_weights(LoRAExpertWeights<Tensor
 
 void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
     if (!enabled()) return;
+    mContentsValid = true;
 
     auto init_layer =
         [&](std::optional<LoRALayerWeights<TensorShard>>& layer, int in_features, unsigned long long subsequence) {
@@ -454,6 +455,7 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
 
 void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, NCCLCommunicator& comm) {
     if (!enabled()) return;
+    mContentsValid = true;
     // Every adapter tensor this trainer allocated must come from the file. Loading is by name and skips
     // what the file lacks, so an adapter with fewer modules (e.g. a Qwen3.5-family adapter from before
     // linear-attention LoRA) used to import "successfully" with the missing adapters left at their fresh
@@ -866,13 +868,64 @@ std::size_t ModularLoRAWeightsManager::total_persistent_bytes() const {
     return total;
 }
 
+std::size_t ModularLoRAWeightsManager::release_storage_for_persistent_arena(std::size_t max_bytes) {
+    if (!enabled() || mContentsValid || !mArenaPending.empty() || max_bytes == 0) return 0;
+
+    // Lay the slab out before freeing anything, in the rebind's order.
+    std::size_t cursor = 0;
+    auto plan = [&](auto& tensor) {
+        const std::size_t bytes = tensor.bytes();
+        if (bytes == 0) return;
+        cursor = align_up_bytes(cursor, 256);
+        mArenaPending.push_back({&tensor, cursor});
+        cursor += bytes;
+    };
+    for_each_lora_tensor(mMaster, plan);
+    for_each_lora_tensor(mWork, plan);
+    if (cursor > max_bytes) {
+        // Leave everything in place: the rebind reports the shortfall.
+        mArenaPending.clear();
+        return 0;
+    }
+
+    std::size_t released = 0;
+    for (const auto& pending : mArenaPending) {
+        Tensor& tensor = *pending.tensor;
+        released += tensor.bytes();
+        float* preserved_stats = tensor.Stats;
+        const int device = tensor.Device;
+        mAllocator->free(tensor);  // clears Data
+        tensor.Device = device;
+        tensor.Stats = preserved_stats;
+    }
+    return released;
+}
+
+void ModularLoRAWeightsManager::restore_released_storage() {
+    for (const auto& pending : mArenaPending) {
+        Tensor& tensor = *pending.tensor;
+        std::vector<long> shape(tensor.Sizes.begin(), tensor.Sizes.begin() + tensor.Rank);
+        tensor.Data = mAllocator->allocate(tensor.DType, "lora_adapter", EAllocationType::ON_DEVICE, shape).Data;
+    }
+    mArenaPending.clear();
+}
+
 std::size_t ModularLoRAWeightsManager::rebind_to_persistent_arena(std::byte* arena_base,
                                                                   std::size_t max_bytes,
                                                                   cudaStream_t stream) {
     if (!enabled()) return 0;
-    if (arena_base == nullptr || max_bytes == 0) return 0;
+    if (arena_base == nullptr || max_bytes == 0) {
+        restore_released_storage();
+        return 0;
+    }
 
-    std::size_t cursor = 0;
+    // Released tensors keep the slots release_storage_for_persistent_arena() gave them, at the
+    // front of the slab; anything still in its own storage is copied in after them.
+    std::size_t cursor = mArenaPending.empty() ? 0 : mArenaPending.back().offset + mArenaPending.back().tensor->bytes();
+    if (cursor > max_bytes) {
+        throw std::logic_error("ModularLoRAWeightsManager::rebind_to_persistent_arena: released tensors need " +
+                               std::to_string(cursor) + " bytes, slab is " + std::to_string(max_bytes));
+    }
     std::size_t rebound = 0;
 
     auto rebind_tensor = [&](auto& tensor) {
@@ -900,12 +953,20 @@ std::size_t ModularLoRAWeightsManager::rebind_to_persistent_arena(std::byte* are
     for_each_lora_tensor(mMaster, rebind_tensor);
     for_each_lora_tensor(mWork, rebind_tensor);
 
+    // Released before the arena existed, with nothing written yet: bind in place. These were
+    // null above, so the copy walk skipped them.
+    const std::size_t bound_in_place = mArenaPending.size();
+    for (const auto& pending : mArenaPending) {
+        pending.tensor->Data = arena_base + pending.offset;
+    }
+    mArenaPending.clear();
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     if (const char* dbg = std::getenv("SUROGATE_DEBUG_ARENA_CONSUME")) {
         if (std::string(dbg) == "1") {
-            std::cerr << "[arena-consume lora_persistent] rebound=" << rebound << " bytes_used=" << cursor
-                      << " slab_bytes=" << max_bytes << "\n";
+            std::cerr << "[arena-consume lora_persistent] rebound=" << rebound << " bound_in_place=" << bound_in_place
+                      << " bytes_used=" << cursor << " slab_bytes=" << max_bytes << "\n";
         }
     }
 
@@ -925,6 +986,7 @@ std::array<std::string, 4> ModularLoRAWeightsManager::attention_names(int layer)
 
 void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
     if (!enabled()) return;
+    mContentsValid = true;  // the callback may write (a checkpoint load)
 
     for (int l = 0; l < (int)mMaster.blocks.size(); ++l) {
         const std::string prefix = layer_prefix(l);

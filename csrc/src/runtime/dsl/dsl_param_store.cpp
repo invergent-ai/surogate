@@ -398,6 +398,11 @@ void DslParamStore::restore_released_storage() {
     }
 }
 
+void DslParamStore::mark_contents_valid() {
+    mContentsValid = true;
+    if (mWeightManager) mWeightManager->mark_contents_valid();
+}
+
 void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
                                                const PhaseArenas& arenas,
                                                cudaStream_t stream) {
