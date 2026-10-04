@@ -826,6 +826,20 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
                 }
             }
 
+            // Only the parameter-gradient ops from the first non-capturable op on move to the tail. Those
+            // before it stay where autodiff put them, inside their layer: per-layer gradient streaming
+            // (cpu_training, offloaded gradients) hands a layer's gradients off at the layer's end, so an
+            // op that finishes a layer's gradient (e.g. the view of a conv weight's gradient back to the
+            // weight's shape) must run before it. Moved to the tail, it wrote after the hand-off and the
+            // gradient was lost.
+            std::size_t first_noncapturable = 0;
+            while (!noncapturable[first_noncapturable]) {
+                ++first_noncapturable;
+            }
+            for (std::size_t idx = 0; idx < first_noncapturable; ++idx) {
+                core[idx] = 1;
+            }
+
             std::size_t tail_count = 0;
             for (std::size_t idx = 0; idx < op_count; ++idx) {
                 if (!core[idx]) {

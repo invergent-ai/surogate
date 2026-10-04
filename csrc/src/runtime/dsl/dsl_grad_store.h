@@ -246,6 +246,7 @@ private:
         cudaEvent_t d2h_done = nullptr;      ///< D2H copy complete (safe to reuse)
         cudaEvent_t compute_done = nullptr;  ///< backward + reduce done (safe to D2H)
         cudaEvent_t reduce_done = nullptr;   ///< NCCL reduce done (safe to D2H, multi-GPU)
+        cudaEvent_t accum_done = nullptr;    ///< host accumulation of the staged copy done
     };
     std::array<GradBufferSlot, kNumGradSlots> mGradSlots;
     int mActiveGradSlot = 0;
@@ -253,8 +254,22 @@ private:
     // Per-layer gradient norm accumulator (single float on GPU)
     Tensor mLayerNormAccum;
 
-    // CPU staging buffer for micro-step accumulation (pinned, max-layer sized)
+    // CPU staging buffer for micro-step accumulation (pinned, max-layer sized).
+    // Shared by every layer, so each layer's staged copy is added into its CPU
+    // grads (a host function on the copy stream) before the next layer's D2H.
     std::unordered_map<std::string, Tensor> mCpuStagingBuffer;
+
+    /// One `cpu_grad += staging` for a host function to run.
+    struct HostAccumTask {
+        void* dst = nullptr;
+        const void* src = nullptr;
+        std::size_t nelem = 0;
+        ETensorDType dtype = ETensorDType::FP32;
+    };
+    /// Per-layer accumulation tasks; the host function's payload, so never resized after allocation.
+    std::vector<std::vector<HostAccumTask>> mLayerHostAccum;
+    /// cudaHostFn_t: runs the payload's `std::vector<HostAccumTask>`.
+    static void accumulate_staged_layer(void* tasks);
 
     // Track pending D2H operations for wait_all_offloads()
     std::vector<cudaEvent_t> mPendingD2HEvents;

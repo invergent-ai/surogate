@@ -402,19 +402,21 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
         Tensor source;
     };
 
-    // Under ZeRO-3 the weight manager's masters are the weights: a block's work copy is a
-    // prefetch slot (holding whichever layer was gathered last) and a replicated non-block
+    // Whenever block weights are gathered per layer -- ZeRO-3, and offloaded masters
+    // (offload_master, cpu_training) -- the weight manager's masters are the weights: a block's
+    // work copy is a prefetch slot (holding whichever layer was gathered last) and a non-block
     // weight's is refreshed only by the next forward. Each rank holds a flat slice of a sharded
     // master, and the HF tensors of one parameter (fused slices, transposes, per-expert blocks)
     // cut across those slices, so such a parameter is gathered whole from every rank before its
     // tensors are written -- one at a time: the export never holds two full parameters (#229).
     const bool sharded_run = mWeightManager && mOptions.ShardWeights && mNumShards > 1;
+    const bool masters_are_weights = mWeightManager && (sharded_run || mWeightManager->needs_block_gather());
     auto is_gathered = [&](const std::string& name) {
         return sharded_run && mWeightManager->has(name) && mWeightManager->is_sharded(name);
     };
     auto source_of = [&](const std::string& name) -> Tensor {
         if (is_gathered(name)) return mWeightManager->full_master_shape(name);
-        if (sharded_run && mWeightManager->has(name)) return mWeightManager->get_master(name);
+        if (masters_are_weights && mWeightManager->has(name)) return mWeightManager->get_master(name);
         return mParams->get(name);
     };
 

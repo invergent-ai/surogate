@@ -17,6 +17,7 @@
 #include <cuda_bf16.h>
 
 #include "runtime/dsl/dsl_param_store.h"
+#include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/dsl/tensor_role.h"
@@ -41,6 +42,17 @@ bool is_lm_head_name(const std::string& name) {
 bool use_expert_parallel_grad_route(const std::string& name, const char* context) {
     (void)context;
     return tensor_role_is_expert_parallel_name(name);
+}
+
+// The decoder layer a parameter's gradient belongs to, or -1. Per-layer DSL parameters are
+// "blocks[N].<name>" -- the names the weight manager streams per layer -- so cpu_training streams
+// exactly those gradients per layer. The test used to look for "blocks.N." / "layers.N." only, which
+// no DSL name has: every layer's gradients became placeholders that were never bound to a device slot
+// or copied to the host, and the CPU optimizer stepped on zeros for every block parameter.
+int decoder_layer_of(const std::string& name) {
+    int layer = -1;
+    std::string param;
+    return internal::parse_block_param(name, layer, param) ? layer : -1;
 }
 
 }  // namespace
@@ -68,13 +80,10 @@ DslGradStore::DslGradStore(const DslParamStore& params,
     // Sharded gradients (for ZeRO-2) are allocated later in configure() and can be offloaded.
     const EAllocationType grad_alloc = EAllocationType::ON_DEVICE;
 
-    // Helper: check if a parameter name is a block (per-layer) parameter.
-    auto is_block_name = [](const std::string& n) -> bool {
-        for (const char* prefix : {"blocks.", "blocks[", "layers.", "model.layers.", "model.blocks."}) {
-            if (n.find(prefix) != std::string::npos) return true;
-        }
-        return false;
-    };
+    // A per-layer parameter: under cpu_training its gradient is streamed through the layer's slot,
+    // so it must be exactly what build_layer_grad_map files under a layer (a placeholder it does not
+    // file is never bound and its gradient is lost).
+    auto is_block_name = [](const std::string& n) -> bool { return decoder_layer_of(n) >= 0; };
 
     // First pass: find embedding gradient name if present (for weight tying)
     std::string embedding_grad_name;
@@ -182,36 +191,14 @@ void DslGradStore::build_layer_grad_map() {
     mLayerGradNames.resize(mConfig.num_layers);
     mHasLayerGrads = false;
 
-    // Parse gradient names to determine which layer they belong to.
-    // Naming convention: "blocks.{layer_idx}.{component}" or "layers.{layer_idx}.{component}"
+    // Per-layer gradients by decoder layer ("blocks[N].<name>"). Non-layer params (embeddings,
+    // lm_head, final_norm) are not tracked per-layer.
     for (const auto& name : mParamOrder) {
-        int layer_idx = -1;
-
-        // Check for "blocks.N." or "layers.N." pattern
-        auto extract_layer = [&](const std::string& prefix) -> bool {
-            auto pos = name.find(prefix);
-            if (pos != std::string::npos) {
-                pos += prefix.size();
-                auto dot_pos = name.find('.', pos);
-                if (dot_pos != std::string::npos) {
-                    try {
-                        layer_idx = std::stoi(name.substr(pos, dot_pos - pos));
-                        return true;
-                    } catch (...) {
-                    }
-                }
-            }
-            return false;
-        };
-
-        if (extract_layer("blocks.") || extract_layer("layers.") || extract_layer("model.layers.") ||
-            extract_layer("model.blocks.")) {
-            if (layer_idx >= 0 && layer_idx < mConfig.num_layers) {
-                mLayerGradNames[layer_idx].push_back(name);
-                mHasLayerGrads = true;
-            }
+        const int layer_idx = decoder_layer_of(name);
+        if (layer_idx >= 0 && layer_idx < mConfig.num_layers) {
+            mLayerGradNames[layer_idx].push_back(name);
+            mHasLayerGrads = true;
         }
-        // Non-layer params (embeddings, lm_head, final_norm) are not tracked per-layer
     }
 }
 
@@ -700,19 +687,14 @@ std::vector<Tensor*> DslGradStore::get_layer_sharded_grads(int layer_idx) {
 // ============================================================================
 
 std::string DslGradStore::base_grad_name(const std::string& name) {
-    // "blocks.5.attn_q_weight" → "blocks[].attn_q_weight"
-    // Find "blocks.N." or "layers.N." and replace the number with []
-    for (const char* prefix : {"blocks.", "layers.", "model.layers.", "model.blocks."}) {
-        auto pos = name.find(prefix);
-        if (pos != std::string::npos) {
-            auto num_start = pos + std::strlen(prefix);
-            auto dot_pos = name.find('.', num_start);
-            if (dot_pos != std::string::npos) {
-                return name.substr(0, pos) + std::string(prefix, std::strlen(prefix) - 1) + "[]" + name.substr(dot_pos);
-            }
-        }
+    // "blocks[5].attn_q_weight" (or "blocks.5.attn_q_weight") -> "blocks[].attn_q_weight": the key of
+    // the device slot buffer and host staging buffer every layer's copy of that parameter shares.
+    if (decoder_layer_of(name) < 0) {
+        return name;  // Non-block param, return as-is
     }
-    return name;  // Non-block param, return as-is
+    const std::size_t end = name.compare(0, 7, "blocks[") == 0 ? name.find(']') : name.find('.', 7);
+    const std::size_t dot = end == std::string::npos ? std::string::npos : name.find('.', end);
+    return dot == std::string::npos ? name : "blocks[]" + name.substr(dot);
 }
 
 bool DslGradStore::is_block_grad(const std::string& name) const {
@@ -784,6 +766,27 @@ void DslGradStore::allocate_streaming_buffers(const DslParamStore& params) {
             mAllocator->allocate(base_dtypes[base], ("staging_d_" + base).c_str(), EAllocationType::PINNED, shape));
     }
 
+    // Each layer's `cpu_grad += staging`, run on the host after that layer's D2H
+    // on micro-steps after the first (see offload_layer_grads).
+    mLayerHostAccum.assign(mLayerGradNames.size(), {});
+    for (std::size_t layer = 0; layer < mLayerGradNames.size(); ++layer) {
+        for (const auto& name : mLayerGradNames[layer]) {
+            auto grad_it = mGrads.find(name);
+            auto cpu_it = mCpuGrads.find(name);
+            auto staging_it = mCpuStagingBuffer.find(base_grad_name(name));
+            if (grad_it == mGrads.end() || cpu_it == mCpuGrads.end() || staging_it == mCpuStagingBuffer.end()) {
+                continue;
+            }
+            if (staging_it->second.DType != cpu_it->second.DType) {
+                throw std::runtime_error("DslGradStore: staging dtype differs from the CPU gradient of " + name);
+            }
+            mLayerHostAccum[layer].push_back(HostAccumTask{cpu_it->second.Data,
+                                                           staging_it->second.Data,
+                                                           static_cast<std::size_t>(cpu_it->second.nelem()),
+                                                           cpu_it->second.DType});
+        }
+    }
+
     // 3. Allocate double-buffered GPU gradient slots (sized for max layer)
     for (int s = 0; s < kNumGradSlots; ++s) {
         auto& slot = mGradSlots[s];
@@ -806,6 +809,7 @@ void DslGradStore::create_streaming_events() {
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.compute_done, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.reduce_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.accum_done, cudaEventDisableTiming));
         // Pre-signal so first prepare doesn't deadlock
         CUDA_CHECK(cudaEventRecord(slot.d2h_done, nullptr));
     }
@@ -825,6 +829,10 @@ void DslGradStore::destroy_streaming_events() noexcept {
         if (slot.reduce_done) {
             cudaEventDestroy(slot.reduce_done);
             slot.reduce_done = nullptr;
+        }
+        if (slot.accum_done) {
+            cudaEventDestroy(slot.accum_done);
+            slot.accum_done = nullptr;
         }
     }
 }
@@ -926,9 +934,21 @@ void DslGradStore::offload_layer_grads(int layer_idx, cudaStream_t compute_strea
         }
     }
 
-    // Record D2H done
+    // Record D2H done: the GPU slot can be reused from here.
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, copy_stream));
-    mPendingD2HEvents.push_back(slot.d2h_done);
+
+    if (mMicroStep == 0) {
+        mPendingD2HEvents.push_back(slot.d2h_done);
+    } else {
+        // Every layer stages through the same per-name buffer, so add this layer's
+        // copy into its CPU grads before the copy stream moves on to the next
+        // layer's D2H, which would overwrite it. A host function holds the copy
+        // stream until it returns; the GPU slot was already released above.
+        CUDA_CHECK(
+            cudaLaunchHostFunc(copy_stream, &DslGradStore::accumulate_staged_layer, &mLayerHostAccum[layer_idx]));
+        CUDA_CHECK(cudaEventRecord(slot.accum_done, copy_stream));
+        mPendingD2HEvents.push_back(slot.accum_done);
+    }
 
     // Advance to next slot
     mActiveGradSlot = (mActiveGradSlot + 1) % kNumGradSlots;
@@ -962,6 +982,25 @@ void DslGradStore::offload_non_block_grads(cudaStream_t stream) {
     }
 }
 
+void DslGradStore::accumulate_staged_layer(void* tasks) {
+    for (const auto& task : *static_cast<const std::vector<HostAccumTask>*>(tasks)) {
+        if (task.dtype == ETensorDType::FP32) {
+            auto* dst = static_cast<float*>(task.dst);
+            const auto* src = static_cast<const float*>(task.src);
+            for (std::size_t i = 0; i < task.nelem; ++i) {
+                dst[i] += src[i];
+            }
+        } else if (task.dtype == ETensorDType::BF16) {
+            auto* dst = static_cast<nv_bfloat16*>(task.dst);
+            const auto* src = static_cast<const nv_bfloat16*>(task.src);
+            for (std::size_t i = 0; i < task.nelem; ++i) {
+                float val = static_cast<float>(dst[i]) + static_cast<float>(src[i]);
+                dst[i] = static_cast<nv_bfloat16>(val);
+            }
+        }
+    }
+}
+
 void DslGradStore::wait_all_offloads(cudaStream_t stream) {
     if (!mStreamGrads) return;
 
@@ -972,35 +1011,8 @@ void DslGradStore::wait_all_offloads(cudaStream_t stream) {
     // Synchronize to ensure all D2H is visible on CPU
     CUDA_CHECK(cudaStreamSynchronize(stream));
     mPendingD2HEvents.clear();
-
-    // CPU-side accumulation for micro_step > 0
-    if (mMicroStep > 0) {
-        for (const auto& layer_names : mLayerGradNames) {
-            for (const auto& name : layer_names) {
-                auto cpu_it = mCpuGrads.find(name);
-                auto base = base_grad_name(name);
-                auto staging_it = mCpuStagingBuffer.find(base);
-                if (cpu_it == mCpuGrads.end() || staging_it == mCpuStagingBuffer.end()) continue;
-
-                // cpu_grad += staging
-                const auto nelem = static_cast<std::size_t>(cpu_it->second.nelem());
-                if (cpu_it->second.DType == ETensorDType::FP32) {
-                    auto* dst = cpu_it->second.template get<float>();
-                    const auto* src = staging_it->second.template get<float>();
-                    for (std::size_t i = 0; i < nelem; ++i) {
-                        dst[i] += src[i];
-                    }
-                } else if (cpu_it->second.DType == ETensorDType::BF16) {
-                    auto* dst = reinterpret_cast<nv_bfloat16*>(cpu_it->second.Data);
-                    const auto* src = reinterpret_cast<const nv_bfloat16*>(staging_it->second.Data);
-                    for (std::size_t i = 0; i < nelem; ++i) {
-                        float val = static_cast<float>(dst[i]) + static_cast<float>(src[i]);
-                        dst[i] = static_cast<nv_bfloat16>(val);
-                    }
-                }
-            }
-        }
-    }
+    // Micro-steps after the first were added into the CPU grads per layer, as
+    // each staged copy landed (accumulate_staged_layer); the waits above cover them.
 }
 
 const Tensor& DslGradStore::get_cpu_grad(const std::string& name) const {
