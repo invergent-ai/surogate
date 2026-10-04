@@ -22,8 +22,12 @@ from pathlib import Path
 
 import pytest
 
-from surogate.dsl.hf import StackExpertsMapping
-from surogate.dsl.models.qwen3_5_moe import Qwen3_5MoEConditionalModel
+import inspect
+
+import surogate.dsl.models as dsl_models
+from surogate.dsl.hf import GateFirstExpertsMapping, StackExpertsMapping, mapping_to_dict
+from surogate.dsl.models.qwen3_5_moe import Qwen3_5MoECausalModel, Qwen3_5MoEConditionalModel
+from surogate.dsl.py_compiler import _serialize_hf_spec
 
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 
@@ -51,6 +55,8 @@ def _source_keys(mapping_value, *, layer: int, num_experts: int) -> list[str]:
         return keys
     if isinstance(mapping_value, str):
         return [mapping_value.replace("{layer}", str(layer))]
+    if isinstance(mapping_value, GateFirstExpertsMapping):
+        return [mapping_value.source.replace("{layer}", str(layer))]
     pytest.fail(f"unhandled mapping type for expert weights: {mapping_value!r}")
 
 
@@ -69,3 +75,41 @@ def test_expert_mapping_keys_exist_in_checkpoint():
         + "\n".join(missing[:5])
         + (f"\n... (+{len(missing) - 5} more)" if len(missing) > 5 else "")
     )
+
+
+def _all_mappings(cls) -> dict:
+    mappings = dict(getattr(cls, "_hf_block_mappings_", {}) or {})
+    hf = getattr(cls, "_hf_mapping_", None)
+    if hf is not None:
+        mappings.update(getattr(hf, "mappings", {}) or {})
+    return mappings
+
+
+@pytest.mark.parametrize("model", [Qwen3_5MoECausalModel, Qwen3_5MoEConditionalModel])
+def test_qwen3_5_moe_routed_experts_are_declared_gate_first(model):
+    """HF reads experts.gate_up_proj as `gate, up = chunk(2)`; the runtime's SwiGLU reads
+    [up | gate]. Read as stored, every routed expert computed gate * silu(up) (#270)."""
+    mapping = model._hf_block_mappings_["experts_gate_up"]
+    assert isinstance(mapping, GateFirstExpertsMapping)
+    assert mapping.source.endswith("mlp.experts.gate_up_proj")
+    # down_proj has no halves: it maps straight through.
+    assert isinstance(model._hf_block_mappings_["experts_down"], str)
+    # What the C++ loader receives: a direct mapping that carries the flag.
+    assert _serialize_hf_spec(mapping) == {"type": "direct", "source": mapping.source, "gate_first": True}
+    assert mapping_to_dict(mapping) == {"kind": "direct", "path": mapping.source, "gate_first": True}
+
+
+def test_only_qwen3_5_moe_declares_gate_first_experts():
+    """Every other model's expert layout is unchanged: the swap is opt-in per model."""
+    declared = set()
+    for name in dsl_models.__all__:
+        cls = getattr(dsl_models, name)
+        if not inspect.isclass(cls):
+            continue
+        for key, value in _all_mappings(cls).items():
+            if isinstance(value, GateFirstExpertsMapping):
+                declared.add((name, key))
+    assert declared == {
+        ("Qwen3_5MoECausalModel", "experts_gate_up"),
+        ("Qwen3_5MoEConditionalModel", "experts_gate_up"),
+    }

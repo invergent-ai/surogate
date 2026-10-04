@@ -956,8 +956,8 @@ class GRPOTrainer:
             if config.merge_adapter:
                 from surogate.utils.adapter_merge import merge_adapter
 
+                # merge_adapter creates the directory once the merge succeeds
                 merged_dir = output_path / "final_merged"
-                merged_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     merge_adapter(
                         base_model_path=config.model_dir,

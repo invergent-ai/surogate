@@ -36,6 +36,11 @@ class PretrainedConfig;
 
 namespace dsl {
 
+/// Exchanges the two row halves of every expert of `tensor` ([E, 2M, ...], any dtype), in device
+/// or host memory (`Device < 0`): gate-first fused experts (MappingSpec::gate_first) into the
+/// runtime's [up | gate] order, and back. Synchronous: done when it returns.
+void swap_expert_gate_up_halves(Tensor& tensor, cudaStream_t stream);
+
 /// Sharding configuration for multi-GPU weight loading.
 struct ShardConfig {
     int shard_idx = 0;   ///< This GPU's shard index (0-based).

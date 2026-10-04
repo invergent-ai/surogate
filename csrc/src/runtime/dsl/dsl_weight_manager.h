@@ -120,6 +120,10 @@ struct DslWeightEntry {
     bool is_block = false;           ///< Whether this is a per-layer block weight
     bool ep_sliced = false;          ///< Stream only this rank's expert rows (EP-local prefetch)
     int layer_idx = -1;              ///< Layer index for block weights (-1 for non-block)
+    /// The dtype compute reads: the parameter's declared dtype, else the work dtype. A streamed
+    /// block weight's prefetch buffer has it too, so an FP32 parameter (GDN A_log / dt_bias)
+    /// reaches the kernels as FP32 under offload_master, as it does resident.
+    ETensorDType work_dtype = ETensorDType::BF16;
 };
 
 /**

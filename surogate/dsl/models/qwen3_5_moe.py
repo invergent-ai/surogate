@@ -18,7 +18,7 @@ from .qwen3_5 import (
     QWEN3_5_VISION_SERVE_SECTION,
     capture_vision_geometry,
 )
-from ..hf import build_norm_mappings, expand_module_mapping
+from ..hf import build_norm_mappings, expand_module_mapping, gate_first_experts
 from ..models.qwen3_5 import _parse_qwen3_5_layer_types
 from ..blocks.qwen3_5 import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
@@ -70,8 +70,11 @@ def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
     runtime expects directly (no stacking, no transpose):
       - experts.gate_up_proj : [E, 2*M, C]  (gate-first concat, as HF chunk(2))
       - experts.down_proj    : [E, C,   M]
-    So both map straight through. (Contrast GPT-OSS, stored [E, C, 2*M], which
-    needs a transpose.)
+    down_proj maps straight through. gate_up_proj is gate-first while the runtime's
+    SwiGLU reads [up | gate], so it is declared gate_first_experts(): the loader
+    exchanges each expert's halves on import and back on export. Read as stored,
+    every routed expert computed gate * silu(up). (Contrast GPT-OSS, stored
+    [E, C, 2*M], which needs a transpose.)
     """
     from ..modules.moe import MoESharedExpert
 
@@ -80,7 +83,7 @@ def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
         # Router
         "router_weight": f"{moe_prefix}.gate.weight",
         # Batched experts — passthrough (already stacked + gate/up fused on disk).
-        "experts_gate_up": f"{moe_prefix}.experts.gate_up_proj",
+        "experts_gate_up": gate_first_experts(f"{moe_prefix}.experts.gate_up_proj"),
         "experts_down": f"{moe_prefix}.experts.down_proj",
         # Shared expert (SwiGLU MLP). `self.shared_expert = MoESharedExpert(...)`
         # on the block compiles params to `shared_expert_{gate,up,down}`, so the

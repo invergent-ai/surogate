@@ -25,6 +25,36 @@
 
 namespace dsl {
 
+void swap_expert_gate_up_halves(Tensor& tensor, cudaStream_t stream) {
+    if (tensor.Rank < 2 || tensor.Sizes[1] % 2 != 0) {
+        throw std::runtime_error("swap_expert_gate_up_halves: expected [E, 2M, ...], got rank " +
+                                 std::to_string(tensor.Rank));
+    }
+    const long experts = tensor.Sizes[0];
+    std::size_t half_bytes = static_cast<std::size_t>(tensor.Sizes[1] / 2) * get_dtype_size(tensor.DType);
+    for (int d = 2; d < tensor.Rank; ++d) {
+        half_bytes *= static_cast<std::size_t>(tensor.Sizes[d]);
+    }
+    auto* base = static_cast<std::byte*>(tensor.Data);
+    if (tensor.Device < 0) {
+        for (long e = 0; e < experts; ++e) {
+            std::byte* first = base + static_cast<std::size_t>(e) * 2 * half_bytes;
+            std::swap_ranges(first, first + half_bytes, first + half_bytes);
+        }
+        return;
+    }
+    void* scratch = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&scratch, half_bytes, stream));
+    for (long e = 0; e < experts; ++e) {
+        std::byte* first = base + static_cast<std::size_t>(e) * 2 * half_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(scratch, first, half_bytes, cudaMemcpyDefault, stream));
+        CUDA_CHECK(cudaMemcpyAsync(first, first + half_bytes, half_bytes, cudaMemcpyDefault, stream));
+        CUDA_CHECK(cudaMemcpyAsync(first + half_bytes, scratch, half_bytes, cudaMemcpyDefault, stream));
+    }
+    CUDA_CHECK(cudaFreeAsync(scratch, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 // ============================================================================
 // Construction / Destruction
 // ============================================================================

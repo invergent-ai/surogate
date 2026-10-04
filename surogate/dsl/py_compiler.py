@@ -24,7 +24,14 @@ from .errors import (
     WarningCollector,
 )
 from .graph_builder import GraphBuilder, GraphNode
-from .hf import FuseMapping, SplitMapping, StackExpertsMapping, TiedToMapping, TransformMapping
+from .hf import (
+    FuseMapping,
+    GateFirstExpertsMapping,
+    SplitMapping,
+    StackExpertsMapping,
+    TiedToMapping,
+    TransformMapping,
+)
 from .specs import (
     ActivationLayoutSpec,
     ActivationSlotSpec,
@@ -464,6 +471,10 @@ def _serialize_hf_spec(spec: Any) -> Any:
         if spec.fn:
             payload["fn"] = spec.fn
         return payload
+    if isinstance(spec, GateFirstExpertsMapping):
+        if not spec.source:
+            raise DSLError(ErrorCode.E010, "gate_first_experts() requires a non-empty source")
+        return {"type": "direct", "source": spec.source, "gate_first": True}
     if isinstance(spec, TiedToMapping):
         if not spec.target:
             raise DSLError(ErrorCode.E010, "tied_to() requires a non-empty target")

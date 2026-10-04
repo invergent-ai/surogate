@@ -87,6 +87,26 @@ class TransformMapping:
 
 
 @dataclass(frozen=True)
+class GateFirstExpertsMapping:
+    """Routed experts stored fused per layer with the GATE rows first.
+
+    Qwen3.5 / Qwen3.6 MoE ship ``experts.gate_up_proj`` as [E, 2*M, C], read by HF as
+    ``gate, up = (x @ W.T).chunk(2)``. The runtime's SwiGLU reads ``[up | gate]``, so this
+    mapping loads the tensor as stored and has every training import exchange the two halves
+    of each expert (and every export exchange them back). Fused-expert checkpoints that are
+    already ``[up | gate]`` map with a plain path instead.
+
+    Example:
+        gate_first_experts("model.layers.{layer}.mlp.experts.gate_up_proj")
+    """
+
+    source: str
+
+    def __repr__(self) -> str:
+        return f'gate_first_experts("{self.source}")'
+
+
+@dataclass(frozen=True)
 class TiedToMapping:
     """Specification to tie a weight to another parameter.
 
@@ -209,6 +229,11 @@ def transform(source: str, *, fn: str) -> TransformMapping:
     return TransformMapping(source=source, fn=fn)
 
 
+def gate_first_experts(source: str) -> GateFirstExpertsMapping:
+    """Map fused routed experts stored gate-first (see GateFirstExpertsMapping)."""
+    return GateFirstExpertsMapping(source=source)
+
+
 def tied_to(target: str) -> TiedToMapping:
     """Create a tied mapping to share weights with another parameter.
 
@@ -262,12 +287,17 @@ def stack_experts(
 
 
 # Type alias for any HF mapping spec
-HFMappingValue = str | FuseMapping | SplitMapping | TransformMapping | TiedToMapping | StackExpertsMapping
+HFMappingValue = (
+    str | FuseMapping | SplitMapping | TransformMapping | GateFirstExpertsMapping | TiedToMapping | StackExpertsMapping
+)
 
 
 def is_hf_mapping_spec(value: Any) -> bool:
     """Check if a value is an HF mapping specification."""
-    return isinstance(value, (str, FuseMapping, SplitMapping, TransformMapping, TiedToMapping, StackExpertsMapping))
+    return isinstance(
+        value,
+        (str, FuseMapping, SplitMapping, TransformMapping, GateFirstExpertsMapping, TiedToMapping, StackExpertsMapping),
+    )
 
 
 # =============================================================================
@@ -295,6 +325,8 @@ def _expand_hf_prefix(mapping: Any, hf_prefix: str) -> Any:
             source=mapping.source.replace("{prefix}", hf_prefix),
             fn=mapping.fn,
         )
+    elif isinstance(mapping, GateFirstExpertsMapping):
+        return GateFirstExpertsMapping(source=mapping.source.replace("{prefix}", hf_prefix))
     elif isinstance(mapping, StackExpertsMapping):
         return StackExpertsMapping(
             pattern=mapping.pattern.replace("{prefix}", hf_prefix),
@@ -576,6 +608,8 @@ def mapping_to_dict(mapping: HFMappingValue) -> dict[str, Any]:
         return {"kind": "split", "source": mapping.source, "ranges": list(mapping.ranges), "dim": mapping.dim}
     elif isinstance(mapping, TransformMapping):
         return {"kind": "transform", "source": mapping.source, "fn": mapping.fn}
+    elif isinstance(mapping, GateFirstExpertsMapping):
+        return {"kind": "direct", "path": mapping.source, "gate_first": True}
     elif isinstance(mapping, TiedToMapping):
         return {"kind": "tied_to", "target": mapping.target}
     elif isinstance(mapping, StackExpertsMapping):

@@ -271,6 +271,11 @@ public:
                                   const int* opt_step);
     void prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config);
     void zero_grads(cudaStream_t stream);
+    /// Starts an optimizer step whose first window may not be micro-step 0 (chunked GRPO skips
+    /// unoccupied chunks, so its windows start wherever the occupied ones do): the executor's
+    /// start-of-step work, then zeroed gradients once the previous update has read them. Later
+    /// windows of the step accumulate onto those zeros, which is what micro-step 0 would do.
+    void begin_training_step();
     void set_internal_graphs_enabled(bool enabled);
     [[nodiscard]] bool internal_graphs_enabled() const;
     [[nodiscard]] bool has_capture_unsafe_ops() const;

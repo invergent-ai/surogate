@@ -539,35 +539,6 @@ resolve_mapping_spec(const dsl::MappingTable& mapping, const std::string& intern
     return nullptr;
 }
 
-std::string to_lower_ascii(std::string_view s) {
-    std::string out(s);
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return out;
-}
-
-bool is_qwen3_5_moe_model(const PretrainedConfig& pt_config) {
-    const std::string arch = to_lower_ascii(pt_config.ArchitectureName);
-    const std::string model_type = to_lower_ascii(pt_config.ModelTypeName);
-    return arch.find("qwen3_5moe") != std::string::npos || model_type.find("qwen3_5_moe") != std::string::npos ||
-           model_type.find("qwen3_5moe") != std::string::npos;
-}
-
-bool should_swap_qwen3_5_moe_gate_up_halves(const dsl::MappingSpec& mspec,
-                                            const std::string& internal_name,
-                                            const PretrainedConfig& pt_config) {
-    if (mspec.kind != dsl::MappingSpec::Kind::Direct && mspec.kind != dsl::MappingSpec::Kind::Transform) {
-        return false;
-    }
-    if (!is_qwen3_5_moe_model(pt_config)) {
-        return false;
-    }
-
-    const std::string& source = mspec.source.empty() ? internal_name : mspec.source;
-    return dsl::tensor_role_is_expert_gate_up_name(source);
-}
-
 /// Substitute {layer} and {expert} placeholders in HF name template.
 std::string resolve_hf_name(std::string templ, int layer_idx, int expert_idx = -1) {
     {
@@ -961,7 +932,7 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(const std::str
 
     // --- Pass 1: Non-expert weights (2D quantizable + full-precision) ---
 
-    bool logged_qwen35_gate_up_swap = false;
+    bool logged_gate_up_swap = false;
     for (int i = 0; i < total; ++i) {
         const auto& spec = config.weight_specs[i];
 
@@ -1097,17 +1068,18 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(const std::str
             throw std::runtime_error("import_and_quantize_weights: no mapping for expert param '" + spec.name + "'");
         }
 
-        const bool swap_qwen35_gate_up_halves = should_swap_qwen3_5_moe_gate_up_halves(*mspec, spec.name, pt_config);
-        if (swap_qwen35_gate_up_halves && (per_M % 2 != 0)) {
+        // Fused experts the model's DSL declares gate-first (gate_first_experts(): Qwen3.5/3.6 MoE).
+        const bool swap_gate_up_halves = mspec->gate_first;
+        if (swap_gate_up_halves && (per_M % 2 != 0)) {
             throw std::runtime_error("import_and_quantize_weights: expected even per-expert rows for "
-                                     "Qwen3.5 MoE experts.gate_up_proj: " +
+                                     "gate-first experts.gate_up_proj: " +
                                      spec.name);
         }
-        if (swap_qwen35_gate_up_halves && !logged_qwen35_gate_up_swap) {
+        if (swap_gate_up_halves && !logged_gate_up_swap) {
             fmt::print(stderr,
-                       "[QLoRA Import] Qwen3.5 MoE experts.gate_up_proj detected: "
+                       "[QLoRA Import] gate-first fused experts.gate_up_proj: "
                        "reordering [gate|up] -> [up|gate] before quantization.\n");
-            logged_qwen35_gate_up_swap = true;
+            logged_gate_up_swap = true;
         }
 
         // Allocate a small per-expert load buffer
@@ -1134,7 +1106,7 @@ std::unique_ptr<GenericWeightManager> import_and_quantize_weights(const std::str
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
-            if (swap_qwen35_gate_up_halves) {
+            if (swap_gate_up_halves) {
                 swap_halves_bf16(expert_buf.get<nv_bfloat16>(), per_M, K, per_M / 2, stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }

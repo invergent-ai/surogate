@@ -564,3 +564,36 @@ TEST_CASE("Host-master loads of a real checkpoint equal the file on every tensor
                  << (disable_cufile ? "buffered" : "cuFile"));
     REQUIRE(mismatches == 0);
 }
+
+// Qwen3.5/3.6 MoE ships routed experts gate-first; the runtime reads [up | gate] (#270: the BF16
+// import read them as stored, so every expert computed gate * silu(up)).
+TEST_CASE("Gate-first fused experts have their halves exchanged", "[weight-loader]") {
+    // Opt-in per mapping (the model's DSL declares gate_first_experts()); nothing else swaps.
+    REQUIRE_FALSE(MappingSpec{}.gate_first);
+
+    // [E=2, 2M=4, C=3]: expert e's rows are gate (first 2) then up (last 2).
+    std::vector<float> host = sequence(24);
+    std::vector<float> expected(24);
+    for (int e = 0; e < 2; ++e) {
+        for (int i = 0; i < 6; ++i) {
+            expected[e * 12 + i] = host[e * 12 + 6 + i];
+            expected[e * 12 + 6 + i] = host[e * 12 + i];
+        }
+    }
+    auto host_tensor = Tensor::from_pointer(reinterpret_cast<std::byte*>(host.data()), /*device=*/-1,
+                                            ETensorDType::FP32, std::vector<long>{2, 4, 3});
+    dsl::swap_expert_gate_up_halves(host_tensor, nullptr);
+    REQUIRE(host == expected);
+
+    require_gpu();
+    TensorAllocator allocator;
+    auto device = allocate(allocator, {2, 4, 3}, ETensorDType::BF16);
+    std::vector<nv_bfloat16> raw(24);
+    const auto original = sequence(24);
+    std::transform(original.begin(), original.end(), raw.begin(), [](float x) { return __float2bfloat16(x); });
+    CUDA_CHECK(cudaMemcpy(device.Data, raw.data(), device.bytes(), cudaMemcpyHostToDevice));
+    dsl::swap_expert_gate_up_halves(device, nullptr);
+    REQUIRE(values(device) == expected);
+    dsl::swap_expert_gate_up_halves(device, nullptr);
+    REQUIRE(values(device) == original);
+}
