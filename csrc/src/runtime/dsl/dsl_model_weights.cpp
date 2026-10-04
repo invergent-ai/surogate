@@ -60,21 +60,37 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
     const unsigned long long shard_base = static_cast<unsigned long long>(mShardIdx) * 100000ULL;
     const bool use_weight_manager = (mWeightManager != nullptr);
 
+    // A master in host memory -- cpu_training's shared frozen base, plain malloc until it is
+    // page-locked -- is not writable by the fill kernels: fill a device copy and copy it back.
+    // (The store's claim is left to import_weights: claiming here would make a later import
+    // skip every shared master. Each rank writes the same values, as the kernels did.)
+    auto fill = [&](Tensor& param, const auto& write) {
+        if (param.Device >= 0) {
+            write(param);
+            return;
+        }
+        Tensor device = mAllocator->allocate(param.DType, "init_weights_host_master", EAllocationType::ON_DEVICE,
+                                             std::vector<long>(param.Sizes.begin(), param.Sizes.begin() + param.Rank));
+        write(device);
+        CUDA_CHECK(cudaMemcpy(param.Data, device.Data, param.bytes(), cudaMemcpyDefault));
+        mAllocator->free(device);
+    };
+
     for (const auto& name : mParams->param_names()) {
         if (mParams->is_external(name) || mParams->is_storage_alias(name)) {
             continue;
         }
         Tensor& param = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
         if (name.ends_with("layer_scalar") || name.ends_with("per_expert_scale")) {
-            fill_constant(param, 1.f, param.nelem(), nullptr);
+            fill(param, [](Tensor& t) { fill_constant(t, 1.f, t.nelem(), nullptr); });
             continue;
         }
         if (internal::is_bias_param_name(name)) {
-            fill_zero(param, nullptr);
+            fill(param, [](Tensor& t) { fill_zero(t, nullptr); });
             continue;
         }
         if (internal::is_norm_param_name(name)) {
-            fill_constant(param, 1.f, param.nelem(), nullptr);
+            fill(param, [](Tensor& t) { fill_constant(t, 1.f, t.nelem(), nullptr); });
             continue;
         }
 
@@ -83,7 +99,7 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         const bool is_mlp_down =
             internal::contains_ci(name, "mlp_down_weight") || internal::contains_ci(name, "down_proj");
         if (mOptions.InitProjectionsToZero && (is_out_proj || is_mlp_down)) {
-            fill_zero(param, nullptr);
+            fill(param, [](Tensor& t) { fill_zero(t, nullptr); });
             continue;
         }
 
@@ -94,7 +110,7 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         const bool param_sharded =
             use_weight_manager && mOptions.ShardWeights && (mNumShards > 1) && mWeightManager->is_sharded(name);
         const unsigned long long param_subseq = param_sharded ? (shard_base + subseq) : subseq;
-        fill_normal(param, param.nelem(), 0.f, stddev, seed, param_subseq, nullptr);
+        fill(param, [&](Tensor& t) { fill_normal(t, t.nelem(), 0.f, stddev, seed, param_subseq, nullptr); });
         ++subseq;
     }
 

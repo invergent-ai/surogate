@@ -312,6 +312,7 @@ void DslWeightManager::allocate_weights(const Module& module,
 
         DslWeightEntry entry;
         entry.trainable = !info.frozen && !is_rope_param(name);
+        entry.work_dtype = param_dtype;
         if (freeze_base) {
             entry.trainable = !info.frozen && train_router && is_router_param(name);
         }
@@ -613,8 +614,13 @@ void DslWeightManager::allocate_prefetch_buffers() {
                 // slot is a raw byte buffer sized by Nvfp4StreamLayout; the entry keeps the
                 // logical (N, K) shape so the matmul can address the sections.
                 const bool fp4 = !fp8 && is_fp4_stream_weight(name, shape) && !entry.trainable;
-                const ETensorDType buf_dtype = fp8 ? ETensorDType::FP8_E4M3 : mConfig.work_dtype;
-                const std::string pkey = prefetch_key(bname, shape) + (fp8 ? "|f8" : (fp4 ? "|f4" : ""));
+                // Otherwise the buffer holds what compute reads: an FP32 parameter stays FP32,
+                // as it does resident, instead of being rounded to the work dtype on every gather.
+                const ETensorDType buf_dtype = fp8 ? ETensorDType::FP8_E4M3 : entry.work_dtype;
+                const std::string pkey = prefetch_key(bname, shape) + (fp8 ? "|f8" : (fp4 ? "|f4" : "")) +
+                                         (!fp8 && !fp4 && buf_dtype != mConfig.work_dtype
+                                              ? "|t" + std::to_string(static_cast<int>(buf_dtype))
+                                              : std::string());
                 auto bit = base_buffers.find(pkey);
 
                 if (bit == base_buffers.end()) {
