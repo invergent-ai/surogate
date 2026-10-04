@@ -138,10 +138,7 @@ def test_graphed_step_reduces_every_gradient(model_dir, level, optimizer, tmp_pa
 
 def test_zero2_accumulates_micro_steps_as_zero1(model_dir, tmp_path):
     """ZeRO-2 reduce-scatters a layer's gradients once, on the last micro-step, as ZeRO-1 all-reduces them.
-
-    The reference is the eager ZeRO-1 step rather than a graphed one: a captured embedding backward keeps
-    the token layout it computed on the host at capture time, so a graphed step with two micro-steps
-    sends the first micro-step's embedding gradient to the second one's token rows."""
+    The reference is the eager ZeRO-1 step, which always reduced once per optimizer step."""
     zero1_loss, zero1_norm = _step(model_dir, "zero1", "adamw_8bit", 2, graphs=False, out=tmp_path / "zero1")
     zero2_loss, zero2_norm = _step(model_dir, "zero2", "adamw_8bit", 2, graphs=False, out=tmp_path / "zero2")
     assert abs(zero2_loss - zero1_loss) <= 1e-2 * abs(zero1_loss), (zero2_loss, zero1_loss)

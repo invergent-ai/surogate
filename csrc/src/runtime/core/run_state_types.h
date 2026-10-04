@@ -102,8 +102,6 @@ struct ScratchBuffers {
     // via temp_acquire/temp_free, so it can overlap with other temporaries (e.g. output logits chunks).
     Tensor cudnn_workspace;
     Tensor encoder_bwd_scratch;  ///< For encoder backward
-    Tensor encoder_bwd_indices;  ///< CPU tensor for encoder scheduling
-    Tensor encoder_bwd_info;     ///< CPU tensor for encoder scheduling
     Tensor norm_buffer;          ///< For gradient norm computation
     Tensor matmul_scales;        ///< For FP8 scaling
 };
