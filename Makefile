@@ -63,12 +63,15 @@ PYTEST ?= .venv/bin/python -m pytest
 # that only Blackwell can run carry only its cubin -- csrc/CMakeLists.txt pins those targets --
 # so the second architecture costs what it actually uses rather than doubling the fatbin.
 SERVE_CUDA_ARCHS ?= 89;120a
+# OFF leaves the STT server out, for a host without FFmpeg development libraries.
+SERVE_SPEECH ?= ON
 
 serve-configure:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_CUDA_ARCHITECTURES="$(SERVE_CUDA_ARCHS)" \
 		-DSUROGATE_SERVE_CUDA_ARCHS="$(SERVE_CUDA_ARCHS)" \
+		-DSUROGATE_BUILD_SPEECH=$(SERVE_SPEECH) \
 		-DPYTHON_BINDING=ON $(CCACHE_FLAGS)
 
 serve-build: serve-configure

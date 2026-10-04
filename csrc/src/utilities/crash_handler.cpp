@@ -23,10 +23,20 @@
 #define SUROGATE_MC_PC(mc) ((mc)->gregs[REG_RIP])
 #define SUROGATE_MC_SP(mc) ((mc)->gregs[REG_RSP])
 #define SUROGATE_MC_FP(mc) ((mc)->gregs[REG_RBP])
+#define SUROGATE_MC_PC_NAME "RIP"
+#define SUROGATE_MC_SP_NAME "RSP"
+#define SUROGATE_MC_FP_NAME "RBP"
+// Highest user-space address: the frame-pointer walk stops at anything above it.
+#define SUROGATE_USER_VA_MAX 0x7fffffffffffULL
 #elif defined(__aarch64__)
 #define SUROGATE_MC_PC(mc) ((mc)->pc)
 #define SUROGATE_MC_SP(mc) ((mc)->sp)
 #define SUROGATE_MC_FP(mc) ((mc)->regs[29])
+#define SUROGATE_MC_PC_NAME "PC"
+#define SUROGATE_MC_SP_NAME "SP"
+#define SUROGATE_MC_FP_NAME "FP"
+// 48-bit user addresses: Linux puts the stack just below 0x1000000000000 here.
+#define SUROGATE_USER_VA_MAX 0xffffffffffffULL
 #else
 #error "crash_handler: unsupported architecture"
 #endif
@@ -250,11 +260,11 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
         ucontext_t* uc = static_cast<ucontext_t*>(context);
         mcontext_t* mc = &uc->uc_mcontext;
 
-        safe_write("\nCPU Registers: RIP=");
+        safe_write("\nCPU Registers: " SUROGATE_MC_PC_NAME "=");
         safe_write_ptr((void*)SUROGATE_MC_PC(mc));
-        safe_write(" RSP=");
+        safe_write(" " SUROGATE_MC_SP_NAME "=");
         safe_write_ptr((void*)SUROGATE_MC_SP(mc));
-        safe_write(" RBP=");
+        safe_write(" " SUROGATE_MC_FP_NAME "=");
         safe_write_ptr((void*)SUROGATE_MC_FP(mc));
         safe_write("\n");
 
@@ -306,7 +316,7 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
         void** rbp = (void**)SUROGATE_MC_FP(mc);
         while (num_frames < MAX_FRAMES && rbp != nullptr) {
             // Validate pointer is in a reasonable range
-            if ((uintptr_t)rbp < 0x1000 || (uintptr_t)rbp > 0x7fffffffffff) break;
+            if ((uintptr_t)rbp < 0x1000 || (uintptr_t)rbp > SUROGATE_USER_VA_MAX) break;
 
             // Return address is at rbp[1]
             void* ret_addr = rbp[1];

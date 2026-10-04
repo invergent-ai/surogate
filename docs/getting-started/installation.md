@@ -68,6 +68,12 @@ exactly that target and refuse other devices at runtime. The CPU expert-compute 
 CPU embedding paths have no NEON port, so they run their reference code on aarch64.
 `SUROGATE_BUILD_SPEECH=OFF` skips the STT server on a host without FFmpeg development
 libraries; `SINFER_ENABLE_FFMPEG=OFF` does the same for media decoding in the engine.
+`SKBUILD_CMAKE_DEFINE` is one semicolon-separated list, so add them to the line above rather
+than exporting it a second time, which would drop the architecture:
+
+```bash
+export SKBUILD_CMAKE_DEFINE="SUROGATE_SERVE_CUDA_ARCHS=121a;SUROGATE_BUILD_SPEECH=OFF;SINFER_ENABLE_FFMPEG=OFF"
+```
 
 ## Verify installation
 

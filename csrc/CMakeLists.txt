@@ -1488,6 +1488,17 @@ if(SUROGATE_BUILD_SPEECH)
   set(SUROGATE_STT_TARGETS surogate-stt surogate-stt-lm)
 else()
   set(SUROGATE_STT_TARGETS)
+  # pyproject.toml's build.targets and the Makefile both name surogate-stt. Keep the name a
+  # target, so those lists work unchanged, and have it say what it is.
+  add_custom_target(surogate-stt
+    COMMAND ${CMAKE_COMMAND} -E echo "surogate-stt: not built, SUROGATE_BUILD_SPEECH=OFF"
+    VERBATIM)
+  # A warning, not an error: pip builds always set SUROGATE_REQUIRE_SERVE (pyproject.toml), and
+  # they are how a host without FFmpeg development libraries builds everything else.
+  if(SUROGATE_REQUIRE_SERVE)
+    message(WARNING "SUROGATE_BUILD_SPEECH=OFF: surogate-stt and surogate-stt-lm are not built "
+                    "or installed, so `surogate serve --stt` will not work with this build.")
+  endif()
 endif()
 add_subdirectory(${SERVE_ROOT}/tts)
 target_include_directories(surogate-embed PRIVATE
