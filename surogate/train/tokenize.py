@@ -15,6 +15,7 @@ from surogate.core.datasets.loader import (
     pre_process,
     shuffle_dataset,
 )
+from surogate.train.bin_packing import materialize_window, next_k_fit, padding_share
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -75,6 +76,9 @@ def compute_tokenize_hash(config: SFTConfig) -> str:
         "validation_datasets": [_dataset_config_to_dict(ds) for ds in config.validation_datasets],
         "renderer_version": RENDERER_VERSION,
     }
+    # Only bin packing reads the bin count; leaving it out otherwise keeps existing hashes valid.
+    if config.sample_packing == "bin":
+        hash_dict["sample_packing_bins"] = config.sample_packing_bins
 
     # Serialize to JSON with sorted keys for deterministic output
     hash_str = json.dumps(hash_dict, sort_keys=True, default=str)
@@ -735,7 +739,20 @@ class TokenizeDatasets(SurogateCommand):
             name_prefix = "train" if split_name == "train" else "eval"
             non_overlapping = not packing
 
-            if packing:
+            if packing == "bin":
+                self._write_bin_packed(
+                    all_tokens,
+                    all_masks,
+                    doc_lengths,
+                    out_dir,
+                    name_prefix,
+                    vocab_size,
+                    seq_len,
+                    pad_token_id,
+                    max_tokens_per_file,
+                    self.config.sample_packing_bins,
+                )
+            elif packing:
                 self._write_packed_vectorized(
                     all_tokens,
                     all_masks,
@@ -829,6 +846,49 @@ class TokenizeDatasets(SurogateCommand):
             ) as writer:
                 for i in range(start, end):
                     writer.add_document(tokens=tokens_2d[i], position_ids=pos_2d[i], mask=mask_2d[i])
+                total_tokens += writer.n_tokens
+                logger.info(f"Completed file {output_path} with {writer.n_tokens:,} tokens")
+            file_index += 1
+
+        logger.info(f"Multi-file write complete: {file_index} files, {total_tokens:,} total tokens")
+
+    def _write_bin_packed(
+        self,
+        all_tokens,
+        all_masks,
+        doc_lengths,
+        out_dir,
+        name_prefix,
+        vocab_size,
+        seq_len,
+        pad_token_id,
+        max_tokens_per_file,
+        bins,
+    ):
+        """Whole-document packing: Next-k-Fit windows, padding only at each window's tail."""
+        from tqdm import tqdm
+
+        windows = next_k_fit(doc_lengths, seq_len, bins)
+        logger.info(
+            f"Bin packing (k={bins}): {len(doc_lengths)} documents into {len(windows)} windows, "
+            f"{padding_share(doc_lengths, windows, seq_len) * 100:.2f}% padding"
+        )
+
+        file_index = 0
+        total_tokens = 0
+        seqs_per_file = max(1, max_tokens_per_file // seq_len)
+
+        def get_path(idx):
+            return os.path.join(out_dir, f"{name_prefix}-{idx:03d}.bin")
+
+        for start in tqdm(range(0, len(windows), seqs_per_file), desc="Writing", unit=" shards"):
+            end = min(start + seqs_per_file, len(windows))
+            output_path = get_path(file_index)
+            # Non-overlapping: every chunk is exactly one window, so no target crosses into the next.
+            with TokenizedDataFileWriter(output_path, vocab_size, masking=True, non_overlapping=True) as writer:
+                for docs in windows[start:end]:
+                    tokens, pos_ids, mask = materialize_window(all_tokens, all_masks, docs, seq_len, pad_token_id)
+                    writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
                 total_tokens += writer.n_tokens
                 logger.info(f"Completed file {output_path} with {writer.n_tokens:,} tokens")
             file_index += 1
