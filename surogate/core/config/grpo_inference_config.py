@@ -45,6 +45,19 @@ def _offload_share(name, value, *, allow_auto=False):
     raise ValueError(f"{name} must be a finite number between 0 and 1{alternative}")
 
 
+def _parallel_degree(name, value):
+    # None (an explicit YAML null) keeps the default of 1, as it did when these
+    # were read as `dp or 1`.
+    if value is None:
+        return 1
+    # An interpolated `${VAR}` arrives as a string, as for the offload counts.
+    if isinstance(value, str) and value.isdecimal():
+        value = int(value)
+    if type(value) is int and value >= 1:
+        return value
+    raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+
 @dataclass
 class GRPOInferenceConfig:
     """
@@ -101,9 +114,12 @@ class GRPOInferenceConfig:
         decode_prefill_chunk: Maximum prefill tokens per scheduler round on the
             shared training path; reduced automatically during decode and memory pressure.
         decode_prefix_entries: Maximum reusable prompt snapshots on that path; 0 disables caching.
-        kv_cache_dtype: KV cache dtype, e.g. `fp8` (`--kv-dtype`).
-        tp: GPUs per replica. With `dp`, the number of GPUs a split run hands the server.
-        dp: Replicas.
+        kv_cache_dtype: KV cache dtype, e.g. `fp8` (`--kv-cache-dtype`).
+        tp: GPUs per replica. The engine splits the model's layers across them, one
+            pipeline stage per GPU (`--devices`). With `dp`, the number of GPUs a split
+            run hands the server.
+        dp: Replicas, one whole model per GPU (`--devices ... --data-parallel`). The
+            engine's replicas are one GPU each, so `dp` and `tp` cannot both exceed 1.
         enable_lora: Enable LoRA hot-loading, which is how the trainer's adapter reaches the
             server (`--enable-lora`).
         max_loras: Adapters held at once (`--max-loras`).
@@ -162,8 +178,8 @@ class GRPOInferenceConfig:
     # names one; it takes vLLM's names, so ``hermes`` is the same format.
     enable_auto_tool_choice: bool = False
     tool_call_parser: str | None = None
-    tp: int | None = 1
-    dp: int | None = 1
+    tp: int = 1
+    dp: int = 1
     enable_lora: bool | None = True
     max_loras: int | None = 8
     max_lora_rank: int | None = None
@@ -229,8 +245,16 @@ class GRPOInferenceConfig:
                 f"adapter claim a weight update waits on"
             )
         self.kv_cache_dtype = cfg.get("kv_cache_dtype", self.kv_cache_dtype)
-        self.tp = cfg.get("tp", self.tp)
-        self.dp = cfg.get("dp", self.dp)
+        self.tp = _parallel_degree("tp", cfg.get("tp", self.tp))
+        self.dp = _parallel_degree("dp", cfg.get("dp", self.dp))
+        # The engine loads a data-parallel replica on one GPU only
+        # (`replica_options()` in serve_options.cpp). Refused here, before a split
+        # run spawns the server, rather than by the engine after execv.
+        if self.dp > 1 and self.tp > 1:
+            raise ValueError(
+                f"dp ({self.dp}) and tp ({self.tp}) cannot both exceed 1: each data-parallel "
+                "replica of the engine runs on one GPU"
+            )
         self.enable_lora = cfg.get("enable_lora", self.enable_lora)
         self.max_loras = cfg.get("max_loras", self.max_loras)
         self.max_lora_rank = cfg.get("max_lora_rank", self.max_lora_rank)

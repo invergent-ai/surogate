@@ -79,8 +79,9 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
     # queued the rest, and ran with 29 GiB free and a decode batch of 1. Sizing it
     # from what is free took the same run from 13.6-25.3s per step to 3.2-4.9s.
     argv += ["--kv-capacity", "auto"]
+    # `--kv-dtype` is the `--generate` spelling; server mode refuses it and exits 2.
     if config.kv_cache_dtype:
-        argv += ["--kv-dtype", str(config.kv_cache_dtype)]
+        argv += ["--kv-cache-dtype", str(config.kv_cache_dtype)]
     if config.enable_lora:
         argv += ["--enable-lora"]
         if config.max_loras is not None:
@@ -97,9 +98,29 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
     if config.seed is not None:
         argv += ["--seed", str(config.seed)]
 
-    # One engine per visible device set: split.py already gave this child its own
-    # CUDA_VISIBLE_DEVICES, so device 0 here is the first card it was granted.
-    argv += ["--device", "0"]
+    argv += _placement(config)
+    return argv
+
+
+def _placement(config: GRPOInferenceConfig) -> list[str]:
+    """The devices the engine runs on, from `dp` and `tp`.
+
+    split.py gives this child its own CUDA_VISIBLE_DEVICES holding exactly
+    `dp * tp` cards, so they are 0..N-1 here. A single card is `--device 0`. More
+    than one is `--devices`: as `tp` the engine splits the model's layers across
+    them, one pipeline stage per card; with `--data-parallel` (`dp`) it loads a
+    whole replica on each and spreads requests over them behind the one model id.
+    Every replica takes the adapter the trainer posts to `/load_lora_adapter`.
+
+    Passing `--device 0` whatever the count served from one card and left the
+    others idle.
+    """
+    gpus = config.dp * config.tp
+    if gpus == 1:
+        return ["--device", "0"]
+    argv = ["--devices", ",".join(str(i) for i in range(gpus))]
+    if config.dp > 1:
+        argv += ["--data-parallel"]
     return argv
 
 
