@@ -115,6 +115,27 @@ def test_window_keeps_documents_whole_and_isolated():
         assert (x[o:] == pad).all() and not y[o:].any()
 
 
+def test_single_document_window_is_the_padded_layout():
+    # The padded writer (sample_packing: false, validation splits) writes one-document windows.
+    T = 16
+    short = np.arange(3, 13, dtype=np.int32)
+    long = np.arange(3, 23, dtype=np.int32)
+    masks = [np.r_[np.ones(9, np.int32), 0], np.r_[np.ones(19, np.int32), 0]]
+
+    x, p, y = materialize_window([short, long], masks, [0], T, 0)
+    np.testing.assert_array_equal(p, np.arange(T))
+    np.testing.assert_array_equal(x, np.r_[short, np.zeros(6, np.int32)])
+    np.testing.assert_array_equal(y, np.r_[masks[0], np.zeros(6, np.int32)])
+
+    x, p, y = materialize_window([short, long], masks, [1], T, 0)
+    np.testing.assert_array_equal(p, np.arange(T))
+    np.testing.assert_array_equal(x, long[:T])
+    # The token cut off at T was this position's target; the shard's next token is another
+    # example's, so the truncated example must not train on it.
+    assert y[: T - 1].all() and y[T - 1] == 0
+    assert masks[1][T - 1] == 1  # the caller's mask is left as it was
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(True, True), (False, False), ("false", False), ("True", True), ("bin", "bin"), (" BIN ", "bin"), (None, None)],

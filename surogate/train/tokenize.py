@@ -928,25 +928,10 @@ class TokenizeDatasets(SurogateCommand):
                 output_path, vocab_size, masking=True, non_overlapping=non_overlapping
             ) as writer:
                 for i in range(start, end):
-                    tokens = all_tokens[i]
-                    mask = all_masks[i]
-
-                    # Truncate
-                    if tokens.size > seq_len:
-                        tokens = tokens[:seq_len]
-                        mask = mask[:seq_len]
-
-                    actual_len = tokens.size
-
-                    # Pad
-                    if tokens.size < seq_len:
-                        p = seq_len - tokens.size
-                        tokens = np.pad(tokens, (0, p), constant_values=pad_token_id)
-                        mask = np.pad(mask, (0, p), constant_values=0)
-
-                    # Keep padding monotonic so document-boundary detection
-                    # does not create one-token documents for every pad slot.
-                    pos_ids = np.arange(seq_len, dtype=np.int32)
+                    # A padded window is a bin-packed window holding one document: positions
+                    # 0..seq_len-1, and a truncated document does not train on the token that
+                    # was cut off (the shard's next token belongs to another example).
+                    tokens, pos_ids, mask = materialize_window(all_tokens, all_masks, [i], seq_len, pad_token_id)
                     writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
 
                 total_tokens += writer.n_tokens
