@@ -179,6 +179,12 @@ public:
     /// gathers' waits on them are legal.
     void begin_capture(cudaStream_t stream);
 
+    /// Call on `stream` after launching a graph captured with begin_capture: the events were last
+    /// recorded inside that capture, where an eager stream may not wait on them (the next evaluation
+    /// would fail with cudaErrorInvalidValue), so forget the slots again and record the events after
+    /// the graph's work.
+    void after_graph_launch(cudaStream_t stream);
+
     // Synchronization helpers
     void wait_for_gather(int layer_idx, cudaStream_t stream);
     void invalidate();  ///< Invalidate all cached weights (call on optimizer update)
@@ -269,6 +275,9 @@ private:
     void allocate_prefetch_buffers();
     void create_cuda_resources();
     void release_cuda_resources() noexcept;
+
+    /// Forget what the prefetch slots and non-block buffers hold and record their events on `stream`.
+    void reset_gathers(cudaStream_t stream);
 
     // Helper to convert master -> work (dtype conversion, H2D, etc.)
     void convert_to_work(const Tensor& master, Tensor& work, cudaStream_t stream);

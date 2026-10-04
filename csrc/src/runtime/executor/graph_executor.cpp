@@ -1653,10 +1653,11 @@ void GraphExecutor::execute_forward(long B,
         !has_capture_unsafe_ops || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
     const bool use_split_attention =
         save_forward && needs_split && capture_unsafe_split_allowed && mOptions.UseCudaGraphs && !in_capture;
-    // The internal forward graph skips every block gather while capturing (handle_layer_start),
-    // so with sharded weights it would replay whatever the prefetch slots held at capture time.
-    const bool sharded_weights = mWeightManager && mWeightManager->is_streaming_enabled();
-    const bool use_graphs = save_forward && mGraphsEnabled && !in_capture && !needs_split && !sharded_weights;
+    // The internal forward graph skips every block gather while capturing (handle_layer_start), so
+    // with block weights streamed into prefetch slots -- sharded (ZeRO-3) or offload_master -- it
+    // would replay whatever the slots held at capture time.
+    const bool streamed_blocks = mWeightManager && mWeightManager->needs_block_gather();
+    const bool use_graphs = save_forward && mGraphsEnabled && !in_capture && !needs_split && !streamed_blocks;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
