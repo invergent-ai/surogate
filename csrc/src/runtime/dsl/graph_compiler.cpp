@@ -6062,6 +6062,37 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 const long B = mB;
                 const long T = mT;
                 const long C = mConfig.HiddenSize;
+                // The {B,T,C} guess for an output no rule below gave a shape. Recorded, and checked
+                // once the whole graph is compiled (check_shape_fallbacks).
+                auto shape_default = [&]() {
+                    if (!ref.shape.empty()) {
+                        return;
+                    }
+                    ref.shape = {B, T, C};
+                    shape_is_default_fallback = true;
+                    ShapeFallback fallback;
+                    fallback.op_id = op.id;
+                    fallback.op_type = op_type;
+                    fallback.output_index = i;
+                    fallback.output = op.outputs[i];
+                    fallback.consumed = is_consumed(idx, op.outputs[i]);
+                    if (const char* dbg = std::getenv("SUROGATE_DEBUG_SHAPE_FALLBACK");
+                        dbg && std::string(dbg) == "1") {
+                        fprintf(stderr,
+                                "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to op=%s type=%s "
+                                "output[%zu]=%s consumed=%d (resolve_tensor_ref gave empty shape)\n",
+                                B,
+                                T,
+                                C,
+                                op.id.c_str(),
+                                op_type.c_str(),
+                                i,
+                                op.outputs[i].c_str(),
+                                fallback.consumed ? 1 : 0);
+                        fflush(stderr);
+                    }
+                    result.shape_fallbacks.push_back(std::move(fallback));
+                };
                 const long Hq = mConfig.NumQueryHeads;
                 const long Hs = mConfig.head_size();
                 const long QKV = mConfig.qkv_channels();
@@ -6743,6 +6774,57 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                     if (ref.shape.empty()) {
                         ref.shape = compiled.inputs[0].shape;
                     }
+                } else if (compiled.type == CompiledOpType::MambaSplitProj ||
+                           compiled.type == CompiledOpType::MambaSplitConvOut ||
+                           (compiled.type == CompiledOpType::MambaSsmScanBackward && i != 2 && i < 5) ||
+                           (compiled.type == CompiledOpType::MambaConv1dBackward && i == 0)) {
+                    // The Mamba2 splits and the activation gradients of the scan and conv (Nemotron-H),
+                    // as their dispatches allocate them; D is intermediate_size (heads * head_dim):
+                    //   split_proj      gate [B, T, D], conv_input [B, conv_dim, T], dt [B, D, T]
+                    //   split_conv_out  u [B, D, T], B / C [B, groups, state, T]
+                    //   ssm_scan_bwd    du, d_dt [B, D, T] (u's dtype), d_B, d_C [B, groups, state, T] FP32
+                    //   conv1d_bwd      d_x like x [B, conv_dim, T]
+                    auto int_attr = [&](const char* key) -> long {
+                        if (auto* a = find_attr(op.attrs, key)) {
+                            if (auto v = attr_int(*a)) return *v;
+                        }
+                        return 0;
+                    };
+                    long D = int_attr("intermediate_size");
+                    if (D <= 0) D = int_attr("num_heads") * int_attr("head_dim");
+                    const long conv_dim = int_attr("conv_dim");
+                    const long groups = int_attr("n_groups");
+                    const long state = int_attr("ssm_state_size");
+                    std::vector<long> shape;
+                    if (compiled.type == CompiledOpType::MambaSplitProj) {
+                        if (!compiled.inputs.empty()) ref.dtype = compiled.inputs[0].dtype;
+                        if (i == 0 && D > 0) shape = {B, T, D};
+                        if (i == 1 && conv_dim > 0) shape = {B, conv_dim, T};
+                        if (i == 2 && D > 0) shape = {B, D, T};
+                    } else if (compiled.type == CompiledOpType::MambaSplitConvOut) {
+                        if (!compiled.inputs.empty()) ref.dtype = compiled.inputs[0].dtype;
+                        if (i == 0 && D > 0) shape = {B, D, T};
+                        if (i > 0 && groups > 0 && state > 0) shape = {B, groups, state, T};
+                    } else if (compiled.type == CompiledOpType::MambaSsmScanBackward) {
+                        if (i < 2) {
+                            if (compiled.inputs.size() > 1) ref.dtype = compiled.inputs[1].dtype;
+                            if (D > 0) shape = {B, D, T};
+                        } else {
+                            ref.dtype = ETensorDType::FP32;
+                            if (groups > 0 && state > 0) shape = {B, groups, state, T};
+                        }
+                    } else {
+                        if (!compiled.inputs.empty()) ref.dtype = compiled.inputs[0].dtype;
+                        if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                            shape = compiled.inputs[1].shape;
+                        } else if (!compiled.inputs.empty()) {
+                            shape = compiled.inputs[0].shape;
+                        }
+                    }
+                    if (ref.shape.empty()) {
+                        ref.shape = std::move(shape);
+                    }
+                    shape_default();  // an attribute was missing
                 } else if (compiled.type == CompiledOpType::Transpose && !compiled.inputs.empty() &&
                            compiled.inputs[0].shape.size() >= 2) {
                     // output[0] = input with dim0/dim1 swapped.
@@ -6896,34 +6978,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                     // the hidden-size default (e.g., d_blocks[N].self_attn_q_rn_flat
                     // in hybrid models resolves to [B*T*Hq, Hs], not [B,T,C]).
                     ref.dtype = ETensorDType::BF16;
-                    if (ref.shape.empty()) {
-                        ref.shape = {B, T, C};
-                        shape_is_default_fallback = true;
-                        // Checked once the whole graph is compiled (check_shape_fallbacks).
-                        ShapeFallback fallback;
-                        fallback.op_id = op.id;
-                        fallback.op_type = op_type;
-                        fallback.output_index = i;
-                        fallback.output = op.outputs[i];
-                        fallback.consumed = is_consumed(idx, op.outputs[i]);
-                        if (const char* dbg = std::getenv("SUROGATE_DEBUG_SHAPE_FALLBACK");
-                            dbg && std::string(dbg) == "1") {
-                            fprintf(stderr,
-                                    "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to "
-                                    "op=%s type=%s output[%zu]=%s consumed=%d (resolve_tensor_ref gave "
-                                    "empty shape)\n",
-                                    B,
-                                    T,
-                                    C,
-                                    op.id.c_str(),
-                                    op_type.c_str(),
-                                    i,
-                                    op.outputs[i].c_str(),
-                                    fallback.consumed ? 1 : 0);
-                            fflush(stderr);
-                        }
-                        result.shape_fallbacks.push_back(std::move(fallback));
-                    }
+                    shape_default();
                 }
             }
 
