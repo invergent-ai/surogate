@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "core/device_footprint.h"
 #include "core/engine_context.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/plane_storage.h"
 #include <atomic>
 #include "ops/linear/w8a8/w8fp8_plane.h"
@@ -329,9 +330,11 @@ std::size_t w4fp4_plane_bytes() noexcept {
 }
 
 W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
-    // The fp4 profile needs the sm_120a block-scale mma (and the W4 decode
-    // path is gated with it): require CC 12.x.
-    if (w8_device_compute_capability() < 120) { return {nullptr, nullptr, nullptr, nullptr}; }
+    // The fp4 profile needs the sm_120a / sm_121a block-scale mma (and the W4
+    // decode path is gated with it): require a device this build has it for.
+    if (!fp4_kernels_built_for(w8_device_compute_capability())) {
+        return {nullptr, nullptr, nullptr, nullptr};
+    }
     if (!w8fp8_plane_enabled() || g_mode != PrefillQuantMode::Fp4 ||
         weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.qdata == nullptr ||

@@ -65,8 +65,8 @@ __device__ __forceinline__ void w4fp4_mma_16n8k64(float& d0, float& d1, float& d
           "h"(static_cast<unsigned short>(0)), "h"(static_cast<unsigned short>(0)), "r"(sfb),
           "h"(static_cast<unsigned short>(0)), "h"(static_cast<unsigned short>(0)));
 #else
-    // mxf4nvf4 block-scale mma is an sm_120a feature; runtime CC gating
-    // keeps this unreachable elsewhere.
+    // mxf4nvf4 block-scale mma is an sm_120a / sm_121a feature; runtime CC
+    // gating keeps this unreachable elsewhere.
     (void)d0; (void)d1; (void)d2; (void)d3;
     (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1; (void)sfa; (void)sfb;
     __trap();
@@ -83,8 +83,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
     const std::uint8_t* __restrict__ x_sf, const float* __restrict__ x_scales, int rows, int k,
     int tokens, RowMap row_map, Epilogue epilogue) {
 #if defined(__CUDA_ARCH__) && !defined(__CUDA_ARCH_FEAT_SM120_ALL) && !defined(__CUDA_ARCH_FEAT_SM121_ALL)
-    // sm_120a-only (block-scale mma + >48KB static smem tiles); runtime CC
-    // gating keeps this unreachable on other architectures.
+    // sm_120a / sm_121a only (block-scale mma + >48KB static smem tiles);
+    // runtime CC gating keeps this unreachable on other architectures.
     (void)codes; (void)sf; (void)row_scales; (void)x_codes; (void)x_sf; (void)x_scales;
     (void)rows; (void)k; (void)tokens; (void)row_map; (void)epilogue;
     __trap();

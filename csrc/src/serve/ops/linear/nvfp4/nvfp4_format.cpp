@@ -15,6 +15,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sinfer::ops::detail {
 namespace {
@@ -44,6 +45,13 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 
 } // namespace
 
+bool fp4_kernels_built_for(int sm) noexcept {
+    // The FP4 subset of SUROGATE_SERVE_CUDA_ARCHS, comma-joined: "120a", "121a", both, or empty.
+    constexpr std::string_view archs = SINFER_FP4_ARCHS;
+    return (sm == 120 && archs.find("120a") != std::string_view::npos) ||
+           (sm == 121 && archs.find("121a") != std::string_view::npos);
+}
+
 Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* operation) {
     // The hardware question, asked of the weight rather than of a label.
     //
@@ -67,20 +75,18 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
     // prefill-width call takes W4A4 and traps; refusing up front beats proving
     // a given call stays on A16.
     //
-    // An exact match, not `< 120`: the FP4 archives are built for the
-    // architecture-specific `120a` and/or `121a` (SINFER_FP4_ARCHS), which load
-    // on exactly sm_120 or sm_121 (GB10 / DGX Spark). On sm_100 the driver JITs
-    // the fatbin's only other PTX, compute_89, whose W4A4 body is __trap().
+    // The test is against what was built, not `< 120` and not "any sm_12x":
+    // see `fp4_kernels_built_for`. Both sm_120 and sm_121 are supported
+    // devices, each only under a build that names its own target.
     //
     // This is the chokepoint: every NVFP4 wrapper (linear, linear_swiglu,
     // attn_input_proj, linear_add, gdn_input_proj) calls this before any NVFP4
-    // kernel runs. `w4fp4_plane_for` next door guards the same way, though it
-    // still spells the test `< 120` and inherits the sm_121 hole.
-    if (weight.qtype == QType::NVFP4 && w8_device_compute_capability() != 120 &&
-        w8_device_compute_capability() != 121) {
+    // kernel runs. `w4fp4_plane_for` next door asks the same question.
+    if (weight.qtype == QType::NVFP4 && !fp4_kernels_built_for(w8_device_compute_capability())) {
         throw std::invalid_argument(
             std::string(operation) +
-            ": NVFP4 weights need compute capability 12.0 or newer; this device cannot run them");
+            ": NVFP4 weights need a compute capability 12.0 or 12.1 device and a build "
+            "for it (SUROGATE_SERVE_CUDA_ARCHS 120a or 121a); this device cannot run them");
     }
     if (weight.n <= 0 || weight.k <= 0 || (weight.n % 128) != 0 || (weight.k % 64) != 0) {
         throw std::invalid_argument(std::string(operation) + ": NVFP4 requires N%128=0 and K%64=0");

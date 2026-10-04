@@ -996,6 +996,11 @@ target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
 # set: sm_120a (RTX 50 / RTX PRO) or sm_121a (GB10 / DGX Spark).
 set(SINFER_FP4_ARCHS "${SUROGATE_SERVE_CUDA_ARCHS}")
 list(FILTER SINFER_FP4_ARCHS INCLUDE REGEX "^12[01]a$")
+# The runtime refuses FP4 weights on a device these archives were not built for
+# (fp4_kernels_built_for). Comma-joined for the same reason as SINFER_BUILD_CUDA_ARCHS below.
+string(REPLACE ";" "," SINFER_FP4_ARCHS_TEXT "${SINFER_FP4_ARCHS}")
+set_source_files_properties(${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_format.cpp PROPERTIES
+  COMPILE_DEFINITIONS "SINFER_FP4_ARCHS=\"${SINFER_FP4_ARCHS_TEXT}\"")
 if(SINFER_FP4_ARCHS)
   set(SINFER_NVFP4_TMA_REAL ON)
   add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
@@ -1012,7 +1017,8 @@ set_target_properties(sinfer_nvfp4_tma PROPERTIES
 # TMA, cluster launch and block-scaled FP4 MMA are sm_120 hardware. In a multi-architecture
 # build the rest of the engine is compiled for every listed architecture and this is not:
 # an sm_89 cubin of a kernel sm_89 cannot run is fatbin weight and a compile that has to be
-# guarded instruction by instruction. `w4fp4_plane` admits these routes at CC 120 and above.
+# guarded instruction by instruction. `w4fp4_plane` admits these routes on a device one of
+# these archives was built for.
 if(SINFER_NVFP4_TMA_REAL)
   set_target_properties(sinfer_nvfp4_tma PROPERTIES CUDA_ARCHITECTURES "${SINFER_FP4_ARCHS}")
 endif()

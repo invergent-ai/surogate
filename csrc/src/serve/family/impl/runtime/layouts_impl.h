@@ -6,6 +6,7 @@
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
 #include "ops/linear/marlin/marlin_plane.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/vision_context.h"
 #include "api/ops/qsa_indexer.h"
@@ -1198,18 +1199,21 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
     validate_target_options(options, geometry);
-    // An exact match, not `< 120`. The FP4 archives are built for the
-    // architecture-specific `120a` and/or `121a` (SINFER_FP4_ARCHS in
-    // csrc/CMakeLists.txt), which load on exactly sm_120 (RTX 50 / RTX PRO)
-    // or sm_121 (GB10 / DGX Spark) -- not sm_100/103 (B200/B300). On any
-    // other device the driver falls back to the only other PTX in the
-    // fatbin, compute_89, which was built with __CUDA_ARCH__ == 890 and whose
-    // W4A4 body is __trap(). Confirmed by cuobjdump on the built library:
-    // the arch set is {sm_89, sm_120a} or {sm_121a}, with no generic
-    // compute_120 PTX to fall back to.
-    if (weights_profile_needs_sm120(weights_profile) && device.sm() != 120 && device.sm() != 121) {
+    // A match against what was built, not `< 120`. The FP4 archives are built
+    // for the architecture-specific `120a` and/or `121a` (SINFER_FP4_ARCHS in
+    // csrc/CMakeLists.txt), and each loads on exactly its own architecture:
+    // sm_120 (RTX 50 / RTX PRO) or sm_121 (GB10 / DGX Spark) -- not
+    // sm_100/103 (B200/B300), and not the other of the two. On any other
+    // device the driver falls back to the only other PTX in the fatbin,
+    // compute_89, which was built with __CUDA_ARCH__ == 890 and whose W4A4
+    // body is __trap(). Confirmed by cuobjdump on the built library: the arch
+    // set is {sm_89, sm_120a} or {sm_121a}, with no generic compute_120 PTX
+    // to fall back to.
+    if (weights_profile_needs_sm120(weights_profile) &&
+        !ops::detail::fp4_kernels_built_for(device.sm())) {
         throw std::invalid_argument(
-            "this checkpoint's NVFP4 weights need compute capability 12.0 or newer; "
+            "this checkpoint's NVFP4 weights need a compute capability 12.0 or 12.1 device and "
+            "a build for it (SUROGATE_SERVE_CUDA_ARCHS 120a or 121a); "
             "serve a non-FP4 export of the model on this device");
     }
     if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {
