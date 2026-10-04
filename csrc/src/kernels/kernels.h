@@ -2254,6 +2254,21 @@ void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen
 // Efficiently zero multiple non-contiguous device buffers in a single kernel launch.
 // `ptrs[i]` is a device pointer (encoded as uint64_t) and `sizes[i]` is the size in bytes.
 void zero_device_segments(const std::uint64_t* ptrs, const std::uint64_t* sizes, int n, cudaStream_t stream);
+// Matmul autotune probes (matmul_probe.cu). fill_matmul_probe writes deterministic uniform values in
+// [-1, 1). count_word_mismatches adds to counts[0] the 32-bit words where a and b differ, and to
+// counts[1] the words of a that hold a value other than +-0 for elem_bytes-wide elements; counts is
+// device memory the caller zeroes.
+void fill_matmul_probe(float* dst, std::size_t count, unsigned int seed, cudaStream_t stream);
+void fill_matmul_probe(nv_bfloat16* dst, std::size_t count, unsigned int seed, cudaStream_t stream);
+void fill_matmul_probe(half* dst, std::size_t count, unsigned int seed, cudaStream_t stream);
+void fill_matmul_probe(__nv_fp8_e4m3* dst, std::size_t count, unsigned int seed, cudaStream_t stream);
+void fill_matmul_probe(__nv_fp8_e5m2* dst, std::size_t count, unsigned int seed, cudaStream_t stream);
+void count_word_mismatches(const void* a,
+                           const void* b,
+                           std::size_t bytes,
+                           int elem_bytes,
+                           unsigned long long* counts,
+                           cudaStream_t stream);
 void zero_matrix_columns(Tensor& dest, long col_start, long col_end, cudaStream_t stream);
 
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size);

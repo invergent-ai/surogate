@@ -8,12 +8,14 @@
 #include <cublas_v2.h>
 #include <fmt/core.h>
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "kernels.h"
@@ -196,6 +198,22 @@ static int matmul_autotune_max_candidates() {
     return candidates;
 }
 
+// Below this many output elements the bitwise comparison may miss a candidate that rounds
+// differently (a BF16 output hides most FP32 accumulation differences), so the shape keeps the
+// reference algorithm. Matmuls that small gain little from tuning anyway.
+static std::size_t matmul_autotune_min_output_elems() {
+    static const std::size_t elems = []() {
+        if (const char* env = std::getenv("SUROGATE_MATMUL_AUTOTUNE_MIN_OUTPUT_ELEMS")) {
+            char* end = nullptr;
+            const long long val = std::strtoll(env, &end, 10);
+            if (end != env && val >= 0) return static_cast<std::size_t>(val);
+        }
+        return static_cast<std::size_t>(1) << 20;
+    }();
+    return elems;
+}
+
+// Cap on the scratch a tuning probe allocates: synthetic A and B, and two outputs.
 static std::size_t matmul_autotune_max_temp_bytes() {
     static const std::size_t bytes = []() {
         if (const char* env = std::getenv("SUROGATE_MATMUL_AUTOTUNE_MAX_TEMP_MB")) {
@@ -378,6 +396,14 @@ static bool try_get_cached_matmul_algo(const MatmulAutotuneKey& key, cublasLtMat
     return true;
 }
 
+// The autotune times the candidates cuBLASLt's heuristic returns and keeps the fastest, but only
+// among those whose output is bit-identical to the reference, the algorithm the untuned path runs
+// (the first heuristic that succeeds). Candidates round differently (split-K, tile shape), so
+// letting the timing race choose among them made results differ run to run, and differ from
+// graph-captured matmuls, which never tune (#233). Now tuning changes speed, never results.
+//
+// It probes on synthetic operands of the same shape, never the live ones: those can hide a
+// different summation order (a padded batch leaves whole K ranges zero in a weight gradient).
 template <class FloatC, class FloatA, class FloatB>
 static bool tune_matmul_algo(const MatmulAutotuneKey& key,
                              cublasLtHandle_t handle,
@@ -387,13 +413,12 @@ static bool tune_matmul_algo(const MatmulAutotuneKey& key,
                              cublasLtMatrixLayout_t CLayout,
                              cublasLtMatrixLayout_t DLayout,
                              const float* alpha,
-                             const FloatA* a,
-                             const FloatB* b,
                              const float* beta,
+                             const void* a,
+                             const void* b,
+                             const void* d,
                              std::byte* workspace,
                              std::size_t workspace_size,
-                             int ldc,
-                             int n,
                              cudaStream_t stream,
                              const cublasLtMatmulHeuristicResult_t* heuristics,
                              int returned_results,
@@ -415,17 +440,97 @@ static bool tune_matmul_algo(const MatmulAutotuneKey& key,
         return false;
     }
 
-    const std::size_t temp_elems = static_cast<std::size_t>(ldc) * static_cast<std::size_t>(n);
-    const std::size_t temp_bytes = temp_elems * sizeof(FloatC);
-    if (temp_bytes == 0 || temp_bytes > matmul_autotune_max_temp_bytes()) {
+    // Column-major storage as the layouts describe it. Each probe buffer sits at its live pointer's
+    // offset mod 256, so an algorithm that needs more alignment than the live operand has fails here
+    // as it would in the real call, and the reference is the algorithm the untuned path would run.
+    const auto mode = static_cast<EMMTranspose>(key.mode);
+    const bool trans_a = mode == EMMTranspose::TN || mode == EMMTranspose::TT;
+    const bool trans_b = mode == EMMTranspose::NT || mode == EMMTranspose::TT;
+    const std::size_t a_elems = static_cast<std::size_t>(key.lda) * static_cast<std::size_t>(trans_a ? key.m : key.k);
+    const std::size_t b_elems = static_cast<std::size_t>(key.ldb) * static_cast<std::size_t>(trans_b ? key.k : key.n);
+    const std::size_t d_elems = static_cast<std::size_t>(key.ldc) * static_cast<std::size_t>(key.n);
+    // Outputs are compared as 32-bit words; the zeroed tail is never written.
+    const std::size_t d_bytes = (d_elems * sizeof(FloatC) + 3) & ~std::size_t{3};
+    auto region = [](std::size_t bytes) {
+        return (bytes + 2 * 256 - 1) & ~std::size_t{255};
+    };
+    auto offset = [](const void* p) {
+        return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(p) % 256);
+    };
+    const std::size_t a_region = region(a_elems * sizeof(FloatA));
+    const std::size_t b_region = region(b_elems * sizeof(FloatB));
+    const std::size_t d_region = region(d_bytes);
+    const std::size_t temp_bytes = a_region + b_region + 2 * d_region + 2 * sizeof(unsigned long long);
+    if (static_cast<std::size_t>(key.m) * static_cast<std::size_t>(key.n) < matmul_autotune_min_output_elems() ||
+        d_elems == 0 || temp_bytes > matmul_autotune_max_temp_bytes()) {
         return false;
     }
 
-    FloatC* temp_d = nullptr;
-    cudaError_t alloc_status = cudaMalloc(&temp_d, temp_bytes);
+    std::byte* temp = nullptr;
+    cudaError_t alloc_status = cudaMalloc(&temp, temp_bytes);
     if (alloc_status != cudaSuccess) {
         cudaGetLastError();
         return false;
+    }
+    auto* probe_a = reinterpret_cast<FloatA*>(temp + offset(a));
+    auto* probe_b = reinterpret_cast<FloatB*>(temp + a_region + offset(b));
+    auto* ref_d = reinterpret_cast<FloatC*>(temp + a_region + b_region + offset(d));
+    auto* cand_d = reinterpret_cast<FloatC*>(temp + a_region + b_region + d_region + offset(d));
+    auto* counts = reinterpret_cast<unsigned long long*>(temp + a_region + b_region + 2 * d_region);
+    fill_matmul_probe(probe_a, a_elems, 0x2330a, stream);
+    fill_matmul_probe(probe_b, b_elems, 0x2330b, stream);
+
+    auto launch = [&](const cublasLtMatmulAlgo_t& algo, FloatC* out) {
+        return cublasLtMatmul(handle,
+                              operationDesc,
+                              alpha,
+                              probe_a,
+                              ALayout,
+                              probe_b,
+                              BLayout,
+                              beta,
+                              out,
+                              CLayout,
+                              out,
+                              DLayout,
+                              &algo,
+                              workspace,
+                              workspace_size,
+                              stream);
+    };
+    // C = D = zeros, so beta adds nothing and every algorithm sees the same problem.
+    auto run_once = [&](const cublasLtMatmulAlgo_t& algo, FloatC* out) {
+        CUDA_CHECK(cudaMemsetAsync(out, 0, d_bytes, stream));
+        return launch(algo, out);
+    };
+    // {words where x and y differ, nonzero words of x}
+    auto compare = [&](const FloatC* x, const FloatC* y) {
+        unsigned long long host[2] = {0, 0};
+        CUDA_CHECK(cudaMemsetAsync(counts, 0, sizeof(host), stream));
+        count_word_mismatches(x, y, d_bytes, static_cast<int>(sizeof(FloatC)), counts, stream);
+        CUDA_CHECK(cudaMemcpyAsync(host, counts, sizeof(host), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return std::make_pair(host[0], host[1]);
+    };
+
+    int ref_idx = -1;
+    for (int i = 0; i < returned_results && ref_idx < 0; ++i) {
+        if (heuristics[i].state == CUBLAS_STATUS_SUCCESS &&
+            run_once(heuristics[i].algo, ref_d) == CUBLAS_STATUS_SUCCESS) {
+            ref_idx = i;
+        }
+    }
+    // An all-zero reference (alpha == 0) can't tell candidates apart: keep the reference.
+    if (ref_idx < 0 || compare(ref_d, ref_d).second == 0) {
+        CUDA_CHECK(cudaFree(temp));
+        if (ref_idx < 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_matmul_autotune_mutex);
+        auto [it, inserted] =
+            g_matmul_autotune_cache.emplace(key, MatmulAutotuneEntry{heuristics[ref_idx].algo, 0.0f, ref_idx});
+        algo_out = it->second.algo;
+        return true;
     }
 
     cudaEvent_t start = nullptr;
@@ -433,68 +538,58 @@ static bool tune_matmul_algo(const MatmulAutotuneKey& key,
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    const int max_candidates = std::min(returned_results, matmul_autotune_max_candidates());
     const int reps = matmul_autotune_repetitions();
-    float best_ms = INFINITY;
-    int best_idx = -1;
-    cublasLtMatmulAlgo_t best_algo{};
-
-    for (int i = 0; i < max_candidates; ++i) {
-        const auto& candidate = heuristics[i];
-        if (candidate.state != CUBLAS_STATUS_SUCCESS || candidate.workspaceSize > workspace_size) {
-            continue;
-        }
-
-        cublasStatus_t status = cublasLtMatmul(handle,
-                                               operationDesc,
-                                               alpha,
-                                               a,
-                                               ALayout,
-                                               b,
-                                               BLayout,
-                                               beta,
-                                               temp_d,
-                                               CLayout,
-                                               temp_d,
-                                               DLayout,
-                                               &candidate.algo,
-                                               workspace,
-                                               workspace_size,
-                                               stream);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            continue;
-        }
-
+    auto time_algo = [&](const cublasLtMatmulAlgo_t& algo) {
         CUDA_CHECK(cudaEventRecord(start, stream));
         for (int r = 0; r < reps; ++r) {
-            status = cublasLtMatmul(handle,
-                                    operationDesc,
-                                    alpha,
-                                    a,
-                                    ALayout,
-                                    b,
-                                    BLayout,
-                                    beta,
-                                    temp_d,
-                                    CLayout,
-                                    temp_d,
-                                    DLayout,
-                                    &candidate.algo,
-                                    workspace,
-                                    workspace_size,
-                                    stream);
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                break;
+            if (launch(algo, cand_d) != CUBLAS_STATUS_SUCCESS) {
+                return INFINITY;
             }
-        }
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            continue;
         }
         CUDA_CHECK(cudaEventRecord(stop, stream));
         CUDA_CHECK(cudaEventSynchronize(stop));
         float elapsed_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        elapsed_ms /= static_cast<float>(reps);
+        return elapsed_ms / static_cast<float>(reps);
+    };
+
+    const int max_candidates = std::min(returned_results, matmul_autotune_max_candidates());
+    float best_ms = time_algo(heuristics[ref_idx].algo);
+    int best_idx = ref_idx;
+    cublasLtMatmulAlgo_t best_algo = heuristics[ref_idx].algo;
+    int rejected = 0;
+
+    for (int i = 0; i < max_candidates; ++i) {
+        const auto& candidate = heuristics[i];
+        if (i == ref_idx || candidate.state != CUBLAS_STATUS_SUCCESS || candidate.workspaceSize > workspace_size) {
+            continue;
+        }
+        if (run_once(candidate.algo, cand_d) != CUBLAS_STATUS_SUCCESS) {
+            continue;
+        }
+        const unsigned long long mismatched = compare(cand_d, ref_d).first;
+        if (mismatched != 0) {
+            ++rejected;
+            if (matmul_autotune_debug_enabled()) {
+                std::fprintf(stderr,
+                             "[MATMUL-AUTOTUNE]   m=%d n=%d k=%d mode=%d reject idx=%d algo=%d tile=%d stages=%d "
+                             "splitk=%d: %llu of %zu words differ from idx=%d\n",
+                             key.m,
+                             key.n,
+                             key.k,
+                             key.mode,
+                             i,
+                             get_algo_attr_int(candidate.algo, CUBLASLT_ALGO_CONFIG_ID),
+                             get_algo_attr_int(candidate.algo, CUBLASLT_ALGO_CONFIG_TILE_ID),
+                             get_algo_attr_int(candidate.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID),
+                             get_algo_attr_int(candidate.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM),
+                             mismatched,
+                             d_bytes / 4,
+                             ref_idx);
+            }
+            continue;
+        }
+        const float elapsed_ms = time_algo(candidate.algo);
         if (elapsed_ms < best_ms) {
             best_ms = elapsed_ms;
             best_idx = i;
@@ -504,11 +599,7 @@ static bool tune_matmul_algo(const MatmulAutotuneKey& key,
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    CUDA_CHECK(cudaFree(temp_d));
-
-    if (best_idx < 0) {
-        return false;
-    }
+    CUDA_CHECK(cudaFree(temp));
 
     {
         std::lock_guard<std::mutex> lock(g_matmul_autotune_mutex);
@@ -522,7 +613,7 @@ static bool tune_matmul_algo(const MatmulAutotuneKey& key,
     if (matmul_autotune_debug_enabled()) {
         std::fprintf(stderr,
                      "[MATMUL-AUTOTUNE] m=%d n=%d k=%d mode=%d types=%d/%d/%d beta_milli=%d best_idx=%d "
-                     "elapsed_ms=%.4f algo=%d tile=%d stages=%d splitk=%d candidates=%d\n",
+                     "elapsed_ms=%.4f algo=%d tile=%d stages=%d splitk=%d candidates=%d ref_idx=%d rejected=%d\n",
                      key.m,
                      key.n,
                      key.k,
@@ -537,7 +628,9 @@ static bool tune_matmul_algo(const MatmulAutotuneKey& key,
                      get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_TILE_ID),
                      get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_STAGES_ID),
                      get_algo_attr_int(best_algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM),
-                     max_candidates);
+                     max_candidates,
+                     ref_idx,
+                     rejected);
     }
 
     algo_out = best_algo;
@@ -874,13 +967,12 @@ void matmul_cublaslt(FloatC* d,
                                                  CLayout,
                                                  DLayout,
                                                  alpha,
+                                                 beta,
                                                  a,
                                                  b,
-                                                 beta,
+                                                 d,
                                                  workspace,
                                                  workspace_size,
-                                                 ldc,
-                                                 n,
                                                  stream,
                                                  heuristics,
                                                  returnedResults,
