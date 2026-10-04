@@ -192,6 +192,9 @@ public:
     //! Empty under correct compilation (modulo intentional `alias_of`).
     std::vector<dsl::DebugAliasingPair> get_debug_static_aliasing();
 
+    //! Outputs that took the {B,T,C} shape default, across forward + backward graphs.
+    std::vector<dsl::DebugShapeFallback> get_debug_shape_fallbacks();
+
     //! Single-tensor provenance lookup. If `name` is empty, uses `tid`;
     //! otherwise resolves via the graph's name→tid map.
     dsl::DebugTensorResolution get_debug_tensor_resolution(const std::string& name, int tid, bool is_backward);

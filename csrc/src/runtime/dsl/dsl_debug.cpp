@@ -592,6 +592,27 @@ std::vector<DebugAliasingPair> collect_static_aliasing(const DslModel& model) {
     return out;
 }
 
+std::vector<DebugShapeFallback> collect_shape_fallbacks(const DslModel& model) {
+    std::vector<DebugShapeFallback> out;
+    for (const bool is_backward : {false, true}) {
+        const CompiledGraph* graph = compiled_graph_for(model, is_backward);
+        if (!graph) {
+            continue;
+        }
+        for (const auto& fallback : graph->shape_fallbacks) {
+            DebugShapeFallback entry;
+            entry.graph = is_backward ? DebugGraphKind::Backward : DebugGraphKind::Forward;
+            entry.op_id = fallback.op_id;
+            entry.op_type = fallback.op_type;
+            entry.output_index = static_cast<std::uint64_t>(fallback.output_index);
+            entry.output = fallback.output;
+            entry.consumed = fallback.consumed;
+            out.push_back(std::move(entry));
+        }
+    }
+    return out;
+}
+
 DebugTensorResolution resolve_tensor(const DslModel& model, const std::string& name, int tid, bool is_backward) {
     DebugTensorResolution out;
     out.graph = is_backward ? DebugGraphKind::Backward : DebugGraphKind::Forward;

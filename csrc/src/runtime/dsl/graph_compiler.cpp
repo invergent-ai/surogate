@@ -5743,7 +5743,56 @@ void GraphCompiler::reset_tid_namespace() {
     mTensorDtypes.clear();
 }
 
-CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is_backward) {
+namespace {
+
+// The {B,T,C} default is a guess for an op without a shape rule: an output that is read, or that
+// a backward op writes, then loses its planned buffer to a runtime temp (a persistent fallback
+// allocation under CUDA-graph capture) or carries a wrong shape to its reader. Those fail the
+// compile; outputs nothing reads keep the one warning.
+void check_shape_fallbacks(const CompiledGraph& graph, bool is_backward) {
+    std::vector<const ShapeFallback*> errors;
+    std::size_t discarded = 0;
+    for (const auto& fallback : graph.shape_fallbacks) {
+        if (fallback.consumed || (is_backward && !fallback.output.empty())) {
+            errors.push_back(&fallback);
+        } else {
+            ++discarded;
+        }
+    }
+    const char* allow = std::getenv("SUROGATE_ALLOW_SHAPE_FALLBACK");
+    const bool allowed = allow && std::string(allow) == "1";
+    if (!errors.empty() && !allowed) {
+        std::ostringstream oss;
+        oss << "GraphCompiler: " << errors.size() << " output(s) of the " << (is_backward ? "backward" : "forward")
+            << " graph have no shape rule and would take the {B,T,C} default:\n";
+        constexpr std::size_t kMaxListed = 20;
+        for (std::size_t k = 0; k < errors.size() && k < kMaxListed; ++k) {
+            const auto& fallback = *errors[k];
+            oss << "  op " << fallback.op_id << " (" << fallback.op_type << ") output[" << fallback.output_index << "] "
+                << fallback.output << (fallback.consumed ? ", which is read" : ", a backward output") << "\n";
+        }
+        if (errors.size() > kMaxListed) {
+            oss << "  ... and " << errors.size() - kMaxListed << " more\n";
+        }
+        oss << "Give the op a Mapped-slot output shape rule in GraphCompiler::compile, or set "
+               "SUROGATE_ALLOW_SHAPE_FALLBACK=1 to run on the default (SUROGATE_DEBUG_SHAPE_FALLBACK=1 "
+               "prints every fallback).";
+        throw std::runtime_error(oss.str());
+    }
+    if (discarded > 0 || !errors.empty()) {
+        static std::once_flag warned_once;
+        std::call_once(warned_once, []() {
+            fprintf(stderr,
+                    "[graph_compiler] warning: using the {B,T,C} default for a Mapped-slot output without a "
+                    "shape rule; set SUROGATE_DEBUG_SHAPE_FALLBACK=1 to see each occurrence.\n");
+            fflush(stderr);
+        });
+    }
+}
+
+}  // namespace
+
+CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is_backward, const Graph* reader) {
     update_dimensions(B, T);
 
     // Note: mTensorIdMap, mNextTensorId, mExtraShapes, mTensorShapes, and
@@ -5865,6 +5914,47 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     result.ops.reserve(graph.operations.size());
     result.total_ops = graph.operations.size();
 
+    // Who reads each tensor, for outputs that take the {B,T,C} shape default below: the last op
+    // of this graph that names it (as an input or an attribute such as shape_like), and the
+    // names read from outside it (its outputs and save list, and the graph compiled after it).
+    std::unordered_map<std::string, std::size_t> last_reader;
+    std::unordered_set<std::string> read_outside;
+    {
+        auto for_each_read = [](const Operation& op, auto&& fn) {
+            for (const auto& inp : op.inputs) {
+                fn(inp);
+            }
+            for (const auto& [key, value] : op.attrs) {
+                if (const auto* str = std::get_if<std::string>(&value.value)) {
+                    fn(*str);
+                }
+            }
+        };
+        auto unsaved = [](const std::string& name) {
+            return starts_with(name, kSavedPrefix) ? name.substr(kSavedPrefix.size()) : name;
+        };
+        for (std::size_t idx = 0; idx < graph.operations.size(); ++idx) {
+            for_each_read(graph.operations[idx], [&](const std::string& name) { last_reader[unsaved(name)] = idx; });
+        }
+        for (const auto& [name, info] : graph.outputs) {
+            read_outside.insert(name);
+        }
+        read_outside.insert(graph.save.begin(), graph.save.end());
+        if (reader) {
+            for (const auto& op : reader->operations) {
+                for_each_read(op, [&](const std::string& name) { read_outside.insert(unsaved(name)); });
+            }
+            read_outside.insert(reader->save.begin(), reader->save.end());
+        }
+    }
+    auto is_consumed = [&](std::size_t idx, const std::string& name) {
+        if (name.empty()) {
+            return false;
+        }
+        auto it = last_reader.find(name);
+        return (it != last_reader.end() && it->second > idx) || read_outside.count(name) > 0;
+    };
+
     for (std::size_t idx = 0; idx < graph.operations.size(); ++idx) {
         const auto& op = graph.operations[idx];
         const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
@@ -5972,6 +6062,37 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 const long B = mB;
                 const long T = mT;
                 const long C = mConfig.HiddenSize;
+                // The {B,T,C} guess for an output no rule below gave a shape. Recorded, and checked
+                // once the whole graph is compiled (check_shape_fallbacks).
+                auto shape_default = [&]() {
+                    if (!ref.shape.empty()) {
+                        return;
+                    }
+                    ref.shape = {B, T, C};
+                    shape_is_default_fallback = true;
+                    ShapeFallback fallback;
+                    fallback.op_id = op.id;
+                    fallback.op_type = op_type;
+                    fallback.output_index = i;
+                    fallback.output = op.outputs[i];
+                    fallback.consumed = is_consumed(idx, op.outputs[i]);
+                    if (const char* dbg = std::getenv("SUROGATE_DEBUG_SHAPE_FALLBACK");
+                        dbg && std::string(dbg) == "1") {
+                        fprintf(stderr,
+                                "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to op=%s type=%s "
+                                "output[%zu]=%s consumed=%d (resolve_tensor_ref gave empty shape)\n",
+                                B,
+                                T,
+                                C,
+                                op.id.c_str(),
+                                op_type.c_str(),
+                                i,
+                                op.outputs[i].c_str(),
+                                fallback.consumed ? 1 : 0);
+                        fflush(stderr);
+                    }
+                    result.shape_fallbacks.push_back(std::move(fallback));
+                };
                 const long Hq = mConfig.NumQueryHeads;
                 const long Hs = mConfig.head_size();
                 const long QKV = mConfig.qkv_channels();
@@ -6653,6 +6774,57 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                     if (ref.shape.empty()) {
                         ref.shape = compiled.inputs[0].shape;
                     }
+                } else if (compiled.type == CompiledOpType::MambaSplitProj ||
+                           compiled.type == CompiledOpType::MambaSplitConvOut ||
+                           (compiled.type == CompiledOpType::MambaSsmScanBackward && i != 2 && i < 5) ||
+                           (compiled.type == CompiledOpType::MambaConv1dBackward && i == 0)) {
+                    // The Mamba2 splits and the activation gradients of the scan and conv (Nemotron-H),
+                    // as their dispatches allocate them; D is intermediate_size (heads * head_dim):
+                    //   split_proj      gate [B, T, D], conv_input [B, conv_dim, T], dt [B, D, T]
+                    //   split_conv_out  u [B, D, T], B / C [B, groups, state, T]
+                    //   ssm_scan_bwd    du, d_dt [B, D, T] (u's dtype), d_B, d_C [B, groups, state, T] FP32
+                    //   conv1d_bwd      d_x like x [B, conv_dim, T]
+                    auto int_attr = [&](const char* key) -> long {
+                        if (auto* a = find_attr(op.attrs, key)) {
+                            if (auto v = attr_int(*a)) return *v;
+                        }
+                        return 0;
+                    };
+                    long D = int_attr("intermediate_size");
+                    if (D <= 0) D = int_attr("num_heads") * int_attr("head_dim");
+                    const long conv_dim = int_attr("conv_dim");
+                    const long groups = int_attr("n_groups");
+                    const long state = int_attr("ssm_state_size");
+                    std::vector<long> shape;
+                    if (compiled.type == CompiledOpType::MambaSplitProj) {
+                        if (!compiled.inputs.empty()) ref.dtype = compiled.inputs[0].dtype;
+                        if (i == 0 && D > 0) shape = {B, T, D};
+                        if (i == 1 && conv_dim > 0) shape = {B, conv_dim, T};
+                        if (i == 2 && D > 0) shape = {B, D, T};
+                    } else if (compiled.type == CompiledOpType::MambaSplitConvOut) {
+                        if (!compiled.inputs.empty()) ref.dtype = compiled.inputs[0].dtype;
+                        if (i == 0 && D > 0) shape = {B, D, T};
+                        if (i > 0 && groups > 0 && state > 0) shape = {B, groups, state, T};
+                    } else if (compiled.type == CompiledOpType::MambaSsmScanBackward) {
+                        if (i < 2) {
+                            if (compiled.inputs.size() > 1) ref.dtype = compiled.inputs[1].dtype;
+                            if (D > 0) shape = {B, D, T};
+                        } else {
+                            ref.dtype = ETensorDType::FP32;
+                            if (groups > 0 && state > 0) shape = {B, groups, state, T};
+                        }
+                    } else {
+                        if (!compiled.inputs.empty()) ref.dtype = compiled.inputs[0].dtype;
+                        if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                            shape = compiled.inputs[1].shape;
+                        } else if (!compiled.inputs.empty()) {
+                            shape = compiled.inputs[0].shape;
+                        }
+                    }
+                    if (ref.shape.empty()) {
+                        ref.shape = std::move(shape);
+                    }
+                    shape_default();  // an attribute was missing
                 } else if (compiled.type == CompiledOpType::Transpose && !compiled.inputs.empty() &&
                            compiled.inputs[0].shape.size() >= 2) {
                     // output[0] = input with dim0/dim1 swapped.
@@ -6806,32 +6978,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                     // the hidden-size default (e.g., d_blocks[N].self_attn_q_rn_flat
                     // in hybrid models resolves to [B*T*Hq, Hs], not [B,T,C]).
                     ref.dtype = ETensorDType::BF16;
-                    if (ref.shape.empty()) {
-                        ref.shape = {B, T, C};
-                        shape_is_default_fallback = true;
-                        static std::once_flag warned_once;
-                        std::call_once(warned_once, []() {
-                            fprintf(stderr,
-                                    "[graph_compiler] warning: using {B,T,C} fallback for unknown "
-                                    "Mapped-slot output shape; set SUROGATE_DEBUG_SHAPE_FALLBACK=1 "
-                                    "to see each occurrence.\n");
-                            fflush(stderr);
-                        });
-                        if (const char* dbg = std::getenv("SUROGATE_DEBUG_SHAPE_FALLBACK");
-                            dbg && std::string(dbg) == "1") {
-                            fprintf(stderr,
-                                    "[graph_compiler] shape fallback {B=%ld,T=%ld,C=%ld} applied to "
-                                    "op=%s type=%d output[%zu]=%s (resolve_tensor_ref gave empty shape)\n",
-                                    B,
-                                    T,
-                                    C,
-                                    op.id.c_str(),
-                                    static_cast<int>(compiled.type),
-                                    i,
-                                    op.outputs[i].c_str());
-                            fflush(stderr);
-                        }
-                    }
+                    shape_default();
                 }
             }
 
@@ -6921,6 +7068,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
 
         result.ops.push_back(std::move(compiled));
     }
+
+    check_shape_fallbacks(result, is_backward);
 
     apply_fusion_rewrites(result, is_backward);
 

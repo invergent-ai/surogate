@@ -630,6 +630,18 @@ struct FusionRewritePreview {
     std::string reason;
 };
 
+/// A Mapped-slot output that no shape rule in GraphCompiler::compile covered, so it took the
+/// {B, T, C} default. `consumed` is set when something reads it: a later op of the graph, the
+/// graph's outputs or save list, or the graph compiled after it (the backward of a forward).
+/// A consumed one, or any named backward output, fails the compile (#235).
+struct ShapeFallback {
+    std::string op_id;
+    std::string op_type;
+    std::size_t output_index = 0;
+    std::string output;  ///< empty for an unnamed output, which nothing can read
+    bool consumed = false;
+};
+
 // ============================================================================
 // Compiled Graph
 // ============================================================================
@@ -868,6 +880,10 @@ struct CompiledGraph {
     // Deterministic rewrite plan preview. Populated before supported rewrites
     // mutate `ops`; entries also record whether a candidate was applied.
     std::vector<FusionRewritePreview> fusion_rewrite_preview;
+
+    // Outputs that took the {B,T,C} shape default. Only discarded ones survive a
+    // compile unless SUROGATE_ALLOW_SHAPE_FALLBACK=1.
+    std::vector<ShapeFallback> shape_fallbacks;
 };
 
 // ============================================================================
@@ -885,7 +901,10 @@ public:
     // Compile a forward or backward graph. `is_backward=true` selects the
     // backward dispatch function for each op when both a forward and a
     // backward are registered (e.g. View, Zeros, MatmulBackward).
-    CompiledGraph compile(const Graph& graph, long B, long T, bool is_backward = false);
+    // `reader` is the graph compiled after this one that reads its tensors
+    // (the backward of a forward): its reads count as consumers when a
+    // Mapped output has no shape rule (see ShapeFallback).
+    CompiledGraph compile(const Graph& graph, long B, long T, bool is_backward = false, const Graph* reader = nullptr);
 
     // Reset the per-compile-pair namespace. This clears:
     //   - tensor-id map (so fresh forward+backward get consistent tids)
