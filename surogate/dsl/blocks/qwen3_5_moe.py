@@ -145,10 +145,13 @@ def _qwen3_5_moe_schema(block_family: str, *, has_linear_mixer: bool = False) ->
     )
     return BlockSchema(
         slots=slots,
+        # HF's Qwen3_5MoeTopKRouter renormalises the top-k softmax weights unconditionally (the
+        # config has no norm_topk_prob), and so does the serving engine. Without it every routed
+        # expert was weighted by the top-k's share of the softmax, well under 1 with 256 experts.
         routing=RoutingSchema(
             kind="topk_softmax",
             topk="num_experts_per_tok",
-            norm_topk_prob=False,
+            norm_topk_prob=True,
             shared_experts="shared_expert_intermediate",
         ),
         ep_topology=EPTopology(ep_size_param="ep_size"),
@@ -232,7 +235,7 @@ class Qwen3_5MoEAttentionBlock(nn.Block):
             d_ff,
             num_experts,
             num_experts_per_tok,
-            norm_topk_prob=False,
+            norm_topk_prob=True,
             ep_size=ep_size,
         )
         self.shared_expert = MoESharedExpert(d_model, shared_expert_intermediate)
@@ -340,7 +343,7 @@ class Qwen3_5MoELinearBlock(nn.Block):
             d_ff,
             num_experts,
             num_experts_per_tok,
-            norm_topk_prob=False,
+            norm_topk_prob=True,
             ep_size=ep_size,
         )
         self.shared_expert = MoESharedExpert(d_model, shared_expert_intermediate)

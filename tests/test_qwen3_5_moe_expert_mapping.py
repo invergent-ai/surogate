@@ -113,3 +113,21 @@ def test_only_qwen3_5_moe_declares_gate_first_experts():
         ("Qwen3_5MoECausalModel", "experts_gate_up"),
         ("Qwen3_5MoEConditionalModel", "experts_gate_up"),
     }
+
+
+@pytest.mark.parametrize("block", ["Qwen3_5MoEAttentionBlock", "Qwen3_5MoELinearBlock"])
+def test_qwen3_5_moe_renormalises_the_top_k_routing_weights(block):
+    """HF's Qwen3_5MoeTopKRouter divides the top-k softmax weights by their sum, always (the config
+    carries no norm_topk_prob). Not renormalising weighted every routed expert by the top-k's share
+    of the softmax: on Qwen3.6-35B-A3B the first layer's output was at cos 0.98 against HF."""
+    from surogate.dsl.blocks import qwen3_5_moe as blocks
+
+    cls = getattr(blocks, block)
+    assert cls.schema.routing.norm_topk_prob is True
+    dims = dict(d_model=64, d_ff=32, num_experts=8, num_experts_per_tok=2, shared_expert_intermediate=32)
+    if block == "Qwen3_5MoEAttentionBlock":
+        dims.update(num_query_heads=2, num_kv_heads=1, head_size=32, max_seq=128)
+    else:
+        dims.update(linear_key_head_dim=16, linear_value_head_dim=16, linear_num_key_heads=2,
+                    linear_num_value_heads=4)
+    assert cls(**dims).moe.norm_topk_prob is True
