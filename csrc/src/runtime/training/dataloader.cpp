@@ -563,6 +563,14 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids,
             }
         }
 
+        // A non-overlapping shard holds one example per window, so the token after a window's last
+        // position is the next window's first -- another example's, or past the end of the file's
+        // token block. It is never that position's target, whatever its mask bit says: shards written
+        // before the tokenizer cleared the bit of a truncated example carry it set (#277).
+        if (file_info->NonOverlapping) {
+            targets.get<int>()[mSeqLen - 1] = -100;
+        }
+
         // Update position only after successful reads
         mChunkIndex += mWorldSize;
 

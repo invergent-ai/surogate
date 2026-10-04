@@ -343,6 +343,18 @@ def pack_and_write(
     flush()
 
 
+def _truncate(tokens: np.ndarray, mask: np.ndarray, seq_len: int) -> tuple[np.ndarray, np.ndarray]:
+    """An example cut to one padded window of ``seq_len``.
+
+    The mask is input-aligned (``mask[t]`` trains the prediction of ``tokens[t + 1]``), so after
+    the cut its last bit trains the token that was cut off. That bit is cleared: the loader's
+    target there is the shard's next token, the first of another example's window (#277).
+    """
+    mask = mask[:seq_len].copy()
+    mask[-1] = 0
+    return tokens[:seq_len], mask
+
+
 def write_padded(
     writer: TokenizedDataFileWriter,
     docs: Iterable[dict],
@@ -365,8 +377,7 @@ def write_padded(
 
         # Truncate if too long
         if tokens.size > seq_len:
-            tokens = tokens[:seq_len]
-            mask = mask[:seq_len]
+            tokens, mask = _truncate(tokens, mask, seq_len)
 
         # Pad if too short
         if tokens.size < seq_len:
@@ -871,10 +882,8 @@ class TokenizeDatasets(SurogateCommand):
                     tokens = all_tokens[i]
                     mask = all_masks[i]
 
-                    # Truncate
                     if tokens.size > seq_len:
-                        tokens = tokens[:seq_len]
-                        mask = mask[:seq_len]
+                        tokens, mask = _truncate(tokens, mask, seq_len)
 
                     actual_len = tokens.size
 
