@@ -63,10 +63,13 @@ def test_routed_experts_are_read_as_the_checkpoint_stores_them():
     their halves for its SwiGLU. That is the trainer's layout, not the engine's: the engine reads
     routed experts gate-first, so the artifact takes the checkpoint tensor as stored."""
     g = inv.geometry_from_config(config_for(), token_domain=500)
+    assert g.declared.hf_mapping["experts_gate_up"] == "model.layers.{layer}.mlp.experts.gate_up_proj"
     recipes = {r.object_name: r for r in recipe.build_recipes(g)}
-    sources = source_requirements((recipes["text/layers/0/moe/routed_gate_up"],))
-    assert list(sources) == ["model.layers.0.mlp.experts.gate_up_proj"]
-    assert sources["model.layers.0.mlp.experts.gate_up_proj"].shape == (4, 2 * 64, g.hidden)
+    fused, split = recipes["text/layers/0/moe/routed_gate_up"].expression.options
+    assert (fused.source.name, fused.source.shape) == ("model.layers.0.mlp.experts.gate_up_proj", (4, 2 * 64, g.hidden))
+    assert [part.name for part in split.source.sources] == [
+        "model.layers.0.mlp.experts.gate_proj", "model.layers.0.mlp.experts.up_proj",
+    ]
 
 
 @pytest.mark.parametrize("layers,head,targets", [(3, 64, (0, 2)), (4, 128, (1, 3, 0))])
