@@ -784,6 +784,27 @@ void DslGradStore::allocate_streaming_buffers(const DslParamStore& params) {
             mAllocator->allocate(base_dtypes[base], ("staging_d_" + base).c_str(), EAllocationType::PINNED, shape));
     }
 
+    // Each layer's `cpu_grad += staging`, run on the host after that layer's D2H
+    // on micro-steps after the first (see offload_layer_grads).
+    mLayerHostAccum.assign(mLayerGradNames.size(), {});
+    for (std::size_t layer = 0; layer < mLayerGradNames.size(); ++layer) {
+        for (const auto& name : mLayerGradNames[layer]) {
+            auto grad_it = mGrads.find(name);
+            auto cpu_it = mCpuGrads.find(name);
+            auto staging_it = mCpuStagingBuffer.find(base_grad_name(name));
+            if (grad_it == mGrads.end() || cpu_it == mCpuGrads.end() || staging_it == mCpuStagingBuffer.end()) {
+                continue;
+            }
+            if (staging_it->second.DType != cpu_it->second.DType) {
+                throw std::runtime_error("DslGradStore: staging dtype differs from the CPU gradient of " + name);
+            }
+            mLayerHostAccum[layer].push_back(HostAccumTask{cpu_it->second.Data,
+                                                           staging_it->second.Data,
+                                                           static_cast<std::size_t>(cpu_it->second.nelem()),
+                                                           cpu_it->second.DType});
+        }
+    }
+
     // 3. Allocate double-buffered GPU gradient slots (sized for max layer)
     for (int s = 0; s < kNumGradSlots; ++s) {
         auto& slot = mGradSlots[s];
@@ -806,6 +827,7 @@ void DslGradStore::create_streaming_events() {
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.compute_done, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.reduce_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.accum_done, cudaEventDisableTiming));
         // Pre-signal so first prepare doesn't deadlock
         CUDA_CHECK(cudaEventRecord(slot.d2h_done, nullptr));
     }
@@ -825,6 +847,10 @@ void DslGradStore::destroy_streaming_events() noexcept {
         if (slot.reduce_done) {
             cudaEventDestroy(slot.reduce_done);
             slot.reduce_done = nullptr;
+        }
+        if (slot.accum_done) {
+            cudaEventDestroy(slot.accum_done);
+            slot.accum_done = nullptr;
         }
     }
 }
@@ -926,9 +952,21 @@ void DslGradStore::offload_layer_grads(int layer_idx, cudaStream_t compute_strea
         }
     }
 
-    // Record D2H done
+    // Record D2H done: the GPU slot can be reused from here.
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, copy_stream));
-    mPendingD2HEvents.push_back(slot.d2h_done);
+
+    if (mMicroStep == 0) {
+        mPendingD2HEvents.push_back(slot.d2h_done);
+    } else {
+        // Every layer stages through the same per-name buffer, so add this layer's
+        // copy into its CPU grads before the copy stream moves on to the next
+        // layer's D2H, which would overwrite it. A host function holds the copy
+        // stream until it returns; the GPU slot was already released above.
+        CUDA_CHECK(
+            cudaLaunchHostFunc(copy_stream, &DslGradStore::accumulate_staged_layer, &mLayerHostAccum[layer_idx]));
+        CUDA_CHECK(cudaEventRecord(slot.accum_done, copy_stream));
+        mPendingD2HEvents.push_back(slot.accum_done);
+    }
 
     // Advance to next slot
     mActiveGradSlot = (mActiveGradSlot + 1) % kNumGradSlots;
@@ -962,6 +1000,25 @@ void DslGradStore::offload_non_block_grads(cudaStream_t stream) {
     }
 }
 
+void DslGradStore::accumulate_staged_layer(void* tasks) {
+    for (const auto& task : *static_cast<const std::vector<HostAccumTask>*>(tasks)) {
+        if (task.dtype == ETensorDType::FP32) {
+            auto* dst = static_cast<float*>(task.dst);
+            const auto* src = static_cast<const float*>(task.src);
+            for (std::size_t i = 0; i < task.nelem; ++i) {
+                dst[i] += src[i];
+            }
+        } else if (task.dtype == ETensorDType::BF16) {
+            auto* dst = static_cast<nv_bfloat16*>(task.dst);
+            const auto* src = static_cast<const nv_bfloat16*>(task.src);
+            for (std::size_t i = 0; i < task.nelem; ++i) {
+                float val = static_cast<float>(dst[i]) + static_cast<float>(src[i]);
+                dst[i] = static_cast<nv_bfloat16>(val);
+            }
+        }
+    }
+}
+
 void DslGradStore::wait_all_offloads(cudaStream_t stream) {
     if (!mStreamGrads) return;
 
@@ -972,35 +1029,8 @@ void DslGradStore::wait_all_offloads(cudaStream_t stream) {
     // Synchronize to ensure all D2H is visible on CPU
     CUDA_CHECK(cudaStreamSynchronize(stream));
     mPendingD2HEvents.clear();
-
-    // CPU-side accumulation for micro_step > 0
-    if (mMicroStep > 0) {
-        for (const auto& layer_names : mLayerGradNames) {
-            for (const auto& name : layer_names) {
-                auto cpu_it = mCpuGrads.find(name);
-                auto base = base_grad_name(name);
-                auto staging_it = mCpuStagingBuffer.find(base);
-                if (cpu_it == mCpuGrads.end() || staging_it == mCpuStagingBuffer.end()) continue;
-
-                // cpu_grad += staging
-                const auto nelem = static_cast<std::size_t>(cpu_it->second.nelem());
-                if (cpu_it->second.DType == ETensorDType::FP32) {
-                    auto* dst = cpu_it->second.template get<float>();
-                    const auto* src = staging_it->second.template get<float>();
-                    for (std::size_t i = 0; i < nelem; ++i) {
-                        dst[i] += src[i];
-                    }
-                } else if (cpu_it->second.DType == ETensorDType::BF16) {
-                    auto* dst = reinterpret_cast<nv_bfloat16*>(cpu_it->second.Data);
-                    const auto* src = reinterpret_cast<const nv_bfloat16*>(staging_it->second.Data);
-                    for (std::size_t i = 0; i < nelem; ++i) {
-                        float val = static_cast<float>(dst[i]) + static_cast<float>(src[i]);
-                        dst[i] = static_cast<nv_bfloat16>(val);
-                    }
-                }
-            }
-        }
-    }
+    // Micro-steps after the first were added into the CPU grads per layer, as
+    // each staged copy landed (accumulate_staged_layer); the waits above cover them.
 }
 
 const Tensor& DslGradStore::get_cpu_grad(const std::string& name) const {
