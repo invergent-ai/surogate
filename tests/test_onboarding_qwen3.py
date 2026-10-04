@@ -50,6 +50,13 @@ SEQ_LEN = 16
 # bf16 forward through multiple layers accumulates error; 5e-2 is a reasonable
 # threshold for implementation-level differences (fused kernels, cuDNN attention).
 RMS_TOL = 5e-2
+# From layer 2 on, three channels of the first token carry massive activations (about 400, 700
+# and 7200). At 7232 one bf16 step is 32, and a one-step rounding difference there adds
+# 32 / sqrt(16 * 1024) = 0.25 to an RMS over the whole tensor, five times RMS_TOL: residual_final
+# passed or failed on how one element rounded (#234). Elements that large are held to a relative
+# bound of at least two bf16 steps instead; the rest keep the absolute RMS budget.
+MASSIVE_ABS = 256.0
+MASSIVE_RTOL = 2.0**-6
 
 MINI_MODEL_DIR = Path("tmp/onboarding_qwen3_mini")
 DUMP_DIR = Path("tmp/onboarding_qwen3_dumps")
@@ -168,6 +175,14 @@ def diff_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     rms = float(np.sqrt(np.mean(diff * diff)))
     max_abs = float(np.max(np.abs(diff)))
     return rms, max_abs
+
+
+def residual_stats(a: np.ndarray, ref: np.ndarray) -> tuple[float, float, float]:
+    """diff_stats over the elements below MASSIVE_ABS, and the largest relative error over the rest."""
+    massive = np.abs(ref) >= MASSIVE_ABS
+    rms, max_abs = diff_stats(a[~massive], ref[~massive])
+    rel = np.abs(a[massive].astype(np.float32) - ref[massive]) / np.abs(ref[massive])
+    return rms, max_abs, float(rel.max()) if rel.size else 0.0
 
 
 def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
@@ -389,7 +404,10 @@ class TestQwen3Onboarding:
         assert rms < RMS_TOL, f"xF (final norm output) rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
 
     def test_residual_final(self, forward_results):
-        """Check that residual_final (before final norm) matches HF pre-norm."""
+        """Check that residual_final (before final norm) matches HF pre-norm.
+
+        The massive activations are compared relative to their size (see MASSIVE_ABS).
+        """
         hf = forward_results
 
         try:
@@ -397,8 +415,11 @@ class TestQwen3Onboarding:
         except FileNotFoundError:
             pytest.skip("residual_final dump not available")
 
-        rms, max_abs = diff_stats(rt_residual_final, hf["pre_norm"])
+        rms, max_abs, massive_rel = residual_stats(rt_residual_final, hf["pre_norm"])
         assert rms < RMS_TOL, f"residual_final rms={rms:.4e} max_abs={max_abs:.4e} (tol={RMS_TOL:.0e})"
+        assert massive_rel < MASSIVE_RTOL, (
+            f"residual_final |x| >= {MASSIVE_ABS:g}: rel={massive_rel:.4e} (tol={MASSIVE_RTOL:.4e})"
+        )
 
     def test_summary(self, forward_results):
         """Print a summary table of all comparisons (informational)."""
@@ -421,9 +442,10 @@ class TestQwen3Onboarding:
         except FileNotFoundError:
             pass
 
+        massive_rel = None
         try:
             rt_rf = load_dump("residual_final")
-            rms, max_abs = diff_stats(rt_rf, hf["pre_norm"])
+            rms, max_abs, massive_rel = residual_stats(rt_rf, hf["pre_norm"])
             rows.append(("residual_final (pre-norm)", rms, max_abs))
         except FileNotFoundError:
             pass
@@ -432,3 +454,6 @@ class TestQwen3Onboarding:
         for name, rms, max_abs in rows:
             status = "OK" if rms <= RMS_TOL else "FAIL"
             print(f"  {name:30s} rms={rms:.4e}  max={max_abs:.4e}  [{status}]")
+        if massive_rel is not None:
+            status = "OK" if massive_rel < MASSIVE_RTOL else "FAIL"
+            print(f"  {'residual_final |x| >= ' + f'{MASSIVE_ABS:g}':30s} rel={massive_rel:.4e}  [{status}]")
