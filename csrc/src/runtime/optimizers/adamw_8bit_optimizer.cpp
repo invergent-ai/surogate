@@ -7,6 +7,7 @@
 #include "runtime/optimizers/adamw_8bit_optimizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -82,6 +83,48 @@ private:
     Tensor* mScales2 = nullptr;
 };
 
+/// A view of `n` consecutive elements of `t`, starting at element `offset`.
+Tensor flat_range(const Tensor& t, std::size_t offset, std::size_t n) {
+    return Tensor::from_pointer(t.Data + offset * get_dtype_size(t.DType),
+                                t.Device,
+                                t.DType,
+                                std::array<long, 1>{static_cast<long>(n)});
+}
+
+/// The slice of a whole (replicated) master that this rank updated.
+struct OwnedSlice {
+    Tensor master;
+    std::size_t offset;
+    std::size_t n;
+};
+
+/// All-gather every rank's updated slice into the whole masters, in place: this rank's slice
+/// already sits in its own slot (rank * n), which is NCCL's in-place convention. Every rank
+/// passes the same tensors in the same order.
+void all_gather_owned_slices(const std::vector<OwnedSlice>& slices,
+                             int rank,
+                             int world,
+                             NCCLCommunicator& comm,
+                             cudaEvent_t done,
+                             cudaStream_t stream) {
+    // Bounds the collectives in one NCCL group.
+    constexpr std::size_t kPerTransaction = 64;
+    for (std::size_t begin = 0; begin < slices.size(); begin += kPerTransaction) {
+        const std::size_t end = std::min(slices.size(), begin + kPerTransaction);
+        comm.begin_transaction(stream);
+        for (std::size_t i = begin; i < end; ++i) {
+            Tensor master = slices[i].master;
+            const Tensor own = flat_range(master, slices[i].offset, slices[i].n);
+            comm.schedule_all_gather(
+                TensorShard(own, rank, world, std::array<long, 1>{static_cast<long>(master.nelem())}),
+                master);
+        }
+        comm.execute_transaction(done);
+        // The all-gather runs on the comm stream; `stream` refreshes the work weights from it next.
+        CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
+    }
+}
+
 }  // namespace
 
 struct AdamW8BitOptimizer::Impl {
@@ -98,18 +141,51 @@ struct AdamW8BitOptimizer::Impl {
         Tensor scales2;  // FP16 per-group scales for variance
     };
 
+    /// Where one trainable parameter's state lives, and which of its elements this rank updates.
+    struct ParamSlot {
+        std::string name;
+        size_t state_offset = 0;   // GROUP_SIZE-aligned offset into state1/state2
+        size_t elem_offset = 0;    // first element of the master this rank updates
+        size_t n = 0;              // elements this rank updates and keeps state for
+        bool wm_sharded = false;   // the master is this rank's ZeRO-3 weight shard
+        bool partitioned = false;  // every rank holds the whole master; this rank owns [elem_offset, +n)
+    };
+
     std::unique_ptr<State> state;
+    std::vector<ParamSlot> slots;  // in param_names() order, fixed when the state is allocated
+    bool any_partitioned = false;
+    cudaEvent_t gather_done = nullptr;
     AdamW8BitMomentumContainer momentum_container;
     AdamW8BitVarianceContainer variance_container;
 
     // CPU FP32 AdamW state for the CPU-streaming path
     CPUAdamWState cpu_state;
 
+    ~Impl() {
+        if (gather_done) {
+            (void)cudaEventDestroy(gather_done);
+        }
+    }
+
     void ensure_state() {
         if (!state) {
             state = std::make_unique<State>();
         }
     }
+};
+
+/// One update pass: the eager step passes its hyperparameters; the graphed step passes zeros and
+/// the device-resident opt_params / opt_step that every replay reads.
+struct AdamW8BitOptimizer::UpdateArgs {
+    float learning_rate;
+    float beta1;
+    float beta2;
+    int step;
+    float epsilon;
+    float weight_decay;  // eager: the configured decay; graphed: 1, a scale on opt_params[4]
+    const float* opt_params;
+    const int* opt_step;
+    const char* caller;
 };
 
 AdamW8BitOptimizer::AdamW8BitOptimizer()
@@ -134,18 +210,54 @@ void AdamW8BitOptimizer::init_state(dsl::DslModel& model, cudaStream_t stream) {
     }
 
     constexpr size_t GROUP_SIZE = FLASH_ADAMW8BIT_GROUP_SIZE;
+    const bool use_weight_manager = (model.mWeightManager != nullptr);
+    const bool sharded_weights = use_weight_manager && model.mOptions.ShardWeights && (model.mNumShards > 1);
+    // ZeRO-1: a master every rank holds whole -- every master below ZeRO-3, the replicated
+    // embedding / lm_head at ZeRO-3 -- gets state for 1/world of its elements on each rank. Each
+    // rank updates its slice and the slices are all-gathered after the step. Not across nodes
+    // (only the first node writes checkpoints), not with expert parallelism (expert masters differ
+    // between EP ranks), not under dispatch-PP (one GPU runs the whole update).
+    const int world = model.mNumShards;
+    const bool partition =
+        world > 1 && model.mNumNodes <= 1 && model.mOptions.EPSize <= 1 && !model.mDispatchPpLocalGrads;
+
+    auto& slots = mImpl->slots;
+    slots.clear();
+    mImpl->any_partitioned = false;
+    std::unordered_set<void*> seen_grads;
     size_t total_params = 0;
     size_t state_elems = 0;
-    const bool use_weight_manager = (model.mWeightManager != nullptr);
-    auto add_tensor = [&](size_t n) {
-        total_params += n;
-        state_elems = (state_elems + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
-        state_elems += n;
-    };
-
     for (const auto& name : model.mGrads->param_names()) {
-        Tensor& param = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
-        add_tensor(param.nelem());
+        bool accumulate = false;
+        Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+        (void)accumulate;
+        if (!grad) {
+            continue;
+        }
+        // A tied lm_head shares the embedding's gradient: the embedding's update is the only one
+        // either name gets, so the alias needs no state of its own.
+        if (grad->Data && !seen_grads.insert(static_cast<void*>(grad->Data)).second) {
+            continue;
+        }
+        Tensor& master = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+        const size_t nelem = master.nelem();
+
+        Impl::ParamSlot slot;
+        slot.name = name;
+        slot.wm_sharded = sharded_weights && model.mWeightManager->is_sharded(name);
+        // The in-place all-gather needs equal slices, and NCCL cannot gather into an offloaded
+        // (host) master; those keep whole state and are updated whole on every rank.
+        slot.partitioned =
+            partition && !slot.wm_sharded && master.Device >= 0 && nelem > 0 && nelem % static_cast<size_t>(world) == 0;
+        slot.n = slot.partitioned ? nelem / static_cast<size_t>(world) : nelem;
+        slot.elem_offset = slot.partitioned ? static_cast<size_t>(model.mShardIdx) * slot.n : 0;
+
+        state_elems = (state_elems + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
+        slot.state_offset = state_elems;
+        state_elems += slot.n;
+        total_params += slot.n;
+        mImpl->any_partitioned = mImpl->any_partitioned || slot.partitioned;
+        slots.push_back(std::move(slot));
     }
 
     state.total_params = total_params;
@@ -178,6 +290,10 @@ void AdamW8BitOptimizer::init_state(dsl::DslModel& model, cudaStream_t stream) {
                                state.scales2.template get<half>(),
                                state.total_state_elems,
                                stream);
+
+    if (mImpl->any_partitioned && !mImpl->gather_done) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&mImpl->gather_done, cudaEventDisableTiming));
+    }
 
     state.initialized = true;
     mImpl->momentum_container.update_pointers(&state.state1, &state.scales1);
@@ -237,208 +353,18 @@ void AdamW8BitOptimizer::step(dsl::DslModel& model,
         return;
     }
 
-    mImpl->ensure_state();
-
-    auto& rs = *model.mRunState;
-    cudaStream_t stream = rs.MainStream;
-    wait_event_if_not_capturing(stream, rs.BackwardDone);
-
-    const bool use_weight_manager = (model.mWeightManager != nullptr);
-    const bool sharded_weights = use_weight_manager && model.mOptions.ShardWeights && (model.mNumShards > 1);
-    auto param_is_sharded = [&](const std::string& name) -> bool {
-        return sharded_weights && model.mWeightManager->is_sharded(name);
-    };
-
-    // dispatch-PP collects complete grads onto this GPU by hand (no DDP), so skip
-    // the cross-GPU grad/norm reductions that would deadlock against the idle pool.
-    const bool dispatch_local = model.mDispatchPpLocalGrads;
-    const bool grads_reduced = comm.world_size() > 1;
-    if (grads_reduced && !dispatch_local) {
-        if (model.mGrads->is_reduce_pending()) {
-            wait_event_if_not_capturing(stream, rs.all_reduce_done_event());
-            model.mGrads->clear_reduce_pending();
-        } else {
-            model.mGrads->reduce_all(comm, stream);
-        }
-    }
-
-    const bool grad_mask_enabled = gradient_mask::enabled();
-    std::unordered_map<void*, bool> trainable_grad_ptrs;
-    if (grad_mask_enabled) {
-        for (const auto& name : model.mGrads->param_names()) {
-            bool accumulate = false;
-            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
-            (void)accumulate;
-            if (!grad || !grad->Data) continue;
-            auto [it, inserted] =
-                trainable_grad_ptrs.emplace(static_cast<void*>(grad->Data), gradient_mask::whole_param_trainable(name));
-            if (!inserted) {
-                it->second = it->second || gradient_mask::whole_param_trainable(name);
-            }
-        }
-
-        std::unordered_set<void*> seen_mask_ptrs;
-        for (const auto& name : model.mGrads->param_names()) {
-            Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
-            bool accumulate = false;
-            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
-            (void)accumulate;
-            if (!grad || !grad->Data) continue;
-
-            const bool param_sharded = param_is_sharded(name);
-            Tensor grad_view =
-                param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
-            if (param_sharded && grad_view.nelem() != val.nelem()) {
-                throw std::runtime_error("AdamW8BitOptimizer::step: sharded grad size mismatch for " + name);
-            }
-
-            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
-            const bool trainable = (it != trainable_grad_ptrs.end()) && it->second;
-            if (!trainable) {
-                if (seen_mask_ptrs.insert(static_cast<void*>(grad->Data)).second) {
-                    fill_zero(grad_view, stream);
-                }
-                continue;
-            }
-            gradient_mask::apply_partial_mask(name, grad_view, stream);
-        }
-    }
-
-    model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
-    const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
-
-    if (!mImpl->state->initialized) {
-        if (stream_is_capturing(stream)) {
-            throw std::runtime_error("AdamW8BitOptimizer::step: optimizer state must be initialized before capture");
-        }
-        init_state(model, stream);
-    }
-
-    auto& state = *mImpl->state;
-    constexpr size_t GROUP_SIZE = FLASH_ADAMW8BIT_GROUP_SIZE;
-    size_t state_offset = 0;
-
-    std::unordered_set<void*> seen_grad_ptrs;
-
-    for (const auto& name : model.mGrads->param_names()) {
-        Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
-        bool accumulate = false;
-        Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
-        (void)accumulate;
-        if (!grad) {
-            continue;
-        }
-
-        if (seen_grad_ptrs.count(grad->Data) > 0) {
-            state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
-            state_offset += val.nelem();
-            continue;
-        }
-        seen_grad_ptrs.insert(grad->Data);
-
-        const bool param_sharded = param_is_sharded(name);
-        Tensor grad_view =
-            param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
-        if (param_sharded && grad_view.nelem() != val.nelem()) {
-            throw std::runtime_error("AdamW8BitOptimizer::step: sharded grad size mismatch for " + name);
-        }
-
-        float wd = gradient_mask::weight_decay_for(name, config.weight_decay);
-
-        state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
-        const size_t n = val.nelem();
-        if (!val.Data || !grad_view.Data) {
-            state_offset += n;
-            continue;
-        }
-        if (grad_mask_enabled) {
-            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
-            if (it != trainable_grad_ptrs.end() && !it->second) {
-                state_offset += n;
-                continue;
-            }
-        }
-        const size_t group_offset = state_offset / GROUP_SIZE;
-
-        signed char* s1 = reinterpret_cast<signed char*>(state.state1.template get<std::byte>()) + state_offset;
-        unsigned char* s2 = reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()) + state_offset;
-        half* sc1 = state.scales1.template get<half>() + group_offset;
-        half* sc2 = state.scales2.template get<half>() + group_offset;
-
-        if (val.DType == ETensorDType::FP32) {
-            if (grad_view.DType == ETensorDType::FP32) {
-                flash_adamw_update_8bit(val.template get<float>(),
-                                        grad_view.template get<float>(),
-                                        s1,
-                                        s2,
-                                        sc1,
-                                        sc2,
-                                        n,
-                                        config.learning_rate,
-                                        config.adamw_beta1,
-                                        config.adamw_beta2,
-                                        step_idx,
-                                        config.adamw_epsilon,
-                                        wd,
-                                        grad_scale,
-                                        nullptr,
-                                        nullptr,
-                                        stream);
-            } else if (grad_view.DType == ETensorDType::BF16) {
-                throw std::runtime_error(
-                    "AdamW8BitOptimizer::step: FP32 param with BF16 grad not supported for flash adamw 8-bit");
-            } else {
-                throw std::runtime_error("AdamW8BitOptimizer::step: unsupported grad dtype for " + name);
-            }
-        } else if (val.DType == ETensorDType::BF16) {
-            if (grad_view.DType != ETensorDType::BF16) {
-                throw std::runtime_error("AdamW8BitOptimizer::step: unsupported grad dtype for " + name);
-            }
-            flash_adamw_update_8bit(val.template get<nv_bfloat16>(),
-                                    grad_view.template get<nv_bfloat16>(),
-                                    s1,
-                                    s2,
-                                    sc1,
-                                    sc2,
-                                    n,
-                                    config.learning_rate,
-                                    config.adamw_beta1,
-                                    config.adamw_beta2,
-                                    step_idx,
-                                    config.adamw_epsilon,
-                                    wd,
-                                    grad_scale,
-                                    nullptr,
-                                    nullptr,
-                                    stream);
-        } else {
-            throw std::runtime_error("AdamW8BitOptimizer::step: unsupported param dtype for " + name);
-        }
-
-        state_offset += n;
-        if (state_offset > state.total_state_elems) {
-            throw std::runtime_error("AdamW8BitOptimizer::step: state buffer overflow");
-        }
-    }
-
-    if (rs.has_fp8_delayed_scaling()) {
-        if (auto* fp8_state = rs.get_fp8_scaling_state()) {
-            delayed_scaling_update(*fp8_state, stream);
-        }
-    }
-
-    if (model.mWeightManager) {
-        model.mWeightManager->invalidate();
-        model.mWeightManager->sync_work_from_master(stream);
-    }
-
-    if (!stream_is_capturing(stream)) {
-        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
-        if (!std::isfinite(*rs.GradScaleHost)) {
-            throw std::runtime_error("AdamW8BitOptimizer::step: grad_scale is NaN/Inf");
-        }
-    }
-    record_event_if_not_capturing(rs.OptimizerDone, stream);
+    update(model,
+           comm,
+           config,
+           UpdateArgs{config.learning_rate,
+                      config.adamw_beta1,
+                      config.adamw_beta2,
+                      step_idx,
+                      config.adamw_epsilon,
+                      config.weight_decay,
+                      nullptr,
+                      nullptr,
+                      "AdamW8BitOptimizer::step"});
 }
 
 void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
@@ -458,11 +384,35 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
         throw std::logic_error("AdamW8BitOptimizer::step_graph: optimizer state not allocated");
     }
 
+    update(model,
+           comm,
+           config,
+           UpdateArgs{/*learning_rate=*/0.f,
+                      /*beta1=*/0.f,
+                      /*beta2=*/0.f,
+                      /*step=*/1,
+                      /*epsilon=*/0.f,
+                      /*weight_decay=*/1.f,
+                      opt_params,
+                      opt_step,
+                      "AdamW8BitOptimizer::step_graph"});
+}
+
+void AdamW8BitOptimizer::update(dsl::DslModel& model,
+                                NCCLCommunicator& comm,
+                                const OptimizerConfig& config,
+                                const UpdateArgs& args) {
+    const std::string caller = args.caller;
+    mImpl->ensure_state();
+
     auto& rs = *model.mRunState;
     cudaStream_t stream = rs.MainStream;
     wait_event_if_not_capturing(stream, rs.BackwardDone);
 
     const bool use_weight_manager = (model.mWeightManager != nullptr);
+    auto master_of = [&](const std::string& name) -> Tensor& {
+        return use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+    };
     const bool sharded_weights = use_weight_manager && model.mOptions.ShardWeights && (model.mNumShards > 1);
     auto param_is_sharded = [&](const std::string& name) -> bool {
         return sharded_weights && model.mWeightManager->is_sharded(name);
@@ -498,7 +448,7 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
 
         std::unordered_set<void*> seen_mask_ptrs;
         for (const auto& name : model.mGrads->param_names()) {
-            Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+            Tensor& val = master_of(name);
             bool accumulate = false;
             Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
             (void)accumulate;
@@ -508,7 +458,7 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
             Tensor grad_view =
                 param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
             if (param_sharded && grad_view.nelem() != val.nelem()) {
-                throw std::runtime_error("AdamW8BitOptimizer::step_graph: sharded grad size mismatch for " + name);
+                throw std::runtime_error(caller + ": sharded grad size mismatch for " + name);
             }
 
             auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
@@ -527,57 +477,61 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
 
     if (!mImpl->state->initialized) {
+        if (stream_is_capturing(stream)) {
+            throw std::runtime_error(caller + ": optimizer state must be initialized before capture");
+        }
         init_state(model, stream);
+    }
+    if (mImpl->any_partitioned && (dispatch_local || comm.world_size() != model.mNumShards)) {
+        throw std::logic_error(caller + ": the optimizer state is partitioned over " +
+                               std::to_string(model.mNumShards) + " GPUs, but this update does not run on all of them");
     }
 
     auto& state = *mImpl->state;
     constexpr size_t GROUP_SIZE = FLASH_ADAMW8BIT_GROUP_SIZE;
-    size_t state_offset = 0;
+    std::vector<OwnedSlice> owned;
 
-    std::unordered_set<void*> seen_grad_ptrs_graph;
-
-    for (const auto& name : model.mGrads->param_names()) {
-        Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+    for (const auto& slot : mImpl->slots) {
+        Tensor& master = master_of(slot.name);
         bool accumulate = false;
-        Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+        Tensor* grad = model.mGrads->get_param_grad(slot.name, accumulate);
         (void)accumulate;
-        if (!grad) {
-            continue;
-        }
-
-        if (seen_grad_ptrs_graph.count(grad->Data) > 0) {
-            state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
-            state_offset += val.nelem();
-            continue;
-        }
-        seen_grad_ptrs_graph.insert(grad->Data);
-
-        const bool param_sharded = param_is_sharded(name);
-        Tensor grad_view =
-            param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
-        if (param_sharded && grad_view.nelem() != val.nelem()) {
-            throw std::runtime_error("AdamW8BitOptimizer::step_graph: sharded grad size mismatch for " + name);
-        }
-
-        const float wd_scale = gradient_mask::weight_decay_for(name, 1.f);
-
-        state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
-        const size_t n = val.nelem();
-        if (!val.Data || !grad_view.Data) {
-            state_offset += n;
+        if (!grad || !master.Data || !grad->Data) {
             continue;
         }
         if (grad_mask_enabled) {
             auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
             if (it != trainable_grad_ptrs.end() && !it->second) {
-                state_offset += n;
                 continue;
             }
         }
-        const size_t group_offset = state_offset / GROUP_SIZE;
 
-        signed char* s1 = reinterpret_cast<signed char*>(state.state1.template get<std::byte>()) + state_offset;
-        unsigned char* s2 = reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()) + state_offset;
+        Tensor val = master;
+        Tensor grad_view = *grad;
+        if (slot.wm_sharded) {
+            grad_view = static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards));
+            if (grad_view.nelem() != master.nelem()) {
+                throw std::runtime_error(caller + ": sharded grad size mismatch for " + slot.name);
+            }
+        } else if (slot.partitioned) {
+            // The slice is reduced either way: ZeRO-1 all-reduces the whole gradient, and ZeRO-2's
+            // reduce-scatter leaves this rank's reduced slice in exactly this range.
+            if (grad->nelem() != master.nelem()) {
+                throw std::runtime_error(caller + ": grad size mismatch for " + slot.name);
+            }
+            val = flat_range(master, slot.elem_offset, slot.n);
+            grad_view = flat_range(*grad, slot.elem_offset, slot.n);
+        }
+        if (val.nelem() != slot.n) {
+            throw std::logic_error(caller + ": " + slot.name + " changed size after its optimizer state was laid out");
+        }
+
+        const float wd = gradient_mask::weight_decay_for(slot.name, args.weight_decay);
+        const size_t n = slot.n;
+        const size_t group_offset = slot.state_offset / GROUP_SIZE;
+        signed char* s1 = reinterpret_cast<signed char*>(state.state1.template get<std::byte>()) + slot.state_offset;
+        unsigned char* s2 =
+            reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()) + slot.state_offset;
         half* sc1 = state.scales1.template get<half>() + group_offset;
         half* sc2 = state.scales2.template get<half>() + group_offset;
 
@@ -590,24 +544,24 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
                                         sc1,
                                         sc2,
                                         n,
-                                        /*lr=*/0.f,
-                                        /*beta1=*/0.f,
-                                        /*beta2=*/0.f,
-                                        /*step=*/1,
-                                        /*eps=*/0.f,
-                                        wd_scale,
+                                        args.learning_rate,
+                                        args.beta1,
+                                        args.beta2,
+                                        args.step,
+                                        args.epsilon,
+                                        wd,
                                         grad_scale,
-                                        opt_params,
-                                        opt_step,
+                                        args.opt_params,
+                                        args.opt_step,
                                         stream);
             } else if (grad_view.DType == ETensorDType::BF16) {
-                throw std::runtime_error("AdamW8BitOptimizer::step_graph: FP32 param with BF16 grad not supported");
+                throw std::runtime_error(caller + ": FP32 param with BF16 grad not supported for flash adamw 8-bit");
             } else {
-                throw std::runtime_error("AdamW8BitOptimizer::step_graph: unsupported grad dtype for " + name);
+                throw std::runtime_error(caller + ": unsupported grad dtype for " + slot.name);
             }
         } else if (val.DType == ETensorDType::BF16) {
             if (grad_view.DType != ETensorDType::BF16) {
-                throw std::runtime_error("AdamW8BitOptimizer::step_graph: unsupported grad dtype for " + name);
+                throw std::runtime_error(caller + ": unsupported grad dtype for " + slot.name);
             }
             flash_adamw_update_8bit(val.template get<nv_bfloat16>(),
                                     grad_view.template get<nv_bfloat16>(),
@@ -616,25 +570,28 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
                                     sc1,
                                     sc2,
                                     n,
-                                    /*lr=*/0.f,
-                                    /*beta1=*/0.f,
-                                    /*beta2=*/0.f,
-                                    /*step=*/1,
-                                    /*eps=*/0.f,
-                                    wd_scale,
+                                    args.learning_rate,
+                                    args.beta1,
+                                    args.beta2,
+                                    args.step,
+                                    args.epsilon,
+                                    wd,
                                     grad_scale,
-                                    opt_params,
-                                    opt_step,
+                                    args.opt_params,
+                                    args.opt_step,
                                     stream);
         } else {
-            throw std::runtime_error("AdamW8BitOptimizer::step_graph: unsupported param dtype for " + name);
+            throw std::runtime_error(caller + ": unsupported param dtype for " + slot.name);
         }
 
-        state_offset += n;
-        if (state_offset > state.total_state_elems) {
-            throw std::runtime_error("AdamW8BitOptimizer::step_graph: state buffer overflow");
+        if (slot.partitioned) {
+            owned.push_back(OwnedSlice{master, slot.elem_offset, slot.n});
         }
     }
+
+    // Each rank updated only its slice of a partitioned master: gather the slices so every rank
+    // holds the whole updated master before the work weights are refreshed from it.
+    all_gather_owned_slices(owned, model.mShardIdx, model.mNumShards, comm, mImpl->gather_done, stream);
 
     if (rs.has_fp8_delayed_scaling()) {
         if (auto* fp8_state = rs.get_fp8_scaling_state()) {
@@ -650,7 +607,7 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
     if (!stream_is_capturing(stream)) {
         CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
         if (!std::isfinite(*rs.GradScaleHost)) {
-            throw std::runtime_error("AdamW8BitOptimizer::step_graph: grad_scale is NaN/Inf");
+            throw std::runtime_error(caller + ": grad_scale is NaN/Inf");
         }
     }
     record_event_if_not_capturing(rs.OptimizerDone, stream);

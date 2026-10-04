@@ -51,9 +51,11 @@ public:
 
 private:
     struct Impl;
+    struct UpdateArgs;
     std::unique_ptr<Impl> mImpl;
 
     void init_state(dsl::DslModel& model, cudaStream_t stream);
+    void update(dsl::DslModel& model, NCCLCommunicator& comm, const OptimizerConfig& config, const UpdateArgs& args);
     void step_cpu_streaming(dsl::DslModel& model,
                             NCCLCommunicator& comm,
                             float learning_rate,
