@@ -11,21 +11,23 @@ on:
 jobs:
   wheel:
     name: Build wheel (CUDA ${{ matrix.cuda_version }})
-    # GitHub-hosted. The self-hosted build box is gone, and the build never needed it: there is
-    # no GPU in it (CUDAARCHS names the architectures, and the checks read the cubins with
-    # cuobjdump), and the toolkit comes from the nvidia/cuda image below, not from the host. The
-    # standard runner for a public repository is 4 vCPUs, 16 GB and about 100 GB of free disk, at
-    # no cost. A cold build is about 8 CPU-hours -- the near-cold build of 2026-09-21 (79% ccache
-    # misses) took 57 minutes at 8 jobs on the old box -- so it fits the six-hour limit here, and
-    # ccache, kept in the Actions cache, makes the next one much shorter.
+    # Blacksmith (blacksmith.sh), which this repository's workflows run on since 2026-10-05. The
+    # self-hosted build box is gone, and the build never needed it: there is no GPU in it
+    # (CUDAARCHS names the architectures, and the checks read the cubins with cuobjdump), and the
+    # toolkit comes from the nvidia/cuda image below, not from the host. The 32-vCPU runner has
+    # 128 GB and 1.5 TB of disk, room for 19 build jobs (see the first step). A cold build is
+    # about 8 CPU-hours -- the near-cold build of 2026-09-21 (79% ccache misses) took 57 minutes
+    # at 8 jobs on the old box -- and ccache, kept in the Actions cache (Blacksmith serves
+    # actions/cache from its own cache next to the runners), makes the next one shorter.
     #
-    # `SUROGATE_WHEEL_RUNNER`, a repository variable, points the job at another label -- a larger
-    # GitHub-hosted runner, say -- without editing this file. The job sizes its parallelism to
-    # the runner it lands on, so nothing else changes.
-    runs-on: ${{ vars.SUROGATE_WHEEL_RUNNER || 'ubuntu-24.04' }}
+    # `SUROGATE_WHEEL_RUNNER`, a repository variable, points the job at another label -- a smaller
+    # Blacksmith runner, or GitHub's free `ubuntu-24.04` (4 vCPUs, 16 GB, where a cold build takes
+    # hours) -- without editing this file. The job sizes its parallelism to the runner it lands
+    # on, so nothing else changes.
+    runs-on: ${{ vars.SUROGATE_WHEEL_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 360
     # --privileged for one thing: the first step adds swap to the runner, which a container
-    # cannot do otherwise and which a 16 GB runner needs (see that step).
+    # cannot do otherwise (see that step).
     container:
       image: ${{ matrix.cuda_build_image }}
       options: --privileged
@@ -93,10 +95,11 @@ jobs:
       # Memory decides the parallelism. The CUTLASS FP4 translation units take roughly 8 GB of
       # cicc per job (measured on the self-hosted box: 12 jobs crossed a 60 GB cap and had
       # `matmul_cutlass_fp4_sm100.cu` killed, 8 jobs peak near 64 GB), so the build runs as many
-      # jobs as memory plus swap holds at 8 GB each, and no more than there are CPUs. The standard
-      # runner's 16 GB get a 24 GB swap file first, the margin for the moments several FP4 units
-      # and the libsinfer.so link coincide; that makes 4 jobs there, and more on a larger runner.
-      # The file lives in /__w, the runner's own disk mounted into the container.
+      # jobs as memory plus swap holds at 8 GB each, and no more than there are CPUs. The runner
+      # gets a 24 GB swap file first, the margin for the moments several FP4 units and the
+      # libsinfer.so link coincide: 128 GB and 24 GB make 19 jobs on the 32-vCPU runner, and 16 GB
+      # and 24 GB make 4 on a 4-vCPU one. The file lives in /__w, the runner's own disk mounted
+      # into the container.
       - name: Add swap and size the build
         run: |
           set -euo pipefail
