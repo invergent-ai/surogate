@@ -1852,6 +1852,17 @@ trtllm_moe::Nvfp4RoutedExperts trtllm_experts(const PreparedSparseMoeWeights& we
     return experts;
 }
 
+/// The routed weights as Hopper's grouped GEMM reads them: the stacked block-FP8 matrices'
+/// codes and per-128x128 scales, an expert's gate/up rows ordered [gate; up].
+fp8_moe_sm90::Fp8RoutedExperts fp8_experts(const PreparedSparseMoeWeights& weights) {
+    fp8_moe_sm90::Fp8RoutedExperts experts;
+    experts.gate_up_codes  = static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata);
+    experts.gate_up_scales = static_cast<const float*>(weights.routed_gate_up.scales);
+    experts.down_codes     = static_cast<const std::uint8_t*>(weights.routed_down.qdata);
+    experts.down_scales    = static_cast<const float*>(weights.routed_down.scales);
+    return experts;
+}
+
 // Every mixture here but Gemma 4 projects the router and the experts from the same tokens, and
 // passes the same tensor twice. Gemma 4 does not: its router reads the post-attention residual
 // normalised with no weight and scaled by a learned per-channel vector, its experts the same
@@ -1962,6 +1973,55 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                             trtllm_experts(weights), workspace.trtllm_workspace.data,
                             workspace.trtllm_workspace.bytes, routed_sum, stream);
 
+            if constexpr (kHasShared) {
+                const dim3 shared_down_grid(kHidden / kExpertBM,
+                                            (tokens + kExpertBN - 1) / kExpertBN);
+                sparse_moe_prefill_w8_down_kernel<false, false>
+                    <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                        shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
+                        nullptr, routed_sum, shared_scale, output, tokens, nullptr, shared_output);
+            } else {
+                sparse_moe_prefill_combine_routed_kernel<<<tokens, 256, 0, stream>>>(
+                    routed_sum, output, tokens);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            continue;
+        }
+
+        if (plan.routed_fp8) {
+            // Block-FP8 experts run on Hopper's grouped GEMM. The family still routes: the scan
+            // gives each expert its run of packed columns, and the gather, with no copy to
+            // make, leaves the column-to-token map the module gathers and quantises by. The
+            // module writes each column's unweighted expert output into grouped_io, which the
+            // usual reduce weighs and sums per token.
+            sparse_moe_prefill_scan_kernel<<<1, kExperts, 0, stream>>>(
+                tile_counts, tile_bases, offsets, route_job_experts, route_job_columns,
+                route_job_count, route_tiles, 64, tokens, false, sparse_moe_fault_warp_skew_ns());
+            CUDA_CHECK(cudaGetLastError());
+            sparse_moe_prefill_gather_kernel<false><<<assignments, kHidden / 8, 0, stream>>>(
+                input, ids, packed_index, tile_bases, nullptr, nullptr, column_token,
+                sparse_moe_fault_warp_skew_ns());
+            CUDA_CHECK(cudaGetLastError());
+            if constexpr (kHasShared) {
+                if (!shared_output) {
+                    const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
+                                                (tokens + kExpertBN - 1) / kExpertBN);
+                    sparse_moe_prefill_w8_gate_up_kernel<false, false>
+                        <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                            input, nullptr, nullptr, shared_gate_codes, shared_gate_scales,
+                            shared_activation, tokens, nullptr);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            }
+            auto* gate_up_scratch = workspace.fp8_gate_up.data != nullptr
+                                        ? static_cast<__nv_bfloat16*>(workspace.fp8_gate_up.data)
+                                        : grouped_io;
+            fp8_moe_sm90::run(fp8_geometry(kGeometry), input, tokens, column_token, offsets,
+                              fp8_experts(weights), workspace.fp8_workspace.data,
+                              workspace.fp8_workspace.bytes, gate_up_scratch, grouped_io, stream);
+            sparse_moe_prefill_reduce_kernel<false><<<tokens, kHidden / 8, 0, stream>>>(
+                grouped_io, packed_index, ids, alpha, nullptr, routed_sum, nullptr);
+            CUDA_CHECK(cudaGetLastError());
             if constexpr (kHasShared) {
                 const dim3 shared_down_grid(kHidden / kExpertBM,
                                             (tokens + kExpertBN - 1) / kExpertBN);

@@ -123,6 +123,7 @@ sinfer_add_op_test(sinfer_mixed_attention_workspace_test SOURCES ops/test_mixed_
 sinfer_add_op_test(sinfer_marlin_fp8_wide_test SOURCES ops/test_marlin_fp8_wide.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_fused_parent_test SOURCES ops/test_marlin_fused_parent.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_moe_reduce_test SOURCES ops/test_marlin_moe_reduce.cpp LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_sparse_moe_fp8_sm90_test SOURCES ops/test_sparse_moe_fp8_sm90.cu LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_segments.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)

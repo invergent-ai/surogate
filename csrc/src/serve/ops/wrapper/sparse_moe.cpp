@@ -9,6 +9,7 @@
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
+#include "ops/sparse_moe/fp8_sm90/fp8_moe_sm90.h"
 #include "ops/sparse_moe/trtllm/trtllm_moe.h"
 
 #include <algorithm>
@@ -173,22 +174,67 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     }
 }
 
+/// A block-scaled FP8 matrix as `artifact::materialized_linear` describes one: [n, k] E4M3 codes,
+/// then one FP32 scale per 128 x 128 block, [n / 128, k / 128] row-major. Stacked experts are a
+/// whole number of blocks each, so expert e's rows and scales are contiguous runs.
+void require_fp8_block(const Weight& weight, std::int32_t n, std::int32_t k, const char* name,
+                       std::vector<AddressRange>& ranges) {
+    require_matrix_metadata(weight, n, k, name);
+    const std::size_t code_bytes  = static_cast<std::size_t>(n) * k;
+    const std::size_t scale_bytes = static_cast<std::size_t>(n / 128) * (k / 128) * sizeof(float);
+    const auto* codes  = static_cast<const std::byte*>(weight.qdata);
+    const auto* scales = static_cast<const std::byte*>(weight.scales);
+    if (n % 128 != 0 || k % 128 != 0 || weight.layout != QuantLayout::Fp8Block128 ||
+        weight.scale_dtype != DType::FP32 || weight.scale_ne[0] != 128 || weight.scale_ne[1] != 128 ||
+        weight.qdata == nullptr || weight.scales == nullptr || weight.qhigh != nullptr ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16) || scales < codes + code_bytes ||
+        weight.payload_bytes < static_cast<std::size_t>(scales - codes) + scale_bytes) {
+        throw std::invalid_argument(std::string("sparse_moe: invalid block-FP8 ") + name);
+    }
+    ranges.push_back(address_range(weight.qdata, code_bytes, std::string(name) + " code"));
+    ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
+}
+
 void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& geometry,
                       std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, geometry, ranges);
     const auto is_ggml_k = [](QType qtype) { return detail::ggml::is_ggml_qtype(qtype); };
-    if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
+    const bool fp8_routed =
+        detail::sparse_moe_routed_fp8_profile(weights.routed_gate_up.qtype, weights.routed_down.qtype);
+    if ((weights.routed_gate_up.qtype == QType::FP8_E4M3FN_BLK128_F32S ||
+         weights.routed_down.qtype == QType::FP8_E4M3FN_BLK128_F32S) && !fp8_routed) {
+        throw std::invalid_argument(
+            "sparse_moe: block-FP8 routed experts need both gate/up and down in block FP8");
+    }
+    if (fp8_routed) {
+        // Hopper's grouped GEMM is the only kernel these experts have, at every width.
+        if (!detail::fp8_moe_sm90::available()) {
+            throw std::invalid_argument(
+                "sparse_moe: block-FP8 routed experts run on Hopper only (an H100 or H200 with a "
+                "build that includes sm_90a); convert the checkpoint to the groupwise-int profile "
+                "for other GPUs");
+        }
+        if (!detail::fp8_moe_sm90::supports(detail::fp8_geometry(geometry))) {
+            throw std::invalid_argument(
+                "sparse_moe: block-FP8 routed experts need hidden and intermediate widths that "
+                "are multiples of 128");
+        }
+        if (weights.slot_of_expert != nullptr) {
+            throw std::invalid_argument(
+                "sparse_moe: block-FP8 routed experts do not take an expert slot pool");
+        }
+    } else if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
         weights.routed_gate_up.qtype != QType::W8G32_F16S &&
         weights.routed_gate_up.qtype != QType::NVFP4 && !is_ggml_k(weights.routed_gate_up.qtype)) {
         throw std::invalid_argument(
-            "sparse_moe: routed_gate_up must be Q4, W8, NVFP4, or a GGML K-quant");
+            "sparse_moe: routed_gate_up must be Q4, W8, NVFP4, block FP8, or a GGML K-quant");
     }
-    if (weights.routed_down.qtype != QType::Q5G64_F16S &&
+    if (!fp8_routed && weights.routed_down.qtype != QType::Q5G64_F16S &&
         weights.routed_down.qtype != QType::Q6G64_F16S &&
         weights.routed_down.qtype != QType::W8G32_F16S &&
         weights.routed_down.qtype != QType::NVFP4 && !is_ggml_k(weights.routed_down.qtype)) {
         throw std::invalid_argument(
-            "sparse_moe: routed_down must be Q5, Q6, W8, NVFP4, or a GGML K-quant");
+            "sparse_moe: routed_down must be Q5, Q6, W8, NVFP4, block FP8, or a GGML K-quant");
     }
     if (geometry.gating == SparseMoeGating::SigmoidBiasTopK) {
         if (weights.router_bias == nullptr) {
@@ -271,7 +317,12 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
                 "does not contain (it needs the sm_120a architecture)");
         }
     }
-    if (weights.slot_of_expert == nullptr) {
+    if (fp8_routed) {
+        require_fp8_block(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
+                          "routed_gate_up", ranges);
+        require_fp8_block(weights.routed_down, geometry.routed_down_rows(), geometry.intermediate,
+                          "routed_down", ranges);
+    } else if (weights.slot_of_expert == nullptr) {
         require_quantized(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
                           "routed_gate_up", ranges);
         require_quantized(weights.routed_down, geometry.routed_down_rows(), geometry.intermediate,
@@ -447,6 +498,12 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
     }
+    // Block-FP8 experts have no decode or small-T kernel: the prefill family runs them from a
+    // single token up, so only its workspace is asked for.
+    if (detail::sparse_moe_routed_fp8_profile(routed_gate_up, routed_down)) {
+        return detail::sparse_moe_prefill_workspace_bytes(geometry, max_tokens, false, false, true) +
+               (native_shared ? native_shared_capacity(geometry, min_tokens, max_tokens) : 0);
+    }
     (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
     const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
     // The NVFP4 routed profile has no kernel of ours at any width: the prefill family carries it
@@ -540,6 +597,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     // [up; gate] row order (`Nvfp4CodecFor::kGateRowsFirst`). Rounds between the small-T bound
     // and the crossover walk small-T in slices, as they did before the runner existed.
     const bool nvfp4_routed = gate_up == QType::NVFP4 && down == QType::NVFP4;
+    const bool fp8_routed   = detail::sparse_moe_routed_fp8_profile(gate_up, down);
     // A GGML K-quant has no prefill kernel of this family yet, so without this every round wider
     // than the small-T bound fell to the per-token decode loop -- one launch per prompt token.
     // Walking small-T slices instead is the same arrangement NVFP4 uses for the same reason.
@@ -554,6 +612,10 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         ? hook.max_resolve_tokens : std::numeric_limits<std::int32_t>::max();
     if (detail::native_shared(weights) && adapters) {
         throw std::invalid_argument("sparse_moe: adapters on native shared experts are not supported");
+    }
+    if (fp8_routed && adapters) {
+        // Adapted rounds run on the decode kernels, which have no block-FP8 codec.
+        throw std::invalid_argument("sparse_moe: adapters on block-FP8 routed experts are not supported");
     }
     if (adapters && tokens > resolve_tokens) {
         // Adapter routing is batched too. Keep each hook invocation within the cache's
@@ -644,7 +706,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                                     width_invariant);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens,
-                                                          plan.routed_trtllm, plan.routed_int8);
+                                                          plan.routed_trtllm, plan.routed_int8,
+                                                          plan.routed_fp8);
         detail::sparse_moe_prefill_launch(geometry, x, router_x, prepared, destination, plan,
                                           views, stream, round_hook);
         return;

@@ -82,6 +82,8 @@ std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcep
     // NVFP4's routed experts have no kernel of this family - the vendored TRT-LLM runner computes
     // them - so the family serves that profile at every width, down to a single token.
     if (routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4) { return 1; }
+    // Nor do block-FP8 experts: Hopper's grouped GEMM (fp8_moe_sm90) runs them at every width.
+    if (sparse_moe_routed_fp8_profile(routed_gate_up, routed_down)) { return 1; }
     if (routed_gate_up == QType::Q4G64_F16S) {
         if (routed_down == QType::Q5G64_F16S) { return kSparseMoePrefillQ4Q5Min; }
         if (routed_down == QType::Q6G64_F16S) { return kSparseMoePrefillQ4Q6Min; }
@@ -142,6 +144,11 @@ bool int8_codec_admitted(QType qtype, bool gate_up_side) noexcept {
 
 } // namespace
 
+bool sparse_moe_routed_fp8_profile(QType routed_gate_up, QType routed_down) noexcept {
+    return routed_gate_up == QType::FP8_E4M3FN_BLK128_F32S &&
+           routed_down == QType::FP8_E4M3FN_BLK128_F32S;
+}
+
 bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                              QType routed_down) noexcept {
     const std::int32_t minimum = prefill_min_tokens(routed_gate_up, routed_down);
@@ -161,14 +168,14 @@ bool sparse_moe_routed_int8_profile(QType routed_gate_up, QType routed_down) noe
 
 std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
                                                std::int32_t max_tokens, bool routed_trtllm,
-                                               bool routed_int8) {
+                                               bool routed_int8, bool routed_fp8) {
     if (max_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 1");
     }
     const std::int32_t capacity_tokens = std::min(max_tokens, kSparseMoePrefillSliceMax);
     WorkspaceLayoutBuilder layout;
     (void)allocate_sparse_moe_prefill_workspace(layout, geometry, capacity_tokens, routed_trtllm,
-                                                routed_int8);
+                                                routed_int8, routed_fp8);
     return layout.peak_bytes(1);
 }
 
@@ -220,9 +227,17 @@ SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& ge
     const bool routed_trtllm =
         routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
     const bool routed_int8 = sparse_moe_routed_int8_profile(routed_gate_up, routed_down);
-    return {tokens, slice_tokens,
-            sparse_moe_prefill_workspace_bytes(geometry, tokens, routed_trtllm, routed_int8),
-            routed_trtllm, routed_int8, width_invariant};
+    const bool routed_fp8  = sparse_moe_routed_fp8_profile(routed_gate_up, routed_down);
+    SparseMoePrefillPlan plan;
+    plan.tokens          = tokens;
+    plan.slice_tokens    = slice_tokens;
+    plan.workspace_bytes = sparse_moe_prefill_workspace_bytes(geometry, tokens, routed_trtllm,
+                                                              routed_int8, routed_fp8);
+    plan.routed_trtllm   = routed_trtllm;
+    plan.routed_int8     = routed_int8;
+    plan.routed_fp8      = routed_fp8;
+    plan.width_invariant = width_invariant;
+    return plan;
 }
 
 } // namespace sinfer::ops::detail

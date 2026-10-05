@@ -265,3 +265,137 @@ def test_compressed_source_folds_nested_text_tower_names(monkeypatch, tmp_path):
     monkeypatch.setattr(cts, "read_tensor_shapes", lambda model_dir: both)
     ambiguous = cts.CompressedTensorsSource(tmp_path)
     assert "model.language_model.layers.0.mlp.gate.weight" in ambiguous.logical
+
+
+#: The Linears Qwen's block-FP8 exports quantise, by the stored tensor's suffix.
+_FP8_LINEARS = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+                "in_proj_qkv.weight", "in_proj_z.weight", "out_proj.weight",
+                "shared_expert.gate_proj.weight", "shared_expert.up_proj.weight",
+                "shared_expert.down_proj.weight")
+
+
+def _fp8_linear(generator, rows, columns):
+    codes = (torch.rand((rows, columns), generator=generator) * 8 - 4).to(torch.float8_e4m3fn)
+    scales = (torch.rand((rows // 128, columns // 128), generator=generator) + 0.5).to(torch.bfloat16)
+    return codes, scales
+
+
+def _save_fp8_export(root, c, g, ranking, monkeypatch, convert):
+    """A Qwen-style block-FP8 export: per-expert routed Linears, E4M3 codes and BF16 multipliers."""
+    from safetensors.torch import save_file
+    from surogate.serve.convert.common.draft_head import compute_shortlist
+    generator = torch.Generator().manual_seed(7)
+    tensors = {}
+    for name, source in source_requirements(recipe.build_recipes(g)).items():
+        if ".mlp.experts." in name:
+            continue  # the stacked spellings a BF16 export uses; this one stores per expert
+        if name.endswith(_FP8_LINEARS):
+            codes, scales = _fp8_linear(generator, *source.shape)
+            tensors[name], tensors[name + "_scale_inv"] = codes, scales
+        else:
+            tensors[name] = torch.randn(source.shape, generator=generator).to(torch.bfloat16)
+    for prefix in ["model.layers.%d" % layer for layer in range(g.layers)] + ["mtp.layers.0"]:
+        for expert in range(g.experts):
+            for projection, shape in (("gate_proj", (g.intermediate, g.hidden)),
+                                      ("up_proj", (g.intermediate, g.hidden)),
+                                      ("down_proj", (g.hidden, g.intermediate))):
+                stem = f"{prefix}.mlp.experts.{expert}.{projection}.weight"
+                tensors[stem], tensors[stem + "_scale_inv"] = _fp8_linear(generator, *shape)
+    root.mkdir()
+    c["quantization_config"] = {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                                "weight_block_size": [128, 128]}
+    (root / "config.json").write_text(json.dumps(c))
+    save_file(tensors, root / "model.safetensors")
+    (root / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {str(i): i for i in range(500)}}}))
+    (root / "tokenizer_config.json").write_text('{}')
+    (root / "chat_template.jinja").write_text('{{ messages }}')
+    (root / "generation_config.json").write_text('{}')
+    np.arange(g.vocab, dtype='<i8').tofile(ranking)
+    monkeypatch.setattr(convert.draft_head, "compute_shortlist", lambda _path, root, *, geometry:
+                        compute_shortlist(ranking, root, n=geometry.draft_vocab, vocab=geometry.vocab,
+                                          tokenizer_vocab_size=geometry.token_domain))
+    return tensors
+
+
+def _fp8_words(artifact, name, shape):
+    from surogate.serve.artifact.layouts import block_scale128_geometry
+    from surogate.serve.convert.common.inventory import FP8_BLOCK
+    obj = artifact.find(name)
+    assert obj.format == FP8_BLOCK and tuple(obj.shape) == shape
+    geometry = block_scale128_geometry(FP8_BLOCK, shape)
+    payload = bytes(artifact.payload(obj))
+    codes = torch.frombuffer(bytearray(payload[:geometry.code_plane_bytes]), dtype=torch.uint8)
+    scales = torch.frombuffer(bytearray(payload[geometry.scale_plane_offset:geometry.payload_bytes]),
+                              dtype=torch.float32)
+    return codes.reshape(shape), scales.reshape(shape[0] // 128, shape[1] // 128)
+
+
+def test_fp8_block_export_keeps_its_codes_where_kernels_read_them(tmp_path, monkeypatch):
+    from surogate.serve.artifact.container import Artifact
+    from surogate.serve.artifact.layouts import dequantize_row_split
+    from surogate.serve.convert.qwen3_5_moe import convert
+    c = config_for()
+    c.update(moe_intermediate_size=128, shared_expert_intermediate_size=128)
+    g = inv.geometry_from_config(c, token_domain=500)
+    model = tmp_path / "fp8"
+    stored = _save_fp8_export(model, c, g, tmp_path / "counts.i64", monkeypatch, convert)
+    output = tmp_path / "model.sinfer"
+    report = json.loads(convert.convert(model, None, output, device="cpu").read_text())
+    assert report["quantization"]["fp8_block"] == {
+        "stored_codes": 2 * g.layers, "routed_stacked": 2 * (g.layers + 1),
+        "requantized_to_base_format": 2 * (g.layers + 1) + 2}
+
+    def codes(name):
+        return stored[name].view(torch.uint8)
+
+    def scales(name):
+        return stored[name + "_scale_inv"].float()
+
+    with Artifact(output) as artifact:
+        assert artifact.identity.weights_id == "fp8-block"
+        # The routed experts: each expert's [gate; up] rows and its own block multipliers.
+        for prefix, source in (("text/layers/1/moe/", "model.layers.1"), ("mtp/layer/moe/", "mtp.layers.0")):
+            n = g.experts * 2 * g.intermediate
+            gate_up, gate_up_scales = _fp8_words(artifact, prefix + "routed_gate_up", (n, g.hidden))
+            down, down_scales = _fp8_words(artifact, prefix + "routed_down", (g.experts * g.hidden, g.intermediate))
+            for expert in range(g.experts):
+                stem = f"{source}.mlp.experts.{expert}."
+                rows = slice(expert * 2 * g.intermediate, (expert + 1) * 2 * g.intermediate)
+                expected = torch.cat([codes(stem + "gate_proj.weight"), codes(stem + "up_proj.weight")])
+                assert torch.equal(gate_up[rows], expected)
+                assert torch.equal(gate_up_scales[2 * expert:2 * expert + 2],
+                                   torch.cat([scales(stem + "gate_proj.weight"), scales(stem + "up_proj.weight")]))
+                assert torch.equal(down[expert * g.hidden:(expert + 1) * g.hidden], codes(stem + "down_proj.weight"))
+                assert torch.equal(down_scales[expert], scales(stem + "down_proj.weight")[0])
+        # The fused attention input: [query heads | key | gate heads | value], 128-row blocks
+        # of the stored Linears, each with its own multiplier.
+        q = "model.layers.0.self_attn.q_proj.weight"
+        k = "model.layers.0.self_attn.k_proj.weight"
+        v = "model.layers.0.self_attn.v_proj.weight"
+        qkgv, qkgv_scales = _fp8_words(artifact, "text/layers/0/attention/query_key_gate_value",
+                                       (codes(q).shape[0] + codes(k).shape[0] + codes(v).shape[0], g.hidden))
+        blocks = [(q, 0), (q, 2), (k, 0), (q, 1), (q, 3), (v, 0)]
+        for index, (name, block) in enumerate(blocks):
+            assert torch.equal(qkgv[index * 128:(index + 1) * 128], codes(name)[block * 128:(block + 1) * 128])
+            assert torch.equal(qkgv_scales[index], scales(name)[block])
+        _fp8_words(artifact, "text/layers/1/gdn/query_key_value_z", (
+            codes("model.layers.1.linear_attn.in_proj_qkv.weight").shape[0]
+            + codes("model.layers.1.linear_attn.in_proj_z.weight").shape[0], g.hidden))
+        # The shared expert is W8 for its kernels, requantised from the values the codes state.
+        shared = artifact.find("text/layers/1/moe/shared_down")
+        assert shared.format == inv.W8
+        values = dequantize_row_split(bytes(artifact.payload(shared)), inv.W8, tuple(shared.shape),
+                                      dtype=torch.float32)
+        name = "model.layers.1.mlp.shared_expert.down_proj.weight"
+        reference = codes(name).view(torch.float8_e4m3fn).float() * scales(name).repeat_interleave(128, 0).repeat_interleave(128, 1)
+        assert torch.allclose(values, reference, rtol=0, atol=float(reference.abs().max()) / 100)
+        # The MTP block's dense projections stay the base converter's W8.
+        assert artifact.find("mtp/layer/attention/output").format == inv.W8
+
+
+def test_fp8_export_with_other_block_sizes_is_refused():
+    from surogate.serve.convert.qwen3_5_moe.exports.fp8_block_source import is_fp8_block_export
+    assert not is_fp8_block_export(config_for())
+    assert is_fp8_block_export({"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}})
+    with pytest.raises(ValueError, match="128 x 128 block scales"):
+        is_fp8_block_export({"quantization_config": {"quant_method": "fp8", "weight_block_size": [1, 128]}})

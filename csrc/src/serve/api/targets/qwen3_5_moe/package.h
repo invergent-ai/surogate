@@ -45,6 +45,11 @@ enum class WeightsProfile : std::uint8_t {
     // interim value: the profile still sizes workspaces; when formats reach the planner from
     // the load plan this enumerator goes with the rest.
     CompressedTensors,
+    // A block-FP8 export (Qwen's own, quant_method "fp8" with 128 x 128 blocks): the routed
+    // experts and the text layers' dense projections keep the export's E4M3 codes and run on
+    // Hopper's block-FP8 kernels, everything else as GroupwiseInt has it. The routed experts
+    // have no kernel off sm_90; the sparse-MoE op refuses them there.
+    Fp8Block,
 };
 
 /// Do these weights need the sm_120 block-scaled FP4 MMA?
@@ -58,6 +63,7 @@ enum class WeightsProfile : std::uint8_t {
 [[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile profile) noexcept {
     switch (profile) {
     case WeightsProfile::GroupwiseInt:
+    case WeightsProfile::Fp8Block:
         return false;
     case WeightsProfile::RoutedNvfp4:
     case WeightsProfile::CompressedTensors:

@@ -1039,17 +1039,19 @@ target_compile_options(sinfer_nvfp4_cutlass PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
 target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
-# Hopper's block-scaled FP8 GEMM: vLLM's CUTLASS 3.x wgmma/TMA kernel for fine-grained FP8
-# checkpoints. sm_90a-specific (wgmma and the 90a TMA paths load on exactly sm_90), so it is
+# Hopper's block-scaled FP8 GEMMs: vLLM's CUTLASS 3.x wgmma/TMA kernel for fine-grained FP8
+# checkpoints, and the ptr-array grouped GEMM the block-FP8 routed experts run on. sm_90a-specific (wgmma and the 90a TMA paths load on exactly sm_90), so it is
 # pinned to 90a like the FP4 archives are to 120a, whole-program for the same ptxas reason as
 # the CUTLASS archive above, and a build without 90a links a stub that declines every call.
 if("90a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "90a")
   set(SINFER_FP8_BLOCK_SM90_REAL ON)
   add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
-    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm.cu)
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm.cu
+    ${SERVE_ROOT}/ops/sparse_moe/fp8_sm90/fp8_moe_sm90.cu)
 else()
   add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
-    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_stub.cpp)
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_stub.cpp
+    ${SERVE_ROOT}/ops/sparse_moe/fp8_sm90/fp8_moe_sm90_stub.cpp)
 endif()
 sinfer_internal_includes(sinfer_fp8_block_sm90)
 target_include_directories(sinfer_fp8_block_sm90 PRIVATE
