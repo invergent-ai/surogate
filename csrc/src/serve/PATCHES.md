@@ -3717,7 +3717,9 @@ fell back on JIT-compiling the sm_89 PTX. The default is now `89;90a;120a` (`SUR
   would have pushed the wheel (1.50 GB for v1.5.8) to GitHub's 2 GiB release-asset cap. With it, that
   library is 339 MB (235 MB deflated). An engine serving Qwen3.5-0.8B Q8_0 became ready in 15.7 s
   instead of 31.6 s on a cold volume and 3.1 s instead of 3.5 s warm, so loading compressed modules
-  costs nothing measurable.
+  costs nothing measurable. The release set, `89;90a;120a`, builds clean: its `libsinfer.so` is 781 MB
+  (669 MB deflated, with 200/201/219 sm_89/sm_90a/sm_120a cubins). v1.5.8's two-architecture library was
+  1,565 MB (1,096 MB in its wheel), so the wheel gets about 430 MB smaller while gaining Hopper.
 - **Qwen's own FP8 checkpoints** (`surogate/serve/convert/qwen3_5/exports/quantized.py`). Qwen's FP8
   exports (Qwen3.6-27B-FP8) store `weight_scale_inv` in BF16, while DeepSeek-style exports use FP32.
   The converter refused BF16 ("invalid FP8 block geometry"); both now widen exactly to the artifact's
