@@ -3766,3 +3766,41 @@ round's width.
 Not done: NVFP4 on Hopper (vLLM's Marlin FP4, W4A16, would cover the dense layers and its Marlin MoE
 the routed experts); the route tables' SM counts and split choices, still the RTX 5090's; conversion of
 quantized MTP blocks.
+
+## 102
+
+**Hopper: Qwen3.5/3.6 MoE serves Qwen's own FP8 export, routed experts on a CUTLASS sm90 grouped
+GEMM (2026-10-05, after #101).**
+
+Qwen3.6-35B-A3B on an H100 decoded 278 tok/s for one stream (vLLM 251) but only tied vLLM at 16
+users (883) and fell behind at 64 (1,238 against 1,923), and it prefilled 2,048-token prompts at
+12.0k tok/s against vLLM's 39.5k. Our 4/5-bit experts ran kernels tuned for the RTX 5090, and vLLM
+served Qwen's 8-bit export, so the comparison was not like for like either. Changes:
+
+- **Converter** (`surogate/serve/convert/qwen3_5_moe/exports/fp8_block_source.py`, `convert.py`).
+  It reads `Qwen/Qwen3.6-35B-A3B-FP8` as stored: E4M3 codes with BF16 `weight_scale_inv` per
+  128 x 128 block (widened exactly to FP32, as in #101). Routed experts and the attention and GDN
+  input projections keep the codes; the shared expert, GDN gating and MTP projections are
+  requantised to W8 and the head to Q6, as for the other exports. New weights profile `fp8-block`.
+- **Wide rounds** (`ops/sparse_moe/fp8_sm90/fp8_moe_sm90.{h,cu}`, archive `sinfer_fp8_block_sm90`).
+  Two CUTLASS 3.x ptr-array grouped GEMMs with blockwise FP8 scaling (CUTLASS example 68's kernel),
+  activations quantised per row per 128 values, vLLM's FP8 MoE recipe. The expert boundaries are read
+  from device memory, so a round is capture-safe. The tile family follows the round's width (swapped
+  16/32/64-column tiles for few rows per expert, 128 x 128 otherwise; `SUROGATE_SERVE_MOE_FP8_TILE`
+  forces one), and up to 128 assignments take a GEMV per packed column instead.
+- **Narrow rounds** (`ops/sparse_moe/decode/sparse_moe_decode_body.inc`, `Fp8BlockCodecFor`). Below
+  20 tokens (`SUROGATE_SERVE_MOE_FP8_PREFILL_MIN`, 1..47) the decode and small-T kernels read the
+  E4M3 codes directly, eight a lane, with the cell's FP32 scale. The first version sent one-token
+  rounds through the whole grouped-GEMM chain and decoded one stream at 145 tok/s.
+- **Workspace for fused projections** (`targets/qwen3_5_moe/impl/variant.cpp`). A block-FP8 input
+  projection quantises its activation into scratch; without the arena it used the engine scratch,
+  which cannot grow inside a graph capture, and the server failed to capture its decode graphs.
+
+One H100, closed loop, both engines on the 8-bit export (vLLM 0.31): one stream 268 tok/s (vLLM 251);
+16 users 1,126 (883); 64 users 2,115 (1,923); 2,048-token prompts from 32 users 28.5k prompt tok/s
+(39.5k). Moving the crossover to 2 lost 25 % at 4 users; moving it to 47 lost 14 % at 32 users.
+
+Tests. `sinfer_sparse_moe_fp8_sm90_test` checks both GEMM families and the GEMV against a dequantised
+reference; the MoE correctness suite gains a block-FP8 profile at 1, 2, 3, 5, 16 and 19 tokens with
+graph replay on sm_90; `tests/serve/test_qwen3_5_moe_checkpoint_config.py` covers the converter's
+block-FP8 reading.
