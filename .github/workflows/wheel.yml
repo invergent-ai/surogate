@@ -11,25 +11,19 @@ on:
 jobs:
   wheel:
     name: Build wheel (CUDA ${{ matrix.cuda_version }})
-    # The self-hosted runner is this project's build box and is far faster than a GitHub-hosted
-    # one (dozens of cores against four). `SUROGATE_WHEEL_RUNNER`, a repository variable,
-    # redirects the job to another label -- `ubuntu-24.04`, say -- without editing this file,
-    # for when the box is busy or offline.
-    runs-on: ${{ vars.SUROGATE_WHEEL_RUNNER || 'self-hosted' }}
-    # The runner is a shared training host, so the build container gets a hard memory limit: an
-    # uncapped build at 20 jobs invoked the OOM killer on 2026-09-21 and killed a nine-hour
-    # training run. Inside the cgroup the kernel kills the build, which fails the job; outside
-    # it, nothing else on the host is touched.
+    # GitHub-hosted. The self-hosted build box is gone, and nothing about this build needs one:
+    # there is no GPU in it (CUDAARCHS names the architectures, and the checks read the cubins
+    # with cuobjdump) and the toolkit is installed below. The standard runner for a public
+    # repository is 4 vCPUs, 16 GB and about 100 GB of free disk, at no cost. A cold build is
+    # about 8 CPU-hours -- the near-cold build of 2026-09-21 (79% ccache misses) took 57 minutes
+    # at 8 jobs on the old box -- so it fits the six-hour limit here, and ccache, kept in the
+    # Actions cache, makes the next one much shorter.
     #
-    # The budget is measured, not guessed. The CUTLASS FP4 translation units dominate it at
-    # roughly 8 GB of cicc per job, so a build needs about `jobs x 8 GB`: 20 jobs took more than
-    # the 160 GB the host had free that morning, and 12 jobs inside a 60 GB cap hit the limit and
-    # had `matmul_cutlass_fp4_sm100.cu` killed under it. 8 jobs peak near 64 GB, which is why the
-    # cap is 96 GB -- room for the peak and for the libsinfer.so link, and still well under what
-    # a training run on this host needs.
-    container:
-      image: ${{ matrix.cuda_build_image }}
-      options: -v /var/cache/surogate-ccache/${{ matrix.cuda_version }}:/ccache --memory 96g --memory-swap 96g
+    # `SUROGATE_WHEEL_RUNNER`, a repository variable, points the job at another label -- a larger
+    # GitHub-hosted runner, say -- without editing this file. The job sizes its parallelism to
+    # the runner it lands on, so nothing else changes.
+    runs-on: ${{ vars.SUROGATE_WHEEL_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 360
 
     strategy:
       matrix:
@@ -54,8 +48,12 @@ jobs:
           # sm_89 and sm_120a -- one binary for the 4090, the 5090 and the RTX PRO 6000. It is
           # left at its default here and checked in the wheel afterwards; restating it in the
           # workflow would only be a second place to be wrong.
+          #
+          # The toolkit comes from NVIDIA's apt repository for Ubuntu 24.04 -- the same packages
+          # the nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04 image the self-hosted job ran in is
+          # made of -- rather than from that image as a job container, which would start before
+          # any step could add the swap the build needs on a 16 GB runner.
           - cuda_version: "13.1"
-            cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
             archs: "89;90a;120a"
 
@@ -66,37 +64,86 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-      # See the container's memory limit above for where 8 comes from. NVCC_THREADS keeps each
-      # job compiling one architecture at a time; nvcc's default of 8 threads does all three at
-      # once and triples the per-job footprint (csrc/CMakeLists.txt reads it into
-      # SUROGATE_NVCC_THREADS).
-      CMAKE_BUILD_PARALLEL_LEVEL: 8
+      # One architecture at a time per job: nvcc's default of 8 threads does all three at once
+      # and triples the per-job footprint (csrc/CMakeLists.txt reads NVCC_THREADS into
+      # SUROGATE_NVCC_THREADS). How many jobs is decided from the runner's memory, below.
       NVCC_THREADS: 1
       CUDAARCHS: ${{ matrix.archs }}
+      CUDA_HOME: /usr/local/cuda-${{ matrix.cuda_version }}
+      CUDACXX: /usr/local/cuda-${{ matrix.cuda_version }}/bin/nvcc
       # A wheel without an engine in it is not this package: a missing FFmpeg, libcurl or
       # toolkit must fail the build rather than quietly produce a trainer-only wheel.
       SKBUILD_CMAKE_DEFINE: SUROGATE_REQUIRE_SERVE=ON
       UV_NO_SYNC: 1
-      CCACHE_DIR: /ccache
-      CCACHE_MAXSIZE: 10G
-      CCACHE_CUDA_PATHS: /usr/local/cuda
+      # One cold build leaves about 2 GB of objects; 5 GB holds it and the generation before.
+      CCACHE_MAXSIZE: 5G
+      CCACHE_CUDA_PATHS: /usr/local/cuda-${{ matrix.cuda_version }}
 
     defaults:
       run:
         working-directory: ${{ github.workspace }}
-        # Steps inside a container run under `sh` (dash) unless told otherwise, and the checks
-        # below open with `set -euo pipefail`, which dash rejects: `set: Illegal option -o
-        # pipefail`, exit 2, before the check has looked at anything. It failed that way the
-        # first time this workflow ran with those checks in it.
+        # `bash` rather than the default `bash -e`: the checks below rely on pipefail.
         shell: bash
 
     steps:
-      - name: Install System Dependencies
+      # The runner image ships toolchains this build never uses, on the disk it needs; the CUDA
+      # toolkit alone is about 15 GB installed.
+      #
+      # Memory decides the parallelism. The CUTLASS FP4 translation units take roughly 8 GB of
+      # cicc per job (measured on the self-hosted box: 12 jobs crossed a 60 GB cap, 8 jobs peak
+      # near 64 GB), so the build runs as many jobs as memory plus swap holds at 8 GB each, and no
+      # more than there are CPUs: 4 on the standard runner, whose 16 GB get a 24 GB swap file as
+      # the margin for the odd moment two FP4 units and the libsinfer.so link coincide.
+      - name: Make room on the runner
         run: |
-          apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
-          git wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev libdw-dev libelf-dev libicu-dev patch libnccl2 libnccl-dev \
-          g++-13 \
-          pkg-config libcurl4-openssl-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libnuma-dev
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell \
+            /usr/local/julia* /opt/microsoft /usr/lib/jvm /usr/local/lib/node_modules /opt/az \
+            /usr/local/share/chromium /usr/local/share/vcpkg 2>/dev/null || true
+          swapdir=/mnt; [ -d /mnt ] || swapdir=/
+          free_gb=$(df --output=avail -BG "$swapdir" | tail -1 | tr -dc 0-9)
+          swap=$(( free_gb / 4 )); [ "$swap" -gt 24 ] && swap=24
+          if [ "$swap" -ge 4 ]; then
+            sudo fallocate -l "${swap}G" "$swapdir/swapfile-build" && sudo chmod 600 "$swapdir/swapfile-build" \
+              && sudo mkswap "$swapdir/swapfile-build" >/dev/null && sudo swapon "$swapdir/swapfile-build"
+          fi
+          mem_gb=$(free -g | awk '/^Mem:/ {print $2}')
+          swap_gb=$(free -g | awk '/^Swap:/ {print $2}')
+          jobs=$(( (mem_gb + swap_gb) / 8 )); cpus=$(nproc)
+          [ "$jobs" -gt "$cpus" ] && jobs=$cpus
+          [ "$jobs" -lt 1 ] && jobs=1
+          {
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs"
+            echo "CCACHE_DIR=$HOME/.ccache"
+          } >> "$GITHUB_ENV"
+          echo "${cpus} CPUs, ${mem_gb} GB memory, ${swap_gb} GB swap: ${jobs} build jobs"
+          df -h / "$swapdir" | uniq
+
+      - name: Install CUDA ${{ matrix.cuda_version }} and build dependencies
+        run: |
+          set -euo pipefail
+          wget -qO /tmp/cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update -qq
+          v="${{ matrix.cuda_version }}"; pkg="${v/./-}"; major="${v%%.*}"
+          # NCCL is published per CUDA version (2.29.3-1+cuda13.1, ...); take the newest build for
+          # this toolkit, else the newest for its major (the runtime soname is the same across a
+          # major, and the wheel's runtime NCCL comes from nvidia-nccl-cu13 anyway).
+          versions=$(apt-cache madison libnccl2 | awk '{print $3}')
+          nccl=$(echo "$versions" | grep -F "+cuda${v}" | sort -V | tail -1 || true)
+          [ -n "$nccl" ] || nccl=$(echo "$versions" | grep -F "+cuda${major}." | sort -V | tail -1 || true)
+          [ -n "$nccl" ] || { echo "::error::no libnccl2 build for CUDA ${v} in the repository"; exit 1; }
+          echo "nccl: $nccl"
+          sudo apt-get install -y -qq --no-install-recommends \
+            "cuda-toolkit-${pkg}" "cudnn9-cuda-${major}" "libnccl2=${nccl}" "libnccl-dev=${nccl}" \
+            g++-13 python3-dev ninja-build ccache libopenmpi-dev libdw-dev libelf-dev libicu-dev patch \
+            pkg-config libcurl4-openssl-dev libavformat-dev libavcodec-dev libavutil-dev \
+            libswscale-dev libswresample-dev libnuma-dev
+          echo "/usr/local/cuda-${v}/bin" >> "$GITHUB_PATH"
+          "/usr/local/cuda-${v}/bin/nvcc" --version | tail -2
+          df -h / | tail -1
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -105,13 +152,25 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Mark workspace as safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Restore and save are separate steps so a build that runs out of time still seeds the
+      # cache: re-running the job then picks up where it stopped. Every attempt saves under its
+      # own key, since a cache entry cannot be overwritten, and a restore takes the newest entry
+      # for this commit, else the newest at all. A run sees what was saved on its own ref or on
+      # the default branch -- so a tag's build is warm when the same commit was built on main
+      # first (Actions -> Build Wheels -> Run workflow), and cold otherwise.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.wheel_tag }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ matrix.wheel_tag }}-${{ github.sha }}-
+            ccache-${{ matrix.wheel_tag }}-
 
       - name: Setup ccache
         run: |
-          mkdir -p /ccache
-          ccache --max-size=10G
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size="$CCACHE_MAXSIZE"
           ccache --zero-stats
 
       - name: Install uv
@@ -119,18 +178,33 @@ jobs:
 
       - name: Install Rust for structured output
         run: |
-          wget -qO /tmp/surogate-rustup.sh https://sh.rustup.rs
-          sh /tmp/surogate-rustup.sh -y --profile minimal --default-toolchain 1.90.0
+          if command -v rustup >/dev/null; then
+            rustup toolchain install 1.90.0 --profile minimal
+            rustup default 1.90.0
+          else
+            wget -qO /tmp/surogate-rustup.sh https://sh.rustup.rs
+            sh /tmp/surogate-rustup.sh -y --profile minimal --default-toolchain 1.90.0
+          fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Add CUDA version tag
         run: uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py "${{ matrix.wheel_tag }}"
 
+      # The step's own limit leaves the job time to save the cache when a build runs long.
       - name: Build wheel
+        timeout-minutes: 320
         run: uv build --wheel --out-dir wheelhouse
 
       - name: Show ccache stats
+        if: always()
         run: ccache --show-stats
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.wheel_tag }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # auditwheel vendors every shared library the wheel's ELF files load and the manylinux
       # policy does not promise, and patches their RPATHs to find the copies. What is excluded
