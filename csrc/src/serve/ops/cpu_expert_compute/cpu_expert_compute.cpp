@@ -9,7 +9,8 @@
 //   hq   = quantise(h)
 //   y    = dot(down_row, hq)                 (hidden wide)
 //   out += weight * y
-// The AVX-512 path (compiled with -mavx512bw for this file) widens 32 int8 to int16, multiplies
+// The AVX-512 path (its functions carry target attributes; the rest of this file is generic x86-64
+// and picks it at run time) widens 32 int8 to int16, multiplies
 // pairwise into int32 with vpmaddwd and accumulates in float per group; the scalar path is the
 // same arithmetic in plain C++ and is what the unit test compares against a double reference.
 
@@ -210,7 +211,11 @@ float dot_row_q5_scalar(const std::uint8_t* q5, const std::uint16_t* scales,
     return acc;
 }
 
-#if defined(__x86_64__) && defined(__AVX512BW__)
+// Compiled on every x86-64 build and chosen at run time: each AVX-512 function carries its own
+// target attribute. Compiling the whole file with -mavx512* instead (as it once was) let the
+// compiler use AVX-512 in the scalar fallbacks and the pool's own code, which then died with
+// SIGILL on hosts without it.
+#if defined(__x86_64__)
 constexpr bool kAvx512Compiled = true;
 
 bool detect_avx512() {
@@ -545,7 +550,7 @@ void dot_two_rows_q5_vnni(const std::uint8_t* codes0, const std::uint16_t* scale
     out0 = _mm512_reduce_add_ps(acc0);
     out1 = _mm512_reduce_add_ps(acc1);
 }
-#if defined(__AVX512VNNI__)
+#if defined(__x86_64__)
 constexpr bool kVnniCompiled = true;
 bool detect_vnni() { return __builtin_cpu_supports("avx512vnni"); }
 

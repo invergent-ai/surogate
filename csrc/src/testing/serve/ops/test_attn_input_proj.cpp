@@ -1,4 +1,5 @@
 #include "ops/parallel_rows.h"
+#include "ops/nvfp4_device.h"
 #include "api/ops/attn_input_proj.h"
 
 #include "ops/direct_bf16_weight.h"
@@ -764,7 +765,7 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_bf16_target();
-    failures += run_nvfp4_target();
+    if (nvfp4_device("attn_input_proj NVFP4")) { failures += run_nvfp4_target(); }
     failures += run_fp8_target();
     failures += run_w8_target();
     failures += run_w8_q08();

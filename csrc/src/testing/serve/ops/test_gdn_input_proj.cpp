@@ -1,4 +1,5 @@
 #include "api/ops/gdn_input_proj.h"
+#include "ops/nvfp4_device.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -466,7 +467,7 @@ int main() {
     failures += run_w8_q08();
     failures += run_w8_q2b();
     failures += run_w8_generic();
-    failures += run_nvfp4();
+    if (nvfp4_device("gdn_input_proj NVFP4")) { failures += run_nvfp4(); }
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;

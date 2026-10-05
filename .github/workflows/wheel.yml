@@ -51,10 +51,10 @@ jobs:
           # Blackwell -- sm_100a (B200) and sm_103a (B300) -- is not here: no code path, no
           # benchmark and no config asks for it.
           #
-          # The serve engine keeps its own list, `SUROGATE_SERVE_CUDA_ARCHS`, narrower still at
-          # sm_89 and sm_120a -- one binary for the 4090, the 5090 and the RTX PRO 6000. It is
-          # left at its default here and checked in the wheel afterwards; restating it in the
-          # workflow would only be a second place to be wrong.
+          # The serve engine keeps its own list, `SUROGATE_SERVE_CUDA_ARCHS`, the same three:
+          # one binary for the 4090, the H100/H200, the 5090 and the RTX PRO 6000. It is left at
+          # its default here and checked in the wheel afterwards; restating it in the workflow
+          # would only be a second place to be wrong.
           - cuda_version: "13.1"
             cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
@@ -220,7 +220,7 @@ jobs:
 
       # An install-rule or component mistake produces a wheel that builds, installs, imports --
       # and has no engine in it. The only way to know is to look inside the artifact.
-      - name: The wheel carries the engine, for both architectures
+      - name: The wheel carries the engine, for every architecture it serves
         run: |
           set -euo pipefail
           rm -rf /tmp/wheel-check && mkdir -p /tmp/wheel-check
@@ -241,9 +241,9 @@ jobs:
           done
           cuobjdump -lelf /tmp/wheel-check/surogate/libsinfer.so \
             | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | tee /tmp/wheel-cubins.txt
-          for arch in sm_89 sm_120a; do
+          for arch in sm_89 sm_90a sm_120a; do
             if ! grep -q "$arch" /tmp/wheel-cubins.txt; then
-              echo "::error::the wheel's engine has no $arch cubins — it does not serve the whole RTX line"
+              echo "::error::the wheel's engine has no $arch cubins — it does not serve every card it claims to"
               exit 1
             fi
           done

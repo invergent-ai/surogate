@@ -1,4 +1,5 @@
 #include "ops/linear/fp8_block/fp8_block.h"
+#include "ops/linear/fp8_block/fp8_block_sm90_gemm.h"
 
 #include "core/device.h"
 #include "ops/common/memory.cuh"
@@ -27,9 +28,18 @@ constexpr int kBlocksPerSm  = 2;
 constexpr std::size_t kAlign = 256;
 
 // ---- activations: E4M3 per token per 128, the recipe's convention ----
+// The scale of (token, block) sits at token * kblocks + block, or block * tokens + token when
+// `kb_major` -- the layout Hopper's CUTLASS kernel reads its activation scales in (see
+// fp8_block_sm90_gemm.h). The tile kernel reads either.
+__device__ __forceinline__ std::size_t act_scale_index(int token, int block, int tokens, int kblocks,
+                                                       bool kb_major) {
+    return kb_major ? static_cast<std::size_t>(block) * tokens + token
+                    : static_cast<std::size_t>(token) * kblocks + block;
+}
+
 __global__ void quantize_blocks_kernel(const __nv_bfloat16* __restrict__ x, int k, int tokens,
                                        std::uint8_t* __restrict__ codes,
-                                       float* __restrict__ scales) {
+                                       float* __restrict__ scales, bool kb_major) {
     const int token  = static_cast<int>(blockIdx.y);
     const int block  = static_cast<int>(blockIdx.x);
     const int i      = block * kBlock + static_cast<int>(threadIdx.x);
@@ -44,7 +54,7 @@ __global__ void quantize_blocks_kernel(const __nv_bfloat16* __restrict__ x, int 
     const float inverse = 1.0f / scale;
     codes[static_cast<std::size_t>(token) * k + i] =
         __nv_cvt_float_to_fp8(v * inverse, __NV_SATFINITE, __NV_E4M3);
-    if (threadIdx.x == 0) { scales[static_cast<std::size_t>(token) * (k / kBlock) + block] = scale; }
+    if (threadIdx.x == 0) { scales[act_scale_index(token, block, tokens, k / kBlock, kb_major)] = scale; }
 }
 
 // ---- decode: a warp per row on exact BF16 activations, the block scale per lane ----
@@ -130,7 +140,7 @@ template <bool Accumulate>
 __global__ __launch_bounds__(kTileWarps * 32, kBlocksPerSm) void tile_kernel(
     const std::uint8_t* __restrict__ w_codes, const float* __restrict__ w_scales, ScaleCell cell,
     const std::uint8_t* __restrict__ x_codes, const float* __restrict__ x_scales, int rows, int k,
-    int tokens, __nv_bfloat16* __restrict__ out) {
+    int tokens, __nv_bfloat16* __restrict__ out, bool kb_major) {
     __shared__ TileSmem sm;
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -168,7 +178,7 @@ __global__ __launch_bounds__(kTileWarps * 32, kBlocksPerSm) void tile_kernel(
                 sm.Sw[slot][tid] = w_scales[static_cast<std::size_t>((row0 + tid) / cell.rows_per) * kcells + (kb * kBlock) / cell.k_per];
             } else if (tid < kTileRows + kTileCols) {
                 const int t = tid - kTileRows;
-                sm.Sx[slot][t] = t < cols ? x_scales[static_cast<std::size_t>(col0 + t) * kblocks + kb] : 0.0f;
+                sm.Sx[slot][t] = t < cols ? x_scales[act_scale_index(col0 + t, kb, tokens, kblocks, kb_major)] : 0.0f;
             }
         };
 
@@ -306,17 +316,26 @@ void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t 
                                   : static_cast<std::byte*>(ggml::scratch_for(bytes, stream));
     auto* x_codes  = reinterpret_cast<std::uint8_t*>(scratch);
     auto* x_scales = reinterpret_cast<float*>(scratch + codes_bytes(k, tokens));
+    // On Hopper the activation scales are laid out for its CUTLASS kernel, which `prepared`
+    // planes follow too (linear_projections asks the same question).
+    const bool kb_major = sm90_gemm_available();
     if (prepared == nullptr) {
         quantize_blocks_kernel<<<dim3(static_cast<unsigned>(kblocks), static_cast<unsigned>(tokens)), kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales);
+            static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales, kb_major);
         CUDA_CHECK(cudaGetLastError());
+    }
+    // Hopper: vLLM's wgmma kernel for the 128 x 128 block grid. A per-channel weight, or a launch
+    // the kernel declines, takes the engine's own tile below on the same activation planes.
+    if (kb_major && cell.k_per == kBlock && cell.rows_per == kBlock &&
+        sm90_gemm(x_codes, x_scales, codes, scales, o, accumulate, tokens, rows, k, stream)) {
+        return;
     }
     const int work = (rows / kTileRows) * ((tokens + kTileCols - 1) / kTileCols);
     const int grid = std::min(work, persistent_blocks());
     if (accumulate) {
-        tile_kernel<true><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, cell, x_codes, x_scales, rows, k, tokens, o);
+        tile_kernel<true><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, cell, x_codes, x_scales, rows, k, tokens, o, kb_major);
     } else {
-        tile_kernel<false><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, cell, x_codes, x_scales, rows, k, tokens, o);
+        tile_kernel<false><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, cell, x_codes, x_scales, rows, k, tokens, o, kb_major);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -398,7 +417,7 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
         quantize_blocks_kernel<<<dim3(k / kBlock, tokens), kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), k, tokens,
             reinterpret_cast<std::uint8_t*>(prepared),
-            reinterpret_cast<float*>(prepared + codes_bytes(k, tokens)));
+            reinterpret_cast<float*>(prepared + codes_bytes(k, tokens)), sm90_gemm_available());
         CUDA_CHECK(cudaGetLastError());
     }
     for (const auto& p : projections) {

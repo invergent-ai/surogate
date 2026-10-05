@@ -183,7 +183,7 @@ def resolve_hf_repo(repo_id: str) -> Path:
 
     path = snapshot_download(
         repo_id,
-        allow_patterns=["*.safetensors", "*.json", "tokenizer*", "*.txt"],
+        allow_patterns=["*.safetensors", "*.json", "*.jinja", "tokenizer*", "*.txt"],
     )
     return Path(path)
 

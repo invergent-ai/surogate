@@ -3670,3 +3670,89 @@ captured as one, with the adapters resident and the round published (no token ca
 is unchanged beside it). `sinfer_lora_base_rounds_test` (opt-in, real weights) serves a base request alone, beside
 an adapter request in both orders, and alone again, against the same engine without adapters; on the engine before
 this change its first comparison fails by 0.018 nats.
+
+
+## 101
+
+**Hopper: the engine builds for and serves on sm_90a (H100, H200, GH200) (2026-10-05, on v1.5.8).**
+
+The serve arch set was `89;120a`, chosen for PCIe RTX machines. An H100 had no cubin of its own and
+fell back on JIT-compiling the sm_89 PTX. The default is now `89;90a;120a` (`SUROGATE_SERVE_CUDA_ARCHS`,
+`make SERVE_CUDA_ARCHS`, the wheel workflow's cuobjdump check), and these changes make it work:
+
+- **Block-scaled FP8 GEMM from vLLM** (`ops/linear/fp8_block/fp8_block_sm90_gemm.{h,cu}`, archive
+  `sinfer_fp8_block_sm90`, pinned to 90a; other arch sets link `fp8_block_sm90_stub.cpp`). It is
+  vLLM's CUTLASS 3.x warp-specialized wgmma/TMA kernel for fine-grained FP8 checkpoints
+  (`csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm90_fp8_dispatch.cuh`, Apache-2.0,
+  provenance in the file header), with vLLM's two configurations: cooperative 128x128x128 tiles in a
+  1x2 cluster, and swapped A/B with ping-pong 128x16x128 tiles. vLLM swaps when the token count is not
+  a multiple of 4; here it also swaps at 64 tokens or fewer, where a 128-token tile would mostly be
+  padding. Linear-add runs it with an in-place residual epilogue (C = D = out, beta 1).
+  `fp8_block::run` takes it for 128x128 weight blocks on an sm_90 device. On Hopper the activation
+  quantizer writes the per-token scales k-block-major (`act_scale_index`), the layout the kernel's
+  TMA reads; the engine's tile kernel reads either layout and still runs per-channel weights and any
+  launch the CUTLASS kernel declines (alignment, or a workspace it would need).
+  `SUROGATE_SERVE_FP8_BLOCK_SM90=0` keeps Hopper on the tile kernel. Qwen3.6-27B-FP8 on one H100,
+  through the CLI with a 1,499-token prompt: prefill 7,964 tok/s with this kernel and 2,152 tok/s on the
+  tile kernel (3.7x). Decode was 52.9 against 52.8 tok/s, because decode rows take the warp-per-row
+  BF16 path, not the GEMM. Both produced the same 57 greedy tokens.
+- **GDN gating projection, cooperative grids** (`ops/gdn_gating_proj/bf16`). The 27B and 35B route
+  tables size their split-K cooperative grids for an RTX 5090 (170 SMs, two or four CTAs each). On an
+  H100 (132 SMs) the 27B prefill's split-4 grid at 2048-4096 tokens (192 CTAs of 512 threads) did not
+  fit, and `cudaLaunchCooperativeKernel` failed with `cudaErrorCooperativeLaunchTooLarge`.
+  `launch_bf16_prefill_mma` now compares the grid with the device's co-resident capacity
+  (`cooperative_capacity_per_device`, `ops/kernel/func_attribute.cuh`, occupancy x SMs, cached per
+  device and kernel) and halves the split until it fits. The fused-norm variant stops at split 2,
+  since it reduces its slices after the grid barrier. Each smaller split needs less of the workspace
+  the plan reserved, and the choice is fixed per device, so captured graphs agree with eager launches.
+- **CPU expert pool, SIGILL** (`ops/cpu_expert_compute/cpu_expert_compute.cpp`, `CMakeLists.txt`). The
+  file was compiled with file-wide `-mavx512*` flags. GCC then used AVX-512 in the scalar fallbacks
+  and in the pool's constructor, so any process that built a pool died with SIGILL on a host without
+  AVX-512 (one of Modal's H100 machines; five serve tests). The flags are gone: the AVX-512 and VNNI
+  functions already carried target attributes and are chosen at run time, so the file now compiles
+  them on every x86-64 build and nothing else changes. objdump shows no zmm instruction outside them.
+- **Fatbin compression** (`sinfer_internal_includes`): every serve CUDA target builds with
+  `--compress-mode=size` (CUDA 12.8+). A third architecture adds a full cubin of every kernel. Without
+  compression the 90a-only `libsinfer.so` was 856 MB (575 MB deflated, as a wheel stores it), which
+  would have pushed the wheel (1.50 GB for v1.5.8) to GitHub's 2 GiB release-asset cap. With it, that
+  library is 339 MB (235 MB deflated). An engine serving Qwen3.5-0.8B Q8_0 became ready in 15.7 s
+  instead of 31.6 s on a cold volume and 3.1 s instead of 3.5 s warm, so loading compressed modules
+  costs nothing measurable.
+- **Qwen's own FP8 checkpoints** (`surogate/serve/convert/qwen3_5/exports/quantized.py`). Qwen's FP8
+  exports (Qwen3.6-27B-FP8) store `weight_scale_inv` in BF16, while DeepSeek-style exports use FP32.
+  The converter refused BF16 ("invalid FP8 block geometry"); both now widen exactly to the artifact's
+  FP32 scale plane (`test_fp8_block_scales_widen_to_fp32`). Their MTP block is FP8 too and still has
+  no conversion, so these checkpoints convert with `no_mtp`.
+- **Chat template from Hugging Face** (`surogate/serve/ingest.py`). `resolve_hf_repo` downloaded
+  `*.json`, `tokenizer*` and `*.txt` but not `chat_template.jinja`. Qwen3.5 and 3.6 ship their template
+  only in that file, so `surogate serve Qwen/Qwen3.5-0.8B` refused every chat request ("this model
+  publishes no chat template"). It is now downloaded. The source fingerprint already hashed `*.jinja`,
+  so cached artifacts converted without it are rebuilt.
+
+NVFP4 stays refused on Hopper. The runtime gates (`validate_nvfp4_weight`,
+`weights_profile_needs_sm120`, the TRT-LLM MoE runner, `w4fp4_plane`, `SUROGATE_SERVE_PREFILL_QUANT=fp4`)
+are unchanged, and sm_90a's W4A4 bodies trap like sm_89's. The NVFP4 op tests now skip off sm_120
+(`testing/serve/ops/nvfp4_device.h`, exit 77) instead of aborting.
+
+Tests. `sinfer_linear_fp8_block_test` gains a linear-add residual check and cases at 66, 96 and 256
+tokens and a 256-token rows view, which cover both CUTLASS configurations and the swap.
+`sinfer_gdn_gating_proj_test` adds 2048 and 4096 tokens to the 27B, 35B and 0.8B width lists. Two
+existing tests raced their uploads: a pageable `cudaMemcpy` can return before its DMA lands, and a
+non-blocking stream does not wait for the legacy stream. On an H100 that left the last 576 products
+of `test_gelu_mul`'s 8064-wide case zero, and the fp8_block residual at 256 tokens stale. Both now
+synchronize before the launch.
+
+On one H100 80GB HBM3, with a 90a-only build, `ctest` over every serve test:
+175 pass and 36 skip (six NVFP4 tests, plus tests that need real weights, fixtures or several
+GPUs). `sinfer_http_nodelay_test` fails on Modal's networking. `speech_cpu_ops` (packed linear
+against ATen, bit-exact) passed on one Modal host and failed on two others with the same code. The
+two vision tests are not part of `serve-tests`. End to end, greedy through the CLI and eight concurrent chat requests through the server
+all pass for Qwen3-0.6B BF16, Qwen3.5-0.8B safetensors, Qwen3.5-0.8B GGUF Q4_K_M and Q8_0, and
+Qwen3.6-27B-FP8. One-stream CLI decode speeds were 644, 524, 578, 641 and 55.8 tok/s. The 0.8B models
+gave eight identical replies. The 0.6B and 27B replies differed slightly between requests: greedy
+batching is not batch-invariant without `--batch-invariant` (#99), and the FP8 route depends on the
+round's width.
+
+Not done: NVFP4 on Hopper (vLLM's Marlin FP4, W4A16, would cover the dense layers and its Marlin MoE
+the routed experts); the route tables' SM counts and split choices, still the RTX 5090's; conversion of
+quantized MTP blocks.

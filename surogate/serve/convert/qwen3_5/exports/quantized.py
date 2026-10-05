@@ -113,7 +113,10 @@ class Sources:
             if encoding.scale:
                 scale = self.raw_metadata(reader, source.field(encoding.scale))
                 if encoding.format == inv.FP8_BLOCK_FORMAT:
-                    if n % 128 or k % 128 or scale.shape != (n // 128, k // 128) or scale.dtype != "F32":
+                    # Qwen's own FP8 exports store the block multipliers in BF16, DeepSeek-style
+                    # ones in FP32; both widen to the artifact's FP32 exactly.
+                    if (n % 128 or k % 128 or scale.shape != (n // 128, k // 128)
+                            or scale.dtype not in ("F32", "BF16")):
                         raise ValueError(f"{source.name}: invalid FP8 block geometry")
                 elif math.prod(scale.shape) != n:
                     raise ValueError(f"{source.name}: expected one FP8 scale per row")
@@ -311,7 +314,7 @@ def encode_matrix(entry, sources, device):
     if not bool(torch.isfinite(scales.float()).all()):
         raise ValueError(f"{entry.object_name}: invalid FP8 scales")
     if numeric_format == inv.FP8_BLOCK_FORMAT:
-        return encode_fp8_block_scaled(codes, scales, entry.shape)
+        return encode_fp8_block_scaled(codes, scales.float(), entry.shape)
     if numeric_format == inv.FP8_ROW_F32_FORMAT:
         return encode_fp8_row_f32(codes, scales.float(), entry.shape)
     return encode_fp8_row_scaled(codes, scales, entry.shape)

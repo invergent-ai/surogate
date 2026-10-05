@@ -7,9 +7,12 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <map>
 #include <mutex>
 #include <set>
 #include <tuple>
+#include <utility>
 
 namespace sinfer::ops {
 
@@ -26,6 +29,27 @@ inline cudaError_t set_func_attribute_per_device(Kernel* kernel, cudaFuncAttribu
     error = cudaFuncSetAttribute(kernel, attribute, value);
     if (error == cudaSuccess) { configured.insert({device, key, static_cast<int>(attribute)}); }
     return error;
+}
+
+/// Device-wide co-resident CTAs of `kernel` at this block size and dynamic shared memory: the
+/// largest grid a cooperative launch of it admits on the current device. Computed once per
+/// (device, kernel), after the launcher has set the kernel's shared-memory attribute; 0 when the
+/// device cannot be queried.
+template <class Kernel>
+inline int cooperative_capacity_per_device(Kernel* kernel, int threads, std::size_t dynamic_smem) {
+    static std::mutex mutex;
+    static std::map<std::pair<int, const void*>, int> capacity;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { return 0; }
+    const auto key = std::make_pair(device, reinterpret_cast<const void*>(kernel));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (const auto found = capacity.find(key); found != capacity.end()) { return found->second; }
+    int per_sm = 0, sms = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, dynamic_smem) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return 0;
+    }
+    return capacity[key] = per_sm * sms;
 }
 
 } // namespace sinfer::ops

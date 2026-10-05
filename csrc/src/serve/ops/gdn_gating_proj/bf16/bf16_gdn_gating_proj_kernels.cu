@@ -320,6 +320,28 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                                                  NormalizeInput, NormTokenCapacity>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
         if constexpr (SplitK > 1) {
+            // The route tables size these cooperative grids for the RTX 5090: 170 SMs, and the
+            // registers its sm_120a build uses (bf16_gdn_gating_proj_plan.cpp). A device that
+            // holds fewer CTAs at once -- an H100's 132 SMs at one CTA each, an L4 -- takes the
+            // next smaller split, down to the unsplit kernel. Each needs less of the workspace
+            // the plan reserved, and the choice is fixed per device, so captured graphs agree.
+            const std::int64_t ctas = static_cast<std::int64_t>(grid.x) * grid.y * grid.z;
+            if (ctas > ::sinfer::ops::cooperative_capacity_per_device(
+                           bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                                NormalizeInput, NormTokenCapacity>,
+                           Warps * 32, kSmemBytes)) {
+                // The fused norm reduces its slices after the grid barrier, so it stops at two.
+                if constexpr (SplitK / 2 >= (NormalizeInput ? 2 : 1)) {
+                    launch_bf16_prefill_mma<Geometry, SplitK / 2, Warps, NormalizeInput,
+                                            NormTokenCapacity>(
+                        variant, x, norm_weight, norm_eps, normalized_x, a_weight, b_weight, A_log,
+                        dt_bias, workspace, g, beta, stream);
+                    return;
+                } else {
+                    throw std::runtime_error(
+                        "gdn_gating_proj: the cooperative grid does not fit on this device");
+                }
+            }
             cudaLaunchConfig_t config{};
             config.gridDim          = grid;
             config.blockDim         = block;

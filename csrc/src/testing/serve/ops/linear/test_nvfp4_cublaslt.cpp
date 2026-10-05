@@ -2,6 +2,7 @@
 // the stored weight codes and 128x4-tiled scales are consumed in place; only the activation
 // scales are re-tiled from the quantizer's token-major layout.
 #include "core/engine_context.h"
+#include "ops/nvfp4_device.h"
 #include "core/tensor.h"
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
@@ -315,6 +316,7 @@ int run_two_engine_case(int n, int k, int tokens, int iterations) {
 } // namespace
 
 int main() {
+    if (!sinfer::test::nvfp4_device("NVFP4 cuBLASLt")) { return 77; }
     // The reference must stay on the in-house kernels whatever the route default is; the
     // route reads its switch once, so pin it before the first GEMM.
     setenv("SUROGATE_SERVE_NVFP4_CUBLASLT", "0", 1);

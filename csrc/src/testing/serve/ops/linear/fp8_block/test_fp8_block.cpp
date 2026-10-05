@@ -2,6 +2,7 @@
 // activations, and the tensor-core tile on activations quantised per token per 128 -- the
 // reference quantises the same way, so what remains is accumulation order and BF16 output.
 #include "api/ops/linear.h"
+#include "api/ops/linear_add.h"
 #include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/op_tester.h"
 
@@ -170,9 +171,38 @@ int run(const Case& c) {
         }
         CHECK_CUDA(cudaGraphExecDestroy(exec)); CHECK_CUDA(cudaGraphDestroy(graph));
     }
+    // linear_add on the whole weight: residual += W . x in place, which on Hopper is the CUTLASS
+    // kernel's residual epilogue (C = D). Checked as the delta it added against the reference.
+    double add_rel = 0.0;
+    if (!c.rows_view) {
+        for (std::size_t i = 0; i < x.size(); ++i) { hx[i] = __float2bfloat16(x[i]); }
+        CHECK_CUDA(cudaMemcpy(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+        std::uniform_real_distribution<float> ur(-0.1f, 0.1f);
+        std::vector<__nv_bfloat16> res0(ref.size());
+        for (auto& v : res0) { v = __float2bfloat16(ur(rng)); }
+        DeviceBuffer residual(res0.size() * 2);
+        CHECK_CUDA(cudaMemcpy(residual.p, res0.data(), residual.bytes, cudaMemcpyHostToDevice));
+        // A pageable cudaMemcpy may return before its DMA lands, and `stream` does not wait for
+        // the legacy stream: finish the uploads before the launch reads them.
+        CHECK_CUDA(cudaDeviceSynchronize());
+        Tensor residual_t(residual.p, DType::BF16, {c.rows, c.tokens});
+        ops::linear_add(xt, w, residual_t, workspace, stream);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        std::vector<__nv_bfloat16> summed(res0.size());
+        CHECK_CUDA(cudaMemcpy(summed.data(), residual.p, residual.bytes, cudaMemcpyDeviceToHost));
+        double aerr = 0.0, anorm = 0.0, amax = 0.0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            const double delta = static_cast<double>(__bfloat162float(summed[i])) - __bfloat162float(res0[i]);
+            const double d = delta - ref[i];
+            aerr += d * d; anorm += ref[i] * ref[i]; amax = std::fmax(amax, std::fabs(d));
+        }
+        add_rel = std::sqrt(aerr / std::fmax(anorm, 1e-30));
+        ok &= add_rel <= 8e-3 && amax <= 1.5e-2 * max_ref;
+    }
     CHECK_CUDA(cudaStreamDestroy(stream));
-    std::printf("  [%5d, %5d] T=%-4d %-12s %-8s rel_l2=%.2e max_abs=%.2e of max  %s\n", c.rows, c.k, c.tokens,
-                c.rows_view ? "linear_rows" : "linear", c.per_row ? "per-row" : "blk128", rel, max_abs / max_ref, ok ? "ok" : "FAIL");
+    std::printf("  [%5d, %5d] T=%-4d %-12s %-8s rel_l2=%.2e max_abs=%.2e of max add_rel=%.2e  %s\n", c.rows, c.k, c.tokens,
+                c.rows_view ? "linear_rows" : "linear", c.per_row ? "per-row" : "blk128", rel, max_abs / max_ref,
+                add_rel, ok ? "ok" : "FAIL");
     CHECK_CUDA(cudaFree(d_payload)); CHECK_CUDA(cudaFree(d_x)); CHECK_CUDA(cudaFree(d_out));
     return ok ? 0 : 1;
 }
@@ -184,6 +214,10 @@ int main() {
     for (const Case& c : {Case{256, 512, 1, false}, Case{256, 512, 3, false}, Case{256, 512, 4, true},
                           Case{256, 512, 5, false}, Case{384, 1024, 64, false}, Case{384, 1024, 200, true},
                           Case{512, 1024, 130, false}, Case{1024, 3584, 33, true},
+                          // Hopper's two CUTLASS configurations (fp8_block_sm90_gemm.h): the swapped
+                          // narrow tile at 33/130/66 tokens, the cooperative one at 96 and 256.
+                          Case{1024, 2048, 66, false}, Case{1536, 1024, 96, false},
+                          Case{2048, 2048, 256, false}, Case{2048, 1024, 256, true},
                           Case{256, 512, 1, false, true}, Case{384, 1024, 64, true, true},
                           Case{512, 1024, 200, false, true}}) {
         failures += run(c);

@@ -146,6 +146,32 @@ def test_nvfp4_source_words_and_scale_conventions_are_preserved(tmp_path, modelo
         assert torch.equal(sources.get(stem + ".weight")[1, 2:4], torch.tensor([.25, .5], dtype=torch.bfloat16))
 
 
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
+def test_fp8_block_scales_widen_to_fp32(tmp_path, scale_dtype):
+    """Qwen's own FP8 exports store `weight_scale_inv` in BF16; it widens to the FP32 plane exactly."""
+    from safetensors.torch import save_file
+    from surogate.serve.artifact.layouts import block_scale128_geometry
+    from surogate.serve.convert.common.safetensors import ShardReader
+    from surogate.serve.convert.qwen3_5.exports import quantized, recipe_nvfp4_uniform as matrices
+    stem = "model.layers.0.mlp.gate_proj"
+    codes = torch.arange(256 * 128, dtype=torch.int32).remainder(120).to(torch.uint8).reshape(256, 128)
+    scales = torch.tensor([[0.0078125], [3.25]], dtype=scale_dtype)
+    save_file({stem + ".weight": codes.view(torch.float8_e4m3fn), stem + ".weight_scale_inv": scales},
+              str(tmp_path / "model.safetensors"))
+    source = matrices.MatrixSource(stem, (256, 128))
+    entry = matrices.Nvfp4WeightRecipe("text/layers/0/mlp/gate_up", (256, 128), (matrices._all(source),), (source,))
+    with ShardReader.for_directory(tmp_path) as reader:
+        sources = quantized.Sources(reader)
+        assert sources.encoding(stem).format == inv.FP8_BLOCK_FORMAT
+        sources.validate_matrix(source, sources.encoding(stem))
+        payload = quantized.encode_matrix(entry, sources, "cpu")
+    geometry = block_scale128_geometry("FP8_E4M3FN_BLK128_F32S", (256, 128))
+    assert payload[:geometry.code_plane_bytes] == codes.numpy().tobytes()
+    begin = geometry.scale_plane_offset
+    stored = torch.frombuffer(bytearray(payload[begin:begin + geometry.scale_plane_bytes]), dtype=torch.float32)
+    assert torch.equal(stored, scales.float().reshape(-1))
+
+
 @pytest.mark.parametrize("mtp,vision,tied", [(True, True, False), (False, False, True)])
 def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monkeypatch, mtp, vision, tied):
     from safetensors.torch import save_file

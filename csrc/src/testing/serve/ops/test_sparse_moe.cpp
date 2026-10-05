@@ -1,4 +1,5 @@
 #include "ops/parallel_rows.h"
+#include "ops/nvfp4_device.h"
 
 #include "api/ops/sparse_moe.h"
 
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
 
     if (argc == 2 && std::string(argv[1]) == "--lfm2") { return run_lfm2() ? 1 : 0; }
     if (argc == 2 && std::string(argv[1]) == "--nvfp4-small-t") {
+        if (!nvfp4_device("sparse_moe nvfp4 small-T")) { return 77; }
         constexpr std::array<std::int32_t, 7> tokens{{1, 2, 4, 15, 16, 17, 31}};
         const CodecProfile profile{"nvfp4 small-T crossover", QType::NVFP4,
                                    QType::NVFP4, tokens, true, 16};
@@ -166,6 +168,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--gemma4") {
+        if (!nvfp4_device("sparse_moe gemma4 nvfp4")) { return 77; }
         // The NVFP4 profile at every width class: the decode kernel (W4A16) at one token, the
         // runner's power-of-two and linear rungs, and the 4,096-row slice crossed. (The fixture
         // stores row-split codecs without the K padding a 704-wide expert needs, so the served
@@ -210,8 +213,12 @@ int main(int argc, char** argv) {
         {"sparse_moe nvfp4 w4a4", QType::NVFP4, QType::NVFP4, kNvfp4Tokens, false},
     }};
 
+    const bool nvfp4 = nvfp4_device("sparse_moe nvfp4 w4a4");
     int failures = run_lfm2();
-    for (const CodecProfile& profile : profiles) { failures += qwen36::run_profile(profile); }
+    for (const CodecProfile& profile : profiles) {
+        if (profile.routed_gate_up == QType::NVFP4 && !nvfp4) { continue; }
+        failures += qwen36::run_profile(profile);
+    }
 
     // The second registered mixture routes every token and has no always-on expert, which is
     // the whole reason it is here: its router is one row narrower, a token sums one fewer path,
@@ -224,7 +231,7 @@ int main(int argc, char** argv) {
         // is 768, which the op refuses by name rather than approximating.
         const bool baked_for_512 = profile.routed_down == QType::Q5G64_F16S ||
                                    profile.routed_down == QType::Q6G64_F16S;
-        if (baked_for_512) { continue; }
+        if (baked_for_512 || (profile.routed_gate_up == QType::NVFP4 && !nvfp4)) { continue; }
         failures += qwen3_moe::run_profile(profile);
     }
     // The third registered mixture is GLM-5.3's, and every axis of it is new: its router
@@ -238,7 +245,7 @@ int main(int argc, char** argv) {
         // and Q6 routed-down kernels are baked for 512.
         const bool baked_for_512 = profile.routed_down == QType::Q5G64_F16S ||
                                    profile.routed_down == QType::Q6G64_F16S;
-        if (baked_for_512) { continue; }
+        if (baked_for_512 || (profile.routed_gate_up == QType::NVFP4 && !nvfp4)) { continue; }
         failures += glm53::run_profile(profile);
     }
 

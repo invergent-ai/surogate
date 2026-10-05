@@ -53,6 +53,10 @@ int run(std::size_t n, bool tanh_approx, std::uint32_t seed) {
 
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    // The uploads are pageable cudaMemcpy calls, which may return before their DMA lands, and a
+    // non-blocking stream does not wait for the legacy stream. On an H100 the last 576 products
+    // of the 8064-wide case came back zero.
+    cuda_synchronize();
     ops::gelu_mul(tg, tu, tanh_approx ? ops::GeluMode::Tanh : ops::GeluMode::Exact, to, stream);
     cuda_synchronize(stream);
     cuda_check(cudaStreamDestroy(stream), "stream destroy");

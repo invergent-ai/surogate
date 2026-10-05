@@ -453,8 +453,11 @@ int main() {
         }
     }
 
-    // Every registered 27B projection route, including predicated and full token tiles.
-    for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
+    // Every registered 27B projection route, including predicated and full token tiles. 2048 and
+    // 4096 are the split-4 and split-2 routes' widest cooperative grids (192 CTAs of 512 threads),
+    // which a Qwen3.6-27B prefill on an H100 could not launch until the launcher learned to step
+    // the split down.
+    for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2048, 2049, 4096, 4097}) {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }
@@ -462,14 +465,14 @@ int main() {
     // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
     failures += run_projection_case(kQwen38Parent, 1, 0x1801u);
     // Every registered 35B projection route and its contiguous-parent storage contract.
-    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
+    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2048, 2049, 4096, 4097}) {
         failures +=
             run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
     }
 
     // Every registered 0.8B projection route (same schedule family as 35B).
     failures += verify_workspace_capacity_contract(kQwen08, {1, 127, 1024, 2048, 4096, 4097});
-    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
+    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2048, 2049, 4096, 4097}) {
         failures +=
             run_projection_case(kQwen08, tokens, 0x5000u + static_cast<std::uint32_t>(tokens));
     }

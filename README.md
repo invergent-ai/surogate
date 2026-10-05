@@ -320,7 +320,7 @@ Read [how training works](docs/about/how-it-works.md), the [DSL guide](docs/abou
 | **Platform** | Linux x86_64; the published wheel targets Python 3.12 and CUDA 13 (driver 580+). |
 | **Training** | SM89+ in the current build: Ada (RTX 40 series, L4/L40), Hopper (H100/H200), and supported Blackwell targets. |
 | **FP8 / NVFP4 training** | FP8 requires SM89+; native NVFP4 requires a supported Blackwell GPU and matching build. |
-| **Generative serving** | Current default builds target **SM120a**: RTX 50 series and RTX PRO Blackwell. The SM89/Ada port compiles, with runtime validation pending. |
+| **Generative serving** | Default builds target Ada (SM89: RTX 40 series, L4/L40), Hopper (SM90a: H100/H200) and RTX Blackwell (SM120a: RTX 50 series, RTX PRO). NVFP4 checkpoints need SM120. |
 | **CPU embeddings** | AVX-512 CPU; generative serving still requires a GPU when using CPU offload. |
 | **Multi-GPU / offload** | NCCL for distributed training; sufficient system RAM for offloaded weights and state. Dispatch-PP supports PCIe systems without NVLink. |
 

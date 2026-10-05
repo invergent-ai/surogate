@@ -133,8 +133,9 @@ lower-bit GGUFs can therefore require more disk space and memory after preparati
 
 ## Hardware
 
-Supported GPU builds target NVIDIA Ada and Blackwell cards, including RTX 4070/4090,
-RTX 5070/5080/5090, and RTX Pro 6000 Blackwell. The accelerated NVFP4 path requires Blackwell.
+Supported GPU builds target NVIDIA Ada, Hopper and RTX Blackwell cards, including RTX 4070/4090,
+L4/L40, H100/H200, RTX 5070/5080/5090, and RTX Pro 6000 Blackwell. The accelerated NVFP4 path
+requires RTX Blackwell (SM120); on Hopper, serve FP8, GGUF or BF16 checkpoints instead.
 See the [CLI reference](cli.md#devices) for models that can use several GPUs.
 
 CPU-only serving supports **embedding models** and requires AVX-512. Generative models need

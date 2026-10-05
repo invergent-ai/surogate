@@ -154,7 +154,9 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
     // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
-    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
+    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile. These counts
+    // are the RTX 5090's; on a device that holds fewer, the launcher steps the split down
+    // (launch_bf16_prefill_mma, bf16_gdn_gating_proj_kernels.cu).
     return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
 }
 
@@ -162,7 +164,7 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
     // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
     // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
     // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
-    // device-wide limits are 340 and 680 CTAs respectively.
+    // device-wide limits are 340 and 680 CTAs respectively (other devices: see above).
     const std::int32_t resident_ctas =
         schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
     return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
