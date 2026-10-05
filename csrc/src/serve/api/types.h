@@ -50,6 +50,11 @@ enum class KvCacheStorage : std::uint8_t {
     /// (IQ4_XS) of perplexity against llama.cpp's f16 cache -- both rows match llama.cpp
     /// once the cache is BF16 -- while a 3:1 GDN stack pays 0.4 % (27B) to nothing (35B,
     /// 0.8B) and keeps the halved cache.
+    ///
+    /// On Hopper (sm_90) it is BFloat16 for every stack: prompt attention there runs
+    /// FlashAttention-3, which reads a BF16 cache. Qwen3.6-35B-A3B-FP8 on one H100, 2,048-token
+    /// prompts from 32 users (2026-10-05): 35.7k prompt tok/s with BF16 against 28.6k with e4m3
+    /// (and 28.9k with BF16 but FA3 off), decode no slower; the 80 GB card holds the larger cache.
     Auto,
 };
 

@@ -40,7 +40,8 @@ Common server options (full list: surogate serve --engine-help):
   --max-num-seqs N               simultaneous requests (default 1)
   --kv-cache-dtype auto|fp8|bf16|int8
                                 KV cache precision (default auto: bf16 for a pure-attention
-                                 model, fp8 where linear-attention layers carry the stack)
+                                 model and on Hopper, fp8 where linear-attention layers carry
+                                 the stack elsewhere)
   --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
   --dflash-model PATH           separate Muse-Glimmer DFlash GGUF checkpoint

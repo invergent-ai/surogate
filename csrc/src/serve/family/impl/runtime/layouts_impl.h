@@ -162,12 +162,15 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
-/// The storage a request for `Auto` resolves to for this geometry: BF16 when every layer
-/// is attention, e4m3 when linear-attention layers carry the stack. KvCacheStorage::Auto
-/// documents the measurements behind the split.
-KvCacheStorage resolve_kv_storage(KvCacheStorage storage, const family::TextGeometry& geometry) {
+/// The storage a request for `Auto` resolves to for this geometry on a device of compute
+/// capability `sm`: BF16 when every layer is attention or the device is Hopper, e4m3 when
+/// linear-attention layers carry the stack elsewhere. KvCacheStorage::Auto documents the
+/// measurements behind the split.
+KvCacheStorage resolve_kv_storage(KvCacheStorage storage, const family::TextGeometry& geometry,
+                                  int sm) {
     if (storage != KvCacheStorage::Auto) { return storage; }
-    return geometry_gdn_layers(geometry) == 0 ? KvCacheStorage::BFloat16 : KvCacheStorage::Fp8E4M3;
+    return geometry_gdn_layers(geometry) == 0 || sm == 90 ? KvCacheStorage::BFloat16
+                                                          : KvCacheStorage::Fp8E4M3;
 }
 
 DType kv_storage_dtype(KvCacheStorage storage) {
@@ -1213,7 +1216,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {
         throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
     }
-    const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry);
+    const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry, device.sm());
     SequencePlanningInputs inputs{
         .weights_profile = weights_profile,
         .geometry        = geometry,

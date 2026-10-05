@@ -182,8 +182,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --kv-cache-dtype defaults to auto: BF16 for attention-only models, FP8 for "
-           "hybrids.\n"
+           "       --kv-cache-dtype defaults to auto: BF16 for attention-only models and on "
+           "Hopper, FP8 for hybrids elsewhere.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --batch-invariant makes each request's logits, log-probabilities and greedy\n"

@@ -3804,3 +3804,43 @@ Tests. `sinfer_sparse_moe_fp8_sm90_test` checks both GEMM families and the GEMV 
 reference; the MoE correctness suite gains a block-FP8 profile at 1, 2, 3, 5, 16 and 19 tokens with
 graph replay on sm_90; `tests/serve/test_qwen3_5_moe_checkpoint_config.py` covers the converter's
 block-FP8 reading.
+
+## 103
+
+**Hopper: prompt attention runs FlashAttention-3 (2026-10-05, after #102).**
+
+With #102 the 35B-A3B's experts stopped being its largest prefill cost: attention was, 7.6 ms of GPU
+time per 1,000 prompt tokens against vLLM's 0.3. Our prompt route cuts a prompt into eight-column
+tiles over split-KV partials (`mma.sync`, about 22 TFLOP/s); vLLM runs FlashAttention-3.
+
+- **Vendored kernel** (`src/third_party/flash_attn3`, BSD-3-Clause, NOTICE there): FA3's sm90 forward
+  headers and varlen scheduler from flash-attention 3451a2a, built against our CUTLASS 4.6.1 into
+  archive `sinfer_gqa_sm90` (pinned to 90a, hidden visibility; a stub elsewhere). One local change:
+  its error macros throw instead of calling `exit(1)`.
+- **Launcher** (`ops/gqa_sm90/gqa_fa3.{h,cu}`). One instantiation: BF16, head dim 256, causal, varlen,
+  paged without TMA, query group packed into the tile, no split. The paged cache's layout (a page is
+  64 slots of one KV head) is passed as strides, the block-table row through `kv_batch_idx`, and the
+  segment lengths through device arrays filled on the stream, so it captures in prefill graphs.
+- **Routes** (`ops/wrapper/gqa_attention.cpp`). A prompt of 32 columns or more
+  (`SUROGATE_SERVE_GQA_FA3_MIN_COLUMNS`) over a BF16 cache with no window takes FA3 on an sm_90 device;
+  `SUROGATE_SERVE_GQA_FA3=0` turns it off. Narrower prompts keep the tiles: FA3 runs one CTA per 128
+  packed query rows, which at an 8K history took 0.18 ms for 32 or for 64 columns. Packed rounds
+  (#14) send all such segments to one varlen launch, which computes each segment exactly as its own
+  launch does, so the packed-equals-alone check still holds bit for bit. FA3's arithmetic is not the
+  decode kernels', so `--batch-invariant` keeps every width on the tiles.
+- **KV cache default** (`family/impl/runtime/layouts_impl.h`, `KvCacheStorage::Auto`). Hybrids defaulted
+  to an e4m3 cache, which FA3 cannot read. On sm_90 `auto` is now BF16 for every stack.
+
+FA3 alone, on an H100: a fresh 2,048-token prompt in 0.064 ms per layer (535 TFLOP/s), a 2,048-token
+chunk after 6,144 keys at 719 TFLOP/s, four packed 2,048-token segments at 709; every case within
+3e-3 of an FP32 reference, graph replay bit-identical to eager. The 35B-A3B server, 2,048-token prompts
+from 32 users: 35.7k prompt tok/s and 968 ms median TTFT, against 28.6k and 1,203 ms before (28.9k with a
+BF16 cache and FA3 off, so FA3 is the gain). Decode: one stream 282 tok/s, 16 users 1,184, 64 users
+2,291 (vLLM 251, 883, 1,923). vLLM still prefills faster (39.5k, 275 ms TTFT).
+
+Tests. `sinfer_gqa_attention_test` adds wide prompts over scattered pages (130 and 300 columns after
+200 and 1,500 keys, 32 after 1,000) against its oracle; its width-invariance check now runs under
+`--batch-invariant`, the contract it states.
+
+Not done: FA3 over an e4m3 cache (FA3 would need FP8 queries), sliding windows (Gemma), head dims
+other than 256.
