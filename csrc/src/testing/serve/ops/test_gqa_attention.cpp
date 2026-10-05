@@ -2,6 +2,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "api/ops/batch_invariant.h"
 #include "api/ops/gqa_attention.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/op_tester.h"
@@ -1373,6 +1374,19 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 
+        // Wide prompts over scattered pages: on an H100 these take FlashAttention-3 (BF16,
+        // 256-wide heads, 32 columns and up), whose 128-row query tiles and 80-key tiles straddle
+        // the 64-slot pages; elsewhere they are more prompt-tile coverage.
+        if (geometry.head_dim == 256) {
+            failures += run_a1_case(geometry, dtype, {130, 200, 400, 701u}, MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, dtype, {130, 200, 400, 702u}, MappingPattern::Fragmented);
+            failures += run_a1_case(geometry, dtype, {32, 1000, 1100, 703u}, MappingPattern::Offset);
+            if (geometry.q_heads >= 16) {
+                failures += run_a1_case(geometry, dtype, {300, 1500, 1800, 704u},
+                                        MappingPattern::Fragmented);
+            }
+        }
+
         // Causal sliding window. The 200-token cases are the ones that matter:
         // with Br = Bc = 64, a query tile at 128 against a key tile at 0 is
         // wholly below the diagonal, so the prefill kernel takes its "every key
@@ -1520,8 +1534,14 @@ int verify_split_numerator_precision() {
 
 // A cached query must give identical results whether it is decoded alone, verified
 // with other tokens, or included in a full prefill. Nonzero Q/K exercises softmax
-// and contexts/windows cross both key-partition and query-tile boundaries.
+// and contexts/windows cross both key-partition and query-tile boundaries. This is the
+// --batch-invariant contract: by default a Hopper prompt of 32 columns or more runs
+// FlashAttention-3, whose bits differ from the split-KV kernels' (the oracle cases cover it).
 int verify_query_batch_invariance() {
+    struct InvariantScope {
+        InvariantScope() { ops::set_batch_invariant(true); }
+        ~InvariantScope() { ops::set_batch_invariant(false); }
+    } invariant;
     int failures = 0;
     constexpr int tokens = 385, pages = 264, context = pages * kPagedKVPageSize;
     for (const Geometry geometry : {Geometry{"gemma", 8, 4}, Geometry{"qwen", 8, 2},
