@@ -28,7 +28,7 @@ permissions:
 jobs:
   # Tests are platform-agnostic logic — run them once, not per-target.
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: jackalope
@@ -53,20 +53,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runs-on: ubuntu-latest
+          - runs-on: blacksmith-4vcpu-ubuntu-2404
             target: bun-linux-x64
             asset: jackalope-linux-x64
-          - runs-on: ubuntu-24.04-arm
+          - runs-on: blacksmith-4vcpu-ubuntu-2404-arm
             target: bun-linux-arm64
             asset: jackalope-linux-arm64
-          - runs-on: macos-14
+          - runs-on: blacksmith-6vcpu-macos-15
             target: bun-darwin-arm64
             asset: jackalope-darwin-arm64
-          - runs-on: macos-13
+          - runs-on: blacksmith-6vcpu-macos-15
             target: bun-darwin-x64
             asset: jackalope-darwin-x64
             experimental: true
-          - runs-on: windows-latest
+          - runs-on: blacksmith-4vcpu-windows-2025
             target: bun-windows-x64
             asset: jackalope-windows-x64.exe
             experimental: true
@@ -104,7 +104,7 @@ jobs:
   release:
     name: publish
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/download-artifact@v4
         with:
