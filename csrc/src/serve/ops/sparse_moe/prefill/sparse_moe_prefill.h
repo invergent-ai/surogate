@@ -23,6 +23,9 @@ inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
 /// GGML K-quants share the Q4/Q5 tiling, so they cross over where those do; measured, not
 /// assumed -- below this the small-T slices win.
 inline constexpr std::int32_t kSparseMoePrefillGgmlKMin     = 47;
+/// Block-FP8 experts: below this the decode and small-T kernels read the codes directly; from
+/// it up, Hopper's grouped GEMM (fp8_moe_sm90) runs them inside this family.
+inline constexpr std::int32_t kSparseMoePrefillFp8Min       = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
@@ -60,6 +63,11 @@ struct SparseMoePrefillPlan {
 
 /// Whether a routed codec pair is the block-FP8 profile (Hopper's grouped GEMM).
 [[nodiscard]] bool sparse_moe_routed_fp8_profile(QType routed_gate_up, QType routed_down) noexcept;
+
+/// The narrowest round the block-FP8 profile sends to this family: kSparseMoePrefillFp8Min, or
+/// SUROGATE_SERVE_MOE_FP8_PREFILL_MIN in [1, 47] so the crossover can be re-measured. Never
+/// above the small-T bound plus one, so no width falls to the per-token decode loop.
+[[nodiscard]] std::int32_t sparse_moe_fp8_prefill_min() noexcept;
 
 /// Whether a routed codec pair takes the int8 tensor-core route.
 [[nodiscard]] bool sparse_moe_routed_int8_profile(QType routed_gate_up, QType routed_down) noexcept;

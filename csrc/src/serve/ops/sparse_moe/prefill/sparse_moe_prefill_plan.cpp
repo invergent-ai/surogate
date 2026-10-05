@@ -1,4 +1,5 @@
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include "core/layout.h"
 
@@ -82,8 +83,10 @@ std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcep
     // NVFP4's routed experts have no kernel of this family - the vendored TRT-LLM runner computes
     // them - so the family serves that profile at every width, down to a single token.
     if (routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4) { return 1; }
-    // Nor do block-FP8 experts: Hopper's grouped GEMM (fp8_moe_sm90) runs them at every width.
-    if (sparse_moe_routed_fp8_profile(routed_gate_up, routed_down)) { return 1; }
+    // Block-FP8 experts run on Hopper's grouped GEMM (fp8_moe_sm90) from the crossover up.
+    if (sparse_moe_routed_fp8_profile(routed_gate_up, routed_down)) {
+        return sparse_moe_fp8_prefill_min();
+    }
     if (routed_gate_up == QType::Q4G64_F16S) {
         if (routed_down == QType::Q5G64_F16S) { return kSparseMoePrefillQ4Q5Min; }
         if (routed_down == QType::Q6G64_F16S) { return kSparseMoePrefillQ4Q6Min; }
@@ -147,6 +150,23 @@ bool int8_codec_admitted(QType qtype, bool gate_up_side) noexcept {
 bool sparse_moe_routed_fp8_profile(QType routed_gate_up, QType routed_down) noexcept {
     return routed_gate_up == QType::FP8_E4M3FN_BLK128_F32S &&
            routed_down == QType::FP8_E4M3FN_BLK128_F32S;
+}
+
+std::int32_t sparse_moe_fp8_prefill_min() noexcept {
+    static const std::int32_t value = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_FP8_PREFILL_MIN");
+        if (raw == nullptr || *raw == '\0') { return kSparseMoePrefillFp8Min; }
+        char* end         = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end == raw || *end != '\0' || parsed < 1 || parsed > kSparseMoeSmallTMax + 1) {
+            std::fprintf(stderr,
+                         "sparse moe: ignoring SUROGATE_SERVE_MOE_FP8_PREFILL_MIN=%s (want 1..%d)\n",
+                         raw, kSparseMoeSmallTMax + 1);
+            return kSparseMoePrefillFp8Min;
+        }
+        return static_cast<std::int32_t>(parsed);
+    }();
+    return value;
 }
 
 bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,

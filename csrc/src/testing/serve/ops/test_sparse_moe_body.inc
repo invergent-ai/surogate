@@ -46,6 +46,10 @@ struct QuantGeometry {
     std::size_t high_bytes_per_group;
     std::size_t scale_bytes_per_group = 2;   // fp16 for the row-split codecs, e4m3 for NVFP4
     bool block_scale                  = false; // NVFP4 stores scales in 128x4 tiles, not per row
+    /// Block FP8 has one scale per 128 x 128 cell, so a scale row covers 128 weight rows.
+    std::int32_t rows_per_scale       = 1;
+    /// Block FP8's scale grid follows its codes in one payload, which the op checks.
+    bool scales_follow_codes          = false;
 };
 
 QuantGeometry quant_geometry(QType qtype) {
@@ -60,6 +64,8 @@ QuantGeometry quant_geometry(QType qtype) {
         return {32, 32, 0};
     case QType::NVFP4:
         return {16, 8, 0, 1, true};
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        return {128, 128, 0, 4, false, 128, true};
     default:
         throw std::invalid_argument("sparse_moe test: unsupported codec");
     }
@@ -190,6 +196,65 @@ quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std:
     return packed;
 }
 
+/// Quantises a float source into block FP8 as Qwen's FP8 export stores it: E4M3 codes row-major
+/// and one FP32 scale per 128 x 128 cell (amax / 448), the scale grid row-major after the codes.
+/// `dequant` holds what the stored bytes decode to, which is what the oracle reads.
+quantized_weight::PackedWeight pack_fp8_block(const std::vector<float>& source, std::int32_t n,
+                                              std::int32_t k) {
+    if ((n % 128) != 0 || (k % 128) != 0 || source.size() != static_cast<std::size_t>(n) * k) {
+        throw std::invalid_argument("fp8 block test packer: N and K must be multiples of 128");
+    }
+    const std::int32_t cells_per_row = k / 128;
+    quantized_weight::PackedWeight packed;
+    packed.code_plane_bytes   = static_cast<std::uint64_t>(n) * k;
+    packed.scale_plane_offset = (packed.code_plane_bytes + 255U) / 256U * 256U;
+    packed.scale_plane_bytes  = static_cast<std::uint64_t>(n / 128) * cells_per_row * sizeof(float);
+    packed.payload.assign(static_cast<std::size_t>(packed.scale_plane_offset + packed.scale_plane_bytes), 0);
+    packed.dequant.assign(source.size(), 0.0f);
+    for (std::int32_t band = 0; band < n / 128; ++band) {
+        for (std::int32_t cell = 0; cell < cells_per_row; ++cell) {
+            float amax = 0.0f;
+            for (std::int32_t row = band * 128; row < band * 128 + 128; ++row) {
+                for (std::int32_t col = cell * 128; col < cell * 128 + 128; ++col) {
+                    amax = std::max(amax, std::fabs(source[static_cast<std::size_t>(row) * k + col]));
+                }
+            }
+            const float scale   = amax > 0.0f ? amax / 448.0f : 1.0f;
+            const float inverse = 1.0f / scale;
+            for (std::int32_t row = band * 128; row < band * 128 + 128; ++row) {
+                for (std::int32_t col = cell * 128; col < cell * 128 + 128; ++col) {
+                    const std::size_t at = static_cast<std::size_t>(row) * k + col;
+                    const __nv_fp8_e4m3 code(source[at] * inverse);
+                    packed.payload[at] = code.__x;
+                    packed.dequant[at] = static_cast<float>(code) * scale;
+                }
+            }
+            std::memcpy(packed.payload.data() + packed.scale_plane_offset +
+                            (static_cast<std::size_t>(band) * cells_per_row + cell) * sizeof(float),
+                        &scale, sizeof(float));
+        }
+    }
+    packed.weight.qtype           = QType::FP8_E4M3FN_BLK128_F32S;
+    packed.weight.layout          = QuantLayout::Fp8Block128;
+    packed.weight.scale_dtype     = DType::FP32;
+    packed.weight.scale_ne[0]     = 128;
+    packed.weight.scale_ne[1]     = 128;
+    packed.weight.payload         = packed.payload.data();
+    packed.weight.payload_bytes   = packed.payload.size();
+    packed.weight.qdata           = packed.payload.data();
+    packed.weight.scales          = packed.payload.data() + packed.scale_plane_offset;
+    packed.weight.group_size      = 128;
+    packed.weight.group           = 128;
+    packed.weight.ndim            = 2;
+    packed.weight.shape[0]        = n;
+    packed.weight.shape[1]        = k;
+    packed.weight.padded_shape[0] = n;
+    packed.weight.padded_shape[1] = k;
+    packed.weight.n               = n;
+    packed.weight.k               = k;
+    return packed;
+}
+
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
     for (std::size_t index = 0; index < values.size(); ++index) {
@@ -233,10 +298,16 @@ public:
                           geometry_.high_bytes_per_group),
           scale_row_bytes_(static_cast<std::size_t>(groups_per_row_) *
                            geometry_.scale_bytes_per_group),
-          codes_(static_cast<std::size_t>(rows) * code_row_bytes_),
-          scales_(static_cast<std::size_t>(rows) * scale_row_bytes_) {
+          scale_plane_bytes_(static_cast<std::size_t>(rows / geometry_.rows_per_scale) *
+                             scale_row_bytes_),
+          scale_base_(geometry_.scales_follow_codes
+                          ? (static_cast<std::size_t>(rows) * code_row_bytes_ + 255U) / 256U * 256U
+                          : 0),
+          codes_(geometry_.scales_follow_codes ? scale_base_ + scale_plane_bytes_
+                                               : static_cast<std::size_t>(rows) * code_row_bytes_),
+          scales_(geometry_.scales_follow_codes ? DeviceBuffer{} : DeviceBuffer(scale_plane_bytes_)) {
         codes_.fill(0);
-        scales_.fill(0);
+        if (!geometry_.scales_follow_codes) { scales_.fill(0); }
         if (high_row_bytes_ != 0) {
             high_ =
                 std::make_unique<DeviceBuffer>(static_cast<std::size_t>(rows) * high_row_bytes_);
@@ -247,7 +318,9 @@ public:
     void copy_rows(const quantized_weight::PackedWeight& source, std::int32_t destination_row) {
         const std::int32_t source_rows = source.weight.n;
         if (source.weight.qtype != qtype_ || source.weight.k != columns_ || source_rows < 1 ||
-            destination_row < 0 || destination_row > rows_ - source_rows) {
+            destination_row < 0 || destination_row > rows_ - source_rows ||
+            source_rows % geometry_.rows_per_scale != 0 ||
+            destination_row % geometry_.rows_per_scale != 0) {
             throw std::invalid_argument("sparse_moe test: invalid packed row copy");
         }
         codes_.copy_from_host(source.payload.data(),
@@ -258,15 +331,33 @@ public:
                                   static_cast<std::size_t>(source_rows) * high_row_bytes_,
                                   static_cast<std::size_t>(destination_row) * high_row_bytes_);
         }
-        scales_.copy_from_host(source.payload.data() + source.scale_plane_offset,
-                               static_cast<std::size_t>(source_rows) * scale_row_bytes_,
-                               static_cast<std::size_t>(destination_row) * scale_row_bytes_);
+        scale_plane().copy_from_host(source.payload.data() + source.scale_plane_offset,
+                                     scale_bytes(source_rows), scale_offset(destination_row));
     }
 
     Weight weight() const {
         Weight result{};
         result.payload          = codes_.p;
         result.payload_bytes    = codes_.bytes + (high_ ? high_->bytes : 0) + scales_.bytes;
+        if (qtype_ == QType::FP8_E4M3FN_BLK128_F32S) {
+            result.payload       = codes_.p;
+            result.payload_bytes = codes_.bytes;
+            result.qtype         = qtype_;
+            result.group_size    = 128;
+            result.group         = 128;
+            result.qdata         = codes_.p;
+            result.scales        = static_cast<std::uint8_t*>(codes_.p) + scale_base_;
+            result.n             = rows_;
+            result.k             = columns_;
+            result.layout        = QuantLayout::Fp8Block128;
+            result.scale_dtype   = DType::FP32;
+            result.scale_ne[0]   = 128;
+            result.scale_ne[1]   = 128;
+            result.ndim          = 2;
+            result.shape[0] = result.padded_shape[0] = rows_;
+            result.shape[1] = result.padded_shape[1] = columns_;
+            return result;
+        }
         result.high_plane_bytes = high_ ? high_->bytes : 0;
         result.qtype            = qtype_;
         result.group_size       = static_cast<std::uint32_t>(geometry_.group);
@@ -300,14 +391,24 @@ public:
                                      static_cast<std::size_t>(destination_row) * high_row_bytes_,
                                      static_cast<std::size_t>(source_rows) * high_row_bytes_);
         }
-        failures += verify_plane(label + " scale", scales_,
+        failures += verify_plane(label + " scale", scale_plane(),
                                  source.payload.data() + source.scale_plane_offset,
-                                 static_cast<std::size_t>(destination_row) * scale_row_bytes_,
-                                 static_cast<std::size_t>(source_rows) * scale_row_bytes_);
+                                 scale_offset(destination_row), scale_bytes(source_rows));
         return failures;
     }
 
 private:
+    DeviceBuffer& scale_plane() { return geometry_.scales_follow_codes ? codes_ : scales_; }
+    const DeviceBuffer& scale_plane() const {
+        return geometry_.scales_follow_codes ? codes_ : scales_;
+    }
+    std::size_t scale_offset(std::int32_t row) const {
+        return scale_base_ + static_cast<std::size_t>(row / geometry_.rows_per_scale) * scale_row_bytes_;
+    }
+    std::size_t scale_bytes(std::int32_t rows) const {
+        return static_cast<std::size_t>(rows / geometry_.rows_per_scale) * scale_row_bytes_;
+    }
+
     static int verify_plane(const std::string& label, const DeviceBuffer& device,
                             const std::uint8_t* expected, std::size_t offset, std::size_t bytes) {
         std::vector<std::uint8_t> actual(bytes);
@@ -325,6 +426,8 @@ private:
     std::size_t code_row_bytes_;
     std::size_t high_row_bytes_;
     std::size_t scale_row_bytes_;
+    std::size_t scale_plane_bytes_;
+    std::size_t scale_base_;
     DeviceBuffer codes_;
     std::unique_ptr<DeviceBuffer> high_;
     DeviceBuffer scales_;
@@ -820,10 +923,14 @@ public:
                                                         kExpertGateRows, kHidden,
                                                         {up_scale, gate_scale}),
                                              kHidden)
+                : profile.routed_gate_up == QType::FP8_E4M3FN_BLK128_F32S
+                    ? pack_fp8_block(gate_up_source, kExpertGateRows, kHidden)
                     : quantized_weight::pack_row_split_lowbit(gate_up_source, kExpertGateRows,
                                                               kHidden, profile.routed_gate_up);
             auto down = profile.routed_down == QType::NVFP4
                             ? pack_nvfp4(down_source, kHidden, kIntermediate, {down_scale})
+                        : profile.routed_down == QType::FP8_E4M3FN_BLK128_F32S
+                            ? pack_fp8_block(down_source, kHidden, kIntermediate)
                             : quantized_weight::pack_row_split_lowbit(
                                   down_source, kHidden, kIntermediate, profile.routed_down);
             routed_gate_.copy_rows(gate_up, expert * kExpertGateRows);

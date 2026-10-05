@@ -207,7 +207,8 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
             "sparse_moe: block-FP8 routed experts need both gate/up and down in block FP8");
     }
     if (fp8_routed) {
-        // Hopper's grouped GEMM is the only kernel these experts have, at every width.
+        // Narrow rounds read the codes on the decode and small-T kernels, but any round can be
+        // wide, and the wide ones have only Hopper's grouped GEMM.
         if (!detail::fp8_moe_sm90::available()) {
             throw std::invalid_argument(
                 "sparse_moe: block-FP8 routed experts run on Hopper only (an H100 or H200 with a "
@@ -498,19 +499,15 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
     }
-    // Block-FP8 experts have no decode or small-T kernel: the prefill family runs them from a
-    // single token up, so only its workspace is asked for.
-    if (detail::sparse_moe_routed_fp8_profile(routed_gate_up, routed_down)) {
-        return detail::sparse_moe_prefill_workspace_bytes(geometry, max_tokens, false, false, true) +
-               (native_shared ? native_shared_capacity(geometry, min_tokens, max_tokens) : 0);
-    }
     (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
     const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
     // The NVFP4 routed profile has no kernel of ours at any width: the prefill family carries it
     // from a single token upwards, with the vendored runner computing the routed half.
     const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    const bool fp8_profile   = detail::sparse_moe_routed_fp8_profile(routed_gate_up, routed_down);
     const std::int32_t prefill_first =
         nvfp4_profile ? trtllm_min_tokens()
+        : fp8_profile ? detail::sparse_moe_fp8_prefill_min()
         : w8_profile  ? detail::kSparseMoePrefillW8W8Min
                       : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
                                                           : detail::kSparseMoePrefillQ4Q6Min);
@@ -545,7 +542,8 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
         required = std::max(required,
                             detail::sparse_moe_prefill_workspace_bytes(
                                 geometry, max_tokens, nvfp4_profile,
-                                detail::sparse_moe_routed_int8_profile(routed_gate_up, routed_down)));
+                                detail::sparse_moe_routed_int8_profile(routed_gate_up, routed_down),
+                                fp8_profile));
     }
     return required + (native_shared ? native_shared_capacity(geometry, min_tokens, max_tokens) : 0);
 }
@@ -614,7 +612,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         throw std::invalid_argument("sparse_moe: adapters on native shared experts are not supported");
     }
     if (fp8_routed && adapters) {
-        // Adapted rounds run on the decode kernels, which have no block-FP8 codec.
+        // Adapted rounds run on the decode kernels at every width; nothing has measured them
+        // against block-FP8 experts, whose wide rounds would leave the grouped GEMM.
         throw std::invalid_argument("sparse_moe: adapters on block-FP8 routed experts are not supported");
     }
     if (adapters && tokens > resolve_tokens) {
@@ -649,7 +648,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                   : detail::sparse_moe_uses_prefill(tokens, gate_up, down));
     const bool use_small_t =
         !adapters && !use_prefill && resolve_tokens >= 3 && (detail::sparse_moe_uses_small_t(tokens) ||
-                         ((nvfp4_routed || ggml_k_routed) && tokens > 1));
+                         ((nvfp4_routed || ggml_k_routed || fp8_routed) && tokens > 1));
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,
