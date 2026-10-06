@@ -4031,12 +4031,14 @@ replies differ slightly between concurrent requests, whose rounds differ in widt
 
 ## 107
 
-**Hopper decode at three to sixteen tokens (2026-10-06, after #106).** After #106, Qwen3-8B-FP8 on
-one H100 decoded 153-158 tok/s a stream at three and four users against vLLM's 207: those rounds ran
-the GEMV, whose work grows with its columns, or quantised their activations for the narrow CUTLASS
-tile, whose grid has no K split. Everything below is engine-wide unless it says otherwise.
+**Hopper decode at two to sixteen tokens, and admission between bursts (2026-10-06, after #106).**
+After #106, Qwen3-8B-FP8 on one H100 decoded 153-158 tok/s a stream at three and four users against
+vLLM's 207: those rounds ran the GEMV, whose work grows with its columns, or quantised their
+activations for the narrow CUTLASS tile, whose grid has no K split. Two users decoded 181 a stream
+(vLLM 222) and waited 53 ms for a first token (vLLM 27). Everything below is
+engine-wide unless it says otherwise.
 
-- **A tensor-core kernel for narrow rounds** (`fp8_block.cu`, `mma_kernel`). Three to sixteen tokens
+- **A tensor-core kernel for narrow rounds** (`fp8_block.cu`, `mma_kernel`). Two to sixteen tokens
   now take a kernel that turns each E4M3 code into a BF16 in registers (exactly: every E4M3 value is
   one) and runs m16n8k16 MMAs against the BF16 activations as they are, so nothing quantises them
   first and a round's error is the GEMV's, not the quantised tile's (sampled against a double
@@ -4048,11 +4050,29 @@ tile, whose grid has no K split. Everything below is engine-wide unless it says 
   waves, else the split whose last wave idles fewer SMs (occupancy from the runtime). At four tokens
   over an 8B model's q/k/v, o, gate/up and down on an H100 (us): 11.5 / 8.6 / 37.8 / 21.1, against
   the GEMV's 14.4 / 11.1 / 48.7 / 28.6 and the tile's 18.2 / 17.7 / 43.0 / 42.7 with its quantise;
-  flat from three to eight tokens, 5-10 % slower at sixteen. In the engine at four users the four
-  projections of a layer take 82 us against 122. One and two tokens keep the GEMV (34.0 against
-  37.5 us at 24576 x 4096). Either scale cell, chained row ranges and residual accumulation are
+  flat from one to eight tokens, 5-10 % slower at sixteen. In the engine at four users the four
+  projections of a layer take 82 us against 122. Alone the GEMV reads one and two tokens faster
+  (34.0 against 37.5 us at 24576 x 4096), but inside a decode round its kernels ran slower than
+  alone (two tokens: 26.1 us on average over the 8B's four shapes against 18.5; one token: 21.5
+  against 17.9; the SM clock held 1,980 MHz, so the cause is not yet known) while the tensor-core
+  kernel ran within 5 % of its own. Two tokens therefore take the tensor cores (Qwen3-8B-FP8: 212
+  tok/s a stream at two users against 184; Qwen3.6-27B-FP8: 75 against 74); one token stays on the
+  GEMV, where the trade depends on the shapes (the 8B decodes 217 on the tensor cores against 210,
+  the 27B 78 against 80). Either scale cell, chained row ranges and residual accumulation are
   covered. On by default on sm_90 only, where it was measured (other GPUs keep their routes);
-  `SUROGATE_SERVE_FP8_BLOCK_MMA=0` turns it off, `=1` on, on any GPU.
+  `SUROGATE_SERVE_FP8_BLOCK_MMA=0` turns it off, `=1` on, on any GPU, and
+  `SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=N` (0 to 4) keeps rounds up to N tokens on the GEMV.
+- **Single rounds while a lane is free** (`runtime/engine/concurrent_executor.h`). Round chaining
+  (#32) ran eight decode rounds a burst whenever no request waited, and admission waits for a burst
+  to end. A closed-loop client's next turn arrives just after the burst that finished its last turn
+  began, so it waited out nearly the whole burst. A free lane now takes single rounds whether or
+  not a request waits yet; full lanes keep the eight-round burst (`SUROGATE_SERVE_BURST_CAP`), and
+  `SUROGATE_SERVE_FREE_LANE_BURST` sets the free-lane length. Qwen3-8B-FP8: TTFT p50 52 -> 19 ms at
+  two users, 30 -> 19-20 ms at three to sixteen, 36 -> 27 ms at 64, with the same decode tok/s in
+  total (each stream's share of the round time moves from waiting to decoding, so a stream's decode
+  rate dips 1-2 % from three users up); one stream decodes as fast (210 tok/s; Qwen3-0.6B 690 ->
+  685, Qwen3.5-0.8B 565 -> 563). The host's per-round work overlaps the GPU, which is why bursts no
+  longer pay for themselves at these widths.
 - **The decode GEMV past one token** (`gemv_kernel`, every GPU). Each code was converted once per
   (row, token) pair and each activation once per row. They are now converted once a row and once a
   chunk (shared by the CTA's rows), with the same sums in the same order: on an H100 four tokens take
@@ -4063,21 +4083,24 @@ tile, whose grid has no K split. Everything below is engine-wide unless it says 
   after the row's reduction and its barriers, a second memory round trip; they now go with x's.
   Bit-identical; the 4096-wide CTA kernel at four users 3.7 -> 2.5 us (73 launches a round).
 
-Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream with
-the tensor-core kernel (and with it off on the same VM): 1 user 210 (210), 2 users 184 (184), 3 users
-209 (158), 4 users 204 (158), 8 users 184 (174), 16 users 157 (154), 64 users 78 (78); 32 users with
-2,048-token prompts 50.7k prompt tok/s, TTFT 682 ms. vLLM 0.31 on another Nebius H100 the same day
-(where our build without the kernel measured within 2 % of the off column): 230, 222, -, 208, -, 156,
-89; 53.8k, 230 ms. What remains: two-token rounds, which take longer than three-token ones (5.4
-against 4.8 ms) and so trail vLLM by 17 %; one stream (9 %); 64 users (13 %); and TTFT under long
-prompts.
+Qwen3-8B-FP8 against vLLM 0.31 (DeepGEMM linears, BF16 KV both) on the same Nebius H100, 512-token
+prompts and 128 new tokens, decode tok/s a stream and TTFT p50: 1 user 210 / 229 (13 / 24 ms), 2
+users 212 / 222 (19 / 26), 3 users 206 / 215 (19 / 25), 4 users 201 / 211 (19 / 23), 8 users 181 /
+194 (20 / 23), 16 users 155 / 169 (20 / 31), 64 users 78 / 94 (27 / 44); 32 users with 2,048-token
+prompts 51.0k / 53.9k prompt tok/s, TTFT 679 / 257 ms. vLLM varies between VMs (16 users 156 on
+another H100 the same day, where our build measured 153-157), ours within 2 %. Qwen3.6-27B-FP8 (no
+MTP), ours alone: 1 user 80 tok/s a stream (TTFT 41 ms), 2 users 75 (59 ms; 74 and 86 ms before), 4
+users 72 (59 ms; 72 and 149 ms before). What remains: 64 users (83 % of vLLM's decode), one to
+sixteen users (92-96 %), and TTFT under long prompts, where prompts wait behind running streams by
+design.
 
 Tests. `sinfer_linear_fp8_block_test` runs three times: by default, with the tensor-core kernel off
 (`sinfer_linear_fp8_block_mma0_test`) and forced on (`..._mma1_test`, the route other GPUs can
-opt into). New cases: 6, 7, 9, 12, 13 and 16 tokens (one and two 8-token groups, block and
-per-channel cells, row ranges, K over four and eight warps), four tokens at 96+ row blocks, a chain
-whose ranges are each under 96 blocks while the parent is not, and the fused SwiGLU pair at a 12288
-output. On one Nebius H100 the 47 RoPE, linear, SwiGLU, projection, attention, MLP, norm, SiLU and
-batch-invariance tests pass (five NVFP4 tests skip). End to end, greedy through the CLI and eight
-concurrent chat requests through the server pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B,
-Qwen3.5-0.8B and Gemma 4 E4B (one-stream CLI decode 216, 81, 668, 570 and 103 tok/s).
+opt into). New cases: 2, 6, 7, 9, 12, 13 and 16 tokens (one and two 8-token groups, block and
+per-channel cells, row ranges, K over four and eight warps), four tokens at 96+ row blocks, a
+two-token chain, a chain whose ranges are each under 96 blocks while the parent is not, and the
+fused SwiGLU pair at a 12288 output. On one Nebius H100 the 47 RoPE, linear, SwiGLU, projection,
+attention, MLP, norm, SiLU and batch-invariance tests pass (five NVFP4 tests skip). End to end,
+greedy through the CLI and eight concurrent chat requests through the server pass for
+Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B (one-stream CLI decode
+217, 81, 673, 573 and 104 tok/s).

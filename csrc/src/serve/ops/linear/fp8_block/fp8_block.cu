@@ -326,7 +326,7 @@ void launch_gemv(const std::uint8_t* codes, const float* scales, const __nv_bflo
 }
 
 // ---- narrow rounds: tensor cores on exact BF16 activations ----
-// Three to sixteen tokens (Hopper; see mma_enabled): each code becomes a BF16 in registers
+// Two to sixteen tokens (Hopper; see mma_enabled): each code becomes a BF16 in registers
 // (exactly: every E4M3 value is one) and m16n8k16 MMAs take the products against the BF16
 // activations as they are, so a round's error is the GEMV's, not the quantised tile's (on an
 // H100, sampled against a double reference: 1.5e-3, the BF16 output's own rounding, against the
@@ -340,7 +340,7 @@ void launch_gemv(const std::uint8_t* codes, const float* scales, const __nv_bflo
 // tokens over the q/k/v, o, gate/up and down shapes of an 8B model on an H100 (us): 11.5 / 8.6 /
 // 37.8 / 21.1, against the GEMV's 14.4 / 11.1 / 48.7 / 28.6 and the narrow CUTLASS tile's 18.2 /
 // 17.7 / 43.0 / 42.7 with its quantise (its grid has no K split, so a 4096-row weight gets 32
-// CTAs); flat from three to eight tokens, 5-10 % slower at sixteen.
+// CTAs); flat from one to eight tokens, 5-10 % slower at sixteen.
 constexpr int kMmaMaxTokens = 16;
 constexpr int kMmaRows      = 16;
 constexpr int kMmaUnroll    = 2;
@@ -706,8 +706,9 @@ int device_cc() noexcept {
     return cc;
 }
 
-// The tensor-core narrow kernel takes the rounds past the GEMV's widths up to kMmaMaxTokens: on
-// Hopper by default (measured there; elsewhere the engine's tile keeps them).
+// The tensor-core narrow kernel takes the rounds past the GEMV's always-widths up to
+// kMmaMaxTokens: on Hopper by default (measured there; elsewhere the GEMV and the engine's tile
+// keep them).
 // SUROGATE_SERVE_FP8_BLOCK_MMA=0 turns it off, =1 on, on any GPU.
 bool mma_enabled() noexcept {
     static const int forced = [] {
@@ -718,17 +719,21 @@ bool mma_enabled() noexcept {
     return forced >= 0 ? forced == 1 : device_cc() == 90;
 }
 
-// Rounds up to this many tokens run the GEMV on every weight: two where the narrow kernel takes
-// the next widths (one and two tokens read each code fewer times on the GEMV: 34.0 against
-// 37.5 us at 24576 x 4096 on an H100), three on Hopper without it, four elsewhere and whenever
-// SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=4 keeps every round to four tokens on it.
+// Rounds up to this many tokens run the GEMV on every weight: one where the narrow kernel takes
+// the next widths, three on Hopper without it, four elsewhere; SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS
+// =N (0 to 4) sets it. Alone on an H100 the GEMV reads one and two tokens faster (34.0 against
+// 37.5 us at 24576 x 4096), but in a decode round its two-token kernel ran 41 % slower than alone
+// while the narrow kernel ran within 5 % of its own: Qwen3-8B-FP8 decodes 212 tok/s a stream with
+// two users against 184 on the GEMV, Qwen3.6-27B-FP8 75 against 74. One token stays: the 27B
+// decodes 80 tok/s on the GEMV against 78 (the 8B 210 against 217).
 int gemv_always_tokens() noexcept {
-    static const bool all_four = [] {
+    static const int forced = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS");
-        return raw != nullptr && std::string_view(raw) == "4";
+        if (raw == nullptr || raw[0] < '0' || raw[0] > '0' + kGemvMaxTokens || raw[1] != '\0') { return -1; }
+        return raw[0] - '0';
     }();
-    if (all_four) { return kGemvMaxTokens; }
-    if (mma_enabled()) { return 2; }
+    if (forced >= 0) { return forced; }
+    if (mma_enabled()) { return 1; }
     return sm90_gemm_available() ? 3 : kGemvMaxTokens;
 }
 
