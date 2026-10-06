@@ -3950,3 +3950,81 @@ codes and multipliers bit-exact (fused q|k|v and gate|up in recipe order), LFM2 
 attention and MLP projections, Gemma 3 its seven separate projections; a per-channel Qwen3 export
 converts to W8 within 1 % of the stored values. The Qwen3.5 MoE FP8 tests run against the moved
 module unchanged.
+
+## 106
+
+**Hopper decode at width and the FP8 GEMV (2026-10-06, after #105).** With FP8 checkpoints on every
+dense family, Qwen3-8B-FP8 against vLLM 0.31 on one H100 still trailed at every width: one stream
+157 tok/s (vLLM 227), 64 users 3,363 (5,690), 2,048-token prompts 40.4k (55.7k). vLLM runs these
+linears through DeepGEMM. Everything below is engine-wide unless it says otherwise.
+
+- **FA3 decode and verify rows** (`ops/wrapper/gqa_attention.cpp`, `gqa_fa3*.cu`). Rows over a BF16
+  cache take FlashAttention-3 on sm_90, split over the keys and merged by FA3's own combine kernel
+  (`flash_fwd_combine_*`, vendored from flash-attention 3451a2a); the split-KV kernels kept them
+  before. An e4m3 cache keeps the split-KV kernels: FA3's FP8 kernel also rounds the probabilities
+  to e4m3 for P.V, which over a long history loses most of it. `SUROGATE_SERVE_GQA_FA3_ROWS=0`
+  turns the rows off; `--batch-invariant` keeps them off. The workspace plan books the largest of
+  the routes a width can take plus FA3's row metadata.
+- **Five tiles for Hopper's block-FP8 GEMM** (`fp8_block_sm90_gemm{,_mid,_wide}.cu`). vLLM's kernel
+  carried two (a swapped 128x16 ping-pong to 64 tokens, else 128x128). The picker now takes the
+  swapped 128x16 tile to 32 tokens, swapped cooperative 128x32 or 128x64 to 128, and cooperative
+  128x128 or 256x128 (cluster 1x2) above, by the persistent grid's wave count; past 128 tokens the
+  64-token tile stays a candidate, each tile costing its waves times 10 : 14 : 26 for 64, 128 and
+  256 tokens, so narrow outputs (o, down) keep SMs busy: 20-25 % faster at 160-256 tokens on an
+  8B/27B probe. `SUROGATE_SERVE_FP8_BLOCK_SM90_TILES=0` restores vLLM's pair.
+- **Fused FP8 projections** (`fp8_block.cu`, `linear_projections`). Consecutive row ranges of one
+  block-FP8 parent (q/k/v, q/k/gate/v, qkv/z) run as one launch: the GEMV and the tile kernel write
+  each range to its own output; Hopper's CUTLASS kernel writes one packed plane, so up to 128
+  tokens it runs once into a staging plane and a split kernel scatters the ranges. A block-FP8
+  gate/up parent runs as one GEMM.
+- **Fused SwiGLU into the down projection's quantise** (`linear_swiglu_down_add`, FP8 arm). Past the
+  GEMV widths silu(gate) * up is formed, rounded to BF16 and quantised per token per 128 in one
+  kernel, so the BF16 [I, T] activation is never written; codes and scales are bit-identical to
+  silu_mul followed by the quantiser. Qwen3, Llama, LFM2 and dense Qwen3.5 take it (their MLPs call
+  `swiglu_mlp_down_add`); Gemma 3 and 4 (GeGLU, separate gate and up) do not yet. The FP8 MoE already
+  fused its gate. `SUROGATE_SERVE_FP8_BLOCK_FUSED_SWIGLU=0` vetoes it.
+- **RoPE for the generic shapes** (`ops/kernel/rope.cuh`). A CTA per token walked every head; a
+  decode round of one token ran on one SM. The kernel is now a warp per head, eight heads a CTA,
+  grid (tokens, heads / 8), values loaded before the angles are formed and stored as bf16x2 where
+  aligned: 6.7 -> 2.6 us per Qwen3-8B decode layer. Every model whose geometry has no tuned RoPE
+  kernel takes it.
+- **The decode GEMV** (`gemv_kernel`, every GPU). It kept a warp per row and divided by the scale
+  cell's runtime size on every load. A CTA of two warps now takes two rows and splits their K
+  (each warp every other 512-code chunk, two chunks in flight, partials summed in warp order), and
+  the block cell's indices are shifts (a per-channel weight has its own instantiation): one token
+  over the q/k/v, o, gate/up and down shapes of 8B and 27B models takes 24 % less time on an H100
+  (gate/up 24576 x 4096: 47.1 -> 34.2 us, 2.9 TB/s), two tokens 13 % less.
+- **Three and four tokens on Hopper** (`gemv_serves`). The GEMV's sums grow with its columns while
+  the narrow CUTLASS tile reads the weight once for up to 16 tokens. On an H100 the GEMV stays the
+  faster at two tokens on every shape, at three below 64 row blocks of 128 and at four below 40,
+  so the o and down projections of 8B to 27B models keep it while q/k/v and gate/up take the tile
+  (gate/up 24576 x 4096 at four tokens: 76.7 us on the GEMV, 45.4 quantised on the tile). Those
+  rounds now quantise their activations per token per 128, as every wider round does; a parent's
+  ranges run apart follow the parent's route, so their bits stay the whole linear's.
+  `SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=4` keeps every round to four tokens on the GEMV; other
+  GPUs and per-channel weights keep it to four as before.
+- **Probed and dropped.** CUTLASS's stream-K scheduler for the 33-128-token tiles: slower on most
+  shapes, faster only for down-shaped ones (k >= 3n), and not bit-identical once it splits K.
+
+Qwen3-8B-FP8 against vLLM 0.31 (DeepGEMM linears; BF16 KV both), one Nebius H100, the same VM and
+client for both: one stream 208 tok/s (vLLM 221), four users 602 (800), 16 users 2,298 (2,432), 64
+users 4,922 (5,590), 32 users with 2,048-token prompts 50.7k prompt tok/s (53.5k). On the same VM,
+`SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=4` gives four users 486 and every other row within 1 %. On one
+Modal H100 before the GEMV rewrite and the three-and-four-token route, the same client measured one
+stream 186 (vLLM 218), 16 users 2,259 (2,464), 64 users 4,397 (5,642), 2,048-token prompts 48.9k
+(52.2k); Modal served an earlier run on an H200 when asked for an H100, so its harness now pins the
+H100. What remains: decode at three and four tokens a round (153 tok/s a stream against vLLM's 207),
+and TTFT while 32 users send 2,048-token prompts (682 ms against 264), where prefill throughput is
+within 5 %, so the difference is in how prompts are admitted, not in compute.
+
+Tests. `sinfer_linear_fp8_block_test`: the fused SwiGLU route against the unfused pair bit for bit
+(eager and from a graph, five widths, a clamped case) and declined at GEMV widths; chained
+projections across the tiles' widths, including a 48-block parent at four tokens whose ranges run
+apart and follow its tile route; three- and four-token rounds on tall, short and per-channel weights
+against the reference their route implies (quantised activations on the tile, BF16 on the GEMV).
+`sinfer_gqa_attention_test`: decode rows over BF16 caches through FA3 with the plan's high-water. On
+one H100 (Modal, then Nebius) the 38 RoPE, linear, SwiGLU, projection, attention and MLP tests pass
+(five NVFP4 tests skip). End to end on a Nebius H100, greedy through the CLI and eight concurrent
+chat requests through the server pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and
+Gemma 4 E4B (one-stream CLI decode 217, 81, 661, 556 and 101 tok/s); as in #101, the 0.6B and the FP8
+replies differ slightly between concurrent requests, whose rounds differ in width.
