@@ -3856,4 +3856,17 @@ cache prefills as fast as a BF16 one (38.3k against 38.6k prompt tok/s, 32 users
 prompts) and decodes 2-7 % slower (263 against 283 tok/s for one stream, 2,506 against 2,563 for
 64), so `auto` stays BF16 on Hopper; `fp8` halves the cache when capacity is what is short.
 
-Not done: sliding windows (Gemma), head dims other than 256.
+**Every head dim FA3 has, windows, any query group (2026-10-06).** The route above served head dim 256
+without a window, i.e. Qwen3.5/3.6 only. FA3 now runs at head dims 64, 128 and 256 (TinyLlama and
+LFM2; Qwen3, Qwen3-MoE and Llama 3; Qwen3.5/3.6 and Gemma's sliding layers), BF16 or e4m3, causal or
+under a sliding window through FA3's local mask (`window_size_left = window - 1`, which is the
+engine's `i - j < window`): twelve instantiations, one translation unit each
+(`gqa_fa3_hdim{64,128,256}_{bf16,e4m3}{,_local}.cu` over `gqa_fa3_launch_impl.cuh`). Gemma 4's
+512-wide global layers stay on the tiles; FA3 has no such head. Shapes whose query group has no tuned
+kernels (Qwen3-8B's 32 query heads over 8, Llama 3 8B's) ran their prompts through the generic
+one-warp-per-query kernel; they now take FA3 like any other shape, and the workspace plan books its
+scratch for them. Qwen3-8B on one H100, one 2,048-token prompt: 9.35 s to the first token before,
+0.23 s after with #104's MLP route (attention was 70 % of the 9.35 s, the MLP 28 %); Gemma 4 E4B (head dim 256, windows of 512), 32 users with 2,048-token prompts: 12.2k
+prompt tok/s against 11.5k with FA3 off. Tests: FP8 wide prompts at head dims 128 and 64, under
+windows of 512 and 128, and for Qwen3-8B's shape (FA3 2.9-3.7 % relative L2 against the BF16-query
+oracle, the tiles about 0.2 %); BF16 wide prompts of three unregistered shapes.

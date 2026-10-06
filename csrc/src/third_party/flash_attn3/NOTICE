@@ -6,7 +6,8 @@ fetches (v4.6.1).
 What is here, and why: FlashAttention-3's sm90 forward kernel (wgmma, TMA for Q/O, warp
 specialisation, intra-warpgroup softmax overlap) and the varlen scheduler's prepare kernel, so the
 serving engine's prompt attention on H100/H200 runs the kernel vLLM runs there
-(`src/serve/ops/gqa_sm90/gqa_fa3.cu` instantiates exactly one configuration). Only the forward
+(`src/serve/ops/gqa_sm90/gqa_fa3_hdim*.cu` instantiate one configuration per head dim, 64, 128
+and 256, cache dtype, BF16 or e4m3, and mask, causal or a causal sliding window). Only the forward
 headers are taken; the Python/PyTorch API (`flash_api.cpp`), the backward, the split-KV combine
 and the generated instantiation files are not.
 

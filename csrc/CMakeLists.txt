@@ -1067,8 +1067,9 @@ target_compile_options(sinfer_fp8_block_sm90 PRIVATE
 target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # FlashAttention-3's Hopper forward (src/third_party/flash_attn3, BSD-3-Clause; NOTICE there),
-# the prompt attention vLLM runs on H100/H200: head dim 256 over the paged cache, one
-# instantiation per cache dtype (BF16, and e4m3 as vLLM runs it for an FP8 cache). sm_90a-only like the archive above (wgmma, setmaxnreg), whole-program, and a build
+# the prompt attention vLLM runs on H100/H200: head dims 64, 128 and 256 over the paged cache,
+# causal or windowed, one translation unit per head dim, cache dtype (BF16, and e4m3 as vLLM runs
+# it for an FP8 cache) and mask so they compile in parallel. sm_90a-only like the archive above (wgmma, setmaxnreg), whole-program, and a build
 # without 90a links a stub that declines every prompt. FA3's own flags: fast math, the extended
 # wgmma shapes it instantiates, no device asserts. Hidden visibility keeps FA3's global symbols
 # (Flash_fwd_params, prepare_varlen_num_blocks) out of libsinfer's exports, where another FA3 in
@@ -1076,7 +1077,18 @@ target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUD
 if(SINFER_FP8_BLOCK_SM90_REAL)
   add_library(sinfer_gqa_sm90 STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3.cu
-    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_bf16.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_bf16_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_e4m3_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_e4m3_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_bf16.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_bf16_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_e4m3_local.cu
     ${SUROGATE_VENDOR_DIR}/flash_attn3/flash_prepare_scheduler.cu)
   target_include_directories(sinfer_gqa_sm90 PRIVATE
     ${SUROGATE_VENDOR_DIR}/flash_attn3

@@ -63,7 +63,7 @@ struct Geometry {
     const char* name;
     std::int32_t q_heads;
     std::int32_t kv_heads;
-    /// Every case below is a 256-wide head. It is a member because the head dimension is part
+    /// Most cases below are 256-wide heads. It is a member because the head dimension is part
     /// of a registered shape rather than derivable from its head counts -- two models attend
     /// with 32 query heads over 4 KV heads at different widths.
     std::int32_t head_dim = kHeadDim;
@@ -97,6 +97,9 @@ constexpr Geometry kGeometries[] = {
     // wider than 256, which the prompt kernel serves with a 16-key tile.
     {"glm5_3_flash_absorbed", 64, 1, 512},
     {"minicpm5", 16, 2, 128},
+    // The other 128- and 64-wide heads FlashAttention-3 serves on Hopper (the wide prompts below).
+    {"qwen3_30b_a3b", 32, 4, 128},
+    {"tinyllama_1_1b", 32, 4, 64},
 };
 
 struct AttentionCase {
@@ -1388,10 +1391,11 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 
-        // Wide prompts over scattered pages: on an H100 these take FlashAttention-3 (BF16,
-        // 256-wide heads, 32 columns and up), whose 128-row query tiles and 80-key tiles straddle
-        // the 64-slot pages; elsewhere they are more prompt-tile coverage.
-        if (geometry.head_dim == 256) {
+        // Wide prompts over scattered pages: on an H100 these take FlashAttention-3 (BF16, heads
+        // 64, 128 or 256 wide, 32 columns and up), whose 128- and 192-row query tiles and 80- to
+        // 128-key tiles straddle the 64-slot pages; elsewhere they are more prompt-tile coverage.
+        // The window cases below are FA3's local mask there.
+        if (geometry.head_dim <= 256) {
             failures += run_a1_case(geometry, dtype, {130, 200, 400, 701u}, MappingPattern::Fragmented);
             failures += run_a3_case(geometry, dtype, {130, 200, 400, 702u}, MappingPattern::Fragmented);
             failures += run_a1_case(geometry, dtype, {32, 1000, 1100, 703u}, MappingPattern::Offset);
@@ -2073,11 +2077,18 @@ int verify_fp8_wide_prompts() {
         int history;
         int tokens;
         std::uint32_t seed;
+        int window = 0;
     };
     const Case cases[] = {
         {Geometry{"qwen3.6-35b-a3b", 16, 2}, 200, 130, 811u},
         {Geometry{"qwen3.6-27b", 24, 4}, 1000, 200, 812u},
         {Geometry{"qwen", 8, 2}, 1000, 32, 813u},
+        {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 1000, 200, 814u},
+        {Geometry{"tinyllama-1.1b", 32, 4, 64}, 200, 130, 815u},
+        {Geometry{"gemma3-4b", 8, 4}, 1000, 200, 816u, 512},
+        {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 200, 300, 817u, 128},
+        // No tuned kernels for this query group: FA3 on an H100, the generic kernel otherwise.
+        {Geometry{"qwen3-8b", 32, 8, 128}, 1000, 200, 818u},
     };
     constexpr int pages = 64;
     constexpr float scale = 1.0F / 16.0F;
@@ -2139,12 +2150,13 @@ int verify_fp8_wide_prompts() {
         std::vector<double> reference(q.numel());
         std::vector<double> scores(keys);
         for (int col = 0; col < c.tokens; ++col) {
-            const int last = c.history + col;
+            const int last  = c.history + col;
+            const int first = c.window > 0 ? std::max(0, last - c.window + 1) : 0;
             for (int h = 0; h < heads; ++h) {
                 const int g = h / group;
                 const float* query = q_values.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
                 double peak = -std::numeric_limits<double>::infinity();
-                for (int t = 0; t <= last; ++t) {
+                for (int t = first; t <= last; ++t) {
                     const double* key = kd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
                     double dot = 0;
                     for (int d = 0; d < dim; ++d) { dot += query[d] * key[d]; }
@@ -2152,9 +2164,9 @@ int verify_fp8_wide_prompts() {
                     peak      = std::max(peak, scores[t]);
                 }
                 double total = 0;
-                for (int t = 0; t <= last; ++t) { total += scores[t] = std::exp(scores[t] - peak); }
+                for (int t = first; t <= last; ++t) { total += scores[t] = std::exp(scores[t] - peak); }
                 double* row = reference.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
-                for (int t = 0; t <= last; ++t) {
+                for (int t = first; t <= last; ++t) {
                     const double* value = vd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
                     const double weight = scores[t] / total;
                     for (int d = 0; d < dim; ++d) { row[d] += weight * value[d]; }
@@ -2163,7 +2175,7 @@ int verify_fp8_wide_prompts() {
         }
 
         Tensor query_pos = positions.slice(0, c.history, c.tokens);
-        const ops::GqaExecutionEnvelope envelope{1, pages * kPagedKVPageSize, 0};
+        const ops::GqaExecutionEnvelope envelope{1, pages * kPagedKVPageSize, c.window};
         for (const bool invariant : {false, true}) {
             ops::set_batch_invariant(invariant);
             Tensor out = arena.alloc(DType::BF16, {dim, heads, c.tokens});
@@ -2175,6 +2187,7 @@ int verify_fp8_wide_prompts() {
             const bool flash = !invariant && major == 9;
             const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
                                       " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +
+                                      " window=" + std::to_string(c.window) +
                                       (flash ? " flash-attention-3" : " tiles");
             failures += verify_attention(label, bf16_bits_to_double(from_device<std::uint16_t>(out.data, out.numel())),
                                          reference, flash ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
@@ -2215,6 +2228,18 @@ int main() {
         if (geometry.head_dim >= 128) {
             failures += run_batch_case(geometry, DType::I8,
                 {3, {61, 127}, {3, 2}, {1, 0}, MappingPattern::Fragmented, 2201U});
+        }
+    }
+    // Wide prompts of shapes with no tuned kernels: FlashAttention-3 on an H100 (it serves any
+    // query group), the generic kernel elsewhere. Qwen3-8B is 32 query heads over 8 at 128.
+    for (const Geometry geometry : {Geometry{"qwen3_8b", 32, 8, 128},
+                                    Geometry{"fallback_16q8_d64", 16, 8, 64},
+                                    Geometry{"fallback_12q4_d256", 12, 4, 256}}) {
+        for (const AttentionCase& test_case :
+             {AttentionCase{130, 200, 400, 2300U}, AttentionCase{200, 0, 256, 2301U, 64},
+              AttentionCase{66, 63, 129, 2302U, 32}}) {
+            failures += run_a1_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
         }
     }
     for (const Geometry geometry : {Geometry{"gemma3_image",8,4,256}, Geometry{"gemma4_image",8,1,256}}) {

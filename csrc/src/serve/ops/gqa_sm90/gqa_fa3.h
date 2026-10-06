@@ -12,8 +12,8 @@
 // `q_lengths[s]` of those positions (causal, bottom-right aligned, as in a prefill). All four
 // arrays live in device memory, so a launch is graph-capture safe.
 //
-// Built for one shape family, head dim 256, any query group, no window, no softcap, over either
-// cache dtype. Over a BF16 cache it runs in BF16. Over an e4m3 cache it runs FA3's FP8 kernel the
+// Built for one shape family: head dim 64, 128 or 256, any query group, causal or a causal sliding
+// window, no softcap, over either cache dtype (gqa_fa3_launch.h; one instantiation each). Over a BF16 cache it runs in BF16. Over an e4m3 cache it runs FA3's FP8 kernel the
 // way vLLM does for `--kv-cache-dtype fp8`: the queries are cast to e4m3 at scale 1 (saturating,
 // like the cache's own keys), both products run on FP8 wgmma, and the output is BF16. The cache
 // carries no scales, so every descale is 1. Everything here is sm_90a-specific; builds without
@@ -26,9 +26,8 @@
 
 namespace sinfer::ops::detail::gqa_fa3 {
 
-inline constexpr std::int32_t kHeadDim = 256;
-
 struct PagedPrefill {
+    std::int32_t head_dim = 0;          ///< 64, 128 or 256 (supports)
     const void* q = nullptr;            ///< BF16 [total_q][q_heads][head_dim]
     void* out     = nullptr;            ///< BF16, the same shape as q
     /// [physical_pages][kv_heads][64][head_dim], BF16, or e4m3 with `fp8_cache`.
@@ -52,6 +51,9 @@ struct PagedPrefill {
     const std::int32_t* kv_lengths = nullptr;  ///< device I32 [segments]
     const std::int32_t* kv_rows    = nullptr;  ///< device I32 [segments]
     float scale = 0.0f;
+    /// A causal sliding window in keys, 0 for none: a query at absolute position i sees keys j
+    /// with `i - j < sliding_window` (FA3's local mask with `window_size_left = sliding_window - 1`).
+    std::int32_t sliding_window = 0;
 };
 
 /// True when this build carries the sm_90a kernel, the current device is an sm_90 part and
@@ -71,14 +73,14 @@ struct PagedPrefill {
 /// Scratch `run` needs: the per-row log-sum-exp FA3 always writes, its scheduler's metadata
 /// (four per-segment vectors and a tile counter) and, over an e4m3 cache, the queries' e4m3
 /// codes, each 256-byte aligned. Plain arithmetic, so workspace planning can call it in any build.
-[[nodiscard]] inline std::size_t workspace_bytes(std::int32_t q_heads, std::int32_t total_q,
-                                                 std::int32_t segments,
+[[nodiscard]] inline std::size_t workspace_bytes(std::int32_t head_dim, std::int32_t q_heads,
+                                                 std::int32_t total_q, std::int32_t segments,
                                                  bool fp8_cache = false) noexcept {
     const auto align = [](std::size_t bytes) { return (bytes + 255) / 256 * 256; };
     const std::size_t rounded = (static_cast<std::size_t>(segments) + 3) / 4 * 4;
     const std::size_t rows    = static_cast<std::size_t>(q_heads) * total_q;
     return align(rows * sizeof(float)) + align((rounded * 4 + 1) * sizeof(std::int32_t)) +
-           (fp8_cache ? align(rows * kHeadDim) : 0);
+           (fp8_cache ? align(rows * static_cast<std::size_t>(head_dim)) : 0);
 }
 
 /// Device I32 scratch the segment arrays take, in elements: offsets (segments + 1), lengths,

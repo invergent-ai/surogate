@@ -407,19 +407,20 @@ PromptTileWorkspace allocate_prompt_tile_workspace(Allocator& workspace, int dim
 }
 
 // FlashAttention-3 (ops/gqa_sm90) takes a prompt segment on Hopper when it is wide enough that
-// FA3's 128-row tiles beat the split-KV tiles below, over a BF16 or e4m3 cache with no window
-// (over e4m3 it runs FA3's FP8 kernel on e4m3 queries, as vLLM does). At an 8K
-// history on an H100, FA3 took 0.18 ms for 32 and for 64 columns (one CTA per 128 packed rows walks
-// every key); the tiles' ~22 TFLOP/s puts them near 0.2 and 0.4 ms. It asks the current device,
-// so workspace planning, like the launch, runs with the serving device current.
+// FA3's 128-row tiles beat the split-KV tiles below, at head dim 64, 128 or 256 over a BF16 or
+// e4m3 cache, causal or under a sliding window (FA3's local mask), as vLLM runs it (over e4m3,
+// FA3's FP8 kernel on e4m3 queries). At an 8K history on an H100 (head dim 256), FA3 took 0.18 ms
+// for 32 and for 64 columns (one CTA per 128 packed rows walks every key); the tiles' ~22 TFLOP/s
+// puts them near 0.2 and 0.4 ms. It asks the current device, so workspace planning, like the
+// launch, runs with the serving device current.
 //
 // FA3's arithmetic is not the decode kernels': a query's bits would then depend on whether it was
 // decoded, verified or prefilled with others. --batch-invariant (api/ops/batch_invariant.h) keeps
 // every width on the split-KV kernels, whose fixed key partitions make them width-invariant.
 bool fa3_takes_prompt(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
-                      DType cache_dtype, std::int32_t width, std::int32_t sliding_window) {
+                      DType cache_dtype, std::int32_t width) {
     return !batch_invariant() &&
-           (cache_dtype == DType::BF16 || cache_dtype == DType::FP8_E4M3FN) && sliding_window == 0 &&
+           (cache_dtype == DType::BF16 || cache_dtype == DType::FP8_E4M3FN) &&
            width >= detail::gqa_fa3::min_columns() &&
            detail::gqa_fa3::supports(head_dim, q_heads, kv_heads) &&
            detail::gqa_fa3::available();
@@ -431,19 +432,21 @@ struct Fa3PromptWorkspace {
 };
 
 template <typename Allocator>
-Fa3PromptWorkspace allocate_fa3_prompt_workspace(Allocator& workspace, std::int32_t q_heads,
-                                                 std::int32_t tokens, std::int32_t segments,
-                                                 DType cache_dtype) {
+Fa3PromptWorkspace allocate_fa3_prompt_workspace(Allocator& workspace, std::int32_t head_dim,
+                                                 std::int32_t q_heads, std::int32_t tokens,
+                                                 std::int32_t segments, DType cache_dtype) {
     Tensor metadata = workspace.alloc(DType::I32, {detail::gqa_fa3::metadata_ints(segments)});
     return {metadata, workspace.alloc_bytes(detail::gqa_fa3::workspace_bytes(
-                          q_heads, tokens, segments, cache_dtype == DType::FP8_E4M3FN))};
+                          head_dim, q_heads, tokens, segments, cache_dtype == DType::FP8_E4M3FN))};
 }
 
 detail::gqa_fa3::PagedPrefill fa3_launch(const Tensor& q, const PagedKVBatchLayerView& cache,
-                                         float scale, Tensor& out, std::int32_t segments,
-                                         std::int32_t max_q, const Tensor& metadata) {
+                                         float scale, std::int32_t sliding_window, Tensor& out,
+                                         std::int32_t segments, std::int32_t max_q,
+                                         const Tensor& metadata) {
     auto* m = static_cast<std::int32_t*>(metadata.data);
     detail::gqa_fa3::PagedPrefill args;
+    args.head_dim       = q.ne[0];
     args.q              = q.data;
     args.out            = out.data;
     args.k_pages        = cache.k_pages.data;
@@ -464,6 +467,7 @@ detail::gqa_fa3::PagedPrefill fa3_launch(const Tensor& q, const PagedKVBatchLaye
     args.kv_lengths = m + 2 * segments + 1;
     args.kv_rows    = m + 3 * segments + 1;
     args.scale      = scale;
+    args.sliding_window = sliding_window;
     return args;
 }
 
@@ -471,17 +475,29 @@ detail::gqa_fa3::PagedPrefill fa3_launch(const Tensor& q, const PagedKVBatchLaye
 // lengths are derived on the stream from the device positions, so a captured prefill graph
 // replays with new ones.
 void launch_fa3_prompt(const Tensor& q, const Tensor& positions, const Tensor& parent_row,
-                       float scale, const PagedKVBatchLayerView& cache, WorkspaceArena& workspace,
-                       Tensor& out, cudaStream_t stream) {
+                       float scale, std::int32_t sliding_window, const PagedKVBatchLayerView& cache,
+                       WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     auto scope              = workspace.scope();
     const std::int32_t tokens = q.ne[2];
-    auto [metadata, scratch] = allocate_fa3_prompt_workspace(workspace, q.ne[1], tokens, 1,
-                                                             cache.dtype);
+    auto [metadata, scratch] = allocate_fa3_prompt_workspace(workspace, q.ne[0], q.ne[1], tokens,
+                                                             1, cache.dtype);
     detail::gqa_fa3::prompt_metadata(static_cast<const std::int32_t*>(positions.data), tokens,
                                      static_cast<const std::int32_t*>(parent_row.data),
                                      static_cast<std::int32_t*>(metadata.data), stream);
-    detail::gqa_fa3::run(fa3_launch(q, cache, scale, out, 1, tokens, metadata), scratch.data,
-                         scratch.bytes, stream);
+    detail::gqa_fa3::run(fa3_launch(q, cache, scale, sliding_window, out, 1, tokens, metadata),
+                         scratch.data, scratch.bytes, stream);
+}
+
+// A geometry with a registered head dim and KV count but no tuned kernels of its own (its query
+// count unregistered, as Qwen3-8B's 32 over 8) runs every prompt through the generic kernel, which
+// on an H100 took 3.6 ms per layer for a 2,048-token Qwen3-8B prompt. FA3 serves any query group,
+// so on Hopper such a prompt takes it under the same conditions as a registered one
+// (fa3_takes_prompt): one sequence, every column live, no image block or QSA selection.
+bool fa3_takes_generic_prompt(const Tensor& q, const Tensor& valid_columns,
+                              const PagedKVBatchLayerView& cache, const GqaBlockMask& selection) {
+    return !selection.image_end && !selection.words && q.ne[3] == 1 &&
+           valid_columns.data == nullptr &&
+           fa3_takes_prompt(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, q.ne[2]);
 }
 
 void launch_cached_prompt_tiles(const Tensor& q, const Tensor& positions,
@@ -490,9 +506,9 @@ void launch_cached_prompt_tiles(const Tensor& q, const Tensor& positions,
                                  GqaExecutionEnvelope envelope, WorkspaceArena& workspace,
                                  Tensor& out, cudaStream_t stream) {
     if (parent_valid.data == nullptr &&
-        fa3_takes_prompt(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, q.ne[2],
-                         envelope.sliding_window)) {
-        launch_fa3_prompt(q, positions, parent_row, scale, cache, workspace, out, stream);
+        fa3_takes_prompt(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, q.ne[2])) {
+        launch_fa3_prompt(q, positions, parent_row, scale, envelope.sliding_window, cache,
+                          workspace, out, stream);
         return;
     }
     // Public prompt invocations have one sequence; only the private launcher sees the
@@ -644,7 +660,14 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
 
-    if (!optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype)) { return 0; }
+    if (!optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype)) {
+        // The generic kernel needs none; FA3 (fa3_takes_generic_prompt) needs its scratch, which
+        // grows with the width.
+        if (!fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype, max_width)) { return 0; }
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_fa3_prompt_workspace(layout, head_dim, q_heads, max_width, 1, cache_dtype);
+        return layout.peak_bytes(1);
+    }
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
@@ -675,10 +698,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
             detail::gqa_attention_resolve_route(q_heads, kv_heads, width, batch_size, envelope);
         if (route == detail::GqaAttentionRoute::Prompt) {
             if (cache_dtype == DType::I8) { return std::size_t{0}; }
-            if (batch_size == 1 && fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype,
-                                                    width, envelope.sliding_window)) {
+            if (batch_size == 1 &&
+                fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype, width)) {
                 WorkspaceLayoutBuilder layout;
-                (void)allocate_fa3_prompt_workspace(layout, q_heads, width, 1, cache_dtype);
+                (void)allocate_fa3_prompt_workspace(layout, head_dim, q_heads, width, 1, cache_dtype);
                 return layout.peak_bytes(1);
             }
             return exact_prompt_capacity(width);
@@ -752,6 +775,13 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(v, op, "v");
 
     if (selection.image_end || !optimized_decode_shape(head_dim, q.ne[1], kv_heads, cache.dtype)) {
+        if (fa3_takes_generic_prompt(q, valid_columns, cache, selection)) {
+            detail::gqa_kv_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                               stream);
+            launch_fa3_prompt(q, positions, kv_table_rows, scale, envelope.sliding_window, cache,
+                              workspace, out, stream);
+            return;
+        }
         detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                             scale, cache, out, stream, envelope.sliding_window,
                                             selection);
@@ -828,6 +858,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
     require_registered_shape(q.ne[0], q.ne[1], cache.num_kv_heads, op);
 
     if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {
+        if (fa3_takes_generic_prompt(q, valid_columns, cache, selection)) {
+            launch_fa3_prompt(q, positions, kv_table_rows, scale, envelope.sliding_window, cache,
+                              workspace, out, stream);
+            return;
+        }
         detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows,
                                                    scale, cache, out, stream,
                                                    envelope.sliding_window, selection);
@@ -870,8 +905,20 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         static_cast<std::uint32_t>(selection.image_end) > envelope.max_visible_keys ||
         (selection.image_end && q.ne[3] != 1)) { throw std::invalid_argument("invalid image attention block"); }
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
+    const PagedKVBatchLayerView batch_cache{
+        .k_pages = cache.k_pages, .v_pages = cache.v_pages,
+        .k_scale_pages = cache.k_scale_pages, .v_scale_pages = cache.v_scale_pages,
+        .indexer_pages = cache.indexer_pages, .block_tables = cache.block_table,
+        .head_dim = cache.head_dim, .num_kv_heads = cache.num_kv_heads,
+        .dtype = cache.dtype, .quant_group = cache.quant_group,
+    };
 
     if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {
+        if (fa3_takes_generic_prompt(q, Tensor{}, batch_cache, selection)) {
+            launch_fa3_prompt(q, positions, Tensor{}, scale, envelope.sliding_window, batch_cache,
+                              workspace, out, stream);
+            return;
+        }
         detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
                                                       envelope.sliding_window, selection);
         return;
@@ -896,13 +943,6 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         return;
     }
     if (cache.dtype != DType::I8 && !selection.words) {
-        const PagedKVBatchLayerView batch_cache{
-            .k_pages = cache.k_pages, .v_pages = cache.v_pages,
-            .k_scale_pages = cache.k_scale_pages, .v_scale_pages = cache.v_scale_pages,
-            .indexer_pages = cache.indexer_pages, .block_tables = cache.block_table,
-            .head_dim = cache.head_dim, .num_kv_heads = cache.num_kv_heads,
-            .dtype = cache.dtype, .quant_group = cache.quant_group,
-        };
         launch_cached_prompt_tiles(q, positions, {}, {}, scale, batch_cache,
                                      envelope, workspace, out, stream);
         return;
@@ -1000,15 +1040,14 @@ void gqa_attention_packed_prompts(const Tensor& q, const Tensor& k, const Tensor
     std::vector<const GqaPackedSegment*> tiled;
     std::vector<const GqaPackedSegment*> flash;
     for (const GqaPackedSegment& segment : segments) {
-        const bool fa3 = fa3_takes_prompt(head_dim, q_heads, kv_heads, cache.dtype, segment.width,
-                                          segment.envelope.sliding_window);
+        const bool fa3 = fa3_takes_prompt(head_dim, q_heads, kv_heads, cache.dtype, segment.width);
         (fa3 ? flash : tiled).push_back(&segment);
     }
     if (!flash.empty()) {
         // The arena is planned for one prompt of the round's width through FA3 (or its far larger
         // tiles); a round of many segments needs a few KiB more for their metadata.
         WorkspaceLayoutBuilder layout;
-        (void)allocate_fa3_prompt_workspace(layout, q_heads, columns,
+        (void)allocate_fa3_prompt_workspace(layout, head_dim, q_heads, columns,
                                             static_cast<std::int32_t>(flash.size()), cache.dtype);
         if (workspace.capacity() - workspace.used() < layout.peak_bytes(1) + 256) {
             tiled.insert(tiled.end(), flash.begin(), flash.end());
@@ -1028,13 +1067,13 @@ void gqa_attention_packed_prompts(const Tensor& q, const Tensor& k, const Tensor
         }
         metadata[n] = columns;
         auto [device_metadata, scratch] =
-            allocate_fa3_prompt_workspace(workspace, q_heads, columns, n, cache.dtype);
+            allocate_fa3_prompt_workspace(workspace, head_dim, q_heads, columns, n, cache.dtype);
         auto* m = static_cast<std::int32_t*>(device_metadata.data);
         CUDA_CHECK(cudaMemcpyAsync(m, metadata.data(), metadata.size() * sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, stream));
         detail::gqa_fa3::segment_kv_lengths(static_cast<const std::int32_t*>(positions.data), m,
                                             m + n + 1, n, m + 2 * n + 1, stream);
-        detail::gqa_fa3::run(fa3_launch(q, cache, scale, out, n, max_q, device_metadata),
+        detail::gqa_fa3::run(fa3_launch(q, cache, scale, window, out, n, max_q, device_metadata),
                              scratch.data, scratch.bytes, stream);
     }
 

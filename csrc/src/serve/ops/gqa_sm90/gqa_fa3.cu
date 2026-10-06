@@ -1,7 +1,7 @@
 // sinfer::ops - FlashAttention-3's sm90 forward over the paged KV cache (see gqa_fa3.h).
 #include "ops/gqa_sm90/gqa_fa3.h"
 
-#include "flash_fwd_launch_template.h"
+#include "ops/gqa_sm90/gqa_fa3_launch.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -15,15 +15,9 @@
 namespace sinfer::ops::detail::gqa_fa3 {
 namespace {
 
-using Element = cutlass::bfloat16_t;
-
 constexpr std::int32_t kPageSize = 64;
 constexpr std::size_t kAlign     = 256;
-
-// The BF16 instantiation: head dim 256, causal, varlen, paged without TMA (a 64-slot page is not
-// a multiple of the 80-key tile, the condition under which FA3 itself takes this path), the query
-// group packed into the M tile, no split. gqa_fa3_e4m3.cu holds the same over e4m3.
-constexpr int kArch = 90;
+constexpr int kArch              = 90;
 
 struct Hardware {
     int device   = -1;
@@ -99,6 +93,14 @@ __global__ void quantize_query_kernel(const uint4* __restrict__ q, uint2* __rest
                           static_cast<std::uint32_t>(out[2]) | static_cast<std::uint32_t>(out[3]) << 16);
 }
 
+template <int HeadDim>
+void dispatch(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream) {
+    if (fp8) {
+        return local ? launch<HeadDim, true, true>(p, stream) : launch<HeadDim, true, false>(p, stream);
+    }
+    return local ? launch<HeadDim, false, true>(p, stream) : launch<HeadDim, false, false>(p, stream);
+}
+
 void check_launch(const char* what) {
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -108,13 +110,11 @@ void check_launch(const char* what) {
 
 } // namespace
 
-// gqa_fa3_e4m3.cu: the FP8 instantiation, its own translation unit so the two compile in parallel.
-void launch_e4m3(Flash_fwd_params& params, cudaStream_t stream);
-
 bool available() noexcept { return hardware().cc == 90 && enabled_by_env(); }
 
 bool supports(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads) noexcept {
-    return head_dim == kHeadDim && kv_heads > 0 && q_heads > 0 && q_heads % kv_heads == 0;
+    return (head_dim == 64 || head_dim == 128 || head_dim == 256) && kv_heads > 0 && q_heads > 0 &&
+           q_heads % kv_heads == 0;
 }
 
 std::int32_t min_columns() noexcept {
@@ -149,20 +149,23 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     if (!available()) {
         throw std::runtime_error("gqa_fa3: needs an sm_90 device and a build with 90a");
     }
-    if (!supports(kHeadDim, a.q_heads, a.kv_heads)) {
+    if (!supports(a.head_dim, a.q_heads, a.kv_heads)) {
         throw std::invalid_argument("gqa_fa3: unsupported head geometry");
     }
     if (a.segments <= 0 || a.total_q <= 0 || a.max_q <= 0 || a.max_q > a.total_q ||
         a.logical_pages <= 0 || a.table_rows <= 0 || a.physical_pages <= 0 || a.q == nullptr ||
         a.out == nullptr || a.k_pages == nullptr || a.v_pages == nullptr ||
         a.block_tables == nullptr || a.q_offsets == nullptr || a.q_lengths == nullptr ||
-        a.kv_lengths == nullptr || a.kv_rows == nullptr || !(a.scale > 0.0f)) {
+        a.kv_lengths == nullptr || a.kv_rows == nullptr || !(a.scale > 0.0f) ||
+        a.sliding_window < 0) {
         throw std::invalid_argument("gqa_fa3: invalid launch");
     }
-    if (workspace_capacity < workspace_bytes(a.q_heads, a.total_q, a.segments, a.fp8_cache)) {
+    if (workspace_capacity <
+        workspace_bytes(a.head_dim, a.q_heads, a.total_q, a.segments, a.fp8_cache)) {
         throw std::invalid_argument("gqa_fa3: workspace smaller than workspace_bytes()");
     }
 
+    const std::int64_t dim = a.head_dim;
     const std::size_t rows = static_cast<std::size_t>(a.q_heads) * a.total_q;
     const std::int32_t b_rounded = rounded_segments(a.segments);
     auto* lse       = static_cast<float*>(workspace);
@@ -171,7 +174,7 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     if (a.fp8_cache) {
         void* codes = static_cast<char*>(workspace) + align_up(rows * sizeof(float)) +
                       align_up((static_cast<std::size_t>(b_rounded) * 4 + 1) * sizeof(std::int32_t));
-        const std::size_t groups = rows * kHeadDim / 8;
+        const std::size_t groups = rows * static_cast<std::size_t>(dim) / 8;
         quantize_query_kernel<<<static_cast<unsigned>((groups + 255) / 256), 256, 0, stream>>>(
             static_cast<const uint4*>(a.q), static_cast<uint2*>(codes), groups);
         check_launch("query quantize");
@@ -187,15 +190,15 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.v_ptr   = const_cast<void*>(a.v_pages);
     p.o_ptr   = a.out;
     // Strides in elements. Varlen queries carry no batch stride; the cache's "batch" is the page.
-    p.q_row_stride   = static_cast<std::int64_t>(a.q_heads) * kHeadDim;
-    p.q_head_stride  = kHeadDim;
+    p.q_row_stride   = a.q_heads * dim;
+    p.q_head_stride  = dim;
     p.o_row_stride   = p.q_row_stride;
-    p.o_head_stride  = kHeadDim;
-    p.k_row_stride   = kHeadDim;
-    p.v_row_stride   = kHeadDim;
-    p.k_head_stride  = static_cast<std::int64_t>(kPageSize) * kHeadDim;
+    p.o_head_stride  = dim;
+    p.k_row_stride   = dim;
+    p.v_row_stride   = dim;
+    p.k_head_stride  = kPageSize * dim;
     p.v_head_stride  = p.k_head_stride;
-    p.k_batch_stride = static_cast<std::int64_t>(a.kv_heads) * kPageSize * kHeadDim;
+    p.k_batch_stride = a.kv_heads * kPageSize * dim;
     p.v_batch_stride = p.k_batch_stride;
     p.v_dim_stride   = 1;
     p.softmax_lse_ptr = lse;
@@ -204,10 +207,10 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.b_k        = a.table_rows;
     p.h          = a.q_heads;
     p.h_k        = a.kv_heads;
-    p.d          = kHeadDim;
-    p.d_rounded  = kHeadDim;
-    p.dv         = kHeadDim;
-    p.dv_rounded = kHeadDim;
+    p.d          = a.head_dim;
+    p.d_rounded  = a.head_dim;
+    p.dv         = a.head_dim;
+    p.dv_rounded = a.head_dim;
     p.seqlen_q   = a.max_q;
     p.total_q    = a.total_q;
     p.seqlen_k   = a.logical_pages * kPageSize;
@@ -226,15 +229,16 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.num_pages    = a.physical_pages;
     p.pagedkv_tma  = false;
 
-    p.is_causal         = true;
-    p.is_local          = false;
-    p.window_size_left  = -1;
+    const bool local    = a.sliding_window > 0;
+    p.is_causal         = !local;
+    p.is_local          = local;
+    p.window_size_left  = local ? a.sliding_window - 1 : -1;
     p.window_size_right = 0;
     p.num_splits        = 1;
     p.pack_gqa          = true;
 
-    p.varlen_sort_batches   = true;  // !is_local: the scheduler's Sort
-    p.head_swizzle          = true;  // causal: the scheduler's LPT order
+    p.varlen_sort_batches   = !local;  // as FA3's API sets the scheduler's Sort and LPT order
+    p.head_swizzle          = true;
     p.num_splits_dynamic_ptr = scheduler;
     p.num_m_blocks_ptr       = scheduler + b_rounded;
     p.varlen_batch_idx_ptr   = scheduler + b_rounded * 2;
@@ -249,14 +253,11 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.num_sm = hardware().sm_count;
     // q/k/v descale pointers stay null: 1.0, the cache's (absent) scale.
 
-    if (a.fp8_cache) {
-        launch_e4m3(p, stream);
-        return;
+    switch (a.head_dim) {
+    case 64:  return dispatch<64>(p, a.fp8_cache, local, stream);
+    case 128: return dispatch<128>(p, a.fp8_cache, local, stream);
+    default:  return dispatch<256>(p, a.fp8_cache, local, stream);
     }
-    run_flash_fwd<kArch, kHeadDim, kHeadDim, 1, Element, Element, /*Is_causal=*/true,
-                  /*Is_local=*/false, /*Has_softcap=*/false, /*Varlen=*/true,
-                  /*PagedKVNonTMA=*/true, /*AppendKV=*/false, /*HasQv=*/false,
-                  /*PackGQA=*/true, /*Split=*/false, /*V_colmajor=*/false>(p, stream);
 }
 
 } // namespace sinfer::ops::detail::gqa_fa3
