@@ -122,7 +122,10 @@ void Variant::attention_projection(const Tensor& hidden,
         family::apply_lora(split.value, family::kValuePort, hidden, value, stream);
         return;
     }
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
+    // The workspace is sized by attention_projection_workspace_capacity_bytes(); a block-FP8
+    // parent stages its quantized activation there, since nothing may allocate inside a capture.
+    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value,
+                         ops::LinearPolicy::A16Only, workspace, stream);
     family::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
     family::apply_lora(weights.query_key_gate_value, family::kAttentionGatePort, hidden, gate, stream);
 }
@@ -175,7 +178,8 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
         family::apply_lora_gdn_input(weights, hidden, qkv, output_gate_flat, stream);
         return;
     }
-    ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, stream);
+    ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat,
+                        ops::LinearPolicy::A16Only, workspace, stream);
     family::apply_lora_gdn_input(weights, hidden, qkv, output_gate_flat, stream);
 }
 

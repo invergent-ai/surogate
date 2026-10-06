@@ -13,6 +13,7 @@
 #include "api/family/frontend.h"
 
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <cassert>
 #include <atomic>
@@ -73,6 +74,7 @@ public:
         }
         slots_.resize(max_concurrency_);
         lane_plan_versions_.resize(max_concurrency_);
+        lane_released_at_.resize(max_concurrency_);
         cancellation_snapshot_.resize(max_concurrency_);
         ops_context_ = options.ops_context;
         // A thread's CUDA device is its own. Everything this engine owns was allocated on the
@@ -841,6 +843,7 @@ private:
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
+        lane_released_at_[lane] = ++lane_release_clock_;
         invalidate_lane_plans(lane);
     }
 
@@ -1088,10 +1091,26 @@ private:
         request->lane_plan_versions[lane] = version;
     }
 
+    /// Among free lanes that reuse equally much of a request, the one whose loss costs least:
+    /// a lane holding no retained prefix first, then the retained prefix released longest
+    /// ago. Picking the lowest index instead handed a new conversation the lane another
+    /// agent's conversation was retained on between its turns, and that agent's next turn
+    /// then prefilled its whole context again.
+    [[nodiscard]] bool cheaper_lane_to_take(std::uint32_t lane, std::uint32_t than) const {
+        const bool lane_retained = instance_.program->has_retained_lane(lane);
+        const bool than_retained = instance_.program->has_retained_lane(than);
+        if (lane_retained != than_retained) { return !lane_retained; }
+        return lane_released_at_[lane] < lane_released_at_[than];
+    }
+
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
+        const auto better = [&](std::uint32_t lane, std::uint32_t reuse) {
+            return !selected || reuse > selected_reuse ||
+                   (reuse == selected_reuse && cheaper_lane_to_take(lane, selected->lane));
+        };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
@@ -1099,8 +1118,7 @@ private:
             if (!instance_.request_memory.can_activate_lane(lane, plan.summary().transient_bytes,
                                                            plan.summary().transient_alignment)) { continue; }
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+            if (instance_.program->can_admit_lane(lane, plan) && better(lane, reuse)) {
                 selected       = LaneChoice{.lane = lane};
                 selected_reuse = reuse;
             }
@@ -1115,7 +1133,7 @@ private:
                                                            plan.summary().transient_alignment)) { continue; }
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+                better(lane, reuse)) {
                 selected = LaneChoice{
                     .lane           = lane,
                     .evict_retained = true,
@@ -1159,10 +1177,18 @@ private:
         }
         if (choice.evict_retained) {
             bool evicted = false;
-            for (std::uint32_t retained_lane = 0;
-                 retained_lane < max_concurrency_ &&
+            // Oldest-released retained prefixes go first.
+            std::vector<std::uint32_t> eviction_order(max_concurrency_);
+            std::iota(eviction_order.begin(), eviction_order.end(), 0U);
+            std::stable_sort(eviction_order.begin(), eviction_order.end(),
+                             [&](std::uint32_t a, std::uint32_t b) {
+                                 return lane_released_at_[a] < lane_released_at_[b];
+                             });
+            for (std::size_t order = 0;
+                 order < eviction_order.size() &&
                  !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
-                 ++retained_lane) {
+                 ++order) {
+                const std::uint32_t retained_lane = eviction_order[order];
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
                     instance_.program->evict_retained_lane(retained_lane);
@@ -2520,6 +2546,10 @@ private:
     };
     PrefillLaneSet prefill_lanes_;
     std::vector<std::uint64_t> lane_plan_versions_;
+    /// When each lane last finished a request (a counter, not a time): the eviction order
+    /// among retained lanes that a new request would reuse equally little of.
+    std::vector<std::uint64_t> lane_released_at_;
+    std::uint64_t lane_release_clock_ = 0;
     std::vector<std::uint8_t> cancellation_snapshot_;
     std::uint32_t next_decode_lane_ = 0;
     std::optional<AdmissionProtection> protection_;

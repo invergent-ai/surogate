@@ -38,24 +38,42 @@ __device__ __forceinline__ std::size_t act_scale_index(int token, int block, int
                     : static_cast<std::size_t>(token) * kblocks + block;
 }
 
-__global__ void quantize_blocks_kernel(const __nv_bfloat16* __restrict__ x, int k, int tokens,
-                                       std::uint8_t* __restrict__ codes,
-                                       float* __restrict__ scales, bool kb_major) {
-    const int token  = static_cast<int>(blockIdx.y);
-    const int block  = static_cast<int>(blockIdx.x);
-    const int i      = block * kBlock + static_cast<int>(threadIdx.x);
-    const float v    = __bfloat162float(x[static_cast<std::size_t>(token) * k + i]);
-    float amax       = fabsf(v);
-    __shared__ float partial[kBlock / 32];
+// A warp per (token, 128-block): four values a lane in one 8-byte load, the block's absolute max
+// by shuffles, four codes in one 4-byte store. The arithmetic is per element and unchanged from a
+// thread per value, so the codes and scales are too; the old shape (a 128-thread CTA per block,
+// scalar loads) ran a 2,048 x 5,120 activation at a quarter of the memory bandwidth.
+constexpr int kQuantizeWarps = 8;
+
+__global__ __launch_bounds__(kQuantizeWarps * 32) void quantize_blocks_kernel(
+        const __nv_bfloat16* __restrict__ x, int k, int tokens, std::uint8_t* __restrict__ codes,
+        float* __restrict__ scales, bool kb_major) {
+    const int kblocks = k / kBlock;
+    const long long item = static_cast<long long>(blockIdx.x) * kQuantizeWarps + (threadIdx.x >> 5);
+    if (item >= static_cast<long long>(tokens) * kblocks) { return; }
+    const int lane  = static_cast<int>(threadIdx.x & 31);
+    const int token = static_cast<int>(item / kblocks);
+    const int block = static_cast<int>(item % kblocks);
+    const std::size_t at = static_cast<std::size_t>(token) * k + block * kBlock + lane * 4;
+    const uint2 packed = *reinterpret_cast<const uint2*>(x + at);
+    const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
+    const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
+    float amax = fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(hi.x), fabsf(hi.y)));
     for (int o = 16; o > 0; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o)); }
-    if ((threadIdx.x & 31) == 0) { partial[threadIdx.x >> 5] = amax; }
-    __syncthreads();
-    amax = fmaxf(fmaxf(partial[0], partial[1]), fmaxf(partial[2], partial[3]));
     const float scale   = amax > 0.0f ? amax / 448.0f : 1.0f;
     const float inverse = 1.0f / scale;
-    codes[static_cast<std::size_t>(token) * k + i] =
-        __nv_cvt_float_to_fp8(v * inverse, __NV_SATFINITE, __NV_E4M3);
-    if (threadIdx.x == 0) { scales[act_scale_index(token, block, tokens, k / kBlock, kb_major)] = scale; }
+    const auto c01 = __nv_cvt_float2_to_fp8x2(make_float2(lo.x * inverse, lo.y * inverse), __NV_SATFINITE, __NV_E4M3);
+    const auto c23 = __nv_cvt_float2_to_fp8x2(make_float2(hi.x * inverse, hi.y * inverse), __NV_SATFINITE, __NV_E4M3);
+    *reinterpret_cast<std::uint32_t*>(codes + at) =
+        static_cast<std::uint32_t>(c01) | static_cast<std::uint32_t>(c23) << 16;
+    if (lane == 0) { scales[act_scale_index(token, block, tokens, kblocks, kb_major)] = scale; }
+}
+
+void launch_quantize_blocks(const __nv_bfloat16* x, int k, int tokens, std::uint8_t* codes,
+                            float* scales, bool kb_major, cudaStream_t stream) {
+    const long long items = static_cast<long long>(tokens) * (k / kBlock);
+    const auto grid = static_cast<unsigned>((items + kQuantizeWarps - 1) / kQuantizeWarps);
+    quantize_blocks_kernel<<<grid, kQuantizeWarps * 32, 0, stream>>>(x, k, tokens, codes, scales, kb_major);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ---- decode: a warp per row on exact BF16 activations, the block scale per lane ----
@@ -321,9 +339,8 @@ void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t 
     // planes follow too (linear_projections asks the same question).
     const bool kb_major = sm90_gemm_available();
     if (prepared == nullptr) {
-        quantize_blocks_kernel<<<dim3(static_cast<unsigned>(kblocks), static_cast<unsigned>(tokens)), kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales, kb_major);
-        CUDA_CHECK(cudaGetLastError());
+        launch_quantize_blocks(static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales,
+                               kb_major, stream);
     }
     // Hopper: vLLM's wgmma kernel for the 128 x 128 block grid. A per-channel weight, or a launch
     // the kernel declines, takes the engine's own tile below on the same activation planes.
@@ -416,11 +433,10 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
         const auto bytes = workspace_bytes(k, tokens);
         prepared = workspace != nullptr ? static_cast<std::byte*>(workspace->alloc_bytes(bytes, kAlign).data)
                                          : static_cast<std::byte*>(ggml::scratch_for(bytes, stream));
-        quantize_blocks_kernel<<<dim3(k / kBlock, tokens), kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), k, tokens,
-            reinterpret_cast<std::uint8_t*>(prepared),
-            reinterpret_cast<float*>(prepared + codes_bytes(k, tokens)), sm90_gemm_available());
-        CUDA_CHECK(cudaGetLastError());
+        launch_quantize_blocks(static_cast<const __nv_bfloat16*>(x.data), k, tokens,
+                               reinterpret_cast<std::uint8_t*>(prepared),
+                               reinterpret_cast<float*>(prepared + codes_bytes(k, tokens)),
+                               sm90_gemm_available(), stream);
     }
     for (const auto& p : projections) {
         run(x, p.weight, std::max(0, p.row_begin), p.out.ne[0], p.out, false, workspace, stream,

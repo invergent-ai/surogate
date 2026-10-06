@@ -1039,17 +1039,19 @@ target_compile_options(sinfer_nvfp4_cutlass PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
 target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
-# Hopper's block-scaled FP8 GEMM: vLLM's CUTLASS 3.x wgmma/TMA kernel for fine-grained FP8
-# checkpoints. sm_90a-specific (wgmma and the 90a TMA paths load on exactly sm_90), so it is
+# Hopper's block-scaled FP8 GEMMs: vLLM's CUTLASS 3.x wgmma/TMA kernel for fine-grained FP8
+# checkpoints, and the ptr-array grouped GEMM the block-FP8 routed experts run on. sm_90a-specific (wgmma and the 90a TMA paths load on exactly sm_90), so it is
 # pinned to 90a like the FP4 archives are to 120a, whole-program for the same ptxas reason as
 # the CUTLASS archive above, and a build without 90a links a stub that declines every call.
 if("90a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "90a")
   set(SINFER_FP8_BLOCK_SM90_REAL ON)
   add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
-    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm.cu)
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm.cu
+    ${SERVE_ROOT}/ops/sparse_moe/fp8_sm90/fp8_moe_sm90.cu)
 else()
   add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
-    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_stub.cpp)
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_stub.cpp
+    ${SERVE_ROOT}/ops/sparse_moe/fp8_sm90/fp8_moe_sm90_stub.cpp)
 endif()
 sinfer_internal_includes(sinfer_fp8_block_sm90)
 target_include_directories(sinfer_fp8_block_sm90 PRIVATE
@@ -1063,6 +1065,51 @@ endif()
 target_compile_options(sinfer_fp8_block_sm90 PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
 target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
+# FlashAttention-3's Hopper forward (src/third_party/flash_attn3, BSD-3-Clause; NOTICE there),
+# the prompt attention vLLM runs on H100/H200: head dims 64, 128 and 256 over the paged cache,
+# causal or windowed, one translation unit per head dim, cache dtype (BF16, and e4m3 as vLLM runs
+# it for an FP8 cache) and mask so they compile in parallel. sm_90a-only like the archive above (wgmma, setmaxnreg), whole-program, and a build
+# without 90a links a stub that declines every prompt. FA3's own flags: fast math, the extended
+# wgmma shapes it instantiates, no device asserts. Hidden visibility keeps FA3's global symbols
+# (Flash_fwd_params, prepare_varlen_num_blocks) out of libsinfer's exports, where another FA3 in
+# the same process (vLLM's, PyTorch's) could interpose on them.
+if(SINFER_FP8_BLOCK_SM90_REAL)
+  add_library(sinfer_gqa_sm90 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_bf16.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_bf16_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_e4m3_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_e4m3_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_bf16.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_bf16_local.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_e4m3.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_e4m3_local.cu
+    ${SUROGATE_VENDOR_DIR}/flash_attn3/flash_prepare_scheduler.cu)
+  target_include_directories(sinfer_gqa_sm90 PRIVATE
+    ${SUROGATE_VENDOR_DIR}/flash_attn3
+    ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+  target_compile_definitions(sinfer_gqa_sm90 PRIVATE
+    CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED CUTLASS_ENABLE_GDC_FOR_SM90
+    CUTLASS_DEBUG_TRACE_LEVEL=0 NDEBUG)
+  target_compile_options(sinfer_gqa_sm90 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math;-Xcompiler=-fvisibility=hidden>)
+else()
+  add_library(sinfer_gqa_sm90 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_stub.cpp)
+endif()
+sinfer_internal_includes(sinfer_gqa_sm90)
+set_target_properties(sinfer_gqa_sm90 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+if(SINFER_FP8_BLOCK_SM90_REAL)
+  set_target_properties(sinfer_gqa_sm90 PROPERTIES CUDA_ARCHITECTURES 90a)
+endif()
+target_link_libraries(sinfer_gqa_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # TensorRT-LLM's CUTLASS fused-MoE runner, vendored from FlashInfer 0.6.16.post3
 # (src/third_party/trtllm_moe, Apache-2.0; NOTICE there records provenance). It is the kernel
@@ -1177,6 +1224,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
   ${SERVE_ROOT}/ops/launcher/swa.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_generic.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_prefill.cu
   ${SERVE_ROOT}/ops/launcher/kv_cache_append_prefix.cu
   ${SERVE_ROOT}/ops/launcher/l2norm.cu
@@ -1522,7 +1570,7 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # constructor, which then died with SIGILL on hosts without it (seen on one of Modal's H100
 # machines; four other serve tests that build a pool died the same way).
 sinfer_cuda_archive(sinfer_ops)
-target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_trtllm_moe CUDA::cublasLt)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
@@ -1666,7 +1714,7 @@ endif()
 set(SINFER_SHARED_ARCHIVES "")
 foreach(candidate IN ITEMS
     sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
-    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_trtllm_moe sinfer_media_decode
+    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
     sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
     sinfer_product_load_progress sinfer_product_cuda_visibility)
   if(TARGET ${candidate})

@@ -174,6 +174,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->prompt_logprobs = options.prompt_logprobs;
     base->top_logprobs = options.top_logprobs;
     base->allow_prefix_reuse = options.allow_prefix_reuse;
+    if (shared_prefix_slots != 0 && options.allow_prefix_reuse && prompt.identity.reusable &&
+        !prompt.has_media() && !base->target_only && !gpu_prefix_readout && options.prompt_logprobs < 0) {
+        base->page_hashes = shared_prefix_hashes(prompt, options.lora_slot);
+    }
     base->lora_slot                      = options.lora_slot;
     base->min_tokens                     = options.min_tokens;
     base->stop_barrier_count =
@@ -301,7 +305,22 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             auto cached = plan_request_for_sequence(lane, saved->state, prompt, base_plan, true);
             if (cached.summary().reusable_prompt_tokens > resident.summary().reusable_prompt_tokens) {
                 cached.impl_->archived = std::move(saved);
-                return cached;
+                resident = std::move(cached);
+            }
+        }
+        const auto& hashes = base_plan.impl_->page_hashes;
+        if (hashes && !shared_prefixes.empty()) {
+            if (auto entry = find_shared_prefix(prompt, *hashes, base_plan.impl_->lora_slot);
+                entry && entry->tokens > resident.summary().reusable_prompt_tokens) {
+                auto shared = plan_request_for_sequence(lane, entry->state, prompt, base_plan, true);
+                if (shared.impl_->reuse == ReusePath::AppendAtFrontier &&
+                    shared.impl_->reuse_base == entry->tokens) {
+                    // The fork borrows the prefix's whole pages; the request owns the rest.
+                    shared.impl_->summary.admission.main_kv_pages -=
+                        entry->tokens / static_cast<std::uint32_t>(kPagedKVPageSize);
+                    shared.impl_->shared_prefix = std::move(entry);
+                    return shared;
+                }
             }
         }
     }
@@ -339,6 +358,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->lora_slot                   = base.lora_slot;
     plan->min_tokens                  = base.min_tokens;
     plan->stop_barrier_count          = base.stop_barrier_count;
+    plan->page_hashes                 = base.page_hashes;
 
     // Even a target-only readout may contain images. Plan its transient memory and
     // vision work before returning, just as for a generating request.
@@ -438,6 +458,14 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
             plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
             plan->reuse_base = sequence.rewrite_checkpoint.frontier;
         }
+    }
+
+    // A fork's borrowed pages are shared and read-only: a reuse that would rewind into them
+    // starts over instead.
+    if (plan->reuse != ReusePath::FullReset && sequence.kv && plan->reuse_base > 0 &&
+        pages_for_tokens(plan->reuse_base) < sequence.kv->text.borrowed_pages()) {
+        plan->reuse      = ReusePath::FullReset;
+        plan->reuse_base = 0;
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {

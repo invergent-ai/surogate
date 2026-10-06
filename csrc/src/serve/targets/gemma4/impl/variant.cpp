@@ -9,6 +9,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/storage_workspace.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -246,16 +247,22 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
     // The larger of the two routes this artifact may carry: the profile's row-split format,
     // or the K-quants a GGUF served natively keeps. The layout is planned before the weights
     // are read, so it must hold either.
-    return std::max(
+    return std::max({
         attention_projection_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
-        attention_projection_workspace_bytes(geometry, QType::Q4_K, first, last));
+        attention_projection_workspace_bytes(geometry, QType::Q4_K, first, last),
+        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return attention_projection_workspace_bytes(geometry, type, first, last);
+        })});
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return std::max(
+    return std::max({
         attention_output_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
-        attention_output_workspace_bytes(geometry, QType::Q4_K, first, last));
+        attention_output_workspace_bytes(geometry, QType::Q4_K, first, last),
+        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return attention_output_workspace_bytes(geometry, type, first, last);
+        })});
 }
 
 // ---- Post-mixer (gated-GELU MLP, between the other two sandwich norms) ------
@@ -302,9 +309,12 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
-    return std::max(
+    return std::max({
         post_mixer_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
-        post_mixer_workspace_bytes(geometry, QType::Q4_K, first, last));
+        post_mixer_workspace_bytes(geometry, QType::Q4_K, first, last),
+        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return post_mixer_workspace_bytes(geometry, type, first, last);
+        })});
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

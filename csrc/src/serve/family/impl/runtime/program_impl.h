@@ -495,6 +495,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    // The shared-prefix cache cuts a capturing prompt at the prefix boundary, which a fixed
+    // batch-invariant cut schedule forbids; draft heads keep KV and state it does not copy.
+    if (speculative_backend == SpeculativeBackend::None && !pipeline_stage() && !ops::batch_invariant()) {
+        const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_SLOTS");
+        shared_prefix_slots = raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 4U;
+        shared_prefix_page_budget = decoder->text_kv.pool().capacity_pages() / 8;
+    }
 }
 
 bool ProgramImplCore::base_round_for(std::span<const std::uint32_t> lanes,
@@ -578,6 +585,9 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             reclaimable_backend += sequences[other].kv->backend->owned_entitlement();
         }
     }
+    // Evicting a retained lane drops the shared prefixes too. Their pages come back once no
+    // running request borrows them; if one does, the executor re-plans and retries.
+    reclaimable_text += shared_prefix_pages();
 
     // The retained lanes' entitlements go back before the new one is taken: the pool's test
     // with them folded into the pages being replaced (device gate included).
@@ -655,12 +665,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
-    if (request_plan.archived || request_plan.reuse == ReusePath::FullReset ||
+    if (request_plan.archived || request_plan.shared_prefix ||
+        request_plan.reuse == ReusePath::FullReset ||
         request_plan.reuse_base < sequence.execution_frontier ||
         is_rewrite_checkpoint_restore(request_plan.reuse)) {
         archive_sequence(sequence);
     }
     if (request_plan.device_prefix) { restore_gpu_prefix(sequence, request_plan); }
+    else if (request_plan.shared_prefix) { restore_shared_prefix(sequence, request_plan); }
     else if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
     sequence.target_only = request_plan.target_only;
     request.target_only = request_plan.target_only;
@@ -935,6 +947,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
+        staged.shared_restore = request_plan.shared_prefix != nullptr;
+        if (request_plan.page_hashes && shared_prefix_slots != 0 && !request_plan.target_only &&
+            !staged.vision_plan) {
+            plan_shared_prefix_capture(staged, *request_plan.page_hashes);
+        }
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
                 device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
@@ -959,7 +976,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             return runtime::PrefillStepResult{
                 .summary = runtime::BeginSummary{.prompt_tokens        = staged.prompt_tokens,
                                                  .reused_prompt_tokens = staged.base,
-                                                 .prefix_reuse_path    = staged.reuse},
+                                                 .prefix_reuse_path    = reported_reuse(staged)},
                 .processed_prompt_tokens = 0};
         }
         return advance_prefill(sequence, request);
@@ -1245,10 +1262,13 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 void ProgramImplCore::evict_archived_prefixes() noexcept {
     archived_prefixes.clear();
     prune_gpu_prefixes();
+    drop_shared_prefixes();
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     archived_prefixes.clear();
+    // Retained lanes go only when the pool is short; so do the shared prefixes' pages.
+    drop_shared_prefixes();
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
 }
@@ -1919,6 +1939,20 @@ void ProgramImplCore::prepare_graphs() {
                 prepare_representative(code_warm.min, 1);
                 device.synchronize();
             }
+            // A route that stages through the engine-slot scratch (a K-quant or block-FP8
+            // projection given no caller workspace: ops::detail::ggml::scratch_for) sizes it by
+            // the round's width, and a capture may not grow it. Warm the widest round so every
+            // capture below finds the scratch it needs already there.
+            if (ordinary_batch_limit > 1) {
+                prepare_representative(code_warm.min, ordinary_batch_limit);
+                device.synchronize();
+                schedule::ordinary_decode_batch(ordinary_state,
+                                                static_cast<std::int32_t>(ordinary_batch_limit),
+                                                {code_warm.min + 1, code_warm.max + 1}, nullptr);
+                device.synchronize();
+                prepare_representative(code_warm.min, 1);
+                device.synchronize();
+            }
         };
         warm_ordinary();
         warm_base_rounds(warm_ordinary);
@@ -2525,7 +2559,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     RequestControl::Prefill& staged = *request.prefill;
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse};
+                                        .prefix_reuse_path    = reported_reuse(staged)};
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
@@ -2705,6 +2739,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
+            if (staged.shared_capture && staged.cursor == *staged.shared_capture) {
+                capture_shared_prefix(sequence, staged);
+            }
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (!request.target_only && speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
@@ -3851,7 +3888,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             const std::uint32_t processed        = nominals[i];
             const runtime::BeginSummary summary{.prompt_tokens        = entry.prompt_tokens,
                                                 .reused_prompt_tokens = entry.base,
-                                                .prefix_reuse_path    = entry.reuse};
+                                                .prefix_reuse_path    = reported_reuse(entry)};
             score_prefill_hidden(lane_id, prefill_hidden.slice(1, column, processed), entry.cursor);
             if (flash) {
                 if (stage_holds_head()) {
@@ -3916,6 +3953,9 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                 CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data, hidden.data,
                     hidden.bytes(), cudaMemcpyDeviceToDevice, device.stream));
                 if (flash && stage_holds_head()) { dflash->save_rewrite_checkpoint(sequence.lane, device.stream); }
+            }
+            if (entry.shared_capture && entry.cursor == *entry.shared_capture) {
+                capture_shared_prefix(sequence, entry);
             }
             requests[lane_id].prefill->elapsed_seconds += seconds;
             column += processed;

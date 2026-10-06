@@ -133,12 +133,18 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
     // The larger of the two routes this artifact may carry: the profile's row-split format,
     // or the K-quants a GGUF served natively keeps. The layout is planned before the weights
     // are read, so it must hold either.
-    return std::max(
+    // An FP8 export's block-scaled codes are a third, read off the stored objects.
+    return std::max({
         ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile), geometry.hidden,
                                                  geometry.query_size(), kTextPolicy, first, last),
         ops::linear_add_workspace_capacity_bytes(QType::Q4_K, geometry.hidden,
                                                  geometry.query_size(), ops::LinearPolicy::A16Only,
-                                                 first, last));
+                                                 first, last),
+        family::stored_role_workspace(geometry, "attention/output",
+                                      [&](QType type, std::int32_t rows, std::int32_t columns) {
+                                          return ops::linear_add_workspace_capacity_bytes(
+                                              type, rows, columns, kTextPolicy, first, last);
+                                      })});
 }
 
 // ---- Post-mixer (SwiGLU MLP) ----------------------------------------------

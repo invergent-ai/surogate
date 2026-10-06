@@ -298,6 +298,47 @@ struct W8Codec {
     }
 };
 
+/// Block-FP8 routed experts, as Qwen's FP8 export stores them and Hopper's grouped GEMM reads
+/// them (`fp8_moe_sm90`): E4M3 codes row-major [rows, K] and one FP32 scale per 128 x 128 cell,
+/// [rows / 128, K / 128]. A group is one cell's span of a row, 128 values over sixteen lanes.
+/// The wide rounds stay on the grouped GEMM; this is what a decode or small-T round reads, so a
+/// narrow round pays four launches instead of the prefill family's chain.
+template <int kGroupsPerRow>
+struct Fp8BlockCodecFor {
+    static constexpr bool kGateRowsFirst        = true;
+    static constexpr int kGroupK                = 128;
+    static constexpr int kStoredKAlignment      = 128;
+    static constexpr bool kD3SingleValuePerLane = false;
+    static constexpr bool kD3PackedWord8        = false;
+    static constexpr bool kPackedWord8          = true;
+
+    __device__ static __forceinline__ void
+    load_eight(const std::uint8_t* codes, const std::uint8_t* /*high*/,
+               const std::uint8_t* scales, std::int64_t group_index, int lane_in_group,
+               float (&weights)[8]) {
+        const uint2 packed = load_vec<uint2>(codes + group_index * kGroupK + lane_in_group * 8);
+        const std::int64_t row   = group_index / kGroupsPerRow;
+        const std::int64_t group = group_index - row * kGroupsPerRow;
+        const float scale =
+            reinterpret_cast<const float*>(scales)[(row >> 7) * kGroupsPerRow + group];
+        const std::uint32_t words[2] = {packed.x, packed.y};
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            __nv_fp8x2_e4m3 two;
+            two.__x              = static_cast<__nv_fp8x2_storage_t>(words[pair >> 1] >> (16 * (pair & 1)));
+            const float2 decoded = static_cast<float2>(two);
+            weights[2 * pair]     = decoded.x * scale;
+            weights[2 * pair + 1] = decoded.y * scale;
+        }
+    }
+};
+
+/// Block-FP8 needs both reduction axes in whole 128-wide cells; a mixture without them never
+/// reaches these kernels (the wrapper refuses its weights), so it compiles none.
+inline constexpr bool kFp8BlockGeometry = kHidden % 128 == 0 && kIntermediate % 128 == 0;
+using Fp8GateUpCodec = Fp8BlockCodecFor<kHidden / 128>;
+using Fp8DownCodec   = Fp8BlockCodecFor<kIntermediate / 128>;
+
 /// How wide a stored row is, against how wide the math reads.
 ///
 /// `row-split-k128-v1` pads K up to 128 and stores `padded / group` groups per row
@@ -907,6 +948,12 @@ void launch_d2_d3(const Tensor& x, const PreparedSparseMoeWeights& weights, Tens
     case QType::NVFP4:
         launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream, adapters, adapter_slot);
         break;
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        if constexpr (kFp8BlockGeometry) {
+            launch_d3_dependent_codec<Fp8GateUpCodec>(x, weights, workspace, stream, adapters, adapter_slot);
+            break;
+        }
+        throw std::invalid_argument("sparse_moe: block-FP8 D3 needs 128-aligned widths");
 #define SINFER_D3_DEP(NAME)                                                                        \
     case QType::NAME:                                                                              \
         launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>(x, weights, workspace,  \
@@ -979,6 +1026,13 @@ void launch_d4_dependent(const PreparedSparseMoeWeights& weights, Tensor& destin
         launch_d4_dependent_codec<Nvfp4CodecFor<kIntermediate / 16>>(weights, destination,
                                                                      workspace, stream, adapters, adapter_slot);
         return;
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        if constexpr (kFp8BlockGeometry) {
+            launch_d4_dependent_codec<Fp8DownCodec>(weights, destination, workspace, stream, adapters,
+                                                    adapter_slot);
+            return;
+        }
+        throw std::invalid_argument("sparse_moe: block-FP8 D4 needs 128-aligned widths");
     default:
         throw std::invalid_argument("sparse_moe: unsupported D4 codec");
     }
@@ -1110,6 +1164,13 @@ void decode_launch_d3_small_t(const Tensor& x, const PreparedSparseMoeWeights& w
         launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
                                                 schedule, stream, nullptr);
         return;
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        if constexpr (kFp8BlockGeometry) {
+            launch_d3_small_t_codec<Fp8GateUpCodec, false>(x, weights, token_ids, token_activations,
+                                                           tokens, schedule, stream, nullptr);
+            return;
+        }
+        throw std::invalid_argument("sparse_moe: block-FP8 small-T D3 needs 128-aligned widths");
 #define SINFER_D3_SMALL(NAME)                                                                      \
     case QType::NAME:                                                                              \
         launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>, false>(                  \
@@ -1165,6 +1226,14 @@ void decode_launch_d4_small_t(const PreparedSparseMoeWeights& weights, Tensor& d
                                                 shared_scale, token_activations, tokens, schedule,
                                                 stream, nullptr);
         return;
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        if constexpr (kFp8BlockGeometry) {
+            launch_d4_small_t_codec<Fp8DownCodec, false>(weights, destination, token_ids, token_alpha,
+                                                         shared_scale, token_activations, tokens,
+                                                         schedule, stream, nullptr);
+            return;
+        }
+        throw std::invalid_argument("sparse_moe: block-FP8 small-T D4 needs 128-aligned widths");
 #define SINFER_D4_SMALL(NAME)                                                                      \
     case QType::NAME:                                                                              \
         launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>, false>(                  \

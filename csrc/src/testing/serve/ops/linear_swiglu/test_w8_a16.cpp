@@ -18,6 +18,8 @@ int main() {
         int failures = run_profile(
             "LinearSwiGLU W8_A16",
             {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
+        // A shape no route table names takes the runtime-shaped MMA tiles past one column when its
+        // k and intermediate are aligned (the first two below) and the per-pair kernel otherwise.
         constexpr std::array<std::int32_t, 4> kFallbackTokens{1, 17, 128, 512};
         for (const auto compute : {ActivationCompute::A16, ActivationCompute::A8}) {
             failures += run_profile(
@@ -30,6 +32,11 @@ int main() {
                 "LinearSwiGLU W8 fallback narrow scale loads",
                 {QType::W8G32_F16S, 256, 1152, 128, 1637U, compute}, kFallbackTokens);
         }
+        // qwen3-8b mlp (4096 -> 2x12288), the shape that found the per-pair kernel at prefill.
+        constexpr std::array<std::int32_t, 3> kQwen3_8bTokens{1, 2, 33};
+        failures += run_profile(
+            "LinearSwiGLU W8 fallback qwen3-8b",
+            {QType::W8G32_F16S, 24576, 4096, 12288, 1639U, ActivationCompute::A16}, kQwen3_8bTokens);
         // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
         constexpr std::array<std::int32_t, 8> kQ08TokenCases{1, 2, 6, 17, 33, 65, 129, 257};
         failures += run_profile(

@@ -13,7 +13,10 @@
 //   - the fused GDN norm + gating projection takes its generic fixed-order kernel instead of the
 //     registered routes, which split k by the token count (ops/wrapper/gdn_gating_proj.cpp);
 //   - prompts are cut only at fixed multiples from position zero, never where a shared round's
-//     window runs out (ProgramImplCore::invariant_prefill_piece).
+//     window runs out (ProgramImplCore::invariant_prefill_piece);
+//   - on Hopper, prompt attention stays on the split-KV tile kernels instead of FlashAttention-3,
+//     so a query's attention is the same whether it is decoded, verified or prefilled
+//     (ops/wrapper/gqa_attention.cpp).
 //
 // The server also turns off CUDA graphs and prefix reuse and refuses speculative decoding in
 // this mode (serve/serve_options.cpp). Other weight formats keep their own routes (the GGML and

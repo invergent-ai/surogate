@@ -22,6 +22,7 @@ from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import dflash as dflash_checkpoint
+from surogate.serve.convert.common import fp8_block_source
 from surogate.serve.convert.common import recipe as family_recipe
 
 from . import draft_head, inventory, recipe
@@ -55,6 +56,20 @@ class ConversionPreflight:
     #: text-core object's format, and these read the stored words for them.
     compressed_source: compressed_tensors_source.CompressedTensorsSource | None = None
     compressed_plan: compressed_tensors_source.SourcePlan | None = None
+    #: Set when the source is a block-FP8 export: the routed experts and the dense projections
+    #: keep its codes, the shared expert is requantised from them.
+    fp8_source: fp8_block_source.Fp8BlockSource | None = None
+    fp8_plan: fp8_block_source.SourcePlan | None = None
+
+    @property
+    def weights_id(self) -> str:
+        if self.compressed_plan is not None:
+            return compressed_tensors_source.WEIGHTS_ID
+        if self.fp8_plan is not None:
+            return fp8_block_source.WEIGHTS_ID
+        if self.routed_nvfp4_dir is not None:
+            return routed_nvfp4.WEIGHTS_ID
+        return inventory.WEIGHTS_ID
 
 
 def _tools_root() -> Path:
@@ -114,6 +129,10 @@ def preflight_conversion(
         print(scope, flush=True)
     compressed_source = (compressed_tensors_source.CompressedTensorsSource(model)
                          if quant_schemes.quantization_config_of(config) is not None else None)
+    fp8_source = (fp8_block_source.Fp8BlockSource(model)
+                  if fp8_block_source.is_fp8_block_export(config) else None)
+    if fp8_source is not None and routed_nvfp4_dir is not None:
+        raise ValueError("a block-FP8 export already carries its routed experts; drop --routed-nvfp4")
     if compressed_source is not None and routed_nvfp4_dir is None:
         routed_nvfp4_dir = model
     routed = Path(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None
@@ -123,9 +142,15 @@ def preflight_conversion(
     compressed_plan = (compressed_source.plan(
         routed_nvfp4.tensor_specs(geometry, dflash=dflash_geometry), base, shared_expert=shared_expert)
         if compressed_source is not None else None)
+    fp8_plan = (fp8_source.plan(
+        tuple(object_specs) if object_specs is not None
+        else tensor_specs(geometry, False, dflash=dflash_geometry), base, geometry.experts)
+        if fp8_source is not None else None)
     excluded = set(covered)
     if compressed_plan is not None:
         excluded.update(compressed_plan.covered)
+    if fp8_plan is not None:
+        excluded.update(fp8_plan.covered)
     if routed is not None:
         excluded.update(name for name in base if routed_nvfp4.is_routed_object(name))
     base_source = family_recipe.preflight_sources(model, tuple(
@@ -137,8 +162,10 @@ def preflight_conversion(
     dflash_source = recipe.preflight_dflash_sources(dflash_model, recipes) if dflash_model else None
     resources = load_resources(model)
     resource_map = {r.name: r.data for r in resources}
-    specs = (compressed_plan.specs if compressed_plan is not None else tuple(object_specs)
-             if object_specs is not None else tensor_specs(geometry, routed is not None, dflash=dflash_geometry))
+    specs = (compressed_plan.specs if compressed_plan is not None
+             else fp8_plan.specs if fp8_plan is not None
+             else tuple(object_specs) if object_specs is not None
+             else tensor_specs(geometry, routed is not None, dflash=dflash_geometry))
     object_plan = family_conversion.build_object_plan(inventory.RESOURCE_SPECS + specs, resource_map)
     draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model, geometry=geometry)
     return ConversionPreflight(
@@ -149,7 +176,7 @@ def preflight_conversion(
         base_source=base_source, dflash_source=dflash_source, resources=resources,
         draft=draft, object_plan=object_plan, routed_nvfp4_dir=routed,
         routed_nvfp4_summary=routed_summary, compressed_source=compressed_source,
-        compressed_plan=compressed_plan)
+        compressed_plan=compressed_plan, fp8_source=fp8_source, fp8_plan=fp8_plan)
 
 
 def materialize_tensor(
@@ -297,6 +324,9 @@ def convert(
     # superblocks and the Q8_0 tensors repack into W8 bit-exactly, so only the remainder takes
     # the dequantise path.
     repack = GgufRepackSource(gguf_repack) if gguf_repack else None
+    if repack is not None and fp8_block_source.is_fp8_block_export(
+            family_conversion.load_json(model / "config.json")):
+        raise ValueError("--gguf-repack reads a GGUF; point --model at a BF16 checkpoint, not an FP8 export")
     geometry = inventory.geometry_from_checkpoint(model, extra_names=repack.sources if repack else ())
     if not mtp:
         geometry = replace(geometry, mtp_layers=0)
@@ -405,14 +435,7 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     with ArtifactWriter(
         output,
-        ArtifactIdentity(
-            inventory.MODEL_ID,
-            compressed_tensors_source.WEIGHTS_ID
-            if preflight.compressed_plan is not None
-            else routed_nvfp4.WEIGHTS_ID
-            if preflight.routed_nvfp4_dir is not None
-            else inventory.WEIGHTS_ID,
-         architecture="qwen3_5_moe"),
+        ArtifactIdentity(inventory.MODEL_ID, preflight.weights_id, architecture="qwen3_5_moe"),
         preflight.object_plan.specs,
         external=external,
         geometry=inventory.geometry_block(geometry),
@@ -472,6 +495,16 @@ def convert(
                         # not. No dequantise-requantise round trip in either case.
                         payload = preflight.compressed_source.payload_for(
                             spec.name, preflight.compressed_plan.objects, reader, resolved_device
+                        )
+                        write_payload(spec, payload)
+                        del payload
+                        continue
+                    if preflight.fp8_plan is not None and spec.name in preflight.fp8_plan.objects:
+                        # The export's E4M3 codes and block multipliers as stored where a
+                        # block-FP8 kernel reads them, dequantised through the same words where
+                        # the kernels read W8 (the shared expert, the MTP block's projections).
+                        payload = preflight.fp8_source.payload_for(
+                            spec.name, preflight.fp8_plan.objects, reader, resolved_device
                         )
                         write_payload(spec, payload)
                         del payload
@@ -541,14 +574,19 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
         ranking_path=ranking,
-        weights_id=compressed_tensors_source.WEIGHTS_ID if preflight.compressed_plan is not None
-                   else routed_nvfp4.WEIGHTS_ID if preflight.routed_nvfp4_dir else inventory.WEIGHTS_ID,
+        weights_id=preflight.weights_id,
     )
     if preflight.compressed_plan is not None:
         report["quantization"]["compressed_tensors"] = {
             "shared_expert": preflight.compressed_plan.shared_expert,
             "shared_expert_requested": shared_expert,
             "text_core_objects_from_export": len(preflight.compressed_plan.objects),
+        }
+    if preflight.fp8_plan is not None:
+        report["quantization"]["fp8_block"] = {
+            "stored_codes": preflight.fp8_plan.counts.get("codes", 0),
+            "routed_stacked": preflight.fp8_plan.counts.get("routed", 0),
+            "requantized_to_base_format": preflight.fp8_plan.counts.get("requantize", 0),
         }
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:

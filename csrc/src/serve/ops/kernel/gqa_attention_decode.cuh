@@ -13,8 +13,10 @@
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <atomic>
 #include <cstdint>
 
 namespace sinfer::ops {
@@ -93,16 +95,63 @@ __device__ __forceinline__ int gqa_small_t_key_lo(int first_pos, int sliding_win
     return lo > 0 ? lo : 0;
 }
 
+// Hopper (sm_90) uses narrower partitions past 4K keys. A split CTA is two warps that stage
+// one 32-key tile at a time, so its time grows with its partition, and the widest partition
+// is what the whole layer waits for: with the default scheme a 17K-key decode spends ~80 us
+// per layer behind one 2048-key partition while most of the H100 sits idle. Partitions of
+// 128 keys up to 16K and 256 up to 64K keep every CTA short, at about three times the split
+// storage of the default scheme. Device code knows its own architecture; the host asks the
+// current device, which is the one its launches and workspaces are for.
+namespace detail {
+inline bool gqa_host_device_uses_fine_partitions() {
+    static std::atomic<int> cached[64] = {};  // 0 unknown, 1 default scheme, 2 Hopper
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) { return false; }
+    int known = cached[device].load(std::memory_order_relaxed);
+    if (known == 0) {
+        int major = 0;
+        int minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+        known = major == 9 && minor == 0 ? 2 : 1;
+        cached[device].store(known, std::memory_order_relaxed);
+    }
+    return known == 2;
+}
+} // namespace detail
+
+__host__ __device__ inline bool gqa_fine_key_partitions() {
+#if defined(__CUDA_ARCH__)
+#    if __CUDA_ARCH__ == 900
+    return true;
+#    else
+    return false;
+#    endif
+#else
+    return detail::gqa_host_device_uses_fine_partitions();
+#endif
+}
+
 // Partitions are anchored to absolute key positions, never to the current
 // sequence length or batch. Wider partitions in the tail bound temporary
 // storage at long contexts without regrouping a query when the context grows.
 __host__ __device__ inline int gqa_key_partition(int key) {
+    if (gqa_fine_key_partitions()) {
+        if (key < 16384) { return key / 128; }
+        if (key < 65536) { return 128 + (key - 16384) / 256; }
+        return 320 + (key - 65536) / 2048;
+    }
     if (key < 4096) { return key / 128; }
     if (key < 16384) { return 32 + (key - 4096) / 512; }
     return 56 + (key - 16384) / 2048;
 }
 
 __host__ __device__ inline int gqa_key_partition_begin(int partition) {
+    if (gqa_fine_key_partitions()) {
+        if (partition < 128) { return partition * 128; }
+        if (partition < 320) { return 16384 + (partition - 128) * 256; }
+        return 65536 + (partition - 320) * 2048;
+    }
     if (partition < 32) { return partition * 128; }
     if (partition < 56) { return 4096 + (partition - 32) * 512; }
     return 16384 + (partition - 56) * 2048;
@@ -258,15 +307,38 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         return;
     }
 
+    // Each split's weight, computed once by the whole block instead of serially per output
+    // value. The sums below still add the same terms in the same order, so the result is
+    // bit-identical to the serial form; it just stops waiting on one load per split.
+    constexpr int kStagedSplits = 512;
+    __shared__ float split_l[kStagedSplits];
+    __shared__ float split_weight[kStagedSplits];
+    const bool staged = !Int8 && active_split_count <= kStagedSplits;
+    if (staged) {
+        for (int split = tid; split < active_split_count; split += blockDim.x) {
+            const auto index = gqa_partial_stat_index<Geometry>(q_head, token, split, tokens);
+            const float tile_l  = partial_l[index];
+            split_l[split]      = tile_l;
+            split_weight[split] = tile_l > 0.0f ? expf(partial_m[index] - head_m) : 0.0f;
+        }
+        __syncthreads();
+    }
+
     // Keep the normalization sum in absolute key order. A sliding-window query
     // tile may add leading empty splits, which must not regroup the nonzero terms.
     if constexpr (!Int8) {
         if (tid == 0) {
             float sum = 0.0f;
-            for (int split = 0; split < active_split_count; ++split) {
-                const auto index = gqa_partial_stat_index<Geometry>(q_head, token, split, tokens);
-                if (partial_l[index] > 0.0f) {
-                    sum += partial_l[index] * expf(partial_m[index] - head_m);
+            if (staged) {
+                for (int split = 0; split < active_split_count; ++split) {
+                    if (split_l[split] > 0.0f) { sum += split_l[split] * split_weight[split]; }
+                }
+            } else {
+                for (int split = 0; split < active_split_count; ++split) {
+                    const auto index = gqa_partial_stat_index<Geometry>(q_head, token, split, tokens);
+                    if (partial_l[index] > 0.0f) {
+                        sum += partial_l[index] * expf(partial_m[index] - head_m);
+                    }
                 }
             }
             reduce[0] = sum;
@@ -298,7 +370,30 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     if (tid >= DChunk || d >= Geometry::HeadDim) { return; }
 
     float numerator = 0.0f;
-    if (head_l > 0.0f) {
+    if (head_l > 0.0f && staged) {
+        // Eight independent loads ahead of the in-order accumulation.
+        constexpr int kAhead = 8;
+        int split = 0;
+        for (; split + kAhead <= active_split_count; split += kAhead) {
+            float acc[kAhead];
+#pragma unroll
+            for (int j = 0; j < kAhead; ++j) {
+                acc[j] = split_l[split + j] > 0.0f
+                    ? partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split + j, tokens)]
+                    : 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < kAhead; ++j) {
+                if (split_l[split + j] > 0.0f) { numerator += acc[j] * split_weight[split + j]; }
+            }
+        }
+        for (; split < active_split_count; ++split) {
+            if (split_l[split] <= 0.0f) { continue; }
+            numerator +=
+                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *
+                split_weight[split];
+        }
+    } else if (head_l > 0.0f) {
         for (int split = 0; split < active_split_count; ++split) {
             const float tile_l =
                 partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];

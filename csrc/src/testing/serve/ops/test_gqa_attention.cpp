@@ -2,8 +2,10 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "api/ops/batch_invariant.h"
 #include "api/ops/gqa_attention.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/fp8_reference.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -44,11 +46,24 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
     /*gross_relative_to_max_reference*/ 2.2e-3,
 };
 
+// FlashAttention-3's FP8 kernel over an e4m3 cache (Hopper prompts, verify_fp8_wide_prompts) also
+// rounds the queries and the softmax probabilities to e4m3, as vLLM's FP8 path does; this bound,
+// against an oracle that keeps the queries BF16, covers both roundings. Each is about 2.4 % RMS
+// per element (three mantissa bits), and on random keys and values both the output and its error
+// shrink as one over the root of the keys a query sees, so the relative error stays near 3-4 %
+// at any length: 3.6-3.7 % on an H100 for every case here, against 0.19 % for the split-KV tiles
+// over the same codes. A misread page or head is off by order one.
+constexpr ReductionCriterion kAttentionFp8QueryCriterion{
+    /*relative_l2*/ 5.0e-2,
+    /*gross_absolute*/ 3.0e-2,
+    /*gross_relative_to_max_reference*/ 3.0e-2,
+};
+
 struct Geometry {
     const char* name;
     std::int32_t q_heads;
     std::int32_t kv_heads;
-    /// Every case below is a 256-wide head. It is a member because the head dimension is part
+    /// Most cases below are 256-wide heads. It is a member because the head dimension is part
     /// of a registered shape rather than derivable from its head counts -- two models attend
     /// with 32 query heads over 4 KV heads at different widths.
     std::int32_t head_dim = kHeadDim;
@@ -82,6 +97,9 @@ constexpr Geometry kGeometries[] = {
     // wider than 256, which the prompt kernel serves with a 16-key tile.
     {"glm5_3_flash_absorbed", 64, 1, 512},
     {"minicpm5", 16, 2, 128},
+    // The other 128- and 64-wide heads FlashAttention-3 serves on Hopper (the wide prompts below).
+    {"qwen3_30b_a3b", 32, 4, 128},
+    {"tinyllama_1_1b", 32, 4, 64},
 };
 
 struct AttentionCase {
@@ -1373,6 +1391,20 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 
+        // Wide prompts over scattered pages: on an H100 these take FlashAttention-3 (BF16, heads
+        // 64, 128 or 256 wide, 32 columns and up), whose 128- and 192-row query tiles and 80- to
+        // 128-key tiles straddle the 64-slot pages; elsewhere they are more prompt-tile coverage.
+        // The window cases below are FA3's local mask there.
+        if (geometry.head_dim <= 256) {
+            failures += run_a1_case(geometry, dtype, {130, 200, 400, 701u}, MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, dtype, {130, 200, 400, 702u}, MappingPattern::Fragmented);
+            failures += run_a1_case(geometry, dtype, {32, 1000, 1100, 703u}, MappingPattern::Offset);
+            if (geometry.q_heads >= 16) {
+                failures += run_a1_case(geometry, dtype, {300, 1500, 1800, 704u},
+                                        MappingPattern::Fragmented);
+            }
+        }
+
         // Causal sliding window. The 200-token cases are the ones that matter:
         // with Br = Bc = 64, a query tile at 128 against a key tile at 0 is
         // wholly below the diagonal, so the prefill kernel takes its "every key
@@ -1520,8 +1552,14 @@ int verify_split_numerator_precision() {
 
 // A cached query must give identical results whether it is decoded alone, verified
 // with other tokens, or included in a full prefill. Nonzero Q/K exercises softmax
-// and contexts/windows cross both key-partition and query-tile boundaries.
+// and contexts/windows cross both key-partition and query-tile boundaries. This is the
+// --batch-invariant contract: by default a Hopper prompt of 32 columns or more runs
+// FlashAttention-3, whose bits differ from the split-KV kernels' (the oracle cases cover it).
 int verify_query_batch_invariance() {
+    struct InvariantScope {
+        InvariantScope() { ops::set_batch_invariant(true); }
+        ~InvariantScope() { ops::set_batch_invariant(false); }
+    } invariant;
     int failures = 0;
     constexpr int tokens = 385, pages = 264, context = pages * kPagedKVPageSize;
     for (const Geometry geometry : {Geometry{"gemma", 8, 4}, Geometry{"qwen", 8, 2},
@@ -2027,6 +2065,142 @@ int verify_workspace_capacity_contract() {
 
 } // namespace
 
+// Wide prompts over an e4m3 cache, against attention in double over the cache's own codes with
+// the BF16 queries. On an H100 the default run takes FlashAttention-3's FP8 kernel (e4m3 queries
+// and probabilities, kAttentionFp8QueryCriterion); --batch-invariant keeps the split-KV tiles,
+// which read the same codes with BF16 queries and keep the BF16 bound. Elsewhere both runs take
+// the tiles. Keys and queries span [-2, 2], so scores reach the peaked softmax a QK-normed model
+// sees, over scattered pages and histories that cross FA3's 128-key tiles.
+int verify_fp8_wide_prompts() {
+    struct Case {
+        Geometry geometry;
+        int history;
+        int tokens;
+        std::uint32_t seed;
+        int window = 0;
+    };
+    const Case cases[] = {
+        {Geometry{"qwen3.6-35b-a3b", 16, 2}, 200, 130, 811u},
+        {Geometry{"qwen3.6-27b", 24, 4}, 1000, 200, 812u},
+        {Geometry{"qwen", 8, 2}, 1000, 32, 813u},
+        {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 1000, 200, 814u},
+        {Geometry{"tinyllama-1.1b", 32, 4, 64}, 200, 130, 815u},
+        {Geometry{"gemma3-4b", 8, 4}, 1000, 200, 816u, 512},
+        {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 200, 300, 817u, 128},
+        // No tuned kernels for this query group: FA3 on an H100, the generic kernel otherwise.
+        {Geometry{"qwen3-8b", 32, 8, 128}, 1000, 200, 818u},
+        // Below FA3's width the generic split-KV route, its history split across CTAs.
+        {Geometry{"qwen3-8b", 32, 8, 128}, 2000, 1, 819u},
+        {Geometry{"qwen3-8b", 32, 8, 128}, 1500, 3, 820u, 256},
+        {Geometry{"fallback-12q4-d256", 12, 4, 256}, 1000, 1, 821u},
+        {Geometry{"fallback-16q8-d64", 16, 8, 64}, 700, 2, 822u},
+    };
+    constexpr int pages = 64;
+    constexpr float scale = 1.0F / 16.0F;
+    int device = 0, major = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    int failures = 0;
+    for (const Case& c : cases) {
+        const int dim = c.geometry.head_dim, heads = c.geometry.q_heads, kv_heads = c.geometry.kv_heads;
+        const int keys = c.history + c.tokens, group = heads / kv_heads;
+        DeviceArena arena(256U << 20);
+        Tensor q = arena.alloc(DType::BF16, {dim, heads, c.tokens});
+        Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, keys});
+        Tensor v = arena.alloc(DType::BF16, {dim, kv_heads, keys});
+        Tensor positions = arena.alloc(DType::I32, {keys});
+        const std::vector<float> q_values = make_bf16_values(q.numel(), c.seed, -2.0F, 2.0F);
+        const std::vector<float> k_values = make_bf16_values(k.numel(), c.seed + 1u, -2.0F, 2.0F);
+        const std::vector<float> v_values = make_bf16_values(v.numel(), c.seed + 2u, -1.0F, 1.0F);
+        const auto upload = [](Tensor tensor, const std::vector<float>& values) {
+            const std::vector<std::uint16_t> bits = to_bf16_bits(values);
+            CUDA_CHECK(cudaMemcpy(tensor.data, bits.data(), tensor.bytes(), cudaMemcpyHostToDevice));
+        };
+        upload(q, q_values);
+        upload(k, k_values);
+        upload(v, v_values);
+        std::vector<int> pos(keys), table(pages);
+        for (int t = 0; t < keys; ++t) { pos[t] = t; }
+        for (int i = 0; i < pages; ++i) { table[i] = (i * 17 + 3) % pages; }
+        CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+        PagedKVLayerView cache;
+        cache.head_dim     = dim;
+        cache.num_kv_heads = kv_heads;
+        cache.dtype        = DType::FP8_E4M3FN;
+        cache.k_pages      = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, pages});
+        cache.v_pages      = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, pages});
+        cache.block_table  = arena.alloc(DType::I32, {pages});
+        CUDA_CHECK(cudaMemcpy(cache.block_table.data, table.data(), cache.block_table.bytes(), cudaMemcpyHostToDevice));
+        ops::gqa_kv_append(k, v, positions, cache, nullptr);
+        cuda_synchronize();
+
+        // The oracle reads the codes the cache holds: [page][kv head][slot][dim].
+        const auto k_codes = from_device<std::uint8_t>(cache.k_pages.data, cache.k_pages.numel());
+        const auto v_codes = from_device<std::uint8_t>(cache.v_pages.data, cache.v_pages.numel());
+        const auto cached = [&](const std::vector<std::uint8_t>& codes, int t, int g, int d) {
+            const std::size_t page = static_cast<std::size_t>(table[t / kPagedKVPageSize]);
+            return static_cast<double>(fp8_reference_value(
+                codes[((page * kv_heads + g) * kPagedKVPageSize + t % kPagedKVPageSize) * dim + d]));
+        };
+        std::vector<double> kd(static_cast<std::size_t>(keys) * kv_heads * dim), vd(kd.size());
+        for (int t = 0; t < keys; ++t) {
+            for (int g = 0; g < kv_heads; ++g) {
+                for (int d = 0; d < dim; ++d) {
+                    const std::size_t i = (static_cast<std::size_t>(t) * kv_heads + g) * dim + d;
+                    kd[i] = cached(k_codes, t, g, d);
+                    vd[i] = cached(v_codes, t, g, d);
+                }
+            }
+        }
+        std::vector<double> reference(q.numel());
+        std::vector<double> scores(keys);
+        for (int col = 0; col < c.tokens; ++col) {
+            const int last  = c.history + col;
+            const int first = c.window > 0 ? std::max(0, last - c.window + 1) : 0;
+            for (int h = 0; h < heads; ++h) {
+                const int g = h / group;
+                const float* query = q_values.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
+                double peak = -std::numeric_limits<double>::infinity();
+                for (int t = first; t <= last; ++t) {
+                    const double* key = kd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
+                    double dot = 0;
+                    for (int d = 0; d < dim; ++d) { dot += query[d] * key[d]; }
+                    scores[t] = dot * scale;
+                    peak      = std::max(peak, scores[t]);
+                }
+                double total = 0;
+                for (int t = first; t <= last; ++t) { total += scores[t] = std::exp(scores[t] - peak); }
+                double* row = reference.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
+                for (int t = first; t <= last; ++t) {
+                    const double* value = vd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
+                    const double weight = scores[t] / total;
+                    for (int d = 0; d < dim; ++d) { row[d] += weight * value[d]; }
+                }
+            }
+        }
+
+        Tensor query_pos = positions.slice(0, c.history, c.tokens);
+        const ops::GqaExecutionEnvelope envelope{1, pages * kPagedKVPageSize, c.window};
+        for (const bool invariant : {false, true}) {
+            ops::set_batch_invariant(invariant);
+            Tensor out = arena.alloc(DType::BF16, {dim, heads, c.tokens});
+            WorkspaceArena scratch(std::max<std::size_t>(256, ops::gqa_attention_workspace_capacity_bytes(
+                dim, heads, kv_heads, cache.dtype, envelope, 1, c.tokens, c.tokens)));
+            ops::gqa_attention_cached(q, query_pos, scale, cache, envelope, scratch, out, nullptr);
+            cuda_synchronize();
+            ops::set_batch_invariant(false);
+            const bool flash = !invariant && major == 9 && c.tokens >= 32;
+            const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
+                                      " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +
+                                      " window=" + std::to_string(c.window) +
+                                      (flash ? " flash-attention-3" : " tiles");
+            failures += verify_attention(label, bf16_bits_to_double(from_device<std::uint16_t>(out.data, out.numel())),
+                                         reference, flash ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
+        }
+    }
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -2044,6 +2218,7 @@ int main() {
     failures += verify_fp8_current_tokens_match_cached(256, 16, 4);
     failures += verify_fp8_current_tokens_match_cached(128, 32, 4);
     failures += verify_fp8_image_attention();
+    failures += verify_fp8_wide_prompts();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     for (const Geometry geometry : {Geometry{"fallback_16q8_d64", 16, 8, 64},
                                     Geometry{"fallback_12q4_d256", 12, 4, 256},
@@ -2058,6 +2233,38 @@ int main() {
         if (geometry.head_dim >= 128) {
             failures += run_batch_case(geometry, DType::I8,
                 {3, {61, 127}, {3, 2}, {1, 0}, MappingPattern::Fragmented, 2201U});
+        }
+    }
+    // Wide prompts of shapes with no tuned kernels: FlashAttention-3 on an H100 (it serves any
+    // query group), the generic kernel elsewhere. Qwen3-8B is 32 query heads over 8 at 128.
+    for (const Geometry geometry : {Geometry{"qwen3_8b", 32, 8, 128},
+                                    Geometry{"fallback_16q8_d64", 16, 8, 64},
+                                    Geometry{"fallback_12q4_d256", 12, 4, 256}}) {
+        for (const AttentionCase& test_case :
+             {AttentionCase{130, 200, 400, 2300U}, AttentionCase{200, 0, 256, 2301U, 64},
+              AttentionCase{66, 63, 129, 2302U, 32}}) {
+            failures += run_a1_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
+        }
+    }
+    // Decode rows of such a shape: every row in one launch, each query's history split across
+    // CTAs while the rows leave the device idle (one row: nine splits on an H100; four: three).
+    {
+        const Geometry qwen3_8b{"qwen3_8b", 32, 8, 128};
+        failures += run_batch_case(qwen3_8b, DType::BF16,
+            {1, {2000}, {1}, {0}, MappingPattern::Fragmented, 2400U});
+        failures += run_batch_case(qwen3_8b, DType::BF16,
+            {1, {61, 1500, 700, 3000}, {1, 1, 0, 1}, {3, 0, 2, 1}, MappingPattern::Fragmented, 2401U});
+        failures += run_batch_case(qwen3_8b, DType::BF16,
+            {4, {300, 1100}, {4, 2}, {1, 0}, MappingPattern::Fragmented, 2402U});
+        failures += run_batch_case(qwen3_8b, DType::I8,
+            {2, {900, 300}, {2, 1}, {1, 0}, MappingPattern::Fragmented, 2403U});
+        for (const int tokens : {1, 3}) {
+            const AttentionCase test_case{tokens, 1800, 2048, 2410U + tokens};
+            failures += run_a1_case(qwen3_8b, DType::BF16, test_case, MappingPattern::Fragmented);
+            failures += run_a3_case(qwen3_8b, DType::BF16, test_case, MappingPattern::Fragmented);
+            const AttentionCase windowed{tokens, 1800, 2048, 2420U + tokens, 300};
+            failures += run_a1_case(qwen3_8b, DType::BF16, windowed, MappingPattern::Fragmented);
         }
     }
     for (const Geometry geometry : {Geometry{"gemma3_image",8,4,256}, Geometry{"gemma4_image",8,1,256}}) {

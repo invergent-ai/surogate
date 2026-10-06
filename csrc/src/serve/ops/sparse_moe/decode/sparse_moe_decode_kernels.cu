@@ -15,6 +15,7 @@
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>

@@ -1,4 +1,5 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include "core/layout.h"
@@ -40,7 +41,8 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(const SparseMoeGeometry& geo
     // lanes where a superblock is thirty-two.
     const auto is_ggml_k = [](QType qtype) { return detail::ggml::is_ggml_qtype(qtype); };
     const bool ggml_k_profile = is_ggml_k(routed_gate_up) && is_ggml_k(routed_down);
-    if (!main_profile && !w8_profile && !nvfp4_profile && !ggml_k_profile) {
+    const bool fp8_profile    = sparse_moe_routed_fp8_profile(routed_gate_up, routed_down);
+    if (!main_profile && !w8_profile && !nvfp4_profile && !ggml_k_profile && !fp8_profile) {
         throw std::invalid_argument("sparse_moe small-T: unsupported routed codec profile");
     }
     SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(geometry, tokens)};
@@ -61,7 +63,7 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(const SparseMoeGeometry& geo
             tokens <= 8 ? SparseMoeSmallTD4Schedule::Rows1 : SparseMoeSmallTD4Schedule::Rows4;
         return plan;
     }
-    if (w8_profile) {
+    if (w8_profile || fp8_profile) {
         // PathsAll puts every routed path and the shared path in one CTA; Paths1 gives each
         // its own CTA. Both exist for every geometry, unlike the three-path split.
         plan.d3_schedule = tokens <= 5 ? SparseMoeSmallTD3Schedule::Paths1

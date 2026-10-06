@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
+#include "ops/sparse_moe/fp8_sm90/fp8_moe_sm90.h"
 #include "ops/sparse_moe/shared.h"
 #include "ops/sparse_moe/trtllm/trtllm_moe.h"
 
@@ -22,6 +23,9 @@ inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
 /// GGML K-quants share the Q4/Q5 tiling, so they cross over where those do; measured, not
 /// assumed -- below this the small-T slices win.
 inline constexpr std::int32_t kSparseMoePrefillGgmlKMin     = 47;
+/// Block-FP8 experts: below this the decode and small-T kernels read the codes directly; from
+/// it up, Hopper's grouped GEMM (fp8_moe_sm90) runs them inside this family.
+inline constexpr std::int32_t kSparseMoePrefillFp8Min       = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
@@ -44,6 +48,10 @@ struct SparseMoePrefillPlan {
     /// and the weights' own codes as the other MMA operand. Set for the Q4_K/Q5_K/Q6_K routed
     /// profile unless `SUROGATE_SERVE_MOE_INT8=0` asks for the BF16-activation kernels.
     bool routed_int8 = false;
+    /// The routed experts are block-scaled FP8 and run on Hopper's grouped GEMM
+    /// (fp8_moe_sm90): the family routes, gathers by `column_token` and reduces, and the module
+    /// quantises the gathered rows and runs both GEMMs with the gate between them.
+    bool routed_fp8 = false;
     /// The round was routed here by `SparseMoeRouting::WidthInvariant`, below the pair's own
     /// prefill floor if need be, so a token column must be computed the same way at every width.
     /// The plan pins the one width-dependent variant an admitted pair could reach, the Q5/Q6-down
@@ -52,6 +60,14 @@ struct SparseMoePrefillPlan {
     /// is admitted.
     bool width_invariant = false;
 };
+
+/// Whether a routed codec pair is the block-FP8 profile (Hopper's grouped GEMM).
+[[nodiscard]] bool sparse_moe_routed_fp8_profile(QType routed_gate_up, QType routed_down) noexcept;
+
+/// The narrowest round the block-FP8 profile sends to this family: kSparseMoePrefillFp8Min, or
+/// SUROGATE_SERVE_MOE_FP8_PREFILL_MIN in [1, 47] so the crossover can be re-measured. Never
+/// above the small-T bound plus one, so no width falls to the per-token decode loop.
+[[nodiscard]] std::int32_t sparse_moe_fp8_prefill_min() noexcept;
 
 /// Whether a routed codec pair takes the int8 tensor-core route.
 [[nodiscard]] bool sparse_moe_routed_int8_profile(QType routed_gate_up, QType routed_down) noexcept;
@@ -93,7 +109,19 @@ struct SparseMoePrefillWorkspace {
     /// Only allocated for a `routed_trtllm` plan: the runner's own scratch, its BF16 output block
     /// and its permutation map, laid out by `trtllm_moe::workspace_bytes`.
     DeviceSpan trtllm_workspace;
+    /// Only for a `routed_fp8` plan: the module's planes and GEMM arguments
+    /// (`fp8_moe_sm90::workspace_bytes`), and, where the gate/up product [assignments][2I] is
+    /// wider than `grouped_io`, a block of its own for it (otherwise it shares `grouped_io`).
+    DeviceSpan fp8_workspace;
+    DeviceSpan fp8_gate_up;
 };
+
+/// The Hopper FP8 module's view of a mixture.
+[[nodiscard]] constexpr fp8_moe_sm90::Geometry fp8_geometry(const SparseMoeGeometry& geometry) noexcept {
+    return {geometry.hidden, geometry.experts, geometry.experts_per_token, geometry.intermediate,
+            geometry.activation == GatedActivation::GeluTanh ? fp8_moe_sm90::Activation::GegluTanh
+                                                             : fp8_moe_sm90::Activation::Swiglu};
+}
 
 /// The runner's gate for a mixture's experts.
 [[nodiscard]] constexpr trtllm_moe::Activation
@@ -107,7 +135,8 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                                 const SparseMoeGeometry& geometry,
                                                                 std::int32_t capacity_tokens,
                                                                 bool routed_trtllm = false,
-                                                                bool routed_int8   = false) {
+                                                                bool routed_int8   = false,
+                                                                bool routed_fp8    = false) {
     SparseMoePrefillWorkspace out;
     const std::int32_t assignments = geometry.experts_per_token * capacity_tokens;
     const std::int32_t experts     = geometry.experts;
@@ -166,8 +195,18 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                        static_cast<std::int64_t>(hidden) * 4));
     out.routed_storage = Tensor(routed_span.data, DType::BF16, {inter, assignments});
     out.routed_sum     = Tensor(routed_span.data, DType::FP32, {hidden, capacity_tokens});
-    if (routed_int8) {
+    if (routed_int8 || routed_fp8) {
         out.column_token = arena.alloc(DType::I32, {assignments}, 256);
+    }
+    if (routed_fp8) {
+        const fp8_moe_sm90::Geometry fp8 = fp8_geometry(geometry);
+        out.fp8_workspace = arena.alloc_bytes(fp8_moe_sm90::workspace_bytes(fp8, capacity_tokens), 256);
+        if (2 * inter > hidden) {
+            out.fp8_gate_up =
+                arena.alloc_bytes(fp8_moe_sm90::gate_up_scratch_bytes(fp8, assignments), 256);
+        }
+    }
+    if (routed_int8) {
         out.act_codes    = arena.alloc(DType::I8, {hidden, capacity_tokens}, 256);
         out.act_ds       = arena.alloc(DType::FP16, {2 * (hidden / 32), capacity_tokens}, 256);
         out.mid_codes    = arena.alloc(DType::I8, {inter, assignments}, 256);
@@ -191,7 +230,8 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 [[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
                                                              std::int32_t max_tokens,
                                                              bool routed_trtllm,
-                                                             bool routed_int8 = false);
+                                                             bool routed_int8 = false,
+                                                             bool routed_fp8  = false);
 /// `width_invariant`: the round was sent here by SparseMoeRouting::WidthInvariant, so any positive
 /// width is accepted and the plan pins the width-invariant variant.
 [[nodiscard]] SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,

@@ -11,6 +11,7 @@
 #include "family/impl/lora_hook.h"
 #include "family/impl/lora_gdn.h"
 #include "family/impl/mlp_swiglu.h"
+#include "family/impl/storage_workspace.h"
 #include "family/impl/moe/moe_routing.h"
 
 #include <algorithm>
@@ -136,12 +137,18 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
     // The larger of the two routes this artifact may carry: the profile's row-split format,
     // or the K-quants a GGUF served natively keeps. The layout is planned before the weights
     // are read, so it must hold either.
-    return std::max(
+    // An FP8 export's block-scaled codes are a third, when the artifact stores them.
+    return std::max({
         ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile), geometry.hidden,
                                                  geometry.query_size(), kTextPolicy, first, last),
         ops::linear_add_workspace_capacity_bytes(QType::Q4_K, geometry.hidden,
                                                  geometry.query_size(), ops::LinearPolicy::A16Only,
-                                                 first, last));
+                                                 first, last),
+        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return ops::linear_add_workspace_capacity_bytes(type, geometry.hidden,
+                                                            geometry.query_size(), kTextPolicy,
+                                                            first, last);
+        })});
 }
 
 // ---- Post-mixer (SwiGLU MLP) ----------------------------------------------
@@ -179,10 +186,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     const QType qtype = profile_qtype(weights_profile);
     auto dense = geometry;
     if (geometry.experts) { dense.intermediate = geometry.dense_intermediate; }
-    auto bytes = std::max(
+    auto bytes = std::max({
         post_mixer_workspace_bytes(dense, qtype, qtype, kTextPolicy, first, last),
         post_mixer_workspace_bytes(dense, QType::Q4_K, QType::Q4_K,
-                                   ops::LinearPolicy::A16Only, first, last));
+                                   ops::LinearPolicy::A16Only, first, last),
+        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return post_mixer_workspace_bytes(dense, type, type, kTextPolicy, first, last);
+        })});
     if (geometry.experts) {
         const ops::SparseMoeGeometry moe{geometry.hidden, geometry.experts,
             geometry.experts_per_token, geometry.intermediate,
@@ -219,12 +229,16 @@ std::size_t Variant::short_conv_projection_workspace_capacity_bytes(
         auto scope = layout.scope();
         // Either format the artifact may carry: the profile's row-split W8, or the K-quants a
         // GGUF served natively keeps. The layout is planned before the weights are read.
-        (void)layout.alloc_bytes(std::max(
+        (void)layout.alloc_bytes(std::max({
             ops::linear_workspace_capacity_bytes(profile_qtype(weights_profile),
                                                  3 * geometry.hidden, geometry.hidden,
                                                  kTextPolicy, first, last),
             ops::linear_workspace_capacity_bytes(QType::Q4_K, 3 * geometry.hidden, geometry.hidden,
-                                                 ops::LinearPolicy::A16Only, first, last)));
+                                                 ops::LinearPolicy::A16Only, first, last),
+            family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+                return ops::linear_workspace_capacity_bytes(type, 3 * geometry.hidden,
+                                                            geometry.hidden, kTextPolicy, first, last);
+            })}));
     }
     return layout.peak_bytes(1);
 }
@@ -242,13 +256,17 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(
     const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase,
     std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return std::max(ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
-                                                             geometry.hidden, geometry.hidden,
-                                                             kTextPolicy, first, last),
-                    ops::linear_add_workspace_capacity_bytes(QType::Q4_K, geometry.hidden,
-                                                             geometry.hidden,
-                                                             ops::LinearPolicy::A16Only, first,
-                                                             last));
+    return std::max({ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
+                                                              geometry.hidden, geometry.hidden,
+                                                              kTextPolicy, first, last),
+                     ops::linear_add_workspace_capacity_bytes(QType::Q4_K, geometry.hidden,
+                                                              geometry.hidden,
+                                                              ops::LinearPolicy::A16Only, first,
+                                                              last),
+                     family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+                         return ops::linear_add_workspace_capacity_bytes(
+                             type, geometry.hidden, geometry.hidden, kTextPolicy, first, last);
+                     })});
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

@@ -73,7 +73,7 @@ weight format. Supported formats depend on the model family and export:
 | Other GGUF formats | Includes `Q4_0`, `Q5_0`, `Q4_1`, `Q5_1`, and supported IQ formats; availability depends on the model |
 | BF16 safetensors | Prepared using the model family's conversion settings |
 | NVFP4 checkpoints | Four-bit floating-point weights for supported Blackwell GPUs |
-| FP8 checkpoints | Supported row- and block-scaled exports |
+| FP8 checkpoints | Block-scaled exports (`quant_method: fp8`, 128 x 128 blocks) keep their FP8 weights on Qwen3, Qwen3-VL, Qwen3.5/3.6/3.8 and its MoE models, Llama, Gemma 3, the dense and E-series Gemma 4, and LFM2. Row-scaled exports keep them on Qwen3.5/3.6/3.8 and are converted to 8-bit weights on the others |
 
 ### Preparing model files
 

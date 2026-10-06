@@ -106,6 +106,20 @@ SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeLfm2Moe64Geometry)
 #include "ops/test_sparse_moe_body.inc"
 }
 
+/// Block-FP8 routed experts are admitted on Hopper only: their wide rounds have no other kernel.
+bool hopper_device(const char* what) {
+    int device = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+        return false;
+    }
+    if (major == 9 && minor == 0) { return true; }
+    std::printf("SKIP %s: block-FP8 experts need an sm_90 device (this one is sm_%d%d)\n", what,
+                major, minor);
+    return false;
+}
+
 int run_lfm2() {
     constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 129}};
     const CodecProfile profile{"lfm2_moe w8+w8", QType::W8G32_F16S, QType::W8G32_F16S,
@@ -247,6 +261,20 @@ int main(int argc, char** argv) {
                                    profile.routed_down == QType::Q6G64_F16S;
         if (baked_for_512 || (profile.routed_gate_up == QType::NVFP4 && !nvfp4)) { continue; }
         failures += glm53::run_profile(profile);
+    }
+
+    // Block-FP8 routed experts, as Qwen's FP8 export stores them. These widths stay below the
+    // grouped GEMM's crossover, so the decode and small-T kernels read the codes against exact
+    // BF16 activations and the A16 oracle holds; the grouped GEMM's own test
+    // (test_sparse_moe_fp8_sm90) covers the wide rounds and their FP8 activations. T=2 runs
+    // under graph capture.
+    if (hopper_device("sparse_moe block fp8")) {
+        constexpr std::array<std::int32_t, 6> kFp8Tokens{{1, 2, 3, 5, 16, 19}};
+        const CodecProfile fp8{"sparse_moe fp8 block a16", QType::FP8_E4M3FN_BLK128_F32S,
+                               QType::FP8_E4M3FN_BLK128_F32S, kFp8Tokens, true};
+        failures += qwen36::run_profile(fp8);
+        failures += qwen3_moe::run_profile(fp8);
+        failures += glm53::run_profile(fp8);
     }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";

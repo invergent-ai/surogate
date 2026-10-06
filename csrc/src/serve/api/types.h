@@ -50,6 +50,12 @@ enum class KvCacheStorage : std::uint8_t {
     /// (IQ4_XS) of perplexity against llama.cpp's f16 cache -- both rows match llama.cpp
     /// once the cache is BF16 -- while a 3:1 GDN stack pays 0.4 % (27B) to nothing (35B,
     /// 0.8B) and keeps the halved cache.
+    ///
+    /// On Hopper (sm_90) it is BFloat16 for every stack. Prompt attention there runs
+    /// FlashAttention-3 over either cache, so they prefill alike, but the BF16 one decodes faster
+    /// and the 80 GB card holds it. Qwen3.6-35B-A3B-FP8 on one H100 (2026-10-06): 38.6k against
+    /// 38.3k prompt tok/s (2,048-token prompts, 32 users), one stream 283 against 263 tok/s, 64
+    /// users 2,563 against 2,506, wikitext-2 perplexity 6.371 against 6.367.
     Auto,
 };
 
@@ -760,6 +766,9 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    /// Resumed from a prompt prefix another conversation left on the GPU (reported only:
+    /// the engine appends at that prefix's frontier).
+    SharedPrefix,
 };
 
 struct GenerationResult {

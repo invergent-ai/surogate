@@ -3766,3 +3766,187 @@ round's width.
 Not done: NVFP4 on Hopper (vLLM's Marlin FP4, W4A16, would cover the dense layers and its Marlin MoE
 the routed experts); the route tables' SM counts and split choices, still the RTX 5090's; conversion of
 quantized MTP blocks.
+
+## 102
+
+**Hopper: Qwen3.5/3.6 MoE serves Qwen's own FP8 export, routed experts on a CUTLASS sm90 grouped
+GEMM (2026-10-05, after #101).**
+
+Qwen3.6-35B-A3B on an H100 decoded 278 tok/s for one stream (vLLM 251) but only tied vLLM at 16
+users (883) and fell behind at 64 (1,238 against 1,923), and it prefilled 2,048-token prompts at
+12.0k tok/s against vLLM's 39.5k. Our 4/5-bit experts ran kernels tuned for the RTX 5090, and vLLM
+served Qwen's 8-bit export, so the comparison was not like for like either. Changes:
+
+- **Converter** (`surogate/serve/convert/qwen3_5_moe/exports/fp8_block_source.py`, `convert.py`).
+  It reads `Qwen/Qwen3.6-35B-A3B-FP8` as stored: E4M3 codes with BF16 `weight_scale_inv` per
+  128 x 128 block (widened exactly to FP32, as in #101). Routed experts and the attention and GDN
+  input projections keep the codes; the shared expert, GDN gating and MTP projections are
+  requantised to W8 and the head to Q6, as for the other exports. New weights profile `fp8-block`.
+- **Wide rounds** (`ops/sparse_moe/fp8_sm90/fp8_moe_sm90.{h,cu}`, archive `sinfer_fp8_block_sm90`).
+  Two CUTLASS 3.x ptr-array grouped GEMMs with blockwise FP8 scaling (CUTLASS example 68's kernel),
+  activations quantised per row per 128 values, vLLM's FP8 MoE recipe. The expert boundaries are read
+  from device memory, so a round is capture-safe. The tile family follows the round's width (swapped
+  16/32/64-column tiles for few rows per expert, 128 x 128 otherwise; `SUROGATE_SERVE_MOE_FP8_TILE`
+  forces one), and up to 128 assignments take a GEMV per packed column instead.
+- **Narrow rounds** (`ops/sparse_moe/decode/sparse_moe_decode_body.inc`, `Fp8BlockCodecFor`). Below
+  20 tokens (`SUROGATE_SERVE_MOE_FP8_PREFILL_MIN`, 1..47) the decode and small-T kernels read the
+  E4M3 codes directly, eight a lane, with the cell's FP32 scale. The first version sent one-token
+  rounds through the whole grouped-GEMM chain and decoded one stream at 145 tok/s.
+- **Workspace for fused projections** (`targets/qwen3_5_moe/impl/variant.cpp`). A block-FP8 input
+  projection quantises its activation into scratch; without the arena it used the engine scratch,
+  which cannot grow inside a graph capture, and the server failed to capture its decode graphs.
+
+One H100, closed loop, both engines on the 8-bit export (vLLM 0.31): one stream 268 tok/s (vLLM 251);
+16 users 1,126 (883); 64 users 2,115 (1,923); 2,048-token prompts from 32 users 28.5k prompt tok/s
+(39.5k). Moving the crossover to 2 lost 25 % at 4 users; moving it to 47 lost 14 % at 32 users.
+
+Tests. `sinfer_sparse_moe_fp8_sm90_test` checks both GEMM families and the GEMV against a dequantised
+reference; the MoE correctness suite gains a block-FP8 profile at 1, 2, 3, 5, 16 and 19 tokens with
+graph replay on sm_90; `tests/serve/test_qwen3_5_moe_checkpoint_config.py` covers the converter's
+block-FP8 reading.
+
+## 103
+
+**Hopper: prompt attention runs FlashAttention-3 (2026-10-05, after #102).**
+
+With #102 the 35B-A3B's experts stopped being its largest prefill cost: attention was, 7.6 ms of GPU
+time per 1,000 prompt tokens against vLLM's 0.3. Our prompt route cuts a prompt into eight-column
+tiles over split-KV partials (`mma.sync`, about 22 TFLOP/s); vLLM runs FlashAttention-3.
+
+- **Vendored kernel** (`src/third_party/flash_attn3`, BSD-3-Clause, NOTICE there): FA3's sm90 forward
+  headers and varlen scheduler from flash-attention 3451a2a, built against our CUTLASS 4.6.1 into
+  archive `sinfer_gqa_sm90` (pinned to 90a, hidden visibility; a stub elsewhere). One local change:
+  its error macros throw instead of calling `exit(1)`.
+- **Launcher** (`ops/gqa_sm90/gqa_fa3.{h,cu}`). One instantiation: BF16, head dim 256, causal, varlen,
+  paged without TMA, query group packed into the tile, no split. The paged cache's layout (a page is
+  64 slots of one KV head) is passed as strides, the block-table row through `kv_batch_idx`, and the
+  segment lengths through device arrays filled on the stream, so it captures in prefill graphs.
+- **Routes** (`ops/wrapper/gqa_attention.cpp`). A prompt of 32 columns or more
+  (`SUROGATE_SERVE_GQA_FA3_MIN_COLUMNS`) over a BF16 cache with no window takes FA3 on an sm_90 device;
+  `SUROGATE_SERVE_GQA_FA3=0` turns it off. Narrower prompts keep the tiles: FA3 runs one CTA per 128
+  packed query rows, which at an 8K history took 0.18 ms for 32 or for 64 columns. Packed rounds
+  (#14) send all such segments to one varlen launch, which computes each segment exactly as its own
+  launch does, so the packed-equals-alone check still holds bit for bit. FA3's arithmetic is not the
+  decode kernels', so `--batch-invariant` keeps every width on the tiles.
+- **KV cache default** (`family/impl/runtime/layouts_impl.h`, `KvCacheStorage::Auto`). Hybrids defaulted
+  to an e4m3 cache, which FA3 cannot read. On sm_90 `auto` is now BF16 for every stack.
+
+FA3 alone, on an H100: a fresh 2,048-token prompt in 0.064 ms per layer (535 TFLOP/s), a 2,048-token
+chunk after 6,144 keys at 719 TFLOP/s, four packed 2,048-token segments at 709; every case within
+3e-3 of an FP32 reference, graph replay bit-identical to eager. The 35B-A3B server, 2,048-token prompts
+from 32 users: 35.7k prompt tok/s and 968 ms median TTFT, against 28.6k and 1,203 ms before (28.9k with a
+BF16 cache and FA3 off, so FA3 is the gain). Decode: one stream 282 tok/s, 16 users 1,184, 64 users
+2,291 (vLLM 251, 883, 1,923). vLLM still prefills faster (39.5k, 275 ms TTFT).
+
+Tests. `sinfer_gqa_attention_test` adds wide prompts over scattered pages (130 and 300 columns after
+200 and 1,500 keys, 32 after 1,000) against its oracle; its width-invariance check now runs under
+`--batch-invariant`, the contract it states.
+
+**FP8 KV cache, as vLLM runs it (2026-10-06).** vLLM's `--kv-cache-dtype fp8` stores e4m3 keys and
+values (per-layer scale, 1.0 by default), casts the query to e4m3 at a static scale of 1.0, and runs
+FA3's FP8 kernel, which also rounds the softmax probabilities to e4m3 for the second product. Ours
+now does the same over our e4m3 cache (a plain saturating cast, so every descale is 1):
+`gqa_fa3_e4m3.cu` holds the FP8 instantiation (its own translation unit, so the two compile in
+parallel), `run` casts the queries into the workspace first (`workspace_bytes(..., fp8_cache)`), and
+the route takes e4m3 caches as it takes BF16 ones. Over random inputs the e4m3 queries and
+probabilities cost 3.7 % relative L2 against a BF16-query oracle (the tiles: 0.19 %), but not the
+model: Qwen3.6-35B-A3B-FP8's wikitext-2 perplexity (16 windows of 2,048 tokens) is 6.371 with a BF16
+cache, 6.367 with e4m3 through FA3, 6.369 with e4m3 through the tiles. With FA3 on both, an e4m3
+cache prefills as fast as a BF16 one (38.3k against 38.6k prompt tok/s, 32 users, 2,048-token
+prompts) and decodes 2-7 % slower (263 against 283 tok/s for one stream, 2,506 against 2,563 for
+64), so `auto` stays BF16 on Hopper; `fp8` halves the cache when capacity is what is short.
+
+**Every head dim FA3 has, windows, any query group (2026-10-06).** The route above served head dim 256
+without a window, i.e. Qwen3.5/3.6 only. FA3 now runs at head dims 64, 128 and 256 (TinyLlama and
+LFM2; Qwen3, Qwen3-MoE and Llama 3; Qwen3.5/3.6 and Gemma's sliding layers), BF16 or e4m3, causal or
+under a sliding window through FA3's local mask (`window_size_left = window - 1`, which is the
+engine's `i - j < window`): twelve instantiations, one translation unit each
+(`gqa_fa3_hdim{64,128,256}_{bf16,e4m3}{,_local}.cu` over `gqa_fa3_launch_impl.cuh`). Gemma 4's
+512-wide global layers stay on the tiles; FA3 has no such head. Shapes whose query group has no tuned
+kernels (Qwen3-8B's 32 query heads over 8, Llama 3 8B's) ran their prompts through the generic
+one-warp-per-query kernel; they now take FA3 like any other shape, and the workspace plan books its
+scratch for them. Qwen3-8B on one H100, one 2,048-token prompt: 9.35 s to the first token before,
+0.23 s after with #104's MLP route (attention was 70 % of the 9.35 s, the MLP 28 %); Gemma 4 E4B (head dim 256, windows of 512), 32 users with 2,048-token prompts: 12.2k
+prompt tok/s against 11.5k with FA3 off. Tests: FP8 wide prompts at head dims 128 and 64, under
+windows of 512 and 128, and for Qwen3-8B's shape (FA3 2.9-3.7 % relative L2 against the BF16-query
+oracle, the tiles about 0.2 %); BF16 wide prompts of three unregistered shapes.
+
+## 104
+
+**Models outside the tuned shapes (2026-10-06, after #103).** Benchmarking two models nothing had been
+tuned for, Qwen3-8B (W8; 32 query heads over 8 at head dim 128, a pairing the GQA registry does not
+carry) and Gemma 4 E4B, on an H100 showed three engine-wide gaps.
+
+- **Attention for unregistered query groups** (`ops/launcher/gqa_attention_generic.cu`). A shape whose
+  (head dim, KV heads) pair is registered but whose query count is not was served by one warp per
+  query head and column walking the history a key at a time, each batch row its own launch, its
+  append too: ~3.5 ms per layer for a Qwen3-8B decode step, about 8 tokens/s. Such shapes now take a
+  split-KV route for every width FA3 does not take (decode and verify rows on any GPU; prompts off
+  Hopper): one launch for every row and column, four warps per CTA on interleaved keys with a group of
+  lanes per key (several keys in flight per warp), each query's history split across CTAs while the
+  columns alone leave the device idle (two CTAs per SM; never under `--batch-invariant`), partials
+  merged in split order by a reduce kernel; the BF16/e4m3 append is one launch as well (int8 keeps the
+  tuned fill). Head dims 64-512, BF16, e4m3 and int8 caches, sliding windows; QSA selections and image
+  blocks stay on the prompt kernel. The workspace plan books the partials per width, exactly as the
+  launch takes them.
+- **W8 SwiGLU for unaligned plans** (98055e3). A fused gate/up projection with no registered plan ran
+  the per-output kernel, 28 % of a Qwen3-8B prompt; any shape the MMA tiles' alignment admits now
+  takes them.
+- **Mixed-round samplers** (ad21cbb). A mixed round samples its finishing prompts and its decode rows
+  while the prompt chunk's roots are live, and the plan had booked one sampler row there. Gemma 4
+  E4B's 262K vocabulary made the sampler the arena's largest user, and 64 users ran it out by
+  960,000 bytes in the first mixed round with 63 decode rows; the prompt plans now book
+  max(batch, finishing prompts) rows. The same load: no errors, 1,510 decode tok/s.
+
+Qwen3-8B, one H100, with #103's FA3 for its prompts: one 2,048-token prompt 9.35 s to the first token
+before, 0.23 s after; one stream decodes at ~83 tok/s (was ~8); 32 users with 2,048-token prompts
+finish in 9.8 s (68 s before); 64 users at 512/128 decode 1,610 tok/s. Its prompts are now W8-GEMM
+bound (93 % of prefill GPU time on the `mma.sync` tiles): vLLM serves the FP8 checkpoint through
+DeepGEMM at 54.5k prompt tok/s against our 8.5k, and only the Qwen3.5/3.6 converters read FP8
+checkpoints so far.
+
+Tests. `sinfer_gqa_attention_test`: Qwen3-8B decode rows (one row over 2,000 keys, four rows with a
+masked one, width 4, int8), one- and three-column queries with and without a 300-key window, and e4m3
+decode for three unregistered shapes, all against the oracle at the BF16 bound (~0.17 % relative L2).
+
+## 105
+
+**FP8 checkpoints for every dense family (2026-10-06, after #104).** Only the Qwen3.5/3.6 converters
+read FP8 checkpoints, so every other family's FP8 release was refused at preflight (source dtype
+F8_E4M3) and its users served the BF16 release as W8, whose prompts run on `mma.sync` tiles. The
+engine side was never the obstacle: the binder takes whatever format an object declares
+(`bind_linear`), and every projection op dispatches block-FP8 on the stored type, on Hopper through
+vLLM's sm90 block GEMM (#101).
+
+- **One FP8 reader for every converter** (`surogate/serve/convert/common/fp8_block_source.py`, moved
+  out of the Qwen3.5 MoE converter). A block-scaled export (`quant_method: fp8`, 128 x 128 blocks, Qwen's
+  and DeepSeek's) keeps its codes and block multipliers wherever the object is an attention,
+  linear-attention, short-convolution or dense-MLP projection whose recipe is a row program over whole
+  128-row blocks: a fused parent is its constituents' blocks in recipe order. Anything else that reads
+  FP8 sources (off the block grid, a draft head, a shared expert, the vision tower) and every
+  compressed-tensors per-channel or per-tensor export is dequantised through the stored words and
+  encoded in the converter's own format. Wired into the Qwen3, Qwen3-VL, Llama (and Granite), Gemma 3,
+  dense and E-series Gemma 4 and LFM2 converters; artifacts keep their `groupwise-int` identity, as a
+  GGUF's native K-quants do. FP8 routed experts stay the Qwen3.5/3.6 MoE converter's: the others
+  refuse them by name.
+- **Workspace for the stored format.** Those targets planned their projections for W8 and a GGUF's
+  K-quants; FP8's activation planes are larger, so the plans now also take the block-FP8 figure when
+  the artifact stores it (`stored_role_workspace`, `stored_format_workspace`), which leaves a W8
+  artifact's plan exactly as it was.
+- **The widest decode round is warmed before capture.** The ungated attention input projection stages
+  a K-quant or FP8 parent through the engine-slot scratch, which grows with the round's width and
+  may not grow inside a capture; warmup ran one lane (and the Marlin band), so a Qwen3-8B-FP8 server
+  died capturing batch 5 ("activation scratch of 21760 bytes was first needed inside a graph
+  capture"). Warmup now also runs the widest ordinary round.
+
+Qwen3-8B-FP8 against vLLM 0.31 on one H100 (same client, 4K context, BF16 KV both): greedy output
+identical to the W8 artifact's; 32 users with 2,048-token prompts 40.4k prompt tok/s (W8 8.5k; vLLM
+55.7k), TTFT p50 0.85 s (vLLM 0.55 s); decode one stream 157 tok/s (W8 ~83 in #104; vLLM 227),
+16 users 1,626 (vLLM 2,429), 64 users 3,363 (W8 1,610; vLLM 5,690). The remaining gap is decode at
+width, not the GEMMs.
+
+Tests. `tests/serve/test_converter_end_to_end.py`: block-FP8 Qwen3 and Llama keep every projection's
+codes and multipliers bit-exact (fused q|k|v and gate|up in recipe order), LFM2 keeps its convolution,
+attention and MLP projections, Gemma 3 its seven separate projections; a per-channel Qwen3 export
+converts to W8 within 1 % of the stored values. The Qwen3.5 MoE FP8 tests run against the moved
+module unchanged.

@@ -120,6 +120,8 @@ const char* prefix_reuse_path_name(sinfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case sinfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    case sinfer::PrefixReusePath::SharedPrefix:
+        return "shared_prefix";
     }
     return "unknown";
 }

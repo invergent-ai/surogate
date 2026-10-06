@@ -177,6 +177,50 @@ int check_prefix_forks(sinfer::PagedKVPlaneOrder order, cudaStream_t stream) {
     return failures;
 }
 
+// A running sequence hands its first pages to a shared prefix mid-prefill: the pages stay
+// where they are, the sequence borrows them, and forks of the prefix outlive both.
+int check_shared_prefix(cudaStream_t stream) {
+    auto plan = plan_paged_cache(12, 12, 4, {{sinfer::DType::I8, 64, 2}},
+                                 sinfer::PagedKVPlaneOrder::PageMajor);
+    sinfer::DeviceArena arena(plan.bytes);
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+    int failures = 0;
+    auto running = pool.reserve(6);
+    running.materialize_pages(4, stream);
+    const std::vector<std::int32_t> pages(running.page_ids().begin(), running.page_ids().end());
+    auto shared = pool.share_prefix(running, 2);
+    failures += expect_size(shared->owned_entitlement(), 2, "shared prefix owns its pages");
+    failures += expect_size(running.borrowed_pages(), 2, "sequence borrows the shared pages");
+    failures += expect_size(running.owned_entitlement(), 4, "sequence keeps the rest");
+    failures += expect_page_ids(shared->page_ids(), {pages[0], pages[1]}, "shared pages stay in place");
+    if (!std::equal(running.page_ids().begin(), running.page_ids().end(), pages.begin(), pages.end())) {
+        failures += fail("sequence keeps its page table");
+    }
+    failures += expect_size(pool.occupancy().entitled_pages, 6, "sharing moves no entitlement");
+    failures += expect_size(pool.occupancy().pages_in_use, 4, "sharing takes no pages");
+    bool refused = false;
+    try { running.trim_pages(1, stream); } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) failures += fail("sequence trimmed into its shared prefix");
+    refused = false;
+    try { (void)pool.share_prefix(running, 2); } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) failures += fail("shared the same pages twice");
+    // A deeper share chains to the first one.
+    auto deeper = pool.share_prefix(running, 3);
+    failures += expect_size(deeper->owned_entitlement(), 1, "deeper share owns only its new page");
+    failures += expect_size(deeper->borrowed_pages(), 2, "deeper share borrows the first");
+    auto fork = pool.fork_prefix(shared, 128, 3, stream);
+    failures += expect_page_ids(fork.page_ids(), {pages[0], pages[1]}, "fork reads the shared pages");
+    running = {};
+    failures += expect_size(pool.occupancy().pages_in_use, 3, "shared pages outlive the sequence");
+    shared.reset();
+    deeper.reset();
+    failures += expect_size(pool.occupancy().pages_in_use, 2, "fork pins only the pages it borrows");
+    fork = {};
+    failures += expect_size(pool.occupancy().pages_in_use, 0, "shared tree releases physical pages");
+    failures += expect_size(pool.occupancy().entitled_pages, 0, "shared tree releases entitlement");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -195,6 +239,7 @@ int main() {
     sinfer::DeviceContext ctx(0);
     failures += check_prefix_forks(sinfer::PagedKVPlaneOrder::PageMajor, ctx.stream);
     failures += check_prefix_forks(sinfer::PagedKVPlaneOrder::HeadMajor, ctx.stream);
+    failures += check_shared_prefix(ctx.stream);
 
     auto paged_plan = plan_paged_cache(10, 10, 2,
                                        {{sinfer::DType::I8, 64, 2},

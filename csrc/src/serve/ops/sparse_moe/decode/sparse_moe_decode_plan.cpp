@@ -1,5 +1,6 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/layout.h"
 
@@ -28,7 +29,8 @@ SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geom
     // lanes where a superblock is thirty-two.
     const auto is_ggml_k = [](QType qtype) { return detail::ggml::is_ggml_qtype(qtype); };
     const bool ggml_k_profile = is_ggml_k(routed_gate_up) && is_ggml_k(routed_down);
-    if (!main_profile && !w8_profile && !nvfp4_profile && !ggml_k_profile) {
+    const bool fp8_profile    = sparse_moe_routed_fp8_profile(routed_gate_up, routed_down);
+    if (!main_profile && !w8_profile && !nvfp4_profile && !ggml_k_profile && !fp8_profile) {
         throw std::invalid_argument("sparse_moe: unsupported routed codec profile");
     }
     SparseMoeDecodePlan plan;

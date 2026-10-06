@@ -6,7 +6,8 @@
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
 std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& sequence,
-                                                         bool checkpoint, bool draft) const {
+                                                         bool checkpoint, bool draft,
+                                                         bool with_hidden) const {
     const auto slot = checkpoint
         ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
         : LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
@@ -29,7 +30,7 @@ std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& s
         tensors.push_back(decoder->ple.conv_slot(slot));
     }
     const Tensor hidden = checkpoint ? sequence.rewrite_checkpoint_hidden : sequence.tail_hidden;
-    if (hidden.data) { tensors.push_back(hidden); }
+    if (hidden.data && with_hidden) { tensors.push_back(hidden); }
     if (dflash && draft) {
         auto& local = checkpoint ? decoder->checkpoint_dflash(sequence.lane) : dflash->local;
         for (std::uint32_t layer = 0; layer < local.layer_count(); ++layer) {
@@ -214,6 +215,197 @@ void ProgramImplCore::restore_gpu_prefix(SequenceState& sequence, const RequestP
         CUDA_CHECK(cudaMemcpyAsync(tensors[i].data, image->current[i].data, tensors[i].bytes(),
                                    cudaMemcpyDeviceToDevice, device.stream));
     }
+    ++checkpoint_revisions[sequence.lane];
+}
+
+std::shared_ptr<const std::vector<std::uint64_t>>
+ProgramImplCore::shared_prefix_hashes(const PreparedPromptData& prompt, std::int32_t lora_slot) const {
+    constexpr auto page = static_cast<std::size_t>(kPagedKVPageSize);
+    // Whole pages before the prompt's last token: a fork must leave at least one token to
+    // prefill, whose hidden the request samples from.
+    const std::size_t pages = (prompt.token_ids.size() - 1) / page;
+    if (pages == 0) { return nullptr; }
+    auto hashes = std::make_shared<std::vector<std::uint64_t>>();
+    hashes->reserve(pages);
+    // Chained, so a page's hash names the whole prefix through it; seeded by the adapter,
+    // whose KV is its own. A collision costs at most a capture: lookups compare the tokens.
+    std::uint64_t h = 0xcbf29ce484222325ULL ^ (static_cast<std::uint64_t>(lora_slot + 2) << 32);
+    for (std::size_t p = 0; p < pages; ++p) {
+        for (std::size_t i = 0; i < page; ++i) {
+            h ^= static_cast<std::uint32_t>(prompt.token_ids[p * page + i]);
+            h *= 0x100000001b3ULL;
+        }
+        h ^= h >> 31;
+        h *= 0x9e3779b97f4a7c15ULL;
+        hashes->push_back(h);
+    }
+    return hashes;
+}
+
+std::shared_ptr<SharedPrefix> ProgramImplCore::find_shared_prefix(const PreparedPromptData& prompt,
+    const std::vector<std::uint64_t>& hashes, std::int32_t lora_slot) const {
+    std::shared_ptr<SharedPrefix> best;
+    for (const auto& [hash, entry] : shared_prefixes) {
+        const std::size_t pages = entry->tokens / kPagedKVPageSize;
+        if (pages == 0 || pages > hashes.size() || hashes[pages - 1] != hash ||
+            (best && best->tokens >= entry->tokens) ||
+            !family::detail::prefix_matches(prompt, entry->state.ledger, entry->state.prefix_identity,
+                                            entry->tokens, lora_slot)) {
+            continue;
+        }
+        best = entry;
+    }
+    return best;
+}
+
+void ProgramImplCore::plan_shared_prefix_capture(RequestControl::Prefill& staged,
+                                                 const std::vector<std::uint64_t>& hashes) {
+    static const std::uint32_t min_tokens = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_MIN_TOKENS");
+        return raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 1024U;
+    }();
+    // The deepest page an earlier request carried too: the prefix they have in common.
+    std::size_t seen = 0;
+    for (std::size_t k = hashes.size(); k > 0 && seen == 0; --k) {
+        if (shared_prefix_seen[0].contains(hashes[k - 1]) || shared_prefix_seen[1].contains(hashes[k - 1])) {
+            seen = k;
+        }
+    }
+    constexpr std::size_t kSeenGeneration = 1U << 16;
+    if (shared_prefix_seen[0].size() + hashes.size() > kSeenGeneration) {
+        shared_prefix_seen[1] = std::move(shared_prefix_seen[0]);
+        shared_prefix_seen[0].clear();
+    }
+    shared_prefix_seen[0].insert(hashes.begin(), hashes.end());
+    const auto tokens = static_cast<std::uint32_t>(seen * kPagedKVPageSize);
+    if (seen == 0 || tokens < std::max<std::uint32_t>(min_tokens, kPagedKVPageSize) ||
+        tokens <= staged.cursor || tokens >= staged.prompt_tokens ||
+        shared_prefixes.contains(hashes[seen - 1])) {
+        return;
+    }
+    staged.shared_capture = tokens;
+    staged.shared_capture_hash = hashes[seen - 1];
+}
+
+std::uint32_t ProgramImplCore::shared_prefix_pages() const noexcept {
+    std::uint32_t pages = 0;
+    for (const auto& item : shared_prefixes) { pages += item.second->pages->owned_entitlement(); }
+    return pages;
+}
+
+void ProgramImplCore::drop_shared_prefixes() noexcept {
+    if (shared_prefixes.empty()) { shared_prefix_storage.reset(); return; }
+    // Pages a running or retained fork still borrows stay with it until it lets them go.
+    shared_prefixes.clear();
+    shared_prefix_storage.reset(); // its memory goes back once no plan holds an entry
+    ++shared_prefix_revision;
+}
+
+void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestControl::Prefill& staged) {
+    const std::uint32_t tokens = *staged.shared_capture;
+    const std::uint64_t hash = staged.shared_capture_hash;
+    staged.shared_capture.reset();
+    if (shared_prefix_slots == 0) { return; }
+    const auto pages = tokens / static_cast<std::uint32_t>(kPagedKVPageSize);
+    if (!sequence.kv || sequence.kv->backend || sequence.text_kv_valid != tokens ||
+        tokens % kPagedKVPageSize != 0 || pages <= sequence.kv->text.borrowed_pages() ||
+        pages > sequence.kv->text.mapped_page_count() || shared_prefixes.contains(hash)) {
+        return;
+    }
+    const std::uint32_t owned = pages - sequence.kv->text.borrowed_pages();
+    if (owned > shared_prefix_page_budget) { return; }
+    // Make room: the least useful entry goes first (never hit, then least recently used).
+    while (!shared_prefixes.empty() && (shared_prefixes.size() >= shared_prefix_slots ||
+                                        shared_prefix_pages() + owned > shared_prefix_page_budget)) {
+        auto victim = shared_prefixes.begin();
+        for (auto it = shared_prefixes.begin(); it != shared_prefixes.end(); ++it) {
+            const bool cold = it->second->hits == 0, victim_cold = victim->second->hits == 0;
+            if (cold != victim_cold ? cold : it->second->last_use < victim->second->last_use) { victim = it; }
+        }
+        shared_prefixes.erase(victim);
+        ++shared_prefix_revision;
+    }
+    const auto tensors = prefix_state_tensors(sequence, false, false, false);
+    if (!shared_prefix_storage) {
+        std::size_t bytes = 0;
+        for (const auto& t : tensors) { bytes = (bytes + 255) / 256 * 256 + t.bytes(); }
+        bytes = (bytes + 255) / 256 * 256;
+        try {
+            shared_prefix_storage = std::make_shared<GpuPrefixStorage>(bytes, shared_prefix_slots);
+        } catch (const std::exception&) {
+            // Opportunistic like the host archive: no room for the states means no cache.
+            (void)cudaGetLastError(); // the failed cudaMalloc must not fail a later launch check
+            shared_prefix_slots = 0;
+            return;
+        }
+    }
+    // A plan that still holds an evicted entry keeps its slot until the plan is dropped.
+    if (shared_prefix_storage->free.empty()) { return; }
+    auto entry = std::make_shared<SharedPrefix>();
+    entry->hash = hash;
+    entry->tokens = tokens;
+    entry->state.copy_metadata(sequence);
+    entry->state.ledger.resize(tokens);
+    entry->state.prefix_identity.truncate(tokens);
+    entry->state.cached_scores.clear();
+    entry->state.execution_frontier = tokens;
+    entry->state.ledger_frontier = tokens;
+    entry->state.text_kv_valid = tokens;
+    entry->state.mtp_kv_valid = 0;
+    entry->state.dflash_context_frontier = 0;
+    entry->state.mtp_draft_count = 0;
+    // No hidden is kept: a fork always has prompt left to prefill past the boundary, so the
+    // append path never samples from it, but it needs the frontier marked complete.
+    entry->state.tail_hidden_valid = true;
+    entry->state.retained = true;
+    entry->state.cacheable = true;
+    entry->state.target_only = false;
+    entry->state.rewrite_checkpoint = {};
+    entry->storage = shared_prefix_storage;
+    entry->slot = shared_prefix_storage->free.back();
+    shared_prefix_storage->free.pop_back();
+    DeviceArena frame(DeviceSpan{static_cast<std::byte*>(shared_prefix_storage->memory.base()) +
+                                     entry->slot * shared_prefix_storage->stride,
+                                 shared_prefix_storage->stride});
+    for (const auto& tensor : tensors) {
+        if (!tensor.is_contiguous()) { throw std::logic_error("noncontiguous shared prefix state"); }
+        auto memory = frame.alloc_bytes(tensor.bytes());
+        auto copy = tensor;
+        copy.data = memory.data;
+        entry->current.push_back(copy);
+        CUDA_CHECK(cudaMemcpyAsync(copy.data, tensor.data, tensor.bytes(), cudaMemcpyDeviceToDevice,
+                                   device.stream));
+    }
+    entry->pages = decoder->text_kv.pool().share_prefix(sequence.kv->text, pages);
+    entry->last_use = ++shared_prefix_clock;
+    static const bool trace = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_TRACE") != nullptr;
+    if (trace) {
+        std::fprintf(stderr, "shared-prefix: captured %u tokens on lane %u (%zu entries, %u pages)\n",
+                     tokens, sequence.lane, shared_prefixes.size() + 1, shared_prefix_pages() + owned);
+    }
+    shared_prefixes.emplace(hash, std::move(entry));
+    ++shared_prefix_revision;
+}
+
+void ProgramImplCore::restore_shared_prefix(SequenceState& sequence, const RequestPlanImpl& plan) {
+    SharedPrefix& entry = *plan.shared_prefix;
+    clear_lane(sequence, requests[sequence.lane]);
+    sequence.copy_metadata(entry.state);
+    SequenceKVBundle bundle;
+    bundle.text = decoder->text_kv.pool().fork_prefix(entry.pages, entry.tokens,
+                                                     plan.text_kv_page_entitlement, device.stream);
+    sequence.kv.emplace(std::move(bundle));
+    const auto tensors = prefix_state_tensors(sequence, false, false, false);
+    if (tensors.size() != entry.current.size()) { throw std::logic_error("shared prefix state layout changed"); }
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (!tensors[i].is_contiguous() || tensors[i].bytes() != entry.current[i].bytes()) {
+            throw std::logic_error("shared prefix state geometry changed");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(tensors[i].data, entry.current[i].data, tensors[i].bytes(),
+                                   cudaMemcpyDeviceToDevice, device.stream));
+    }
+    entry.last_use = ++shared_prefix_clock;
+    ++entry.hits;
     ++checkpoint_revisions[sequence.lane];
 }
 

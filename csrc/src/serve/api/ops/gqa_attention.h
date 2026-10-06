@@ -181,7 +181,9 @@ bool gqa_attention_packs_prompt(std::int32_t head_dim, std::int32_t q_heads,
  * share a launch -- as many as the workspace's free room holds, up to 64 MiB of partials --
  * instead of each segment's few-CTA launches running one after another. Each tile reads only its
  * own sequence's keys over the same absolute key partitions, and the reducer sums its own
- * partitions in order, so every output bit is what the segment's own call writes.
+ * partitions in order, so every output bit is what the segment's own call writes. On Hopper the
+ * segments FlashAttention-3 takes alone (wide ones over a BF16 cache) share one varlen FA3
+ * launch instead, which computes each segment's tiles exactly as its one-segment launch does.
  *
  * q and out are `[D, Hq, N]`, positions `[N]`, and k/v `[D, Hkv, N]` over the same N columns.
  * Every segment must pass gqa_attention_packs_prompt, with its positions sequential and its last
