@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
+#include "ops/nvfp4_device.h"
 
 #include <array>
 #include <exception>
@@ -8,6 +9,7 @@ int main() {
     using namespace sinfer;
     using namespace sinfer::test::linear_swiglu;
 
+    if (!sinfer::test::nvfp4_device("linear_swiglu NVFP4")) { return 77; }
     try {
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
         constexpr std::array<std::int32_t, 5> kA4Cases{5, 48, 49, 128, 1024};

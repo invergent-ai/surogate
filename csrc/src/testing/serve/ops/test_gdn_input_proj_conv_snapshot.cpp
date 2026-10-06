@@ -1,4 +1,5 @@
 #include "api/ops/gdn_input_proj.h"
+#include "ops/nvfp4_device.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -1064,7 +1065,7 @@ int main() {
     failures += run_w8(2048, 4096);
     failures += run_w8(2560, 4096);
     failures += run_w8(4096, 4096, false); // qwen3.5-9b: no fused W8 kernels
-    failures += run_nvfp4();
+    if (nvfp4_device("gdn_input_proj_conv_snapshot NVFP4")) { failures += run_nvfp4(); }
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;

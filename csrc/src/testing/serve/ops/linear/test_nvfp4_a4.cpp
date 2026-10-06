@@ -1,4 +1,5 @@
 #include "ops/linear/linear_test_common.h"
+#include "ops/nvfp4_device.h"
 
 #include <array>
 #include <exception>
@@ -104,6 +105,7 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (!sinfer::test::nvfp4_device("NVFP4_A4 Linear")) { return 77; }
     try {
         const int failures = run_nvfp4_a4();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";

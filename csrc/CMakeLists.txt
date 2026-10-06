@@ -95,27 +95,26 @@ option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer
 # first-class targets in this project, EXCLUDE_FROM_ALL so `make build` cost
 # is unchanged. Build with e.g. `cmake --build <dir> --target
 # surogate-engine-cli`. Deps (json, cutlass) come from this file's
-# FetchContent; serve targets are pinned to sm_120a.
+# FetchContent; the serve targets build for SUROGATE_SERVE_CUDA_ARCHS below.
 option(SUROGATE_BUILD_SERVE "Expose the serve engine targets" ON)
 option(SUROGATE_SERVE_TESTS "Expose the serve engine test targets" OFF)
 option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
-# One binary for the RTX line the engine is built for: Ada (RTX 4090) and consumer/workstation
-# Blackwell (RTX 5090, RTX PRO 6000). The driver picks the cubin; nothing chooses at build time.
-# Hopper and datacenter Blackwell are deliberately absent: this engine's shape -- experts banked
-# in host memory, pipeline stages and expert gathers over PCIe -- is a PCIe machine's, and on
-# NVLink hardware neither the design nor the competition is the same.
+# One binary for the cards the engine is built for: Ada (RTX 4090, L4, L40), Hopper (H100,
+# H200, GH200) and consumer/workstation Blackwell (RTX 5090, RTX PRO 6000). The driver picks the
+# cubin; nothing chooses at build time. Datacenter Blackwell (sm_100/103) is absent: the `a`
+# cubins below load on exactly their own architecture, so a B200 would JIT the sm_89 PTX.
 #
 # A kernel family that only one of these architectures can run stays that architecture's alone
 # *inside* the one binary: `set_target_properties(<target> PROPERTIES CUDA_ARCHITECTURES 120a)`
-# below does that for the FP4 families, which keeps the fatbin from carrying an sm_89 copy of a
-# kernel sm_89 cannot execute.
+# below does that for the FP4 families, and `... 90a` for Hopper's block-scaled FP8 GEMM, which
+# keeps the fatbin from carrying a copy of a kernel the other architectures cannot execute.
 #
 # It does NOT cover every FP4 kernel. `ops/linear/nvfp4/nvfp4_w4a4.cu` lives in sinfer_ops and
 # so builds at this whole arch set: cuobjdump shows sm_89 cubins AND compute_89 PTX for the
 # w4a4 entries. Their sm_89 bodies are `__trap()`, so the refusal for those is a runtime one
 # (`validate_nvfp4_weight`), not this pinning. Do not read the paragraph above as covering them.
-set(SUROGATE_SERVE_CUDA_ARCHS "89;120a" CACHE STRING
-    "CUDA architectures for the serve engine targets (the RTX line: Ada and Blackwell)")
+set(SUROGATE_SERVE_CUDA_ARCHS "89;90a;120a" CACHE STRING
+    "CUDA architectures for the serve engine targets (Ada, Hopper and RTX Blackwell)")
 # A build machine missing FFmpeg or libcurl drops the serve targets with a status
 # line, which is right for a training-only tree and wrong for a wheel: it would
 # publish a package whose `surogate serve` exits 127 and say nothing. The wheel
@@ -917,14 +916,19 @@ function(sinfer_internal_includes target)
     ${SUROGATE_VENDOR_DIR}
     ${SUROGATE_VENDOR_DIR}/utf8proc
     ${SINFER_JSON_INCLUDE})
-  # Serve targets build for the RTX arch set (default 120a; sm_89 compiles
-  # via the upstream port guards, execution pending Ada hardware). Features
-  # above a device's capability gate off at runtime (FP8 plane needs sm_89+,
-  # the fp4 profile needs sm_120a). PIC everywhere so the archives can link
+  # Serve targets build for SUROGATE_SERVE_CUDA_ARCHS (default 89;90a;120a;
+  # sm_89 and sm_90a compile via the upstream port guards). Features above a
+  # device's capability gate off at runtime (FP8 plane needs sm_89+, the fp4
+  # profile needs sm_120a). PIC everywhere so the archives can link
   # into the _surogate_serve Python module as well as the executables.
   set_target_properties(${target} PROPERTIES
       CUDA_ARCHITECTURES "${SUROGATE_SERVE_CUDA_ARCHS}"
       POSITION_INDEPENDENT_CODE ON)
+  # Fatbins compressed for size (CUDA 12.8+; serve needs 13). Each architecture in the set adds
+  # a full cubin of every kernel, and this cuts what one adds: the 90a-only libsinfer.so went
+  # from 856 to 339 MB (575 to 235 MB deflated, as a wheel stores it), and the engine came up
+  # no slower (the driver decompresses a module when it loads it).
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>)
 endfunction()
 
 # Whole-program, not relocatable. Nothing in these archives references device code across
@@ -1034,6 +1038,31 @@ set_target_properties(sinfer_nvfp4_cutlass PROPERTIES
 target_compile_options(sinfer_nvfp4_cutlass PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
 target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
+# Hopper's block-scaled FP8 GEMM: vLLM's CUTLASS 3.x wgmma/TMA kernel for fine-grained FP8
+# checkpoints. sm_90a-specific (wgmma and the 90a TMA paths load on exactly sm_90), so it is
+# pinned to 90a like the FP4 archives are to 120a, whole-program for the same ptxas reason as
+# the CUTLASS archive above, and a build without 90a links a stub that declines every call.
+if("90a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "90a")
+  set(SINFER_FP8_BLOCK_SM90_REAL ON)
+  add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm.cu)
+else()
+  add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_stub.cpp)
+endif()
+sinfer_internal_includes(sinfer_fp8_block_sm90)
+target_include_directories(sinfer_fp8_block_sm90 PRIVATE
+  ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+set_target_properties(sinfer_fp8_block_sm90 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+if(SINFER_FP8_BLOCK_SM90_REAL)
+  set_target_properties(sinfer_fp8_block_sm90 PROPERTIES CUDA_ARCHITECTURES 90a)
+endif()
+target_compile_options(sinfer_fp8_block_sm90 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # TensorRT-LLM's CUTLASS fused-MoE runner, vendored from FlashInfer 0.6.16.post3
 # (src/third_party/trtllm_moe, Apache-2.0; NOTICE there records provenance). It is the kernel
@@ -1487,12 +1516,13 @@ sinfer_internal_includes(sinfer_ops)
 # default; vendoring a snapshot is tracked.
 # cutlass comes from the main project's FetchContent (v4.6.1).
 set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
-# The CPU expert-compute kernels carry their own AVX-512 code path (runtime-detected); the
-# rest of the engine stays generic x86-64.
-set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
-  COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
+# The CPU expert-compute kernels carry their own AVX-512 code path (target attributes, chosen at
+# run time); the file, like the rest of the engine, compiles for generic x86-64. File-wide
+# -mavx512* flags let the compiler put AVX-512 into the scalar fallbacks and the pool's
+# constructor, which then died with SIGILL on hosts without it (seen on one of Modal's H100
+# machines; four other serve tests that build a pool died the same way).
 sinfer_cuda_archive(sinfer_ops)
-target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe CUDA::cublasLt)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
@@ -1636,7 +1666,7 @@ endif()
 set(SINFER_SHARED_ARCHIVES "")
 foreach(candidate IN ITEMS
     sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
-    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe sinfer_media_decode
+    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_trtllm_moe sinfer_media_decode
     sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
     sinfer_product_load_progress sinfer_product_cuda_visibility)
   if(TARGET ${candidate})

@@ -1,7 +1,7 @@
 """Python wrapper for the serve engine (_surogate_serve extension).
 
 The extension is a separate module from _surogate: the serve engine is
-arch-gated (sm_120-class GPUs today) and its kernel payload is large, so it
+arch-gated (Ada, Hopper and RTX Blackwell) and its kernel payload is large, so it
 never rides along with the training binding. `make serve-build` produces and
 copies it next to the training extensions; in a source checkout the loader
 also finds it in csrc/build-serve.
@@ -32,8 +32,8 @@ def _load_extension():
             spec.loader.exec_module(module)
             return module
     raise ImportError(
-        "_surogate_serve is not built. Run `make serve-build` (requires an "
-        "sm_120-class toolchain; see csrc/src/serve/PATCHES.md #26 for the "
+        "_surogate_serve is not built. Run `make serve-build` (requires a "
+        "CUDA 13 toolchain; see csrc/src/serve/PATCHES.md #26 for the "
         "architecture ladder)."
     )
 

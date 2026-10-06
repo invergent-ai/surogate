@@ -1,4 +1,5 @@
 #include "api/ops/attn_input_proj.h"
+#include "ops/nvfp4_device.h"
 #include "api/ops/gdn_input_proj.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
@@ -204,6 +205,7 @@ int main() {
         failures += run(384, 512, 128, tokens);
     }
     for (int tokens : {1, 7, 33}) {
+        if (!sinfer::test::nvfp4_device("checkpoint_projection mixed NVFP4")) { break; }
         for (bool pair : {false, true}) {
             for (bool quantized_first : {false, true}) {
                 failures += mixed_projection(tokens, pair, quantized_first);

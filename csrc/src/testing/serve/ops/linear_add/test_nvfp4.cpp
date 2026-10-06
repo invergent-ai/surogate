@@ -1,4 +1,5 @@
 #include "api/ops/linear_add.h"
+#include "ops/nvfp4_device.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -190,6 +191,7 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (!sinfer::test::nvfp4_device("linear_add NVFP4")) { return 77; }
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);

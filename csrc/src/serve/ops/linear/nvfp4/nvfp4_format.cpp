@@ -69,8 +69,10 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
     //
     // `!= 120`, not `< 120`: the FP4 archives are pinned `120a`, which loads
     // on exactly sm_120. On sm_121 or sm_100 the driver JITs the fatbin's only
-    // other PTX, compute_89, whose W4A4 body is __trap(). cuobjdump on the
-    // built library shows the arch set is exactly {sm_89, sm_120a}.
+    // other PTX, compute_89, whose W4A4 body is __trap(). The default arch set
+    // is {sm_89, sm_90a, sm_120a}; the sm_90a cubin (H100/H200) is built with
+    // __CUDA_ARCH__ == 900 and its W4A4 body is __trap() as well, and the
+    // `a` PTX beside each cubin JITs only on its own architecture.
     //
     // This is the chokepoint: every NVFP4 wrapper (linear, linear_swiglu,
     // attn_input_proj, linear_add, gdn_input_proj) calls this before any NVFP4
