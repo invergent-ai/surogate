@@ -2,12 +2,14 @@
 
 // sinfer::ops::detail - private launch prototypes for gqa_attention policies.
 
+#include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "api/ops/gqa_attention.h"
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace sinfer::ops::detail {
@@ -120,5 +122,30 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream, std::int32_t sliding_window,
                                            GqaBlockMask selection = {});
+
+// The route for shapes with no tuned kernel (gqa_attention_generic.cu): any query group over a
+// registered (head dim, KV heads) pair, every batch row and column in one launch, each query's
+// history split across CTAs while the columns alone leave the device idle. Splits depend on the
+// query-head and column counts and the device, never on the history; one under --batch-invariant.
+[[nodiscard]] int gqa_generic_attention_splits(std::int32_t q_heads, std::int32_t columns,
+                                               std::uint32_t max_visible_keys);
+[[nodiscard]] std::size_t gqa_generic_attention_workspace_bytes(std::int32_t head_dim,
+                                                                std::int32_t q_heads,
+                                                                std::int32_t columns,
+                                                                std::int32_t splits);
+[[nodiscard]] bool gqa_generic_attention_serves(std::int32_t head_dim, DType cache_dtype);
+
+void gqa_generic_attention_launch(const Tensor& q, const Tensor& positions,
+                                  const Tensor& valid_columns, const Tensor& table_rows,
+                                  float scale, const PagedKVBatchLayerView& cache,
+                                  std::int32_t sliding_window, std::int32_t splits,
+                                  DeviceSpan workspace, Tensor& out, cudaStream_t stream);
+void gqa_generic_attention_launch(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache, std::int32_t sliding_window,
+                                  std::int32_t splits, DeviceSpan workspace, Tensor& out,
+                                  cudaStream_t stream);
+void gqa_generic_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                  const Tensor& valid_columns, const Tensor& table_rows,
+                                  const PagedKVBatchLayerView& cache, cudaStream_t stream);
 
 } // namespace sinfer::ops::detail

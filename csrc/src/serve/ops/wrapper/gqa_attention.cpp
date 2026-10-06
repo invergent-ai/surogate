@@ -500,6 +500,35 @@ bool fa3_takes_generic_prompt(const Tensor& q, const Tensor& valid_columns,
            fa3_takes_prompt(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, q.ne[2]);
 }
 
+// Every other width of such a geometry -- decode and verify rows on any GPU, and prompts where
+// FA3 is not available -- takes the generic split-KV route (gqa_attention_generic.cu), save for
+// the masks only the prompt kernel applies: a QSA selection and an image's bidirectional block.
+bool generic_takes(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
+                   DType cache_dtype, const GqaBlockMask& selection) {
+    return !selection.words && !selection.image_end &&
+           !gqa_shape_is_registered(head_dim, q_heads, kv_heads) &&
+           detail::gqa_generic_attention_serves(head_dim, cache_dtype);
+}
+
+// How many CTAs share a query's history on the generic route. A width FA3 takes for one sequence
+// is never split: the plan books FA3's scratch for it, and a masked sequence of that width that
+// lands here instead must not need more.
+int generic_splits(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
+                   DType cache_dtype, std::int32_t batch, std::int32_t width) {
+    if (batch == 1 && fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype, width)) {
+        return 1;
+    }
+    return detail::gqa_generic_attention_splits(q_heads, batch * width,
+                                                kGqaAttentionMaximumVisibleKeys);
+}
+
+DeviceSpan allocate_generic_workspace(WorkspaceArena& workspace, std::int32_t head_dim,
+                                      std::int32_t q_heads, std::int32_t columns, int splits) {
+    const std::size_t bytes =
+        detail::gqa_generic_attention_workspace_bytes(head_dim, q_heads, columns, splits);
+    return bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+}
+
 void launch_cached_prompt_tiles(const Tensor& q, const Tensor& positions,
                                  const Tensor& parent_valid, const Tensor& parent_row,
                                  float scale, PagedKVBatchLayerView cache,
@@ -661,12 +690,32 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
     }
 
     if (!optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype)) {
-        // The generic kernel needs none; FA3 (fa3_takes_generic_prompt) needs its scratch, which
-        // grows with the width.
-        if (!fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype, max_width)) { return 0; }
-        WorkspaceLayoutBuilder layout;
-        (void)allocate_fa3_prompt_workspace(layout, head_dim, q_heads, max_width, 1, cache_dtype);
-        return layout.peak_bytes(1);
+        // FA3 (fa3_takes_generic_prompt) needs its scratch, which grows with the width; the
+        // generic split-KV route (generic_takes) its partials while it splits, which it does
+        // only for a few columns.
+        const auto fa3_width = [&](std::int32_t width) {
+            return batch_size == 1 && fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype, width);
+        };
+        std::size_t bytes = 0;
+        if (fa3_width(max_width)) {
+            WorkspaceLayoutBuilder layout;
+            (void)allocate_fa3_prompt_workspace(layout, head_dim, q_heads, max_width, 1, cache_dtype);
+            bytes = layout.peak_bytes(1);
+        }
+        if (generic_takes(head_dim, q_heads, kv_heads, cache_dtype, {})) {
+            // Splits never grow with the width, so the first unsplit width ends the walk.
+            for (std::int32_t width = min_width; width <= max_width; ++width) {
+                const std::int32_t columns = batch_size * width;
+                const int splits =
+                    generic_splits(head_dim, q_heads, kv_heads, cache_dtype, batch_size, width);
+                if (splits <= 1) { break; }
+                WorkspaceLayoutBuilder layout;
+                (void)layout.alloc_bytes(detail::gqa_generic_attention_workspace_bytes(
+                    head_dim, q_heads, columns, splits));
+                bytes = std::max(bytes, layout.peak_bytes(1));
+            }
+        }
+        return bytes;
     }
 
     const auto chunk_capacity = [&](std::int32_t width) {
@@ -782,6 +831,19 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                               workspace, out, stream);
             return;
         }
+        if (generic_takes(head_dim, q.ne[1], kv_heads, cache.dtype, selection)) {
+            auto scope = workspace.scope();
+            detail::gqa_generic_kv_append_launch(k, v, positions, valid_columns, kv_table_rows,
+                                                 cache, stream);
+            const int splits =
+                generic_splits(head_dim, q.ne[1], kv_heads, cache.dtype, batch, width);
+            const DeviceSpan partials =
+                allocate_generic_workspace(workspace, head_dim, q.ne[1], width * batch, splits);
+            detail::gqa_generic_attention_launch(q, positions, valid_columns, kv_table_rows, scale,
+                                                 cache, envelope.sliding_window, splits, partials,
+                                                 out, stream);
+            return;
+        }
         detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                             scale, cache, out, stream, envelope.sliding_window,
                                             selection);
@@ -863,6 +925,17 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
                               workspace, out, stream);
             return;
         }
+        if (generic_takes(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, selection)) {
+            auto scope = workspace.scope();
+            const int splits =
+                generic_splits(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, batch, width);
+            const DeviceSpan partials =
+                allocate_generic_workspace(workspace, q.ne[0], q.ne[1], width * batch, splits);
+            detail::gqa_generic_attention_launch(q, positions, valid_columns, kv_table_rows, scale,
+                                                 cache, envelope.sliding_window, splits, partials,
+                                                 out, stream);
+            return;
+        }
         detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows,
                                                    scale, cache, out, stream,
                                                    envelope.sliding_window, selection);
@@ -917,6 +990,17 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         if (fa3_takes_generic_prompt(q, Tensor{}, batch_cache, selection)) {
             launch_fa3_prompt(q, positions, Tensor{}, scale, envelope.sliding_window, batch_cache,
                               workspace, out, stream);
+            return;
+        }
+        if (generic_takes(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, selection)) {
+            auto scope = workspace.scope();
+            const int splits =
+                generic_splits(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, 1, q.ne[2]);
+            const DeviceSpan partials =
+                allocate_generic_workspace(workspace, q.ne[0], q.ne[1], q.ne[2], splits);
+            detail::gqa_generic_attention_launch(q, positions, scale, cache,
+                                                 envelope.sliding_window, splits, partials, out,
+                                                 stream);
             return;
         }
         detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,

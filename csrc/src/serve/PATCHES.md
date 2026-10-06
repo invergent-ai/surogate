@@ -3870,3 +3870,41 @@ scratch for them. Qwen3-8B on one H100, one 2,048-token prompt: 9.35 s to the fi
 prompt tok/s against 11.5k with FA3 off. Tests: FP8 wide prompts at head dims 128 and 64, under
 windows of 512 and 128, and for Qwen3-8B's shape (FA3 2.9-3.7 % relative L2 against the BF16-query
 oracle, the tiles about 0.2 %); BF16 wide prompts of three unregistered shapes.
+
+## 104
+
+**Models outside the tuned shapes (2026-10-06, after #103).** Benchmarking two models nothing had been
+tuned for, Qwen3-8B (W8; 32 query heads over 8 at head dim 128, a pairing the GQA registry does not
+carry) and Gemma 4 E4B, on an H100 showed three engine-wide gaps.
+
+- **Attention for unregistered query groups** (`ops/launcher/gqa_attention_generic.cu`). A shape whose
+  (head dim, KV heads) pair is registered but whose query count is not was served by one warp per
+  query head and column walking the history a key at a time, each batch row its own launch, its
+  append too: ~3.5 ms per layer for a Qwen3-8B decode step, about 8 tokens/s. Such shapes now take a
+  split-KV route for every width FA3 does not take (decode and verify rows on any GPU; prompts off
+  Hopper): one launch for every row and column, four warps per CTA on interleaved keys with a group of
+  lanes per key (several keys in flight per warp), each query's history split across CTAs while the
+  columns alone leave the device idle (two CTAs per SM; never under `--batch-invariant`), partials
+  merged in split order by a reduce kernel; the BF16/e4m3 append is one launch as well (int8 keeps the
+  tuned fill). Head dims 64-512, BF16, e4m3 and int8 caches, sliding windows; QSA selections and image
+  blocks stay on the prompt kernel. The workspace plan books the partials per width, exactly as the
+  launch takes them.
+- **W8 SwiGLU for unaligned plans** (98055e3). A fused gate/up projection with no registered plan ran
+  the per-output kernel, 28 % of a Qwen3-8B prompt; any shape the MMA tiles' alignment admits now
+  takes them.
+- **Mixed-round samplers** (ad21cbb). A mixed round samples its finishing prompts and its decode rows
+  while the prompt chunk's roots are live, and the plan had booked one sampler row there. Gemma 4
+  E4B's 262K vocabulary made the sampler the arena's largest user, and 64 users ran it out by
+  960,000 bytes in the first mixed round with 63 decode rows; the prompt plans now book
+  max(batch, finishing prompts) rows. The same load: no errors, 1,510 decode tok/s.
+
+Qwen3-8B, one H100, with #103's FA3 for its prompts: one 2,048-token prompt 9.35 s to the first token
+before, 0.23 s after; one stream decodes at ~83 tok/s (was ~8); 32 users with 2,048-token prompts
+finish in 9.8 s (68 s before); 64 users at 512/128 decode 1,610 tok/s. Its prompts are now W8-GEMM
+bound (93 % of prefill GPU time on the `mma.sync` tiles): vLLM serves the FP8 checkpoint through
+DeepGEMM at 54.5k prompt tok/s against our 8.5k, and only the Qwen3.5/3.6 converters read FP8
+checkpoints so far.
+
+Tests. `sinfer_gqa_attention_test`: Qwen3-8B decode rows (one row over 2,000 keys, four rows with a
+masked one, width 4, int8), one- and three-column queries with and without a 300-key window, and e4m3
+decode for three unregistered shapes, all against the oracle at the BF16 bound (~0.17 % relative L2).

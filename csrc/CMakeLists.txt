@@ -1224,6 +1224,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
   ${SERVE_ROOT}/ops/launcher/swa.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_generic.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_prefill.cu
   ${SERVE_ROOT}/ops/launcher/kv_cache_append_prefix.cu
   ${SERVE_ROOT}/ops/launcher/l2norm.cu

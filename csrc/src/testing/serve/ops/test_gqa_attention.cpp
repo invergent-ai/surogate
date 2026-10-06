@@ -2089,6 +2089,11 @@ int verify_fp8_wide_prompts() {
         {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 200, 300, 817u, 128},
         // No tuned kernels for this query group: FA3 on an H100, the generic kernel otherwise.
         {Geometry{"qwen3-8b", 32, 8, 128}, 1000, 200, 818u},
+        // Below FA3's width the generic split-KV route, its history split across CTAs.
+        {Geometry{"qwen3-8b", 32, 8, 128}, 2000, 1, 819u},
+        {Geometry{"qwen3-8b", 32, 8, 128}, 1500, 3, 820u, 256},
+        {Geometry{"fallback-12q4-d256", 12, 4, 256}, 1000, 1, 821u},
+        {Geometry{"fallback-16q8-d64", 16, 8, 64}, 700, 2, 822u},
     };
     constexpr int pages = 64;
     constexpr float scale = 1.0F / 16.0F;
@@ -2184,7 +2189,7 @@ int verify_fp8_wide_prompts() {
             ops::gqa_attention_cached(q, query_pos, scale, cache, envelope, scratch, out, nullptr);
             cuda_synchronize();
             ops::set_batch_invariant(false);
-            const bool flash = !invariant && major == 9;
+            const bool flash = !invariant && major == 9 && c.tokens >= 32;
             const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
                                       " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +
                                       " window=" + std::to_string(c.window) +
@@ -2240,6 +2245,26 @@ int main() {
               AttentionCase{66, 63, 129, 2302U, 32}}) {
             failures += run_a1_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
             failures += run_a3_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
+        }
+    }
+    // Decode rows of such a shape: every row in one launch, each query's history split across
+    // CTAs while the rows leave the device idle (one row: nine splits on an H100; four: three).
+    {
+        const Geometry qwen3_8b{"qwen3_8b", 32, 8, 128};
+        failures += run_batch_case(qwen3_8b, DType::BF16,
+            {1, {2000}, {1}, {0}, MappingPattern::Fragmented, 2400U});
+        failures += run_batch_case(qwen3_8b, DType::BF16,
+            {1, {61, 1500, 700, 3000}, {1, 1, 0, 1}, {3, 0, 2, 1}, MappingPattern::Fragmented, 2401U});
+        failures += run_batch_case(qwen3_8b, DType::BF16,
+            {4, {300, 1100}, {4, 2}, {1, 0}, MappingPattern::Fragmented, 2402U});
+        failures += run_batch_case(qwen3_8b, DType::I8,
+            {2, {900, 300}, {2, 1}, {1, 0}, MappingPattern::Fragmented, 2403U});
+        for (const int tokens : {1, 3}) {
+            const AttentionCase test_case{tokens, 1800, 2048, 2410U + tokens};
+            failures += run_a1_case(qwen3_8b, DType::BF16, test_case, MappingPattern::Fragmented);
+            failures += run_a3_case(qwen3_8b, DType::BF16, test_case, MappingPattern::Fragmented);
+            const AttentionCase windowed{tokens, 1800, 2048, 2420U + tokens, 300};
+            failures += run_a1_case(qwen3_8b, DType::BF16, windowed, MappingPattern::Fragmented);
         }
     }
     for (const Geometry geometry : {Geometry{"gemma3_image",8,4,256}, Geometry{"gemma4_image",8,1,256}}) {
