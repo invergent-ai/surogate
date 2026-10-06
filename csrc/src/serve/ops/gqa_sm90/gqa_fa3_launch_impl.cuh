@@ -10,13 +10,13 @@
 
 namespace sinfer::ops::detail::gqa_fa3 {
 
-template <int HeadDim, bool Fp8, bool Local>
+template <int HeadDim, bool Fp8, bool Local, bool Split>
 void launch(Flash_fwd_params& params, cudaStream_t stream) {
     using Element = std::conditional_t<Fp8, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
     run_flash_fwd</*Arch=*/90, HeadDim, HeadDim, /*ClusterM=*/1, Element, cutlass::bfloat16_t,
                   /*Is_causal=*/!Local, /*Is_local=*/Local, /*Has_softcap=*/false, /*Varlen=*/true,
                   /*PagedKVNonTMA=*/true, /*AppendKV=*/false, /*HasQv=*/false,
-                  /*PackGQA=*/true, /*Split=*/false, /*V_colmajor=*/false>(params, stream);
+                  /*PackGQA=*/true, Split, /*V_colmajor=*/false>(params, stream);
 }
 
 } // namespace sinfer::ops::detail::gqa_fa3

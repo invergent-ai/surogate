@@ -27,6 +27,8 @@
 #include "core/tensor.h"
 #include "family/impl/lora_hook.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 
@@ -36,7 +38,8 @@ namespace sinfer::family {
 
 /// The whole MLP, residual += down(silu(gate) * up), on the route that never materialises
 /// the activation. Only where nothing needs it: no adapter on gate, up or down (adapters
-/// read and write the BF16 activation), and both projections on the wide NVFP4 route.
+/// read and write the BF16 activation), and both projections on the wide NVFP4 route or
+/// both block FP8 past the decode GEMV's widths.
 /// Returns false without touching anything when the route does not serve the call, and
 /// the caller runs `swiglu_mlp` and `linear_add` as before.
 inline bool swiglu_mlp_down_add(const Tensor& hidden, const Weight& gate_up, const Weight& down,
@@ -52,13 +55,27 @@ inline bool swiglu_mlp_down_add(const Tensor& hidden, const Weight& gate_up, con
 }
 
 /// The fused route's transient capacity, for a plan that must hold it beside the unfused
-/// pair's (`swiglu_mlp_layout` plus the down projection's `linear_add` capacity).
+/// pair's (`swiglu_mlp_layout` plus the down projection's `linear_add` capacity). Nothing when
+/// the pair's formats never take the route.
 inline void swiglu_mlp_down_add_layout(WorkspaceLayoutBuilder& layout, std::int32_t intermediate,
-                                       std::int32_t hidden, ops::LinearPolicy policy,
-                                       std::int32_t first, std::int32_t last) {
+                                       std::int32_t hidden, QType gate_up_qtype, QType down_qtype,
+                                       ops::LinearPolicy policy, std::int32_t first,
+                                       std::int32_t last) {
+    if (!ops::linear_swiglu_down_add_formats(gate_up_qtype, down_qtype, policy)) { return; }
     auto scope = layout.scope();
     (void)layout.alloc_bytes(ops::linear_swiglu_down_add_workspace_capacity_bytes(
-        intermediate, hidden, policy, first, last));
+        gate_up_qtype, intermediate, hidden, policy, first, last));
+}
+
+/// `peak`, or the fused route's capacity for this pair where that is larger: what a post-mixer
+/// plan returns so that either route fits.
+[[nodiscard]] inline std::size_t with_swiglu_mlp_down_add(std::size_t peak, std::int32_t intermediate,
+                                                          std::int32_t hidden, QType gate_up_qtype,
+                                                          QType down_qtype, ops::LinearPolicy policy,
+                                                          std::int32_t first, std::int32_t last) {
+    WorkspaceLayoutBuilder fused;
+    swiglu_mlp_down_add_layout(fused, intermediate, hidden, gate_up_qtype, down_qtype, policy, first, last);
+    return std::max(peak, fused.peak_bytes(1));
 }
 
 /// Whether this fused parent's two halves can be projected on their own.

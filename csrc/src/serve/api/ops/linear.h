@@ -131,7 +131,10 @@ struct LinearProjection {
 
 /// Projects one input into disjoint outputs, sharing activation preparation where
 /// the stored formats permit it. Outputs must not alias the input or each other.
-/// Scratch capacity is the maximum of the individual projections, not their sum.
+/// Scratch capacity is the maximum of the individual projections, not their sum. Block FP8
+/// runs consecutive row ranges of one parent as one launch; on Hopper that stages the rows,
+/// which an arena of fp8_block::projections_workspace_capacity_bytes has room for (a smaller
+/// one runs the ranges one by one).
 /// Row ranges retain linear_rows' A16 policy; whole matrices use their own policy.
 void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
                         WorkspaceArena* workspace, cudaStream_t stream);

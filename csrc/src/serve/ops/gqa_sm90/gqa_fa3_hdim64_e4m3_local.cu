@@ -4,6 +4,6 @@
 
 namespace sinfer::ops::detail::gqa_fa3 {
 
-template void launch<64, true, true>(Flash_fwd_params& params, cudaStream_t stream);
+template void launch<64, true, true, false>(Flash_fwd_params& params, cudaStream_t stream);
 
 } // namespace sinfer::ops::detail::gqa_fa3

@@ -2,6 +2,7 @@
 
 #include "api/ops/linear.h"
 #include "core/layout.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
@@ -15,21 +16,24 @@ namespace sinfer::ops {
 
 namespace {
 
-bool fused_swiglu_vetoed() {
-    static const bool vetoed = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_NVFP4_FUSED_SWIGLU");
-        return raw != nullptr && std::strcmp(raw, "0") == 0;
-    }();
-    return vetoed;
+bool vetoed(const char* name) {
+    const char* raw = std::getenv(name);
+    return raw != nullptr && std::strcmp(raw, "0") == 0;
 }
 
-} // namespace
+bool fused_swiglu_vetoed() {
+    static const bool v = vetoed("SUROGATE_SERVE_NVFP4_FUSED_SWIGLU");
+    return v;
+}
 
-bool linear_swiglu_down_add_admits(const Weight& gate_up, const Weight& down, LinearPolicy policy,
-                                   std::int32_t tokens) {
-    if (fused_swiglu_vetoed() || policy != LinearPolicy::AllowA4 || tokens <= 0) { return false; }
+bool fp8_fused_swiglu_vetoed() {
+    static const bool v = vetoed("SUROGATE_SERVE_FP8_BLOCK_FUSED_SWIGLU");
+    return v;
+}
+
+bool nvfp4_admits(const Weight& gate_up, const Weight& down, LinearPolicy policy, std::int32_t tokens) {
+    if (fused_swiglu_vetoed() || policy != LinearPolicy::AllowA4) { return false; }
     if (gate_up.qtype != QType::NVFP4 || down.qtype != QType::NVFP4) { return false; }
-    if (gate_up.n != 2 * down.k || gate_up.k != down.n) { return false; }
     if (!detail::is_nvfp4_linear_problem(gate_up.n, gate_up.k) ||
         !detail::is_nvfp4_linear_problem(down.n, down.k)) {
         return false;
@@ -39,7 +43,29 @@ bool linear_swiglu_down_add_admits(const Weight& gate_up, const Weight& down, Li
     return detail::nvfp4_cublaslt_route(tokens) && detail::nvfp4_linear_add_w4a4_wide(down, tokens);
 }
 
-std::size_t linear_swiglu_down_add_workspace_capacity_bytes(std::int32_t intermediate,
+// Block FP8 quantises the down projection's activation on every round past the decode GEMV's
+// widths for that weight, whatever the policy; the GEMV reads the BF16 activation, so those
+// rounds stay unfused.
+bool fp8_block_admits(const Weight& gate_up, const Weight& down, std::int32_t tokens) {
+    return !fp8_fused_swiglu_vetoed() && detail::fp8_block::is_fp8_block_qtype(gate_up.qtype) &&
+           detail::fp8_block::is_fp8_block_qtype(down.qtype) &&
+           detail::fp8_block::quantizes_activations(down, tokens);
+}
+
+} // namespace
+
+bool linear_swiglu_down_add_admits(const Weight& gate_up, const Weight& down, LinearPolicy policy,
+                                   std::int32_t tokens) {
+    if (tokens <= 0 || gate_up.n != 2 * down.k || gate_up.k != down.n) { return false; }
+    return nvfp4_admits(gate_up, down, policy, tokens) || fp8_block_admits(gate_up, down, tokens);
+}
+
+bool linear_swiglu_down_add_formats(QType gate_up, QType down, LinearPolicy policy) noexcept {
+    if (gate_up == QType::NVFP4 && down == QType::NVFP4) { return policy == LinearPolicy::AllowA4; }
+    return detail::fp8_block::is_fp8_block_qtype(gate_up) && detail::fp8_block::is_fp8_block_qtype(down);
+}
+
+std::size_t linear_swiglu_down_add_workspace_capacity_bytes(QType qtype, std::int32_t intermediate,
                                                             std::int32_t hidden,
                                                             LinearPolicy policy,
                                                             std::int32_t min_tokens,
@@ -47,17 +73,26 @@ std::size_t linear_swiglu_down_add_workspace_capacity_bytes(std::int32_t interme
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_swiglu_down_add workspace: invalid token interval");
     }
+    const bool fp8 = detail::fp8_block::is_fp8_block_qtype(qtype);
+    if (!fp8 && qtype != QType::NVFP4) {
+        throw std::invalid_argument("linear_swiglu_down_add workspace: NVFP4 or block FP8 only");
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {2 * intermediate, max_tokens});
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(linear_workspace_capacity_bytes(QType::NVFP4, 2 * intermediate,
+        (void)layout.alloc_bytes(linear_workspace_capacity_bytes(qtype, 2 * intermediate,
                                                                 hidden, policy, min_tokens,
                                                                 max_tokens));
     }
     {
         auto scope = layout.scope();
-        (void)detail::allocate_nvfp4_w4a4_workspace(layout, max_tokens, intermediate);
+        if (fp8) {
+            (void)layout.alloc_bytes(
+                detail::fp8_block::linear_workspace_capacity_bytes(hidden, intermediate, max_tokens));
+        } else {
+            (void)detail::allocate_nvfp4_w4a4_workspace(layout, max_tokens, intermediate);
+        }
     }
     return layout.peak_bytes(1);
 }
@@ -74,6 +109,10 @@ void linear_swiglu_down_add(const Tensor& x, const Weight& gate_up, const Weight
     {
         auto gemm_scope = ws.scope();
         linear(x, gate_up, projected, policy, ws, stream);
+    }
+    if (detail::fp8_block::is_fp8_block_qtype(down.qtype)) {
+        detail::fp8_block::swiglu_linear_add(projected, down, residual, limit, &ws, stream);
+        return;
     }
     const detail::Nvfp4W4a4Workspace operand =
         detail::allocate_nvfp4_w4a4_workspace(ws, tokens, down.k);

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -26,6 +27,32 @@ using namespace sinfer;
 using namespace sinfer::test;
 
 namespace {
+
+// Hopper's FA3 takes decode and verify rows over a BF16 cache (gqa_attention.cpp,
+// fa3_takes_rows, at the default switches). The plan still books the routes a QSA or image round
+// of the same width takes, so such a round's high-water is the rows' own, at most the query's.
+bool fa3_takes_rows(int head_dim, int q_heads, int kv_heads, DType dtype, std::int32_t width,
+                    std::int32_t batch, bool image) {
+    static const bool hopper = [] {
+        int device = 0, major = 0, minor = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        const auto on = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        };
+        return major == 9 && minor == 0 && on("SUROGATE_SERVE_GQA_FA3") && on("SUROGATE_SERVE_GQA_FA3_ROWS");
+    }();
+    return hopper && !image && width <= 16 && !(batch == 1 && width >= 32) &&
+           !ops::batch_invariant() && dtype == DType::BF16 &&
+           (head_dim == 64 || head_dim == 128 || head_dim == 256) && q_heads % kv_heads == 0;
+}
+
+bool high_water_matches(const WorkspaceArena& workspace, std::size_t planned, bool rows) {
+    return workspace.used() == 0 && (rows ? workspace.peak_used() > 0 && workspace.peak_used() <= planned
+                                          : workspace.peak_used() == planned);
+}
 
 constexpr std::int32_t kHeadDim       = 256;
 constexpr std::int32_t kQuantGroup    = 64;
@@ -1059,7 +1086,9 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     failures += verify_positions(label + " table row unchanged", dtable_row, {table_row});
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != (test_case.image_end ? 0 : workspace_bytes)) {
+    if (!high_water_matches(workspace, test_case.image_end ? 0 : workspace_bytes,
+                            fa3_takes_rows(geometry.head_dim, geometry.q_heads, geometry.kv_heads, dtype,
+                                           test_case.tokens, 1, test_case.image_end != 0))) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -1127,7 +1156,9 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != (test_case.image_end ? 0 : workspace_bytes)) {
+    if (!high_water_matches(workspace, test_case.image_end ? 0 : workspace_bytes,
+                            fa3_takes_rows(geometry.head_dim, geometry.q_heads, geometry.kv_heads, dtype,
+                                           test_case.tokens, 1, test_case.image_end != 0))) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -1322,7 +1353,9 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
         verify_positions(label + " table rows unchanged", dtable_rows, test_case.table_rows);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (!high_water_matches(workspace, workspace_bytes,
+                            fa3_takes_rows(geometry.head_dim, geometry.q_heads, geometry.kv_heads, dtype,
+                                           test_case.width, batch, false))) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -2065,9 +2098,11 @@ int verify_workspace_capacity_contract() {
 
 } // namespace
 
-// Wide prompts over an e4m3 cache, against attention in double over the cache's own codes with
-// the BF16 queries. On an H100 the default run takes FlashAttention-3's FP8 kernel (e4m3 queries
-// and probabilities, kAttentionFp8QueryCriterion); --batch-invariant keeps the split-KV tiles,
+// Wide prompts and decode rows over an e4m3 cache, against attention in double over the cache's
+// own codes with the BF16 queries. On an H100 the default run takes FlashAttention-3's FP8 kernel
+// for prompts (e4m3 queries and probabilities, kAttentionFp8QueryCriterion) and the split-KV
+// kernels for rows, whose sums FA3's FP8 accumulator would lose over a long history (see
+// test_gqa_long_context.cpp); --batch-invariant keeps the split-KV tiles,
 // which read the same codes with BF16 queries and keep the BF16 bound. Elsewhere both runs take
 // the tiles. Keys and queries span [-2, 2], so scores reach the peaked softmax a QK-normed model
 // sees, over scattered pages and histories that cross FA3's 128-key tiles.
@@ -2089,7 +2124,7 @@ int verify_fp8_wide_prompts() {
         {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 200, 300, 817u, 128},
         // No tuned kernels for this query group: FA3 on an H100, the generic kernel otherwise.
         {Geometry{"qwen3-8b", 32, 8, 128}, 1000, 200, 818u},
-        // Below FA3's width the generic split-KV route, its history split across CTAs.
+        // Decode and verify rows: the generic split-KV route, its history split across CTAs.
         {Geometry{"qwen3-8b", 32, 8, 128}, 2000, 1, 819u},
         {Geometry{"qwen3-8b", 32, 8, 128}, 1500, 3, 820u, 256},
         {Geometry{"fallback-12q4-d256", 12, 4, 256}, 1000, 1, 821u},

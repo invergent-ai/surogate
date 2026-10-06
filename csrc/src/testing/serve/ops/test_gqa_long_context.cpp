@@ -81,7 +81,8 @@ int verify(int dim, int heads, int kv_heads, DType dtype, int batch, int width, 
                                   cache, envelope, scratch, out, stream, selection);
     };
     int failures = 0;
-    for (int context : {262144, 262145, kContext}) {
+    // The graph is captured at the first history and replayed at the rest, the last a short one.
+    for (int context : {262144, 262145, kContext, 300}) {
         std::vector<int> pos(batch * width);
         std::vector<std::uint32_t> bits(mask.numel(), 0);
         std::vector<double> expected(batch * width * kv_heads);
@@ -162,6 +163,15 @@ int main() {
         }
         failures += verify(256, 24, 4, DType::I8, 1, 1, false);
         failures += verify(256, 24, 4, DType::I8, 2, 6, false);
+        // Qwen3-8B's query group (no tuned kernels) and the 35B's. Over BF16 an H100 runs these
+        // rows on FlashAttention-3, each history split as its scheduler decides from the lengths
+        // a replay reads. Over e4m3 they stay on the split-KV kernels: FA3's FP8 kernel sums P.V
+        // on FP8 wgmma, whose accumulator lost a third of this uniform average at 262K keys and
+        // five sixths at 1M.
+        for (auto dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+            failures += verify(128, 32, 8, dtype, 3, 1, false);
+            failures += verify(256, 16, 2, dtype, 2, 4, false);
+        }
         std::cout << "long-context attention: " << (failures ? "FAIL" : "PASS") << '\n';
         return failures != 0;
     } catch (const std::exception& error) {

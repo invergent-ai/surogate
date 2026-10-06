@@ -440,12 +440,12 @@ Fa3PromptWorkspace allocate_fa3_prompt_workspace(Allocator& workspace, std::int3
                           head_dim, q_heads, tokens, segments, cache_dtype == DType::FP8_E4M3FN))};
 }
 
-detail::gqa_fa3::PagedPrefill fa3_launch(const Tensor& q, const PagedKVBatchLayerView& cache,
+detail::gqa_fa3::PagedLaunch fa3_launch(const Tensor& q, const PagedKVBatchLayerView& cache,
                                          float scale, std::int32_t sliding_window, Tensor& out,
                                          std::int32_t segments, std::int32_t max_q,
                                          const Tensor& metadata) {
     auto* m = static_cast<std::int32_t*>(metadata.data);
-    detail::gqa_fa3::PagedPrefill args;
+    detail::gqa_fa3::PagedLaunch args;
     args.head_dim       = q.ne[0];
     args.q              = q.data;
     args.out            = out.data;
@@ -459,7 +459,7 @@ detail::gqa_fa3::PagedPrefill fa3_launch(const Tensor& q, const PagedKVBatchLaye
     args.q_heads        = q.ne[1];
     args.kv_heads       = cache.num_kv_heads;
     args.segments       = segments;
-    args.total_q        = q.ne[2];
+    args.total_q        = q.ne[2] * q.ne[3];
     args.max_q          = max_q;
     // [offsets(segments + 1) | lengths | kv lengths | rows], as gqa_fa3::metadata_ints lays out.
     args.q_offsets  = m;
@@ -498,6 +498,75 @@ bool fa3_takes_generic_prompt(const Tensor& q, const Tensor& valid_columns,
     return !selection.image_end && !selection.words && q.ne[3] == 1 &&
            valid_columns.data == nullptr &&
            fa3_takes_prompt(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, q.ne[2]);
+}
+
+// Decode and verify rows over a BF16 cache take FA3 on Hopper too, one segment a row, as vLLM
+// decodes there, for registered geometries and the rest alike. FA3 packs the query group into its
+// M tile, so a KV head's keys are read once for all of its query heads; the generic route reads
+// them once per query head (Qwen3-8B, 64 rows of ~600 keys on an H100: 157 us a layer, vLLM's
+// FA3 ~65). Long histories split over several CTAs as FA3's own scheduler decides on the device,
+// with row_splits bounding it from the graph's envelope. An e4m3 cache keeps its rows on the
+// split-KV kernels: FA3's FP8 kernel accumulates P.V on FP8 wgmma, whose accumulator keeps far
+// fewer bits than FP32, so a long history loses most of its later keys (on an H100, uniform
+// attention over 262K keys came out a third low, over 1M keys a sixth of the truth); the tiles
+// read the same codes with BF16 queries and FP32 sums. SUROGATE_SERVE_GQA_FA3_ROWS=0 keeps rows
+// on the split-KV kernels, as --batch-invariant does (FA3's arithmetic is not theirs).
+bool fa3_takes_rows(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
+                    DType cache_dtype, std::int32_t width, std::int32_t batch,
+                    const GqaBlockMask& selection) {
+    return !selection.words && !selection.image_end && width <= kMaximumVerifyTokens &&
+           !(batch == 1 && width >= detail::gqa_fa3::min_columns()) && !batch_invariant() &&
+           cache_dtype == DType::BF16 && detail::gqa_fa3::rows_enabled() &&
+           detail::gqa_fa3::supports(head_dim, q_heads, kv_heads) &&
+           detail::gqa_fa3::available();
+}
+
+detail::gqa_fa3::RowSplits fa3_row_splits(std::int32_t head_dim, std::int32_t q_heads,
+                                          std::int32_t kv_heads, std::int32_t width,
+                                          std::int32_t batch, GqaExecutionEnvelope envelope) {
+    return detail::gqa_fa3::row_splits(head_dim, q_heads, kv_heads, width * batch, width,
+                                       static_cast<std::int32_t>(envelope.max_visible_keys),
+                                       /*fp8_cache=*/false, envelope.sliding_window);
+}
+
+// The rows' scratch, the same for a round as for the plan of its width and batch: the partials'
+// reservation grows with the batch whatever split count a round gets (workspace_bytes).
+template <typename Allocator>
+Fa3PromptWorkspace allocate_fa3_rows_workspace(Allocator& workspace, std::int32_t head_dim,
+                                               std::int32_t q_heads, std::int32_t width,
+                                               std::int32_t batch,
+                                               detail::gqa_fa3::RowSplits splits) {
+    Tensor metadata = workspace.alloc(DType::I32, {detail::gqa_fa3::metadata_ints(batch)});
+    return {metadata, workspace.alloc_bytes(detail::gqa_fa3::workspace_bytes(
+                          head_dim, q_heads, width * batch, batch, /*fp8_cache=*/false,
+                          splits.partials))};
+}
+
+// The rows' keys must already be in the cache: row r is segment r, its valid columns the last of
+// its keys.
+void launch_fa3_rows(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
+                     const Tensor& kv_table_rows, float scale, GqaExecutionEnvelope envelope,
+                     const PagedKVBatchLayerView& cache, WorkspaceArena& workspace, Tensor& out,
+                     cudaStream_t stream) {
+    auto scope               = workspace.scope();
+    const std::int32_t width = q.ne[2];
+    const std::int32_t batch = q.ne[3];
+    const detail::gqa_fa3::RowSplits splits =
+        fa3_row_splits(q.ne[0], q.ne[1], cache.num_kv_heads, width, batch, envelope);
+    auto [metadata, scratch] =
+        allocate_fa3_rows_workspace(workspace, q.ne[0], q.ne[1], width, batch, splits);
+    detail::gqa_fa3::rows_metadata(static_cast<const std::int32_t*>(positions.data), width, batch,
+                                   static_cast<const std::int32_t*>(valid_columns.data),
+                                   static_cast<const std::int32_t*>(kv_table_rows.data),
+                                   static_cast<std::int32_t*>(metadata.data), stream);
+    // FA3 writes only the valid columns; the split-KV kernels' contract is zeros in the rest.
+    if (valid_columns.data != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes(), stream));
+    }
+    detail::gqa_fa3::PagedLaunch args =
+        fa3_launch(q, cache, scale, envelope.sliding_window, out, batch, width, metadata);
+    args.max_splits = splits.splits;
+    detail::gqa_fa3::run(args, scratch.data, scratch.bytes, stream);
 }
 
 // Every other width of such a geometry -- decode and verify rows on any GPU, and prompts where
@@ -689,6 +758,21 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
 
+    // FA3's rows (fa3_takes_rows): their scratch grows with the batch, so the plan's batch
+    // covers every smaller one. The other routes stay booked for the same widths: a round with
+    // a QSA selection or an image block, or a lone sequence at a prompt width, still takes them.
+    std::size_t rows_bytes = 0;
+    for (std::int32_t width = min_width; width <= std::min(max_width, kMaximumVerifyTokens); ++width) {
+        if (!fa3_takes_rows(head_dim, q_heads, kv_heads, cache_dtype, width, batch_size, {})) {
+            continue;
+        }
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_fa3_rows_workspace(
+            layout, head_dim, q_heads, width, batch_size,
+            fa3_row_splits(head_dim, q_heads, kv_heads, width, batch_size, envelope));
+        rows_bytes = std::max(rows_bytes, layout.peak_bytes(1));
+    }
+
     if (!optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype)) {
         // FA3 (fa3_takes_generic_prompt) needs its scratch, which grows with the width; the
         // generic split-KV route (generic_takes) its partials while it splits, which it does
@@ -715,7 +799,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
                 bytes = std::max(bytes, layout.peak_bytes(1));
             }
         }
-        return bytes;
+        return std::max(bytes, rows_bytes);
     }
 
     const auto chunk_capacity = [&](std::int32_t width) {
@@ -771,7 +855,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
     }
     if (max_width > last) { maximum = std::max(maximum, exact_capacity(max_width)); }
 
-    return maximum;
+    return std::max(maximum, rows_bytes);
 }
 
 std::size_t gqa_attention_history_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t q_heads,
@@ -823,6 +907,13 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
+    if (fa3_takes_rows(head_dim, q.ne[1], kv_heads, cache.dtype, width, batch, selection)) {
+        detail::gqa_generic_kv_append_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        launch_fa3_rows(q, positions, valid_columns, kv_table_rows, scale, envelope, cache,
+                        workspace, out, stream);
+        return;
+    }
     if (selection.image_end || !optimized_decode_shape(head_dim, q.ne[1], kv_heads, cache.dtype)) {
         if (fa3_takes_generic_prompt(q, valid_columns, cache, selection)) {
             detail::gqa_kv_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
@@ -919,6 +1010,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
     const std::int32_t batch = q.ne[3];
     require_registered_shape(q.ne[0], q.ne[1], cache.num_kv_heads, op);
 
+    if (fa3_takes_rows(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, width, batch, selection)) {
+        launch_fa3_rows(q, positions, valid_columns, kv_table_rows, scale, envelope, cache,
+                        workspace, out, stream);
+        return;
+    }
     if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {
         if (fa3_takes_generic_prompt(q, valid_columns, cache, selection)) {
             launch_fa3_prompt(q, positions, kv_table_rows, scale, envelope.sliding_window, cache,
@@ -986,6 +1082,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         .dtype = cache.dtype, .quant_group = cache.quant_group,
     };
 
+    if (fa3_takes_rows(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, q.ne[2], 1, selection)) {
+        launch_fa3_rows(q, positions, Tensor{}, Tensor{}, scale, envelope, batch_cache, workspace,
+                        out, stream);
+        return;
+    }
     if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {
         if (fa3_takes_generic_prompt(q, Tensor{}, batch_cache, selection)) {
             launch_fa3_prompt(q, positions, Tensor{}, scale, envelope.sliding_window, batch_cache,
@@ -1038,9 +1139,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
 bool gqa_attention_packs_prompt(std::int32_t head_dim, std::int32_t q_heads,
                                 std::int32_t kv_heads, DType cache_dtype, std::int32_t width,
                                 GqaExecutionEnvelope envelope) {
+    // A width FA3 takes as a row runs alone, so its bits are the ones its own call gives.
     return (cache_dtype == DType::BF16 || cache_dtype == DType::FP8_E4M3FN) && width > 0 &&
            supported_attention_shape(head_dim, q_heads, kv_heads) &&
            optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype) &&
+           !fa3_takes_rows(head_dim, q_heads, kv_heads, cache_dtype, width, 1, {}) &&
            detail::gqa_attention_resolve_route(q_heads, kv_heads, width, 1, envelope) ==
                detail::GqaAttentionRoute::Prompt;
 }

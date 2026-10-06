@@ -60,7 +60,7 @@ std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t r
         return linear_workspace_capacity_bytes(qtype, rows, k, LinearPolicy::A16Only, 1, max_tokens);
     }
     return detail::fp8_block::is_fp8_block_qtype(qtype)
-               ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
+               ? detail::fp8_block::projections_workspace_capacity_bytes(rows, k, max_tokens)
                : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
 }
 } // namespace

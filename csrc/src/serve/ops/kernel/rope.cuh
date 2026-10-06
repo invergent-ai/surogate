@@ -242,21 +242,53 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
     }
 }
 
-static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
-                                           __nv_bfloat16* q, __nv_bfloat16* k,
-                                           std::int32_t head_dim, std::int32_t rotary_dim,
-                                           std::int32_t active_pairs, float theta,
-                                           std::int32_t q_heads, std::int32_t k_heads,
-                                           std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride, int height_pairs, int width_pairs,
-                                           float frequency_scale) {
+// A warp per head and a block per (token, eight heads), so a decode round's few tokens still
+// spread over many SMs. Each lane loads its head's values before the block derives the angles,
+// so the loads are in flight while the double-precision phases are computed; Pairs = 2 moves two
+// adjacent pairs per lane in one bf16x2 access. The arithmetic per value is a thread per pair's.
+inline constexpr int kRopeGenericWarps = 8;
+
+template <int Pairs>
+static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_generic_kernel(
+        const std::int32_t* positions, std::int32_t axes, __nv_bfloat16* q, __nv_bfloat16* k,
+        std::int32_t head_dim, std::int32_t rotary_dim, std::int32_t active_pairs, float theta,
+        std::int32_t q_heads, std::int32_t k_heads, std::int32_t tokens, std::int64_t q_token_stride,
+        std::int64_t k_token_stride, int height_pairs, int width_pairs, float frequency_scale) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
     __shared__ float cos_cache[kRopeMaxHalf];
     __shared__ float sin_cache[kRopeMaxHalf];
-    // Strided, not one thread per pair: a 512-wide head has 256 pairs and the block is 128
-    // threads, so a single-thread-per-pair fill would leave half the angles uninitialised.
+
+    constexpr int kStride = 32 * Pairs;              // pairs a warp covers per step
+    constexpr int kSteps  = kRopeMaxHalf / kStride;  // steps of the widest head
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int combined_head = static_cast<int>(blockIdx.y) * kRopeGenericWarps + (static_cast<int>(threadIdx.x) >> 5);
+    const bool active       = combined_head < q_heads + k_heads;
+    __nv_bfloat16* row      = nullptr;
+    float first[kSteps][Pairs], second[kSteps][Pairs];
+    if (active) {
+        const bool is_q = combined_head < q_heads;
+        const int head  = is_q ? combined_head : combined_head - q_heads;
+        row = (is_q ? q : k) + static_cast<std::int64_t>(token) * (is_q ? q_token_stride : k_token_stride) +
+              static_cast<std::int64_t>(head) * head_dim;
+#pragma unroll
+        for (int step = 0; step < kSteps; ++step) {
+            const int pair = step * kStride + lane * Pairs;
+            if (pair >= half) { continue; }
+            if constexpr (Pairs == 2) {
+                const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(row + pair));
+                const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(row + pair + half));
+                first[step][0] = a.x; first[step][1] = a.y;
+                second[step][0] = b.x; second[step][1] = b.y;
+            } else {
+                first[step][0]  = __bfloat162float(row[pair]);
+                second[step][0] = __bfloat162float(row[pair + half]);
+            }
+        }
+    }
+
+    // Strided, not one thread per pair: a 512-wide head has 256 pairs, the block's own size.
     for (int pair = static_cast<int>(threadIdx.x); pair < half;
          pair += static_cast<int>(blockDim.x)) {
         // Pairs past `active_pairs` carry a zero frequency, which is an exact identity:
@@ -295,25 +327,26 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
         }
     }
     __syncthreads();
+    if (!active) { return; }
 
-    const int lane        = static_cast<int>(threadIdx.x) & 31;
-    const int warp        = static_cast<int>(threadIdx.x) >> 5;
-    const int block_warps = static_cast<int>(blockDim.x) >> 5;
-    for (int combined_head = warp; combined_head < q_heads + k_heads;
-         combined_head += block_warps) {
-        const bool is_q             = combined_head < q_heads;
-        const int head              = is_q ? combined_head : combined_head - q_heads;
-        __nv_bfloat16* data         = is_q ? q : k;
-        const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
-        const std::int64_t base     = static_cast<std::int64_t>(token) * stride_t +
-                                  static_cast<std::int64_t>(head) * head_dim;
-        for (int pair = lane; pair < half; pair += 32) {
-            const float first        = __bfloat162float(data[base + pair]);
-            const float second       = __bfloat162float(data[base + pair + half]);
-            const float c            = cos_cache[pair];
-            const float s            = sin_cache[pair];
-            data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
-            data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
+#pragma unroll
+    for (int step = 0; step < kSteps; ++step) {
+        const int pair = step * kStride + lane * Pairs;
+        if (pair >= half) { continue; }
+        float out_first[Pairs], out_second[Pairs];
+#pragma unroll
+        for (int j = 0; j < Pairs; ++j) {
+            const float c = cos_cache[pair + j];
+            const float s = sin_cache[pair + j];
+            out_first[j]  = first[step][j] * c - second[step][j] * s;
+            out_second[j] = second[step][j] * c + first[step][j] * s;
+        }
+        if constexpr (Pairs == 2) {
+            *reinterpret_cast<__nv_bfloat162*>(row + pair) = __floats2bfloat162_rn(out_first[0], out_first[1]);
+            *reinterpret_cast<__nv_bfloat162*>(row + pair + half) = __floats2bfloat162_rn(out_second[0], out_second[1]);
+        } else {
+            row[pair]        = __float2bfloat16_rn(out_first[0]);
+            row[pair + half] = __float2bfloat16_rn(out_second[0]);
         }
     }
 }

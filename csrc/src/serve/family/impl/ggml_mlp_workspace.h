@@ -74,7 +74,18 @@ inline std::size_t stored_mlp_workspace_capacity_bytes(const TextGeometry& geome
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             type, geometry.hidden, geometry.intermediate, policy, first, last));
     }
-    return layout.peak_bytes(1);
+    std::size_t peak = layout.peak_bytes(1);
+    // A fused parent may take the route that never writes the activation (swiglu_mlp_down_add).
+    if (const auto parent = geometry.linear_storage.find(std::string(prefix) + "mlp/gate_up");
+        parent != geometry.linear_storage.end()) {
+        for (auto gate_up_type : parent->second.formats) {
+            for (auto down_type : down.formats) {
+                peak = with_swiglu_mlp_down_add(peak, geometry.intermediate, geometry.hidden,
+                                                gate_up_type, down_type, policy, first, last);
+            }
+        }
+    }
+    return peak;
 }
 
 } // namespace sinfer::family

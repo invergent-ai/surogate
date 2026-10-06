@@ -39,7 +39,7 @@ std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t r
                                                      std::int32_t max_tokens) {
     if (qtype == QType::BF16_CTRL) { return 0; }
     return detail::fp8_block::is_fp8_block_qtype(qtype)
-               ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
+               ? detail::fp8_block::projections_workspace_capacity_bytes(rows, k, max_tokens)
                : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
 }
 // A W8 parent of a shape the fused W8 kernels were never registered for -- a size of the family
@@ -272,7 +272,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
                                                                    max_tokens);
     case QType::FP8_E4M3FN_BLK128_F32S:
     case QType::FP8_E4M3FN_ROW_F32S:
-        return detail::fp8_block::linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
+        return detail::fp8_block::projections_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
     case QType::BF16_CTRL:
         if (parent_rows <= 0 || input_rows <= 0 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");

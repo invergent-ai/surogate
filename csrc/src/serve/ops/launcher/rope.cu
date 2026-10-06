@@ -208,15 +208,27 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
 void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                     Tensor* q, Tensor* k, cudaStream_t stream, int height_pairs = -1, int width_pairs = -1,
                     float frequency_scale = 1.0F) {
-    constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
-    rope_generic_kernel<<<tokens, block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), positions.ne[1],
-        q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
-        active_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
-        token_stride(q), token_stride(k), height_pairs, width_pairs, frequency_scale);
+    const int heads     = (q == nullptr ? 0 : q->ne[1]) + (k == nullptr ? 0 : k->ne[1]);
+    const dim3 grid(static_cast<unsigned>(tokens),
+                    static_cast<unsigned>((heads + kRopeGenericWarps - 1) / kRopeGenericWarps));
+    // Two pairs a lane in one bf16x2 access where both halves of every head start 4-byte aligned.
+    const bool paired = (rotary_dim / 2) % 2 == 0 && sample.ne[0] % 2 == 0 &&
+                        (q == nullptr || bf16x2_aligned(*q)) && (k == nullptr || bf16x2_aligned(*k));
+    const auto launch = [&](auto kernel) {
+        kernel<<<grid, kRopeGenericWarps * 32, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data), positions.ne[1],
+            q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
+            k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
+            active_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
+            token_stride(q), token_stride(k), height_pairs, width_pairs, frequency_scale);
+    };
+    if (paired) {
+        launch(rope_generic_kernel<2>);
+    } else {
+        launch(rope_generic_kernel<1>);
+    }
 }
 
 } // namespace
