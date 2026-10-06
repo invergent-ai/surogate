@@ -131,9 +131,16 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
-                                                    geometry.hidden, geometry.query_size(),
-                                                    kTextPolicy, first, last);
+    // Or whatever the artifact stores instead: a GGUF's K-quants, an FP8 export's codes.
+    return std::max(ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
+                                                             geometry.hidden, geometry.query_size(),
+                                                             kTextPolicy, first, last),
+                    family::stored_role_workspace(
+                        geometry, "attention/output",
+                        [&](QType type, std::int32_t rows, std::int32_t columns) {
+                            return ops::linear_add_workspace_capacity_bytes(type, rows, columns,
+                                                                            kTextPolicy, first, last);
+                        }));
 }
 
 // ---- Post-mixer (SwiGLU MLP) ----------------------------------------------

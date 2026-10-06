@@ -1,25 +1,29 @@
-"""Qwen's block-FP8 export of this architecture (``quant_method: fp8``, 128 x 128 blocks).
+"""FP8 checkpoints, for every converter: block-scaled (``quant_method: fp8``, 128 x 128 blocks)
+and compressed-tensors' per-channel or per-tensor exports.
 
-Every quantised Linear is stored as E4M3 codes ``X.weight`` [n, k] with one multiplier per
-128 x 128 block in ``X.weight_scale_inv`` [n/128, k/128] (DeepSeek's name: the value
-multiplies). Qwen keeps those multipliers in BF16; they widen to the artifact's FP32 exactly.
+A block-FP8 Linear is stored as E4M3 codes ``X.weight`` [n, k] with one multiplier per 128 x 128
+block in ``X.weight_scale_inv`` [n/128, k/128] (DeepSeek's name: the value multiplies); Qwen keeps
+the multipliers in BF16, DeepSeek-style exports in FP32, and both widen to the artifact's FP32
+exactly. A compressed-tensors FP8 Linear keeps one multiplier per row (or one for the matrix) in
+``X.weight_scale``.
 
 Where the engine has a block-FP8 kernel the stored codes become the artifact's codes, with no
 dequantise-requantise round trip:
 
-- the routed experts, which the export stores one Linear per expert
+- the per-layer projections in ``NATIVE_SUFFIXES``, whose ops dispatch on the stored type on every
+  architecture (``attn_input_proj``, ``gdn_input_proj``, ``linear_projections``,
+  ``linear_swiglu``, ``linear_add``; Hopper runs them on the sm90 block GEMM). Their recipes are
+  pure row programs over whole 128-row blocks, so a fused parent is its constituents' blocks in
+  recipe order;
+- an MoE target's routed experts, which these exports store one Linear per expert
   (``mlp.experts.{e}.gate_proj``) and the artifact stacks into the inventory's two parents,
   ``[experts * 2 * intermediate, hidden]`` with each expert's rows ``[gate; up]`` and
-  ``[experts * hidden, intermediate]``. Hopper's grouped GEMM serves them
-  (ops/sparse_moe/fp8_sm90);
-- the text layers' dense projections (attention and GDN, input and output), whose recipes
-  are pure row programs over whole 128-row blocks, so a fused parent is its constituents'
-  blocks in recipe order.
+  ``[experts * hidden, intermediate]``. Hopper's grouped GEMM serves them (ops/sparse_moe/fp8_sm90).
 
-The shared expert's kernels read W8 only, and the MTP block's dense projections stay the
-base converter's W8, so those are dequantised through the stored words and encoded as the
-base converter encodes them. Everything the export keeps in BF16 (router, embedding, output
-head, norms, GDN gates, vision) takes the base recipes unchanged.
+Every other object that reads FP8 sources -- a projection outside the whole-block grid, a
+per-channel export, a draft head or a shared expert whose kernels read W8 only -- is dequantised
+through the stored words and encoded in the converter's own format. Everything the export keeps
+in BF16 (embedding, output head, norms, routers) takes the base recipes unchanged.
 """
 
 from __future__ import annotations
@@ -37,20 +41,33 @@ from surogate.serve.convert.common.conversion import encode_tensor_payload
 from surogate.serve.convert.common.inventory import BLOCK128_LAYOUT, FP8_BLOCK, TensorSpec
 from surogate.serve.convert.common.recipe import TensorRecipe, expression_sources
 from surogate.serve.convert.common.row_algebra import RowShapeMismatch, evaluate_rows
-from surogate.serve.convert.common.safetensors import ShardReader
+from surogate.serve.convert.common.safetensors import ShardReader, name_spellings
 
 
 WEIGHTS_ID = "fp8-block"
 
 BLOCK = 128
-SCALE_SUFFIX = "_scale_inv"  # appended to a logical ``.weight`` name
+SCALE_SUFFIX = "_scale_inv"  # appended to a logical ``.weight`` name: a block grid
+ROW_SCALE_SUFFIX = "_scale"  # compressed-tensors: one multiplier per row, or one in all
 
-#: Per-layer objects that keep the stored codes when every row block they read is FP8.
+#: Per-layer objects that keep the stored codes when every row block they read is FP8: the
+#: attention, linear-attention and short-convolution projections, fused or not, and the dense
+#: MLP's.
 NATIVE_SUFFIXES = (
     "attention/query_key_gate_value",
+    "attention/query_key_value",
+    "attention/query",
+    "attention/key",
+    "attention/value",
     "attention/output",
     "gdn/query_key_value_z",
     "gdn/output",
+    "mlp/gate_up",
+    "mlp/gate",
+    "mlp/up",
+    "mlp/down",
+    "conv/in_proj",
+    "conv/out_proj",
 )
 ROUTED_SUFFIXES = ("moe/routed_gate_up", "moe/routed_down")
 
@@ -75,10 +92,59 @@ def is_fp8_block_export(config: Mapping[str, object]) -> bool:
     return True
 
 
+def is_fp8_channel_export(config: Mapping[str, object]) -> bool:
+    """Whether ``config`` declares a compressed-tensors FP8 export (per-channel or per-tensor
+    weight scales); refuses one that mixes in other bit widths, which these converters lack."""
+
+    quant = config.get("quantization_config")
+    if not isinstance(quant, Mapping) or quant.get("quant_method") != "compressed-tensors":
+        return False
+    groups = quant.get("config_groups") or {}
+    widths = set()
+    for name, group in groups.items():
+        weights = (group or {}).get("weights") or {}
+        widths.add(weights.get("num_bits"))
+        if weights.get("num_bits") == 8 and (
+            weights.get("type") != "float" or weights.get("symmetric") is not True
+            or weights.get("strategy") not in ("channel", "tensor") or weights.get("dynamic", False)
+        ):
+            raise ValueError(f"quantization group {name}: FP8 weights need symmetric, static "
+                             "per-channel or per-tensor scales")
+    if widths and widths != {8}:
+        raise ValueError(f"compressed-tensors export with {sorted(map(str, widths))}-bit groups: "
+                         "this converter reads 8-bit floating-point groups only")
+    return bool(widths)
+
+
+def is_fp8_export(config: Mapping[str, object]) -> bool:
+    """Either FP8 layout this module reads."""
+
+    return is_fp8_block_export(config) or is_fp8_channel_export(config)
+
+
 def _fold(name: str) -> str:
     if name.startswith(NESTED_TEXT_PREFIX):
         return "model." + name[len(NESTED_TEXT_PREFIX):]
     return name
+
+
+class _Shapes(dict):
+    """Stored shapes, answering under every spelling ShardReader resolves (name_spellings)."""
+
+    def _key(self, name):
+        for candidate in name_spellings(name):
+            if dict.__contains__(self, candidate):
+                return candidate
+        return name
+
+    def __contains__(self, name):
+        return dict.__contains__(self, self._key(name))
+
+    def __getitem__(self, name):
+        return dict.__getitem__(self, self._key(name))
+
+    def get(self, name, default=None):
+        return dict.get(self, self._key(name), default)
 
 
 def _role(name: str) -> str | None:
@@ -133,12 +199,15 @@ class Fp8BlockSource:
         self.model_dir = Path(model_dir)
         stored = read_tensor_shapes(self.model_dir)
         ambiguous = any(n.startswith(NESTED_TEXT_PREFIX) and _fold(n) in stored for n in stored)
-        self.shapes: dict[str, tuple[int, ...]] = {
+        self.shapes: dict[str, tuple[int, ...]] = _Shapes({
             (name if ambiguous else _fold(name)): tuple(shape) for name, shape in stored.items()
-        }
+        })
+
+    def is_block(self, logical: str) -> bool:
+        return logical + SCALE_SUFFIX in self.shapes
 
     def is_quantized(self, logical: str) -> bool:
-        return logical + SCALE_SUFFIX in self.shapes
+        return self.is_block(logical) or logical + ROW_SCALE_SUFFIX in self.shapes
 
     # -- planning --------------------------------------------------------------
 
@@ -158,6 +227,8 @@ class Fp8BlockSource:
                 out.append(spec)
                 continue
             if role in ROUTED_SUFFIXES:
+                if experts <= 0:
+                    raise ValueError(f"{spec.name}: this converter does not read FP8 routed experts")
                 item = self._routed(spec, recipe, experts)
             else:
                 item = self._rows(spec, recipe, role)
@@ -188,7 +259,7 @@ class Fp8BlockSource:
                     raise ValueError(
                         f"{spec.name}: {logical} is {self.shapes.get(logical)}, expected {(rows, k)}"
                     )
-                if not self.is_quantized(logical):
+                if not self.is_block(logical):
                     raise ValueError(f"{spec.name}: {logical} has no block scales")
         if rows % BLOCK or k % BLOCK:
             raise ValueError(f"{spec.name}: expert matrices [{rows}, {k}] are not whole 128 x 128 blocks")
@@ -212,7 +283,7 @@ class Fp8BlockSource:
         native = (
             spec.name.startswith("text/layers/")
             and role in NATIVE_SUFFIXES
-            and all(quantized)
+            and all(self.is_block(source) for source, _ in segments)
             and program.k % BLOCK == 0
             and all(_whole_blocks(rows) for _, rows in segments)
         )
@@ -261,6 +332,32 @@ class Fp8BlockSource:
         return encode_tensor_payload(torch.cat(parts).contiguous(), item.spec, device)
 
 
+def for_checkpoint(
+    model_dir: str | Path,
+    config: Mapping[str, object],
+    specs: Sequence[TensorSpec],
+    recipes_by_name: Mapping[str, TensorRecipe],
+    *,
+    experts: int = 0,
+    repack: object | None = None,
+) -> tuple[Fp8BlockSource | None, SourcePlan | None]:
+    """The FP8 source and object plan a converter writes ``model_dir`` with, or ``(None, None)``
+    when the checkpoint is not an FP8 export. ``specs`` are the objects the converter would
+    write; the plan's ``specs`` replace them, and its ``covered`` objects leave the base
+    recipes' source preflight, since this module reads their sources instead."""
+
+    if not is_fp8_export(config):
+        return None, None
+    if repack is not None:
+        raise ValueError("--gguf-repack reads a GGUF; point --model at a BF16 checkpoint, not an FP8 export")
+    source = Fp8BlockSource(model_dir)
+    plan = source.plan(specs, recipes_by_name, experts)
+    print(f"fp8 export: {plan.counts['codes']} objects keep their FP8 codes, "
+          f"{plan.counts['routed']} routed parents stack them, "
+          f"{plan.counts['requantize']} are re-encoded from their values", flush=True)
+    return source, plan
+
+
 def _codes(reader: ShardReader, logical: str) -> torch.Tensor:
     codes = reader.get(logical)
     if codes.dtype != torch.float8_e4m3fn:
@@ -283,15 +380,28 @@ def _scales(reader: ShardReader, logical: str, shape: Sequence[int]) -> torch.Te
 
 
 def _dequantize(reader: ShardReader, logical: str) -> torch.Tensor:
-    """The values a block-FP8 Linear represents, FP32: code * multiplier of its block."""
+    """The values an FP8 Linear represents, FP32: code * multiplier of its block, its row, or
+    the whole matrix."""
 
     codes = reader.get(logical)
     if codes.dtype != torch.float8_e4m3fn:
         raise TypeError(f"{logical} is {codes.dtype}, expected float8_e4m3fn")
     n, k = codes.shape
-    scales = _scales(reader, logical, codes.shape)
-    expanded = scales.repeat_interleave(BLOCK, dim=0)[:n].repeat_interleave(BLOCK, dim=1)[:, :k]
-    return codes.to(torch.float32) * expanded
+    if reader.has(logical + SCALE_SUFFIX):
+        scales = _scales(reader, logical, codes.shape)
+        expanded = scales.repeat_interleave(BLOCK, dim=0)[:n].repeat_interleave(BLOCK, dim=1)[:, :k]
+        return codes.to(torch.float32) * expanded
+    scales = reader.get(logical + ROW_SCALE_SUFFIX).to(torch.float32)
+    if scales.numel() == 1:
+        scales = scales.reshape(1, 1)
+    elif scales.numel() == n:
+        scales = scales.reshape(n, 1)
+    else:
+        raise ValueError(f"{logical}{ROW_SCALE_SUFFIX}: {tuple(scales.shape)}, expected one "
+                         f"multiplier per row ({n}) or one in all")
+    if not bool(torch.isfinite(scales).all()):
+        raise ValueError(f"{logical}{ROW_SCALE_SUFFIX}: non-finite multipliers")
+    return codes.to(torch.float32) * scales
 
 
 __all__ = [
@@ -300,4 +410,7 @@ __all__ = [
     "ObjectSource",
     "SourcePlan",
     "is_fp8_block_export",
+    "is_fp8_channel_export",
+    "is_fp8_export",
+    "for_checkpoint",
 ]

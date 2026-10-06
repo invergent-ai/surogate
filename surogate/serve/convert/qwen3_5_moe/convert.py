@@ -22,10 +22,11 @@ from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import dflash as dflash_checkpoint
+from surogate.serve.convert.common import fp8_block_source
 from surogate.serve.convert.common import recipe as family_recipe
 
 from . import draft_head, inventory, recipe
-from .exports import compressed_tensors_source, fp8_block_source, routed_nvfp4
+from .exports import compressed_tensors_source, routed_nvfp4
 
 
 RECIPE_ID = "qwen3_5_moe-config-v3"

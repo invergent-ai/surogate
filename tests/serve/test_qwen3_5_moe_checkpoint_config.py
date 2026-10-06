@@ -394,7 +394,7 @@ def test_fp8_block_export_keeps_its_codes_where_kernels_read_them(tmp_path, monk
 
 
 def test_fp8_export_with_other_block_sizes_is_refused():
-    from surogate.serve.convert.qwen3_5_moe.exports.fp8_block_source import is_fp8_block_export
+    from surogate.serve.convert.common.fp8_block_source import is_fp8_block_export
     assert not is_fp8_block_export(config_for())
     assert is_fp8_block_export({"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}})
     with pytest.raises(ValueError, match="128 x 128 block scales"):

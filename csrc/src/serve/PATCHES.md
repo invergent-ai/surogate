@@ -3908,3 +3908,45 @@ checkpoints so far.
 Tests. `sinfer_gqa_attention_test`: Qwen3-8B decode rows (one row over 2,000 keys, four rows with a
 masked one, width 4, int8), one- and three-column queries with and without a 300-key window, and e4m3
 decode for three unregistered shapes, all against the oracle at the BF16 bound (~0.17 % relative L2).
+
+## 105
+
+**FP8 checkpoints for every dense family (2026-10-06, after #104).** Only the Qwen3.5/3.6 converters
+read FP8 checkpoints, so every other family's FP8 release was refused at preflight (source dtype
+F8_E4M3) and its users served the BF16 release as W8, whose prompts run on `mma.sync` tiles. The
+engine side was never the obstacle: the binder takes whatever format an object declares
+(`bind_linear`), and every projection op dispatches block-FP8 on the stored type, on Hopper through
+vLLM's sm90 block GEMM (#101).
+
+- **One FP8 reader for every converter** (`surogate/serve/convert/common/fp8_block_source.py`, moved
+  out of the Qwen3.5 MoE converter). A block-scaled export (`quant_method: fp8`, 128 x 128 blocks, Qwen's
+  and DeepSeek's) keeps its codes and block multipliers wherever the object is an attention,
+  linear-attention, short-convolution or dense-MLP projection whose recipe is a row program over whole
+  128-row blocks: a fused parent is its constituents' blocks in recipe order. Anything else that reads
+  FP8 sources (off the block grid, a draft head, a shared expert, the vision tower) and every
+  compressed-tensors per-channel or per-tensor export is dequantised through the stored words and
+  encoded in the converter's own format. Wired into the Qwen3, Qwen3-VL, Llama (and Granite), Gemma 3,
+  dense and E-series Gemma 4 and LFM2 converters; artifacts keep their `groupwise-int` identity, as a
+  GGUF's native K-quants do. FP8 routed experts stay the Qwen3.5/3.6 MoE converter's: the others
+  refuse them by name.
+- **Workspace for the stored format.** Those targets planned their projections for W8 and a GGUF's
+  K-quants; FP8's activation planes are larger, so the plans now also take the block-FP8 figure when
+  the artifact stores it (`stored_role_workspace`, `stored_format_workspace`), which leaves a W8
+  artifact's plan exactly as it was.
+- **The widest decode round is warmed before capture.** The ungated attention input projection stages
+  a K-quant or FP8 parent through the engine-slot scratch, which grows with the round's width and
+  may not grow inside a capture; warmup ran one lane (and the Marlin band), so a Qwen3-8B-FP8 server
+  died capturing batch 5 ("activation scratch of 21760 bytes was first needed inside a graph
+  capture"). Warmup now also runs the widest ordinary round.
+
+Qwen3-8B-FP8 against vLLM 0.31 on one H100 (same client, 4K context, BF16 KV both): greedy output
+identical to the W8 artifact's; 32 users with 2,048-token prompts 40.4k prompt tok/s (W8 8.5k; vLLM
+55.7k), TTFT p50 0.85 s (vLLM 0.55 s); decode one stream 157 tok/s (W8 ~83 in #104; vLLM 227),
+16 users 1,626 (vLLM 2,429), 64 users 3,363 (W8 1,610; vLLM 5,690). The remaining gap is decode at
+width, not the GEMMs.
+
+Tests. `tests/serve/test_converter_end_to_end.py`: block-FP8 Qwen3 and Llama keep every projection's
+codes and multipliers bit-exact (fused q|k|v and gate|up in recipe order), LFM2 keeps its convolution,
+attention and MLP projections, Gemma 3 its seven separate projections; a per-channel Qwen3 export
+converts to W8 within 1 % of the stored values. The Qwen3.5 MoE FP8 tests run against the moved
+module unchanged.

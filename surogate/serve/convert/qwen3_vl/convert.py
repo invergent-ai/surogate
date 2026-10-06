@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
-from surogate.serve.convert.common import conversion
+from surogate.serve.convert.common import conversion, fp8_block_source
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
 from surogate.serve.convert.common.official_resources import chat_template_bytes, tokenizer_config_with_template
 from surogate.serve.convert.common.quantize import pick_device
@@ -28,7 +28,14 @@ def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISI
     with recipe.open_reader(model) as reader:
         recipes = recipe.build_recipes(geometry, reader=reader)
     validate_recipe_coverage(recipes, tensors)
-    source = recipe.preflight_sources(model, recipes)
+    # An FP8 export keeps its codes where the kernels read them (common/fp8_block_source.py).
+    object_specs = inventory.build_object_specs(geometry, vision_storage=vision_storage)
+    fp8_source, fp8_plan = fp8_block_source.for_checkpoint(
+        model, config, object_specs, {r.object_name: r for r in recipes})
+    if fp8_plan is not None:
+        object_specs = fp8_plan.specs
+    source = recipe.preflight_sources(
+        model, [r for r in recipes if fp8_plan is None or r.object_name not in fp8_plan.covered])
     resources = {r.name: r.data for r in conversion.load_resources(model, inventory.RESOURCE_SPECS)}
     template = chat_template_bytes(model)
     if template is not None:
@@ -38,8 +45,7 @@ def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISI
     if "frontend/preprocessor_config.json" not in resources:
         raise ValueError("Qwen3-VL requires preprocessor_config.json for its image processor")
     resources = {s.name: resources[s.name] for s in inventory.RESOURCE_SPECS if s.name in resources}
-    plan = conversion.build_object_plan(
-        inventory.build_object_specs(geometry, vision_storage=vision_storage), resources)
+    plan = conversion.build_object_plan(object_specs, resources)
     recipes = {r.object_name: r for r in recipes}
     identity = ArtifactIdentity(geometry.architecture, inventory.WEIGHTS_ID, architecture=geometry.architecture)
     print(f"preflight complete: {len(plan.objects)} objects, {source.source_tensor_count} source tensors", flush=True)
@@ -52,6 +58,8 @@ def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISI
         for i, spec in enumerate(plan.specs, 1):
             if spec.name in resources:
                 payload = resources[spec.name]
+            elif fp8_plan is not None and spec.name in fp8_plan.objects:
+                payload = fp8_source.payload_for(spec.name, fp8_plan.objects, reader, device)
             else:
                 tensor = materialize_recipe(recipes[spec.name], reader)
                 payload = conversion.encode_tensor_payload(tensor, spec, device)
@@ -66,6 +74,8 @@ def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISI
         config_summary=config, source_preflight=source, objects=plan.objects,
         elapsed_seconds=time.perf_counter() - started, final_bytes=output.stat().st_size, device=device,
     )
+    if fp8_plan is not None:
+        report["quantization"] = {"fp8": dict(fp8_plan.counts)}
     report_path = Path(str(output) + ".conversion.json")
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"complete: {output}; report={report_path}", flush=True)

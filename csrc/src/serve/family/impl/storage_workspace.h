@@ -41,6 +41,34 @@ std::size_t matrix_pair_workspace(const TextGeometry& geometry, std::string_view
     return peak;
 }
 
+/// The largest workspace any text layer's stored `role` matrix asks of `capacity`, 0 when the
+/// artifact's storage was not resolved. What a planner adds for formats an artifact carries
+/// beyond its profile's own: a GGUF's K-quants, an FP8 export's block-scaled codes.
+template<class Capacity>
+std::size_t stored_role_workspace(const TextGeometry& geometry, std::string_view role,
+                                  Capacity capacity) {
+    std::size_t peak = 0;
+    for (std::int32_t layer = 0; layer < geometry.layers && !geometry.linear_storage.empty(); ++layer) {
+        const std::string name = "text/layers/" + std::to_string(layer) + "/" + std::string(role);
+        if (geometry.linear_storage.contains(name)) {
+            peak = std::max(peak, matrix_workspace(geometry, name, capacity));
+        }
+    }
+    return peak;
+}
+
+/// `capacity(type)` when the artifact stores any text matrix as `type`, else 0: how a planner
+/// that sizes for its profile's format and a GGUF's K-quants also covers an FP8 export's codes.
+template<class Capacity>
+std::size_t stored_format_workspace(const TextGeometry& geometry, QType type, Capacity capacity) {
+    for (const auto& [name, storage] : geometry.linear_storage) {
+        if (std::find(storage.formats.begin(), storage.formats.end(), type) != storage.formats.end()) {
+            return capacity(type);
+        }
+    }
+    return 0;
+}
+
 enum class WorkspaceLayers { All, Attention, Linear };
 
 template<class Capacity>

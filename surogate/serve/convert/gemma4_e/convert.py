@@ -32,6 +32,7 @@ from surogate.serve.convert.common.gguf_repack import (
     half_names,
 )
 from surogate.serve.convert.common.quantize import pick_device
+from surogate.serve.convert.common import fp8_block_source
 from surogate.serve.convert.common.recipe import expression_sources, materialize_recipe
 
 from . import inventory, recipe
@@ -127,6 +128,12 @@ def convert(
     if native:
         tensor_specs = GgufRepackSource.native_specs(tensor_specs, native, native_runs)
 
+    # An FP8 export keeps its codes where the kernels read them (common/fp8_block_source.py).
+    fp8_source, fp8_plan = fp8_block_source.for_checkpoint(model, config, tensor_specs, recipes,
+                                                           repack=repack)
+    if fp8_plan is not None:
+        tensor_specs = fp8_plan.specs
+
     resources = load_resources(model)
     resource_payloads = {item.name: item.data for item in resources}
     carried = tuple(spec for spec in inventory.RESOURCE_SPECS if spec.name in resource_payloads)
@@ -134,7 +141,8 @@ def convert(
 
     # Repacked objects read the GGUF directly; only what remains needs a bridged source.
     remaining = tuple(r for name, r in recipes.items()
-                      if name not in repacked_names and name not in native and name not in halves)
+                      if name not in repacked_names and name not in native and name not in halves
+                      and (fp8_plan is None or name not in fp8_plan.covered))
     # object name -> (fused parent recipe, the rows of that parent it holds)
     half_lookup: dict[str, tuple[str, slice]] = {}
     for parent, runs in halves.items():
@@ -181,6 +189,9 @@ def convert(
                 elif repack is not None and spec.name in repacked_names:
                     payload = repack.payload_for(spec, recipes[spec.name], None)
                     note = " (repacked)"
+                elif fp8_plan is not None and spec.name in fp8_plan.objects:
+                    payload = fp8_source.payload_for(spec.name, fp8_plan.objects, reader,
+                                                     resolved_device)
                 else:
                     tensor = materialize_recipe(recipes[spec.name], reader)
                     payload = family_conversion.encode_tensor_payload(
@@ -224,6 +235,8 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
     )
+    if fp8_plan is not None:
+        report["quantization"] = {"fp8": dict(fp8_plan.counts)}
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)

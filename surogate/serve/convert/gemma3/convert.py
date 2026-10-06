@@ -79,6 +79,7 @@ from surogate.serve.convert.common.gguf_repack import (
     RepackError,
     half_names,
 )
+from surogate.serve.convert.common import fp8_block_source
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import official_resources
@@ -610,8 +611,14 @@ def convert(
             print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
                   flush=True)
 
+    # An FP8 export keeps its codes where the kernels read them (common/fp8_block_source.py).
+    fp8_source, fp8_plan = fp8_block_source.for_checkpoint(model, config, object_specs,
+                                                           recipes_by_name, repack=repack)
+    if fp8_plan is not None:
+        object_specs = fp8_plan.specs
     preflight = preflight_conversion(
-        model, repack, planned + tuple(native) + tuple(halves),
+        model, repack, planned + tuple(native) + tuple(halves)
+        + (tuple(fp8_plan.covered) if fp8_plan is not None else ()),
         native=native, object_specs=object_specs,
     )
     print(
@@ -660,6 +667,9 @@ def convert(
                     payload = repack.payload_for_native(spec, recipes[spec.name], None)
                 elif repack is not None and spec.name in repacked_names:
                     payload = repack.payload_for(spec, recipes[spec.name], None)
+                elif fp8_plan is not None and spec.name in fp8_plan.objects:
+                    payload = fp8_source.payload_for(spec.name, fp8_plan.objects, reader,
+                                                     resolved_device)
                 else:
                     tensor = materialize_tensor(spec, reader, recipes)
                     payload = encode_tensor_payload(tensor, spec, resolved_device)
@@ -686,6 +696,8 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
     )
+    if fp8_plan is not None:
+        report["quantization"] = {"fp8": dict(fp8_plan.counts)}
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
