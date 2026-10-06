@@ -1,5 +1,6 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
+#include "ops/linear/w8/w8_launch.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include <array>
@@ -291,6 +292,27 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
 void w8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const W8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     w8_linear_swiglu_execute_plan(w8_linear_swiglu_resolve_plan(problem), x, w, out, stream);
+}
+
+// The bands tinyllama and lfm2 run (kTinyLlamaRoutes, kLfm2Routes): the shapes whose exact-T
+// tables are baked for another geometry take these two runtime-shaped tiles above decode, and so
+// does a shape with no table at all. The pair kernel the wrapper falls back to otherwise is a
+// warp per output, which re-reads the whole weight for every column: fine at T=1, and three
+// orders of magnitude slower than these tiles at a 2,048-column prefill (Qwen3-8B on an H100).
+bool w8_linear_swiglu_runtime_mma(const Tensor& x, const Weight& w, Tensor& out,
+                                  cudaStream_t stream) {
+    const std::int32_t intermediate = w.n / 2;
+    if (x.ne[1] < 2 || (w.n % 2) != 0 || (w.k % kW8MmaScaleRowAlignmentK) != 0 ||
+        (intermediate % kW8MmaRowAlignmentN) != 0 || w.padded_shape[1] != w.k ||
+        out.ne[0] != intermediate) {
+        return false;
+    }
+    if (x.ne[1] <= 1024) {
+        w8_linear_swiglu_mma_r32_c128_launch(x, w, out, stream);
+    } else {
+        w8_linear_swiglu_mma_r64_c128_launch(x, w, out, stream);
+    }
+    return true;
 }
 
 } // namespace sinfer::ops::detail

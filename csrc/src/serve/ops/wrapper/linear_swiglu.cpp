@@ -196,6 +196,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
             !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 2)) {
             throw std::invalid_argument("linear_swiglu: invalid W8 input or row-split weight");
         }
+        if (detail::w8_linear_swiglu_runtime_mma(x, w, out, stream)) { return; }
         detail::w8_linear_swiglu_generic_launch(x, w, out, stream);
         return;
     }

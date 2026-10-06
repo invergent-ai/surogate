@@ -55,4 +55,10 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
                                    Tensor& out, cudaStream_t stream);
 void w8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
+/// A W8 parent no route table names, past one column: the runtime-shaped MMA tiles, which read
+/// both extents from the weight, when its k and intermediate meet the MMA routes' alignment
+/// (w8_launch.h: k % 256, rows % 128). False, launching nothing, when they do not.
+bool w8_linear_swiglu_runtime_mma(const Tensor& x, const Weight& w, Tensor& out,
+                                  cudaStream_t stream);
+
 } // namespace sinfer::ops::detail
