@@ -193,6 +193,11 @@ public:
     // private, copied device-to-device before any suffix writes can reach it.
     [[nodiscard]] PagedKVAllocation fork_prefix(std::shared_ptr<const PagedKVAllocation> source,
         std::uint32_t tokens, std::uint32_t page_entitlement, cudaStream_t stream);
+    // Hands the first `pages` mapped pages of `allocation` to a new allocation, which
+    // `allocation` then borrows like a fork: they stay mapped and in place, and outlive it
+    // while anything else forks them. Pool totals are unchanged; only ownership moves.
+    [[nodiscard]] std::shared_ptr<const PagedKVAllocation> share_prefix(PagedKVAllocation& allocation,
+                                                                        std::uint32_t pages);
     void copy_pages(std::span<const std::int32_t> source, std::span<const std::int32_t> destination,
                     cudaStream_t stream) const;
 

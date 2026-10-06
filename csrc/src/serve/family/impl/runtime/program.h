@@ -34,6 +34,8 @@
 #include <span>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
@@ -42,6 +44,7 @@ using PreparedPromptData    = family::PreparedPromptData;
 struct ArchivedSequence;
 struct GpuPrefix;
 struct GpuPrefixStorage;
+struct SharedPrefix;
 using RewriteCheckpointKind = family::RewriteCheckpointKind;
 using RewriteCheckpointSpec = family::RewriteCheckpointSpec;
 
@@ -96,6 +99,9 @@ struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<family::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    /// Chained hashes of the prompt's whole 64-token pages before its last token, for the
+    /// shared-prefix cache; null when the request cannot use it.
+    std::shared_ptr<const std::vector<std::uint64_t>> page_hashes;
     /// The adapter slot the request selected; copied into RequestControl at admit.
     std::int32_t lora_slot = -1;
     /// A minimum length and the stop ids barred until it is reached; both copied
@@ -115,6 +121,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     bool retain_prefix = true;
     std::shared_ptr<const SINFER_FAMILY_RUNTIME_NS::ArchivedSequence> archived;
     std::shared_ptr<const SINFER_FAMILY_RUNTIME_NS::GpuPrefix> device_prefix;
+    std::shared_ptr<SINFER_FAMILY_RUNTIME_NS::SharedPrefix> shared_prefix;
+    std::shared_ptr<const std::vector<std::uint64_t>> page_hashes;
     std::optional<SINFER_FAMILY_RUNTIME_NS::VisionPrefillPlan> vision;
     SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -300,6 +308,22 @@ struct GpuPrefix {
     ~GpuPrefix() { if (storage) storage->free.push_back(slot); }
 };
 
+// A prompt prefix several conversations share (a system prompt, tool definitions), kept on
+// the GPU at a page boundary: its full KV pages, which forks borrow in place, and a copy of
+// the lane's recurrent state there. `state` is the sequence a fork resumes from.
+struct SharedPrefix {
+    std::uint64_t hash = 0;
+    std::uint32_t tokens = 0;
+    SequenceState state;
+    std::shared_ptr<const PagedKVAllocation> pages;
+    std::shared_ptr<GpuPrefixStorage> storage;
+    std::uint32_t slot = 0;
+    std::vector<Tensor> current;
+    std::uint64_t last_use = 0;
+    std::uint32_t hits = 0;
+    ~SharedPrefix() { if (storage) storage->free.push_back(slot); }
+};
+
 struct ArchivedSequence {
     SequenceState state;
     PagedKVHostImage text, backend;
@@ -352,10 +376,19 @@ struct RequestControl {
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
         // Recurrent prefill keeps its chunk boundaries when snapshot storage is unavailable.
         std::optional<std::uint32_t> recurrent_boundary;
+        // A shared-prefix capture: the chunk stops here and the lane's state is kept.
+        std::optional<std::uint32_t> shared_capture;
+        std::uint64_t shared_capture_hash = 0;
+        bool shared_restore = false; // resumed from a shared prefix (reported, not a path)
         [[nodiscard]] std::optional<std::uint32_t> chunk_boundary() const noexcept {
-            if (recurrent_boundary) { return recurrent_boundary; }
-            if (rewrite_checkpoint_capture) { return rewrite_checkpoint_capture->frontier; }
-            return std::nullopt;
+            std::optional<std::uint32_t> boundary;
+            if (recurrent_boundary) { boundary = recurrent_boundary; }
+            else if (rewrite_checkpoint_capture) { boundary = rewrite_checkpoint_capture->frontier; }
+            if (shared_capture && cursor < *shared_capture &&
+                (!boundary || cursor >= *boundary || *shared_capture < *boundary)) {
+                boundary = shared_capture;
+            }
+            return boundary;
         }
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
@@ -416,7 +449,7 @@ public:
     [[nodiscard]] std::uint32_t reusable_append_frontier(const SequenceState& sequence) const noexcept;
     [[nodiscard]] bool acquire_rewrite_checkpoint(SequenceState& sequence);
     [[nodiscard]] std::uint64_t prefix_cache_revision(std::uint32_t lane) const noexcept {
-        return decoder->checkpoint_revision() + archived_prefixes.revision() +
+        return decoder->checkpoint_revision() + archived_prefixes.revision() + shared_prefix_revision +
                (lane < checkpoint_revisions.size() ? checkpoint_revisions[lane] : 0);
     }
     static void burst_egress_copy_host(void* user) noexcept;
@@ -608,6 +641,31 @@ public:
                              const std::shared_ptr<GpuPrefixStorage>& storage);
     void restore_gpu_prefix(SequenceState& sequence, const RequestPlanImpl& plan);
 
+    // Shared-prefix cache (SUROGATE_SERVE_SHARED_PREFIX_SLOTS, 0 disables): a page-aligned
+    // prompt prefix seen in an earlier request is captured once, mid-prefill, and later
+    // requests on any lane fork it instead of prefilling it again.
+    std::uint32_t shared_prefix_slots = 0;
+    std::uint32_t shared_prefix_page_budget = 0;
+    std::unordered_map<std::uint64_t, std::shared_ptr<SharedPrefix>> shared_prefixes;
+    // Page hashes earlier requests carried, in two generations so the set stays bounded.
+    std::array<std::unordered_set<std::uint64_t>, 2> shared_prefix_seen;
+    std::shared_ptr<GpuPrefixStorage> shared_prefix_storage;
+    std::uint64_t shared_prefix_clock = 0;
+    std::uint64_t shared_prefix_revision = 0;
+    [[nodiscard]] std::shared_ptr<const std::vector<std::uint64_t>>
+    shared_prefix_hashes(const PreparedPromptData& prompt, std::int32_t lora_slot) const;
+    [[nodiscard]] std::shared_ptr<SharedPrefix> find_shared_prefix(const PreparedPromptData& prompt,
+        const std::vector<std::uint64_t>& hashes, std::int32_t lora_slot) const;
+    void plan_shared_prefix_capture(RequestControl::Prefill& staged,
+                                    const std::vector<std::uint64_t>& hashes);
+    void capture_shared_prefix(SequenceState& sequence, RequestControl::Prefill& staged);
+    void restore_shared_prefix(SequenceState& sequence, const RequestPlanImpl& plan);
+    [[nodiscard]] std::uint32_t shared_prefix_pages() const noexcept;
+    void drop_shared_prefixes() noexcept;
+    [[nodiscard]] static ReusePath reported_reuse(const RequestControl::Prefill& staged) noexcept {
+        return staged.shared_restore ? ReusePath::SharedPrefix : staged.reuse;
+    }
+
     DecodeGraphFlavors ordinary_graphs;
     // Round chaining (PATCHES.md #32): the chained flavor of every ordinary
     // profile, plus the device 1-scalar its in-graph increments read and the
@@ -722,7 +780,8 @@ private:
         const SequenceState& sequence, const PreparedPromptData& prompt,
         const RequestBasePlan& base, bool archived = false);
     [[nodiscard]] std::vector<Tensor> prefix_state_tensors(const SequenceState& sequence,
-                                                          bool checkpoint, bool draft = true) const;
+                                                          bool checkpoint, bool draft = true,
+                                                          bool hidden = true) const;
     void archive_sequence(const SequenceState& sequence);
     void restore_archived_sequence(SequenceState& sequence, const RequestPlanImpl& plan);
     void prepare_graphs();

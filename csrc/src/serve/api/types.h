@@ -766,6 +766,9 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    /// Resumed from a prompt prefix another conversation left on the GPU (reported only:
+    /// the engine appends at that prefix's frontier).
+    SharedPrefix,
 };
 
 struct GenerationResult {

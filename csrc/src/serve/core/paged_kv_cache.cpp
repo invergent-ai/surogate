@@ -281,6 +281,21 @@ PagedKVAllocation PagedKVPool::fork_prefix(std::shared_ptr<const PagedKVAllocati
     return out;
 }
 
+std::shared_ptr<const PagedKVAllocation> PagedKVPool::share_prefix(PagedKVAllocation& allocation,
+                                                                   std::uint32_t pages) {
+    if (!allocation.belongs_to(*this) || pages <= allocation.borrowed_pages_ ||
+        pages > allocation.mapped_page_count()) {
+        throw std::invalid_argument("invalid shared KV prefix");
+    }
+    std::shared_ptr<PagedKVAllocation> shared(new PagedKVAllocation(*this, pages));
+    shared->prefix_ = std::move(allocation.prefix_);
+    shared->borrowed_pages_ = allocation.borrowed_pages_;
+    shared->page_ids_.assign(allocation.page_ids_.begin(), allocation.page_ids_.begin() + pages);
+    allocation.prefix_ = shared;
+    allocation.borrowed_pages_ = pages;
+    return shared;
+}
+
 void PagedKVPool::copy_pages(std::span<const std::int32_t> source,
                              std::span<const std::int32_t> destination, cudaStream_t stream) const {
     if (source.size() != destination.size()) { throw std::invalid_argument("GPU page copy size mismatch"); }
