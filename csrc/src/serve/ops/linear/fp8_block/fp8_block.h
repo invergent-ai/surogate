@@ -29,6 +29,12 @@ void require_fp8_block_weight(const Weight& w, const char* op);
 [[nodiscard]] std::size_t linear_workspace_capacity_bytes(std::int32_t output_rows,
                                                           std::int32_t input_rows,
                                                           std::int32_t max_tokens);
+/// What linear_projections over row ranges of a `parent_rows` parent needs to run them as one
+/// launch on Hopper (a staging plane on narrow rounds); an arena with only
+/// linear_workspace_capacity_bytes runs them one by one.
+[[nodiscard]] std::size_t projections_workspace_capacity_bytes(std::int32_t parent_rows,
+                                                               std::int32_t input_rows,
+                                                               std::int32_t max_tokens);
 
 /// The row range `[row_begin, row_begin + rows)` as a weight of its own; `row_begin` a
 /// multiple of 128 so the scale grid splits with it.
@@ -45,6 +51,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                   WorkspaceArena* workspace, cudaStream_t stream);
 
+/// Each projection's row range into its output. Consecutive ranges of one parent, in order (up
+/// to four), run as one launch.
 void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
                         WorkspaceArena* workspace, cudaStream_t stream);
 

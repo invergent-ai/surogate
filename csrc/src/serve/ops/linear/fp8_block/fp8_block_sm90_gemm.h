@@ -1,6 +1,7 @@
 // Hopper's block-scaled FP8 GEMM: the CUTLASS 3.x warp-specialized wgmma kernel vLLM runs for
 // fine-grained FP8 checkpoints on sm_90 (csrc/quantization/w8a8/cutlass/c3x/
-// scaled_mm_blockwise_sm90_fp8_dispatch.cuh, vLLM, Apache-2.0), with vLLM's two tile choices.
+// scaled_mm_blockwise_sm90_fp8_dispatch.cuh, vLLM, Apache-2.0), with vLLM's two tiles and three
+// more for the round sizes between and above them (fp8_block_sm90_gemm.cu picks one per call).
 //
 // Operands, in the engine's own layouts:
 //   activations  E4M3 codes [tokens, k] row-major, one FP32 scale per token per 128 of k stored

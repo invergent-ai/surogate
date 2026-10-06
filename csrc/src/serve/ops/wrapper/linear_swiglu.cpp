@@ -163,6 +163,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         }
         if (detail::ggml::ggml_swiglu(x, gate_up_weight, out, ws, stream)) { return; }
         auto scope  = ws.scope();
+        if (detail::fp8_block::is_fp8_block_qtype(gate_up_weight.qtype)) {
+            // Block FP8: one GEMM over the whole parent, [gate; up] per token, which silu_mul
+            // reads as two strided halves. Two launches of half the rows each left SMs idle on a
+            // decode round, and the packed plane is the size the two halves took.
+            Tensor packed = ws.alloc(DType::BF16, {2 * rows, t});
+            detail::fp8_block::linear(x, gate_up_weight, packed, &ws, stream);
+            silu_mul(packed.slice(0, 0, rows), packed.slice(0, rows, rows), out, stream);
+            return;
+        }
         Tensor gate = ws.alloc(DType::BF16, {rows, t});
         Tensor up   = ws.alloc(DType::BF16, {rows, t});
         linear_projections(x, {{gate_up_weight, gate, LinearPolicy::A16Only, 0},

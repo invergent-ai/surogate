@@ -3,10 +3,14 @@
 
 #include "ops/gqa_sm90/gqa_fa3_launch.h"
 
+#include "tile_size.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cutlass/kernel_hardware_info.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -66,6 +70,22 @@ __global__ void prompt_metadata_kernel(const std::int32_t* positions, std::int32
     }
 }
 
+// Row r of a decode or verify batch as segment r (rows_metadata in the header).
+__global__ void rows_metadata_kernel(const std::int32_t* positions, std::int32_t width,
+                                     std::int32_t batch, const std::int32_t* valid_columns,
+                                     const std::int32_t* rows, std::int32_t* metadata) {
+    const std::int32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= batch) { return; }
+    std::int32_t valid = valid_columns != nullptr ? valid_columns[r] : width;
+    valid              = valid < 0 ? 0 : (valid > width ? width : valid);
+    const std::int32_t keys = valid > 0 ? positions[r * width] + valid : 0;
+    metadata[r]                 = r * width;
+    metadata[batch + 1 + r]     = valid;
+    metadata[2 * batch + 1 + r] = keys > 0 ? keys : 0;
+    metadata[3 * batch + 1 + r] = rows != nullptr ? rows[r] : r;
+    if (r == batch - 1) { metadata[batch] = batch * width; }
+}
+
 __global__ void segment_kv_lengths_kernel(const std::int32_t* positions,
                                           const std::int32_t* q_offsets,
                                           const std::int32_t* q_lengths, std::int32_t segments,
@@ -93,13 +113,45 @@ __global__ void quantize_query_kernel(const uint4* __restrict__ q, uint2* __rest
                           static_cast<std::uint32_t>(out[2]) | static_cast<std::uint32_t>(out[3]) << 16);
 }
 
-template <int HeadDim>
-void dispatch(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream) {
-    if (fp8) {
-        return local ? launch<HeadDim, true, true>(p, stream) : launch<HeadDim, true, false>(p, stream);
+template <int HeadDim, bool Split>
+void dispatch_dim(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream) {
+    if constexpr (!Split) {
+        if (fp8) {
+            return local ? launch<HeadDim, true, true, false>(p, stream)
+                         : launch<HeadDim, true, false, false>(p, stream);
+        }
     }
-    return local ? launch<HeadDim, false, true>(p, stream) : launch<HeadDim, false, false>(p, stream);
+    return local ? launch<HeadDim, false, true, Split>(p, stream)
+                 : launch<HeadDim, false, false, Split>(p, stream);
 }
+
+template <bool Split>
+void dispatch(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream) {
+    switch (p.d) {
+    case 64:  return dispatch_dim<64, Split>(p, fp8, local, stream);
+    case 128: return dispatch_dim<128, Split>(p, fp8, local, stream);
+    default:  return dispatch_dim<256, Split>(p, fp8, local, stream);
+    }
+}
+
+// flash_api.cpp's num_splits_heuristic: the fewest splits within 85 % of the best wave
+// efficiency, none when the segments' M blocks nearly fill the device or a segment holds at most
+// four key blocks (FA3's sm90 kernels split causal and windowed launches only this way).
+int num_splits_heuristic(int total_mblocks, int num_sms, int num_n_blocks, int max_splits) {
+    if (total_mblocks >= 0.8f * num_sms || num_n_blocks <= 4) { return 1; }
+    max_splits = std::min({max_splits, num_sms, num_n_blocks});
+    float best = 0.0f;
+    for (int splits = 1; splits <= max_splits; ++splits) {
+        const float waves = float(total_mblocks * splits) / num_sms;
+        best              = std::max(best, waves / std::ceil(waves));
+    }
+    for (int splits = 1; splits <= max_splits; ++splits) {
+        const float waves = float(total_mblocks * splits) / num_sms;
+        if (waves / std::ceil(waves) >= 0.85f * best) { return splits; }
+    }
+    return 1;
+}
+
 
 void check_launch(const char* what) {
     const cudaError_t status = cudaGetLastError();
@@ -129,10 +181,53 @@ std::int32_t min_columns() noexcept {
     return value;
 }
 
+bool rows_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_GQA_FA3_ROWS");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 void prompt_metadata(const std::int32_t* positions, std::int32_t tokens,
                      const std::int32_t* kv_row, std::int32_t* metadata, cudaStream_t stream) {
     prompt_metadata_kernel<<<1, 32, 0, stream>>>(positions, tokens, kv_row, metadata);
     check_launch("prompt metadata");
+}
+
+RowSplits row_splits(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
+                     std::int32_t total_q, std::int32_t max_q, std::int32_t max_keys, bool fp8_cache,
+                     std::int32_t sliding_window) noexcept {
+    if (!supports(head_dim, q_heads, kv_heads) || total_q <= 0 || max_q <= 0 || max_keys <= 0 ||
+        fp8_cache) {
+        return {};
+    }
+    const int num_sms = hardware().sm_count;
+    if (num_sms <= 0) { return {}; }
+    const bool local = sliding_window > 0;
+    const auto tile  = tile_size_fwd_sm90(head_dim, head_dim, !local, local, /*element_size=*/2,
+                                          /*v_colmajor=*/false, /*paged_kv_non_TMA=*/true,
+                                          /*softcap=*/false);
+    const int block_m = std::get<0>(tile);
+    const int block_n = std::get<1>(tile);
+    // A window loads at most its own keys plus one M tile's worth (FA3's seqlen_k_loaded).
+    const int keys = local ? std::min(max_keys, sliding_window + block_m) : max_keys;
+    const int n_blocks = (keys + block_n - 1) / block_n;
+    const int m_blocks = (max_q * (q_heads / kv_heads) + block_m - 1) / block_m;
+    const int splits = num_splits_heuristic(kv_heads * m_blocks, num_sms, n_blocks, kMaxSplits);
+    if (splits <= 1) { return {}; }
+    const std::size_t cap = kPartialBudget / split_bytes(head_dim, q_heads, total_q);
+    return {static_cast<std::int32_t>(std::min<std::size_t>(splits, std::max<std::size_t>(1, cap))),
+            true};
+}
+
+void rows_metadata(const std::int32_t* positions, std::int32_t width, std::int32_t batch,
+                   const std::int32_t* valid_columns, const std::int32_t* rows,
+                   std::int32_t* metadata, cudaStream_t stream) {
+    if (batch <= 0 || width <= 0) { throw std::invalid_argument("gqa_fa3: empty row batch"); }
+    rows_metadata_kernel<<<(batch + 127) / 128, 128, 0, stream>>>(positions, width, batch,
+                                                                   valid_columns, rows, metadata);
+    check_launch("rows metadata");
 }
 
 void segment_kv_lengths(const std::int32_t* positions, const std::int32_t* q_offsets,
@@ -144,7 +239,7 @@ void segment_kv_lengths(const std::int32_t* positions, const std::int32_t* q_off
     check_launch("segment kv lengths");
 }
 
-void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
+void run(const PagedLaunch& a, void* workspace, std::size_t workspace_capacity,
          cudaStream_t stream) {
     if (!available()) {
         throw std::runtime_error("gqa_fa3: needs an sm_90 device and a build with 90a");
@@ -157,11 +252,14 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
         a.out == nullptr || a.k_pages == nullptr || a.v_pages == nullptr ||
         a.block_tables == nullptr || a.q_offsets == nullptr || a.q_lengths == nullptr ||
         a.kv_lengths == nullptr || a.kv_rows == nullptr || !(a.scale > 0.0f) ||
-        a.sliding_window < 0) {
+        a.sliding_window < 0 || a.max_splits < 1 || a.max_splits > kMaxSplits ||
+        (a.fp8_cache && a.max_splits > 1) ||
+        static_cast<std::size_t>(a.max_splits) * split_bytes(a.head_dim, a.q_heads, a.total_q) >
+            std::max(kPartialBudget, split_bytes(a.head_dim, a.q_heads, a.total_q))) {
         throw std::invalid_argument("gqa_fa3: invalid launch");
     }
-    if (workspace_capacity <
-        workspace_bytes(a.head_dim, a.q_heads, a.total_q, a.segments, a.fp8_cache)) {
+    if (workspace_capacity < workspace_bytes(a.head_dim, a.q_heads, a.total_q, a.segments,
+                                             a.fp8_cache, a.max_splits > 1)) {
         throw std::invalid_argument("gqa_fa3: workspace smaller than workspace_bytes()");
     }
 
@@ -171,9 +269,11 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     auto* lse       = static_cast<float*>(workspace);
     auto* scheduler = reinterpret_cast<int*>(static_cast<char*>(workspace) + align_up(rows * sizeof(float)));
     const void* q   = a.q;
-    if (a.fp8_cache) {
-        void* codes = static_cast<char*>(workspace) + align_up(rows * sizeof(float)) +
+    char* cursor    = static_cast<char*>(workspace) + align_up(rows * sizeof(float)) +
                       align_up((static_cast<std::size_t>(b_rounded) * 4 + 1) * sizeof(std::int32_t));
+    if (a.fp8_cache) {
+        void* codes = cursor;
+        cursor += align_up(rows * static_cast<std::size_t>(dim));
         const std::size_t groups = rows * static_cast<std::size_t>(dim) / 8;
         quantize_query_kernel<<<static_cast<unsigned>((groups + 255) / 256), 256, 0, stream>>>(
             static_cast<const uint4*>(a.q), static_cast<uint2*>(codes), groups);
@@ -234,14 +334,28 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.is_local          = local;
     p.window_size_left  = local ? a.sliding_window - 1 : -1;
     p.window_size_right = 0;
-    p.num_splits        = 1;
+    p.num_splits        = a.max_splits;
     p.pack_gqa          = true;
+    if (a.max_splits > 1) {
+        // [splits][q_heads][total_q][dv] partial outputs and [splits][q_heads][total_q]
+        // log-sum-exps, as flash_api.cpp lays them out for a varlen launch.
+        const std::size_t partial = static_cast<std::size_t>(a.max_splits) * rows;
+        p.oaccum_ptr               = cursor;
+        p.softmax_lseaccum_ptr     = cursor + align_up(partial * dim * sizeof(float));
+        p.oaccum_split_stride      = static_cast<std::int64_t>(rows) * dim;
+        p.oaccum_head_stride       = static_cast<std::int64_t>(a.total_q) * dim;
+        p.oaccum_row_stride        = dim;
+        p.lseaccum_split_stride    = static_cast<std::int64_t>(rows);
+        p.lseaccum_head_stride     = a.total_q;
+    }
 
     p.varlen_sort_batches   = !local;  // as FA3's API sets the scheduler's Sort and LPT order
     p.head_swizzle          = true;
     p.num_splits_dynamic_ptr = scheduler;
     p.num_m_blocks_ptr       = scheduler + b_rounded;
-    p.varlen_batch_idx_ptr   = scheduler + b_rounded * 2;
+    // Only a sorted scheduler (causal) writes the virtual-to-real batch map, and the combine reads
+    // it whenever it is set, so a window leaves it null, as flash_api.cpp does.
+    p.varlen_batch_idx_ptr   = local ? nullptr : scheduler + b_rounded * 2;
     p.num_nheads_in_l2_ptr   = scheduler + b_rounded * 3;
     p.tile_count_semaphore   = scheduler + b_rounded * 4;
     p.tile_count_semaphore_offset = b_rounded * 4;
@@ -253,11 +367,12 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.num_sm = hardware().sm_count;
     // q/k/v descale pointers stay null: 1.0, the cache's (absent) scale.
 
-    switch (a.head_dim) {
-    case 64:  return dispatch<64>(p, a.fp8_cache, local, stream);
-    case 128: return dispatch<128>(p, a.fp8_cache, local, stream);
-    default:  return dispatch<256>(p, a.fp8_cache, local, stream);
-    }
+    if (a.max_splits == 1) { return dispatch<false>(p, a.fp8_cache, local, stream); }
+    dispatch<true>(p, a.fp8_cache, local, stream);
+    // The combine writes the output of every segment the forward split and leaves the rest,
+    // which the forward wrote whole.
+    p.is_bf16 = true;
+    combine(p, stream);
 }
 
 } // namespace sinfer::ops::detail::gqa_fa3

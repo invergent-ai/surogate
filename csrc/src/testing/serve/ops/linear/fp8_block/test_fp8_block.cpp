@@ -4,6 +4,7 @@
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
 #include "ops/linear/fp8_block/fp8_block.h"
+#include "ops/linear/fp8_block/fp8_block_sm90_gemm.h"
 #include "ops/op_tester.h"
 
 #include <cuda_bf16.h>
@@ -206,6 +207,113 @@ int run(const Case& c) {
     CHECK_CUDA(cudaFree(d_payload)); CHECK_CUDA(cudaFree(d_x)); CHECK_CUDA(cudaFree(d_out));
     return ok ? 0 : 1;
 }
+// Consecutive row ranges of one parent (q/k/v, q/k/gate/v) through linear_projections, which
+// runs them as one launch: each output must hold exactly the rows the whole-parent linear writes,
+// eagerly, replayed from a graph, with no arena and in arenas with and without the staging room.
+int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t tokens) {
+    std::int32_t rows = 0;
+    for (auto r : parts) { rows += r; }
+    std::mt19937 rng(static_cast<unsigned>(99 + rows + 7 * k + 13 * tokens));
+    std::uniform_real_distribution<float> uw(-1.0f, 1.0f), us(0.5f, 2.0f), ux(-3.0f, 3.0f);
+    const std::size_t scale_off = (static_cast<std::size_t>(rows) * k + 255) / 256 * 256;
+    std::vector<std::uint8_t> payload(scale_off + static_cast<std::size_t>(rows / 128) * (k / 128) * 4);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(rows) * k; ++i) { payload[i] = float_to_e4m3(uw(rng)); }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(rows / 128) * (k / 128); ++i) {
+        const float v = us(rng) * 0.01f;
+        std::memcpy(payload.data() + scale_off + 4 * i, &v, 4);
+    }
+    DeviceBuffer d_payload(payload.size());
+    d_payload.copy_from_host(payload.data(), payload.size());
+    Weight w{};
+    w.payload = d_payload.p; w.payload_bytes = payload.size(); w.qtype = QType::FP8_E4M3FN_BLK128_F32S;
+    w.layout = QuantLayout::Fp8Block128; w.group_size = 128; w.group = 128; w.ndim = 2;
+    w.qdata = d_payload.p; w.scales = static_cast<std::uint8_t*>(d_payload.p) + scale_off; w.scale_dtype = DType::FP32;
+    w.scale_ne[0] = 128; w.scale_ne[1] = 128;
+    w.n = rows; w.k = k; w.shape[0] = rows; w.shape[1] = k; w.padded_shape[0] = rows; w.padded_shape[1] = k;
+    std::vector<__nv_bfloat16> hx(static_cast<std::size_t>(k) * tokens);
+    for (auto& v : hx) { v = __float2bfloat16(ux(rng)); }
+    DeviceBuffer d_x(hx.size() * 2), d_whole(static_cast<std::size_t>(rows) * tokens * 2);
+    d_x.copy_from_host(hx.data(), d_x.bytes);
+    Tensor xt(d_x.p, DType::BF16, {k, tokens});
+    Tensor whole(d_whole.p, DType::BF16, {rows, tokens});
+    ops::linear(xt, w, whole, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::vector<std::uint16_t> want(static_cast<std::size_t>(rows) * tokens);
+    d_whole.copy_to_host(want.data(), d_whole.bytes);
+
+    std::vector<DeviceBuffer> outs;
+    std::vector<Tensor> views;
+    std::vector<ops::LinearProjection> projections;
+    for (auto r : parts) { outs.emplace_back(static_cast<std::size_t>(r) * tokens * 2); }
+    std::int32_t begin = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        views.emplace_back(outs[i].p, DType::BF16, std::initializer_list<std::int32_t>{parts[i], tokens});
+    }
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        projections.push_back({w, views[i], ops::LinearPolicy::A16Only, begin});
+        begin += parts[i];
+    }
+    // The chained launch's bits are the whole linear's: the same tile over the same rows.
+    const auto matches = [&] {
+        std::int32_t at = 0;
+        bool same = true;
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            std::vector<std::uint16_t> got(static_cast<std::size_t>(parts[i]) * tokens);
+            outs[i].copy_to_host(got.data(), outs[i].bytes);
+            for (std::int32_t t = 0; t < tokens; ++t) {
+                for (std::int32_t r = 0; r < parts[i]; ++r) {
+                    same &= got[static_cast<std::size_t>(t) * parts[i] + r] ==
+                            want[static_cast<std::size_t>(t) * rows + at + r];
+                }
+            }
+            at += parts[i];
+        }
+        return same;
+    };
+    const bool hopper  = ops::detail::fp8_block::sm90_gemm_available();
+    const bool gemv    = tokens <= 4;
+    const bool chained = gemv || !hopper || tokens <= 128;
+    // GEMV: one launch; the tile: quantize + one launch; Hopper: quantize + GEMM + split
+    const std::size_t want_nodes = gemv ? 1 : !chained ? 1 + parts.size() : hopper ? 3 : 2;
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    bool ok = true;
+    const std::size_t roomy = std::max(std::size_t{256}, ops::detail::fp8_block::projections_workspace_capacity_bytes(rows, k, tokens));
+    const std::size_t tight = std::max(std::size_t{256}, ops::detail::fp8_block::workspace_bytes(k, tokens));
+    std::size_t nodes_seen = 0;
+    for (int arena = 0; arena < 3; ++arena) {
+        WorkspaceArena workspace(arena == 2 ? tight : roomy);
+        for (auto& o : outs) { o.fill(0); }
+        CHECK_CUDA(cudaDeviceSynchronize()); // the fills run on the legacy stream
+        ops::linear_projections(xt, projections, arena == 0 ? nullptr : &workspace, stream);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        ok &= matches();
+        for (auto& o : outs) { o.fill(0); }
+        CHECK_CUDA(cudaDeviceSynchronize());
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        ops::linear_projections(xt, projections, arena == 0 ? nullptr : &workspace, stream);
+        CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+        CHECK_CUDA(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        std::size_t nodes = 0;
+        CHECK_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
+        // The tight arena has no staging room: Hopper's chained launch falls back to one GEMM
+        // per range.
+        const std::size_t expect = arena == 2 && hopper && !gemv ? 1 + parts.size() : want_nodes;
+        ok &= nodes == expect;
+        if (arena == 0) { nodes_seen = nodes; }
+        CHECK_CUDA(cudaGraphLaunch(exec, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        ok &= matches();
+        CHECK_CUDA(cudaGraphExecDestroy(exec)); CHECK_CUDA(cudaGraphDestroy(graph));
+    }
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    std::printf("  chain [");
+    for (std::size_t i = 0; i < parts.size(); ++i) { std::printf(i ? " %d" : "%d", parts[i]); }
+    std::printf("] k=%d T=%-4d nodes=%zu  %s\n", k, tokens, nodes_seen, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
 } // namespace
 
 int main() {
@@ -214,16 +322,27 @@ int main() {
     for (const Case& c : {Case{256, 512, 1, false}, Case{256, 512, 3, false}, Case{256, 512, 4, true},
                           Case{256, 512, 5, false}, Case{384, 1024, 64, false}, Case{384, 1024, 200, true},
                           Case{512, 1024, 130, false}, Case{1024, 3584, 33, true},
-                          // Hopper's two CUTLASS configurations (fp8_block_sm90_gemm.h): the swapped
-                          // narrow tile at 33 tokens, the cooperative one past 64 -- at 66, 130, 573
-                          // and 1027 over activation scales padded to a multiple of four tokens.
+                          // Hopper's CUTLASS tiles (fp8_block_sm90_gemm.cu), as an H100's 132 SMs
+                          // pick them: the swapped 16-token tile at 5 tokens; the swapped 32-token one
+                          // at 33 to 96, and the 64-token one at 100 over 4352 rows; 128 x 128 at
+                          // 130 to 1027, and 256 x 128 at 300 over 5760 rows -- over activation
+                          // scales padded to a multiple of four tokens.
                           Case{1024, 2048, 66, false}, Case{1536, 1024, 96, false},
+                          Case{4352, 1024, 100, false}, Case{4352, 1024, 100, true},
                           Case{2048, 2048, 256, false}, Case{2048, 1024, 256, true},
+                          Case{5760, 512, 300, false},
                           Case{2048, 2048, 573, false}, Case{1536, 1024, 1027, true},
                           Case{256, 512, 1, false, true}, Case{384, 1024, 64, true, true},
                           Case{512, 1024, 200, false, true}}) {
         failures += run(c);
     }
+    // q/k/v of a 4:1:1 head layout, q/k/gate/v of a gated one, and a qkv/z pair: decode GEMV
+    // widths, Hopper's staged widths (narrow and swapped tiles), and wide rounds it runs apart.
+    for (std::int32_t tokens : {1, 3, 20, 64, 100, 200}) {
+        failures += run_chain({512, 128, 128}, 1024, tokens);
+    }
+    failures += run_chain({256, 128, 256, 128}, 512, 48);
+    failures += run_chain({768, 256}, 512, 128);
     std::printf("%s\n", failures == 0 ? "fp8 block: all cases ok" : "fp8 block: FAILURES");
     return failures == 0 ? 0 : 1;
 }
