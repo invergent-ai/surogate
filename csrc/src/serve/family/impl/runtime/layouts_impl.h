@@ -18,6 +18,7 @@
 #include "api/ops/gdn_input_proj.h"
 #include "api/ops/linear_add.h"
 #include "api/ops/linear_swiglu.h"
+#include "api/family/round_state.h"
 #include "api/ops/sampling.h"
 #include "api/ops/speculative_round.h"
 #include "api/ops/gqa_attention.h"
@@ -756,12 +757,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         proposal_scratch(layout, 1);
     };
 
+    // A mixed round samples on top of its prompt chunk's live roots: the prompts that finish
+    // in it (up to kMaximumPrefillSegments) and then its decode rows (up to the batch). Booking
+    // one row here left the chunk's roots plus a full batch's sampler to the ordinary round's
+    // figure, which holds only `batch` columns -- enough while the chunk's layer scratch
+    // dominates, short where a large vocabulary's sampler does: Gemma 4 E4B (262K tokens) at
+    // 64 users ran out by ~1 MB in a mixed round with 63 decode rows.
+    const std::int32_t mixed_sample_rows =
+        std::max(batch_capacity, std::min<std::int32_t>(family::kMaximumPrefillSegments,
+                                                        static_cast<std::int32_t>(plan.max_concurrency)));
+
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
     target_body(text_prefill, 1, chunk, family::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                 1, chunk, text_envelope);
-    scratch(text_prefill, ops::sampling_workspace_capacity_bytes(plan.geometry.token_domain, 1, 1));
+    scratch(text_prefill, ops::sampling_workspace_capacity_bytes(plan.geometry.token_domain, 1,
+                                                                 mixed_sample_rows));
     out.text_prefill = finish(text_prefill);
 
     for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
@@ -794,6 +806,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                    mtp_block_is_trunk_layer<Variant>() ? plan.geometry.residual : plan.geometry.hidden, 1);
             mtp_full_call(mtp_prefill, 1, text_envelope, true);
         }
+        // The same mixed-round sampler as text_prefill's, over this chunk's live state.
+        scratch(mtp_prefill, ops::sampling_workspace_capacity_bytes(plan.geometry.token_domain, 1,
+                                                                    mixed_sample_rows));
         out.mtp_prefill = finish(mtp_prefill);
 
         WorkspaceLayoutBuilder mtp_batch;
