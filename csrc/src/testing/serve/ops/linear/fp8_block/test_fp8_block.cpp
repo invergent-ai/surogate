@@ -435,10 +435,19 @@ int main() {
                           Case{2048, 2048, 573, false}, Case{1536, 1024, 1027, true},
                           Case{256, 512, 1, false, true}, Case{384, 1024, 64, true, true},
                           Case{512, 1024, 200, false, true},
-                          // On Hopper, 3 and 4 tokens over 64 and 40 row blocks leave the GEMV
-                          // for the narrow tile (gemv_serves); per-row scales keep the GEMV.
+                          // On Hopper the narrow tensor-core kernel takes 3 to 16 tokens
+                          // (mma_serves): 8-token groups one and two, either scale cell, row
+                          // ranges, and K over eight warps (a wave of CTAs) and over four (two
+                          // waves or more). With it off (the mma0 run) the GEMV keeps 3 tokens on
+                          // any weight and 4 below 96 row blocks, and from 96 blocks 4 tokens take
+                          // the narrow CUTLASS tile, whole or as a row range; per-row scales keep
+                          // the GEMV.
                           Case{8192, 1024, 3, false}, Case{5120, 2048, 4, false},
-                          Case{10240, 1024, 4, true}, Case{5120, 1024, 4, false, true}}) {
+                          Case{10240, 1024, 4, true}, Case{12288, 1024, 4, false},
+                          Case{24576, 512, 4, true}, Case{5120, 1024, 4, false, true},
+                          Case{256, 512, 12, false}, Case{512, 1024, 16, true},
+                          Case{384, 1024, 9, false, true}, Case{1024, 3584, 7, false, true},
+                          Case{20480, 256, 6, false}, Case{20480, 256, 13, true}}) {
         failures += run(c);
     }
     // q/k/v of a 4:1:1 head layout, q/k/gate/v of a gated one, and a qkv/z pair: decode GEMV
@@ -449,10 +458,12 @@ int main() {
     failures += run_chain({256, 128, 256, 128}, 512, 48);
     failures += run_chain({768, 256}, 512, 128);
     failures += run_chain({4096, 1024, 1024}, 1024, 4);
+    failures += run_chain({8192, 2048, 2048}, 1024, 4); // each range under 96 blocks, the parent not
     // Decode GEMV widths keep the pair; the narrow, swapped and wide tiles take the fused route.
     for (std::int32_t tokens : {3, 5, 64, 100, 300}) { failures += run_swiglu(512, 256, tokens, 0.0f); }
     failures += run_swiglu(384, 512, 40, 1.5f);
     failures += run_swiglu(512, 5120, 4, 0.0f);
+    failures += run_swiglu(512, 12288, 4, 0.0f);
     std::printf("%s\n", failures == 0 ? "fp8 block: all cases ok" : "fp8 block: FAILURES");
     return failures == 0 ? 0 : 1;
 }

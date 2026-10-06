@@ -103,13 +103,20 @@ __launch_bounds__(Block) __global__
     const int pairs             = d / 2;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[kMaxPairsPerLane];
+    float2 gains[kMaxPairsPerLane], operands[kMaxPairsPerLane];
     float sum = 0.0f;
 
+    // The gain and operand loads go out with x's, ahead of the reduction they do not need.
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
-            values[k]       = x[row_base + pair];
+            values[k]   = x[row_base + pair];
+            gains[k]    = rmsnorm_gain2<Epilogue>(weight, pair);
+            operands[k] = float2{0.0f, 0.0f};
+            if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
+                operands[k] = __bfloat1622float2(z[row_base + pair]);
+            }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -124,11 +131,8 @@ __launch_bounds__(Block) __global__
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = rmsnorm_gain2<Epilogue>(weight, pair);
-            float2 zf{0.0f, 0.0f};
-            if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
-                zf = __bfloat1622float2(z[row_base + pair]);
-            }
+            const float2 wf = gains[k];
+            const float2 zf = operands[k];
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
@@ -157,13 +161,7 @@ __launch_bounds__(Block) __global__
     const int pair1             = lane + kWarpSize;
     const __nv_bfloat162 value0 = x[row_base + pair0];
     const __nv_bfloat162 value1 = x[row_base + pair1];
-    const float2 x0             = __bfloat1622float2(value0);
-    const float2 x1             = __bfloat1622float2(value1);
-    float sum                   = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
-    sum                         = warp_reduce_sum(sum);
-    float inv                   = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
-    inv                         = __shfl_sync(kFullWarpMask, inv, 0);
-
+    // The gain and operand loads go out with x's, ahead of the reduction they do not need.
     const float2 w0 = rmsnorm_gain2<Epilogue>(weight, pair0);
     const float2 w1 = rmsnorm_gain2<Epilogue>(weight, pair1);
     float2 z0{0.0f, 0.0f};
@@ -172,6 +170,13 @@ __launch_bounds__(Block) __global__
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
+    const float2 x0             = __bfloat1622float2(value0);
+    const float2 x1             = __bfloat1622float2(value1);
+    float sum                   = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
+    sum                         = warp_reduce_sum(sum);
+    float inv                   = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
+    inv                         = __shfl_sync(kFullWarpMask, inv, 0);
+
     out[row_base + pair0] =
         __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x0.x, inv, w0.x, z0.x),
                               rmsnorm_epilogue<Epilogue>(x0.y, inv, w0.y, z0.y));
@@ -195,13 +200,21 @@ __launch_bounds__(Block) __global__
     const int pairs_per_thread  = pairs / Block;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[MaxPairsPerThread];
+    float2 gains[MaxPairsPerThread], operands[MaxPairsPerThread];
     float sum = 0.0f;
 
+    // The gain and operand loads go out with x's, ahead of the block reduction (and its
+    // barriers) they do not need: issued after it, they added a second memory round trip.
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
         if (k < pairs_per_thread) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             values[k]       = x[row_base + pair];
+            gains[k]        = rmsnorm_gain2<Epilogue>(weight, pair);
+            operands[k]     = float2{0.0f, 0.0f};
+            if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
+                operands[k] = __bfloat1622float2(z[row_base + pair]);
+            }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -219,11 +232,8 @@ __launch_bounds__(Block) __global__
         if (k < pairs_per_thread) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = rmsnorm_gain2<Epilogue>(weight, pair);
-            float2 zf{0.0f, 0.0f};
-            if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
-                zf = __bfloat1622float2(z[row_base + pair]);
-            }
+            const float2 wf = gains[k];
+            const float2 zf = operands[k];
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
@@ -249,6 +259,15 @@ __launch_bounds__(512) __global__
     const int pair1             = pair0 + kBlock;
     const __nv_bfloat162 value0 = x[row_base + pair0];
     const __nv_bfloat162 value1 = x[row_base + pair1];
+    // The gain and operand loads go out with x's, ahead of the reduction they do not need.
+    const float2 w0 = rmsnorm_gain2<Epilogue>(weight, pair0);
+    const float2 w1 = rmsnorm_gain2<Epilogue>(weight, pair1);
+    float2 z0{0.0f, 0.0f};
+    float2 z1{0.0f, 0.0f};
+    if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
+        z0 = __bfloat1622float2(z[row_base + pair0]);
+        z1 = __bfloat1622float2(z[row_base + pair1]);
+    }
     const float2 x0             = __bfloat1622float2(value0);
     const float2 x1             = __bfloat1622float2(value1);
     const float local_sum       = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
@@ -260,14 +279,6 @@ __launch_bounds__(512) __global__
     __syncthreads();
     const float inv = inv_shared;
 
-    const float2 w0 = rmsnorm_gain2<Epilogue>(weight, pair0);
-    const float2 w1 = rmsnorm_gain2<Epilogue>(weight, pair1);
-    float2 z0{0.0f, 0.0f};
-    float2 z1{0.0f, 0.0f};
-    if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
-        z0 = __bfloat1622float2(z[row_base + pair0]);
-        z1 = __bfloat1622float2(z[row_base + pair1]);
-    }
     out[row_base + pair0] =
         __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x0.x, inv, w0.x, z0.x),
                               rmsnorm_epilogue<Epilogue>(x0.y, inv, w0.y, z0.y));

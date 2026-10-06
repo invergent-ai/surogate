@@ -650,6 +650,13 @@ sinfer_add_op_test(sinfer_linear_add_fp8_test
 sinfer_add_op_test(sinfer_linear_fp8_block_test
   SOURCES ops/linear/fp8_block/test_fp8_block.cpp
   LIBRARIES sinfer_ops)
+# The same cases with the narrow tensor-core kernel off (Hopper's GEMV / CUTLASS split at three
+# to sixteen tokens) and forced on (the GPUs it is not the default on).
+foreach(mma 0 1)
+  add_test(NAME sinfer_linear_fp8_block_mma${mma}_test COMMAND sinfer_linear_fp8_block_test)
+  set_tests_properties(sinfer_linear_fp8_block_mma${mma}_test PROPERTIES
+    ENVIRONMENT "SUROGATE_SERVE_FP8_BLOCK_MMA=${mma}" SKIP_RETURN_CODE 77)
+endforeach()
 sinfer_add_fused_linear_test(
   sinfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp

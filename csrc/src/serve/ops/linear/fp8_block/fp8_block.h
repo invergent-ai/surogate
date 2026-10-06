@@ -53,7 +53,7 @@ void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tens
 
 /// Whether a round of `tokens` columns through `w` runs on quantised activations -- past the
 /// GEMV's widths for this weight, which read the exact BF16 activation instead (to four tokens;
-/// on Hopper a tall block-FP8 weight leaves the GEMV past two, see gemv_serves).
+/// on Hopper a tall block-FP8 weight leaves the GEMV past three, see gemv_serves).
 [[nodiscard]] bool quantizes_activations(const Weight& w, std::int32_t tokens) noexcept;
 /// residual[n, T] += W . (silu(gate) * up), from `packed` [2k, T]: each token's k gate rows, then
 /// its k up rows (linear_swiglu's packed plane). The activation goes straight into W's quantised

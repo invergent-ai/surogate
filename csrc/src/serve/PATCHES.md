@@ -4028,3 +4028,56 @@ one H100 (Modal, then Nebius) the 38 RoPE, linear, SwiGLU, projection, attention
 chat requests through the server pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and
 Gemma 4 E4B (one-stream CLI decode 217, 81, 661, 556 and 101 tok/s); as in #101, the 0.6B and the FP8
 replies differ slightly between concurrent requests, whose rounds differ in width.
+
+## 107
+
+**Hopper decode at three to sixteen tokens (2026-10-06, after #106).** After #106, Qwen3-8B-FP8 on
+one H100 decoded 153-158 tok/s a stream at three and four users against vLLM's 207: those rounds ran
+the GEMV, whose work grows with its columns, or quantised their activations for the narrow CUTLASS
+tile, whose grid has no K split. Everything below is engine-wide unless it says otherwise.
+
+- **A tensor-core kernel for narrow rounds** (`fp8_block.cu`, `mma_kernel`). Three to sixteen tokens
+  now take a kernel that turns each E4M3 code into a BF16 in registers (exactly: every E4M3 value is
+  one) and runs m16n8k16 MMAs against the BF16 activations as they are, so nothing quantises them
+  first and a round's error is the GEMV's, not the quantised tile's (sampled against a double
+  reference on an H100: 1.5e-3, the BF16 output's own rounding, against 2.4e-2). A CTA takes 16 rows
+  and splits K over four or eight warps by 128-blocks, two blocks in flight; each lane loads 16
+  contiguous codes of two rows and the matching 32 activations (the MMA's k order permuted alike on
+  both sides), a block's MMAs sum unscaled and fold in at the block's scale, and the CTA sums its
+  warps in warp order. Eight warps when one wave holds every CTA, four when even four make two
+  waves, else the split whose last wave idles fewer SMs (occupancy from the runtime). At four tokens
+  over an 8B model's q/k/v, o, gate/up and down on an H100 (us): 11.5 / 8.6 / 37.8 / 21.1, against
+  the GEMV's 14.4 / 11.1 / 48.7 / 28.6 and the tile's 18.2 / 17.7 / 43.0 / 42.7 with its quantise;
+  flat from three to eight tokens, 5-10 % slower at sixteen. In the engine at four users the four
+  projections of a layer take 82 us against 122. One and two tokens keep the GEMV (34.0 against
+  37.5 us at 24576 x 4096). Either scale cell, chained row ranges and residual accumulation are
+  covered. On by default on sm_90 only, where it was measured (other GPUs keep their routes);
+  `SUROGATE_SERVE_FP8_BLOCK_MMA=0` turns it off, `=1` on, on any GPU.
+- **The decode GEMV past one token** (`gemv_kernel`, every GPU). Each code was converted once per
+  (row, token) pair and each activation once per row. They are now converted once a row and once a
+  chunk (shared by the CTA's rows), with the same sums in the same order: on an H100 four tokens take
+  31-47 % less time over the 8B/27B shapes (down 4096 x 12288: 42.6 -> 28.8 us), two tokens 15-26 %
+  less. Without the tensor-core kernel the GEMV now keeps three tokens on every weight and four below
+  96 row blocks.
+- **RMSNorm's gain and operand loads** (`ops/kernel/rmsnorm.cuh`, every kernel shape). They went out
+  after the row's reduction and its barriers, a second memory round trip; they now go with x's.
+  Bit-identical; the 4096-wide CTA kernel at four users 3.7 -> 2.5 us (73 launches a round).
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream with
+the tensor-core kernel (and with it off on the same VM): 1 user 210 (210), 2 users 184 (184), 3 users
+209 (158), 4 users 204 (158), 8 users 184 (174), 16 users 157 (154), 64 users 78 (78); 32 users with
+2,048-token prompts 50.7k prompt tok/s, TTFT 682 ms. vLLM 0.31 on another Nebius H100 the same day
+(where our build without the kernel measured within 2 % of the off column): 230, 222, -, 208, -, 156,
+89; 53.8k, 230 ms. What remains: two-token rounds, which take longer than three-token ones (5.4
+against 4.8 ms) and so trail vLLM by 17 %; one stream (9 %); 64 users (13 %); and TTFT under long
+prompts.
+
+Tests. `sinfer_linear_fp8_block_test` runs three times: by default, with the tensor-core kernel off
+(`sinfer_linear_fp8_block_mma0_test`) and forced on (`..._mma1_test`, the route other GPUs can
+opt into). New cases: 6, 7, 9, 12, 13 and 16 tokens (one and two 8-token groups, block and
+per-channel cells, row ranges, K over four and eight warps), four tokens at 96+ row blocks, a chain
+whose ranges are each under 96 blocks while the parent is not, and the fused SwiGLU pair at a 12288
+output. On one Nebius H100 the 47 RoPE, linear, SwiGLU, projection, attention, MLP, norm, SiLU and
+batch-invariance tests pass (five NVFP4 tests skip). End to end, greedy through the CLI and eight
+concurrent chat requests through the server pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B,
+Qwen3.5-0.8B and Gemma 4 E4B (one-stream CLI decode 216, 81, 668, 570 and 103 tok/s).
