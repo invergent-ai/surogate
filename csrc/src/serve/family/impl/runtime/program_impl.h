@@ -1939,6 +1939,20 @@ void ProgramImplCore::prepare_graphs() {
                 prepare_representative(code_warm.min, 1);
                 device.synchronize();
             }
+            // A route that stages through the engine-slot scratch (a K-quant or block-FP8
+            // projection given no caller workspace: ops::detail::ggml::scratch_for) sizes it by
+            // the round's width, and a capture may not grow it. Warm the widest round so every
+            // capture below finds the scratch it needs already there.
+            if (ordinary_batch_limit > 1) {
+                prepare_representative(code_warm.min, ordinary_batch_limit);
+                device.synchronize();
+                schedule::ordinary_decode_batch(ordinary_state,
+                                                static_cast<std::int32_t>(ordinary_batch_limit),
+                                                {code_warm.min + 1, code_warm.max + 1}, nullptr);
+                device.synchronize();
+                prepare_representative(code_warm.min, 1);
+                device.synchronize();
+            }
         };
         warm_ordinary();
         warm_base_rounds(warm_ordinary);
