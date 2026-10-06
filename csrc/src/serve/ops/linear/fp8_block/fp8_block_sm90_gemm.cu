@@ -196,9 +196,14 @@ bool launch(const std::uint8_t* act_codes, const float* act_scales, const std::u
     const auto problem = kSwap ? cute::make_shape(n, m, static_cast<int>(k), 1)
                                : cute::make_shape(m, n, static_cast<int>(k), 1);
 
+    // The activation scales' rows are sm90_scale_stride(m) long: their layout takes the padded
+    // token count, the problem the real one, so the padding is loaded but never stored.
+    const int scale_m       = sm90_scale_stride(m);
+    const auto scale_shape  = kSwap ? cute::make_shape(n, scale_m, static_cast<int>(k), 1)
+                                    : cute::make_shape(scale_m, n, static_cast<int>(k), 1);
     typename GemmKernel::MainloopArguments mainloop{};
-    mainloop.layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(problem);
-    mainloop.layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(problem);
+    mainloop.layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(scale_shape);
+    mainloop.layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(scale_shape);
     const auto* a = reinterpret_cast<const cutlass::float_e4m3_t*>(act_codes);
     const auto* b = reinterpret_cast<const cutlass::float_e4m3_t*>(w_codes);
     if constexpr (kSwap) {
@@ -261,9 +266,13 @@ bool sm90_gemm(const std::uint8_t* act_codes, const float* act_scales, const std
         !aligned(w_scales) || !aligned(out_bf16)) {
         return false;
     }
-    // vLLM swaps when the token count breaks the activation scales' TMA alignment; a narrow round
-    // also gains from the 16-token tile instead of wasting most of a 128-token one.
-    const bool swap = (tokens % 4) != 0 || tokens <= 64;
+    // A narrow round gains from the swapped 16-token tile instead of wasting most of a 128-token
+    // one. vLLM also swaps whenever the token count breaks the activation scales' TMA alignment;
+    // here their rows are padded to keep it (sm90_scale_stride), so a wide round of any count
+    // keeps the 128 x 128 tile. Serving's mixed rounds (a prompt chunk plus the decode rows)
+    // rarely hold a multiple of four, and the 16-token tile re-reads the weight for every 16
+    // tokens.
+    const bool swap = tokens <= 64;
     if (swap) {
         return residual ? launch<Narrow<true>>(act_codes, act_scales, w_codes, w_scales, out_bf16, tokens, n, k, stream)
                         : launch<Narrow<false>>(act_codes, act_scales, w_codes, w_scales, out_bf16, tokens, n, k, stream);

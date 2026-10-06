@@ -3686,8 +3686,15 @@ fell back on JIT-compiling the sm_89 PTX. The default is now `89;90a;120a` (`SUR
   (`csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm90_fp8_dispatch.cuh`, Apache-2.0,
   provenance in the file header), with vLLM's two configurations: cooperative 128x128x128 tiles in a
   1x2 cluster, and swapped A/B with ping-pong 128x16x128 tiles. vLLM swaps when the token count is not
-  a multiple of 4; here it also swaps at 64 tokens or fewer, where a 128-token tile would mostly be
-  padding. Linear-add runs it with an in-place residual epilogue (C = D = out, beta 1).
+  a multiple of 4, because the activation scales' TMA rows must start 16-byte aligned. Here those rows
+  are padded to a multiple of four tokens (`sm90_scale_stride`; the kernel's scale layout takes the
+  padded count, the problem the real one), so only rounds of 64 tokens or fewer swap, where a
+  128-token tile would mostly be padding. Serving's mixed rounds (a prompt chunk plus the decode rows)
+  rarely hold a multiple of four, and before the padding they all took the 16-token tile, which reads
+  the weight again for every 16 tokens: Qwen3.6-27B-FP8 on one H100 decoded 925 tok/s for 64 users
+  (512-token prompts, 128 out) and 614 for 16, against 1,434 and 755 with it (vLLM: 1,626 and 640),
+  and the 64-user TTFT fell from 222 to 130 ms. Linear-add runs it with an in-place residual epilogue
+  (C = D = out, beta 1).
   `fp8_block::run` takes it for 128x128 weight blocks on an sm_90 device. On Hopper the activation
   quantizer writes the per-token scales k-block-major (`act_scale_index`), the layout the kernel's
   TMA reads; the engine's tile kernel reads either layout and still runs per-channel weights and any
@@ -3736,8 +3743,9 @@ NVFP4 stays refused on Hopper. The runtime gates (`validate_nvfp4_weight`,
 are unchanged, and sm_90a's W4A4 bodies trap like sm_89's. The NVFP4 op tests now skip off sm_120
 (`testing/serve/ops/nvfp4_device.h`, exit 77) instead of aborting.
 
-Tests. `sinfer_linear_fp8_block_test` gains a linear-add residual check and cases at 66, 96 and 256
-tokens and a 256-token rows view, which cover both CUTLASS configurations and the swap.
+Tests. `sinfer_linear_fp8_block_test` gains a linear-add residual check and cases at 66, 96, 256, 573
+and 1,027 tokens and a 256-token rows view, which cover both CUTLASS configurations, the swap and the
+padded scale rows.
 `sinfer_gdn_gating_proj_test` adds 2048 and 4096 tokens to the 27B, 35B and 0.8B width lists. Two
 existing tests raced their uploads: a pageable `cudaMemcpy` can return before its DMA lands, and a
 non-blocking stream does not wait for the legacy stream. On an H100 that left the last 576 products

@@ -28,12 +28,13 @@ constexpr int kBlocksPerSm  = 2;
 constexpr std::size_t kAlign = 256;
 
 // ---- activations: E4M3 per token per 128, the recipe's convention ----
-// The scale of (token, block) sits at token * kblocks + block, or block * tokens + token when
-// `kb_major` -- the layout Hopper's CUTLASS kernel reads its activation scales in (see
-// fp8_block_sm90_gemm.h). The tile kernel reads either.
+// The scale of (token, block) sits at token * kblocks + block, or block * scale_stride(tokens) +
+// token when `kb_major` -- the layout Hopper's CUTLASS kernel reads its activation scales in (see
+// fp8_block_sm90_gemm.h), each block's row padded to a multiple of four tokens so that it starts
+// 16-byte aligned for the kernel's TMA. The tile kernel reads either.
 __device__ __forceinline__ std::size_t act_scale_index(int token, int block, int tokens, int kblocks,
                                                        bool kb_major) {
-    return kb_major ? static_cast<std::size_t>(block) * tokens + token
+    return kb_major ? static_cast<std::size_t>(block) * sm90_scale_stride(tokens) + token
                     : static_cast<std::size_t>(token) * kblocks + block;
 }
 
@@ -359,7 +360,8 @@ void require_fp8_block_weight(const Weight& w, const char* op) {
 
 std::size_t workspace_bytes(std::int32_t k, std::int32_t tokens) noexcept {
     if (k <= 0 || tokens <= kGemvMaxTokens) { return 0; }
-    return codes_bytes(k, tokens) + static_cast<std::size_t>(tokens) * (k / kBlock) * sizeof(float) + kAlign;
+    return codes_bytes(k, tokens) +
+           static_cast<std::size_t>(sm90_scale_stride(tokens)) * (k / kBlock) * sizeof(float) + kAlign;
 }
 
 std::size_t linear_workspace_capacity_bytes(std::int32_t output_rows, std::int32_t input_rows,

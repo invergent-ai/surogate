@@ -215,9 +215,11 @@ int main() {
                           Case{256, 512, 5, false}, Case{384, 1024, 64, false}, Case{384, 1024, 200, true},
                           Case{512, 1024, 130, false}, Case{1024, 3584, 33, true},
                           // Hopper's two CUTLASS configurations (fp8_block_sm90_gemm.h): the swapped
-                          // narrow tile at 33/130/66 tokens, the cooperative one at 96 and 256.
+                          // narrow tile at 33 tokens, the cooperative one past 64 -- at 66, 130, 573
+                          // and 1027 over activation scales padded to a multiple of four tokens.
                           Case{1024, 2048, 66, false}, Case{1536, 1024, 96, false},
                           Case{2048, 2048, 256, false}, Case{2048, 1024, 256, true},
+                          Case{2048, 2048, 573, false}, Case{1536, 1024, 1027, true},
                           Case{256, 512, 1, false, true}, Case{384, 1024, 64, true, true},
                           Case{512, 1024, 200, false, true}}) {
         failures += run(c);
