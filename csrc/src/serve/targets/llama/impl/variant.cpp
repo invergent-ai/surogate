@@ -67,7 +67,8 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType gate
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             down_qtype, g.hidden, g.intermediate, policy, first, last));
     }
-    return layout.peak_bytes(1);
+    return family::with_swiglu_mlp_down_add(layout.peak_bytes(1), g.intermediate, g.hidden,
+                                            gate_up_qtype, down_qtype, policy, first, last);
 }
 
 QType profile_qtype(WeightsProfile weights_profile) {
@@ -148,6 +149,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
+    if (family::swiglu_mlp_down_add(hidden, weights.gate_up, weights.down, residual, kTextPolicy,
+                                    /*limit=*/0.0F, workspace, stream)) {
+        return;
+    }
     Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     family::swiglu_mlp(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
     ops::linear_add(activation, weights.down, residual, kTextPolicy, workspace, stream);

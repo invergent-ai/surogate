@@ -36,7 +36,11 @@ TileChoice vllm_tile(std::int32_t tokens) {
 // taller tile reads the weight fewer times but launches fewer CTAs: between the two heights of a
 // family, the persistent grid's wave count decides, a wave of the taller tile costing about 1.8
 // of the shorter one's (H100 probe of the q/k/v, o, gate/up and down shapes of 8B to 27B dense
-// models, 32 to 8192 tokens, where this picks the faster tile or one within 3% of it).
+// models, 32 to 8192 tokens, where this picks the faster tile or one within 3% of it). Past 128
+// tokens the swapped 64-token tile stays a candidate: each tile costs its waves times a per-CTA
+// figure, 10 : 14 : 26 for 64, 128 and 256 tokens (H100 probe at 160 to 768 tokens), so a
+// narrow output (o, down) keeps the 64-token tile while the 128-token one would leave SMs idle,
+// 20-25% faster there; a wide round of a wide output is decided as before.
 TileChoice choose_tile(std::int32_t tokens, std::int32_t n, int sms) {
     if (tokens <= 32) { return {Family::Narrow, 16}; }
     const std::int64_t row_tiles = (n + 127) / 128;
@@ -46,7 +50,9 @@ TileChoice choose_tile(std::int32_t tokens, std::int32_t n, int sms) {
         return 9 * waves(grid(taller)) <= 5 * waves(grid(shorter));
     };
     if (tokens <= 128) { return {Family::Mid, taller_wins(32, 64) ? 64 : 32}; }
-    return {Family::Wide, taller_wins(128, 256) ? 256 : 128};
+    const TileChoice wide{Family::Wide, taller_wins(128, 256) ? 256 : 128};
+    const std::int64_t wide_cost = waves(grid(wide.tokens)) * (wide.tokens == 256 ? 26 : 14);
+    return 10 * waves(grid(64)) <= wide_cost ? TileChoice{Family::Mid, 64} : wide;
 }
 
 bool run_tile(const TileChoice& tile, const Operands& o, bool residual) {

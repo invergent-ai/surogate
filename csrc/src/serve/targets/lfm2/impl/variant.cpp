@@ -71,7 +71,8 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& geometry, QTy
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             down_qtype, geometry.hidden, geometry.intermediate, policy, first, last));
     }
-    return layout.peak_bytes(1);
+    return family::with_swiglu_mlp_down_add(layout.peak_bytes(1), geometry.intermediate, geometry.hidden,
+                                            gate_up_qtype, down_qtype, policy, first, last);
 }
 
 QType profile_qtype(WeightsProfile weights_profile) {
@@ -171,6 +172,10 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     }
     // The width comes from the weight the SwiGLU reads, so this one function serves whatever
     // size of LFM2 was bound: gate and up are fused, hence half the rows.
+    if (family::swiglu_mlp_down_add(hidden, weights.gate_up, weights.down, residual, kTextPolicy,
+                                    /*limit=*/0.0F, workspace, stream)) {
+        return;
+    }
     Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     family::swiglu_mlp(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
     ops::linear_add(activation, weights.down, residual, kTextPolicy, workspace, stream);

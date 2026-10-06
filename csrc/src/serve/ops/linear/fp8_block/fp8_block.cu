@@ -2,6 +2,7 @@
 #include "ops/linear/fp8_block/fp8_block_sm90_gemm.h"
 
 #include "core/device.h"
+#include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/ggml/ggml_dispatch.h" // scratch_for: the engine-slot scratch, graph-safe
@@ -10,9 +11,11 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sinfer::ops::detail::fp8_block {
 namespace {
@@ -72,6 +75,20 @@ __device__ __forceinline__ std::size_t act_scale_index(int token, int block, int
 // scalar loads) ran a 2,048 x 5,120 activation at a quarter of the memory bandwidth.
 constexpr int kQuantizeWarps = 8;
 
+// A warp's (token, 128-block): its lane's four values in, the block's absolute max by shuffles,
+// four codes in one 4-byte store.
+__device__ __forceinline__ void quantize_warp_block(float2 lo, float2 hi, int lane, std::uint8_t* codes,
+                                                    float* scale) {
+    float amax = fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(hi.x), fabsf(hi.y)));
+    for (int o = 16; o > 0; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o)); }
+    const float s       = amax > 0.0f ? amax / 448.0f : 1.0f;
+    const float inverse = 1.0f / s;
+    const auto c01 = __nv_cvt_float2_to_fp8x2(make_float2(lo.x * inverse, lo.y * inverse), __NV_SATFINITE, __NV_E4M3);
+    const auto c23 = __nv_cvt_float2_to_fp8x2(make_float2(hi.x * inverse, hi.y * inverse), __NV_SATFINITE, __NV_E4M3);
+    *reinterpret_cast<std::uint32_t*>(codes) = static_cast<std::uint32_t>(c01) | static_cast<std::uint32_t>(c23) << 16;
+    if (lane == 0) { *scale = s; }
+}
+
 __global__ __launch_bounds__(kQuantizeWarps * 32) void quantize_blocks_kernel(
         const __nv_bfloat16* __restrict__ x, int k, int tokens, std::uint8_t* __restrict__ codes,
         float* __restrict__ scales, bool kb_major) {
@@ -85,15 +102,7 @@ __global__ __launch_bounds__(kQuantizeWarps * 32) void quantize_blocks_kernel(
     const uint2 packed = *reinterpret_cast<const uint2*>(x + at);
     const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
     const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
-    float amax = fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(hi.x), fabsf(hi.y)));
-    for (int o = 16; o > 0; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o)); }
-    const float scale   = amax > 0.0f ? amax / 448.0f : 1.0f;
-    const float inverse = 1.0f / scale;
-    const auto c01 = __nv_cvt_float2_to_fp8x2(make_float2(lo.x * inverse, lo.y * inverse), __NV_SATFINITE, __NV_E4M3);
-    const auto c23 = __nv_cvt_float2_to_fp8x2(make_float2(hi.x * inverse, hi.y * inverse), __NV_SATFINITE, __NV_E4M3);
-    *reinterpret_cast<std::uint32_t*>(codes + at) =
-        static_cast<std::uint32_t>(c01) | static_cast<std::uint32_t>(c23) << 16;
-    if (lane == 0) { scales[act_scale_index(token, block, tokens, kblocks, kb_major)] = scale; }
+    quantize_warp_block(lo, hi, lane, codes + at, scales + act_scale_index(token, block, tokens, kblocks, kb_major));
 }
 
 void launch_quantize_blocks(const __nv_bfloat16* x, int k, int tokens, std::uint8_t* codes,
@@ -102,6 +111,34 @@ void launch_quantize_blocks(const __nv_bfloat16* x, int k, int tokens, std::uint
     const auto grid = static_cast<unsigned>((items + kQuantizeWarps - 1) / kQuantizeWarps);
     quantize_blocks_kernel<<<grid, kQuantizeWarps * 32, 0, stream>>>(x, k, tokens, codes, scales, kb_major);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// silu(gate) * up from a [2k, T] plane -- each token's k gate rows, then its k up rows -- formed and
+// quantised in one pass, for a down projection that never needs the BF16 activation. Each value is
+// rounded to BF16 before it is quantised, as silu_mul's output is, so the codes and scales are the
+// ones silu_mul then launch_quantize_blocks produce.
+__global__ __launch_bounds__(kQuantizeWarps * 32) void swiglu_quantize_blocks_kernel(
+        const __nv_bfloat16* __restrict__ packed, int k, int tokens, float limit,
+        std::uint8_t* __restrict__ codes, float* __restrict__ scales, bool kb_major) {
+    const int kblocks = k / kBlock;
+    const long long item = static_cast<long long>(blockIdx.x) * kQuantizeWarps + (threadIdx.x >> 5);
+    if (item >= static_cast<long long>(tokens) * kblocks) { return; }
+    const int lane  = static_cast<int>(threadIdx.x & 31);
+    const int token = static_cast<int>(item / kblocks);
+    const int block = static_cast<int>(item % kblocks);
+    const int row   = block * kBlock + lane * 4;
+    const __nv_bfloat16* column = packed + static_cast<std::size_t>(token) * 2 * k;
+    const uint2 g = *reinterpret_cast<const uint2*>(column + row);
+    const uint2 u = *reinterpret_cast<const uint2*>(column + k + row);
+    const auto act = [limit](std::uint32_t gate2, std::uint32_t up2) {
+        const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gate2));
+        const float2 uf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&up2));
+        return __bfloat1622float2(__floats2bfloat162_rn(swiglu_clamped(gf.x, uf.x, limit),
+                                                        swiglu_clamped(gf.y, uf.y, limit)));
+    };
+    quantize_warp_block(act(g.x, u.x), act(g.y, u.y), lane,
+                        codes + static_cast<std::size_t>(token) * k + row,
+                        scales + act_scale_index(token, block, tokens, kblocks, kb_major));
 }
 
 // ---- decode: a warp per row on exact BF16 activations, the block scale per lane ----
@@ -128,88 +165,143 @@ __device__ __forceinline__ uint4 load_streaming(const std::uint8_t* p) {
     return v;
 }
 
-constexpr int kGemvUnroll = 4; // a lane's 16-code words in flight at once
+// The decode GEMV: a CTA of kGemvWarps warps takes kGemvRows rows and splits their K, warp w
+// reading the 512-code chunks w, w + kGemvWarps, ... (kGemvUnroll chunks of each row in flight);
+// a lane's 16 codes of a chunk sit inside one 128-block, so each chunk is scaled once. The CTA
+// then sums its warps' partials in warp order. Against a warp per whole row (and the scale
+// cell's runtime divisions), one token over the q/k/v, o, gate/up and down shapes of 8B and 27B
+// models takes 24 % less time on an H100 (gate/up 24576 x 4096: 47.1 -> 34.2 us, 2.9 TB/s).
+constexpr int kGemvRows   = 2;
+constexpr int kGemvWarps  = 2;
+constexpr int kGemvUnroll = 2;
+constexpr int kGemvChunk  = 512; // codes a warp reads per step: 32 lanes x 16
+static_assert(kTileRows % kGemvRows == 0, "a launch's rows are whole 64-row tiles");
 
-/// VecX: the activations are 16-byte aligned and a lane reads its 16 in two vector loads.
-template <int Tokens, bool VecX>
-__global__ __launch_bounds__(128) void gemv_kernel(const std::uint8_t* __restrict__ codes,
-                                                   const float* __restrict__ scales, ScaleCell cell,
-                                                   const __nv_bfloat16* __restrict__ x,
-                                                   const Segments segments, int k, int tokens,
-                                                   bool accumulate) {
+// A lane's 16 codes against one token's 16 activations, summed in code order. VecX: the
+// activations are 16-byte aligned and come in two vector loads.
+template <bool VecX>
+__device__ __forceinline__ float dot16(const uint4 packed, const __nv_bfloat16* xp) {
+    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    std::uint32_t xw[8];
+    if constexpr (VecX) {
+        const uint4 lo = *reinterpret_cast<const uint4*>(xp);
+        const uint4 hi = *reinterpret_cast<const uint4*>(xp + 8);
+        xw[0] = lo.x; xw[1] = lo.y; xw[2] = lo.z; xw[3] = lo.w;
+        xw[4] = hi.x; xw[5] = hi.y; xw[6] = hi.z; xw[7] = hi.w;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { xw[i] = *reinterpret_cast<const std::uint32_t*>(xp + 2 * i); }
+    }
+    float part = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const float2 w01 = e4m3x2_to_float2(static_cast<std::uint16_t>(words[w] & 0xffffu));
+        const float2 w23 = e4m3x2_to_float2(static_cast<std::uint16_t>(words[w] >> 16));
+        const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[2 * w]));
+        const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[2 * w + 1]));
+        part = fmaf(w01.x, x01.x, part);
+        part = fmaf(w01.y, x01.y, part);
+        part = fmaf(w23.x, x23.x, part);
+        part = fmaf(w23.y, x23.y, part);
+    }
+    return part;
+}
+
+/// PerRow: the per-channel cell (one scale a row); otherwise the 128 x 128 block cell, whose
+/// indices are shifts -- a division by the cell's runtime size per load cost the short rows a
+/// quarter of their time.
+template <int Tokens, bool VecX, bool PerRow>
+__global__ __launch_bounds__(kGemvWarps * 32) void gemv_kernel(const std::uint8_t* __restrict__ codes,
+                                                               const float* __restrict__ scales,
+                                                               const __nv_bfloat16* __restrict__ x,
+                                                               const Segments segments, int k, int tokens,
+                                                               bool accumulate) {
+    __shared__ float partials[kGemvWarps][kGemvRows][Tokens];
     const int warp = static_cast<int>(threadIdx.x >> 5);
     const int lane = static_cast<int>(threadIdx.x & 31);
-    const int row  = static_cast<int>(blockIdx.x) * 4 + warp;
-    if (row >= segments.rows()) { return; }
-    const int kcells = k / cell.k_per;
-    const std::uint8_t* wrow = codes + static_cast<std::size_t>(row) * k;
-    const float* srow        = scales + static_cast<std::size_t>(row / cell.rows_per) * kcells;
-    float acc[Tokens];
+    const int row0 = static_cast<int>(blockIdx.x) * kGemvRows;
+    const auto scale_of = [&](int r, int base) {
+        return PerRow ? scales[row0 + r]
+                      : scales[static_cast<std::size_t>((row0 + r) >> 7) * (k >> 7) + (base >> 7)];
+    };
+    float acc[kGemvRows][Tokens];
 #pragma unroll
-    for (int t = 0; t < Tokens; ++t) { acc[t] = 0.0f; }
-    // One step: a lane's 16 codes at `base` against each token's 16 activations, summed in code
-    // order and scaled once (a lane's 16 sit inside one 128-block).
-    const auto step = [&](const uint4 packed, const float s, const int base) {
-        const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-        float part[Tokens];
+    for (int r = 0; r < kGemvRows; ++r) {
 #pragma unroll
-        for (int t = 0; t < Tokens; ++t) { part[t] = 0.0f; }
+        for (int t = 0; t < Tokens; ++t) { acc[r][t] = 0.0f; }
+    }
+    const auto chunk = [&](const int base, const uint4 (&packed)[kGemvRows]) {
 #pragma unroll
-        for (int t = 0; t < Tokens; ++t) {
-            if (t < tokens) {
-                const __nv_bfloat16* xp = x + static_cast<std::size_t>(t) * k + base;
-                std::uint32_t xw[8];
-                if constexpr (VecX) {
-                    const uint4 lo = *reinterpret_cast<const uint4*>(xp);
-                    const uint4 hi = *reinterpret_cast<const uint4*>(xp + 8);
-                    xw[0] = lo.x; xw[1] = lo.y; xw[2] = lo.z; xw[3] = lo.w;
-                    xw[4] = hi.x; xw[5] = hi.y; xw[6] = hi.z; xw[7] = hi.w;
-                } else {
+        for (int r = 0; r < kGemvRows; ++r) {
+            const float s = scale_of(r, base);
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) { xw[i] = *reinterpret_cast<const std::uint32_t*>(xp + 2 * i); }
-                }
-#pragma unroll
-                for (int w = 0; w < 4; ++w) {
-                    const float2 w01 = e4m3x2_to_float2(static_cast<std::uint16_t>(words[w] & 0xffffu));
-                    const float2 w23 = e4m3x2_to_float2(static_cast<std::uint16_t>(words[w] >> 16));
-                    const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[2 * w]));
-                    const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[2 * w + 1]));
-                    part[t] = fmaf(w01.x, x01.x, part[t]);
-                    part[t] = fmaf(w01.y, x01.y, part[t]);
-                    part[t] = fmaf(w23.x, x23.x, part[t]);
-                    part[t] = fmaf(w23.y, x23.y, part[t]);
+            for (int t = 0; t < Tokens; ++t) {
+                if (t < tokens) {
+                    acc[r][t] = fmaf(s, dot16<VecX>(packed[r], x + static_cast<std::size_t>(t) * k + base), acc[r][t]);
                 }
             }
         }
-#pragma unroll
-        for (int t = 0; t < Tokens; ++t) { acc[t] = fmaf(s, part[t], acc[t]); }
     };
-    // 32 lanes x 16 codes = 512 values a step. A warp per row keeps too few loads in flight to
-    // cover the memory latency one word at a time, so a lane loads kGemvUnroll words, then sums.
-    int base = lane * 16;
-    for (; base + (kGemvUnroll - 1) * 512 < k; base += kGemvUnroll * 512) {
-        uint4 packed[kGemvUnroll];
-        float s[kGemvUnroll];
+    const auto load = [&](const int base, uint4 (&packed)[kGemvRows]) {
 #pragma unroll
-        for (int u = 0; u < kGemvUnroll; ++u) {
-            packed[u] = load_streaming(wrow + base + u * 512);
-            s[u]      = srow[(base + u * 512) / cell.k_per];
+        for (int r = 0; r < kGemvRows; ++r) {
+            packed[r] = load_streaming(codes + static_cast<std::size_t>(row0 + r) * k + base);
         }
+    };
+    constexpr int kStride = kGemvWarps * kGemvChunk;
+    int base = (warp * 32 + lane) * 16;
+    for (; base + (kGemvUnroll - 1) * kStride < k; base += kGemvUnroll * kStride) {
+        uint4 packed[kGemvUnroll][kGemvRows];
 #pragma unroll
-        for (int u = 0; u < kGemvUnroll; ++u) { step(packed[u], s[u], base + u * 512); }
+        for (int u = 0; u < kGemvUnroll; ++u) { load(base + u * kStride, packed[u]); }
+#pragma unroll
+        for (int u = 0; u < kGemvUnroll; ++u) { chunk(base + u * kStride, packed[u]); }
     }
-    for (; base < k; base += 512) { step(load_streaming(wrow + base), srow[base / cell.k_per], base); }
-    const Segment seg = segment_of(segments, row);
+    for (; base < k; base += kStride) {
+        uint4 packed[kGemvRows];
+        load(base, packed);
+        chunk(base, packed);
+    }
 #pragma unroll
-    for (int t = 0; t < Tokens; ++t) {
-        float v = acc[t];
-        for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffffu, v, o); }
-        if (lane == 0 && t < tokens) {
+    for (int r = 0; r < kGemvRows; ++r) {
+#pragma unroll
+        for (int t = 0; t < Tokens; ++t) {
+            float v = acc[r][t];
+            for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffffu, v, o); }
+            if (lane == 0) { partials[warp][r][t] = v; }
+        }
+    }
+    __syncthreads();
+    const int item = static_cast<int>(threadIdx.x);
+    if (item < kGemvRows * Tokens) {
+        const int r = item / Tokens, t = item % Tokens;
+        if (t < tokens) {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kGemvWarps; ++w) { v += partials[w][r][t]; }
+            const int row       = row0 + r;
+            const Segment seg   = segment_of(segments, row);
             __nv_bfloat16* slot = seg.out + static_cast<std::size_t>(t) * seg.rows + (row - seg.begin);
             if (accumulate) { v += __bfloat162float(*slot); }
             *slot = __float2bfloat16_rn(v);
         }
     }
+}
+
+template <bool VecX, bool PerRow>
+void launch_gemv(const std::uint8_t* codes, const float* scales, const __nv_bfloat16* x,
+                 const Segments& segments, int k, int tokens, bool accumulate, cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned>(segments.rows() / kGemvRows));
+    const auto launch = [&](auto kernel) {
+        kernel<<<grid, kGemvWarps * 32, 0, stream>>>(codes, scales, x, segments, k, tokens, accumulate);
+    };
+    switch (tokens) {
+    case 1: launch(gemv_kernel<1, VecX, PerRow>); break;
+    case 2: launch(gemv_kernel<2, VecX, PerRow>); break;
+    case 3: launch(gemv_kernel<3, VecX, PerRow>); break;
+    default: launch(gemv_kernel<4, VecX, PerRow>); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ---- prefill: a 64-row x 64-token tile, the block scale applied once per 128 of K ----
@@ -380,45 +472,57 @@ void require_x_out(const Tensor& x, std::int32_t k, const Tensor& out, std::int3
     }
 }
 
-/// One row range of one weight against every column of x, written or accumulated into the
-/// segments' outputs. A chained launch (more than one segment) on Hopper's CUTLASS kernel needs
-/// `staging`, [rows, T] BF16, for the kernel's packed output.
-void run(const Tensor& x, const Weight& w, std::int32_t row_begin, const Segments& segments,
-         bool accumulate, WorkspaceArena* workspace, cudaStream_t stream, const char* op,
-         std::byte* prepared = nullptr, __nv_bfloat16* staging = nullptr) {
+// Rounds up to this many tokens run the GEMV on every weight; on Hopper that is two unless
+// SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=4 keeps every round to four tokens on it.
+int gemv_always_tokens() noexcept {
+    static const bool all_four = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS");
+        return raw != nullptr && std::string_view(raw) == "4";
+    }();
+    return all_four || !sm90_gemm_available() ? kGemvMaxTokens : 2;
+}
+
+bool block_cell(const Weight& w) noexcept { return w.scale_ne[0] == kBlock && w.scale_ne[1] == kBlock; }
+
+// The GEMV's sums grow with its columns; Hopper's narrow CUTLASS tile reads the weight once for
+// up to 16 tokens, on activations quantised per token per 128 as every wider round's are. On an
+// H100 the GEMV is the faster at two tokens for every shape, at three below 64 row blocks of 128
+// and at four below 40: the o and down projections of 8B to 27B models keep it, their q/k/v and
+// gate/up move to the tile (24576 x 4096 at four tokens: 76.7 us on the GEMV, 45.4 quantised on
+// the tile). A per-channel weight has no CUTLASS route and keeps the GEMV to four tokens.
+bool gemv_serves(std::int32_t rows, std::int32_t tokens, bool block) noexcept {
+    if (tokens > kGemvMaxTokens) { return false; }
+    if (tokens <= gemv_always_tokens() || !block) { return true; }
+    const std::int32_t blocks = rows / kBlock;
+    return tokens == 3 ? blocks < 64 : blocks < 40;
+}
+
+/// One row range of one weight against every column of x, [k, tokens] BF16, written or
+/// accumulated into the segments' outputs. `prepared` holds x's activation planes already (x is
+/// then not read past the GEMV widths). A chained launch (more than one segment) on Hopper's
+/// CUTLASS kernel needs `staging`, [rows, T] BF16, for the kernel's packed output.
+void run(const __nv_bfloat16* xin, std::int32_t tokens, const Weight& w, std::int32_t row_begin,
+         const Segments& segments, bool accumulate, WorkspaceArena* workspace, cudaStream_t stream,
+         const char* op, std::byte* prepared = nullptr, __nv_bfloat16* staging = nullptr,
+         std::int32_t route_rows = 0) {
     require_fp8_block_weight(w, op);
     const std::int32_t rows = segments.rows();
     if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n || (row_begin % w.scale_ne[1]) != 0 ||
         (row_begin % kTileRows) != 0 || (rows % kTileRows) != 0) {
         throw std::invalid_argument(std::string(op) + ": row range must start on a scale row and be whole 64-row tiles");
     }
-    const std::int32_t k = w.k, tokens = x.ne[1], kblocks = k / kBlock;
+    const std::int32_t k = w.k, kblocks = k / kBlock;
     const ScaleCell cell{w.scale_ne[0], w.scale_ne[1]};
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata) + static_cast<std::size_t>(row_begin) * k;
     const auto* scales = static_cast<const float*>(w.scales) +
                          static_cast<std::size_t>(row_begin / cell.rows_per) * (k / cell.k_per);
-    if (tokens <= kGemvMaxTokens) {
-        const dim3 grid(static_cast<unsigned>((rows + 3) / 4));
-        const auto* xin = static_cast<const __nv_bfloat16*>(x.data);
-        const auto launch = [&](auto kernel) {
-            kernel<<<grid, 128, 0, stream>>>(codes, scales, cell, xin, segments, k, tokens, accumulate);
-        };
-        if ((reinterpret_cast<std::uintptr_t>(xin) & 15u) == 0) {
-            switch (tokens) {
-            case 1: launch(gemv_kernel<1, true>); break;
-            case 2: launch(gemv_kernel<2, true>); break;
-            case 3: launch(gemv_kernel<3, true>); break;
-            default: launch(gemv_kernel<4, true>); break;
-            }
-        } else {
-            switch (tokens) {
-            case 1: launch(gemv_kernel<1, false>); break;
-            case 2: launch(gemv_kernel<2, false>); break;
-            case 3: launch(gemv_kernel<3, false>); break;
-            default: launch(gemv_kernel<4, false>); break;
-            }
-        }
-        CUDA_CHECK(cudaGetLastError());
+    // A parent's ranges run apart take the route the whole parent takes, so their bits match it.
+    if (gemv_serves(route_rows > 0 ? route_rows : rows, tokens, cell.k_per == kBlock && cell.rows_per == kBlock)) {
+        const bool vec_x   = (reinterpret_cast<std::uintptr_t>(xin) & 15u) == 0;
+        const bool per_row = cell.rows_per == 1;
+        const auto launch  = vec_x ? (per_row ? launch_gemv<true, true> : launch_gemv<true, false>)
+                                   : (per_row ? launch_gemv<false, true> : launch_gemv<false, false>);
+        launch(codes, scales, xin, segments, k, tokens, accumulate, stream);
         return;
     }
     const std::size_t bytes = workspace_bytes(k, tokens);
@@ -432,8 +536,7 @@ void run(const Tensor& x, const Weight& w, std::int32_t row_begin, const Segment
     // planes follow too (linear_projections asks the same question).
     const bool kb_major = sm90_gemm_available();
     if (prepared == nullptr) {
-        launch_quantize_blocks(static_cast<const __nv_bfloat16*>(x.data), k, tokens, x_codes, x_scales,
-                               kb_major, stream);
+        launch_quantize_blocks(xin, k, tokens, x_codes, x_scales, kb_major, stream);
     }
     // Hopper: vLLM's wgmma kernel for the 128 x 128 block grid. A per-channel weight, or a launch
     // the kernel declines, takes the engine's own tile below on the same activation planes.
@@ -463,14 +566,15 @@ void run(const Tensor& x, const Weight& w, std::int32_t row_begin, const Segment
 /// One output: the single-segment launch every plain linear takes.
 void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t rows, Tensor& out,
          bool accumulate, WorkspaceArena* workspace, cudaStream_t stream, const char* op,
-         std::byte* prepared = nullptr) {
+         std::byte* prepared = nullptr, std::int32_t route_rows = 0) {
     require_fp8_block_weight(w, op);
     require_x_out(x, w.k, out, rows, op);
     Segments one;
     one.count  = 1;
     one.end[0] = rows;
     one.out[0] = static_cast<__nv_bfloat16*>(out.data);
-    run(x, w, row_begin, one, accumulate, workspace, stream, op, prepared);
+    run(static_cast<const __nv_bfloat16*>(x.data), x.ne[1], w, row_begin, one, accumulate, workspace,
+        stream, op, prepared, nullptr, route_rows);
 }
 
 /// Projections that are consecutive row ranges of one parent, in order, as the segments of one
@@ -522,7 +626,7 @@ void require_fp8_block_weight(const Weight& w, const char* op) {
 }
 
 std::size_t workspace_bytes(std::int32_t k, std::int32_t tokens) noexcept {
-    if (k <= 0 || tokens <= kGemvMaxTokens) { return 0; }
+    if (k <= 0 || tokens <= gemv_always_tokens()) { return 0; }
     return codes_bytes(k, tokens) +
            static_cast<std::size_t>(sm90_scale_stride(tokens)) * (k / kBlock) * sizeof(float) + kAlign;
 }
@@ -561,6 +665,41 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
     run(x, w, 0, w.n, residual, true, workspace, stream, "fp8 block linear_add");
 }
 
+bool quantizes_activations(const Weight& w, std::int32_t tokens) noexcept {
+    return !gemv_serves(w.n, tokens, block_cell(w));
+}
+
+void swiglu_linear_add(const Tensor& packed, const Weight& w, Tensor& residual, float limit,
+                       WorkspaceArena* workspace, cudaStream_t stream) {
+    const char* op = "fp8 block swiglu linear_add";
+    require_fp8_block_weight(w, op);
+    const std::int32_t k = w.k, tokens = packed.ne[1];
+    if (packed.dtype != DType::BF16 || !packed.is_contiguous() || packed.ne[0] != 2 * k ||
+        (reinterpret_cast<std::uintptr_t>(packed.data) & 7u) != 0) {
+        throw std::invalid_argument(std::string(op) + ": packed must be [2k, T] contiguous BF16, 8-byte aligned");
+    }
+    if (residual.dtype != DType::BF16 || !residual.is_contiguous() || residual.ne[0] != w.n ||
+        residual.ne[1] != tokens || !quantizes_activations(w, tokens)) {
+        throw std::invalid_argument(std::string(op) + ": residual must be [n, T] contiguous BF16, T past the GEMV widths");
+    }
+    auto scope              = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
+    const std::size_t bytes = workspace_bytes(k, tokens);
+    auto* planes = workspace != nullptr ? static_cast<std::byte*>(workspace->alloc_bytes(bytes, kAlign).data)
+                                        : static_cast<std::byte*>(ggml::scratch_for(bytes, stream));
+    const long long items = static_cast<long long>(tokens) * (k / kBlock);
+    swiglu_quantize_blocks_kernel<<<static_cast<unsigned>((items + kQuantizeWarps - 1) / kQuantizeWarps),
+                                    kQuantizeWarps * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(packed.data), k, tokens, limit,
+        reinterpret_cast<std::uint8_t*>(planes), reinterpret_cast<float*>(planes + codes_bytes(k, tokens)),
+        sm90_gemm_available());
+    CUDA_CHECK(cudaGetLastError());
+    Segments one;
+    one.count  = 1;
+    one.end[0] = w.n;
+    one.out[0] = static_cast<__nv_bfloat16*>(residual.data);
+    run(nullptr, tokens, w, 0, one, true, workspace, stream, op, planes);
+}
+
 void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                   WorkspaceArena* workspace, cudaStream_t stream) {
     run(x, w, row_begin, out.ne[0], out, false, workspace, stream, "fp8 block project_rows");
@@ -581,8 +720,10 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     Segments segments;
     std::int32_t chain_begin = 0;
     const bool chained   = chain(projections, segments, chain_begin);
-    const bool gemm      = tokens > kGemvMaxTokens;
     const Weight& parent = projections.front().weight;
+    // Quantised once for every launch that reads the planes; a GEMV among them reads x.
+    bool gemm = chained && !gemv_serves(segments.rows(), tokens, block_cell(parent));
+    for (const auto& p : projections) { gemm |= !chained && !gemv_serves(p.out.ne[0], tokens, block_cell(p.weight)); }
     const bool cutlass   = gemm && sm90_gemm_available() && parent.scale_ne[0] == kBlock &&
                          parent.scale_ne[1] == kBlock;
     const std::size_t plane_bytes = gemm ? workspace_bytes(k, tokens) : 0;
@@ -618,20 +759,20 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
                                sm90_gemm_available(), stream);
     }
     if (chained && (!cutlass || staging != nullptr)) {
-        run(x, parent, chain_begin, segments, false, workspace, stream, "fp8 block linear projections",
-            prepared, staging);
+        run(static_cast<const __nv_bfloat16*>(x.data), tokens, parent, chain_begin, segments, false,
+            workspace, stream, "fp8 block linear projections", prepared, staging);
         return;
     }
     for (const auto& p : projections) {
         run(x, p.weight, std::max(0, p.row_begin), p.out.ne[0], p.out, false, workspace, stream,
-            "fp8 block linear projections", prepared);
+            "fp8 block linear projections", prepared, chained ? segments.rows() : 0);
     }
 }
 
 std::size_t projections_workspace_capacity_bytes(std::int32_t parent_rows, std::int32_t input_rows,
                                                  std::int32_t max_tokens) {
     const std::size_t planes = linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
-    if (max_tokens <= kGemvMaxTokens || parent_rows <= 0) { return planes; }
+    if (max_tokens <= gemv_always_tokens() || parent_rows <= 0) { return planes; }
     return planes + static_cast<std::size_t>(parent_rows) *
                                   std::min(max_tokens, kStagedMaxTokens) * sizeof(__nv_bfloat16);
 }

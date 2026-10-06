@@ -51,6 +51,18 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                   WorkspaceArena* workspace, cudaStream_t stream);
 
+/// Whether a round of `tokens` columns through `w` runs on quantised activations -- past the
+/// GEMV's widths for this weight, which read the exact BF16 activation instead (to four tokens;
+/// on Hopper a tall block-FP8 weight leaves the GEMV past two, see gemv_serves).
+[[nodiscard]] bool quantizes_activations(const Weight& w, std::int32_t tokens) noexcept;
+/// residual[n, T] += W . (silu(gate) * up), from `packed` [2k, T]: each token's k gate rows, then
+/// its k up rows (linear_swiglu's packed plane). The activation goes straight into W's quantised
+/// operand and is never written as BF16; each value is rounded to BF16 first, as silu_mul's output
+/// is, so the result is the unfused pair's. `limit` > 0 clamps as silu_mul does. Only at widths
+/// quantizes_activations admits; the workspace need is linear_workspace_capacity_bytes(n, k, T).
+void swiglu_linear_add(const Tensor& packed, const Weight& w, Tensor& residual, float limit,
+                       WorkspaceArena* workspace, cudaStream_t stream);
+
 /// Each projection's row range into its output. Consecutive ranges of one parent, in order (up
 /// to four), run as one launch.
 void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,

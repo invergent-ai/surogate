@@ -147,14 +147,9 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType gate
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             down_qtype, g.hidden, g.intermediate, down_policy, first, last));
     }
-    std::size_t peak = layout.peak_bytes(1);
-    if (gate_up_qtype == QType::NVFP4 && down_qtype == QType::NVFP4 &&
-        gate_up_policy == ops::LinearPolicy::AllowA4 && down_policy == ops::LinearPolicy::AllowA4) {
-        WorkspaceLayoutBuilder fused;
-        family::swiglu_mlp_down_add_layout(fused, g.intermediate, g.hidden, gate_up_policy, first, last);
-        peak = std::max(peak, fused.peak_bytes(1));
-    }
-    return peak;
+    // The fused route runs under the gate/up weight's policy (post_mixer).
+    return family::with_swiglu_mlp_down_add(layout.peak_bytes(1), g.intermediate, g.hidden,
+                                            gate_up_qtype, down_qtype, gate_up_policy, first, last);
 }
 
 } // namespace

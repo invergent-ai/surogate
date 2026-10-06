@@ -3,6 +3,8 @@
 // reference quantises the same way, so what remains is accumulation order and BF16 output.
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
+#include "api/ops/linear_swiglu_down_add.h"
+#include "api/ops/silu_mul.h"
 #include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/fp8_block/fp8_block_sm90_gemm.h"
 #include "ops/op_tester.h"
@@ -56,9 +58,14 @@ int run(const Case& c) {
     for (auto& v : codes) { v = float_to_e4m3(uw(rng)); }
     for (auto& v : scales) { v = us(rng) * 0.01f; }
     for (auto& v : x) { v = __bfloat162float(__float2bfloat16(ux(rng))); }
-    // the reference activation: exact below the GEMV width, quantised per token per 128 above
+    const std::int32_t row_begin = c.rows_view ? 128 * (c.rows / 256) : 0; // a 128-block boundary
+    const std::int32_t out_rows  = c.rows - row_begin;
+    // The weight the launch sees: its rows and scale cell decide whether the GEMV takes it.
+    Weight launch_shape{};
+    launch_shape.n = out_rows; launch_shape.scale_ne[0] = k_per; launch_shape.scale_ne[1] = rows_per;
+    // the reference activation: exact at the GEMV's widths, quantised per token per 128 past them
     std::vector<double> xr(x.begin(), x.end());
-    if (c.tokens > 4) {
+    if (ops::detail::fp8_block::quantizes_activations(launch_shape, c.tokens)) {
         for (std::int32_t t = 0; t < c.tokens; ++t) {
             for (std::int32_t b = 0; b < kb; ++b) {
                 float amax = 0.0f;
@@ -71,8 +78,6 @@ int run(const Case& c) {
             }
         }
     }
-    const std::int32_t row_begin = c.rows_view ? 128 * (c.rows / 256) : 0; // a 128-block boundary
-    const std::int32_t out_rows  = c.rows - row_begin;
     std::vector<double> ref(static_cast<std::size_t>(out_rows) * c.tokens, 0.0);
     for (std::int32_t t = 0; t < c.tokens; ++t) {
         for (std::int32_t r = 0; r < out_rows; ++r) {
@@ -153,7 +158,12 @@ int run(const Case& c) {
         CHECK_CUDA(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
         std::size_t nodes = 0;
         CHECK_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
-        ok &= nodes == std::size_t(c.tokens <= 4 ? 2 : 3);
+        // Both run apart; a quantise first when either leaves the GEMV.
+        Weight block_shape = launch_shape;
+        block_shape.scale_ne[0] = block_shape.scale_ne[1] = 128;
+        const bool planes = ops::detail::fp8_block::quantizes_activations(launch_shape, c.tokens) ||
+                            ops::detail::fp8_block::quantizes_activations(block_shape, c.tokens);
+        ok &= nodes == std::size_t(planes ? 3 : 2);
         for (int round = 0; round < 3; ++round) {
             for (auto& value : hx) { value = __float2bfloat16(ux(rng)); }
             CHECK_CUDA(cudaMemcpyAsync(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice, stream));
@@ -271,7 +281,7 @@ int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t toke
         return same;
     };
     const bool hopper  = ops::detail::fp8_block::sm90_gemm_available();
-    const bool gemv    = tokens <= 4;
+    const bool gemv    = !ops::detail::fp8_block::quantizes_activations(w, tokens);
     const bool chained = gemv || !hopper || tokens <= 128;
     // GEMV: one launch; the tile: quantize + one launch; Hopper: quantize + GEMM + split
     const std::size_t want_nodes = gemv ? 1 : !chained ? 1 + parts.size() : hopper ? 3 : 2;
@@ -314,6 +324,97 @@ int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t toke
     std::printf("] k=%d T=%-4d nodes=%zu  %s\n", k, tokens, nodes_seen, ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
 }
+// A random block-FP8 weight [rows, k] in the artifact's layout, its payload held by `storage`.
+Weight random_weight(std::int32_t rows, std::int32_t k, std::mt19937& rng, DeviceBuffer& storage) {
+    std::uniform_real_distribution<float> uw(-1.0f, 1.0f), us(0.5f, 2.0f);
+    const std::size_t scale_off = (static_cast<std::size_t>(rows) * k + 255) / 256 * 256;
+    const std::size_t cells     = static_cast<std::size_t>(rows / 128) * (k / 128);
+    std::vector<std::uint8_t> payload(scale_off + cells * 4);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(rows) * k; ++i) { payload[i] = float_to_e4m3(uw(rng)); }
+    for (std::size_t i = 0; i < cells; ++i) {
+        const float v = us(rng) * 0.01f;
+        std::memcpy(payload.data() + scale_off + 4 * i, &v, 4);
+    }
+    storage = DeviceBuffer(payload.size());
+    storage.copy_from_host(payload.data(), payload.size());
+    Weight w{};
+    w.payload = storage.p; w.payload_bytes = payload.size(); w.qtype = QType::FP8_E4M3FN_BLK128_F32S;
+    w.layout = QuantLayout::Fp8Block128; w.group_size = 128; w.group = 128; w.ndim = 2;
+    w.qdata = storage.p; w.scales = static_cast<std::uint8_t*>(storage.p) + scale_off; w.scale_dtype = DType::FP32;
+    w.scale_ne[0] = 128; w.scale_ne[1] = 128;
+    w.n = rows; w.k = k; w.shape[0] = rows; w.shape[1] = k; w.padded_shape[0] = rows; w.padded_shape[1] = k;
+    return w;
+}
+
+// The SwiGLU MLP with the activation quantised as it is formed (linear_swiglu_down_add) against
+// the unfused pair -- gate/up linear, silu_mul, linear_add -- bit for bit, eagerly and replayed
+// from a graph; at decode GEMV widths the fused route must decline.
+int run_swiglu(std::int32_t intermediate, std::int32_t hidden, std::int32_t tokens, float limit) {
+    std::mt19937 rng(static_cast<unsigned>(7 + intermediate + 3 * hidden + 11 * tokens));
+    DeviceBuffer gate_up_storage(1), down_storage(1);
+    const Weight gate_up = random_weight(2 * intermediate, hidden, rng, gate_up_storage);
+    const Weight down    = random_weight(hidden, intermediate, rng, down_storage);
+    std::uniform_real_distribution<float> ux(-3.0f, 3.0f), ur(-0.5f, 0.5f);
+    std::vector<__nv_bfloat16> hx(static_cast<std::size_t>(hidden) * tokens), hres(hx.size());
+    for (auto& v : hx) { v = __float2bfloat16(ux(rng)); }
+    for (auto& v : hres) { v = __float2bfloat16(ur(rng)); }
+    DeviceBuffer d_x(hx.size() * 2), d_want(hres.size() * 2), d_got(hres.size() * 2);
+    DeviceBuffer d_packed(static_cast<std::size_t>(2) * intermediate * tokens * 2),
+        d_act(static_cast<std::size_t>(intermediate) * tokens * 2);
+    d_x.copy_from_host(hx.data(), d_x.bytes);
+    d_want.copy_from_host(hres.data(), d_want.bytes);
+    Tensor xt(d_x.p, DType::BF16, {hidden, tokens});
+    Tensor want(d_want.p, DType::BF16, {hidden, tokens});
+    Tensor got(d_got.p, DType::BF16, {hidden, tokens});
+    Tensor packed(d_packed.p, DType::BF16, {2 * intermediate, tokens});
+    Tensor act(d_act.p, DType::BF16, {intermediate, tokens});
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    const auto policy = ops::LinearPolicy::A16Only;
+    WorkspaceArena workspace(std::size_t{64} << 20);
+    ops::linear(xt, gate_up, packed, policy, workspace, stream);
+    ops::silu_mul(packed.slice(0, 0, intermediate), packed.slice(0, intermediate, intermediate), act, limit, stream);
+    ops::linear_add(act, down, want, policy, workspace, stream);
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    std::vector<std::uint16_t> expected(hres.size()), actual(hres.size());
+    d_want.copy_to_host(expected.data(), d_want.bytes);
+
+    const bool admits = ops::linear_swiglu_down_add_admits(gate_up, down, policy, tokens);
+    bool ok = admits == ops::detail::fp8_block::quantizes_activations(down, tokens);
+    std::size_t nodes = 0;
+    if (admits) {
+        // The plan's own capacity, not the roomy arena: the route must fit what it declares.
+        WorkspaceArena planned(ops::linear_swiglu_down_add_workspace_capacity_bytes(
+            gate_up.qtype, intermediate, hidden, policy, tokens, tokens));
+        d_got.copy_from_host(hres.data(), d_got.bytes);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        ops::linear_swiglu_down_add(xt, gate_up, down, got, policy, limit, planned, stream);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        d_got.copy_to_host(actual.data(), d_got.bytes);
+        ok &= actual == expected;
+        d_got.copy_from_host(hres.data(), d_got.bytes);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        ops::linear_swiglu_down_add(xt, gate_up, down, got, policy, limit, planned, stream);
+        CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+        CHECK_CUDA(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        CHECK_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
+        CHECK_CUDA(cudaGraphLaunch(exec, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        d_got.copy_to_host(actual.data(), d_got.bytes);
+        ok &= actual == expected;
+        // gate/up: quantize + GEMM (or the GEMV); down: SwiGLU quantize + GEMM
+        ok &= nodes == (ops::detail::fp8_block::quantizes_activations(gate_up, tokens) ? 4u : 3u);
+        CHECK_CUDA(cudaGraphExecDestroy(exec)); CHECK_CUDA(cudaGraphDestroy(graph));
+    }
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    std::printf("  swiglu down_add I=%d H=%d T=%-4d limit=%.1f %s nodes=%zu  %s\n", intermediate, hidden,
+                tokens, limit, admits ? "fused " : "paired", nodes, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
 } // namespace
 
 int main() {
@@ -333,7 +434,11 @@ int main() {
                           Case{5760, 512, 300, false},
                           Case{2048, 2048, 573, false}, Case{1536, 1024, 1027, true},
                           Case{256, 512, 1, false, true}, Case{384, 1024, 64, true, true},
-                          Case{512, 1024, 200, false, true}}) {
+                          Case{512, 1024, 200, false, true},
+                          // On Hopper, 3 and 4 tokens over 64 and 40 row blocks leave the GEMV
+                          // for the narrow tile (gemv_serves); per-row scales keep the GEMV.
+                          Case{8192, 1024, 3, false}, Case{5120, 2048, 4, false},
+                          Case{10240, 1024, 4, true}, Case{5120, 1024, 4, false, true}}) {
         failures += run(c);
     }
     // q/k/v of a 4:1:1 head layout, q/k/gate/v of a gated one, and a qkv/z pair: decode GEMV
@@ -343,6 +448,11 @@ int main() {
     }
     failures += run_chain({256, 128, 256, 128}, 512, 48);
     failures += run_chain({768, 256}, 512, 128);
+    failures += run_chain({4096, 1024, 1024}, 1024, 4);
+    // Decode GEMV widths keep the pair; the narrow, swapped and wide tiles take the fused route.
+    for (std::int32_t tokens : {3, 5, 64, 100, 300}) { failures += run_swiglu(512, 256, tokens, 0.0f); }
+    failures += run_swiglu(384, 512, 40, 1.5f);
+    failures += run_swiglu(512, 5120, 4, 0.0f);
     std::printf("%s\n", failures == 0 ? "fp8 block: all cases ok" : "fp8 block: FAILURES");
     return failures == 0 ? 0 : 1;
 }
