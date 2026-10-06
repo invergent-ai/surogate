@@ -51,10 +51,11 @@ enum class KvCacheStorage : std::uint8_t {
     /// once the cache is BF16 -- while a 3:1 GDN stack pays 0.4 % (27B) to nothing (35B,
     /// 0.8B) and keeps the halved cache.
     ///
-    /// On Hopper (sm_90) it is BFloat16 for every stack: prompt attention there runs
-    /// FlashAttention-3, which reads a BF16 cache. Qwen3.6-35B-A3B-FP8 on one H100, 2,048-token
-    /// prompts from 32 users (2026-10-05): 35.7k prompt tok/s with BF16 against 28.6k with e4m3
-    /// (and 28.9k with BF16 but FA3 off), decode no slower; the 80 GB card holds the larger cache.
+    /// On Hopper (sm_90) it is BFloat16 for every stack. Prompt attention there runs
+    /// FlashAttention-3 over either cache, so they prefill alike, but the BF16 one decodes faster
+    /// and the 80 GB card holds it. Qwen3.6-35B-A3B-FP8 on one H100 (2026-10-06): 38.6k against
+    /// 38.3k prompt tok/s (2,048-token prompts, 32 users), one stream 283 against 263 tok/s, 64
+    /// users 2,563 against 2,506, wikitext-2 perplexity 6.371 against 6.367.
     Auto,
 };
 

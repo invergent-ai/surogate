@@ -1,8 +1,10 @@
-// sinfer::ops - FlashAttention-3's sm90 forward over the paged BF16 KV cache (see gqa_fa3.h).
+// sinfer::ops - FlashAttention-3's sm90 forward over the paged KV cache (see gqa_fa3.h).
 #include "ops/gqa_sm90/gqa_fa3.h"
 
 #include "flash_fwd_launch_template.h"
 
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cutlass/kernel_hardware_info.h>
 
 #include <cstdlib>
@@ -18,9 +20,9 @@ using Element = cutlass::bfloat16_t;
 constexpr std::int32_t kPageSize = 64;
 constexpr std::size_t kAlign     = 256;
 
-// The one instantiation: BF16, head dim 256, causal, varlen, paged without TMA (a 64-slot page is
-// not a multiple of the 80-key tile, the condition under which FA3 itself takes this path), the
-// query group packed into the M tile, no split.
+// The BF16 instantiation: head dim 256, causal, varlen, paged without TMA (a 64-slot page is not
+// a multiple of the 80-key tile, the condition under which FA3 itself takes this path), the query
+// group packed into the M tile, no split. gqa_fa3_e4m3.cu holds the same over e4m3.
 constexpr int kArch = 90;
 
 struct Hardware {
@@ -78,6 +80,25 @@ __global__ void segment_kv_lengths_kernel(const std::int32_t* positions,
     if (s < segments) { kv_lengths[s] = positions[q_offsets[s]] + q_lengths[s]; }
 }
 
+// The queries' e4m3 codes for the FP8 kernel: a plain saturating cast, scale 1, as vLLM's static
+// per-tensor query quantization does with its default scale and as the cache stores its keys.
+// Eight values a thread.
+__global__ void quantize_query_kernel(const uint4* __restrict__ q, uint2* __restrict__ codes,
+                                      std::size_t groups) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= groups) { return; }
+    const uint4 packed               = q[i];
+    const std::uint32_t words[4]     = {packed.x, packed.y, packed.z, packed.w};
+    __nv_fp8x2_storage_t out[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words[w]));
+        out[w]         = __nv_cvt_float2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
+    }
+    codes[i] = make_uint2(static_cast<std::uint32_t>(out[0]) | static_cast<std::uint32_t>(out[1]) << 16,
+                          static_cast<std::uint32_t>(out[2]) | static_cast<std::uint32_t>(out[3]) << 16);
+}
+
 void check_launch(const char* what) {
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -86,6 +107,9 @@ void check_launch(const char* what) {
 }
 
 } // namespace
+
+// gqa_fa3_e4m3.cu: the FP8 instantiation, its own translation unit so the two compile in parallel.
+void launch_e4m3(Flash_fwd_params& params, cudaStream_t stream);
 
 bool available() noexcept { return hardware().cc == 90 && enabled_by_env(); }
 
@@ -135,19 +159,30 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
         a.kv_lengths == nullptr || a.kv_rows == nullptr || !(a.scale > 0.0f)) {
         throw std::invalid_argument("gqa_fa3: invalid launch");
     }
-    if (workspace_capacity < workspace_bytes(a.q_heads, a.total_q, a.segments)) {
+    if (workspace_capacity < workspace_bytes(a.q_heads, a.total_q, a.segments, a.fp8_cache)) {
         throw std::invalid_argument("gqa_fa3: workspace smaller than workspace_bytes()");
     }
 
-    auto* lse = static_cast<float*>(workspace);
-    auto* scheduler = reinterpret_cast<int*>(static_cast<char*>(workspace) +
-        align_up(static_cast<std::size_t>(a.q_heads) * a.total_q * sizeof(float)));
+    const std::size_t rows = static_cast<std::size_t>(a.q_heads) * a.total_q;
     const std::int32_t b_rounded = rounded_segments(a.segments);
+    auto* lse       = static_cast<float*>(workspace);
+    auto* scheduler = reinterpret_cast<int*>(static_cast<char*>(workspace) + align_up(rows * sizeof(float)));
+    const void* q   = a.q;
+    if (a.fp8_cache) {
+        void* codes = static_cast<char*>(workspace) + align_up(rows * sizeof(float)) +
+                      align_up((static_cast<std::size_t>(b_rounded) * 4 + 1) * sizeof(std::int32_t));
+        const std::size_t groups = rows * kHeadDim / 8;
+        quantize_query_kernel<<<static_cast<unsigned>((groups + 255) / 256), 256, 0, stream>>>(
+            static_cast<const uint4*>(a.q), static_cast<uint2*>(codes), groups);
+        check_launch("query quantize");
+        q = codes;
+    }
 
     Flash_fwd_params p;
     std::memset(&p, 0, sizeof(p));
-    p.is_bf16 = true;
-    p.q_ptr   = const_cast<void*>(a.q);
+    p.is_bf16 = !a.fp8_cache;
+    p.is_e4m3 = a.fp8_cache;  // the scheduler sizes its L2 windows by the element
+    p.q_ptr   = const_cast<void*>(q);
     p.k_ptr   = const_cast<void*>(a.k_pages);
     p.v_ptr   = const_cast<void*>(a.v_pages);
     p.o_ptr   = a.out;
@@ -212,7 +247,12 @@ void run(const PagedPrefill& a, void* workspace, std::size_t workspace_capacity,
     p.prepare_varlen_pdl = false;
     p.arch   = kArch;
     p.num_sm = hardware().sm_count;
+    // q/k/v descale pointers stay null: 1.0, the cache's (absent) scale.
 
+    if (a.fp8_cache) {
+        launch_e4m3(p, stream);
+        return;
+    }
     run_flash_fwd<kArch, kHeadDim, kHeadDim, 1, Element, Element, /*Is_causal=*/true,
                   /*Is_local=*/false, /*Has_softcap=*/false, /*Varlen=*/true,
                   /*PagedKVNonTMA=*/true, /*AppendKV=*/false, /*HasQv=*/false,

@@ -3842,5 +3842,18 @@ Tests. `sinfer_gqa_attention_test` adds wide prompts over scattered pages (130 a
 200 and 1,500 keys, 32 after 1,000) against its oracle; its width-invariance check now runs under
 `--batch-invariant`, the contract it states.
 
-Not done: FA3 over an e4m3 cache (FA3 would need FP8 queries), sliding windows (Gemma), head dims
-other than 256.
+**FP8 KV cache, as vLLM runs it (2026-10-06).** vLLM's `--kv-cache-dtype fp8` stores e4m3 keys and
+values (per-layer scale, 1.0 by default), casts the query to e4m3 at a static scale of 1.0, and runs
+FA3's FP8 kernel, which also rounds the softmax probabilities to e4m3 for the second product. Ours
+now does the same over our e4m3 cache (a plain saturating cast, so every descale is 1):
+`gqa_fa3_e4m3.cu` holds the FP8 instantiation (its own translation unit, so the two compile in
+parallel), `run` casts the queries into the workspace first (`workspace_bytes(..., fp8_cache)`), and
+the route takes e4m3 caches as it takes BF16 ones. Over random inputs the e4m3 queries and
+probabilities cost 3.7 % relative L2 against a BF16-query oracle (the tiles: 0.19 %), but not the
+model: Qwen3.6-35B-A3B-FP8's wikitext-2 perplexity (16 windows of 2,048 tokens) is 6.371 with a BF16
+cache, 6.367 with e4m3 through FA3, 6.369 with e4m3 through the tiles. With FA3 on both, an e4m3
+cache prefills as fast as a BF16 one (38.3k against 38.6k prompt tok/s, 32 users, 2,048-token
+prompts) and decodes 2-7 % slower (263 against 283 tok/s for one stream, 2,506 against 2,563 for
+64), so `auto` stays BF16 on Hopper; `fp8` halves the cache when capacity is what is short.
+
+Not done: sliding windows (Gemma), head dims other than 256.
