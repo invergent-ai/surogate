@@ -371,7 +371,9 @@ find_path(CUDNN_INCLUDE_DIR cudnn.h
         HINTS $ENV{CUDNN_INCLUDE_PATH} ${CUDA_TOOLKIT_ROOT_DIR}
         PATH_SUFFIXES include)
 
-find_library(CUDNN_LIBRARY cudnn
+# pip's nvidia-cudnn-cu13 (what torch installs, and all a DGX Spark's venv has) ships only the
+# versioned libcudnn.so.9, like pip's NCCL above, so accept it by name.
+find_library(CUDNN_LIBRARY NAMES cudnn libcudnn.so.9 NAMES_PER_DIR
         HINTS $ENV{CUDNN_LIBRARY_PATH} ${CUDA_TOOLKIT_ROOT_DIR}
         PATH_SUFFIXES lib64 lib)
 
