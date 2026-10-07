@@ -50,6 +50,10 @@ enum class CodecProfile : std::uint8_t {
     // formats the converter produces.
     Q4KQ4K,
     Q4KQ6K,
+    // NVFP4 routed experts, as the NVFP4 MoE exports store them (e2m1 codes, an e4m3 scale per
+    // 16 values, a per-expert second level). A one-token round runs the decode kernels; wider
+    // rounds go to the vendored W4A4 runner, which the build must carry.
+    Nvfp4Nvfp4,
 };
 
 enum class ExpertDistribution : std::uint8_t {
@@ -132,6 +136,8 @@ const char* codec_name(CodecProfile profile) {
         return "q4_k-q4_k";
     case CodecProfile::Q4KQ6K:
         return "q4_k-q6_k";
+    case CodecProfile::Nvfp4Nvfp4:
+        return "nvfp4-nvfp4";
     }
     return "unknown";
 }
@@ -142,6 +148,7 @@ const char* codec_name(CodecProfile profile) {
 
 QType gate_codec(CodecProfile profile) {
     if (is_ggml_profile(profile)) { return QType::Q4_K; }
+    if (profile == CodecProfile::Nvfp4Nvfp4) { return QType::NVFP4; }
     return profile == CodecProfile::W8W8 ? QType::W8G32_F16S : QType::Q4G64_F16S;
 }
 
@@ -157,6 +164,8 @@ QType down_codec(CodecProfile profile) {
         return QType::Q4_K;
     case CodecProfile::Q4KQ6K:
         return QType::Q6_K;
+    case CodecProfile::Nvfp4Nvfp4:
+        return QType::NVFP4;
     }
     throw std::logic_error("unknown SparseMoe codec profile");
 }
@@ -198,6 +207,11 @@ std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t c
         const std::uint64_t blocks = static_cast<std::uint64_t>(rows) * columns /
                                      bench::ggml_block_values_for(qtype);
         return blocks * bench::ggml_block_bytes_for(qtype);
+    }
+    case QType::NVFP4: {
+        // Two codes per byte and one e4m3 scale per 16 values.
+        const std::uint64_t values = static_cast<std::uint64_t>(rows) * columns;
+        return values / 2 + values / 16;
     }
     default:
         break;
@@ -318,7 +332,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --codec q4-q5|q4-q6|w8-w8|q4_k-q4_k|q4_k-q6_k|all\n"
+                 "  --codec q4-q5|q4-q6|w8-w8|q4_k-q4_k|q4_k-q6_k|nvfp4-nvfp4|all\n"
                  "                                Routed weight profile (default q4-q5).\n"
                  "  --tokens T                       Exact token extent (default 1).\n"
                  "  --sweep START:END[:STEP]         Public token-extent sweep.\n"
@@ -392,10 +406,11 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--tokens and --sweep are mutually exclusive");
     }
     static constexpr std::string_view kCodecs[] = {"q4-q5",     "q4-q6",     "w8-w8",
-                                                   "q4_k-q4_k", "q4_k-q6_k", "all"};
+                                                   "q4_k-q4_k", "q4_k-q6_k", "nvfp4-nvfp4",
+                                                   "all"};
     if (std::find(std::begin(kCodecs), std::end(kCodecs), options.codec) == std::end(kCodecs)) {
         throw std::invalid_argument(
-            "--codec must be q4-q5, q4-q6, w8-w8, q4_k-q4_k, q4_k-q6_k, or all");
+            "--codec must be q4-q5, q4-q6, w8-w8, q4_k-q4_k, q4_k-q6_k, nvfp4-nvfp4, or all");
     }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -411,6 +426,7 @@ std::vector<CodecProfile> selected_profiles(const std::string& codec) {
     }
     if (codec == "q4_k-q4_k") { return {CodecProfile::Q4KQ4K}; }
     if (codec == "q4_k-q6_k") { return {CodecProfile::Q4KQ6K}; }
+    if (codec == "nvfp4-nvfp4") { return {CodecProfile::Nvfp4Nvfp4}; }
     if (codec == "q4-q5") return {CodecProfile::Q4Q5};
     if (codec == "q4-q6") return {CodecProfile::Q4Q6};
     return {CodecProfile::W8W8};
@@ -550,14 +566,18 @@ public:
         : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
           // The routed pair follows the profile; a GGML profile holds its blocks
           // unrearranged, which is the whole point of measuring it.
-          routed_gate_(is_ggml_profile(profile)
+          routed_gate_(profile == CodecProfile::Nvfp4Nvfp4
+                           ? bench::make_nvfp4_weight(kExperts * 1024, kHidden)
+                       : is_ggml_profile(profile)
                            ? bench::make_ggml_blocks_weight(
                                  gate_codec(profile), kExperts * 1024, kHidden,
                                  {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})
                            : bench::make_row_split_weight(
                                  gate_codec(profile), kExperts * 1024, kHidden, kHidden,
                                  {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})),
-          routed_down_(is_ggml_profile(profile)
+          routed_down_(profile == CodecProfile::Nvfp4Nvfp4
+                           ? bench::make_nvfp4_weight(kExperts * kHidden, kIntermediate)
+                       : is_ggml_profile(profile)
                            ? bench::make_ggml_blocks_weight(
                                  down_codec(profile), kExperts * kHidden, kIntermediate,
                                  {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403})
@@ -569,6 +589,7 @@ public:
                                                     {0x27, 0x00, 0x1405})),
           shared_down_(bench::make_row_split_weight(QType::W8G32_F16S, kHidden, kIntermediate,
                                                     kIntermediate, {0x73, 0x00, 0x1407})),
+          expert_scales_(static_cast<std::size_t>(kNvfp4ExpertArrays) * kExperts * sizeof(float)),
           flush_(flush_bytes) {
         std::vector<std::uint16_t> router(static_cast<std::size_t>(kRouterRows) * kHidden,
                                           bench::f32_to_bf16(0.0F));
@@ -590,6 +611,21 @@ public:
         weights_.shared_gate_up     = shared_gate_.weight;
         weights_.shared_down        = shared_down_.weight;
         weights_.experts_per_token  = kTopK;
+        if (profile == CodecProfile::Nvfp4Nvfp4) {
+            // The format's per-expert second level and the runner's activation scales and
+            // alphas: [experts][2] gate/up, then five [experts] arrays. Plausible magnitudes
+            // only; the benchmark times the kernels, not the values.
+            const std::vector<float> scales(static_cast<std::size_t>(kNvfp4ExpertArrays) * kExperts,
+                                            1.0F);
+            expert_scales_.copy_from_host(scales.data(), expert_scales_.bytes);
+            const auto* base                  = static_cast<const float*>(expert_scales_.p);
+            weights_.routed_gate_up_scale     = base;
+            weights_.routed_down_scale        = base + 2 * kExperts;
+            weights_.routed_gate_up_act_scale = base + 3 * kExperts;
+            weights_.routed_gate_up_alpha     = base + 4 * kExperts;
+            weights_.routed_down_act_scale    = base + 5 * kExperts;
+            weights_.routed_down_alpha        = base + 6 * kExperts;
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -605,6 +641,8 @@ private:
     bench::PackedQuantizedWeight routed_down_;
     bench::PackedQuantizedWeight shared_gate_;
     bench::PackedQuantizedWeight shared_down_;
+    static constexpr int kNvfp4ExpertArrays = 7;
+    DeviceBuffer expert_scales_;
     DeviceBuffer flush_;
     ops::SparseMoeWeights weights_{};
 };
@@ -802,8 +840,10 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
                               const Options& options, cudaStream_t stream) {
     BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed);
 
-    // Match the production graph lifecycle: materialize eagerly, capture from a
-    // reset state, instantiate, then prime one replay before configured warmup.
+    // Match the production graph lifecycle: tune the routed-NVFP4 runner's tactics for this
+    // width (a no-op for every other profile), materialize eagerly, capture from a reset state,
+    // instantiate, then prime one replay before configured warmup.
+    ops::sparse_moe_prepare(fixture.weights(), tokens, stream);
     state.prepare(CacheState::Warm, stream);
     state.launch(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
