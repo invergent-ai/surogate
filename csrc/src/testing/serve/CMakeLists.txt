@@ -769,15 +769,16 @@ sinfer_add_test(sinfer_dflash_readout_test
 target_compile_options(sinfer_dflash_readout_test PRIVATE -UNDEBUG -fno-fast-math)
 set_tests_properties(sinfer_dflash_readout_test PROPERTIES TIMEOUT 600)
 
+sinfer_add_test(sinfer_gemma_vision_test SOURCES test_gemma_vision.cpp LIBRARIES sinfer_engine CUDA::cudart)
+
+sinfer_add_op_test(sinfer_muse_vision_ops_test SOURCES test_muse_vision_ops.cpp LIBRARIES sinfer_engine CUDA::cudart)
+
 # The aggregate: `cmake --build <dir> --target serve-tests` builds every registered test,
-# and `ctest` then has a binary for each of them.
+# and `ctest` then has a binary for each of them. It collects only the tests registered above
+# it, so it stays last.
 get_property(_sinfer_serve_test_targets GLOBAL PROPERTY SINFER_SERVE_TEST_TARGETS)
 if(_sinfer_serve_test_targets)
   add_custom_target(serve-tests DEPENDS ${_sinfer_serve_test_targets})
   list(LENGTH _sinfer_serve_test_targets _sinfer_serve_test_count)
   message(STATUS "serve tests: ${_sinfer_serve_test_count} targets under `serve-tests`")
 endif()
-
-sinfer_add_test(sinfer_gemma_vision_test SOURCES test_gemma_vision.cpp LIBRARIES sinfer_engine CUDA::cudart)
-
-sinfer_add_op_test(sinfer_muse_vision_ops_test SOURCES test_muse_vision_ops.cpp LIBRARIES sinfer_engine CUDA::cudart)

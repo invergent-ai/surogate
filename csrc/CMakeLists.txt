@@ -1753,6 +1753,15 @@ if(SINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/responses_http.cpp
     ${SERVE_ROOT}/serve/serve_options.cpp)
   sinfer_internal_includes(sinfer_serve)
+  # Decisions v1 pins its answers bit for bit against a Python reference
+  # (src/testing/serve/test_decisions_v1.cpp). GCC contracts a*b+c into an FMA by default on
+  # aarch64, which x86-64 builds without -mfma never do, and that moved the last bit of the
+  # scores on a DGX Spark. Keep the arithmetic as written on every host.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+      ${SERVE_ROOT}/serve/decisions_schema.cpp ${SERVE_ROOT}/serve/decisions_thinking.cpp
+      PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  endif()
   target_include_directories(sinfer_serve PRIVATE
     ${SUROGATE_VENDOR_DIR}/cpp-httplib)
   target_link_libraries(sinfer_serve
