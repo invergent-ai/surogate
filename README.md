@@ -163,7 +163,7 @@ For per-family format support, conversion behavior, and hardware details, see th
 
 ### Install
 
-Use **Linux x86_64 and Python 3.12** with a supported NVIDIA GPU and CUDA 13 (driver 580 or newer). See [hardware](#hardware) for the separate training and serving GPU targets.
+Use **Linux x86_64 and Python 3.12** with a supported NVIDIA GPU and CUDA 13 (driver 580 or newer), or a DGX Spark (GB10, Linux aarch64). See [hardware](#hardware) for the separate training and serving GPU targets.
 
 ```bash
 curl -LsSf https://github.com/invergent-ai/surogate/releases/latest/download/install.sh | bash
@@ -176,6 +176,8 @@ also installable on its own, with no index flags — every dependency resolves f
 ```bash
 pip install https://github.com/invergent-ai/surogate/releases/latest/download/surogate-<version>+cu130-cp312-abi3-manylinux_2_39_x86_64.whl
 ```
+
+On a DGX Spark the installer picks the `manylinux_2_39_aarch64` wheel, built for GB10 only.
 
 There is no CUDA 12 package. The serving engine's W8 and NVFP4 kernels declare more shared
 memory per block than a CUDA 12 toolkit will assemble for the RTX line, so CUDA 13.0 is the
@@ -317,10 +319,10 @@ Read [how training works](docs/about/how-it-works.md), the [DSL guide](docs/abou
 
 | Component | Current requirements / targets |
 |---|---|
-| **Platform** | Linux x86_64; the published wheel targets Python 3.12 and CUDA 13 (driver 580+). |
-| **Training** | SM89+ in the current build: Ada (RTX 40 series, L4/L40), Hopper (H100/H200), and supported Blackwell targets. |
+| **Platform** | Linux x86_64, and Linux aarch64 for DGX Spark (GB10); the published wheels target Python 3.12 and CUDA 13 (driver 580+). |
+| **Training** | SM89+ in the current build: Ada (RTX 40 series, L4/L40), Hopper (H100/H200), and supported Blackwell targets, including GB10 (SM121, DGX Spark). |
 | **FP8 / NVFP4 training** | FP8 requires SM89+; native NVFP4 requires a supported Blackwell GPU and matching build. |
-| **Generative serving** | Default builds target Ada (SM89: RTX 40 series, L4/L40), Hopper (SM90a: H100/H200) and RTX Blackwell (SM120a: RTX 50 series, RTX PRO). NVFP4 checkpoints need SM120. |
+| **Generative serving** | Default x86_64 builds target Ada (SM89: RTX 40 series, L4/L40), Hopper (SM90a: H100/H200) and RTX Blackwell (SM120a: RTX 50 series, RTX PRO); aarch64 builds target GB10 (SM121a: DGX Spark). NVFP4 checkpoints need SM120 or SM121. |
 | **CPU embeddings** | AVX-512 CPU; generative serving still requires a GPU when using CPU offload. |
 | **Multi-GPU / offload** | NCCL for distributed training; sufficient system RAM for offloaded weights and state. Dispatch-PP supports PCIe systems without NVLink. |
 

@@ -3,6 +3,7 @@
 ## Supported platforms
 
 - Linux x86_64
+- Linux aarch64 on a DGX Spark (GB10)
 - NVIDIA GPU
 
 ## GPU / CUDA
@@ -50,6 +51,20 @@ From the repository root:
 ```bash
 uv pip install -e .
 ```
+
+## DGX Spark (GB10)
+
+The install script detects the Arm host and installs the aarch64 wheel, which is built for
+GB10 (SM121) only. Training and serving use the same commands as on any other GPU.
+
+To build from source on the Spark, install Rust with `rustup` and the build prerequisites
+above. The Makefile finds the CUDA toolkit in `/usr/local/cuda`, where DGX OS keeps it off
+`PATH`. `make build` detects the GPU and builds for `121a`, and `make serve-build` defaults to
+`121a` on aarch64.
+
+The GPU shares the machine's memory with the system. Surogate counts as free what the system
+can still give it (`MemAvailable`, which includes reclaimable page cache) less 8 GiB left to
+the host. Set `SUROGATE_UNIFIED_MEMORY_RESERVE_MIB` to change that reserve.
 
 ## Verify installation
 
