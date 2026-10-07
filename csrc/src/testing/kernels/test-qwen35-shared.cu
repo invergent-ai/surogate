@@ -12,24 +12,28 @@
 #include "utilities/tensor.h"
 
 namespace {
+// Member functions check through require_cuda rather than REQUIRE: CUDA 13.0's cudafe++ (the DGX
+// Spark's toolkit) never finishes on some REQUIREs inside member functions of this file's classes.
+void require_cuda(cudaError_t status) { REQUIRE(status == cudaSuccess); }
+
 struct DeviceTensor {
     Tensor tensor;
     DeviceTensor(ETensorDType dtype, std::vector<long> shape) {
         long count = 1;
         for (long n : shape) count *= n;
         void* data = nullptr;
-        REQUIRE(cudaMalloc(&data, count * get_dtype_size(dtype)) == cudaSuccess);
+        require_cuda(cudaMalloc(&data, count * get_dtype_size(dtype)));
         tensor = Tensor::from_pointer(static_cast<std::byte*>(data), 0, dtype, shape);
-        REQUIRE(cudaMemset(data, 0, tensor.bytes()) == cudaSuccess);
+        require_cuda(cudaMemset(data, 0, tensor.bytes()));
     }
     ~DeviceTensor() { cudaFree(tensor.Data); }
     template <typename T> void put(const std::vector<T>& values) {
         REQUIRE(values.size() * sizeof(T) == tensor.bytes());
-        REQUIRE(cudaMemcpy(tensor.Data, values.data(), tensor.bytes(), cudaMemcpyHostToDevice) == cudaSuccess);
+        require_cuda(cudaMemcpy(tensor.Data, values.data(), tensor.bytes(), cudaMemcpyHostToDevice));
     }
     template <typename T> std::vector<T> get() {
         std::vector<T> result(tensor.nelem());
-        REQUIRE(cudaMemcpy(result.data(), tensor.Data, tensor.bytes(), cudaMemcpyDeviceToHost) == cudaSuccess);
+        require_cuda(cudaMemcpy(result.data(), tensor.Data, tensor.bytes(), cudaMemcpyDeviceToHost));
         return result;
     }
 };

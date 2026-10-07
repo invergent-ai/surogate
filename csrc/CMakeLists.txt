@@ -870,6 +870,8 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     target_link_libraries(integration-tests PRIVATE
         surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only
     )
+    # cuDNN from the pip wheel (all a DGX Spark has) is not on the default include path.
+    target_include_directories(integration-tests PRIVATE ${CUDNN_INCLUDE_DIR})
     target_compile_options(integration-tests PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>

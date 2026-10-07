@@ -21,11 +21,17 @@
 
 namespace {
 
+// Member functions check through require_cuda rather than REQUIRE: CUDA 13.0's cudafe++ (the DGX
+// Spark's toolkit) never finishes on some REQUIREs inside member functions of this file's classes.
+void require_cuda(cudaError_t status) {
+    REQUIRE(status == cudaSuccess);
+}
+
 struct DeviceBuf {
     void* ptr = nullptr;
     explicit DeviceBuf(std::size_t bytes) {
-        REQUIRE(cudaMalloc(&ptr, bytes) == cudaSuccess);
-        REQUIRE(cudaMemset(ptr, 0, bytes) == cudaSuccess);
+        require_cuda(cudaMalloc(&ptr, bytes));
+        require_cuda(cudaMemset(ptr, 0, bytes));
     }
     ~DeviceBuf() {
         cudaFree(ptr);
