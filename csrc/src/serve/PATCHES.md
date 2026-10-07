@@ -4204,3 +4204,46 @@ every shape it times (bit-identical on all 160 shape and token points without a 
 Nebius H100 every serve test the serve-tests target builds passes (210; the speech, TTS and two
 vision tests it doesn't build report Not Run), and the CLI and eight concurrent server requests
 pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.
+
+## 110
+
+**Attention metadata once per round (2026-10-07, after #109).** In-engine profiles of Qwen3-8B-FP8
+on an H100 put two small kernels in front of every attention layer's FA3 decode launch: the rows'
+segment arrays (`rows_metadata`, 1.2 us) and FA3's scheduler metadata (`prepare_varlen_num_blocks`,
+2.8 us at one user, 3.8 at 64), against vLLM's per-layer forward and combine alone (it computes the
+scheduler metadata once per step). Both depend only on the round's positions, valid columns,
+block-table rows and the launch geometry, which every layer of a stack shares. Engine-wide: any
+model whose decode or verify rows take FA3 (#106).
+
+- **`ops::GqaRoundMetadata`** (`api/ops/gqa_attention.h`). A round's attention layers pass one to
+  the batched `gqa_attention` / `gqa_attention_cached`; its storage is a slice of the round state
+  (`api/family/round_state.h`, `round attention metadata`, a few KiB at the batch capacity). The
+  first FA3 rows launch over a given input set (the arrays' addresses, width, batch, head geometry,
+  window and split bound; up to four sets, so alternating windows each get theirs) derives the
+  segment arrays and the scheduler metadata into it; the rest of the round's layers read them and
+  skip both kernels. The text runtime begins a round before each layer loop (`run_layers` and both
+  mixed loops); MTP layers and anything without a round compute their own as before. Captured
+  graphs replay it as they capture it: the first layer's launches recompute from the new positions.
+- **A tile counter per layer** (`ops/gqa_sm90/gqa_fa3.{h,cu}`). FA3's dynamic tile scheduler
+  counts tiles with a semaphore that its prepare kernel zeroes and a split launch's combine resets;
+  launches that skip the prepare get one counter each (`PagedLaunch::tile_counter`), all zeroed by
+  the round's `rows_metadata` launch, so no layer reads another's leftover count.
+  `PagedLaunch::scheduler` / `prepare` select the shared metadata, as FA3's
+  `skip_scheduler_metadata_computation` does for vLLM.
+- **The split combine launches with programmatic dependent launch** (`gqa_fa3_combine.cu`), as
+  FA3's own API does; its last CTA waits on the forward before resetting the counter.
+  `SUROGATE_SERVE_GQA_FA3_PDL=0` turns that off, `SUROGATE_SERVE_GQA_ROUND_METADATA=0` the sharing.
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream, with
+the sharing off -> on and vLLM 0.31 on the same VM: one user 213.5 -> 221.1 (vLLM 228.8), 16 users
+163.2 -> 167.0 (153.6), 64 users 85.7 -> 86.7 (92.4); 32 users with 2,048-token prompts 52.2k ->
+52.5k prompt tok/s (55.1k). The combine's PDL is a small part of that (220.3 / 166.2 / 86.3 without
+it). Qwen3.6-27B-FP8: one user 80.3 -> 82.6, 64 users 28.2 -> 28.3.
+
+Tests. `sinfer_gqa_attention_test` adds a four-layer round (alternating 256-token windows, widths
+1 and 4, histories of 40 and 2,600 keys so long rows split): every layer's output with the shared
+metadata is bitwise the output without it, eagerly, after the positions move, and from a captured
+graph replayed at two further positions; on Hopper the round holds two input sets of two launches
+each. On one Nebius H100 every serve test the serve-tests target builds passes (210), and the CLI
+and eight concurrent server requests pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B,
+Qwen3.5-0.8B and Gemma 4 E4B.

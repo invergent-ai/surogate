@@ -46,6 +46,66 @@ struct GqaExecutionEnvelope {
 };
 
 /**
+ * What the attention layers of one round share. Every layer of a round attends from the same
+ * positions, valid columns and table rows, and Hopper's decode and verify route (FlashAttention-3)
+ * derives its per-row arrays and its scheduler's metadata from them. Passed a round, the round's
+ * first layer computes those into `storage` and its later layers over the same inputs read them,
+ * as vLLM builds FA3's scheduler metadata once per step, instead of every layer running two small
+ * kernels before its attention. Every other route ignores it.
+ *
+ * `storage` is device I32 [storage_ints(rows)] for rounds of up to `rows` sequences, at an
+ * address that outlives the rounds, so a captured round replays with it. The caller calls
+ * begin() before a round's first layer and passes the round to each of its layers; a layer's
+ * positions, valid columns and table rows must hold the same values for every layer of the round
+ * that passes the same tensors. Rounds on one storage must not overlap on the device: they run on
+ * one stream. The rest is host bookkeeping (gqa_attention.cpp). SUROGATE_SERVE_GQA_ROUND_METADATA=0
+ * makes every layer compute its own.
+ */
+class GqaRoundMetadata {
+public:
+    /// The input sets one round may hold, and the layers each may serve (one tile counter each).
+    static constexpr std::int32_t kEntries  = 4;
+    static constexpr std::int32_t kLaunches = 256;
+
+    struct Entry {
+        const void* positions     = nullptr;
+        const void* valid_columns = nullptr;
+        const void* kv_table_rows = nullptr;
+        std::int32_t width = 0, batch = 0, head_dim = 0, q_heads = 0, kv_heads = 0;
+        std::int32_t sliding_window = 0, splits = 0;
+        /// Layers launched on it this round; the first computed it.
+        std::int32_t launches = 0;
+    };
+
+    /// Per input set: the rows' segment arrays (4 rows + 1 ints, padded to four), FA3's scheduler
+    /// metadata (four vectors of rows padded to four) and kLaunches tile counters.
+    [[nodiscard]] static constexpr std::int32_t entry_ints(std::int32_t rows) noexcept {
+        return (4 * rows + 4) / 4 * 4 + (rows + 3) / 4 * 4 * 4 + kLaunches;
+    }
+    [[nodiscard]] static constexpr std::int32_t storage_ints(std::int32_t rows) noexcept {
+        return kEntries * entry_ints(rows);
+    }
+
+    GqaRoundMetadata() = default;
+    GqaRoundMetadata(Tensor storage, std::int32_t rows) noexcept : storage_(storage), rows_(rows) {}
+
+    void begin() noexcept { used_ = 0; }
+
+    [[nodiscard]] const Tensor& storage() const noexcept { return storage_; }
+    [[nodiscard]] std::int32_t rows() const noexcept { return rows_; }
+    [[nodiscard]] std::int32_t used() const noexcept { return used_; }
+    [[nodiscard]] Entry& entry(std::int32_t index) noexcept { return entries_[index]; }
+    /// Starts entry `used()`, which the caller has checked is below kEntries.
+    Entry& add(const Entry& entry) noexcept { return entries_[used_++] = entry; }
+
+private:
+    Tensor storage_;
+    std::int32_t rows_ = 0;
+    std::int32_t used_ = 0;
+    Entry entries_[kEntries]{};
+};
+
+/**
  * Shared numerical contract for A1/A2/A3.
  *
  * Public q/k/v inputs and BF16 cache values are interpreted after their BF16 storage boundary.
@@ -121,7 +181,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                   GqaBlockMask selection = {});
+                   GqaBlockMask selection = {}, GqaRoundMetadata* round = nullptr);
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
@@ -154,7 +214,8 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
                           const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
                           GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                          cudaStream_t stream, GqaBlockMask selection = {});
+                          cudaStream_t stream, GqaBlockMask selection = {},
+                          GqaRoundMetadata* round = nullptr);
 
 /// One sequence's part of gqa_attention_packed_prompts: its query columns
 /// [column, column + width) of q, k, v, positions and out, the block-table row its cache is

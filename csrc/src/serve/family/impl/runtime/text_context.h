@@ -781,6 +781,9 @@ private:
     PrefillGraphFamily* prefill_graph_family_             = nullptr;
     Tensor graph_pad_valid_storage_;
     MixedDecodeSlice mixed_graph_decode_{};
+    /// What a round's attention layers share (ops::GqaRoundMetadata): begun with each layer loop,
+    /// passed to the decode and verify rows' attention of the stack's own layers.
+    ops::GqaRoundMetadata attention_round_{io_.attention_metadata, io_.attention_metadata_rows};
     const Tensor* graph_pad_valid_                        = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;

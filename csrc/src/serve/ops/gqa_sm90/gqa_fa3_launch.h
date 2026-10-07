@@ -22,7 +22,9 @@ template <int HeadDim, bool Fp8, bool Local, bool Split>
 void launch(Flash_fwd_params& params, cudaStream_t stream);
 
 /// FA3's split-KV combine: merges the partials of every segment the forward split into the BF16
-/// output, by their log-sum-exps. `num_splits` must be at most 64.
-void combine(Flash_fwd_params& params, cudaStream_t stream);
+/// output, by their log-sum-exps. `num_splits` must be at most 64. With `pdl` it is launched as
+/// the forward's programmatic dependent, as FA3's API launches it: the forward lets it start once
+/// every CTA has taken its last tile, and it waits for the forward's partials before reading them.
+void combine(Flash_fwd_params& params, cudaStream_t stream, bool pdl);
 
 } // namespace sinfer::ops::detail::gqa_fa3

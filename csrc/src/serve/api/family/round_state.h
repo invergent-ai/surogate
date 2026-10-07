@@ -198,6 +198,7 @@ struct RoundStateLayout {
     TensorRegion logits;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
+    TensorRegion attention_metadata;
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
@@ -340,6 +341,10 @@ struct RoundState {
     Tensor logits;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
+    /// The attention metadata a round's layers share (ops::GqaRoundMetadata's storage), for
+    /// rounds of up to `attention_metadata_rows` sequences, the spec's batch capacity.
+    Tensor attention_metadata;
+    std::int32_t attention_metadata_rows = 0;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

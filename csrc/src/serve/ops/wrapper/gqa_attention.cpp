@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -542,12 +544,80 @@ Fa3PromptWorkspace allocate_fa3_rows_workspace(Allocator& workspace, std::int32_
                           splits.partials))};
 }
 
+bool round_metadata_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_GQA_ROUND_METADATA");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// One input set's part of a GqaRoundMetadata's storage (GqaRoundMetadata::entry_ints): the rows'
+// segment arrays, FA3's scheduler metadata over them, and a tile counter per layer that launches
+// on them.
+std::int32_t round_metadata_offset(std::int32_t rows) {
+    return (detail::gqa_fa3::metadata_ints(rows) + 3) / 4 * 4;
+}
+
+std::int32_t round_entry_ints(std::int32_t rows) {
+    return round_metadata_offset(rows) + detail::gqa_fa3::scheduler_ints(rows) +
+           GqaRoundMetadata::kLaunches;
+}
+
+// A rows launch's share of its round: where its segment arrays, scheduler metadata and tile
+// counter are, and whether it computes the arrays and metadata (the round's first launch over
+// these inputs, which also zeroes every layer's counter) or reads them. Empty without a round,
+// with the switch off, or when the round has no room for these inputs: the launch then computes
+// its own in its scratch, as it always did.
+struct RoundShare {
+    std::int32_t* metadata  = nullptr;
+    std::int32_t* scheduler = nullptr;
+    std::int32_t* counters  = nullptr;
+    std::int32_t* counter   = nullptr;
+    bool compute            = false;
+};
+
+RoundShare round_share(GqaRoundMetadata* round, const GqaRoundMetadata::Entry& key) {
+    if (round == nullptr || !round_metadata_enabled() || round->storage().data == nullptr ||
+        round->rows() <= 0 || key.batch > round->rows() ||
+        round_entry_ints(round->rows()) != GqaRoundMetadata::entry_ints(round->rows()) ||
+        round->storage().numel() < GqaRoundMetadata::storage_ints(round->rows())) {
+        return {};
+    }
+    const auto same = [&](const GqaRoundMetadata::Entry& e) {
+        return e.positions == key.positions && e.valid_columns == key.valid_columns &&
+               e.kv_table_rows == key.kv_table_rows && e.width == key.width &&
+               e.batch == key.batch && e.head_dim == key.head_dim && e.q_heads == key.q_heads &&
+               e.kv_heads == key.kv_heads && e.sliding_window == key.sliding_window &&
+               e.splits == key.splits;
+    };
+    std::int32_t index = 0;
+    while (index < round->used() && !same(round->entry(index))) { ++index; }
+    if (index == round->used()) {
+        if (index == GqaRoundMetadata::kEntries) { return {}; }
+        round->add(key);
+    }
+    GqaRoundMetadata::Entry& entry = round->entry(index);
+    if (entry.launches == GqaRoundMetadata::kLaunches) { return {}; }
+    auto* base = static_cast<std::int32_t*>(round->storage().data) +
+                 static_cast<std::size_t>(index) * round_entry_ints(round->rows());
+    RoundShare share;
+    share.metadata  = base;
+    share.scheduler = base + round_metadata_offset(round->rows());
+    share.counters  = share.scheduler + detail::gqa_fa3::scheduler_ints(round->rows());
+    share.counter   = share.counters + entry.launches;
+    share.compute   = entry.launches == 0;
+    ++entry.launches;
+    return share;
+}
+
 // The rows' keys must already be in the cache: row r is segment r, its valid columns the last of
-// its keys.
+// its keys. With a round, the round's first launch over these inputs derives the segment arrays
+// and FA3's scheduler metadata into the round's storage and the rest of its layers reuse them.
 void launch_fa3_rows(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
                      const Tensor& kv_table_rows, float scale, GqaExecutionEnvelope envelope,
                      const PagedKVBatchLayerView& cache, WorkspaceArena& workspace, Tensor& out,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, GqaRoundMetadata* round = nullptr) {
     auto scope               = workspace.scope();
     const std::int32_t width = q.ne[2];
     const std::int32_t batch = q.ne[3];
@@ -555,17 +625,31 @@ void launch_fa3_rows(const Tensor& q, const Tensor& positions, const Tensor& val
         fa3_row_splits(q.ne[0], q.ne[1], cache.num_kv_heads, width, batch, envelope);
     auto [metadata, scratch] =
         allocate_fa3_rows_workspace(workspace, q.ne[0], q.ne[1], width, batch, splits);
-    detail::gqa_fa3::rows_metadata(static_cast<const std::int32_t*>(positions.data), width, batch,
-                                   static_cast<const std::int32_t*>(valid_columns.data),
-                                   static_cast<const std::int32_t*>(kv_table_rows.data),
-                                   static_cast<std::int32_t*>(metadata.data), stream);
+    const RoundShare share = round_share(
+        round, {positions.data, valid_columns.data, kv_table_rows.data, width, batch, q.ne[0],
+                q.ne[1], cache.num_kv_heads, envelope.sliding_window, splits.splits});
+    if (share.metadata != nullptr) {
+        metadata = Tensor(share.metadata, DType::I32, {detail::gqa_fa3::metadata_ints(batch)});
+    }
+    const bool prepare = share.metadata == nullptr || share.compute;
+    if (prepare) {
+        detail::gqa_fa3::rows_metadata(
+            static_cast<const std::int32_t*>(positions.data), width, batch,
+            static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(kv_table_rows.data),
+            static_cast<std::int32_t*>(metadata.data), stream, share.counters,
+            share.counters != nullptr ? GqaRoundMetadata::kLaunches : 0);
+    }
     // FA3 writes only the valid columns; the split-KV kernels' contract is zeros in the rest.
     if (valid_columns.data != nullptr) {
         CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes(), stream));
     }
     detail::gqa_fa3::PagedLaunch args =
         fa3_launch(q, cache, scale, envelope.sliding_window, out, batch, width, metadata);
-    args.max_splits = splits.splits;
+    args.max_splits   = splits.splits;
+    args.scheduler    = share.scheduler;
+    args.prepare      = prepare;
+    args.tile_counter = share.counter;
     detail::gqa_fa3::run(args, scratch.data, scratch.bytes, stream);
 }
 
@@ -887,7 +971,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                   GqaBlockMask selection) {
+                   GqaBlockMask selection, GqaRoundMetadata* round) {
     constexpr const char* op = "gqa_attention";
     if (selection.image_begin < 0 || selection.image_end < selection.image_begin ||
         static_cast<std::uint32_t>(selection.image_end) > envelope.max_visible_keys ||
@@ -911,7 +995,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         detail::gqa_generic_kv_append_launch(k, v, positions, valid_columns, kv_table_rows, cache,
                                              stream);
         launch_fa3_rows(q, positions, valid_columns, kv_table_rows, scale, envelope, cache,
-                        workspace, out, stream);
+                        workspace, out, stream, round);
         return;
     }
     if (selection.image_end || !optimized_decode_shape(head_dim, q.ne[1], kv_heads, cache.dtype)) {
@@ -999,7 +1083,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
                           const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
                           GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                          cudaStream_t stream, GqaBlockMask selection) {
+                          cudaStream_t stream, GqaBlockMask selection, GqaRoundMetadata* round) {
     constexpr const char* op = "gqa_attention_cached";
     if (selection.image_begin < 0 || selection.image_end < selection.image_begin ||
         static_cast<std::uint32_t>(selection.image_end) > envelope.max_visible_keys ||
@@ -1012,7 +1096,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
 
     if (fa3_takes_rows(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype, width, batch, selection)) {
         launch_fa3_rows(q, positions, valid_columns, kv_table_rows, scale, envelope, cache,
-                        workspace, out, stream);
+                        workspace, out, stream, round);
         return;
     }
     if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {

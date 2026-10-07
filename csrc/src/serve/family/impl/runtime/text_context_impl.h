@@ -1450,12 +1450,15 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         Tensor a_batch        = a.view({layer_head_dim, cfg_.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        // The draft head runs outside the stack's layer loop, over its own positions.
+        ops::GqaRoundMetadata* round = mtp ? nullptr : &attention_round_;
         if (owns_kv) {
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                               cfg_.attention_scale, kv_view, layer_envelope, work_, a_batch, s, selection);
+                               cfg_.attention_scale, kv_view, layer_envelope, work_, a_batch, s, selection,
+                               round);
         } else {
             ops::gqa_attention_cached(q_batch, position_batch, valid, kv_table_rows, cfg_.attention_scale,
-                                      kv_view, layer_envelope, work_, a_batch, s, selection);
+                                      kv_view, layer_envelope, work_, a_batch, s, selection, round);
         }
     } else if (owns_kv) {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, cfg_.attention_scale,
@@ -1979,6 +1982,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepst
     }
     const int begin = first_layer < 0 ? stage_first_ : std::max(stage_first_, first_layer);
     const int end = last_layer < 0 ? stage_last_ : std::min(stage_last_, last_layer);
+    attention_round_.begin();
     for (int layer = begin; layer < end; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -2470,6 +2474,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
+    attention_round_.begin();
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -2624,12 +2629,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     if (owns_kv) {
                         ops::gqa_attention(qb, kb, vb, position_batch, decode.valid_columns, decode.kv_table_rows,
                                            cfg_.attention_scale, kv_view, decode_layer_envelope,
-                                           work_, ab, s, decode_selection);
+                                           work_, ab, s, decode_selection, &attention_round_);
                     } else {
                         ops::gqa_attention_cached(qb, position_batch, decode.valid_columns, decode.kv_table_rows,
                                                   cfg_.attention_scale, kv_view,
                                                   decode_layer_envelope, work_, ab, s,
-                                                  decode_selection);
+                                                  decode_selection, &attention_round_);
                     }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
@@ -3173,6 +3178,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
+    attention_round_.begin();
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -3285,12 +3291,12 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     if (owns_kv) {
                         ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
                                            cfg_.attention_scale, kv_view, decode_layer_envelope,
-                                           work_, ab, s, decode_selection);
+                                           work_, ab, s, decode_selection, &attention_round_);
                     } else {
                         ops::gqa_attention_cached(qb, position_batch, Tensor{}, decode.kv_table_rows,
                                                   cfg_.attention_scale, kv_view,
                                                   decode_layer_envelope, work_, ab, s,
-                                                  decode_selection);
+                                                  decode_selection, &attention_round_);
                     }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
