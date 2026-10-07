@@ -13,6 +13,7 @@
 #include "serve/translate.h"
 
 #include "core/sleep.h"
+#include "core/unified_memory.h"
 
 #include <nlohmann/json.hpp>
 
@@ -394,7 +395,7 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
         int device = 0;
         cudaGetDevice(&device);
         std::size_t free_bytes = 0, total_bytes = 0;
-        cudaMemGetInfo(&free_bytes, &total_bytes);
+        device_mem_get_info(&free_bytes, &total_bytes);
         std::ostringstream trace;
         trace << "mem-trace device=" << device << " sleepable="
               << (service_->resident_bytes(device) >> 20) << " MiB free="

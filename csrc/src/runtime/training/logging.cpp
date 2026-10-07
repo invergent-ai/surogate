@@ -21,6 +21,7 @@
 #include "utilities/allocator.h"
 #include "utilities/stack.h"
 #include "utilities/sol.h"
+#include "serve/core/unified_memory.h"
 #include <iostream>
 
 /**
@@ -683,7 +684,7 @@ void TrainingRunLogger::log_gpu_model(NCCLCommunicator& comm) {
     CUDA_CHECK(cudaGetDeviceProperties(&msg.prop, msg.device_id));
     CUDA_CHECK(cudaDriverGetVersion(&msg.driver_version));
     CUDA_CHECK(cudaRuntimeGetVersion(&msg.runtime_version));
-    CUDA_CHECK(cudaMemGetInfo(&msg.mem_free, &msg.mem_total));
+    CUDA_CHECK(sinfer::device_mem_get_info(&msg.mem_free, &msg.mem_total));
     msg.mem_reserved = get_mem_reserved();
 
     auto all_gpus = comm.host_gather(msg);
@@ -900,7 +901,7 @@ void print_memory_breakdown(const MemoryBreakdownContext& ctx,
 
     // Query CUDA memory stats
     std::size_t cuda_free = 0, cuda_total = 0;
-    cudaMemGetInfo(&cuda_free, &cuda_total);
+    sinfer::device_mem_get_info(&cuda_free, &cuda_total);
     const std::size_t cuda_used = cuda_total - cuda_free;
 
     // Print allocator segment summary

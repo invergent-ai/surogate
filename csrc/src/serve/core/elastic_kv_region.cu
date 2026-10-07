@@ -5,6 +5,7 @@
 #include "core/device_memory_error.h"
 #include "core/engine_context.h"
 #include "core/sleep.h"
+#include "core/unified_memory.h"
 
 #include <cuda.h>
 
@@ -264,7 +265,7 @@ struct ElasticKvRegion::Impl {
                 granule.handles.clear();
                 if (created == CUDA_ERROR_OUT_OF_MEMORY) {
                     std::size_t free_bytes = 0, total_bytes = 0;
-                    (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+                    (void)device_mem_get_info(&free_bytes, &total_bytes);
                     throw DeviceOutOfMemory("cuMemCreate failed: out of memory mapping " +
                                             std::to_string(span >> 20) + " MiB of KV cache (" +
                                             std::to_string(free_bytes >> 20) +

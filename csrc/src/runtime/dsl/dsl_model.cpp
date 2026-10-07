@@ -51,6 +51,7 @@
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/safetensors.h"
+#include "serve/core/unified_memory.h"
 
 namespace dsl {
 namespace {
@@ -1333,7 +1334,7 @@ DslModel::DslModel(const PretrainedConfig& config,
                   << ", is_quantized=" << mQLoRAConfig.is_quantized() << ", lora=" << lora_config.has_value() << ")"
                   << std::endl;
         size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
+        sinfer::device_mem_get_info(&free_mem, &total_mem);
         std::cerr << "[DEBUG-MODEL] Before param alloc: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
                   << " MiB, free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
@@ -1378,7 +1379,7 @@ DslModel::DslModel(const PretrainedConfig& config,
     // DEBUG: After weight manager + grad store allocation
     if (options.DebugMemoryBreakdown) {
         size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
+        sinfer::device_mem_get_info(&free_mem, &total_mem);
         std::cerr << "[DEBUG-MODEL] After param+grad+wm alloc: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
                   << " MiB, free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }

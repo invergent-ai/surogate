@@ -11,6 +11,7 @@
 #include <nvml.h>
 
 #include "utils.h"
+#include "serve/core/unified_memory.h"
 
 /**
  * @brief Check an NVML API call result and handle errors/warnings.
@@ -173,7 +174,7 @@ public:
         mInfo.mem_utilization = -1.f;
         mInfo.throttle_reason = "not supported";
         std::size_t free = 0, total = 0;
-        if (cudaMemGetInfo(&free, &total) == cudaSuccess) {
+        if (sinfer::device_mem_get_info(&free, &total) == cudaSuccess) {
             mInfo.mem_free = free;
             mInfo.mem_total = total;
         }
@@ -419,7 +420,7 @@ nvmlMemory_v2_t get_mem_info(nvmlDevice_t device) {
         }
         std::size_t free, total;
         // hail mary -- use cuda's basic interface instead
-        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        CUDA_CHECK(sinfer::device_mem_get_info(&free, &total));
         mem_info.reserved = 0;
         mem_info.free = free;
         mem_info.total = total;

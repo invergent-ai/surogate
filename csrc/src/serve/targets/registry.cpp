@@ -13,6 +13,7 @@
 #include "core/device_footprint.h"
 #include "core/engine_context.h"
 #include "core/elastic_kv_region.h"
+#include "core/unified_memory.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
@@ -93,7 +94,7 @@ std::size_t current_free_device_bytes() {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     std::size_t free_bytes = 0, total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes)); // a sticky CUDA error surfaces here
+    CUDA_CHECK(device_mem_get_info(&free_bytes, &total_bytes)); // a sticky CUDA error surfaces here
     return std::min(free_bytes, device_budget_free_bytes(device));
 }
 

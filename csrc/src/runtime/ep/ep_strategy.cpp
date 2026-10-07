@@ -50,6 +50,7 @@
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
 #include "utilities/utils.h"
+#include "serve/core/unified_memory.h"
 
 namespace ep {
 
@@ -117,7 +118,7 @@ bool alloc_or_resize(void*& ptr, std::size_t& cur_bytes, std::size_t need) {
         ptr = nullptr;
         cur_bytes = 0;
         std::size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        sinfer::device_mem_get_info(&free_b, &total_b);
         throw std::runtime_error("EP alloc_or_resize: cudaMalloc(" + std::to_string(need) +
                                  ") failed: " + cudaGetErrorString(err) + " (device free " + std::to_string(free_b) +
                                  "/" + std::to_string(total_b) + ")");

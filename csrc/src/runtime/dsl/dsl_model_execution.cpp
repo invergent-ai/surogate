@@ -34,6 +34,7 @@
 #include "runtime/optimizers/flash_adamw_8bit.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
+#include "serve/core/unified_memory.h"
 
 #include <iostream>
 #include <optional>
@@ -335,7 +336,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
 
     if (options.DebugMemoryBreakdown && comm.rank() == 0) {
         size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
+        sinfer::device_mem_get_info(&free_mem, &total_mem);
         std::cerr
             << "[DEBUG-STACK] plan_peak="
             << initial_plan.plan_stack_peak_bytes(mOptions.LongContext ? initial_plan.C : 0) / (1024 * 1024) << " MiB"

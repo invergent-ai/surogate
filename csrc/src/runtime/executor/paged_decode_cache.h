@@ -11,6 +11,7 @@
 #include <vector>
 #include "utilities/allocator.h"
 #include "utilities/utils.h"
+#include "serve/core/unified_memory.h"
 
 namespace dsl {
 inline constexpr int DecodePageRows = 128;
@@ -48,13 +49,13 @@ struct DecodePagePool {
         if (memory_limit_bytes && memory_bytes() + bytes > memory_limit_bytes)
             throw DecodeCapacityError("Decode cache and workspace VRAM budget exhausted");
         std::size_t available = 0, total = 0;
-        CUDA_CHECK(cudaMemGetInfo(&available, &total));
+        CUDA_CHECK(sinfer::device_mem_get_info(&available, &total));
         if (available < bytes + execution_headroom_bytes) {
             trim();
-            CUDA_CHECK(cudaMemGetInfo(&available, &total));
+            CUDA_CHECK(sinfer::device_mem_get_info(&available, &total));
             while (available < bytes + execution_headroom_bytes && evict_prefix && evict_prefix()) {
                 trim();
-                CUDA_CHECK(cudaMemGetInfo(&available, &total));
+                CUDA_CHECK(sinfer::device_mem_get_info(&available, &total));
             }
             if (available < bytes + execution_headroom_bytes)
                 throw DecodeCapacityError("Insufficient free VRAM for decode execution workspace");

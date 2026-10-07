@@ -13,6 +13,7 @@
 
 #include "config/pretrained_config.h"
 #include "utilities/utils.h"
+#include "serve/core/unified_memory.h"
 
 namespace qlora {
 
@@ -307,7 +308,7 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     }
 
     size_t gpu_free = 0, gpu_total = 0;
-    CUDA_CHECK(cudaMemGetInfo(&gpu_free, &gpu_total));
+    CUDA_CHECK(sinfer::device_mem_get_info(&gpu_free, &gpu_total));
 
     const size_t max_grp = om->max_group_bytes();
     const int num_grp = om->num_groups();

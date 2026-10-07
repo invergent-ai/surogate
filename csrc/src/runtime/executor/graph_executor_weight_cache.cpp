@@ -24,6 +24,7 @@
 #include "runtime/qlora/generic_qlora_provider.h"
 #include "runtime/training/runtime_options.h"
 #include "utilities/tensor.h"
+#include "serve/core/unified_memory.h"
 
 namespace dsl {
 namespace {
@@ -180,7 +181,7 @@ bool GraphExecutor::fp8_weight_caches_fit(std::size_t* bytes_needed) {
     }
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+    if (sinfer::device_mem_get_info(&free_bytes, &total_bytes) != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
     }
@@ -217,7 +218,7 @@ bool GraphExecutor::fp8_weight_cache_enabled() {
     if (mOptions.Fp8WeightCache == RuntimeOptions::Fp8WeightCacheMode::Auto && needed > 0) {
         std::size_t free_bytes = 0;
         std::size_t total_bytes = 0;
-        (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+        (void)sinfer::device_mem_get_info(&free_bytes, &total_bytes);
         int device = -1;
         (void)cudaGetDevice(&device);
         std::fprintf(stderr,

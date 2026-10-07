@@ -1,5 +1,7 @@
 #include "core/device_footprint.h"
 
+#include "core/unified_memory.h"
+
 #include <cuda_runtime.h>
 #include <nvml.h>
 
@@ -149,7 +151,7 @@ bool process_used(int cuda_device, std::size_t& out) noexcept try {
 DeviceFootprint sample_device_footprint() noexcept {
     DeviceFootprint sample;
     std::size_t total = 0;
-    if (cudaMemGetInfo(&sample.device_free_bytes, &total) != cudaSuccess) {
+    if (device_mem_get_info(&sample.device_free_bytes, &total) != cudaSuccess) {
         sample.device_free_bytes = 0;
     }
     int device = 0;
@@ -211,7 +213,7 @@ std::size_t free_on(int device) noexcept {
         return 0;
     }
     std::size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+    if (device_mem_get_info(&free_bytes, &total_bytes) != cudaSuccess) {
         (void)cudaGetLastError();
         free_bytes = 0;
     }
@@ -279,7 +281,7 @@ std::size_t device_budget_free_bytes(int device) noexcept {
 }
 
 bool budgeted_mem_get_info(std::size_t& free_bytes, std::size_t& total_bytes) noexcept {
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+    if (device_mem_get_info(&free_bytes, &total_bytes) != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
     }

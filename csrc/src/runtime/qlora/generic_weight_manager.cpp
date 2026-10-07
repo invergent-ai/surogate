@@ -17,6 +17,7 @@
 
 #include "kernels/kernels.h"
 #include "utilities/utils.h"
+#include "serve/core/unified_memory.h"
 
 namespace qlora {
 
@@ -810,7 +811,7 @@ void GenericWeightManager::consume_self_arena(cudaStream_t stream) {
     }
 
     std::size_t free_bytes = 0, total_bytes = 0;
-    cudaMemGetInfo(&free_bytes, &total_bytes);
+    sinfer::device_mem_get_info(&free_bytes, &total_bytes);
     constexpr std::size_t kSafetyMargin = 1ULL << 30;  // 1 GiB headroom
     if (bytes + kSafetyMargin > free_bytes) {
         if (dbg_arena) {
