@@ -66,29 +66,35 @@ struct GqaPrefillBatchMetadata {
         return width;
     }
 
+    // No row tensor selects row 0, as the split-KV tiles' metadata reads it.
     __device__ __forceinline__ const std::int32_t* block_table() const {
-        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+        const std::int32_t row = table_rows == nullptr ? 0 : table_rows[0];
+        return tables + static_cast<std::int64_t>(row) * table_stride;
     }
 };
 
+// `q_heads` is the query head count of the tensors: the geometry's own, or, for the BF16 kernel,
+// a query group the registry does not carry over the geometry's KV heads.
 template <typename Geometry>
-__device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
+__device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token,
+                                                            int q_heads = Geometry::QHeads) {
     return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(Geometry::HeadDim) *
                                               (static_cast<std::int64_t>(q_head) +
-                                               static_cast<std::int64_t>(Geometry::QHeads) * token);
+                                               static_cast<std::int64_t>(q_heads) * token);
 }
 
 template <typename Geometry>
 __device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out, int q_head,
                                                              int row_begin, int row_end, int tid,
-                                                             int threads) {
+                                                             int threads,
+                                                             int q_heads = Geometry::QHeads) {
     if (row_begin >= row_end) { return; }
     constexpr int D    = Geometry::HeadDim;
     const int elements = (row_end - row_begin) * D;
     for (int element = tid; element < elements; element += threads) {
         const int row = row_begin + element / D;
         const int d   = element - (row - row_begin) * D;
-        out[gqa_prefill_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
+        out[gqa_prefill_q_index<Geometry>(q_head, d, row, q_heads)] = __float2bfloat16(0.0f);
     }
 }
 

@@ -2240,8 +2240,9 @@ int verify_workspace_capacity_contract() {
 // for prompts (e4m3 queries and probabilities, kAttentionFp8QueryCriterion) and the split-KV
 // kernels for rows, whose sums FA3's FP8 accumulator would lose over a long history (see
 // test_gqa_long_context.cpp); --batch-invariant keeps the split-KV tiles,
-// which read the same codes with BF16 queries and keep the BF16 bound. Elsewhere both runs take
-// the tiles. Keys and queries span [-2, 2], so scores reach the peaked softmax a QK-normed model
+// which read the same codes with BF16 queries and keep the BF16 bound. Elsewhere the default run
+// takes the tensor-core prompt kernel from 64 columns (BF16 queries over the widened codes), and
+// the tiles below that. Keys and queries span [-2, 2], so scores reach the peaked softmax a QK-normed model
 // sees, over scattered pages and histories that cross FA3's 128-key tiles.
 int verify_fp8_wide_prompts() {
     struct Case {
@@ -2259,7 +2260,7 @@ int verify_fp8_wide_prompts() {
         {Geometry{"tinyllama-1.1b", 32, 4, 64}, 200, 130, 815u},
         {Geometry{"gemma3-4b", 8, 4}, 1000, 200, 816u, 512},
         {Geometry{"qwen3-30b-a3b", 32, 4, 128}, 200, 300, 817u, 128},
-        // No tuned kernels for this query group: FA3 on an H100, the generic kernel otherwise.
+        // No tuned kernels for this query group: FA3 on an H100, the prompt kernel otherwise.
         {Geometry{"qwen3-8b", 32, 8, 128}, 1000, 200, 818u},
         // Decode and verify rows: the generic split-KV route, its history split across CTAs.
         {Geometry{"qwen3-8b", 32, 8, 128}, 2000, 1, 819u},
@@ -2362,10 +2363,11 @@ int verify_fp8_wide_prompts() {
             cuda_synchronize();
             ops::set_batch_invariant(false);
             const bool flash = !invariant && major == 9 && c.tokens >= 32;
+            const bool kernel = !invariant && major != 9 && c.tokens >= 64;
             const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
                                       " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +
                                       " window=" + std::to_string(c.window) +
-                                      (flash ? " flash-attention-3" : " tiles");
+                                      (flash ? " flash-attention-3" : kernel ? " prompt kernel" : " tiles");
             failures += verify_attention(label, bf16_bits_to_double(from_device<std::uint16_t>(out.data, out.numel())),
                                          reference, flash ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
         }
@@ -2409,7 +2411,8 @@ int main() {
         }
     }
     // Wide prompts of shapes with no tuned kernels: FlashAttention-3 on an H100 (it serves any
-    // query group), the generic kernel elsewhere. Qwen3-8B is 32 query heads over 8 at 128.
+    // query group), elsewhere the KV geometry's tensor-core prompt kernel from 64 columns, its
+    // grid sized by the query heads. Qwen3-8B is 32 query heads over 8 at 128.
     for (const Geometry geometry : {Geometry{"qwen3_8b", 32, 8, 128},
                                     Geometry{"fallback_16q8_d64", 16, 8, 64},
                                     Geometry{"fallback_12q4_d256", 12, 4, 256}}) {
