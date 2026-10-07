@@ -66,16 +66,25 @@ bool run_tile(const TileChoice& tile, const Operands& o, bool residual) {
     return false;
 }
 
-// SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 turns the DeepGEMM route off; =N starts it at N tokens.
-// Rounds to 16 tokens take the tensor-core kernel or the GEMV before they reach this GEMM.
-int deepgemm_min_tokens() {
-    static const int tokens = [] {
+// SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 turns the DeepGEMM route off; =N starts it at N tokens, and
+// =N-M keeps it to N..M tokens. Rounds to 16 tokens take the tensor-core kernel or the GEMV before
+// they reach this GEMM.
+struct TokenRange {
+    int lo, hi;
+};
+
+TokenRange deepgemm_tokens() {
+    static const TokenRange range = [] {
+        constexpr int kMax = std::numeric_limits<int>::max();
         const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM");
-        if (raw == nullptr || *raw == '\0') { return 33; }
-        const int value = std::atoi(raw);
-        return value <= 0 ? std::numeric_limits<int>::max() : value;
+        if (raw == nullptr || *raw == '\0') { return TokenRange{33, kMax}; }
+        char* end = nullptr;
+        const long lo = std::strtol(raw, &end, 10);
+        if (lo <= 0) { return TokenRange{kMax, kMax}; }
+        const long hi = *end == '-' ? std::strtol(end + 1, nullptr, 10) : kMax;
+        return TokenRange{static_cast<int>(lo), hi >= lo ? static_cast<int>(std::min<long>(hi, kMax)) : kMax};
     }();
-    return tokens;
+    return range;
 }
 
 } // namespace
@@ -101,9 +110,9 @@ bool sm90_gemm(const std::uint8_t* act_codes, const float* act_scales, const std
         !aligned(w_scales) || !aligned(out_bf16)) {
         return false;
     }
-    // DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) from deepgemm_min_tokens() tokens up, where it
-    // beats these tiles; SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 keeps every round on them.
-    if (tokens >= sm90::deepgemm_min_tokens() &&
+    // DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) over deepgemm_tokens(), where it beats these
+    // tiles; SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 keeps every round on them.
+    if (const sm90::TokenRange dg = sm90::deepgemm_tokens(); tokens >= dg.lo && tokens <= dg.hi &&
         sm90::deepgemm({act_codes, act_scales, w_codes, w_scales, out_bf16, residual, tokens, n, k, stream})) {
         return true;
     }

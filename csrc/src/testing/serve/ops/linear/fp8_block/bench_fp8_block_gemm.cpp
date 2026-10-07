@@ -1,6 +1,7 @@
 // Hopper block-FP8 GEMM micro-benchmark: DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) against the
 // CUTLASS tiles (sm90_gemm with SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0), per shape, token count and
-// residual mode. Weights rotate through enough copies to stay out of L2, as in a decode round.
+// residual mode, timed from a CUDA graph of 200 launches (and eagerly). Weights rotate through
+// enough copies to stay out of L2, as in a decode round.
 //
 //   sinfer_fp8_block_gemm_bench [n k tokens ...]   (default: Qwen3-8B's four linears)
 
@@ -91,30 +92,42 @@ void run(const Problem& p, std::mt19937& rng) {
             const double x = __bfloat162float(got_dg[i]), y = __bfloat162float(got_ct[i]);
             max_diff = std::max(max_diff, std::abs(x - y)), max_ref = std::max(max_ref, std::abs(y));
         }
-        double us_route[2] = {0, 0};
+        const auto launch = [&](int route, int c) {
+            route == 0 ? (void)fb::sm90::deepgemm({a, as, w[c], ws[c], out_dg, residual, p.tokens, p.n, p.k, stream})
+                       : (void)fb::sm90_gemm(a, as, w[c], ws[c], out_ct, residual, p.tokens, p.n, p.k, stream);
+        };
+        const int iters = 200;
+        double eager[2] = {0, 0}, graph[2] = {0, 0};
         for (int route = 0; route < 2; ++route) {
-            const int iters = 200;
-            for (int i = 0; i < 20; ++i) {
-                const int c = i % copies;
-                route == 0 ? (void)fb::sm90::deepgemm({a, as, w[c], ws[c], out_dg, residual, p.tokens, p.n, p.k, stream})
-                           : (void)fb::sm90_gemm(a, as, w[c], ws[c], out_ct, residual, p.tokens, p.n, p.k, stream);
-            }
+            for (int i = 0; i < 20; ++i) { launch(route, i % copies); }
+            float ms = 0;
             CHECK(cudaEventRecord(start, stream));
-            for (int i = 0; i < iters; ++i) {
-                const int c = i % copies;
-                route == 0 ? (void)fb::sm90::deepgemm({a, as, w[c], ws[c], out_dg, residual, p.tokens, p.n, p.k, stream})
-                           : (void)fb::sm90_gemm(a, as, w[c], ws[c], out_ct, residual, p.tokens, p.n, p.k, stream);
-            }
+            for (int i = 0; i < iters; ++i) { launch(route, i % copies); }
             CHECK(cudaEventRecord(stop, stream));
             CHECK(cudaEventSynchronize(stop));
-            float ms = 0;
             CHECK(cudaEventElapsedTime(&ms, start, stop));
-            us_route[route] = ms * 1000.0 / iters;
+            eager[route] = ms * 1000.0 / iters;
+            // The engine replays decode rounds from CUDA graphs: the same launches, captured.
+            cudaGraph_t g;
+            cudaGraphExec_t exec;
+            CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+            for (int i = 0; i < iters; ++i) { launch(route, i % copies); }
+            CHECK(cudaStreamEndCapture(stream, &g));
+            CHECK(cudaGraphInstantiate(&exec, g, 0));
+            CHECK(cudaGraphLaunch(exec, stream));
+            CHECK(cudaEventRecord(start, stream));
+            CHECK(cudaGraphLaunch(exec, stream));
+            CHECK(cudaEventRecord(stop, stream));
+            CHECK(cudaEventSynchronize(stop));
+            CHECK(cudaEventElapsedTime(&ms, start, stop));
+            graph[route] = ms * 1000.0 / iters;
+            CHECK(cudaGraphExecDestroy(exec));
+            CHECK(cudaGraphDestroy(g));
         }
         std::printf("n=%6d k=%6d tokens=%5d residual=%d  deepgemm %7.1f us  cutlass %7.1f us  ratio %.2f  "
-                    "(ok %d/%d, max diff %.3g of %.3g)\n",
-                    p.n, p.k, p.tokens, residual, us_route[0], us_route[1], us_route[0] / us_route[1], dg_ok, ct_ok,
-                    max_diff, max_ref);
+                    "(graphs; eager %.1f / %.1f; ok %d/%d, max diff %.3g of %.3g)\n",
+                    p.n, p.k, p.tokens, residual, graph[0], graph[1], graph[0] / graph[1], eager[0], eager[1],
+                    dg_ok, ct_ok, max_diff, max_ref);
     }
     for (int c = 0; c < copies; ++c) {
         CHECK(cudaFree(const_cast<std::uint8_t*>(w[c])));

@@ -15,18 +15,23 @@ namespace sinfer::ops::detail::fp8_block::sm90 {
 namespace {
 
 struct Tile {
-    int bm, bn, cm, cn;
+    int bm, bn, cm, cn; // as the cost model scores it
     dg::LaunchFn launch;
+    int cluster; // CTAs per cluster at launch: cm * cn, or a stand-in's twin's 2
 };
 
 // DeepGEMM enumerates cluster m, then cluster n, then block m (64, 128, 256), then block n, and
-// keeps the first of equally cheap candidates; the table is sorted the same way.
-const std::array<Tile, dg::kNumTiles>& tiles() {
-    static const std::array<Tile, dg::kNumTiles> sorted = [] {
-        std::array<Tile, dg::kNumTiles> t{{
-#define SINFER_DG_ENTRY(BM, BN, CM, CN) Tile{BM, BN, CM, CN, &dg::SINFER_DG_NAME(BM, BN, CM, CN)},
+// keeps the first of equally cheap candidates; the table is sorted the same way. A stand-in is
+// scored as the single-CTA tile it replaces and launched as its 2-CTA twin.
+const std::array<Tile, dg::kNumTiles + dg::kNumStandIns>& tiles() {
+    static const std::array<Tile, dg::kNumTiles + dg::kNumStandIns> sorted = [] {
+        std::array<Tile, dg::kNumTiles + dg::kNumStandIns> t{{
+#define SINFER_DG_ENTRY(BM, BN, CM, CN) Tile{BM, BN, CM, CN, &dg::SINFER_DG_NAME(BM, BN, CM, CN), CM * CN},
             SINFER_DG_TILES(SINFER_DG_ENTRY)
 #undef SINFER_DG_ENTRY
+#define SINFER_DG_STAND_IN(BM, BN, CM, CN) Tile{BM, BN, 1, 1, &dg::SINFER_DG_NAME(BM, BN, CM, CN), CM * CN},
+            SINFER_DG_STAND_INS(SINFER_DG_STAND_IN)
+#undef SINFER_DG_STAND_IN
         }};
         std::stable_sort(t.begin(), t.end(), [](const Tile& a, const Tile& b) {
             if (a.cm != b.cm) { return a.cm < b.cm; }
@@ -106,7 +111,7 @@ bool deepgemm(const DeepGemmOperands& o) {
     const Tile* best = nullptr;
     std::int64_t best_cycles = 0;
     for (const Tile& t : tiles()) {
-        if (sms % (t.cm * t.cn) != 0) { continue; }
+        if (sms % t.cluster != 0) { continue; }
         const std::int64_t c = cycles(t, o.tokens, o.n, o.k, sms, o.residual);
         if (best == nullptr || c < best_cycles) { best = &t, best_cycles = c; }
     }
@@ -133,7 +138,7 @@ bool deepgemm(const DeepGemmOperands& o) {
     l.m        = static_cast<std::uint32_t>(o.tokens);
     l.n        = static_cast<std::uint32_t>(o.n);
     l.k        = static_cast<std::uint32_t>(o.k);
-    l.sms      = sms / (best->cm * best->cn) * (best->cm * best->cn);
+    l.sms      = sms / best->cluster * best->cluster;
     l.smem     = dg::smem_bytes(best->bm, best->bn, o.k / dg::kBlockK);
     l.stream   = o.stream;
     if (best->launch(l) != cudaSuccess) {
