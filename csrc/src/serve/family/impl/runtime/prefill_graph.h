@@ -287,6 +287,15 @@ public:
                              mib(lazy_budget_bytes_));
             }
             return &emplaced.first->second.executable;
+        } catch (const std::logic_error& error) {
+            // An op that refuses to run under a capture (an untuned width, a lazy allocation)
+            // is the engine's fault, not the device's: no flag or smaller budget fixes it.
+            std::fprintf(stderr,
+                         "prefill-graph: capture of the %s graph for chunk %d batch %d band %d "
+                         "failed: %s\nThis is an engine fault, not a memory shortfall.\n",
+                         key.mixed ? "mixed" : "prefill", key.chunk, key.batch, key.band, error.what());
+            std::fflush(stderr);
+            std::_Exit(EXIT_FAILURE);
         } catch (const std::exception& error) {
             // Do not degrade to the eager body. A capture that runs out of
             // memory leaves the device with no margin, and the other lazy

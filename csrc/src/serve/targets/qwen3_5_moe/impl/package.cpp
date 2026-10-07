@@ -134,19 +134,18 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     // The routed-NVFP4 experts run on the vendored TRT-LLM runner, whose grouped GEMMs pick a
     // tactic per round width by measurement. That measurement launches and synchronises, so it
     // has to happen before the program captures its decode graphs; every layer shares the
-    // geometry and the tactic, so tuning against one layer's weights tunes them all.
-    if (model.impl_->weights_profile == WeightsProfile::RoutedNvfp4) {
-        const auto prepare = [&](const auto& layers) {
-            for (const auto& layer : layers) {
-                if (layer.post_mixer.op.routed_gate_up.qtype == QType::NVFP4) {
-                    ops::sparse_moe_prepare(layer.post_mixer.op, ops::kSparseMoeTrtllmPrepareWidth, device.stream);
-                    return;
-                }
+    // geometry and the tactic, so tuning against one layer's weights tunes them all. Asked of the
+    // bound experts, not the profile: a compressed-tensors export's routed experts are NVFP4 too.
+    const auto prepare = [&](const auto& layers) {
+        for (const auto& layer : layers) {
+            if (layer.post_mixer.op.routed_gate_up.qtype == QType::NVFP4) {
+                ops::sparse_moe_prepare(layer.post_mixer.op, ops::kSparseMoeTrtllmPrepareWidth, device.stream);
+                return;
             }
-        };
-        prepare(model.impl_->data.runtime.gdn_layers);
-        prepare(model.impl_->data.runtime.full_layers);
-    }
+        }
+    };
+    prepare(model.impl_->data.runtime.gdn_layers);
+    prepare(model.impl_->data.runtime.full_layers);
     family::prepare_banked_experts(model.impl_->data.runtime);
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
