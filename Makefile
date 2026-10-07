@@ -61,8 +61,13 @@ PYTEST ?= .venv/bin/python -m pytest
 
 # One engine binary for Ada (4090, L4), Hopper (H100, H200) and Blackwell (5090, PRO 6000). The
 # kernels that only one architecture can run carry only its cubin -- csrc/CMakeLists.txt pins
-# those targets -- so each architecture costs what it actually uses.
+# those targets -- so each architecture costs what it actually uses. On aarch64 the one
+# Blackwell card is GB10 (DGX Spark), sm_121, whose `121a` cubins no other card loads.
+ifeq ($(shell uname -m),aarch64)
+SERVE_CUDA_ARCHS ?= 121a
+else
 SERVE_CUDA_ARCHS ?= 89;90a;120a
+endif
 
 serve-configure:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
