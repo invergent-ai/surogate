@@ -110,10 +110,11 @@ bool sm90_gemm(const std::uint8_t* act_codes, const float* act_scales, const std
         !aligned(w_scales) || !aligned(out_bf16)) {
         return false;
     }
-    // DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) over deepgemm_tokens(), where it beats these
-    // tiles; SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 keeps every round on them.
+    // DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) over deepgemm_tokens(), save the tiles of its
+    // that ran slower than these (where_faster); SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 keeps every
+    // round on these.
     if (const sm90::TokenRange dg = sm90::deepgemm_tokens(); tokens >= dg.lo && tokens <= dg.hi &&
-        sm90::deepgemm({act_codes, act_scales, w_codes, w_scales, out_bf16, residual, tokens, n, k, stream})) {
+        sm90::deepgemm({act_codes, act_scales, w_codes, w_scales, out_bf16, residual, tokens, n, k, stream, true})) {
         return true;
     }
     // SUROGATE_SERVE_FP8_BLOCK_SM90_TILES=0 keeps vLLM's two tiles, for A/B runs.

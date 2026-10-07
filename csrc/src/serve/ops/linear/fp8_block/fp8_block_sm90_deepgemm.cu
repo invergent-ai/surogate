@@ -115,7 +115,10 @@ bool deepgemm(const DeepGemmOperands& o) {
         const std::int64_t c = cycles(t, o.tokens, o.n, o.k, sms, o.residual);
         if (best == nullptr || c < best_cycles) { best = &t, best_cycles = c; }
     }
-    if (best == nullptr) { return false; }
+    if (best == nullptr ||
+        (o.where_faster && ((best->bm == 64 && o.tokens > 64) || (best->bm == 256 && o.residual)))) {
+        return false;
+    }
 
     const auto m          = static_cast<std::uint64_t>(o.tokens);
     const auto n          = static_cast<std::uint64_t>(o.n);

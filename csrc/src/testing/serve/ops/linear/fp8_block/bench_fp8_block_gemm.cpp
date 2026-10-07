@@ -149,7 +149,9 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::vector<Problem> problems;
-    for (int i = 1; i + 2 < argc; i += 3) { problems.push_back({std::atoi(argv[i]), std::atoi(argv[i + 1]), std::atoi(argv[i + 2])}); }
+    for (int i = 1; i + 2 < argc; i += 3) {
+        problems.push_back({std::atoi(argv[i]), std::atoi(argv[i + 1]), std::atoi(argv[i + 2])});
+    }
     if (problems.empty()) {
         const std::pair<int, int> shapes[] = {{6144, 4096}, {4096, 4096}, {24576, 4096}, {4096, 12288}};
         for (const int tokens : {64, 192, 576}) {
