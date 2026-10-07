@@ -196,6 +196,55 @@ def test_a_module_the_config_quantizes_but_the_file_did_not_pack_is_refused() ->
         resolved.check_against_checkpoint()
 
 
+def mixed_config() -> QuantizationConfig:
+    """NVFP4 MLPs beside FP8 per-channel attention, as llm-compressor writes a mixed export."""
+
+    config = nvfp4_config(ignore=["lm_head"]).model_dump()
+    config["format"] = "mixed-precision"
+    config["config_groups"]["group_0"]["targets"] = [r"re:.*mlp\.(gate|up|down)_proj$"]
+    config["config_groups"]["group_1"] = {
+        "targets": [r"re:.*self_attn\.(q|k|v|o)_proj$"],
+        "format": "float-quantized",
+        "weights": {"num_bits": 8, "type": "float", "strategy": "channel", "symmetric": True, "dynamic": False},
+    }
+    return QuantizationConfig.model_validate(config)
+
+
+def fp8_checkpoint_for(skeleton: nn.Module) -> dict[str, tuple[int, ...]]:
+    mlp = {n for n in linear_names(skeleton) if ".mlp." in n}
+    shapes = checkpoint_for(skeleton, mlp)
+    for name in linear_names(skeleton):
+        if ".self_attn." in name:
+            shapes[f"{name}.weight_scale"] = (shapes[f"{name}.weight"][0], 1)
+    return shapes
+
+
+def test_an_eight_bit_scheme_stores_codes_in_weight_beside_a_scale() -> None:
+    skeleton = tiny_llama()
+    resolved = qs.resolve_schemes(mixed_config(), qs.checkpoint_modules(fp8_checkpoint_for(skeleton)), skeleton)
+    resolved.check_against_checkpoint()
+
+    q_proj = resolved.modules["model.layers.0.self_attn.q_proj"]
+    assert q_proj.group == "group_1" and not qs.packs_weights(q_proj.scheme)
+    assert qs.packs_weights(resolved.modules["model.layers.0.mlp.up_proj"].scheme)
+
+
+def test_an_eight_bit_module_without_a_scale_or_packed_is_refused() -> None:
+    skeleton = tiny_llama()
+    shapes = fp8_checkpoint_for(skeleton)
+    del shapes["model.layers.1.self_attn.o_proj.weight_scale"]
+    resolved = qs.resolve_schemes(mixed_config(), qs.checkpoint_modules(shapes), skeleton)
+    with pytest.raises(ValueError, match="have no weight_scale"):
+        resolved.check_against_checkpoint()
+
+    shapes = fp8_checkpoint_for(skeleton)
+    del shapes["model.layers.1.self_attn.o_proj.weight"]
+    shapes["model.layers.1.self_attn.o_proj.weight_packed"] = (64, 32)
+    resolved = qs.resolve_schemes(mixed_config(), qs.checkpoint_modules(shapes), skeleton)
+    with pytest.raises(ValueError, match="match no config group that packs"):
+        resolved.check_against_checkpoint()
+
+
 def test_a_non_compressed_tensors_config_is_not_ours() -> None:
     assert qs.quantization_config_of({"quantization_config": {"quant_method": "modelopt"}}) is None
     assert qs.quantization_config_of({}) is None

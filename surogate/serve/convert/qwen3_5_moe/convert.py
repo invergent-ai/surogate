@@ -524,7 +524,10 @@ def convert(
                         continue
                     tensor = materialize_tensor(
                         spec,
-                        reader,
+                        (preflight.compressed_source.dequantizing_reader(reader)
+                         if preflight.compressed_plan is not None
+                         and spec.name in preflight.compressed_plan.dequantized
+                         else reader),
                         preflight.draft,
                         base_recipes,
                     )
