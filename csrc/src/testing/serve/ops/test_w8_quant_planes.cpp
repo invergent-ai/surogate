@@ -4,6 +4,7 @@
 // registry's derive-once semantics. Host references mirror the device
 // encoders exactly; requires an sm_120-class GPU (SKIP 77 otherwise).
 
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -110,7 +111,7 @@ int main() {
         std::fprintf(stderr, "SKIP: no CUDA device\n");
         return 77;
     }
-    if (sinfer::ops::detail::w8_device_compute_capability() < 120) {
+    if (!sinfer::fp4_tensor_cores(sinfer::ops::detail::w8_device_compute_capability())) {
         std::fprintf(stderr, "SKIP: quant-plane test needs an sm_120-class GPU\n");
         return 77;
     }

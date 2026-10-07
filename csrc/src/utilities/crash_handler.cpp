@@ -195,6 +195,26 @@ static void safe_write_ptr(const void* ptr) {
     safe_write(buf);
 }
 
+// The interrupted program counter, stack pointer and frame pointer from a signal context. On
+// both architectures the frame pointer addresses a {previous frame pointer, return address}
+// record, so one frame-chain walk serves either; user space ends at 2^47 on x86-64 and at
+// 2^48 on aarch64 (48-bit VA), which bounds the addresses that walk accepts.
+#if defined(__x86_64__)
+constexpr const char* kRegisterNames[3] = {"RIP", "RSP", "RBP"};
+constexpr uintptr_t kUserSpaceEnd = 0x7fffffffffff;
+static void* context_pc(const mcontext_t* mc) { return (void*)mc->gregs[REG_RIP]; }
+static void* context_sp(const mcontext_t* mc) { return (void*)mc->gregs[REG_RSP]; }
+static void* context_fp(const mcontext_t* mc) { return (void*)mc->gregs[REG_RBP]; }
+#elif defined(__aarch64__)
+constexpr const char* kRegisterNames[3] = {"PC", "SP", "FP"};
+constexpr uintptr_t kUserSpaceEnd = 0xffffffffffff;
+static void* context_pc(const mcontext_t* mc) { return (void*)mc->pc; }
+static void* context_sp(const mcontext_t* mc) { return (void*)mc->sp; }
+static void* context_fp(const mcontext_t* mc) { return (void*)mc->regs[29]; }
+#else
+#error "crash_handler: no register map for this architecture"
+#endif
+
 // The actual signal handler (using sigaction with SA_SIGINFO for context)
 void crash_signal_handler(int sig, siginfo_t* info, void* context) {
     // Prevent recursive crashes in the signal handler
@@ -237,16 +257,22 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
         ucontext_t* uc = static_cast<ucontext_t*>(context);
         mcontext_t* mc = &uc->uc_mcontext;
 
-        safe_write("\nCPU Registers: RIP=");
-        safe_write_ptr((void*)mc->gregs[REG_RIP]);
-        safe_write(" RSP=");
-        safe_write_ptr((void*)mc->gregs[REG_RSP]);
-        safe_write(" RBP=");
-        safe_write_ptr((void*)mc->gregs[REG_RBP]);
+        safe_write("\nCPU Registers: ");
+        safe_write(kRegisterNames[0]);
+        safe_write("=");
+        safe_write_ptr(context_pc(mc));
+        safe_write(" ");
+        safe_write(kRegisterNames[1]);
+        safe_write("=");
+        safe_write_ptr(context_sp(mc));
+        safe_write(" ");
+        safe_write(kRegisterNames[2]);
+        safe_write("=");
+        safe_write_ptr(context_fp(mc));
         safe_write("\n");
 
         // Resolve crash location
-        void* rip = (void*)mc->gregs[REG_RIP];
+        void* rip = context_pc(mc);
         Dl_info dl_info;
         memset(&dl_info, 0, sizeof(dl_info));
 
@@ -287,13 +313,13 @@ void crash_signal_handler(int sig, siginfo_t* info, void* context) {
         mcontext_t* mc = &uc->uc_mcontext;
 
         // Start with crash location (RIP)
-        buffer[num_frames++] = (void*)mc->gregs[REG_RIP];
+        buffer[num_frames++] = context_pc(mc);
 
         // Walk the frame pointer chain
-        void** rbp = (void**)mc->gregs[REG_RBP];
+        void** rbp = (void**)context_fp(mc);
         while (num_frames < MAX_FRAMES && rbp != nullptr) {
             // Validate pointer is in a reasonable range
-            if ((uintptr_t)rbp < 0x1000 || (uintptr_t)rbp > 0x7fffffffffff) break;
+            if ((uintptr_t)rbp < 0x1000 || (uintptr_t)rbp > kUserSpaceEnd) break;
 
             // Return address is at rbp[1]
             void* ret_addr = rbp[1];

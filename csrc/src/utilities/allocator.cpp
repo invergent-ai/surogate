@@ -13,6 +13,7 @@
 #include <fmt/core.h>
 
 #include "utilities/gpu_info.h"
+#include "serve/core/unified_memory.h"
 
 TensorAllocator::TensorAllocator(TensorAllocator&&) noexcept = default;
 TensorAllocator& TensorAllocator::operator=(TensorAllocator&&) noexcept = default;
@@ -648,7 +649,7 @@ std::vector<std::pair<std::string, sSegmentMemory>> TensorAllocator::get_allocat
     std::size_t free = 0;
     std::size_t total = 0;
     long reserved = get_mem_reserved();
-    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    CUDA_CHECK(sinfer::device_mem_get_info(&free, &total));
     segments.emplace_back("Free", sSegmentMemory{(long)free, 0, 0, 0});
     if (reserved > 0) {
         segments.emplace_back("Reserved", sSegmentMemory{reserved, 0, 0, 0});

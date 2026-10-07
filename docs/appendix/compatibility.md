@@ -25,7 +25,8 @@ If CUDA cannot be detected, installation fails.
 
 ## OS / platform
 
-Wheels are built for Linux x86_64.
+Wheels are built for Linux x86_64, and for Linux aarch64 on the DGX Spark (GB10, SM121). The
+aarch64 wheel carries GB10 code only; other Arm hosts with discrete GPUs need a source build.
 
 ---
 

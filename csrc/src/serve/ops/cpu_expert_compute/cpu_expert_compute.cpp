@@ -713,6 +713,22 @@ void dot_two_rows_avx512(const std::int8_t*, const std::uint16_t*, const std::in
 void dot_two_rows_two_tokens_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*,
                                     const std::uint16_t*, const std::int8_t*, const float*, const std::int8_t*,
                                     const float*, int, float&, float&, float&, float&) {}
+// The Q4/Q5 dots' callers reach these only under kUseVnni, which is false off x86 (an aarch64
+// host such as the DGX Spark takes the scalar dots).
+void dot_two_rows_two_tokens_q4_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                     const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_q4_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*, const std::uint8_t*,
+                          const std::uint16_t*, const std::uint16_t*, const std::int8_t*, const float*,
+                          const std::int32_t*, int, float&, float&) {}
+void dot_two_rows_two_tokens_q5_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::uint8_t*, const std::uint16_t*, const std::uint16_t*,
+                                     const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                     const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+void dot_two_rows_q5_vnni(const std::uint8_t*, const std::uint16_t*, const std::uint16_t*, const std::uint8_t*,
+                          const std::uint16_t*, const std::uint16_t*, const std::int8_t*, const float*,
+                          const std::int32_t*, int, float&, float&) {}
 #endif
 
 const bool kUseAvx512 = kAvx512Compiled && detect_avx512();

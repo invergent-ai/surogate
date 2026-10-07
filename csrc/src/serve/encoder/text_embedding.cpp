@@ -18,6 +18,7 @@
 #include "encoder/embedding_tokenizer.h"
 #include "artifact/typed_binding.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
+#include "core/unified_memory.h"
 
 #include <cuda_runtime.h>
 
@@ -248,7 +249,7 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         impl.arena.reset(); impl.positions.reset(); impl.attention_workspace.reset();
         impl.arena_tokens = 0; impl.attention_workspace_bytes = 0;
         std::size_t free = 0, bytes = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free, &bytes));
+        CUDA_CHECK(device_mem_get_info(&free, &bytes));
         if (arena_bytes + scratch_bytes + static_cast<std::size_t>(capacity) * 8 + (64u << 20) > free) {
             throw std::runtime_error("embedding request does not fit GPU memory; shorten the input or use --device cpu");
         }

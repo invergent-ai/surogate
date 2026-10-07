@@ -77,7 +77,12 @@ dependencies = [
     # Not on the ordinary GRPO import path, unlike the rest of this block: it
     # is reached through the weight-sharing/convert code, and transformers is
     # what supplies it today. Declared for the same reason, not the same route.
-    "safetensors"  # serve/convert/common/safetensors.py
+    "safetensors",  # serve/convert/common/safetensors.py
+    # Same class again: core/model/quant_schemes.py imports it at module scope, and the serve
+    # converters import that module at theirs (convert/common/fp8_block_source.py, qwen3_5_moe),
+    # so converting a checkpoint died at ModuleNotFoundError on a fresh install (found on a DGX
+    # Spark, 2026-10-07).
+    "compressed-tensors",
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

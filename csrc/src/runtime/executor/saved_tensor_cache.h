@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include "utilities/comm.h"  // CUDA_CHECK
+#include "serve/core/unified_memory.h"
 
 namespace dsl {
 
@@ -85,7 +86,7 @@ public:
             if (err != cudaSuccess) {
                 (void)cudaGetLastError();
                 std::size_t free_b = 0, total_b = 0;
-                cudaMemGetInfo(&free_b, &total_b);
+                sinfer::device_mem_get_info(&free_b, &total_b);
                 throw std::runtime_error(std::string(op_name ? op_name : "compiled_op") + ": cudaMalloc(" +
                                          std::to_string(bytes) + ") for saved tensor '" + key +
                                          "' failed: " + cudaGetErrorString(err) +
@@ -279,7 +280,7 @@ public:
         for(const auto& [ptr,bytes]:mPool) { pool+=bytes;largest=std::max(largest,bytes);
             std::fprintf(stderr,"[cache-pool] device=%d layer=%d phase=%s bytes=%zu\n",device,layer,phase,bytes);
         }
-        std::size_t free=0,total=0;CUDA_CHECK(cudaMemGetInfo(&free,&total));
+        std::size_t free=0,total=0;CUDA_CHECK(sinfer::device_mem_get_info(&free,&total));
         std::fprintf(stderr,"[cache-inventory] device=%d layer=%d phase=%s active=%zu unscoped=%zu pooled=%zu pool_count=%zu largest=%zu free=%zu total=%zu\n",device,layer,phase,active,unscoped,pool,mPool.size(),largest,free,total);
     }
 

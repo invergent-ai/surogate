@@ -209,7 +209,7 @@ int main() {
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { return 77; }
     try {
         DeviceContext device(0);
-        if (detail::w8_device_compute_capability() < 120) { return 77; }
+        if (!fp4_tensor_cores(detail::w8_device_compute_capability())) { return 77; }
         test_owners(false);
         test_owners(true);
         test_pipeline_devices(std::min(count, 2));

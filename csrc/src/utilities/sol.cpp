@@ -14,6 +14,7 @@
 #include "utilities/dtype.h"
 #include "kernels/kernels.h"  // for benchmarking matmul
 #include "utils.h"
+#include "serve/core/unified_memory.h"
 
 struct sPerfSpecs {
     const char* Chip = nullptr;
@@ -656,7 +657,7 @@ double measure_real_peak() {
 
     // Check if we have enough free memory before allocating
     size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
+    sinfer::device_mem_get_info(&free_mem, &total_mem);
     if (free_mem < REQUIRED_MEMORY + 256 * 1024 * 1024) {  // Need 256MB headroom
         // Not enough memory for benchmark, skip and return 0 (will use spec sheet values)
         return 0.0;
@@ -753,7 +754,7 @@ double measure_real_peak_fp8() {
 
     // Check if we have enough free memory before allocating
     size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
+    sinfer::device_mem_get_info(&free_mem, &total_mem);
     if (free_mem < REQUIRED_MEMORY + 256 * 1024 * 1024) {  // Need 256MB headroom
         // Not enough memory for benchmark, skip and return 0 (will use spec sheet values)
         return 0.0;

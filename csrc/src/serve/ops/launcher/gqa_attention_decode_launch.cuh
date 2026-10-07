@@ -367,16 +367,17 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     // over and no more. The value stays constant per (envelope, batch), which
     // is what a captured decode graph requires.
     if (cache.dtype == DType::I8 && invocation.batch_size > 0) {
-        // Target CTA count for the split policy, in units of a 170-SM wave.
-        // Tunable so the wave count can be swept against a real load rather
-        // than argued about.
-        static const std::int32_t kTargetCtas = [] {
+        // Target CTA count for the split policy, in waves of this device's SMs
+        // (170 on the RTX 5090 it was tuned on, 48 on GB10). The wave count is
+        // tunable so it can be swept against a real load rather than argued about.
+        static const std::int32_t kWaves = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_ATTN_WAVES");
             const int waves = raw != nullptr ? std::atoi(raw) : 2;
-            return static_cast<std::int32_t>((waves > 0 ? waves : 2) * 170);
+            return static_cast<std::int32_t>(waves > 0 ? waves : 2);
         }();
+        const std::int32_t target_ctas     = kWaves * current_device_sm_count(170);
         const std::int32_t per_split       = Geometry::KVHeads * invocation.batch_size;
-        const std::int32_t wanted          = per_split > 0 ? div_up(kTargetCtas, per_split) : splits;
+        const std::int32_t wanted          = per_split > 0 ? div_up(target_ctas, per_split) : splits;
         const std::int32_t floored         = wanted < 1 ? 1 : wanted;
         const std::int32_t occupancy_split = splits < floored ? splits : floored;
         // A split stages its page ids in a fixed 64-entry shared array, so it may

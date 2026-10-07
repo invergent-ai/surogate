@@ -6,6 +6,7 @@
 #include "gpu_info.h"
 
 #include "utils.h"
+#include "serve/core/unified_memory.h"
 
 /**
  * @brief Fallback implementation of IGPUUtilTracker when no vendor/OS-specific
@@ -86,7 +87,7 @@ const GPUUtilInfo& GPUUtilTrackerFallback::update() {
     mInfo.pcie_tx = -1;
     mInfo.power = -1;
 
-    CUDA_CHECK(cudaMemGetInfo(&mInfo.mem_free, &mInfo.mem_total));
+    CUDA_CHECK(sinfer::device_mem_get_info(&mInfo.mem_free, &mInfo.mem_total));
     mInfo.mem_reserved = -1;
     int clockRateKHz;
     CUDA_CHECK(cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, mDeviceID));

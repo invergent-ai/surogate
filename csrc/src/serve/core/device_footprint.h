@@ -58,7 +58,8 @@ void set_device_memory_limit(int device, std::size_t bytes) noexcept;
 /// rather than to the card. The process's usage comes from NVML; where NVML cannot attribute
 /// it, from the device's free memory against its level when the limit was set, which also
 /// charges this process for other processes' growth since then (the safe direction) and does
-/// not count the CUDA context created before it.
+/// not count the CUDA context created before it. On a GPU that shares the host's memory (GB10),
+/// "free" is what the system can still give it, not the driver's figure (core/unified_memory.h).
 [[nodiscard]] std::size_t device_budget_free_bytes(int device) noexcept;
 
 /// cudaMemGetInfo for the current device as this process may use it: under a limit, `free` is

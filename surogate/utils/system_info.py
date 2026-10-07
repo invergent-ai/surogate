@@ -169,7 +169,7 @@ def print_system_diagnostics(system_info):
         try:
             cpu_freq = psutil.cpu_freq()
             if cpu_freq:
-                metric_names.append("CPU Freq)")
+                metric_names.append("CPU Freq")
                 metric_values.append(f"{cpu_freq.current:.0f}")
                 metric_units.append("MHz")
         except:

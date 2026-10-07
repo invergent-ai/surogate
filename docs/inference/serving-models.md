@@ -13,7 +13,8 @@ GPUs, and embeddings. See the [CLI reference](cli.md) for all options.
 
 ## NVFP4 model
 
-NVFP4 checkpoints use four-bit weights and require a supported Blackwell GPU. Surogate detects
+NVFP4 checkpoints use four-bit weights and require a supported Blackwell GPU (RTX 50 series,
+RTX PRO 6000 Blackwell, or the DGX Spark's GB10). Surogate detects
 the format automatically; no quantization flag is needed.
 
 ```bash

@@ -42,6 +42,7 @@
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/executor/graph_executor.h"
 #include "runtime/optimizers/normuon.h"
+#include "serve/core/unified_memory.h"
 
 namespace {
 bool env_enabled(const char* name) {
@@ -2135,7 +2136,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
     // DEBUG: GPU memory after model creation (before run state)
     if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {
         size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
+        sinfer::device_mem_get_info(&free_mem, &total_mem);
         std::cerr << "[DEBUG-MEM] After model creation: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
                   << " MiB, free=" << free_mem / (1024 * 1024) << " MiB, total=" << total_mem / (1024 * 1024) << " MiB"
                   << std::endl;
@@ -2146,7 +2147,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
     // DEBUG: GPU memory after run state allocation
     if (mOptions.DebugMemoryBreakdown && comm.rank() == 0) {
         size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
+        sinfer::device_mem_get_info(&free_mem, &total_mem);
         std::cerr << "[DEBUG-MEM] After run state alloc: GPU used=" << (total_mem - free_mem) / (1024 * 1024)
                   << " MiB, free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
@@ -3496,7 +3497,7 @@ void MultiGPUPyTrainer::set_decode_cache_budget(std::int64_t bytes) {
                 if (!model) throw std::runtime_error("Decode requires a DSL model");
                 if (!bytes) {
                     std::size_t available = 0, total = 0;
-                    CUDA_CHECK(cudaMemGetInfo(&available, &total));
+                    CUDA_CHECK(sinfer::device_mem_get_info(&available, &total));
                     bytes = std::max<std::size_t>(1, available / 4);
                 }
                 model->set_decode_cache_budget(bytes);
@@ -3518,7 +3519,7 @@ void MultiGPUPyTrainer::set_decode_memory_budget(std::int64_t bytes) {
                 if (!model) throw std::runtime_error("Decode requires a DSL model");
                 if (!bytes) {
                     std::size_t available = 0, total = 0;
-                    CUDA_CHECK(cudaMemGetInfo(&available, &total));
+                    CUDA_CHECK(sinfer::device_mem_get_info(&available, &total));
                     bytes = available / 5 * 4 + model->decode_batch_stats().at("decode_memory_reserved_bytes");
                 }
                 model->set_decode_memory_budget(bytes);

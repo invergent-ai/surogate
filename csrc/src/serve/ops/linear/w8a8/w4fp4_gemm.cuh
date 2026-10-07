@@ -18,6 +18,13 @@
 
 #include <cstdint>
 
+// The sm_12x block-scaled MMA targets: 120a (RTX 50, RTX PRO 6000), 121a (GB10: DGX Spark) and
+// the family targets 120f/121f. `__CUDA_ARCH_FEAT_SM120_ALL` alone names only the first.
+#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && __CUDA_ARCH_FAMILY_SPECIFIC__ >= 1200 && \
+    __CUDA_ARCH_FAMILY_SPECIFIC__ < 1300
+#define SINFER_SM12X_BLOCK_SCALED_MMA 1
+#endif
+
 namespace sinfer::ops::detail {
 
 // Stage-3 tiling (PATCHES.md #23): 256-element K-tiles (4 mma-K per staged
@@ -54,7 +61,7 @@ __device__ __forceinline__ void w4fp4_mma_16n8k64(float& d0, float& d1, float& d
                                                   unsigned a0, unsigned a1, unsigned a2,
                                                   unsigned a3, unsigned b0, unsigned b1,
                                                   unsigned sfa, unsigned sfb) {
-#if !defined(__CUDA_ARCH__) || defined(__CUDA_ARCH_FEAT_SM120_ALL)
+#if !defined(__CUDA_ARCH__) || defined(SINFER_SM12X_BLOCK_SCALED_MMA)
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1"
         ".f32.ue4m3 "
@@ -65,7 +72,7 @@ __device__ __forceinline__ void w4fp4_mma_16n8k64(float& d0, float& d1, float& d
           "h"(static_cast<unsigned short>(0)), "h"(static_cast<unsigned short>(0)), "r"(sfb),
           "h"(static_cast<unsigned short>(0)), "h"(static_cast<unsigned short>(0)));
 #else
-    // mxf4nvf4 block-scale mma is an sm_120a feature; runtime CC gating
+    // mxf4nvf4 block-scale mma is an sm_12x feature; runtime CC gating
     // keeps this unreachable elsewhere.
     (void)d0; (void)d1; (void)d2; (void)d3;
     (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1; (void)sfa; (void)sfb;
@@ -82,8 +89,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
     const float* __restrict__ row_scales, const std::uint8_t* __restrict__ x_codes,
     const std::uint8_t* __restrict__ x_sf, const float* __restrict__ x_scales, int rows, int k,
     int tokens, RowMap row_map, Epilogue epilogue) {
-#if defined(__CUDA_ARCH__) && !defined(__CUDA_ARCH_FEAT_SM120_ALL)
-    // sm_120a-only (block-scale mma + >48KB static smem tiles); runtime CC
+#if defined(__CUDA_ARCH__) && !defined(SINFER_SM12X_BLOCK_SCALED_MMA)
+    // sm_12x-only (block-scale mma + >48KB static smem tiles); runtime CC
     // gating keeps this unreachable on other architectures.
     (void)codes; (void)sf; (void)row_scales; (void)x_codes; (void)x_sf; (void)x_scales;
     (void)rows; (void)k; (void)tokens; (void)row_map; (void)epilogue;
@@ -247,6 +254,6 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
         }
     }
 }
-#endif  // __CUDA_ARCH_FEAT_SM120_ALL
+#endif  // SINFER_SM12X_BLOCK_SCALED_MMA
 
 } // namespace sinfer::ops::detail

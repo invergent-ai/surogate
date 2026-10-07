@@ -1,5 +1,7 @@
 #include "ops/sparse_moe/trtllm/trtllm_moe.h"
 
+#include "core/device.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -575,7 +577,7 @@ bool available() noexcept {
                 cudaSuccess) {
             return false;
         }
-        return major * 10 + minor >= 120;
+        return fp4_tensor_cores(major * 10 + minor);
     }();
     return supported;
 }
