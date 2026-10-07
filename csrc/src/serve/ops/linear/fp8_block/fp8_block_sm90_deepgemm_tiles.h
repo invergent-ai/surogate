@@ -27,7 +27,7 @@ namespace sinfer::ops::detail::fp8_block::sm90::dg {
 // run-time N, as here, they spill 80 to 520 bytes of registers in the K loop (DeepGEMM compiles N
 // and K in) and ran 1.2 to 3.2x slower than the CUTLASS tiles on an H100. The model still scores
 // them; a round that picks one runs on its 2-CTA twin, which doesn't spill (SINFER_DG_STAND_INS):
-// 0.66 to 0.98 of the CUTLASS tiles' time on those rounds. Four lists, four translation units.
+// 0.67 to 0.99 of the CUTLASS tiles' time on those rounds. Four lists, four translation units.
 // clang-format off
 #define SINFER_DG_TILES_0(X) X(64, 16, 1, 1) X(64, 32, 1, 1) X(64, 48, 1, 1) X(64, 64, 1, 1) \
                              X(64, 80, 1, 1) X(64, 96, 1, 1) X(64, 112, 1, 1) X(64, 128, 1, 1)

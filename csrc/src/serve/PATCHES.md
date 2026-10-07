@@ -4152,3 +4152,55 @@ greedy and tempered columns). The FP8 chain test adds 576 and 1,100 tokens (stag
 the cap). On one Nebius H100 the 44 sampling, speculative, argmax, batch-invariance, MTP, DFlash,
 linear, W8 and head tests pass; end to end, the CLI and eight concurrent server requests pass for
 Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.
+
+## 109
+
+**DeepGEMM's Hopper FP8 GEMM for 33-token and wider rounds (2026-10-07, after #108).** vLLM runs
+fine-grained (128 x 128 block) FP8 linears on H100/H200 through DeepGEMM; in-engine profiles at 64
+users put our CUTLASS tiles (#105, #107) at about 1.26x its time per token. Everything below is
+engine-wide: it applies to every block-FP8 linear on sm_90, whatever the model.
+
+- **The kernel** (`src/third_party/deep_gemm`, MIT; its `NOTICE` lists the local changes). DeepGEMM
+  2.8.1's sm90 1D2D kernel: wgmma with the per-128 activation and weight scales applied per K
+  block in registers, TMA loads and stores, persistent warp-specialised CTAs, optional 2-CTA TMA
+  multicast. DeepGEMM JIT-compiles a kernel per shape; here 30 tiles are compiled ahead of time
+  (`ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles*.cu`) and DeepGEMM's own cost model picks
+  one per call (`fp8_block_sm90_deepgemm.cu`). The residual add of `linear_add` seeds the FP32
+  accumulators from the output, so outputs without a residual are the CUTLASS tiles' bits and with
+  one are within one BF16 ulp (summed before rounding instead of after).
+- **Five tiles run as their 2-CTA twins** (`fp8_block_sm90_deepgemm_tiles.h`,
+  `SINFER_DG_STAND_INS`). With N as a run-time value (DeepGEMM compiles N and K in), the
+  single-CTA 128 x 144, 128 x 160, 128 x 192, 256 x 112 and 256 x 128 tiles spill 80 to 520 bytes
+  of registers in the K loop (`cuobjdump --dump-resource-usage`) and ran 1.2 to 3.2x slower than
+  the CUTLASS tiles. Compiling N in removes the spill; K alone, a larger math register budget
+  (setmaxnreg 240) or less unrolling do not. Their 2-CTA twins don't spill, so those five are not
+  compiled: the cost model still scores them, and a round that picks one launches its twin, 0.67
+  to 0.99x of the CUTLASS tiles' time on those rounds as routed (Qwen3-8B's o projection at 576
+  tokens 26.7 -> 19.5 us, vLLM's DeepGEMM 17.2).
+- **Routing** (`fp8_block_sm90_gemm.cu`). Rounds from 33 tokens take DeepGEMM (narrower ones take
+  the tensor-core kernel or the GEMV of #107/#108), except two picks that measured slower than the
+  CUTLASS tiles, which those keep (`DeepGemmOperands::where_faster`): a 64-row tile past 64 tokens
+  (1.0 to 1.5x; its single math warpgroup waits on its MMAs before promoting each K block) and a
+  256-row tile with a residual (each thread seeds twice the accumulators before its first MMA; up
+  to 1.2x). `SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0` turns the route off, `=N` starts it at N tokens,
+  `=N-M` keeps it to N..M.
+
+GEMM time, one Nebius H100, 16 q/k/v, o, gate/up and down shapes of 0.6B to 70B dense models at
+33 to 2,048 tokens, each timed from a CUDA graph of 200 launches (`sinfer_fp8_block_gemm_bench`, a
+serve-tests binary, not a ctest): DeepGEMM as it picks 0.973x the CUTLASS tiles' total, as routed
+0.959x; on the eight Qwen3-8B and Qwen3.6-27B shapes at 33 to 2,048 tokens the routed total is
+about 1.06x vLLM 0.31's JIT-compiled DeepGEMM (another H100).
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream, with
+vLLM 0.31 on the same VM: 64 users 81.6 -> 85.2 (vLLM 92.7), 16 users 159.9 -> 162.3 (160.5), one
+user 213.5 -> 213.2 (230.7); 32 users with 2,048-token prompts 51.7k -> 52.4k prompt tok/s
+(55.1k). The 64-user TTFT p50 read 24.9 to 31.9 ms over four runs with the route on, 25.6 to 26.3
+off (vLLM 57.3). Qwen3.6-27B-FP8 moves within run-to-run noise: 16 users 52.5 -> 53.0, 64 users
+28.4 -> 28.2, 32 x 2k prefill 14.95k -> 15.10k.
+
+Tests. `sinfer_linear_fp8_block_deepgemm0_test` runs the FP8 block suite with the route off, so
+both routes stay covered; the GEMM bench compares DeepGEMM's output with the CUTLASS tiles' on
+every shape it times (bit-identical on all 160 shape and token points without a residual). On one
+Nebius H100 every serve test the serve-tests target builds passes (210; the speech, TTS and two
+vision tests it doesn't build report Not Run), and the CLI and eight concurrent server requests
+pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.
