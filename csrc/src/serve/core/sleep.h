@@ -19,10 +19,6 @@
 // scratch, rewritten before every read) come back as garbage. The default is
 // Offload: an arena nobody thought about costs host memory, never corruption.
 //
-// On a GPU that shares the host's DRAM (GB10, Jetson) a pinned backup would come
-// out of the same memory as the region, so Offload regions stay mapped through
-// sleep there and only Discard regions and sparse regions release memory.
-//
 // Registration happens at startup on one thread; sleep_device/wake_device are
 // serialized by the engine, which parks its worker loop first.
 
@@ -72,8 +68,7 @@ void sleep_unregister_sparse(const void* key) noexcept;
 
 /// Back up Offload regions to pinned host, then unmap and release the physical
 /// pages of every region on `device`. Returns bytes released. The caller must
-/// have quiesced all work on the device. On a GPU that shares the host's DRAM,
-/// Offload regions are left mapped with their contents in place.
+/// have quiesced all work on the device.
 std::size_t sleep_device(int device, const void* owner = nullptr);
 
 /// Map fresh physical pages at the original addresses and restore Offload
@@ -87,9 +82,8 @@ std::size_t wake_device(int device, const void* owner = nullptr);
 /// Pinned-host bytes currently held as sleep backups for `device`.
 [[nodiscard]] std::size_t sleep_backup_bytes(int device) noexcept;
 
-/// Mapped bytes of the regions owned by `owner` that sleep would release (their
-/// VRAM footprint while awake, less any Offload regions a GPU sharing the host's
-/// DRAM keeps mapped). The scheduler sizes resident sets with this.
+/// Mapped bytes of the regions owned by `owner` (their VRAM footprint while
+/// awake). The scheduler sizes resident sets with this.
 [[nodiscard]] std::size_t sleep_owned_bytes(const void* owner, int device = -1) noexcept;
 
 /// Allocate the pinned host backups for `owner`'s Offload regions without

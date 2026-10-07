@@ -1,6 +1,5 @@
 #include "core/device.h"
 #include "core/sleep.h"
-#include "core/unified_memory.h"
 #include "runtime/engine/request_memory.h"
 
 #include <cuda_runtime.h>
@@ -112,15 +111,9 @@ int main() {
         for (std::size_t i = 0; i < expected.size(); ++i) { expected[i] = static_cast<unsigned char>(i); }
         const auto region = partial_image.region();
         CUDA_CHECK(cudaMemcpy(region.data, expected.data(), expected.size(), cudaMemcpyHostToDevice));
-        if (sinfer::device_is_integrated(0)) {
-            // A GPU sharing the host's DRAM keeps Offload regions mapped through sleep.
-            failures += expect(sinfer::sleep_device(0) == 0 && sinfer::sleep_backup_bytes(0) == 0,
-                               "sleep moved the request allocation on a GPU sharing host memory");
-        } else {
-            failures += expect(sinfer::sleep_device(0) > 0, "sleep did not release the request allocation");
-            failures += expect(sinfer::sleep_backup_bytes(0) >= expected.size(),
-                               "sleep discarded the active image instead of backing it up");
-        }
+        failures += expect(sinfer::sleep_device(0) > 0, "sleep did not release the request allocation");
+        failures += expect(sinfer::sleep_backup_bytes(0) >= expected.size(),
+                           "sleep discarded the active image instead of backing it up");
         sinfer::wake_device(0);
         CUDA_CHECK(cudaMemcpy(actual.data(), region.data, actual.size(), cudaMemcpyDeviceToHost));
         failures += expect(actual == expected && partial_image.region().data == region.data,

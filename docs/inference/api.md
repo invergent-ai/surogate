@@ -423,7 +423,8 @@ allows a client to extend an exact previous token sequence without re-rendering 
 
 ## Sleep mode
 
-Start with `--enable-sleep-mode` to free a model's GPU memory without shutting down the server:
+Start with `--enable-sleep-mode` to free a model's GPU memory without shutting down the server.
+It is not available on the DGX Spark, whose GPU shares the system's memory.
 
 ```bash
 curl -X POST -d '' http://localhost:8080/sleep

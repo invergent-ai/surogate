@@ -118,18 +118,7 @@ void test_owners(bool sleepable) {
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
     const auto owned = sleep_owned_bytes(owner, 0);
-    // A GPU sharing the host's DRAM keeps Offload regions, these planes among them, mapped
-    // through sleep: there sleep must leave them in place and release nothing.
-    const bool in_place = sleepable && device_is_integrated(0);
-    if (in_place) {
-        require(owned == 0 && sleep_device(0, owner) == 0 && !device_asleep(0, owner) &&
-                    sleep_backup_bytes(0) == 0 && wake_device(0, owner) == 0,
-                "sleep moved derived planes on a GPU sharing host memory");
-        CUDA_CHECK(cudaGraphLaunch(executable, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        require(read({{output.p, output.bytes}}) == expected && read(b) == second_expected,
-                "derived planes changed through sleep on a GPU sharing host memory");
-    } else if (sleepable) {
+    if (sleepable) {
         require(owned >= logical, "derived planes are missing from sleep accounting");
         const auto other = sleep_owned_bytes(&second->ops, 0);
         for (int round = 0; round < 2; ++round) {
@@ -154,7 +143,7 @@ void test_owners(bool sleepable) {
     const auto free_before = device_free_bytes(0);
     first.reset();
     require(sleep_owned_bytes(owner, 0) == 0, "destroyed engine retained registered planes");
-    require(device_free_bytes(0) + (1U << 20) >= free_before + (sleepable && !in_place ? owned : logical),
+    require(device_free_bytes(0) + (1U << 20) >= free_before + (sleepable ? owned : logical),
             "destroyed engine leaked derived planes or Marlin scratch");
     require(read(b) == second_expected, "destroying one engine invalidated another's planes");
     const void* second_owner = &second->ops;
@@ -223,8 +212,12 @@ int main() {
         DeviceContext device(0);
         if (!fp4_tensor_cores(detail::w8_device_compute_capability())) { return 77; }
         test_owners(false);
-        test_owners(true);
-        test_pipeline_devices(std::min(count, 2));
+        // The engine refuses sleep mode on a GPU that shares system memory: there a sleeping
+        // region's pinned backup comes out of the same memory, so free memory cannot rise.
+        if (!device_is_integrated(0)) {
+            test_owners(true);
+            test_pipeline_devices(std::min(count, 2));
+        }
         std::cout << "derived-plane ownership, sleep and teardown: OK\n";
     } catch (const std::exception& error) {
         ops::bind_ops_context(nullptr);
