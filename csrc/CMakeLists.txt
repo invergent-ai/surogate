@@ -1613,7 +1613,28 @@ endif()
 # --embed` execs it, so it has to exist after `make serve-build` like the engine
 # does. Same source as the old serve_tests target, which is now gone.
 add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
-add_subdirectory(${SERVE_ROOT}/speech)
+# The speech (STT) server decodes audio with FFmpeg, so it is built only with FFmpeg: a host
+# without FFmpeg development libraries configures with -DSINFER_ENABLE_FFMPEG=OFF and builds
+# everything else. -DSUROGATE_BUILD_SPEECH=OFF leaves it out on any host.
+option(SUROGATE_BUILD_SPEECH "Serve: build the speech (STT) server; needs FFmpeg development libraries" ON)
+if(SUROGATE_BUILD_SPEECH AND SINFER_ENABLE_FFMPEG)
+  add_subdirectory(${SERVE_ROOT}/speech)
+  set(SUROGATE_STT_TARGETS surogate-stt surogate-stt-lm)
+else()
+  set(SUROGATE_STT_TARGETS)
+  # pyproject.toml's build targets and the Makefile name surogate-stt. Keep the name a target,
+  # so those lists work unchanged, and have it say what it is.
+  add_custom_target(surogate-stt
+    COMMAND ${CMAKE_COMMAND} -E echo "surogate-stt: not built (needs SUROGATE_BUILD_SPEECH=ON and FFmpeg)"
+    VERBATIM)
+  # A warning, not an error: pip builds always set SUROGATE_REQUIRE_SERVE (pyproject.toml), and
+  # they are how a host without FFmpeg development libraries builds everything else.
+  if(SUROGATE_REQUIRE_SERVE)
+    message(WARNING "serve: surogate-stt and surogate-stt-lm are not built (SUROGATE_BUILD_SPEECH="
+                    "${SUROGATE_BUILD_SPEECH}, SINFER_ENABLE_FFMPEG=${SINFER_ENABLE_FFMPEG}), so "
+                    "`surogate serve --stt` will not work with this build.")
+  endif()
+endif()
 add_subdirectory(${SERVE_ROOT}/tts)
 target_include_directories(surogate-embed PRIVATE
   ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
@@ -1920,7 +1941,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 INSTALL_RPATH "${SINFER_LIB_RPATH}"
                 BUILD_WITH_INSTALL_RPATH OFF
                 INSTALL_RPATH_USE_LINK_PATH FALSE)
-            install(TARGETS surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
+            install(TARGETS ${SUROGATE_STT_TARGETS} surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer sinfer-serve surogate-embed
                     RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
                     COMPONENT serve)
@@ -1939,7 +1960,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
             endif()
         else()
             install(TARGETS sinfer_tts_bridge LIBRARY DESTINATION bin COMPONENT serve)
-            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker sinfer_shared
+            install(TARGETS sinfer sinfer-serve surogate-embed ${SUROGATE_STT_TARGETS} surogate-tts surogate-tts-worker sinfer_shared
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib
                     COMPONENT serve)
