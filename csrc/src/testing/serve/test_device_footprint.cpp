@@ -60,6 +60,8 @@ extern "C" cudaError_t CUDARTAPI cudaMemGetInfo(std::size_t* free, std::size_t* 
 }
 extern "C" cudaError_t CUDARTAPI cudaGetDevice(int* device) { *device = mode; return cudaSuccess; }
 extern "C" cudaError_t CUDARTAPI cudaSetDevice(int) { return cudaSuccess; }
+// A discrete card: free memory is the driver's figure, not the host's (core/unified_memory.h).
+extern "C" cudaError_t CUDARTAPI cudaDeviceGetAttribute(int* value, cudaDeviceAttr, int) { *value = 0; return cudaSuccess; }
 extern "C" cudaError_t CUDARTAPI cudaGetLastError() { return cudaSuccess; }
 extern "C" cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char* output, int length, int) {
     if (mode == 6) { return cudaErrorInvalidDevice; }

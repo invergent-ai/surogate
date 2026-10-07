@@ -118,8 +118,11 @@ class Sources:
                     if (n % 128 or k % 128 or scale.shape != (n // 128, k // 128)
                             or scale.dtype not in ("F32", "BF16")):
                         raise ValueError(f"{source.name}: invalid FP8 block geometry")
-                elif math.prod(scale.shape) != n:
-                    raise ValueError(f"{source.name}: expected one FP8 scale per row")
+                elif math.prod(scale.shape) not in (1, n):
+                    # One scale per row, or ModelOpt's per-tensor FP8 (the attention and
+                    # linear-attention projections of nvidia/Qwen3.6-27B-NVFP4's mixed
+                    # precision), which encode_matrix spreads over the rows.
+                    raise ValueError(f"{source.name}: expected one FP8 scale per row or per tensor")
         if metadata.shape != shape or metadata.dtype != dtype:
             raise ValueError(f"{source.name}: stored weight signature disagrees with config shape {source.shape}")
 
@@ -299,6 +302,8 @@ def encode_matrix(entry, sources, device):
         unit = 128 if numeric_format == inv.FP8_BLOCK_FORMAT else 1
         if numeric_format in (inv.FP8, inv.FP8_ROW_F32_FORMAT):
             scale = scale.reshape(-1)
+            if scale.numel() == 1:
+                scale = scale.expand(weight.shape[0])
         for rows in part.rows:
             if rows.begin % unit or rows.end % unit:
                 raise ValueError(f"{entry.object_name}: fusion must preserve whole scale blocks")
