@@ -235,17 +235,55 @@ struct Nvfp4CodecFor {
     static constexpr bool kD3PackedWord8        = false;
     static constexpr bool kD3SingleValuePerLane = false;
 
-    __device__ static __forceinline__ float scale_of(const std::uint8_t* scales,
-                                                     std::int64_t group_index) {
+    __device__ static __forceinline__ std::int64_t scale_offset(std::int64_t group_index) {
         constexpr int kTilesPerRow = kGroupsPerRow / 4;
         const int row              = static_cast<int>(group_index / kGroupsPerRow);
         const int group            = static_cast<int>(group_index - static_cast<std::int64_t>(row) * kGroupsPerRow);
         const int row_inner        = row & 127;
-        const std::int64_t offset =
-            (static_cast<std::int64_t>(row >> 7) * kTilesPerRow + (group >> 2)) * 512 +
-            static_cast<std::int64_t>(row_inner & 31) * 16 +
-            static_cast<std::int64_t>(row_inner >> 5) * 4 + (group & 3);
-        return detail::decode_nvfp4_e4m3(scales[offset]);
+        return (static_cast<std::int64_t>(row >> 7) * kTilesPerRow + (group >> 2)) * 512 +
+               static_cast<std::int64_t>(row_inner & 31) * 16 +
+               static_cast<std::int64_t>(row_inner >> 5) * 4 + (group & 3);
+    }
+
+    __device__ static __forceinline__ float scale_of(const std::uint8_t* scales,
+                                                     std::int64_t group_index) {
+        return detail::decode_nvfp4_e4m3(scales[scale_offset(group_index)]);
+    }
+
+    // The wide path (WideRows below): sixteen code bytes are 32 values, two whole groups, and
+    // the two groups' scales are adjacent bytes of a tile (`group % 4` runs fastest; the first
+    // group is even), one 16-bit load.
+    static constexpr int kWideValues = 32;
+
+    __device__ static __forceinline__ uint4 wide_codes(const std::uint8_t* codes,
+                                                       std::int64_t group_index, int /*part*/) {
+        return load_vec<uint4>(codes + group_index * (kGroupK / 2));
+    }
+
+    __device__ static __forceinline__ std::uint32_t wide_scales(const std::uint8_t* scales,
+                                                                std::int64_t group_index) {
+        return *reinterpret_cast<const std::uint16_t*>(scales + scale_offset(group_index));
+    }
+
+    /// Accumulates values [8 piece, 8 piece + 8) of a wide load against `x`: the eight products,
+    /// then their group's scale once.
+    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
+                                                      int piece, const float (&x)[8], float& acc) {
+        const std::uint32_t word = piece == 0   ? codes.x
+                                   : piece == 1 ? codes.y
+                                   : piece == 2 ? codes.z
+                                                : codes.w;
+        float part = 0.0f;
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 decoded =
+                detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(word >> (8 * pair)));
+            part = fmaf(decoded.x, x[2 * pair], part);
+            part = fmaf(decoded.y, x[2 * pair + 1], part);
+        }
+        const float scale =
+            detail::decode_nvfp4_e4m3(static_cast<std::uint8_t>(scale_bits >> (piece < 2 ? 0 : 8)));
+        acc = fmaf(part, scale, acc);
     }
 
     __device__ static __forceinline__ void
@@ -294,6 +332,35 @@ struct W8Codec {
             // Arithmetic shift out of the word sign-extends the byte.
             const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
             weights[item]  = w8_a16_weight(static_cast<std::int8_t>(code), scale);
+        }
+    }
+
+    // The wide path (WideRows below): sixteen code bytes are half a group, under its one scale.
+    static constexpr int kWideValues = 16;
+
+    __device__ static __forceinline__ uint4 wide_codes(const std::uint8_t* codes,
+                                                       std::int64_t group_index, int part) {
+        return load_vec<uint4>(codes + group_index * W8RowSplitStorage::kCodeBytesPerGroup +
+                               part * 16);
+    }
+
+    __device__ static __forceinline__ std::uint32_t wide_scales(const std::uint8_t* scales,
+                                                                std::int64_t group_index) {
+        return *reinterpret_cast<const std::uint16_t*>(scales + group_index * 2);
+    }
+
+    /// Accumulates values [8 piece, 8 piece + 8) of a wide load against `x`, each weight
+    /// rounded as load_eight rounds it.
+    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
+                                                      int piece, const float (&x)[8], float& acc) {
+        const float scale =
+            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
+        const std::uint32_t words[2] = {piece == 0 ? codes.x : codes.z,
+                                        piece == 0 ? codes.y : codes.w};
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
+            acc = fmaf(w8_a16_weight(static_cast<std::int8_t>(code), scale), x[item], acc);
         }
     }
 };
@@ -356,11 +423,180 @@ inline constexpr int kStoredGroups =
     ((K + Codec::kStoredKAlignment - 1) / Codec::kStoredKAlignment) * Codec::kStoredKAlignment /
     Codec::kGroupK;
 
+/// The wide decode path: every lane loads its rows' codes sixteen bytes at a time, and a warp
+/// issues all of its loads before it uses any.
+///
+/// The packed paths below load four or eight bytes a lane and keep one warp step in flight, so
+/// a warp makes a DRAM round trip per step -- eight of them across a 2048-wide NVFP4 or W8
+/// row. That is cheap where many warps hide it, and not where few do: on a DGX Spark (48 SMs)
+/// Qwen3.6-35B-A3B's one-token round read its experts at about 150 GB/s while the FP8 GEMV
+/// beside it, which loads sixteen bytes a lane two steps ahead, read at 226. A codec offers
+/// this path with kWideValues (the values sixteen of its code bytes hold, whole groups or a
+/// whole share of one), wide_codes, wide_scales and wide_piece.
+template <class Codec>
+concept WideCodec = requires { Codec::kWideValues; };
+
+/// `Rows` rows of K values: kLoads sixteen-byte loads a lane. A row of 32 or more loads takes
+/// whole warp steps; a shorter one takes a share of the lanes and a step covers several rows.
+/// The rows are evenly spaced, row r at `first + r * stride`, which is what every caller reads:
+/// a gate row and its up row, or consecutive down rows.
+template <class Codec, int K, int Rows>
+struct WideRows {
+    static constexpr int kChunks = K / Codec::kWideValues;
+    static constexpr int kLoads  = Rows * kChunks / 32;
+    static constexpr int kPieces = Codec::kWideValues / 8;
+    /// Loads i and i + kSteps read the same chunk of different rows, so they share the input.
+    static constexpr int kSteps = kChunks >= 32 ? kChunks / 32 : 1;
+
+    /// Which row and which of its sixteen-byte chunks a lane's `load`-th load reads.
+    __device__ static __forceinline__ void slot(int lane, int load, int& row, int& chunk) {
+        if constexpr (kChunks >= 32) {
+            row   = load / kSteps;
+            chunk = load % kSteps * 32 + lane;
+        } else {
+            row   = load * (32 / kChunks) + lane / kChunks;
+            chunk = lane % kChunks;
+        }
+    }
+
+    /// Issues every load of the lane's share of the rows into the first kLoads entries.
+    template <int N>
+    __device__ static __forceinline__ void load(const std::uint8_t* codes, const std::uint8_t* scales,
+                                                int first, int stride, uint4 (&packed)[N],
+                                                std::uint32_t (&scale_bits)[N]) {
+        static_assert(N >= kLoads);
+        constexpr int kGroups = kStoredGroups<Codec, K>;
+        const int lane        = static_cast<int>(threadIdx.x) & 31;
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) {
+            int row, chunk;
+            slot(lane, i, row, chunk);
+            const int part = chunk * Codec::kWideValues % Codec::kGroupK / Codec::kWideValues;
+            const std::int64_t group = static_cast<std::int64_t>(first + row * stride) * kGroups +
+                                       chunk * Codec::kWideValues / Codec::kGroupK;
+            packed[i]     = Codec::wide_codes(codes, group, part);
+            scale_bits[i] = Codec::wide_scales(scales, group);
+        }
+    }
+
+    /// Finishes the dot products against `x(k, values)`, which fills the eight values from k,
+    /// and leaves each row's sum in lane 0's `result`. The input is read once per chunk and
+    /// piece and feeds every load of that chunk. Each load sums into its own accumulator, which
+    /// joins its row's sum at the end; the order is fixed, so the sums are deterministic.
+    template <int N, class X>
+    __device__ static __forceinline__ void dot(const uint4 (&packed)[N],
+                                               const std::uint32_t (&scale_bits)[N], X&& x,
+                                               float (&result)[Rows]) {
+        static_assert(N >= kLoads);
+        const int lane = static_cast<int>(threadIdx.x) & 31;
+        float acc[kLoads];
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) { acc[i] = 0.0f; }
+#pragma unroll
+        for (int step = 0; step < kSteps; ++step) {
+            int row, chunk;
+            slot(lane, step, row, chunk);
+#pragma unroll
+            for (int piece = 0; piece < kPieces; ++piece) {
+                float values[8];
+                x(chunk * Codec::kWideValues + piece * 8, values);
+#pragma unroll
+                for (int i = step; i < kLoads; i += kSteps) {
+                    Codec::wide_piece(packed[i], scale_bits[i], piece, values, acc[i]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) {
+                int row, chunk;
+                slot(lane, i, row, chunk);
+                if (row == r) { sum += acc[i]; }
+            }
+            result[r] = warp_reduce_sum(sum);
+        }
+    }
+};
+
+/// Whether `Rows` rows of K take the wide path: a codec that has one, rows stored unpadded,
+/// whole loads for every lane, and no more than eight of them, which is what a lane holds in
+/// registers beside the rest of the kernel.
+template <class Codec, int K, int Rows>
+inline constexpr bool kWideRows = [] {
+    if constexpr (WideCodec<Codec>) {
+        constexpr int kChunks = K / Codec::kWideValues;
+        return K % Codec::kWideValues == 0 && kStoredGroups<Codec, K> * Codec::kGroupK == K &&
+               (kChunks % 32 == 0 || 32 % kChunks == 0) && Rows * kChunks % 32 == 0 &&
+               Rows * kChunks / 32 <= 8;
+    } else {
+        return false;
+    }
+}();
+
+/// WideRows<Codec, K, Rows>::kLoads where the rows take the wide path, else 0.
+template <class Codec, int K, int Rows>
+inline constexpr int kWideLoads = [] {
+    if constexpr (kWideRows<Codec, K, Rows>) {
+        return WideRows<Codec, K, Rows>::kLoads;
+    } else {
+        return 0;
+    }
+}();
+
+/// Where a staged row keeps its 16-byte unit `unit` when every warp reads it through WideRows.
+/// A read phase is eight lanes, which read units four apart (NVFP4) or two apart (W8); stored
+/// in order, those land on two or four of the eight 16-byte bank groups. Flipping the low two
+/// bits by bits 3-4 sends each phase to eight distinct groups, for both codecs.
+__device__ __forceinline__ int swizzled_unit(int unit) { return unit ^ ((unit >> 3) & 3); }
+
+/// A staged BF16 input as WideRows::dot reads it, stored in order or by swizzled_unit.
+template <bool Swizzled>
+struct SharedBf16Input {
+    const __nv_bfloat16* x;
+    __device__ __forceinline__ void operator()(int k, float (&values)[8]) const {
+        const uint4 input = load_vec<uint4>(x + (Swizzled ? swizzled_unit(k / 8) * 8 : k));
+        const float2 x0   = bf16x2_bits_to_float2(input.x);
+        const float2 x1   = bf16x2_bits_to_float2(input.y);
+        const float2 x2   = bf16x2_bits_to_float2(input.z);
+        const float2 x3   = bf16x2_bits_to_float2(input.w);
+        values[0] = x0.x; values[1] = x0.y; values[2] = x1.x; values[3] = x1.y;
+        values[4] = x2.x; values[5] = x2.y; values[6] = x3.x; values[7] = x3.y;
+    }
+};
+
+/// An FP32 input in global memory as WideRows::dot reads it.
+struct GlobalF32Input {
+    const float* x;
+    __device__ __forceinline__ void operator()(int k, float (&values)[8]) const {
+        const float4 x0 = load_vec<float4>(x + k);
+        const float4 x1 = load_vec<float4>(x + k + 4);
+        values[0] = x0.x; values[1] = x0.y; values[2] = x0.z; values[3] = x0.w;
+        values[4] = x1.x; values[5] = x1.y; values[6] = x1.z; values[7] = x1.w;
+    }
+};
+
 template <class Codec, int K>
 __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const std::uint8_t* high,
                                              const std::uint8_t* scales, int row0, int row1,
                                              const __nv_bfloat16* x, int k_begin, int k_end,
                                              float& result0, float& result1) {
+    if constexpr (kWideRows<Codec, K, 2>) {
+        // Every caller reads whole rows; the wide path has no partial range.
+        (void)high;
+        (void)k_begin;
+        (void)k_end;
+        using Wide = WideRows<Codec, K, 2>;
+        uint4 packed[Wide::kLoads];
+        std::uint32_t scale_bits[Wide::kLoads];
+        Wide::load(codes, scales, row0, row1 - row0, packed, scale_bits);
+        float result[2];
+        Wide::dot(packed, scale_bits, SharedBf16Input<false>{x}, result);
+        result0 = result[0];
+        result1 = result[1];
+        return;
+    }
     constexpr int kGroups = kStoredGroups<Codec, K>;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc0            = 0.0f;
@@ -460,8 +696,14 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
     result1 = warp_reduce_sum(acc1);
 }
 
+/// Whether D3 can issue every warp's weight loads before it stages the input: the routed rows
+/// and the always-on expert's both take the wide path.
 template <class RoutedCodec>
-__global__ void sparse_moe_d3_nine_warp_kernel(
+inline constexpr bool kD3EarlyLoads =
+    kWideRows<RoutedCodec, kHidden, 2> && (!kHasShared || kWideRows<W8Codec, kHidden, 2>);
+
+template <class RoutedCodec, bool EarlyLoads>
+__device__ __forceinline__ void sparse_moe_d3_nine_warp(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales,
@@ -483,36 +725,85 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     const int warp = tid >> 5;
     const int lane = tid & 31;
     if (tid == 0) { pdl::trigger_dependents(); }
-    for (int vector = tid; vector < kHidden / 8; vector += static_cast<int>(blockDim.x)) {
-        store_vec(x_shared + vector * 8, load_vec<uint4>(x + vector * 8));
-    }
-    __syncthreads();
-
     const int j = static_cast<int>(blockIdx.x);
     float gate  = 0.0f;
     float up    = 0.0f;
-    if (warp < kTopK) {
-        const int expert   = ids[warp];
-        const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
-        const int row_base = block * (2 * kIntermediate);
-        if (block >= 0) {
-            float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
-            float& second = RoutedCodec::kGateRowsFirst ? up : gate;
-            dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
-                                               row_base + j, row_base + kIntermediate + j, x_shared,
-                                               0, kHidden, first, second);
-            // NVFP4's second level, one multiply per path instead of one per weight. It lands
-            // before SwiGLU, which is where a gate/up scale has to be. The array is indexed by
-            // row half, so it follows the codec's order rather than the names.
-            if (routed_gate_up_scale != nullptr) {
-                first *= routed_gate_up_scale[block * 2];
-                second *= routed_gate_up_scale[block * 2 + 1];
+    if constexpr (EarlyLoads) {
+        // Every warp's loads go out first, so staging the input and the block's barrier run
+        // under the DRAM round trip instead of ahead of it.
+        using Routed = WideRows<RoutedCodec, kHidden, 2>;
+        using Shared = WideRows<W8Codec, kHidden, 2>;
+        constexpr int kLoads = Routed::kLoads > Shared::kLoads ? Routed::kLoads : Shared::kLoads;
+        uint4 packed[kLoads];
+        std::uint32_t scale_bits[kLoads];
+        int block = -1;
+        if (warp < kTopK) {
+            const int expert = ids[warp];
+            block            = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+            if (block >= 0) {
+                const int row_base = block * (2 * kIntermediate);
+                Routed::load(routed_codes, routed_scales, row_base + j, kIntermediate, packed,
+                             scale_bits);
+            }
+        } else if constexpr (kHasShared) {
+            if (shared_codes) {
+                Shared::load(shared_codes, shared_scales, j, kIntermediate, packed, scale_bits);
             }
         }
-    } else if constexpr (kHasShared) {
-        if (shared_codes) {
-            dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
-                                       x_shared, 0, kHidden, gate, up);
+        static_assert(kHidden % 32 == 0, "swizzled_unit permutes units within fours");
+        for (int vector = tid; vector < kHidden / 8; vector += static_cast<int>(blockDim.x)) {
+            store_vec(x_shared + swizzled_unit(vector) * 8, load_vec<uint4>(x + vector * 8));
+        }
+        __syncthreads();
+        float rows[2];
+        if (warp < kTopK) {
+            if (block >= 0) {
+                Routed::dot(packed, scale_bits, SharedBf16Input<true>{x_shared}, rows);
+                float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
+                float& second = RoutedCodec::kGateRowsFirst ? up : gate;
+                first         = rows[0];
+                second        = rows[1];
+                if (routed_gate_up_scale != nullptr) {
+                    first *= routed_gate_up_scale[block * 2];
+                    second *= routed_gate_up_scale[block * 2 + 1];
+                }
+            }
+        } else if constexpr (kHasShared) {
+            if (shared_codes) {
+                Shared::dot(packed, scale_bits, SharedBf16Input<true>{x_shared}, rows);
+                gate = rows[0];
+                up   = rows[1];
+            }
+        }
+    } else {
+        for (int vector = tid; vector < kHidden / 8; vector += static_cast<int>(blockDim.x)) {
+            store_vec(x_shared + vector * 8, load_vec<uint4>(x + vector * 8));
+        }
+        __syncthreads();
+
+        if (warp < kTopK) {
+            const int expert   = ids[warp];
+            const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+            const int row_base = block * (2 * kIntermediate);
+            if (block >= 0) {
+                float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
+                float& second = RoutedCodec::kGateRowsFirst ? up : gate;
+                dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
+                                                   row_base + j, row_base + kIntermediate + j, x_shared,
+                                                   0, kHidden, first, second);
+                // NVFP4's second level, one multiply per path instead of one per weight. It lands
+                // before SwiGLU, which is where a gate/up scale has to be. The array is indexed by
+                // row half, so it follows the codec's order rather than the names.
+                if (routed_gate_up_scale != nullptr) {
+                    first *= routed_gate_up_scale[block * 2];
+                    second *= routed_gate_up_scale[block * 2 + 1];
+                }
+            }
+        } else if constexpr (kHasShared) {
+            if (shared_codes) {
+                dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
+                                           x_shared, 0, kHidden, gate, up);
+            }
         }
     }
     if (lane == 0) {
@@ -527,6 +818,39 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         }
         act[static_cast<std::int64_t>(warp) * kIntermediate + j] = gated_clamped(gate, up, kSwigluLimit, kActivation);
     }
+}
+
+template <class RoutedCodec>
+__global__ void sparse_moe_d3_nine_warp_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
+    const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
+    const std::uint8_t* __restrict__ routed_scales,
+    const int* __restrict__ slot_of_expert, const float* __restrict__ routed_gate_up_scale,
+    const std::uint8_t* __restrict__ shared_codes,
+    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act,
+    const LoraBank* adapters, const int* adapter_slot, const float* lora_low, int slot_stride) {
+    sparse_moe_d3_nine_warp<RoutedCodec, false>(
+        x, ids, routed_codes, routed_high, routed_scales, slot_of_expert, routed_gate_up_scale, shared_codes,
+        shared_scales, act, adapters, adapter_slot, lora_low, slot_stride);
+}
+
+/// D3 with every warp's loads issued ahead of the input (kD3EarlyLoads). A lane holds up to
+/// eight sixteen-byte loads, and left to itself the compiler also hoists the staged input
+/// reads beside them, to about 160 registers: one block of nine warps per SM, which then
+/// waits out each block's DRAM round trip alone. Bounded to three blocks, it fits in 72
+/// registers without spilling and the next blocks' loads overlap the current one's math.
+template <class RoutedCodec, int MinBlocks>
+__global__ __launch_bounds__(kPaths * 32, MinBlocks) void sparse_moe_d3_early_loads_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
+    const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
+    const std::uint8_t* __restrict__ routed_scales,
+    const int* __restrict__ slot_of_expert, const float* __restrict__ routed_gate_up_scale,
+    const std::uint8_t* __restrict__ shared_codes,
+    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act,
+    const LoraBank* adapters, const int* adapter_slot, const float* lora_low, int slot_stride) {
+    sparse_moe_d3_nine_warp<RoutedCodec, true>(
+        x, ids, routed_codes, routed_high, routed_scales, slot_of_expert, routed_gate_up_scale, shared_codes,
+        shared_scales, act, adapters, adapter_slot, lora_low, slot_stride);
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive>
@@ -604,6 +928,18 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
                                               const std::uint8_t* scales, int row_base,
                                               const float* x, int first_group, int last_group,
                                               float (&result)[Rows]) {
+    if constexpr (kWideRows<Codec, kIntermediate, Rows>) {
+        // Every caller reads whole rows; the wide path has no partial range.
+        (void)high;
+        (void)first_group;
+        (void)last_group;
+        using Wide = WideRows<Codec, kIntermediate, Rows>;
+        uint4 packed[Wide::kLoads];
+        std::uint32_t scale_bits[Wide::kLoads];
+        Wide::load(codes, scales, row_base, 1, packed, scale_bits);
+        Wide::dot(packed, scale_bits, GlobalF32Input{x}, result);
+        return;
+    }
     constexpr int kGroups = kStoredGroups<Codec, kIntermediate>;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc[Rows];
@@ -660,7 +996,13 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
     for (int row = 0; row < Rows; ++row) { result[row] = warp_reduce_sum(acc[row]); }
 }
 
+/// Whether D4 issues its weight loads before it waits for D3: the routed rows and the
+/// always-on expert's both take the wide path.
 template <class RoutedCodec, int Rows>
+inline constexpr bool kD4EarlyLoads =
+    kWideRows<RoutedCodec, kIntermediate, Rows> && (!kHasShared || kWideRows<W8Codec, kIntermediate, Rows>);
+
+template <class RoutedCodec, int Rows, bool EarlyLoads = false>
 __global__ void sparse_moe_d4_nine_warp_kernel(
     const int* __restrict__ ids, const float* __restrict__ alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ act,
@@ -680,22 +1022,55 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     if (adapter_slot) { adapter_slot += token * slot_stride; }
     if (lora_low) { lora_low += token * 2 * kPaths * kMoeLoraMaxRank; }
     __shared__ float paths[kPaths][Rows];
-    pdl::wait_for_dependencies();
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
     const int row_base = static_cast<int>(blockIdx.x) * Rows;
+    // With EarlyLoads every warp's weight loads go out before the wait, so they run under D3's
+    // last blocks instead of after them. Only the activations are D3's. The expert ids are D2's
+    // (or the round hook's), and D3 waits for those before it triggers this grid, so they are
+    // final by the time any block of it runs.
+    using RoutedRows     = WideRows<RoutedCodec, kIntermediate, Rows>;
+    using SharedRows     = WideRows<W8Codec, kIntermediate, Rows>;
+    constexpr int kLoads = EarlyLoads ? std::max(kWideLoads<RoutedCodec, kIntermediate, Rows>,
+                                                 kWideLoads<W8Codec, kIntermediate, Rows>)
+                                      : 1;
+    uint4 packed[kLoads];
+    std::uint32_t scale_bits[kLoads];
+    int expert = 0;
+    int block  = -1;
+    if constexpr (EarlyLoads) {
+        if (warp < kTopK) {
+            expert = ids[warp];
+            block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+            if (block >= 0) {
+                RoutedRows::load(routed_codes, routed_scales, block * kHidden + row_base, 1, packed,
+                                 scale_bits);
+            }
+        } else if constexpr (kHasShared) {
+            if (!shared_output) {
+                SharedRows::load(shared_codes, shared_scales, row_base, 1, packed, scale_bits);
+            }
+        }
+    }
+    pdl::wait_for_dependencies();
     if (warp < kTopK) {
-        const int expert = ids[warp];
-        const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+        if constexpr (!EarlyLoads) {
+            expert = ids[warp];
+            block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+        }
         float dot[Rows];
         // NVFP4's per-expert second level rides along with the routing weight: both are constant
         // over the path, so the epilogue costs the same multiply it already did.
         float weight = alpha[warp];
         if (block >= 0) {
-            dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
-                                             block * kHidden + row_base,
-                                             act + static_cast<std::int64_t>(warp) * kIntermediate,
-                                             0, kIntermediate / RoutedCodec::kGroupK, dot);
+            const float* path_act = act + static_cast<std::int64_t>(warp) * kIntermediate;
+            if constexpr (EarlyLoads) {
+                RoutedRows::dot(packed, scale_bits, GlobalF32Input{path_act}, dot);
+            } else {
+                dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
+                                                 block * kHidden + row_base, path_act, 0,
+                                                 kIntermediate / RoutedCodec::kGroupK, dot);
+            }
             if (routed_down_scale != nullptr) {
                 if (!adapters) { weight *= routed_down_scale[block]; }
                 else if (lane == 0) { for (int r = 0; r < Rows; ++r) { dot[r] *= routed_down_scale[block]; } }
@@ -718,6 +1093,9 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
             for (int row = 0; row < Rows; ++row) {
                 dot[row] = __bfloat162float(shared_output[static_cast<std::int64_t>(token) * kHidden + row_base + row]);
             }
+        } else if constexpr (EarlyLoads) {
+            SharedRows::dot(packed, scale_bits,
+                            GlobalF32Input{act + static_cast<std::int64_t>(kTopK) * kIntermediate}, dot);
         } else {
             dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
                 act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
@@ -844,9 +1222,18 @@ void launch_d3_dependent_codec(const Tensor& x, const PreparedSparseMoeWeights& 
     const auto* routed_scales = static_cast<const std::uint8_t*>(weights.routed_gate_up.scales);
     const auto* shared_codes  = weights.shared_output.data ? nullptr : static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_gate_up.scales);
+    static const int early_switch = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_MOE_D3_EARLY");
+        return value == nullptr ? 3 : std::atoi(value);
+    }();
+    auto* kernel = sparse_moe_d3_nine_warp_kernel<Codec>;
+    if constexpr (kD3EarlyLoads<Codec>) {
+        if (early_switch == 2) { kernel = sparse_moe_d3_early_loads_kernel<Codec, 2>; }
+        if (early_switch == 3) { kernel = sparse_moe_d3_early_loads_kernel<Codec, 3>; }
+    }
     CUDA_CHECK(pdl::launch_dependent(
         {dim3(kIntermediate, x.ne[1]), dim3(kPaths * 32), 0, stream},
-        sparse_moe_d3_nine_warp_kernel<Codec>,
+        kernel,
         input, ids, routed_codes, routed_high, routed_scales, weights.slot_of_expert,
         weights.routed_gate_up_scale, shared_codes, shared_scales, act,
         adapters, adapter_slot, static_cast<const float*>(workspace.lora_low.data), workspace.slot_stride));
@@ -993,8 +1380,16 @@ void launch_d4_dependent_codec(const PreparedSparseMoeWeights& weights, Tensor& 
     // was the best of the three there. Measured on a 5090, cold, over Q4_K/Q5_K/Q6_K.
     constexpr int kD4Rows = kIntermediate <= 512 ? 4 : kIntermediate <= 1024 ? 2 : 1;
     static_assert(kHidden % kD4Rows == 0);
+    static const bool early_switch = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_MOE_D4_EARLY");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    auto* kernel = sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows, false>;
+    if constexpr (kD4EarlyLoads<Codec, kD4Rows>) {
+        if (early_switch) { kernel = sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows, true>; }
+    }
     CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / kD4Rows, destination.ne[1]), dim3(kPaths * 32), 0, stream},
-                                     sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows>, ids, alpha,
+                                     kernel, ids, alpha,
                                      shared_scale, act, routed_codes, routed_high, routed_scales,
                                      weights.slot_of_expert, weights.routed_down_scale,
                                      shared_codes, shared_scales, static_cast<const __nv_bfloat16*>(weights.shared_output.data),

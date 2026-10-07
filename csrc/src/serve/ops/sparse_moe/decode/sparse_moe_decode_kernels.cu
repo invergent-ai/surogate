@@ -19,6 +19,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
