@@ -476,8 +476,8 @@ def _save_mixed_export(root, c, g, ranking, monkeypatch, convert):
 
 def test_mixed_nvfp4_fp8_export_keeps_every_stored_word(tmp_path, monkeypatch):
     from surogate.serve.artifact.container import Artifact
-    from surogate.serve.artifact.layouts import decode_fp8_row_scaled_words, dequantize_row_split
-    from surogate.serve.convert.common.inventory import FP8
+    from surogate.serve.artifact.layouts import dequantize_row_split, row_scale_f32_geometry
+    from surogate.serve.convert.common.inventory import FP8_ROW_F32
     from surogate.serve.convert.qwen3_5_moe import convert
     c = config_for()
     c.update(moe_intermediate_size=128, shared_expert_intermediate_size=128)
@@ -490,16 +490,23 @@ def test_mixed_nvfp4_fp8_export_keeps_every_stored_word(tmp_path, monkeypatch):
 
     def fp8_rows(artifact, name):
         obj = artifact.find(name)
-        assert obj.format == FP8
-        codes, scales = decode_fp8_row_scaled_words(bytes(artifact.payload(obj)), tuple(obj.shape))
-        return codes.view(torch.uint8), scales
+        assert obj.format == FP8_ROW_F32
+        shape = tuple(obj.shape)
+        geometry = row_scale_f32_geometry(obj.format, shape)
+        payload = bytearray(artifact.payload(obj))
+        codes = torch.frombuffer(payload[: geometry.code_plane_bytes], dtype=torch.uint8).reshape(shape)
+        begin = geometry.scale_plane_offset
+        scales = torch.frombuffer(payload[begin : begin + geometry.scale_plane_bytes], dtype=torch.float32)
+        return codes, scales
 
     def source_rows(name):
-        return stored[name].view(torch.uint8), stored[name[: -len(".weight")] + ".weight_scale"].reshape(-1)
+        # The stored BF16 multipliers widen exactly to the artifact's FP32.
+        return (stored[name].view(torch.uint8),
+                stored[name[: -len(".weight")] + ".weight_scale"].reshape(-1).to(torch.float32))
 
     with Artifact(output) as artifact:
         assert artifact.identity.weights_id == "compressed-tensors"
-        # Each FP8 Linear's codes and BF16 multipliers, row for row as stored.
+        # Each FP8 Linear's codes and multipliers, row for row as stored.
         for name, source in (("text/layers/0/attention/key", "model.layers.0.self_attn.k_proj.weight"),
                              ("text/layers/0/attention/value", "model.layers.0.self_attn.v_proj.weight"),
                              ("text/layers/2/attention/output", "model.layers.2.self_attn.o_proj.weight"),

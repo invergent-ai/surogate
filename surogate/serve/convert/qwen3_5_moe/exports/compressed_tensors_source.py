@@ -12,9 +12,12 @@ constituents are separate Linears in the file becomes one object per
 constituent, because each carries its own global scale and there is no honest
 way to fuse two of those.
 
-An FP8 module is served with BF16 activations: the export's dynamic per-token
-activation quantization is not applied, so its products are the exact
-products of the stored weights.
+An FP8 module is stored as FP8_ROW_F32, its multipliers widened exactly to
+FP32, and runs on the engine's block-FP8 kernels at every width: exact BF16
+activations at decode widths, and past them activations quantized per token
+per 128 -- finer than the export's own dynamic per-token quantization -- on
+the tensor cores. (The BF16-multiplier format has tuned kernels for one
+model's shapes only and a CUDA-core fallback for every other.)
 
 The recipes speak in logical tensors (``self_attn.q_proj.weight`` at
 ``[n, k]``); which stored tensors realise one -- ``weight`` or
@@ -47,20 +50,17 @@ from surogate.core.model.quant_schemes import (
 from surogate.serve.artifact.layouts import (
     encode_direct,
     encode_fp8_row_f32,
-    encode_fp8_row_scaled,
     encode_nvfp4,
 )
 from surogate.serve.convert.common.conversion import encode_tensor_payload
 from surogate.serve.convert.common.inventory import (
     BF16,
-    FP8,
     FP8_ROW_F32,
     FP32,
     BLOCK_SCALE_LAYOUT,
     CONTIGUOUS_LAYOUT,
     NVFP4,
     ROW_SCALE_F32_LAYOUT,
-    ROW_SCALE_LAYOUT,
     ROW_SPLIT_LAYOUT,
     W8,
     TensorSpec,
@@ -120,7 +120,7 @@ class ObjectSource:
     quantized: bool  # NVFP4 (weight_packed) if True, FP8 or BF16 (weight) if not
     requantize_to: str | None = None  # a stored format to re-encode into, e.g. W8
     extra: tuple[tuple[str, np.ndarray], ...] = ()
-    #: The artifact format of FP8 codes kept as stored (FP8 or FP8_ROW_F32), else None.
+    #: The artifact format of FP8 codes kept as stored (FP8_ROW_F32), else None.
     fp8: str | None = None
 
     @property
@@ -209,10 +209,10 @@ class CompressedTensorsSource:
         """The artifact format that keeps this module's FP8 codes, or None if it has none.
 
         An eight-bit float scheme stores E4M3 codes in ``weight`` and one multiplier per
-        row (``channel``) or one for the matrix (``tensor``) in ``weight_scale``. BF16
-        multipliers keep their words in FP8 (E4M3 rows, BF16 scales); any other dtype
-        widens exactly into FP8_ROW_F32. Anything else eight-bit is refused here, at plan
-        time, rather than read as BF16.
+        row (``channel``) or one for the matrix (``tensor``) in ``weight_scale``; the codes
+        are kept and the multipliers widen exactly into FP8_ROW_F32 (see the module
+        docstring). Anything else eight-bit is refused here, at plan time, rather than read
+        as BF16.
         """
 
         if not logical.endswith(".weight"):
@@ -234,7 +234,7 @@ class CompressedTensorsSource:
         codes = self._dtype(module + ".weight")
         if codes != "F8_E4M3":
             raise ValueError(f"{module}.weight is {codes}, expected F8_E4M3 under an FP8 scheme")
-        return FP8 if self._dtype(module + ".weight_scale") == "BF16" else FP8_ROW_F32
+        return FP8_ROW_F32
 
     def _dtype(self, stored: str) -> str:
         if self._dtypes is None:
@@ -352,8 +352,7 @@ class CompressedTensorsSource:
             out.append(TensorSpec(name, (item.n, k), NVFP4, BLOCK_SCALE_LAYOUT))
             out.append(TensorSpec(name + INPUT_DIVISOR_SUFFIX, (), FP32, CONTIGUOUS_LAYOUT))
         elif fp8 is not None:
-            layout = ROW_SCALE_LAYOUT if fp8 == FP8 else ROW_SCALE_F32_LAYOUT
-            out.append(TensorSpec(name, (item.n, k), fp8, layout))
+            out.append(TensorSpec(name, (item.n, k), fp8, ROW_SCALE_F32_LAYOUT))
         else:
             out.append(TensorSpec(name, (item.n, k), BF16, CONTIGUOUS_LAYOUT))
 
@@ -391,12 +390,10 @@ class CompressedTensorsSource:
         rows = torch.from_numpy(np.ascontiguousarray(item.rows))
         if item.fp8 is not None:
             # Rows are self-contained (codes and one multiplier each), so a row gather is
-            # exact, and the multipliers keep their words: BF16 as stored, or widened to FP32.
+            # exact, and the multipliers keep their values, widened to FP32.
             codes, scales = _fp8_words(reader, item.source)
             codes = codes.index_select(0, rows).contiguous()
             scales = scales.index_select(0, rows).contiguous()
-            if item.fp8 == FP8:
-                return encode_fp8_row_scaled(codes, scales, (item.n, item.k))
             return encode_fp8_row_f32(codes, scales.to(torch.float32), (item.n, item.k))
         if not item.quantized:
             weight = reader.get(item.source)
