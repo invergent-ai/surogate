@@ -367,6 +367,23 @@ inline void apply_lora_contribution(Tensor& output,
         return;
     }
 
+    // A slice of a fused projection (q of qkv, gate or up of gate_up): accumulate B @ intermediate
+    // into the slice in place. That reads and writes the slice once; a GEMM into the packed delta
+    // and an add afterwards move it four times, which is most of a LoRA step's extra traffic on a
+    // bandwidth-bound GPU such as the DGX Spark's. Ranks it has no kernel for fall through.
+    if (fold_scaling_into_alpha && lora_accum_b_small_rank_bf16(output,
+                                                                lora.B,
+                                                                intermediate,
+                                                                BT,
+                                                                static_cast<int>(total_out_features),
+                                                                out_features,
+                                                                output_offset,
+                                                                rank,
+                                                                b_alpha,
+                                                                stream)) {
+        return;
+    }
+
     if (!packed_delta_available) {
         throw std::logic_error("apply_lora_contribution: lora_slice too small for packed delta fallback");
     }

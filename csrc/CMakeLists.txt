@@ -860,6 +860,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/kernels/test-moe-grouped-gemm.cu
         src/testing/kernels/test-matmul-autotune.cpp
         src/testing/kernels/test-mem-eff-splits.cu
+        src/testing/kernels/test-lora-accum.cu
         src/testing/kernels/test-chunked-attention.cu
         src/testing/kernels/test-spark-numerics.cu
         src/testing/kernels/test-qwen35-shared.cu
