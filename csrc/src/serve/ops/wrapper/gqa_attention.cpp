@@ -917,8 +917,14 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
             bytes = layout.peak_bytes(1);
         }
         if (generic_takes(head_dim, q_heads, kv_heads, cache_dtype, {})) {
-            // Splits never grow with the width, so the first unsplit width ends the walk.
+            // Splits never grow with the width, so the first unsplit width ends the walk, as
+            // does the first one the prompt kernel takes (prompt_kernel_takes_generic), which
+            // needs none and takes every wider one FA3 does not.
             for (std::int32_t width = min_width; width <= max_width; ++width) {
+                if (batch_size == 1 &&
+                    prompt_kernel_takes(head_dim, q_heads, kv_heads, cache_dtype, width)) {
+                    break;
+                }
                 const std::int32_t columns = batch_size * width;
                 const int splits =
                     generic_splits(head_dim, q_heads, kv_heads, cache_dtype, batch_size, width);
@@ -967,6 +973,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
                 (void)allocate_fa3_prompt_workspace(layout, head_dim, q_heads, width, 1, cache_dtype);
                 return layout.peak_bytes(1);
             }
+            // The prompt kernel (launch_cached_prompt_tiles) needs no workspace.
+            if (prompt_kernel_takes(head_dim, q_heads, kv_heads, cache_dtype, width)) {
+                return std::size_t{0};
+            }
             return exact_prompt_capacity(width);
         }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
@@ -998,16 +1008,20 @@ std::size_t gqa_attention_history_workspace_capacity_bytes(std::int32_t head_dim
     // Their rounded allocation can exceed the one at max_visible_keys, even though
     // each individual query needs fewer split buffers. Cover the entire history
     // interval, including alignment of three partial planes and two metadata planes.
-    if (batch_size == 1 && cache_dtype != DType::I8 &&
+    // The tiles take only the prompts narrower than the prompt kernel's first width.
+    const std::int32_t tiled_max =
+        prompt_kernel_takes(head_dim, q_heads, kv_heads, cache_dtype, max_width)
+            ? std::min(max_width, prompt_kernel_min_columns() - 1) : max_width;
+    if (batch_size == 1 && cache_dtype != DType::I8 && tiled_max >= min_width &&
         envelope.min_visible_keys < envelope.max_visible_keys &&
-        detail::gqa_attention_resolve_route(q_heads, kv_heads, max_width, 1,
+        detail::gqa_attention_resolve_route(q_heads, kv_heads, tiled_max, 1,
             {envelope.min_visible_keys, envelope.min_visible_keys, envelope.sliding_window}) ==
             detail::GqaAttentionRoute::Prompt) {
         const int splits = detail::gqa_attention_split_capacity(head_dim, q_heads, kv_heads,
             32, cache_dtype, envelope);
         const std::size_t per_query = static_cast<std::size_t>(head_dim + 2) * q_heads * splits * 4;
         const std::size_t payload = std::max(per_query,
-            std::min<std::size_t>(32U << 20, per_query * std::min(max_width, 128)));
+            std::min<std::size_t>(32U << 20, per_query * std::min(tiled_max, 128)));
         maximum = std::max(maximum, payload + 2048);
     }
     return maximum;
