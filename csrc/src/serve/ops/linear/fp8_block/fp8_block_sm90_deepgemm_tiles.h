@@ -17,20 +17,26 @@ namespace sinfer::ops::detail::fp8_block::sm90::dg {
 
 // The tiles: (block_m, block_n, cluster_m, cluster_n), in DeepGEMM's enumeration order (cluster m,
 // cluster n, block m, block n) so its comparator breaks ties alike. DeepGEMM JIT-compiles the best
-// of ~90 candidates per shape; these 32 are the ones its cost model keeps choosing over the q/k/v,
+// of ~90 candidates per shape; these 35 are the ones its cost model keeps choosing over the q/k/v,
 // o, gate/up and down shapes of 0.6B to 70B dense models, 33 to 8192 tokens, on 132, 114 and 78 SMs
-// (within 0.1 % of the full set on average under that model). Four lists, four translation units.
+// (within 0.1 % of the full set on average under that model), plus the three 2-CTA 64-row tiles it
+// picks for 3 % of those shapes at decode widths (33 to 128 tokens), where the next best tile is 7 %
+// slower by the model and was 6.5 % slower measured (Qwen3-8B's gate/up at 64 tokens on an H100:
+// 39.0 us against vLLM's 36.6). Four lists, four translation units.
 // clang-format off
 #define SINFER_DG_TILES_0(X) X(64, 16, 1, 1) X(64, 32, 1, 1) X(64, 48, 1, 1) X(64, 64, 1, 1) \
-                             X(64, 80, 1, 1) X(64, 96, 1, 1) X(64, 112, 1, 1) X(64, 128, 1, 1)
+                             X(64, 80, 1, 1) X(64, 96, 1, 1) X(64, 112, 1, 1) X(64, 128, 1, 1) X(64, 80, 2, 1)
 #define SINFER_DG_TILES_1(X) X(64, 144, 1, 1) X(64, 160, 1, 1) X(64, 192, 1, 1) X(128, 80, 1, 1) \
-                             X(128, 96, 1, 1) X(128, 112, 1, 1) X(128, 128, 1, 1) X(128, 144, 1, 1)
+                             X(128, 96, 1, 1) X(128, 112, 1, 1) X(128, 128, 1, 1) X(128, 144, 1, 1) X(64, 96, 2, 1)
 #define SINFER_DG_TILES_2(X) X(128, 160, 1, 1) X(128, 192, 1, 1) X(256, 112, 1, 1) X(256, 128, 1, 1) \
-                             X(128, 80, 1, 2) X(128, 112, 1, 2) X(128, 128, 1, 2) X(256, 96, 1, 2)
+                             X(128, 80, 1, 2) X(128, 112, 1, 2) X(128, 128, 1, 2) X(256, 96, 1, 2) X(64, 160, 2, 1)
 #define SINFER_DG_TILES_3(X) X(256, 112, 1, 2) X(256, 128, 1, 2) X(64, 112, 2, 1) X(64, 128, 2, 1) \
                              X(64, 144, 2, 1) X(128, 144, 2, 1) X(128, 160, 2, 1) X(128, 192, 2, 1)
 // clang-format on
 #define SINFER_DG_TILES(X) SINFER_DG_TILES_0(X) SINFER_DG_TILES_1(X) SINFER_DG_TILES_2(X) SINFER_DG_TILES_3(X)
+#define SINFER_DG_COUNT(BM, BN, CM, CN) +1
+inline constexpr int kNumTiles = 0 SINFER_DG_TILES(SINFER_DG_COUNT);
+#undef SINFER_DG_COUNT
 
 inline constexpr int kBlockK        = 128;
 inline constexpr int kSmemCapacity  = 232448; // sm_90's opt-in shared memory per block

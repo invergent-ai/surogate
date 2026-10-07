@@ -18,6 +18,7 @@ Local changes:
   `kNumSMs` template argument, so one instantiation runs on any SM count (H100 SXM and PCIe, H200,
   H20); `kNumSMs` still sizes the L2 swizzle groups.
 - `impls/sm90_fp8_gemm_1d2d.cuh`: a trailing `residual` kernel argument. When it is non-null (it is
-  the output tensor itself), the epilogue adds the stored BF16 value to the FP32 result before the
-  single rounding to BF16, which is what the engine's `linear_add` needs; null keeps upstream's
-  behaviour.
+  the output tensor itself), each tile's promoted FP32 accumulators start from the stored BF16
+  values instead of zero, so the output is residual + A . B rounded to BF16 once, which is what the
+  engine's `linear_add` needs; null keeps upstream's behaviour. The loads go out before the first
+  K block, behind its TMA wait (read in the epilogue instead, each waited out a global round trip).

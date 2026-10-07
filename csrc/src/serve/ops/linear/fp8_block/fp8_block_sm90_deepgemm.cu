@@ -21,9 +21,9 @@ struct Tile {
 
 // DeepGEMM enumerates cluster m, then cluster n, then block m (64, 128, 256), then block n, and
 // keeps the first of equally cheap candidates; the table is sorted the same way.
-const std::array<Tile, 32>& tiles() {
-    static const std::array<Tile, 32> sorted = [] {
-        std::array<Tile, 32> t{{
+const std::array<Tile, dg::kNumTiles>& tiles() {
+    static const std::array<Tile, dg::kNumTiles> sorted = [] {
+        std::array<Tile, dg::kNumTiles> t{{
 #define SINFER_DG_ENTRY(BM, BN, CM, CN) Tile{BM, BN, CM, CN, &dg::SINFER_DG_NAME(BM, BN, CM, CN)},
             SINFER_DG_TILES(SINFER_DG_ENTRY)
 #undef SINFER_DG_ENTRY

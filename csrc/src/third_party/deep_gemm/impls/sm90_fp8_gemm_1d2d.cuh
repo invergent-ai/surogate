@@ -253,6 +253,32 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
+
+            // Local change (surogate): with `residual` (the D tensor itself, [shape_m, shape_n]
+            // row-major), the promoted accumulators start from its values, so D = residual + A . B
+            // summed in FP32 and rounded once. The loads go out before the first K block, whose
+            // TMA wait hides them, and need no registers past the accumulators they fill.
+            if (residual != nullptr) {
+                #pragma unroll
+                for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
+                    const uint32_t row = m_block_idx * BLOCK_M + local_idx * WAVE_BLOCK_M + r_0;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                        const uint32_t col = n_block_idx * BLOCK_N + i * 8 + (lane_idx % 4) * 2;
+                        auto* shifted = final_accum + WGMMA::kNumAccum * local_idx + i * 4;
+                        if (col < shape_n and row < shape_m) {
+                            const float2 value = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(
+                                residual + static_cast<uint64_t>(row) * shape_n + col));
+                            shifted[0] = value.x, shifted[1] = value.y;
+                        }
+                        if (col < shape_n and row + 8 < shape_m) {
+                            const float2 value = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(
+                                residual + static_cast<uint64_t>(row + 8) * shape_n + col));
+                            shifted[2] = value.x, shifted[3] = value.y;
+                        }
+                    }
+                }
+            }
             
             // Pick threads whose WGMMA results are to be stored in shared memory
             DG_STATIC_ASSERT(BLOCK_M >= 64 or kNumMathThreads == 128, "Only one math warp group for `BLOCK_M < 64`");
@@ -411,29 +437,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         smem_ptr = reinterpret_cast<uint8_t*>(smem_d + (m_offset + warp_idx * WGMMA_M_PER_WARP + lane_idx) * BLOCK_N + i * 8);
                     }
 
-                    // Local change (surogate): with `residual` (the D tensor itself, [shape_m, shape_n]
-                    // row-major), D = accumulator + residual, summed in FP32 and rounded once
-                    float2 top = {shifted_accum[i * 4 + 0], shifted_accum[i * 4 + 1]};
-                    float2 bottom = {shifted_accum[i * 4 + 2], shifted_accum[i * 4 + 3]};
-                    if (residual != nullptr) {
-                        const uint32_t row = m_block_idx * BLOCK_M + m_offset + r_0;
-                        const uint32_t col = n_block_idx * BLOCK_N + i * 8 + (lane_idx % 4) * 2;
-                        if (col < shape_n) {
-                            if (row < shape_m) {
-                                const auto value = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(residual + static_cast<uint64_t>(row) * shape_n + col));
-                                top.x += value.x, top.y += value.y;
-                            }
-                            if (row + 8 < shape_m) {
-                                const auto value = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(residual + static_cast<uint64_t>(row + 8) * shape_n + col));
-                                bottom.x += value.x, bottom.y += value.y;
-                            }
-                        }
-                    }
-
                     // NOTES: only 16 lanes' addresses are used
                     ptx::SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                        __float22bfloat162_rn(top),
-                        __float22bfloat162_rn(bottom),
+                        __float22bfloat162_rn({shifted_accum[i * 4 + 0], shifted_accum[i * 4 + 1]}),
+                        __float22bfloat162_rn({shifted_accum[i * 4 + 2], shifted_accum[i * 4 + 3]}),
                         smem_ptr
                     );
                 }

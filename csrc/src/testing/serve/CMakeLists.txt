@@ -661,6 +661,11 @@ endforeach()
 add_test(NAME sinfer_linear_fp8_block_deepgemm0_test COMMAND sinfer_linear_fp8_block_test)
 set_tests_properties(sinfer_linear_fp8_block_deepgemm0_test PROPERTIES
   ENVIRONMENT "SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0" SKIP_RETURN_CODE 77)
+# DeepGEMM against the CUTLASS tiles per shape (a benchmark, not a ctest; serve-tests builds it).
+add_executable(sinfer_fp8_block_gemm_bench ops/linear/fp8_block/bench_fp8_block_gemm.cpp)
+target_include_directories(sinfer_fp8_block_gemm_bench PRIVATE ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_fp8_block_gemm_bench PRIVATE sinfer_shared CUDA::cudart)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_fp8_block_gemm_bench)
 sinfer_add_fused_linear_test(
   sinfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp
