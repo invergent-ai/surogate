@@ -1049,6 +1049,11 @@ if("90a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL
     ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm.cu
     ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm_mid.cu
     ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_gemm_wide.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles0.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles1.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles2.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles3.cu
     ${SERVE_ROOT}/ops/sparse_moe/fp8_sm90/fp8_moe_sm90.cu)
 else()
   add_library(sinfer_fp8_block_sm90 STATIC EXCLUDE_FROM_ALL
@@ -1066,6 +1071,15 @@ if(SINFER_FP8_BLOCK_SM90_REAL)
 endif()
 target_compile_options(sinfer_fp8_block_sm90 PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+# DeepGEMM's kernel (src/third_party/deep_gemm, MIT; NOTICE there) with the flags its JIT compiles
+# it with: ptxas's register-usage level 10, and its diagnostics quieted.
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles0.cu
+  ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles1.cu
+  ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles2.cu
+  ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles3.cu
+  PROPERTIES COMPILE_OPTIONS
+  "$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10;--diag-suppress=39,161,174,177,186,940;--expt-extended-lambda>")
 target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # FlashAttention-3's Hopper forward (src/third_party/flash_attn3, BSD-3-Clause; NOTICE there),

@@ -3,9 +3,11 @@
 // the narrow tile; the other tiles live in fp8_block_sm90_gemm_{mid,wide}.cu. Built for 90a only.
 
 #include "ops/linear/fp8_block/fp8_block_sm90_gemm.cuh"
+#include "ops/linear/fp8_block/fp8_block_sm90_deepgemm.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <string_view>
 
 namespace sinfer::ops::detail::fp8_block {
@@ -64,6 +66,18 @@ bool run_tile(const TileChoice& tile, const Operands& o, bool residual) {
     return false;
 }
 
+// SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 turns the DeepGEMM route off; =N starts it at N tokens.
+// Rounds to 16 tokens take the tensor-core kernel or the GEMV before they reach this GEMM.
+int deepgemm_min_tokens() {
+    static const int tokens = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM");
+        if (raw == nullptr || *raw == '\0') { return 33; }
+        const int value = std::atoi(raw);
+        return value <= 0 ? std::numeric_limits<int>::max() : value;
+    }();
+    return tokens;
+}
+
 } // namespace
 } // namespace sm90
 
@@ -86,6 +100,12 @@ bool sm90_gemm(const std::uint8_t* act_codes, const float* act_scales, const std
         (n % 8) != 0 || !aligned(act_codes) || !aligned(act_scales) || !aligned(w_codes) ||
         !aligned(w_scales) || !aligned(out_bf16)) {
         return false;
+    }
+    // DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) from deepgemm_min_tokens() tokens up, where it
+    // beats these tiles; SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 keeps every round on them.
+    if (tokens >= sm90::deepgemm_min_tokens() &&
+        sm90::deepgemm({act_codes, act_scales, w_codes, w_scales, out_bf16, residual, tokens, n, k, stream})) {
+        return true;
     }
     // SUROGATE_SERVE_FP8_BLOCK_SM90_TILES=0 keeps vLLM's two tiles, for A/B runs.
     static const bool vllm_tiles = [] {

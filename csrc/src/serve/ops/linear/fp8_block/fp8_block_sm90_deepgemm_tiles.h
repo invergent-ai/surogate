@@ -1,0 +1,75 @@
+// DeepGEMM's sm90 1D2D block-FP8 kernel (src/third_party/deep_gemm) as ahead-of-time tiles: the
+// tile list, each tile's compile-time pipeline and its launcher's declaration. The launchers are
+// defined by the fp8_block_sm90_deepgemm_tiles*.cu units (fp8_block_sm90_deepgemm.cuh), and
+// fp8_block_sm90_deepgemm.cu picks one per call. Internal to the 90a archive.
+#pragma once
+
+#include "ops/linear/fp8_block/fp8_block_sm90_deepgemm.h"
+
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+
+namespace sinfer::ops::detail::fp8_block::sm90::dg {
+
+// The tiles: (block_m, block_n, cluster_m, cluster_n), in DeepGEMM's enumeration order (cluster m,
+// cluster n, block m, block n) so its comparator breaks ties alike. DeepGEMM JIT-compiles the best
+// of ~90 candidates per shape; these 32 are the ones its cost model keeps choosing over the q/k/v,
+// o, gate/up and down shapes of 0.6B to 70B dense models, 33 to 8192 tokens, on 132, 114 and 78 SMs
+// (within 0.1 % of the full set on average under that model). Four lists, four translation units.
+// clang-format off
+#define SINFER_DG_TILES_0(X) X(64, 16, 1, 1) X(64, 32, 1, 1) X(64, 48, 1, 1) X(64, 64, 1, 1) \
+                             X(64, 80, 1, 1) X(64, 96, 1, 1) X(64, 112, 1, 1) X(64, 128, 1, 1)
+#define SINFER_DG_TILES_1(X) X(64, 144, 1, 1) X(64, 160, 1, 1) X(64, 192, 1, 1) X(128, 80, 1, 1) \
+                             X(128, 96, 1, 1) X(128, 112, 1, 1) X(128, 128, 1, 1) X(128, 144, 1, 1)
+#define SINFER_DG_TILES_2(X) X(128, 160, 1, 1) X(128, 192, 1, 1) X(256, 112, 1, 1) X(256, 128, 1, 1) \
+                             X(128, 80, 1, 2) X(128, 112, 1, 2) X(128, 128, 1, 2) X(256, 96, 1, 2)
+#define SINFER_DG_TILES_3(X) X(256, 112, 1, 2) X(256, 128, 1, 2) X(64, 112, 2, 1) X(64, 128, 2, 1) \
+                             X(64, 144, 2, 1) X(128, 144, 2, 1) X(128, 160, 2, 1) X(128, 192, 2, 1)
+// clang-format on
+#define SINFER_DG_TILES(X) SINFER_DG_TILES_0(X) SINFER_DG_TILES_1(X) SINFER_DG_TILES_2(X) SINFER_DG_TILES_3(X)
+
+inline constexpr int kBlockK        = 128;
+inline constexpr int kSmemCapacity  = 232448; // sm_90's opt-in shared memory per block
+inline constexpr int kMaxKBlocks    = 256;    // k up to 32768: the B-scale row each CTA stages
+inline constexpr int kNumSMsHint    = 132;    // sizes the scheduler's L2 swizzle groups only
+inline constexpr int kTmaThreads    = 128;
+
+constexpr int align_up(int x, int a) { return (x + a - 1) / a * a; }
+
+// DeepGEMM's sm90 shared-memory plan (heuristics/sm90.hpp, get_pipeline_config).
+constexpr int fixed_smem(int bm, int bn, int k_blocks) {
+    return align_up(bm * bn * 2, 1024) + 16 * 8 * 2 + align_up(k_blocks * 4 * (kBlockK % bn == 0 ? 1 : 2), 8);
+}
+constexpr int stage_smem(int bm, int bn) { return bm * kBlockK + bn * kBlockK + align_up(bm * 4, 128); }
+constexpr int stages(int bm, int bn) {
+    return std::min((kSmemCapacity - fixed_smem(bm, bn, kMaxKBlocks)) / stage_smem(bm, bn), 16);
+}
+constexpr int smem_bytes(int bm, int bn, int k_blocks) {
+    return fixed_smem(bm, bn, k_blocks) + stages(bm, bn) * stage_smem(bm, bn);
+}
+constexpr int math_threads(int bm) { return bm <= 64 ? 128 : 256; }
+// The output's TMA swizzle: the widest of 128/64/32 bytes that a BF16 row of block_n divides.
+constexpr int swizzle_d(int bn) { return (bn * 2) % 128 == 0 ? 128 : (bn * 2) % 64 == 0 ? 64 : 32; }
+
+struct Launch {
+    CUtensorMap a, b, d, sfa;
+    float* sfb;
+    const __nv_bfloat16* residual;
+    std::uint32_t m, n, k;
+    int sms;
+    int smem;
+    cudaStream_t stream;
+};
+
+using LaunchFn = cudaError_t (*)(const Launch&);
+
+#define SINFER_DG_NAME(BM, BN, CM, CN) launch_##BM##_##BN##_##CM##_##CN
+#define SINFER_DG_DECLARE(BM, BN, CM, CN) cudaError_t SINFER_DG_NAME(BM, BN, CM, CN)(const Launch& l);
+SINFER_DG_TILES(SINFER_DG_DECLARE)
+#undef SINFER_DG_DECLARE
+
+} // namespace sinfer::ops::detail::fp8_block::sm90::dg

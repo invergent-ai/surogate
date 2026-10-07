@@ -657,6 +657,10 @@ foreach(mma 0 1)
   set_tests_properties(sinfer_linear_fp8_block_mma${mma}_test PROPERTIES
     ENVIRONMENT "SUROGATE_SERVE_FP8_BLOCK_MMA=${mma}" SKIP_RETURN_CODE 77)
 endforeach()
+# Hopper's CUTLASS tiles alone, which the DeepGEMM kernel otherwise replaces from 33 tokens.
+add_test(NAME sinfer_linear_fp8_block_deepgemm0_test COMMAND sinfer_linear_fp8_block_test)
+set_tests_properties(sinfer_linear_fp8_block_deepgemm0_test PROPERTIES
+  ENVIRONMENT "SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0" SKIP_RETURN_CODE 77)
 sinfer_add_fused_linear_test(
   sinfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp
