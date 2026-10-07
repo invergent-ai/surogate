@@ -1031,9 +1031,11 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     // final by the time any block of it runs.
     using RoutedRows     = WideRows<RoutedCodec, kIntermediate, Rows>;
     using SharedRows     = WideRows<W8Codec, kIntermediate, Rows>;
-    constexpr int kLoads = EarlyLoads ? std::max(kWideLoads<RoutedCodec, kIntermediate, Rows>,
-                                                 kWideLoads<W8Codec, kIntermediate, Rows>)
-                                      : 1;
+    constexpr int kRoutedLoads = kWideLoads<RoutedCodec, kIntermediate, Rows>;
+    constexpr int kSharedLoads = kWideLoads<W8Codec, kIntermediate, Rows>;
+    constexpr int kLoads       = !EarlyLoads                  ? 1
+                                 : kRoutedLoads > kSharedLoads ? kRoutedLoads
+                                                               : kSharedLoads;
     uint4 packed[kLoads];
     std::uint32_t scale_bits[kLoads];
     int expert = 0;
