@@ -479,7 +479,9 @@ expire according to `--pending-timeout-ms`.
 
 Add `--enable-sleep-mode` to let the server save models in system RAM and wake them when
 requested. This also requires enough RAM for their saved state. A request for a sleeping
-model waits while the server makes room and restores it.
+model waits while the server makes room and restores it. On the DGX Spark, whose GPU shares
+the system's memory, sleeping leaves a model's weights in place, so the weights of every model
+must fit together.
 
 Give frequently used models `priority=high` in their `--model` settings, or use
 `--model-priority high` for the first model. Lower-priority idle models are preferred for

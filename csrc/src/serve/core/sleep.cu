@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/device_footprint.h"
 #include "core/engine_context.h"
+#include "core/unified_memory.h"
 
 #include <atomic>
 #include <chrono>
@@ -87,6 +88,15 @@ void map_region(Region& region) {
 void unmap_region(Region& region) {
     driver_check(cuMemUnmap(region.va, region.bytes), "cuMemUnmap");
     driver_check(cuMemRelease(region.handle), "cuMemRelease");
+}
+
+/// On a GPU that allocates from system memory (GB10, Jetson) an Offload region's pinned host
+/// backup comes out of the same DRAM as the region itself, so offloading frees nothing: sleep
+/// would copy the region and release its pages, and from then on the kept backup would hold its
+/// bytes a second time. There such a region stays mapped through sleep, with its contents in
+/// place, and is not counted as memory sleep can release.
+bool stays_mapped(const Region& region) noexcept {
+    return region.tag == SleepTag::Offload && device_is_integrated(region.device);
 }
 
 } // namespace
@@ -186,6 +196,7 @@ std::size_t sleep_device(int device, const void* owner) {
     for (auto& [base, region] : registry().regions) {
         if (region.device != device || region.asleep) { continue; }
         if (owner != nullptr && region.owner != owner) { continue; }
+        if (stays_mapped(region)) { continue; }
         if (region.tag == SleepTag::Offload) {
             if (region.backup == nullptr) {
                 const auto t0 = Clock::now();
@@ -246,6 +257,7 @@ std::size_t sleep_owned_bytes(const void* owner, int device) noexcept {
     std::size_t bytes = 0;
     for (const auto& [base, region] : registry().regions) {
         if (device >= 0 && region.device != device) { continue; }
+        if (stays_mapped(region)) { continue; }
         if (owner == nullptr || region.owner == owner) { bytes += region.bytes; }
     }
     for (const auto& [key, entry] : registry().sparse) {
@@ -267,7 +279,7 @@ void sleep_prepare_backups(const void* owner) {
     const std::lock_guard<std::mutex> lock(registry().mutex);
     for (auto& [base, region] : registry().regions) {
         if (owner != nullptr && region.owner != owner) { continue; }
-        if (region.tag == SleepTag::Offload && region.backup == nullptr) {
+        if (region.tag == SleepTag::Offload && region.backup == nullptr && !stays_mapped(region)) {
             CUDA_CHECK(cudaMallocHost(&region.backup, region.bytes));
         }
     }
