@@ -1,4 +1,5 @@
 #include "ops/linear/fp8_block/fp8_block.h"
+#include "ops/linear/fp8_block/fp8_block_sm120_gemm.h"
 #include "ops/linear/fp8_block/fp8_block_sm90_gemm.h"
 
 #include "core/device.h"
@@ -717,6 +718,28 @@ int device_cc() noexcept {
     return cc;
 }
 
+// The CUTLASS block-scaled GEMM this device runs, if any: Hopper's wgmma kernel (sm_90) or the
+// sm_12x one (RTX Blackwell, GB10). Where one runs, every quantised round lays its activation
+// scales out for it, k-block-major, and the engine's own tile reads that layout too.
+bool cutlass_available() noexcept { return sm90_gemm_available() || sm120_gemm_available(); }
+
+/// The weight's scale grid, as a CUTLASS kernel sees it: 128 x 128 blocks (both kernels) or one
+/// scale per row (the compressed-tensors per-channel kind; sm_12x only, Hopper's tile takes it).
+bool block_grid(const ScaleCell& cell) noexcept { return cell.k_per == kBlock && cell.rows_per == kBlock; }
+bool row_grid(const ScaleCell& cell, std::int32_t k) noexcept { return cell.k_per == k && cell.rows_per == 1; }
+bool cutlass_serves(const ScaleCell& cell, std::int32_t k) noexcept {
+    return block_grid(cell) ? cutlass_available() : row_grid(cell, k) && sm120_gemm_available();
+}
+
+bool cutlass_gemm(const std::uint8_t* act_codes, const float* act_scales, const std::uint8_t* w_codes,
+                  const float* w_scales, bool per_row, void* out_bf16, bool residual, std::int32_t tokens,
+                  std::int32_t n, std::int32_t k, cudaStream_t stream) {
+    if (sm90_gemm_available()) {
+        return !per_row && sm90_gemm(act_codes, act_scales, w_codes, w_scales, out_bf16, residual, tokens, n, k, stream);
+    }
+    return sm120_gemm(act_codes, act_scales, w_codes, w_scales, per_row, out_bf16, residual, tokens, n, k, stream);
+}
+
 // The tensor-core narrow kernel takes the rounds past the GEMV's always-widths up to
 // kMmaMaxTokens: on Hopper by default (measured there; elsewhere the GEMV and the engine's tile
 // keep them).
@@ -778,8 +801,8 @@ bool exact_serves(std::int32_t rows, std::int32_t tokens, bool block) noexcept {
 
 /// One row range of one weight against every column of x, [k, tokens] BF16, written or
 /// accumulated into the segments' outputs. `prepared` holds x's activation planes already (x is
-/// then not read past the GEMV widths). A chained launch (more than one segment) on Hopper's
-/// CUTLASS kernel needs `staging`, [rows, T] BF16, for the kernel's packed output.
+/// then not read past the GEMV widths). A chained launch (more than one segment) on a CUTLASS
+/// kernel needs `staging`, [rows, T] BF16, for the kernel's packed output.
 void run(const __nv_bfloat16* xin, std::int32_t tokens, const Weight& w, std::int32_t row_begin,
          const Segments& segments, bool accumulate, WorkspaceArena* workspace, cudaStream_t stream,
          const char* op, std::byte* prepared = nullptr, __nv_bfloat16* staging = nullptr,
@@ -815,21 +838,23 @@ void run(const __nv_bfloat16* xin, std::int32_t tokens, const Weight& w, std::in
                                   : static_cast<std::byte*>(ggml::scratch_for(bytes, stream));
     auto* x_codes  = reinterpret_cast<std::uint8_t*>(scratch);
     auto* x_scales = reinterpret_cast<float*>(scratch + codes_bytes(k, tokens));
-    // On Hopper the activation scales are laid out for its CUTLASS kernel, which `prepared`
+    // Where a CUTLASS kernel runs the activation scales are laid out for it, which `prepared`
     // planes follow too (linear_projections asks the same question).
-    const bool kb_major = sm90_gemm_available();
+    const bool kb_major = cutlass_available();
     if (prepared == nullptr) {
         launch_quantize_blocks(xin, k, tokens, x_codes, x_scales, kb_major, stream);
     }
-    // Hopper: vLLM's wgmma kernel for the 128 x 128 block grid. A per-channel weight, or a launch
-    // the kernel declines, takes the engine's own tile below on the same activation planes.
-    if (kb_major && cell.k_per == kBlock && cell.rows_per == kBlock) {
-        if (segments.count == 1 &&
-            sm90_gemm(x_codes, x_scales, codes, scales, segments.out[0], accumulate, tokens, rows, k, stream)) {
+    // Hopper and sm_12x: vLLM's CUTLASS kernels for the 128 x 128 block grid, and on sm_12x for a
+    // per-channel weight too. Another grid, or a launch the kernel declines, takes the engine's own
+    // tile below on the same activation planes.
+    if (cutlass_serves(cell, k)) {
+        const bool per_row = row_grid(cell, k);
+        if (segments.count == 1 && cutlass_gemm(x_codes, x_scales, codes, scales, per_row, segments.out[0],
+                                                accumulate, tokens, rows, k, stream)) {
             return;
         }
         if (segments.count > 1 && staging != nullptr && !accumulate &&
-            sm90_gemm(x_codes, x_scales, codes, scales, staging, false, tokens, rows, k, stream)) {
+            cutlass_gemm(x_codes, x_scales, codes, scales, per_row, staging, false, tokens, rows, k, stream)) {
             const long long items = static_cast<long long>(rows / 8) * tokens;
             split_segments_kernel<<<static_cast<unsigned>((items + 255) / 256), 256, 0, stream>>>(staging, segments, tokens);
             CUDA_CHECK(cudaGetLastError());
@@ -974,7 +999,7 @@ void swiglu_linear_add(const Tensor& packed, const Weight& w, Tensor& residual, 
                                     kQuantizeWarps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(packed.data), k, tokens, limit,
         reinterpret_cast<std::uint8_t*>(planes), reinterpret_cast<float*>(planes + codes_bytes(k, tokens)),
-        sm90_gemm_available());
+        cutlass_available());
     CUDA_CHECK(cudaGetLastError());
     Segments one;
     one.count  = 1;
@@ -998,8 +1023,8 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     auto scope = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
     const int k = x.ne[0], tokens = x.ne[1];
     // Consecutive row ranges of one parent -- q/k/v, q/k/gate/v, qkv/z -- run as one launch: the
-    // GEMV and the engine's tile write each range to its own output; Hopper's CUTLASS kernel,
-    // which writes one packed output, stages the rows and splits them, on narrow rounds only.
+    // GEMV and the engine's tile write each range to its own output; a CUTLASS kernel, which
+    // writes one packed output, stages the rows and splits them, on narrow rounds only.
     Segments segments;
     std::int32_t chain_begin = 0;
     const bool chained   = chain(projections, segments, chain_begin);
@@ -1007,8 +1032,7 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     // Quantised once for every launch that reads the planes; a GEMV among them reads x.
     bool gemm = chained && !exact_serves(segments.rows(), tokens, block_cell(parent));
     for (const auto& p : projections) { gemm |= !chained && !exact_serves(p.out.ne[0], tokens, block_cell(p.weight)); }
-    const bool cutlass   = gemm && sm90_gemm_available() && parent.scale_ne[0] == kBlock &&
-                         parent.scale_ne[1] == kBlock;
+    const bool cutlass   = gemm && cutlass_serves(ScaleCell{parent.scale_ne[0], parent.scale_ne[1]}, parent.k);
     const std::size_t plane_bytes = gemm ? workspace_bytes(k, tokens) : 0;
     std::size_t staging_bytes =
         chained && cutlass && tokens <= staged_tokens()
@@ -1039,7 +1063,7 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
         launch_quantize_blocks(static_cast<const __nv_bfloat16*>(x.data), k, tokens,
                                reinterpret_cast<std::uint8_t*>(prepared),
                                reinterpret_cast<float*>(prepared + codes_bytes(k, tokens)),
-                               sm90_gemm_available(), stream);
+                               cutlass_available(), stream);
     }
     if (chained && (!cutlass || staging != nullptr)) {
         run(static_cast<const __nv_bfloat16*>(x.data), tokens, parent, chain_begin, segments, false,

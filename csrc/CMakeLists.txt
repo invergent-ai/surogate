@@ -1113,6 +1113,31 @@ set_source_files_properties(
   "$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10;--diag-suppress=39,161,174,177,186,940;--expt-extended-lambda>")
 target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
+# RTX Blackwell's and GB10's block-scaled FP8 GEMM: CUTLASS's sm_120 blockwise-scaling kernel
+# (TMA, FP8 mma.sync), the one vLLM runs for fine-grained FP8 checkpoints there. Built for the
+# sm_12x targets only, like the FP4 archives, whole-program for the same ptxas reason, and a build
+# without one links a stub that declines every call.
+if(SUROGATE_SERVE_FP4_ARCHS)
+  add_library(sinfer_fp8_block_sm120 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm_mid.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm_mid_row.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm_wide.cu)
+  set_target_properties(sinfer_fp8_block_sm120 PROPERTIES CUDA_ARCHITECTURES "${SUROGATE_SERVE_FP4_ARCHS}")
+else()
+  add_library(sinfer_fp8_block_sm120 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_stub.cpp)
+endif()
+sinfer_internal_includes(sinfer_fp8_block_sm120)
+target_include_directories(sinfer_fp8_block_sm120 PRIVATE
+  ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+set_target_properties(sinfer_fp8_block_sm120 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(sinfer_fp8_block_sm120 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+target_link_libraries(sinfer_fp8_block_sm120 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
 # FlashAttention-3's Hopper forward (src/third_party/flash_attn3, BSD-3-Clause; NOTICE there),
 # the attention vLLM runs on H100/H200: head dims 64, 128 and 256 over the paged cache, causal or
 # windowed, one translation unit per head dim, cache dtype (BF16, and e4m3 as vLLM runs it for an
@@ -1653,7 +1678,7 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # constructor, which then died with SIGILL on hosts without it (seen on one of Modal's H100
 # machines; four other serve tests that build a pool died the same way).
 sinfer_cuda_archive(sinfer_ops)
-target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
@@ -1806,7 +1831,7 @@ endif()
 set(SINFER_SHARED_ARCHIVES "")
 foreach(candidate IN ITEMS
     sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
-    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
+    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
     sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
     sinfer_product_load_progress sinfer_product_cuda_visibility)
   if(TARGET ${candidate})
