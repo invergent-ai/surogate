@@ -498,6 +498,7 @@ set(sinfer_op_tests
   gdn_gating
   gdn_gating_proj
   rope
+  qk_norm_rope
   vision_pos_embed
   vision_attention
   sampling
@@ -595,6 +596,8 @@ sinfer_add_linear_test(sinfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 sinfer_add_test(sinfer_w8_precision_test SOURCES ops/linear/test_w8_precision.cpp LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_test(sinfer_w8_moe_precision_test SOURCES ops/linear/test_w8_moe_precision.cpp LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_op_test(sinfer_w8_tail_test SOURCES ops/linear/test_w8_tail.cu LIBRARIES sinfer_ops CUDA::cudart)
+# The pipelined W8 kernel against the medium-T one, bit for bit; `bench` times both.
+sinfer_add_op_test(sinfer_w8_pipelined_test SOURCES ops/linear/test_w8_pipelined.cu LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 sinfer_add_op_test(sinfer_linear_nvfp4_cublaslt_test SOURCES ops/linear/test_nvfp4_cublaslt.cpp  LIBRARIES sinfer_ops CUDA::cublasLt)

@@ -66,6 +66,10 @@ inline void validate_token_interval(std::int32_t first, std::int32_t last) {
 void debug_probe_dump(std::int32_t magic, const char* tag, const Tensor& tensor,
                       std::int32_t layer_count, cudaStream_t stream);
 
+/// Whether the probes above write anything (SUROGATE_SERVE_DUMP_RESIDUAL is set). Fused kernels
+/// that skip a probed intermediate plane run their separate ops while it is.
+[[nodiscard]] bool debug_probes_armed() noexcept;
+
 /// Fault injection for the serving tests (tests/serve/test_decisions_retry.py). Each fault is
 /// armed by an environment variable holding a count, read once: the first `count` occasions
 /// take it, then it is spent. Unset, a fault is never taken.

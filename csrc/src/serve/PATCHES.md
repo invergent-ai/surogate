@@ -4247,3 +4247,79 @@ graph replayed at two further positions; on Hopper the round holds two input set
 each. On one Nebius H100 every serve test the serve-tests target builds passes (210), and the CLI
 and eight concurrent server requests pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B,
 Qwen3.5-0.8B and Gemma 4 E4B.
+
+## 111
+
+**Query/key norm and RoPE in one kernel (2026-10-07, after #110).** Every attention layer of a
+model with per-head query/key RMSNorm (Qwen3, Qwen3.5/3.6, Gemma) ran three launches between its
+QKV projection and attention: the query norm, the key norm and the rope over both. vLLM fuses
+them. Engine-wide: any family with `attention_qk_norm` and a rotary layer, on every GPU.
+
+- **`ops::qk_norm_rope`** (`api/ops/qk_norm_rope.h`, `ops/kernel/qk_norm_rope.cuh`). A warp a
+  head and a block a (token, eight heads), the rope kernel's grid: the warp loads its head,
+  reduces it the way the rmsnorm kernel the separate op would dispatch reduces it
+  (`rmsnorm_d128_bf16x2_kernel` for a plain gain at 128, `rmsnorm_warp_bf16x2_kernel` for 64 to
+  256), rounds the normalised head to BF16 as that op writes it, and rotates it with the angles
+  the rope kernel the separate op would dispatch computes (the generic kernel's double-precision
+  phases, or the fixed Text1D / TextMrope / DFlash tables for the shapes `rope.cu` sends there;
+  `rope_interleaved`'s sections too). The partner channel is in the same lane when `rotary_dim / 4`
+  is a multiple of 32 and a shuffle away when it is a power of two below 32; anything else (and
+  head dims outside 64..256) declines, and the layer runs the separate ops. A layer without keys
+  of its own normalises and rotates only its queries.
+- **The runtime** (`text_context_impl.h`): `attn_mix`, `mixed_chunk_multi` and
+  `mixed_graph_window` try the fused launch first and fall back to the separate ops. The rope
+  positions are derived before the norm now. Debug probes (`SUROGATE_SERVE_DUMP_RESIDUAL`) keep
+  the separate ops, so the post-norm probe still sees the unrotated plane.
+  `SUROGATE_SERVE_QK_NORM_ROPE=0` turns the fusion off.
+- **A rotated pair's roundings are spelled out** (`rope.cuh`, `rope_rotated_first/second`):
+  `__fmaf_rn(first, c, -__fmul_rn(second, s))` and `__fmaf_rn(second, c, __fmul_rn(first, s))`,
+  in the generic kernel, the fixed kernels and the fused one. Left to the compiler, the fixed
+  kernels contracted `first * c - second * s` the other way from the generic kernel, so a few
+  values in a million differed by one BF16 step between kernels that must agree. The fixed
+  kernels' outputs move by that much on those values.
+- `rmsnorm_fp32_kernel` moved from `rmsnorm.cuh` into its launcher: the header now has a second
+  includer, and a non-template kernel defined in it was a duplicate symbol at link.
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream,
+fusion off -> on: one user 223.6 -> 228.6, 64 users 87.1 -> 87.4; 32 users with 2,048-token
+prompts 52.3k -> 52.1k prompt tok/s (noise).
+
+Tests. `sinfer_qk_norm_rope_test`: 15 geometries (Qwen3 / Llama heads, the DFlash shape,
+Qwen3.6's fixed-table and interleaved heads, Gemma's full and partial rotations, narrow heads,
+queries only) at 1, 3, 64 and 333 tokens from positions 0, 9,000 and 250,000, each bitwise the
+separate rmsnorm + rope; two geometries outside the domain decline without writing. On one
+Nebius H100 it and every rope, rmsnorm and linear test pass, and Qwen3-8B-FP8's CLI and eight
+concurrent server requests pass.
+
+## 112
+
+**A pipelined W8 kernel for small rounds (2026-10-07, after #111).** On an H100 the
+batch-consistent W8G32 route (`launch_w8_consistent`) read Qwen3-8B's W8 vocabulary head
+(151936 x 4096) at 2.0 TB/s at one token, 330 us against a 197 us streaming read of its codes:
+the medium-T kernel stages one 256-wide K group at a time and loads that group's scales inside
+its MMA loop, so a CTA has about 8 KiB in flight and stalls twice a group.
+
+- **`w8_rowsplit_pipelined_kernel`** (`ops/linear/w8/w8_rowsplit_gemm_pipelined.cuh`). The
+  medium-T kernel's arithmetic -- four K-split warps, each weight rounded once to BF16 from its
+  FP16 group scale, each warp's K slices in the same mma order, the same split combine -- with a
+  `Stages`-deep cp.async pipeline over codes, activations and scales (a row's scales over one
+  group are 16 contiguous bytes), in dynamic shared memory. Every output is the medium-T kernel's
+  bits, so the route stays batch-consistent. `RowGroups = 2` gives a CTA two sets of four warps
+  over one staging of the activations, each set over its own 32 rows; each K step dequantises
+  the weight fragments of every row tile before the activation fragment that feeds them all is
+  loaded.
+- **The schedule** (`w8_rowsplit_gemm_splitk.cu`, from the variants' sweep): up to 8 columns,
+  four groups in flight (the head 330 -> 229 us, 12288 x 4096 30 -> 23 us); 9 to 32 columns, two
+  warp sets a CTA where the rows give each SM four or more 64-row CTAs (the head 311 -> 274 us at
+  16 columns, 380 -> 333 at 32); past 32 columns, or 17 to 32 on 16-row weights, the medium-T
+  kernel as before. On sm_90 by default; `SUROGATE_SERVE_W8_PIPELINED=0` turns it off, `=1` on any
+  device, `SUROGATE_SERVE_W8_ROW_GROUPS=1` drops the shared staging.
+
+Qwen3-8B-FP8 (W8 head) on one Nebius H100, decode tok/s a stream, pipelined off -> on: one user
+226.2 -> 231.3, 16 users 168.6 -> 170.1, 64 users unchanged (the medium-T kernel). vLLM 0.31 on
+the same VM type: 228.8, 153.6, 92.4. With #111, one user 221.1 -> 231.3 since #110.
+
+Tests. `sinfer_w8_pipelined_test` checks every row tiling, row grouping and pipeline depth
+against the medium-T kernel bitwise at widths 1 to 129 on a head-like shape, two narrow ones
+(one with K a group short of the deepest pipeline) and rows only 16-row CTAs tile; `bench`
+times them all beside a streaming read. Passes on one Nebius H100 with the linear and W8 tests.

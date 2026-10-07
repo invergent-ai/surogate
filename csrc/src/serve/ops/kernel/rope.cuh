@@ -115,6 +115,18 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
     }
 }
 
+// One rotated pair (first, second) by (c, s), with its roundings spelled out: left to the
+// compiler, `first * c - second * s` contracts into an FMA one way in one kernel and the other way
+// in another, and kernels that must write each other's bits (qk_norm_rope.cuh) would differ in the
+// last place of a few values.
+__device__ __forceinline__ float rope_rotated_first(float first, float second, float c, float s) {
+    return __fmaf_rn(first, c, -__fmul_rn(second, s));
+}
+
+__device__ __forceinline__ float rope_rotated_second(float first, float second, float c, float s) {
+    return __fmaf_rn(second, c, __fmul_rn(first, s));
+}
+
 template <int HeadDim, int Half>
 __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_t token_stride,
                                                 int head, int token, int lane, float c0, float c1,
@@ -126,9 +138,10 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
     auto* data2         = reinterpret_cast<__nv_bfloat162*>(data + base);
     const float2 first  = __bfloat1622float2(data2[lane]);
     const float2 second = __bfloat1622float2(data2[lane + kHalfPair]);
-    data2[lane] = __floats2bfloat162_rn(first.x * c0 - second.x * s0, first.y * c1 - second.y * s1);
-    data2[lane + kHalfPair] =
-        __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
+    data2[lane] = __floats2bfloat162_rn(rope_rotated_first(first.x, second.x, c0, s0),
+                                        rope_rotated_first(first.y, second.y, c1, s1));
+    data2[lane + kHalfPair] = __floats2bfloat162_rn(rope_rotated_second(first.x, second.x, c0, s0),
+                                                    rope_rotated_second(first.y, second.y, c1, s1));
 }
 
 /// The head dim a fixed-mode kernel is compiled for. A dispatcher MUST test the
@@ -242,6 +255,50 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
     }
 }
 
+// One pair's coefficients for rope_generic_kernel, and for any kernel that must rotate exactly as
+// it does (qk_norm_rope.cuh).
+__device__ __forceinline__ void generic_pair_sincos(const std::int32_t* positions, int axes,
+                                                    int tokens, int token, int pair, int head_dim,
+                                                    int rotary_dim, int active_pairs, float theta,
+                                                    int height_pairs, int width_pairs,
+                                                    float frequency_scale, float* sine_out,
+                                                    float* cosine_out) {
+    // Pairs past `active_pairs` carry a zero frequency, which is an exact identity:
+    // cos 1 and sin 0 leave both halves bit-for-bit unchanged. That is how Gemma 4's
+    // proportional rope is defined -- 64 real angles for a 512-wide head, then 192 zeros
+    // *appended*, so the head rotates over its whole width with an inert tail rather than
+    // over a contiguous prefix.
+    if (pair >= active_pairs) {
+        *cosine_out = 1.0F;
+        *sine_out   = 0.0F;
+        return;
+    }
+    if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F && frequency_scale == 1.0F) {
+        fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair, sine_out,
+                                                   cosine_out);
+        return;
+    }
+    int axis       = 0;
+    float exponent = 0.0F;
+    generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
+    if (axes == 3 && height_pairs >= 0) {
+        axis = pair % 3 == 1 && pair / 3 < height_pairs ? 1
+             : pair % 3 == 2 && pair / 3 < width_pairs ? 2 : 0;
+    }
+    // Long contexts amplify float frequency/phase rounding before sine reduction.
+    // Compute the phase in double, then store float coefficients for BF16 rotation.
+    const double power = axes == 2
+        ? -2.0 * (pair % (rotary_dim / 4)) / (rotary_dim / 2)
+        : -2.0 * pair / rotary_dim;
+    const double frequency = pow(static_cast<double>(theta), power);
+    const double angle =
+        static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) * frequency * frequency_scale;
+    double sine, cosine;
+    sincos(angle, &sine, &cosine);
+    *sine_out   = static_cast<float>(sine);
+    *cosine_out = static_cast<float>(cosine);
+}
+
 // A warp per head and a block per (token, eight heads), so a decode round's few tokens still
 // spread over many SMs. Each lane loads its head's values before the block derives the angles,
 // so the loads are in flight while the double-precision phases are computed; Pairs = 2 moves two
@@ -291,40 +348,9 @@ static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_generic_ke
     // Strided, not one thread per pair: a 512-wide head has 256 pairs, the block's own size.
     for (int pair = static_cast<int>(threadIdx.x); pair < half;
          pair += static_cast<int>(blockDim.x)) {
-        // Pairs past `active_pairs` carry a zero frequency, which is an exact identity:
-        // cos 1 and sin 0 leave both halves bit-for-bit unchanged. That is how Gemma 4's
-        // proportional rope is defined -- 64 real angles for a 512-wide head, then 192 zeros
-        // *appended*, so the head rotates over its whole width with an inert tail rather than
-        // over a contiguous prefix.
-        if (pair >= active_pairs) {
-            cos_cache[pair] = 1.0F;
-            sin_cache[pair] = 0.0F;
-            continue;
-        }
-        if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F && frequency_scale == 1.0F) {
-            fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
-                                                       &sin_cache[pair], &cos_cache[pair]);
-        } else {
-            int axis       = 0;
-            float exponent = 0.0F;
-            generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            if (axes == 3 && height_pairs >= 0) {
-                axis = pair % 3 == 1 && pair / 3 < height_pairs ? 1
-                     : pair % 3 == 2 && pair / 3 < width_pairs ? 2 : 0;
-            }
-            // Long contexts amplify float frequency/phase rounding before sine reduction.
-            // Compute the phase in double, then store float coefficients for BF16 rotation.
-            const double power = axes == 2
-                ? -2.0 * (pair % (rotary_dim / 4)) / (rotary_dim / 2)
-                : -2.0 * pair / rotary_dim;
-            const double frequency = pow(static_cast<double>(theta), power);
-            const double angle =
-                static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) * frequency * frequency_scale;
-            double sine, cosine;
-            sincos(angle, &sine, &cosine);
-            sin_cache[pair] = static_cast<float>(sine);
-            cos_cache[pair] = static_cast<float>(cosine);
-        }
+        generic_pair_sincos(positions, axes, tokens, token, pair, head_dim, rotary_dim,
+                            active_pairs, theta, height_pairs, width_pairs, frequency_scale,
+                            &sin_cache[pair], &cos_cache[pair]);
     }
     __syncthreads();
     if (!active) { return; }
@@ -338,8 +364,8 @@ static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_generic_ke
         for (int j = 0; j < Pairs; ++j) {
             const float c = cos_cache[pair + j];
             const float s = sin_cache[pair + j];
-            out_first[j]  = first[step][j] * c - second[step][j] * s;
-            out_second[j] = second[step][j] * c + first[step][j] * s;
+            out_first[j]  = rope_rotated_first(first[step][j], second[step][j], c, s);
+            out_second[j] = rope_rotated_second(first[step][j], second[step][j], c, s);
         }
         if constexpr (Pairs == 2) {
             *reinterpret_cast<__nv_bfloat162*>(row + pair) = __floats2bfloat162_rn(out_first[0], out_first[1]);

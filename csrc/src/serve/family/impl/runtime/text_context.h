@@ -659,6 +659,14 @@ private:
     enum class KvPlane { Text, Mtp };
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, int layer, Phase phase,
                   KvPlane plane = KvPlane::Text);
+    /// A layer's per-head query/key norm and its RoPE in one launch (ops::qk_norm_rope), into the
+    /// normalised planes `qn`/`kn`: true when it ran, false where the variant has no such norm,
+    /// the layer doesn't rotate, parity probes are armed or the op declines the geometry -- the
+    /// caller then runs ops::rmsnorm and ops::rope as before. A layer that owns no key planes
+    /// normalises and rotates its queries alone.
+    bool fused_qk_norm_rope(const Tensor* q_norm, const Tensor* k_norm, int layer, const Tensor& q,
+                            const Tensor& k, Tensor& qn, Tensor& kn, const Tensor& rope_positions,
+                            bool owns_kv, cudaStream_t stream);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     /// The short-convolution mixer, for a family whose non-attending layers run one. Same slot
     /// in the same schedule as `gdn_mix`, and the same three phases; a different mixer.

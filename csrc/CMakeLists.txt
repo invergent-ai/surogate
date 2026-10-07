@@ -1267,6 +1267,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/sampled_logprob.cu
   ${SERVE_ROOT}/ops/launcher/short_conv.cu
   ${SERVE_ROOT}/ops/launcher/rope.cu
+  ${SERVE_ROOT}/ops/launcher/qk_norm_rope.cu
   ${SERVE_ROOT}/ops/launcher/sampling.cu
   ${SERVE_ROOT}/ops/launcher/scalar.cu
   ${SERVE_ROOT}/ops/launcher/scatter.cu
@@ -1486,6 +1487,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/wrapper/sampled_logprob.cpp
   ${SERVE_ROOT}/ops/wrapper/short_conv.cpp
   ${SERVE_ROOT}/ops/wrapper/rope.cpp
+  ${SERVE_ROOT}/ops/wrapper/qk_norm_rope.cpp
   ${SERVE_ROOT}/ops/wrapper/sampling.cpp
   ${SERVE_ROOT}/ops/wrapper/scalar.cpp
   ${SERVE_ROOT}/ops/wrapper/scatter.cpp
