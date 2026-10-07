@@ -1685,53 +1685,43 @@ private:
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         // Round chaining (PATCHES.md #32): burst pure-decode stretches, but
         // admission rides the round cadence (one attempt per GPU unit), so
-        // the burst length must yield to admission pressure: single rounds
-        // while a prefill is staged or a queued request could admit into a
-        // free lane, short bursts while the queue waits on full lanes, full
-        // bursts only when nothing is waiting.
-        std::uint32_t burst_limit = 8;
+        // the burst length must yield to admission: single rounds while a
+        // prefill is staged or a lane is free, full bursts only on full lanes.
+        //
+        // A free lane takes single rounds whether or not a request waits yet:
+        // one that arrived mid-burst waited out the rest of it, up to eight
+        // rounds, before its prefill could start, and a closed-loop client's
+        // next turn lands just after the burst that finished its last one
+        // began. MEASURED (Qwen3-8B-FP8, one H100, 512-token prompts): TTFT
+        // p50 52 -> 19 ms at two users, 30 -> 19-20 ms at three to sixteen,
+        // the same decode tok/s in total (each stream's share of the round
+        // time moves from waiting to decoding); one stream decodes as fast
+        // (210 tok/s; Qwen3-0.6B 690 -> 685, Qwen3.5-0.8B 565 -> 563).
+        // Under queue pressure: MEASURED (4B, 100 users, 90 s) free-lane
+        // bursts of 1 -> 2,661 tok/s, 2 -> 2,174, 4 -> 1,708, with TTFT
+        // 1.7 s / 3.3 s / 5.5 s: delaying a free lane's refill by even ONE
+        // round costs far more than the host serial a burst amortises.
+        // SUROGATE_SERVE_FREE_LANE_BURST repeats the measurement.
+        static const std::uint32_t kFreeLaneBurst = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_FREE_LANE_BURST");
+            return raw != nullptr ? static_cast<std::uint32_t>(std::max(1, std::atoi(raw))) : 1U;
+        }();
+        // SUROGATE_SERVE_BURST_CAP caps the full-lane burst (bisection knob:
+        // the burst chains rounds device-side, and a mid-burst stop token makes
+        // the resolution unwind — cap 1 removes that whole path).
+        static const std::uint32_t kSaturatedBurst = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_BURST_CAP");
+            return raw != nullptr ? static_cast<std::uint32_t>(std::max(1, std::atoi(raw))) : 8U;
+        }();
+        std::uint32_t burst_limit = kSaturatedBurst;
         if (!prefill_lanes_.empty()) {
             burst_limit = 1;
         } else {
-            bool queue_waiting = false;
-            {
-                std::lock_guard lock(queue_mutex_);
-                queue_waiting = !pending_.empty();
-            }
-            if (queue_waiting) {
-                std::uint32_t free_lanes = 0;
-                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                    free_lanes += slots_[lane] == nullptr ? 1U : 0U;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] == nullptr) {
+                    burst_limit = kFreeLaneBurst;
+                    break;
                 }
-                // With continuous admission (PATCHES.md #41) a queue backed up
-                // behind full lanes has nothing to admit into, so the short
-                // burst that used to protect admission cadence only costs host
-                // round-trips. Free lanes still take the single round, so the
-                // next iteration can refill them.
-                // A free lane used to mean "take a single round so the next
-                // iteration can admit into it". With continuous admission
-                // (PATCHES.md #41) admission runs after any decode unit, so a
-                // free lane no longer needs a single-round cadence — and under
-                // 100-user load a lane is nearly always free, which pinned the
-                // burst at 1 and left every round paying full host serial.
-                // Keep a floor so the serial cost is amortised either way.
-                // MEASURED (4B, 100 users, 90 s): 1 -> 2,661 tok/s, 2 -> 2,174,
-                // 4 -> 1,708, with TTFT 1.7 s / 3.3 s / 5.5 s. Delaying a free
-                // lane's refill by even ONE round costs 18%, which is far more
-                // than the host serial a burst amortises. Keep it at 1; the
-                // knob exists so the measurement can be repeated.
-                static const std::uint32_t kFreeLaneBurst = [] {
-                    const char* raw = std::getenv("SUROGATE_SERVE_FREE_LANE_BURST");
-                    return raw != nullptr ? static_cast<std::uint32_t>(std::atoi(raw)) : 1U;
-                }();
-                // SUROGATE_SERVE_BURST_CAP caps the saturated-lane burst too (bisection knob:
-                // the burst chains rounds device-side, and a mid-burst stop token makes the
-                // resolution unwind — cap 1 removes that whole path).
-                static const std::uint32_t kSaturatedBurst = [] {
-                    const char* raw = std::getenv("SUROGATE_SERVE_BURST_CAP");
-                    return raw != nullptr ? static_cast<std::uint32_t>(std::atoi(raw)) : 8U;
-                }();
-                burst_limit = free_lanes > 0 ? kFreeLaneBurst : kSaturatedBurst;
             }
         }
         instance_.program->set_round_burst_limit(burst_limit);

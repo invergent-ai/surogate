@@ -4028,3 +4028,127 @@ one H100 (Modal, then Nebius) the 38 RoPE, linear, SwiGLU, projection, attention
 chat requests through the server pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and
 Gemma 4 E4B (one-stream CLI decode 217, 81, 661, 556 and 101 tok/s); as in #101, the 0.6B and the FP8
 replies differ slightly between concurrent requests, whose rounds differ in width.
+
+## 107
+
+**Hopper decode at two to sixteen tokens, and admission between bursts (2026-10-06, after #106).**
+After #106, Qwen3-8B-FP8 on one H100 decoded 153-158 tok/s a stream at three and four users against
+vLLM's 207: those rounds ran the GEMV, whose work grows with its columns, or quantised their
+activations for the narrow CUTLASS tile, whose grid has no K split. Two users decoded 181 a stream
+(vLLM 222) and waited 53 ms for a first token (vLLM 27). Everything below is
+engine-wide unless it says otherwise.
+
+- **A tensor-core kernel for narrow rounds** (`fp8_block.cu`, `mma_kernel`). Two to sixteen tokens
+  now take a kernel that turns each E4M3 code into a BF16 in registers (exactly: every E4M3 value is
+  one) and runs m16n8k16 MMAs against the BF16 activations as they are, so nothing quantises them
+  first and a round's error is the GEMV's, not the quantised tile's (sampled against a double
+  reference on an H100: 1.5e-3, the BF16 output's own rounding, against 2.4e-2). A CTA takes 16 rows
+  and splits K over four or eight warps by 128-blocks, two blocks in flight; each lane loads 16
+  contiguous codes of two rows and the matching 32 activations (the MMA's k order permuted alike on
+  both sides), a block's MMAs sum unscaled and fold in at the block's scale, and the CTA sums its
+  warps in warp order. Eight warps when one wave holds every CTA, four when even four make two
+  waves, else the split whose last wave idles fewer SMs (occupancy from the runtime). At four tokens
+  over an 8B model's q/k/v, o, gate/up and down on an H100 (us): 11.5 / 8.6 / 37.8 / 21.1, against
+  the GEMV's 14.4 / 11.1 / 48.7 / 28.6 and the tile's 18.2 / 17.7 / 43.0 / 42.7 with its quantise;
+  flat from one to eight tokens, 5-10 % slower at sixteen. In the engine at four users the four
+  projections of a layer take 82 us against 122. Alone the GEMV reads one and two tokens faster
+  (34.0 against 37.5 us at 24576 x 4096), but inside a decode round its kernels ran slower than
+  alone (two tokens: 26.1 us on average over the 8B's four shapes against 18.5; one token: 21.5
+  against 17.9; the SM clock held 1,980 MHz, so the cause is not yet known) while the tensor-core
+  kernel ran within 5 % of its own. Two tokens therefore take the tensor cores (Qwen3-8B-FP8: 212
+  tok/s a stream at two users against 184; Qwen3.6-27B-FP8: 75 against 74); one token stays on the
+  GEMV, where the trade depends on the shapes (the 8B decodes 217 on the tensor cores against 210,
+  the 27B 78 against 80). Either scale cell, chained row ranges and residual accumulation are
+  covered. On by default on sm_90 only, where it was measured (other GPUs keep their routes);
+  `SUROGATE_SERVE_FP8_BLOCK_MMA=0` turns it off, `=1` on, on any GPU, and
+  `SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=N` (0 to 4) keeps rounds up to N tokens on the GEMV.
+- **Single rounds while a lane is free** (`runtime/engine/concurrent_executor.h`). Round chaining
+  (#32) ran eight decode rounds a burst whenever no request waited, and admission waits for a burst
+  to end. A closed-loop client's next turn arrives just after the burst that finished its last turn
+  began, so it waited out nearly the whole burst. A free lane now takes single rounds whether or
+  not a request waits yet; full lanes keep the eight-round burst (`SUROGATE_SERVE_BURST_CAP`), and
+  `SUROGATE_SERVE_FREE_LANE_BURST` sets the free-lane length. Qwen3-8B-FP8: TTFT p50 52 -> 19 ms at
+  two users, 30 -> 19-20 ms at three to sixteen, 36 -> 27 ms at 64, with the same decode tok/s in
+  total (each stream's share of the round time moves from waiting to decoding, so a stream's decode
+  rate dips 1-2 % from three users up); one stream decodes as fast (210 tok/s; Qwen3-0.6B 690 ->
+  685, Qwen3.5-0.8B 565 -> 563). The host's per-round work overlaps the GPU, which is why bursts no
+  longer pay for themselves at these widths.
+- **The decode GEMV past one token** (`gemv_kernel`, every GPU). Each code was converted once per
+  (row, token) pair and each activation once per row. They are now converted once a row and once a
+  chunk (shared by the CTA's rows), with the same sums in the same order: on an H100 four tokens take
+  31-47 % less time over the 8B/27B shapes (down 4096 x 12288: 42.6 -> 28.8 us), two tokens 15-26 %
+  less. Without the tensor-core kernel the GEMV now keeps three tokens on every weight and four below
+  96 row blocks.
+- **RMSNorm's gain and operand loads** (`ops/kernel/rmsnorm.cuh`, every kernel shape). They went out
+  after the row's reduction and its barriers, a second memory round trip; they now go with x's.
+  Bit-identical; the 4096-wide CTA kernel at four users 3.7 -> 2.5 us (73 launches a round).
+
+Qwen3-8B-FP8 against vLLM 0.31 (DeepGEMM linears, BF16 KV both) on the same Nebius H100, 512-token
+prompts and 128 new tokens, decode tok/s a stream and TTFT p50: 1 user 210 / 229 (13 / 24 ms), 2
+users 212 / 222 (19 / 26), 3 users 206 / 215 (19 / 25), 4 users 201 / 211 (19 / 23), 8 users 181 /
+194 (20 / 23), 16 users 155 / 169 (20 / 31), 64 users 78 / 94 (27 / 44); 32 users with 2,048-token
+prompts 51.0k / 53.9k prompt tok/s, TTFT 679 / 257 ms. vLLM varies between VMs (16 users 156 on
+another H100 the same day, where our build measured 153-157), ours within 2 %. Qwen3.6-27B-FP8 (no
+MTP), ours alone: 1 user 80 tok/s a stream (TTFT 41 ms), 2 users 75 (59 ms; 74 and 86 ms before), 4
+users 72 (59 ms; 72 and 149 ms before). What remains: 64 users (83 % of vLLM's decode), one to
+sixteen users (92-96 %), and TTFT under long prompts, where prompts wait behind running streams by
+design.
+
+Tests. `sinfer_linear_fp8_block_test` runs three times: by default, with the tensor-core kernel off
+(`sinfer_linear_fp8_block_mma0_test`) and forced on (`..._mma1_test`, the route other GPUs can
+opt into). New cases: 2, 6, 7, 9, 12, 13 and 16 tokens (one and two 8-token groups, block and
+per-channel cells, row ranges, K over four and eight warps), four tokens at 96+ row blocks, a
+two-token chain, a chain whose ranges are each under 96 blocks while the parent is not, and the
+fused SwiGLU pair at a 12288 output. On one Nebius H100 the 47 RoPE, linear, SwiGLU, projection,
+attention, MLP, norm, SiLU and batch-invariance tests pass (five NVFP4 tests skip). End to end,
+greedy through the CLI and eight concurrent chat requests through the server pass for
+Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B (one-stream CLI decode
+217, 81, 673, 573 and 104 tok/s).
+
+## 108
+
+**Sampling, the W8 LM head and staged projections at 64 users (2026-10-07, after #107).** After
+#107 Qwen3-8B-FP8 on one H100 decoded 78 tok/s a stream at 64 users against vLLM's 94. Of the
+round's time past vLLM's, the FP8 GEMMs were about half, the LM head and sampling about a third.
+Everything below is engine-wide.
+
+- **A greedy route through the sampler** (`ops/kernel/sampling.cuh`, `sampling_greedy_kernel`). A
+  greedy column needs only the argmax over its allowed tokens, but went through the candidate
+  route: one CTA per 512-token tile, 19,008 CTAs and 81 us for the 19 MB of 64 columns of a
+  151,936-token vocabulary, bound by scheduling and 2-byte loads. A greedy CTA now reads one
+  8,192-token chunk of one row with 16-byte loads (a row with a bias or a barred token a token at a
+  time) and the last to finish reduces the chunk maxima: 12 us. One key per token, ties to the lower
+  id, so the result is the old route's bits however the row is split.
+- **Only the rows that need them walk the candidate passes** (`sampling_sorted.cuh`,
+  `sampling_for_each_unit`). The candidate tiles, the sorted tiles and their merge passes launched a
+  CTA per (tile, row) and returned early on rows that skip them, greedy rows included, or walked the
+  rows from each CTA. A resident grid now counts each chunk of 256 rows' units in shared memory (a
+  prefix sum) and strides over the admitted ones only: the top-k tiles 81 -> 15 us at 64 greedy
+  columns, and a round's eight merge passes cost nothing when no row samples.
+- **`sampled_logprob` reads 16 bytes at a time** (`ops/launcher/sampled_logprob.cu`), four loads in
+  flight a thread: one block per column read a whole row twice with one 2-byte load in flight, 33 us
+  whatever the batch; 16 us at 64 columns.
+- **32-row CTAs for wide W8 heads** (`ops/linear/w8/w8_rowsplit_gemm_splitk.cu`). Every CTA stages
+  its columns' activations for the whole K, so 16-row CTAs over a vocabulary head read them from L2
+  eight times over the weight's own bytes. When the weight still gives two 32-row CTAs an SM, a CTA
+  takes two 16-row tiles (bit-identical: each output's K order is the kernel's). Qwen3-8B's head
+  (151936 x 4096) alone: 376 -> 331 us at one token, 659 -> 520 us at 64. Narrower weights keep one
+  tile (6144 x 4096 would go 17 -> 20 us).
+- **Hopper's staged projections to 1,024 tokens** (`ops/linear/fp8_block/fp8_block.cu`). q/k/v
+  ranges of one parent ran as one GEMM into a staging plane only up to 128 tokens; past that they ran
+  apart, where a 1024-row k or v range at 576 tokens (a 512-token prompt beside 64 decode rows) is 40
+  tiles on 132 SMs: Qwen3-8B's q, k and v took 26.8 + 12.6 + 13.0 us, against 31.1 for vLLM's one
+  GEMM. The plane is rows x tokens BF16 (12 MiB for 6,144 rows at the cap);
+  `SUROGATE_SERVE_FP8_BLOCK_STAGED_TOKENS` lowers the cap.
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream: 64
+users 78.5 -> 81.8, 16 users 155.7 -> 160.0, one user 212.6 either way; 32 users with 2,048-token
+prompts 50.9k prompt tok/s (50.7k before).
+
+Tests. `sinfer_sampling_test` runs its greedy contract (penalties and filters that a greedy row
+ignores, ties, padding past the vocabulary) on a 16-byte-aligned row stride and on an odd one, and
+gains a `sampled_logprob` contract against a host log-softmax (three vocabularies, padded and not,
+greedy and tempered columns). The FP8 chain test adds 576 and 1,100 tokens (staged, and past
+the cap). On one Nebius H100 the 44 sampling, speculative, argmax, batch-invariance, MTP, DFlash,
+linear, W8 and head tests pass; end to end, the CLI and eight concurrent server requests pass for
+Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.

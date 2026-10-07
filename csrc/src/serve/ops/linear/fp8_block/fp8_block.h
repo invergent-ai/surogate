@@ -30,8 +30,9 @@ void require_fp8_block_weight(const Weight& w, const char* op);
                                                           std::int32_t input_rows,
                                                           std::int32_t max_tokens);
 /// What linear_projections over row ranges of a `parent_rows` parent needs to run them as one
-/// launch on Hopper (a staging plane on narrow rounds); an arena with only
+/// launch on Hopper (a staging plane on rounds to staged_max_tokens); an arena with only
 /// linear_workspace_capacity_bytes runs them one by one.
+[[nodiscard]] int staged_max_tokens() noexcept;
 [[nodiscard]] std::size_t projections_workspace_capacity_bytes(std::int32_t parent_rows,
                                                                std::int32_t input_rows,
                                                                std::int32_t max_tokens);
@@ -52,8 +53,8 @@ void project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tens
                   WorkspaceArena* workspace, cudaStream_t stream);
 
 /// Whether a round of `tokens` columns through `w` runs on quantised activations -- past the
-/// GEMV's widths for this weight, which read the exact BF16 activation instead (to four tokens;
-/// on Hopper a tall block-FP8 weight leaves the GEMV past two, see gemv_serves).
+/// exact widths for this weight, where the GEMV (to four tokens) or, on Hopper, the narrow
+/// tensor-core kernel (to sixteen) reads the BF16 activation instead (see exact_serves).
 [[nodiscard]] bool quantizes_activations(const Weight& w, std::int32_t tokens) noexcept;
 /// residual[n, T] += W . (silu(gate) * up), from `packed` [2k, T]: each token's k gate rows, then
 /// its k up rows (linear_swiglu's packed plane). The activation goes straight into W's quantised

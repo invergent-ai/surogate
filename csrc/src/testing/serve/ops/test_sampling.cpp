@@ -363,9 +363,7 @@ int bias_and_mask_contract() {
     return failures;
 }
 
-int greedy_contract() {
-    constexpr int physical_rows = 248320;
-    constexpr int token_domain  = 248077;
+int greedy_contract(int physical_rows, int token_domain) {
     constexpr int batch         = 8;
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -9.0f);
     for (int row = 0; row < batch; ++row) {
@@ -830,6 +828,56 @@ int test_batched_logprob_scores() {
     return failures;
 }
 
+int sampled_logprob_contract() {
+    int failures = 0;
+    for (const int domain : {7, 1031, 151936}) {
+        for (const int padding : {0, 17}) {
+            constexpr int columns = 3;
+            const int vocab       = domain + padding;
+            std::vector<float> input(static_cast<std::size_t>(vocab) * columns, 1000.0f);
+            std::vector<int> tokens(columns);
+            std::vector<ops::SamplingConfig> configs(columns);
+            configs[1].temperature = 0.7f;
+            configs[2].temperature = 1.3f;
+            for (int col = 0; col < columns; ++col) {
+                tokens[col] = (col * 4099 + 3) % domain;
+                for (int i = 0; i < domain; ++i) {
+                    input[static_cast<std::size_t>(col) * vocab + i] = float((i * 73 + col * 19) % 127 - 63) / 8;
+                }
+            }
+            round_to_bf16(input);
+            auto device = to_device(bf16_bits(input));
+            auto chosen = to_device(tokens);
+            auto params = to_device(configs);
+            GuardedDeviceBuffer written(columns * sizeof(float));
+            Tensor logits(device.p, DType::BF16, {vocab, columns});
+            Tensor ids(chosen.p, DType::I32, {columns});
+            Tensor out(written.data(), DType::FP32, {columns});
+            ops::sampled_logprob(logits, ids, out, domain,
+                                 static_cast<const ops::SamplingConfig*>(params.p), nullptr);
+            cuda_synchronize();
+            std::vector<float> actual(columns);
+            written.copy_to_host(actual.data(), written.bytes());
+            failures += written.verify_guards("sampled logprob");
+            for (int col = 0; col < columns; ++col) {
+                const double inverse = configs[col].temperature > 0 ? 1.0 / configs[col].temperature : 1.0;
+                const float* row     = input.data() + static_cast<std::size_t>(col) * vocab;
+                double maximum       = -INFINITY;
+                for (int i = 0; i < domain; ++i) { maximum = std::max(maximum, row[i] * inverse); }
+                double sum = 0;
+                for (int i = 0; i < domain; ++i) { sum += std::exp(row[i] * inverse - maximum); }
+                const double expected = row[tokens[col]] * inverse - maximum - std::log(sum);
+                if (!(std::abs(actual[col] - expected) <= 1e-4)) {
+                    std::cerr << "sampled logprob domain=" << domain << " padding=" << padding
+                              << " column=" << col << ": " << actual[col] << " vs " << expected << '\n';
+                    ++failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -865,7 +913,11 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += bias_and_mask_contract();
-    failures += greedy_contract();
+    // A 16-byte-aligned stride (every row on the greedy route's vector loads) and an
+    // odd one (every row but the first read a token at a time).
+    failures += greedy_contract(248320, 248077);
+    failures += greedy_contract(151937, 151936);
+    failures += sampled_logprob_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();

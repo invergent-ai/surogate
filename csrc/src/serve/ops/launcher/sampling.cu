@@ -56,11 +56,17 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     }
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
-    const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
-                            static_cast<unsigned int>(batch));
+    const unsigned int partial_grid = sampling_resident_grid(
+        sampling_partial_topk_kernel, static_cast<std::int64_t>(partial_blocks) * batch);
     sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), configs, token_domain, physical_rows,
-        scratch);
+        batch, scratch);
+    CUDA_CHECK(cudaGetLastError());
+    const std::int32_t greedy_chunks = div_up(token_domain, kSamplerGreedyChunkItems);
+    sampling_greedy_kernel<<<dim3(static_cast<unsigned int>(greedy_chunks),
+                                  static_cast<unsigned int>(batch)), kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
+        configs, token_domain, physical_rows, greedy_chunks, scratch);
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(

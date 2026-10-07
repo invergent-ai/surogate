@@ -6,12 +6,43 @@
 #include "ops/common/warp.cuh"
 
 #include <cmath>
+#include <cstdint>
 #include <cuda_bf16.h>
 
 namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kThreads = 512;
+constexpr int kVector  = 8; // BF16 logits per 16-byte load
+constexpr int kUnroll  = 4; // loads each thread keeps in flight
+
+/// Calls `visit(x)` for every logit of the row, scaled by `inverse`. An aligned row
+/// is read 16 bytes at a time, kUnroll loads issued before any is used: one block
+/// per column reads a whole 151,936-token row twice, and with one 2-byte load per
+/// thread in flight that took 33 us whatever the batch, a block's own latency
+/// rather than bandwidth. Padding lanes read as -inf, which neither pass notices.
+template <class Visit>
+__device__ __forceinline__ void for_each_scaled(const __nv_bfloat16* __restrict__ row, int domain,
+                                                float inverse, Visit&& visit) {
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int vector_end = (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 ? domain / kVector * kVector : 0;
+    for (int base = tid * kVector; base < vector_end; base += kThreads * kVector * kUnroll) {
+        uint4 packed[kUnroll];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const int v = base + u * kThreads * kVector;
+            packed[u]   = v < vector_end ? *reinterpret_cast<const uint4*>(row + v)
+                                         : make_uint4(0xff80ff80u, 0xff80ff80u, 0xff80ff80u, 0xff80ff80u);
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed[u]);
+#pragma unroll
+            for (int i = 0; i < kVector; ++i) { visit(__bfloat162float(values[i]) * inverse); }
+        }
+    }
+    for (int v = vector_end + tid; v < domain; v += kThreads) { visit(__bfloat162float(row[v]) * inverse); }
+}
 
 /// One block per column: a max pass and a sum pass over the vocabulary, each
 /// reduced within warps and then across them through shared memory. The scale is
@@ -34,9 +65,7 @@ sampled_logprob_kernel(const __nv_bfloat16* __restrict__ logits, const int* __re
     const float inverse     = temperature > 0.0f ? 1.0f / temperature : 1.0f;
 
     float local_max = -INFINITY;
-    for (int v = tid; v < domain; v += kThreads) {
-        local_max = fmaxf(local_max, __bfloat162float(row[v]) * inverse);
-    }
+    for_each_scaled(row, domain, inverse, [&](float x) { local_max = fmaxf(local_max, x); });
     const float warp_best = warp_max(local_max);
     if (lane == 0) { partial[warp] = warp_best; }
     __syncthreads();
@@ -46,9 +75,7 @@ sampled_logprob_kernel(const __nv_bfloat16* __restrict__ logits, const int* __re
     __syncthreads();
 
     float local_sum = 0.0f;
-    for (int v = tid; v < domain; v += kThreads) {
-        local_sum += expf(__bfloat162float(row[v]) * inverse - block_max);
-    }
+    for_each_scaled(row, domain, inverse, [&](float x) { local_sum += expf(x - block_max); });
     local_sum = warp_sum(local_sum);
     if (lane == 0) { partial[warp] = local_sum; }
     __syncthreads();

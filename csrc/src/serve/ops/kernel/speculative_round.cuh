@@ -254,56 +254,61 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     }
 }
 
+// Candidate tiles of every verification column a bounded-candidate row licenses, walked
+// by a resident grid over [batch][cols][partial] (see sampling_for_each_unit).
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
     const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
+    std::int32_t cols, std::int32_t k, std::int32_t batch, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
-    const int row     = static_cast<int>(blockIdx.z);
-    const int col     = static_cast<int>(blockIdx.y);
-    const int partial = static_cast<int>(blockIdx.x);
-    int extent        = current_extents[row];
-    extent            = extent < 0 ? 0 : (extent > k ? k : extent);
-    if (col > extent) { return; }
-    const SamplingConfig cfg = configs[row];
-    if (!(cfg.temperature > 0.0f) || sampling_wide(cfg) || token_domain <= kSamplerTileItems) { return; }
-    workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
-    if (partial == 0 && threadIdx.x == 0) {
-        workspace.group_done[col] = 0;
-        if (col == 0) { *workspace.speculative_finalize_count = 0; }
-    }
-
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
-    unsigned long long keys[kSamplerItemsPerThread];
-
-    const int cap                  = sampling_candidate_cap(cfg, token_domain);
-    const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
-    const std::int32_t* row_drafts = drafts + row * k;
-    const int tile_start           = partial * kSamplerPartialTileItems;
-    // Column col's penalty overlay is the first `col` drafts (see accept loop);
-    // applying it before top-k selection lets it change the candidate set, not
-    // just the post-truncation probabilities.
-#pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v < token_domain) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
-                                                    row_drafts, col);
-            keys[item]    = sampling_sort_key(x, v);
-        } else {
-            keys[item] = 0ull;
+    __shared__ SamplingRowAdmission rows;
+    const auto candidate_route = [&](int row) {
+        const SamplingConfig& cfg = configs[row];
+        return cfg.temperature > 0.0f && !sampling_wide(cfg) && token_domain > kSamplerTileItems;
+    };
+    // Columns past a row's extent (clamped to [0, k]) are not verified; col <= k always.
+    sampling_for_each_unit(rows, batch, cols, div_up(token_domain, kSamplerPartialTileItems),
+                           current_extents, candidate_route, [&](int row, int col, int partial) {
+        const SamplingConfig cfg             = configs[row];
+        const SamplingWorkspace row_workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
+        if (partial == 0 && threadIdx.x == 0) {
+            row_workspace.group_done[col] = 0;
+            if (col == 0) { *row_workspace.speculative_finalize_count = 0; }
         }
-    }
-    SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+
+        unsigned long long keys[kSamplerItemsPerThread];
+
+        const int cap                  = sampling_candidate_cap(cfg, token_domain);
+        const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
+        const std::int32_t* row_drafts = drafts + row * k;
+        const int tile_start           = partial * kSamplerPartialTileItems;
+        // Column col's penalty overlay is the first `col` drafts (see accept loop);
+        // applying it before top-k selection lets it change the candidate set, not
+        // just the post-truncation probabilities.
+#pragma unroll
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int v = tile_start + item * blockDim.x + threadIdx.x;
+            if (v < token_domain) {
+                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
+                                                        row_drafts, col);
+                keys[item]    = sampling_sort_key(x, v);
+            } else {
+                keys[item] = 0ull;
+            }
+        }
+        SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int rank = threadIdx.x * kSamplerItemsPerThread + item;
-        if (rank < cap) {
-            const int off               = sampling_partial_offset(workspace, col, partial, rank);
-            workspace.partial_keys[off] = keys[item];
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int rank = threadIdx.x * kSamplerItemsPerThread + item;
+            if (rank < cap) {
+                const int off                   = sampling_partial_offset(row_workspace, col, partial, rank);
+                row_workspace.partial_keys[off] = keys[item];
+            }
         }
-    }
+        __syncthreads(); // sort_storage is reused by the next tile
+    });
 }
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(

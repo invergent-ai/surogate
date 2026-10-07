@@ -11,6 +11,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <optional>
 #include <stdexcept>
@@ -31,8 +32,19 @@ constexpr int kBlocksPerSm  = 2;
 constexpr std::size_t kAlign = 256;
 // Hopper's CUTLASS kernel writes one packed output, so consecutive row ranges of a parent run as
 // one GEMM into a staging plane and a split -- on rounds up to this many tokens, where separate
-// launches leave most SMs idle and the plane is small.
-constexpr int kStagedMaxTokens = 128;
+// launches leave SMs idle: a 1024-row k or v range at 576 tokens (a 512-token prompt beside 64
+// decode rows) is 40 tiles of 128 x 128 on 132 SMs. There Qwen3-8B's q, k and v took 26.8 + 12.6 +
+// 13.0 us apart on an H100 against 31.1 for vLLM's one GEMM. The plane is rows x tokens BF16
+// (6144 rows: 12 MiB at the cap). SUROGATE_SERVE_FP8_BLOCK_STAGED_TOKENS lowers it (A/B knob).
+constexpr int kStagedCapTokens = 1024;
+int staged_tokens() noexcept {
+    static const int tokens = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_STAGED_TOKENS");
+        const int forced = raw != nullptr ? std::atoi(raw) : 0;
+        return forced > 0 ? std::min(forced, kStagedCapTokens) : kStagedCapTokens;
+    }();
+    return tokens;
+}
 
 /// Where a launch's rows land: up to four consecutive row ranges of one weight, each in its own
 /// [rows, T] output -- a parent's q/k/v or q/k/gate/v projections as one launch. One output is
@@ -171,17 +183,34 @@ __device__ __forceinline__ uint4 load_streaming(const std::uint8_t* p) {
 // then sums its warps' partials in warp order. Against a warp per whole row (and the scale
 // cell's runtime divisions), one token over the q/k/v, o, gate/up and down shapes of 8B and 27B
 // models takes 24 % less time on an H100 (gate/up 24576 x 4096: 47.1 -> 34.2 us, 2.9 TB/s).
+// Past one token the kernel is bound by instructions, not bytes: each code is converted once a
+// row and each activation once a chunk (shared by the CTA's rows), not once per (row, token)
+// pair, with the same sums in the same order: on an H100 four tokens take 31-47 % less time
+// over the same shapes (down 4096 x 12288: 42.6 -> 28.8 us), two tokens 15-26 % less.
 constexpr int kGemvRows   = 2;
 constexpr int kGemvWarps  = 2;
 constexpr int kGemvUnroll = 2;
 constexpr int kGemvChunk  = 512; // codes a warp reads per step: 32 lanes x 16
 static_assert(kTileRows % kGemvRows == 0, "a launch's rows are whole 64-row tiles");
 
-// A lane's 16 codes against one token's 16 activations, summed in code order. VecX: the
-// activations are 16-byte aligned and come in two vector loads.
-template <bool VecX>
-__device__ __forceinline__ float dot16(const uint4 packed, const __nv_bfloat16* xp) {
+// A lane's 16 codes as floats, in code order.
+__device__ __forceinline__ void codes16(const uint4 packed, float (&w)[16]) {
     const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 lo = e4m3x2_to_float2(static_cast<std::uint16_t>(words[i] & 0xffffu));
+        const float2 hi = e4m3x2_to_float2(static_cast<std::uint16_t>(words[i] >> 16));
+        w[4 * i]     = lo.x;
+        w[4 * i + 1] = lo.y;
+        w[4 * i + 2] = hi.x;
+        w[4 * i + 3] = hi.y;
+    }
+}
+
+// One token's 16 activations as floats. VecX: they are 16-byte aligned and come in two vector
+// loads.
+template <bool VecX>
+__device__ __forceinline__ void acts16(const __nv_bfloat16* xp, float (&v)[16]) {
     std::uint32_t xw[8];
     if constexpr (VecX) {
         const uint4 lo = *reinterpret_cast<const uint4*>(xp);
@@ -192,19 +221,12 @@ __device__ __forceinline__ float dot16(const uint4 packed, const __nv_bfloat16* 
 #pragma unroll
         for (int i = 0; i < 8; ++i) { xw[i] = *reinterpret_cast<const std::uint32_t*>(xp + 2 * i); }
     }
-    float part = 0.0f;
 #pragma unroll
-    for (int w = 0; w < 4; ++w) {
-        const float2 w01 = e4m3x2_to_float2(static_cast<std::uint16_t>(words[w] & 0xffffu));
-        const float2 w23 = e4m3x2_to_float2(static_cast<std::uint16_t>(words[w] >> 16));
-        const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[2 * w]));
-        const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[2 * w + 1]));
-        part = fmaf(w01.x, x01.x, part);
-        part = fmaf(w01.y, x01.y, part);
-        part = fmaf(w23.x, x23.x, part);
-        part = fmaf(w23.y, x23.y, part);
+    for (int i = 0; i < 8; ++i) {
+        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xw[i]));
+        v[2 * i]     = f.x;
+        v[2 * i + 1] = f.y;
     }
-    return part;
 }
 
 /// PerRow: the per-channel cell (one scale a row); otherwise the 128 x 128 block cell, whose
@@ -231,13 +253,23 @@ __global__ __launch_bounds__(kGemvWarps * 32) void gemv_kernel(const std::uint8_
         for (int t = 0; t < Tokens; ++t) { acc[r][t] = 0.0f; }
     }
     const auto chunk = [&](const int base, const uint4 (&packed)[kGemvRows]) {
+        float xv[Tokens][16];
+#pragma unroll
+        for (int t = 0; t < Tokens; ++t) {
+            if (t < tokens) { acts16<VecX>(x + static_cast<std::size_t>(t) * k + base, xv[t]); }
+        }
 #pragma unroll
         for (int r = 0; r < kGemvRows; ++r) {
             const float s = scale_of(r, base);
+            float w[16];
+            codes16(packed[r], w);
 #pragma unroll
             for (int t = 0; t < Tokens; ++t) {
                 if (t < tokens) {
-                    acc[r][t] = fmaf(s, dot16<VecX>(packed[r], x + static_cast<std::size_t>(t) * k + base), acc[r][t]);
+                    float part = 0.0f; // the 16 products in code order, then scaled once
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) { part = fmaf(w[i], xv[t][i], part); }
+                    acc[r][t] = fmaf(s, part, acc[r][t]);
                 }
             }
         }
@@ -302,6 +334,163 @@ void launch_gemv(const std::uint8_t* codes, const float* scales, const __nv_bflo
     default: launch(gemv_kernel<4, VecX, PerRow>); break;
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- narrow rounds: tensor cores on exact BF16 activations ----
+// Two to sixteen tokens (Hopper; see mma_enabled): each code becomes a BF16 in registers
+// (exactly: every E4M3 value is one) and m16n8k16 MMAs take the products against the BF16
+// activations as they are, so a round's error is the GEMV's, not the quantised tile's (on an
+// H100, sampled against a double reference: 1.5e-3, the BF16 output's own rounding, against the
+// tile's 2.4e-2), and nothing quantises the activations first. A CTA takes 16 rows and splits K
+// over W warps by 128-blocks (warp w: blocks w, w + W, ..., two in flight; W per launch in
+// launch_mma_split). Lane (g = lane / 4, t = lane % 4) holds, of each block, codes [16t, 16t + 16)
+// and [64 + 16t, 80 + 16t) of rows g and g + 8 and the same 32 activations of token g of each
+// 8-token group: the MMA's k order permuted alike on both sides, so each load is 16 contiguous
+// bytes and each row's 128 codes two fully used 64-byte runs. A block's eight MMAs sum unscaled,
+// then fold in at the block's scale; the CTA sums its warps' partials in warp order. At four
+// tokens over the q/k/v, o, gate/up and down shapes of an 8B model on an H100 (us): 11.5 / 8.6 /
+// 37.8 / 21.1, against the GEMV's 14.4 / 11.1 / 48.7 / 28.6 and the narrow CUTLASS tile's 18.2 /
+// 17.7 / 43.0 / 42.7 with its quantise (its grid has no K split, so a 4096-row weight gets 32
+// CTAs); flat from one to eight tokens, 5-10 % slower at sixteen.
+constexpr int kMmaMaxTokens = 16;
+constexpr int kMmaRows      = 16;
+constexpr int kMmaUnroll    = 2;
+static_assert(kTileRows % kMmaRows == 0 && kBlock % kMmaRows == 0, "a CTA's rows share one scale row");
+
+__device__ __forceinline__ unsigned e4m3x2_to_bf16x2(std::uint32_t two) {
+    const float2 f = e4m3x2_to_float2(static_cast<std::uint16_t>(two & 0xffffu));
+    const __nv_bfloat162 v = __floats2bfloat162_rn(f.x, f.y); // exact
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+
+__device__ __forceinline__ uint4 load_activations(const __nv_bfloat16* p) {
+    uint4 v;
+    asm("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ std::uint32_t word_of(const uint4& v, int i) {
+    return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+
+/// NT: 8-token groups; W: the warps K is split over. VecX: x is 16-byte aligned (eight
+/// activations a load, else two a load); PerRow: one scale a row, else the 128 x 128 cell.
+template <int NT, int W, bool VecX, bool PerRow>
+__global__ __launch_bounds__(W * 32) void mma_kernel(const std::uint8_t* __restrict__ codes,
+                                                     const float* __restrict__ scales,
+                                                     const __nv_bfloat16* __restrict__ x,
+                                                     const Segments segments, int k, int tokens,
+                                                     bool accumulate) {
+    __shared__ float partials[W][kMmaRows][NT * 8 + 1];
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    const int g = lane >> 2, t = lane & 3;
+    const int row0    = static_cast<int>(blockIdx.x) * kMmaRows;
+    const int kblocks = k >> 7;
+    const float* block_scales = scales + static_cast<std::size_t>(row0 >> 7) * kblocks;
+    const std::uint8_t* w_lane = codes + static_cast<std::size_t>(row0 + g) * k + 16 * t;
+    const std::size_t eight_rows = static_cast<std::size_t>(8) * k;
+    const __nv_bfloat16* x_lane[NT];
+    bool live[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int token = 8 * nt + g;
+        live[nt]   = token < tokens;
+        x_lane[nt] = x + static_cast<std::size_t>(live[nt] ? token : 0) * k + 16 * t;
+    }
+    const auto activations = [&](const __nv_bfloat16* p) {
+        if constexpr (VecX) {
+            return load_activations(p);
+        } else {
+            const auto* words = reinterpret_cast<const std::uint32_t*>(p);
+            return make_uint4(words[0], words[1], words[2], words[3]);
+        }
+    };
+    float acc[NT][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { acc[nt][e] = 0.0f; }
+    }
+    for (int kb0 = warp; kb0 < kblocks; kb0 += W * kMmaUnroll) {
+        uint4 a[kMmaUnroll][2][2]; // [block][row g, g + 8][codes 16t.., 64 + 16t..]
+        uint4 b[kMmaUnroll][NT][4]; // [block][group][activations 16t.. (two), 64 + 16t.. (two)]
+        float s[kMmaUnroll];
+#pragma unroll
+        for (int u = 0; u < kMmaUnroll; ++u) {
+            const int kb = kb0 + u * W;
+            if (kb < kblocks) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        a[u][h][q] = load_streaming(w_lane + h * eight_rows + kb * kBlock + 64 * q);
+                    }
+                }
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        b[u][nt][i] = live[nt] ? activations(x_lane[nt] + kb * kBlock + 64 * (i >> 1) + 8 * (i & 1))
+                                               : make_uint4(0, 0, 0, 0);
+                    }
+                }
+                s[u] = PerRow ? 1.0f : block_scales[kb]; // a per-row scale goes on at the end
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kMmaUnroll; ++u) {
+            if (kb0 + u * W < kblocks) {
+                float blk[NT][4];
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) { blk[nt][e] = 0.0f; }
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    // codes 4j..4j+3 of the lane's 32: rows g and g + 8, k (2t, 2t+1) and (2t+8, 2t+9)
+                    const std::uint32_t w0 = word_of(a[u][0][j >> 2], j & 3);
+                    const std::uint32_t w8 = word_of(a[u][1][j >> 2], j & 3);
+                    const unsigned a0 = e4m3x2_to_bf16x2(w0), a2 = e4m3x2_to_bf16x2(w0 >> 16);
+                    const unsigned a1 = e4m3x2_to_bf16x2(w8), a3 = e4m3x2_to_bf16x2(w8 >> 16);
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        mma_bf16(blk[nt][0], blk[nt][1], blk[nt][2], blk[nt][3], a0, a1, a2, a3,
+                                 word_of(b[u][nt][j >> 1], (2 * j) & 3), word_of(b[u][nt][j >> 1], (2 * j + 1) & 3));
+                    }
+                }
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) { acc[nt][e] = fmaf(s[u], blk[nt][e], acc[nt][e]); }
+                }
+            }
+        }
+    }
+    // c0, c1: row g, tokens 2t and 2t + 1 of the group; c2, c3: row g + 8
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        partials[warp][g][8 * nt + 2 * t]         = acc[nt][0];
+        partials[warp][g][8 * nt + 2 * t + 1]     = acc[nt][1];
+        partials[warp][g + 8][8 * nt + 2 * t]     = acc[nt][2];
+        partials[warp][g + 8][8 * nt + 2 * t + 1] = acc[nt][3];
+    }
+    __syncthreads();
+    for (int item = static_cast<int>(threadIdx.x); item < kMmaRows * NT * 8; item += W * 32) {
+        const int token = item / kMmaRows, r = item % kMmaRows;
+        if (token < tokens) {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < W; ++w) { v += partials[w][r][token]; }
+            if constexpr (PerRow) { v *= scales[row0 + r]; } // the blocks summed unscaled
+            const int row       = row0 + r;
+            const Segment seg   = segment_of(segments, row);
+            __nv_bfloat16* slot = seg.out + static_cast<std::size_t>(token) * seg.rows + (row - seg.begin);
+            if (accumulate) { v += __bfloat162float(*slot); }
+            *slot = __float2bfloat16_rn(v);
+        }
+    }
 }
 
 // ---- prefill: a 64-row x 64-token tile, the block scale applied once per 128 of K ----
@@ -451,14 +640,57 @@ __global__ void split_segments_kernel(const __nv_bfloat16* __restrict__ staged, 
         *reinterpret_cast<const uint4*>(staged + static_cast<std::size_t>(token) * segments.rows() + row);
 }
 
-int persistent_blocks() {
-    static const int blocks = [] {
-        int device = 0, sms = 0;
+int sm_count() {
+    static const int sms = [] {
+        int device = 0, count = 0;
         CUDA_CHECK(cudaGetDevice(&device));
-        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        return kBlocksPerSm * sms;
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        return count;
+    }();
+    return sms;
+}
+
+int persistent_blocks() { return kBlocksPerSm * sm_count(); }
+
+template <int NT, int W, bool VecX, bool PerRow>
+int mma_blocks_per_sm() {
+    static const int blocks = [] {
+        int count = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&count, mma_kernel<NT, W, VecX, PerRow>, W * 32, 0));
+        return std::max(count, 1);
     }();
     return blocks;
+}
+
+// K over eight warps when one wave holds every CTA, over four when even four make two waves or
+// more; otherwise the split whose last wave leaves fewer SMs idle, four on a near tie. On an
+// H100 that picks eight for 4096-row weights (o, down: 8.6 against 9.7 us at 4096 x 4096) and
+// four for 5120 x 17408 (36.3 against 41.4: eight make 1.2 waves).
+template <int NT, bool VecX, bool PerRow>
+void launch_mma_split(const std::uint8_t* codes, const float* scales, const __nv_bfloat16* x,
+                const Segments& segments, int k, int tokens, bool accumulate, cudaStream_t stream) {
+    const int ctas = segments.rows() / kMmaRows;
+    const double waves8 = double(ctas) / (sm_count() * mma_blocks_per_sm<NT, 8, VecX, PerRow>());
+    const double waves4 = double(ctas) / (sm_count() * mma_blocks_per_sm<NT, 4, VecX, PerRow>());
+    const auto filled = [](double waves) { return waves / std::ceil(waves); };
+    const bool eight = waves8 <= 1.0 || (waves4 < 2.0 && filled(waves8) > filled(waves4) + 0.05);
+    if (eight) {
+        mma_kernel<NT, 8, VecX, PerRow><<<ctas, 8 * 32, 0, stream>>>(codes, scales, x, segments, k, tokens, accumulate);
+    } else {
+        mma_kernel<NT, 4, VecX, PerRow><<<ctas, 4 * 32, 0, stream>>>(codes, scales, x, segments, k, tokens, accumulate);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_mma(const std::uint8_t* codes, const float* scales, const __nv_bfloat16* x,
+                const Segments& segments, int k, int tokens, bool accumulate, bool per_row, cudaStream_t stream) {
+    const bool vec_x = (reinterpret_cast<std::uintptr_t>(x) & 15u) == 0;
+    const auto launch = tokens <= 8
+        ? (vec_x ? (per_row ? launch_mma_split<1, true, true> : launch_mma_split<1, true, false>)
+                 : (per_row ? launch_mma_split<1, false, true> : launch_mma_split<1, false, false>))
+        : (vec_x ? (per_row ? launch_mma_split<2, true, true> : launch_mma_split<2, true, false>)
+                 : (per_row ? launch_mma_split<2, false, true> : launch_mma_split<2, false, false>));
+    launch(codes, scales, x, segments, k, tokens, accumulate, stream);
 }
 
 std::size_t codes_bytes(std::int32_t k, std::int32_t tokens) noexcept {
@@ -472,29 +704,76 @@ void require_x_out(const Tensor& x, std::int32_t k, const Tensor& out, std::int3
     }
 }
 
-// Rounds up to this many tokens run the GEMV on every weight; on Hopper that is two unless
-// SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS=4 keeps every round to four tokens on it.
-int gemv_always_tokens() noexcept {
-    static const bool all_four = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS");
-        return raw != nullptr && std::string_view(raw) == "4";
+int device_cc() noexcept {
+    static const int cc = [] {
+        int device = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+            return 0;
+        }
+        return major * 10 + minor;
     }();
-    return all_four || !sm90_gemm_available() ? kGemvMaxTokens : 2;
+    return cc;
+}
+
+// The tensor-core narrow kernel takes the rounds past the GEMV's always-widths up to
+// kMmaMaxTokens: on Hopper by default (measured there; elsewhere the GEMV and the engine's tile
+// keep them).
+// SUROGATE_SERVE_FP8_BLOCK_MMA=0 turns it off, =1 on, on any GPU.
+bool mma_enabled() noexcept {
+    static const int forced = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_MMA");
+        if (raw == nullptr) { return -1; }
+        return std::string_view(raw) == "0" ? 0 : std::string_view(raw) == "1" ? 1 : -1;
+    }();
+    return forced >= 0 ? forced == 1 : device_cc() == 90;
+}
+
+// Rounds up to this many tokens run the GEMV on every weight: one where the narrow kernel takes
+// the next widths, three on Hopper without it, four elsewhere; SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS
+// =N (0 to 4) sets it. Alone on an H100 the GEMV reads one and two tokens faster (34.0 against
+// 37.5 us at 24576 x 4096), but in a decode round its two-token kernel ran 41 % slower than alone
+// while the narrow kernel ran within 5 % of its own: Qwen3-8B-FP8 decodes 212 tok/s a stream with
+// two users against 184 on the GEMV, Qwen3.6-27B-FP8 75 against 74. One token stays: the 27B
+// decodes 80 tok/s on the GEMV against 78 (the 8B 210 against 217).
+int gemv_always_tokens() noexcept {
+    static const int forced = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_GEMV_TOKENS");
+        if (raw == nullptr || raw[0] < '0' || raw[0] > '0' + kGemvMaxTokens || raw[1] != '\0') { return -1; }
+        return raw[0] - '0';
+    }();
+    if (forced >= 0) { return forced; }
+    if (mma_enabled()) { return 1; }
+    return sm90_gemm_available() ? 3 : kGemvMaxTokens;
+}
+
+bool mma_serves(std::int32_t tokens) noexcept {
+    return mma_enabled() && tokens > gemv_always_tokens() && tokens <= kMmaMaxTokens;
 }
 
 bool block_cell(const Weight& w) noexcept { return w.scale_ne[0] == kBlock && w.scale_ne[1] == kBlock; }
 
-// The GEMV's sums grow with its columns; Hopper's narrow CUTLASS tile reads the weight once for
-// up to 16 tokens, on activations quantised per token per 128 as every wider round's are. On an
-// H100 the GEMV is the faster at two tokens for every shape, at three below 64 row blocks of 128
-// and at four below 40: the o and down projections of 8B to 27B models keep it, their q/k/v and
-// gate/up move to the tile (24576 x 4096 at four tokens: 76.7 us on the GEMV, 45.4 quantised on
-// the tile). A per-channel weight has no CUTLASS route and keeps the GEMV to four tokens.
+// Past its always-widths the GEMV gives way to the narrow kernel where that runs. Without it
+// (SUROGATE_SERVE_FP8_BLOCK_MMA=0): the GEMV's work grows with its columns, and Hopper's narrow
+// CUTLASS tile reads the weight once for up to 16 tokens, on activations quantised per token per
+// 128 as every wider round's are. On an H100 the GEMV is the faster to three tokens for every
+// shape and at four below 96 row blocks of
+// 128 (an 8B model's q/k/v 14.8 us against 18.3, the down projections of 8B and 27B models 29-44
+// against 44-60), while wider weights move to the tile at four (24576 x 4096: 48.9 us on the
+// GEMV, 44.2 quantised on the tile; 12288 x 5120 about even). A per-channel weight has no CUTLASS
+// route and keeps the GEMV to four tokens.
 bool gemv_serves(std::int32_t rows, std::int32_t tokens, bool block) noexcept {
     if (tokens > kGemvMaxTokens) { return false; }
-    if (tokens <= gemv_always_tokens() || !block) { return true; }
-    const std::int32_t blocks = rows / kBlock;
-    return tokens == 3 ? blocks < 64 : blocks < 40;
+    if (tokens <= gemv_always_tokens()) { return true; }
+    if (mma_enabled()) { return false; }
+    return !block || rows / kBlock < 96;
+}
+
+// Whether a round reads x's BF16 activations as they are -- the GEMV or the narrow kernel --
+// rather than quantised planes.
+bool exact_serves(std::int32_t rows, std::int32_t tokens, bool block) noexcept {
+    return gemv_serves(rows, tokens, block) || mma_serves(tokens);
 }
 
 /// One row range of one weight against every column of x, [k, tokens] BF16, written or
@@ -523,6 +802,10 @@ void run(const __nv_bfloat16* xin, std::int32_t tokens, const Weight& w, std::in
         const auto launch  = vec_x ? (per_row ? launch_gemv<true, true> : launch_gemv<true, false>)
                                    : (per_row ? launch_gemv<false, true> : launch_gemv<false, false>);
         launch(codes, scales, xin, segments, k, tokens, accumulate, stream);
+        return;
+    }
+    if (mma_serves(tokens)) {
+        launch_mma(codes, scales, xin, segments, k, tokens, accumulate, cell.rows_per == 1, stream);
         return;
     }
     const std::size_t bytes = workspace_bytes(k, tokens);
@@ -626,7 +909,7 @@ void require_fp8_block_weight(const Weight& w, const char* op) {
 }
 
 std::size_t workspace_bytes(std::int32_t k, std::int32_t tokens) noexcept {
-    if (k <= 0 || tokens <= gemv_always_tokens()) { return 0; }
+    if (k <= 0 || tokens <= gemv_always_tokens() || mma_serves(tokens)) { return 0; }
     return codes_bytes(k, tokens) +
            static_cast<std::size_t>(sm90_scale_stride(tokens)) * (k / kBlock) * sizeof(float) + kAlign;
 }
@@ -666,7 +949,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 }
 
 bool quantizes_activations(const Weight& w, std::int32_t tokens) noexcept {
-    return !gemv_serves(w.n, tokens, block_cell(w));
+    return !exact_serves(w.n, tokens, block_cell(w));
 }
 
 void swiglu_linear_add(const Tensor& packed, const Weight& w, Tensor& residual, float limit,
@@ -722,13 +1005,13 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     const bool chained   = chain(projections, segments, chain_begin);
     const Weight& parent = projections.front().weight;
     // Quantised once for every launch that reads the planes; a GEMV among them reads x.
-    bool gemm = chained && !gemv_serves(segments.rows(), tokens, block_cell(parent));
-    for (const auto& p : projections) { gemm |= !chained && !gemv_serves(p.out.ne[0], tokens, block_cell(p.weight)); }
+    bool gemm = chained && !exact_serves(segments.rows(), tokens, block_cell(parent));
+    for (const auto& p : projections) { gemm |= !chained && !exact_serves(p.out.ne[0], tokens, block_cell(p.weight)); }
     const bool cutlass   = gemm && sm90_gemm_available() && parent.scale_ne[0] == kBlock &&
                          parent.scale_ne[1] == kBlock;
     const std::size_t plane_bytes = gemm ? workspace_bytes(k, tokens) : 0;
     std::size_t staging_bytes =
-        chained && cutlass && tokens <= kStagedMaxTokens
+        chained && cutlass && tokens <= staged_tokens()
             ? static_cast<std::size_t>(segments.rows()) * tokens * sizeof(__nv_bfloat16)
             : 0;
     if (staging_bytes != 0 && workspace != nullptr) {
@@ -743,11 +1026,11 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     __nv_bfloat16* staging = nullptr;
     if (plane_bytes != 0) {
         std::size_t bytes = plane_bytes + staging_bytes;
-        if (workspace == nullptr && chained && cutlass && tokens > kStagedMaxTokens) {
+        if (workspace == nullptr && chained && cutlass && tokens > staged_tokens()) {
             // The engine-slot scratch grows only outside a capture, warmed at the widest round:
             // past the staged widths, keep room for every narrower round's staged launch too.
-            bytes = std::max(bytes, workspace_bytes(k, kStagedMaxTokens) +
-                                        static_cast<std::size_t>(segments.rows()) * kStagedMaxTokens *
+            bytes = std::max(bytes, workspace_bytes(k, staged_tokens()) +
+                                        static_cast<std::size_t>(segments.rows()) * staged_tokens() *
                                             sizeof(__nv_bfloat16));
         }
         prepared = workspace != nullptr ? static_cast<std::byte*>(workspace->alloc_bytes(bytes, kAlign).data)
@@ -769,12 +1052,14 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     }
 }
 
+int staged_max_tokens() noexcept { return staged_tokens(); }
+
 std::size_t projections_workspace_capacity_bytes(std::int32_t parent_rows, std::int32_t input_rows,
                                                  std::int32_t max_tokens) {
     const std::size_t planes = linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
-    if (max_tokens <= gemv_always_tokens() || parent_rows <= 0) { return planes; }
+    if (max_tokens <= gemv_always_tokens() || mma_serves(max_tokens) || parent_rows <= 0) { return planes; }
     return planes + static_cast<std::size_t>(parent_rows) *
-                                  std::min(max_tokens, kStagedMaxTokens) * sizeof(__nv_bfloat16);
+                                  std::min(max_tokens, staged_tokens()) * sizeof(__nv_bfloat16);
 }
 
 } // namespace sinfer::ops::detail::fp8_block
