@@ -10,7 +10,7 @@ on:
 
 jobs:
   wheel:
-    name: Build wheel (CUDA ${{ matrix.cuda_version }})
+    name: Build wheel (CUDA ${{ matrix.cuda_version }}, ${{ matrix.platform }})
     # Blacksmith (blacksmith.sh), which this repository's workflows run on since 2026-10-05. The
     # self-hosted build box is gone, and the build never needed it: there is no GPU in it
     # (CUDAARCHS names the architectures, and the checks read the cubins with cuobjdump), and the
@@ -24,7 +24,10 @@ jobs:
     # Blacksmith runner, or GitHub's free `ubuntu-24.04` (4 vCPUs, 16 GB, where a cold build takes
     # hours) -- without editing this file. The job sizes its parallelism to the runner it lands
     # on, so nothing else changes.
-    runs-on: ${{ vars.SUROGATE_WHEEL_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}
+    #
+    # The aarch64 wheel (DGX Spark) runs on the matching Arm runner, `SUROGATE_WHEEL_RUNNER_ARM`
+    # standing to it as `SUROGATE_WHEEL_RUNNER` does to the x86_64 one.
+    runs-on: ${{ matrix.platform == 'aarch64' && (vars.SUROGATE_WHEEL_RUNNER_ARM || 'blacksmith-32vcpu-ubuntu-2404-arm') || (vars.SUROGATE_WHEEL_RUNNER || 'blacksmith-32vcpu-ubuntu-2404') }}
     timeout-minutes: 360
     # --privileged for one thing: the first step adds swap to the runner, which a container
     # cannot do otherwise (see that step).
@@ -56,9 +59,22 @@ jobs:
           # its default here and checked in the wheel afterwards; restating it in the workflow
           # would only be a second place to be wrong.
           - cuda_version: "13.1"
+            platform: "x86_64"
             cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
             archs: "89;90a;120a"
+            serve_cubins: "sm_89 sm_90a sm_120a"
+          # The aarch64 wheel is for GB10 -- DGX Spark and its OEM twins (ASUS Ascent GX10, Dell
+          # Pro Max GB10, ...) -- which is sm_121: an Arm host, where `121a` cubins are the only
+          # Blackwell ones any card loads. The same image is multi-arch; the Arm runner pulls its
+          # arm64 (sbsa) variant. The serve engine's aarch64 default (csrc/CMakeLists.txt) is the
+          # same single architecture.
+          - cuda_version: "13.1"
+            platform: "aarch64"
+            cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
+            wheel_tag: "cu130"
+            archs: "121a"
+            serve_cubins: "sm_121a"
 
     env:
       CMAKE_GENERATOR: Ninja
@@ -148,10 +164,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /ccache
-          key: ccache-${{ matrix.wheel_tag }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-${{ matrix.wheel_tag }}-${{ matrix.platform }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-${{ matrix.wheel_tag }}-${{ github.sha }}-
-            ccache-${{ matrix.wheel_tag }}-
+            ccache-${{ matrix.wheel_tag }}-${{ matrix.platform }}-${{ github.sha }}-
+            ccache-${{ matrix.wheel_tag }}-${{ matrix.platform }}-
 
       - name: Setup ccache
         run: |
@@ -185,7 +201,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /ccache
-          key: ccache-${{ matrix.wheel_tag }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-${{ matrix.wheel_tag }}-${{ matrix.platform }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # auditwheel vendors every shared library the wheel's ELF files load and the manylinux
       # policy does not promise, and patches their RPATHs to find the copies. What is excluded
@@ -215,7 +231,8 @@ jobs:
             --exclude libtorch.so \
             --exclude libc10.so
           mv repaired/*.whl wheelhouse/
-          rm -f wheelhouse/*linux_x86_64*.whl
+          # The unrepaired wheel (`-linux_x86_64`, `-linux_aarch64`); the repaired one is `-manylinux_`.
+          rm -f wheelhouse/*-linux_*.whl
           ls -lh wheelhouse/
 
       # An install-rule or component mistake produces a wheel that builds, installs, imports --
@@ -241,7 +258,7 @@ jobs:
           done
           cuobjdump -lelf /tmp/wheel-check/surogate/libsinfer.so \
             | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | tee /tmp/wheel-cubins.txt
-          for arch in sm_89 sm_90a sm_120a; do
+          for arch in ${{ matrix.serve_cubins }}; do
             if ! grep -q "$arch" /tmp/wheel-cubins.txt; then
               echo "::error::the wheel's engine has no $arch cubins — it does not serve every card it claims to"
               exit 1
@@ -251,14 +268,15 @@ jobs:
 
       # Both wheels train, and the trainer's device code lives in libsurogate-common.so (the
       # extension module is a thin binding). CUDAARCHS above is the promise; this is the check.
-      - name: The wheel trains on Ada, Hopper and Blackwell
+      - name: The wheel trains on every architecture it names
         run: |
           set -euo pipefail
           rm -rf /tmp/wheel-check && mkdir -p /tmp/wheel-check
           python3 -m zipfile -e wheelhouse/*.whl /tmp/wheel-check
           cuobjdump -lelf /tmp/wheel-check/surogate/libsurogate-common.so \
             | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | tee /tmp/trainer-cubins.txt
-          for arch in sm_89 sm_90a sm_120a; do
+          for arch in $(echo "${CUDAARCHS}" | tr ';' ' '); do
+            arch="sm_${arch}"
             if ! grep -q "$arch" /tmp/trainer-cubins.txt; then
               echo "::error::the trainer has no $arch cubins"
               exit 1
@@ -269,7 +287,7 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.wheel_tag }}
+          name: wheel-${{ matrix.wheel_tag }}-${{ matrix.platform }}
           path: wheelhouse/*.whl
 
   release:

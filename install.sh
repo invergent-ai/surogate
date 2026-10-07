@@ -93,12 +93,12 @@ install_surogate_wheel() {
     local version="$1"
     local cuda_suffix="$2"
 
-    local wheel_name="surogate-${version}+${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
-    local wheel_pattern="surogate-${version}%2B${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
+    local wheel_name="surogate-${version}+${cuda_suffix}-cp312-abi3-manylinux_2_39_${WHEEL_PLATFORM}.whl"
+    local wheel_pattern="surogate-${version}%2B${cuda_suffix}-cp312-abi3-manylinux_2_39_${WHEEL_PLATFORM}.whl"
 
     local download_url
     if [ -n "$VERSION_OVERRIDE" ]; then
-        download_url="https://github.com/${REPO}/releases/download/v${version}/surogate-${version}%2B${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
+        download_url="https://github.com/${REPO}/releases/download/v${version}/${wheel_pattern}"
     else
         download_url=$(echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "$wheel_pattern" || true)
     fi
@@ -139,6 +139,18 @@ install_surogate_wheel() {
 
     rm -rf "$temp_dir"
 }
+
+# --- Detect the platform ---
+# Two wheels: x86_64 (Ada, Hopper, RTX Blackwell) and aarch64 (GB10: DGX Spark and its OEM
+# twins, sm_121).
+case "$(uname -m)" in
+    x86_64 | amd64) WHEEL_PLATFORM="x86_64" ;;
+    aarch64 | arm64) WHEEL_PLATFORM="aarch64" ;;
+    *)
+        echo "Error: surogate ships wheels for x86_64 and aarch64 Linux; this host is $(uname -m)."
+        exit 1
+        ;;
+esac
 
 # --- Detect CUDA version ---
 
