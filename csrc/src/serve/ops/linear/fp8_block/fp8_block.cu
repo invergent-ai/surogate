@@ -32,8 +32,19 @@ constexpr int kBlocksPerSm  = 2;
 constexpr std::size_t kAlign = 256;
 // Hopper's CUTLASS kernel writes one packed output, so consecutive row ranges of a parent run as
 // one GEMM into a staging plane and a split -- on rounds up to this many tokens, where separate
-// launches leave most SMs idle and the plane is small.
-constexpr int kStagedMaxTokens = 128;
+// launches leave SMs idle: a 1024-row k or v range at 576 tokens (a 512-token prompt beside 64
+// decode rows) is 40 tiles of 128 x 128 on 132 SMs. There Qwen3-8B's q, k and v took 26.8 + 12.6 +
+// 13.0 us apart on an H100 against 31.1 for vLLM's one GEMM. The plane is rows x tokens BF16
+// (6144 rows: 12 MiB at the cap). SUROGATE_SERVE_FP8_BLOCK_STAGED_TOKENS lowers it (A/B knob).
+constexpr int kStagedCapTokens = 1024;
+int staged_tokens() noexcept {
+    static const int tokens = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_STAGED_TOKENS");
+        const int forced = raw != nullptr ? std::atoi(raw) : 0;
+        return forced > 0 ? std::min(forced, kStagedCapTokens) : kStagedCapTokens;
+    }();
+    return tokens;
+}
 
 /// Where a launch's rows land: up to four consecutive row ranges of one weight, each in its own
 /// [rows, T] output -- a parent's q/k/v or q/k/gate/v projections as one launch. One output is
@@ -1000,7 +1011,7 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
                          parent.scale_ne[1] == kBlock;
     const std::size_t plane_bytes = gemm ? workspace_bytes(k, tokens) : 0;
     std::size_t staging_bytes =
-        chained && cutlass && tokens <= kStagedMaxTokens
+        chained && cutlass && tokens <= staged_tokens()
             ? static_cast<std::size_t>(segments.rows()) * tokens * sizeof(__nv_bfloat16)
             : 0;
     if (staging_bytes != 0 && workspace != nullptr) {
@@ -1015,11 +1026,11 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     __nv_bfloat16* staging = nullptr;
     if (plane_bytes != 0) {
         std::size_t bytes = plane_bytes + staging_bytes;
-        if (workspace == nullptr && chained && cutlass && tokens > kStagedMaxTokens) {
+        if (workspace == nullptr && chained && cutlass && tokens > staged_tokens()) {
             // The engine-slot scratch grows only outside a capture, warmed at the widest round:
             // past the staged widths, keep room for every narrower round's staged launch too.
-            bytes = std::max(bytes, workspace_bytes(k, kStagedMaxTokens) +
-                                        static_cast<std::size_t>(segments.rows()) * kStagedMaxTokens *
+            bytes = std::max(bytes, workspace_bytes(k, staged_tokens()) +
+                                        static_cast<std::size_t>(segments.rows()) * staged_tokens() *
                                             sizeof(__nv_bfloat16));
         }
         prepared = workspace != nullptr ? static_cast<std::byte*>(workspace->alloc_bytes(bytes, kAlign).data)
@@ -1041,12 +1052,14 @@ void linear_projections(const Tensor& x, std::span<const LinearProjection> proje
     }
 }
 
+int staged_max_tokens() noexcept { return staged_tokens(); }
+
 std::size_t projections_workspace_capacity_bytes(std::int32_t parent_rows, std::int32_t input_rows,
                                                  std::int32_t max_tokens) {
     const std::size_t planes = linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
     if (max_tokens <= gemv_always_tokens() || mma_serves(max_tokens) || parent_rows <= 0) { return planes; }
     return planes + static_cast<std::size_t>(parent_rows) *
-                                  std::min(max_tokens, kStagedMaxTokens) * sizeof(__nv_bfloat16);
+                                  std::min(max_tokens, staged_tokens()) * sizeof(__nv_bfloat16);
 }
 
 } // namespace sinfer::ops::detail::fp8_block

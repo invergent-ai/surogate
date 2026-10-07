@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -72,22 +74,51 @@ void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
             static_cast<const std::uint8_t*>(w.scales), output, x.ne[1]);
 }
 
+// Streaming multiprocessors of the current device, read once per device.
+int device_multiprocessors() {
+    static std::mutex mutex;
+    static std::map<int, int> counts;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (const auto found = counts.find(device); found != counts.end()) { return found->second; }
+    int sms = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    return counts[device] = sms;
+}
+
 } // namespace
 
 void launch_w8_consistent(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     if (w.k % 256 != 0 || w.n % 16 != 0 || w.padded_shape[1] != w.k) {
         throw std::invalid_argument("W8 consistent GEMM requires aligned, unpadded rows");
     }
+    // Two 16-row tiles a CTA when that still leaves two CTAs an SM. Every CTA stages the
+    // activations of its columns for the whole K, so 16-row CTAs over a vocab head read
+    // them from L2 eight times over the weight's own bytes; 32-row CTAs halve that. The
+    // per-output K order is the kernel's either way (bit-identical outputs). On an H100,
+    // Qwen3-8B's W8 head (151936 x 4096): 376 -> 331 us at one token, 659 -> 520 at 64;
+    // 12288 x 4096: 43 -> 33 at one token. Narrower weights lose parallelism instead
+    // (6144 x 4096: 17 -> 20 us), so they keep one tile.
+    const bool row_pairs = w.n % 32 == 0 && w.n / 32 >= 2 * device_multiprocessors();
     for_each_token_slice(x.ne[1], 64, [&](int begin, int count) {
         const Tensor input = x.slice(1, begin, count);
         Tensor result = out.slice(1, begin, count);
         const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(result.data), w.n};
         const auto launch = [&]<int Columns>() {
-            w8_rowsplit_medium_t_splitk_kernel<0, Columns, 4, 1, 2>
-                <<<dim3(w.n / 16, (count + Columns - 1) / Columns), 128, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(input.data),
-                    static_cast<const std::uint8_t*>(w.qdata),
-                    static_cast<const std::uint8_t*>(w.scales), output, count, w.k);
+            const dim3 tiles(1, (count + Columns - 1) / Columns);
+            const auto* activations = static_cast<const __nv_bfloat16*>(input.data);
+            const auto* codes       = static_cast<const std::uint8_t*>(w.qdata);
+            const auto* scales      = static_cast<const std::uint8_t*>(w.scales);
+            if (row_pairs) {
+                w8_rowsplit_medium_t_splitk_kernel<0, Columns, 4, 1, 2, W8ContiguousOutput, false, 2>
+                    <<<dim3(w.n / 32, tiles.y), 128, 0, stream>>>(activations, codes, scales, output,
+                                                                 count, w.k);
+            } else {
+                w8_rowsplit_medium_t_splitk_kernel<0, Columns, 4, 1, 2>
+                    <<<dim3(w.n / 16, tiles.y), 128, 0, stream>>>(activations, codes, scales, output,
+                                                                 count, w.k);
+            }
         };
         if (count <= 8) { launch.template operator()<8>(); }
         else if (count <= 16) { launch.template operator()<16>(); }

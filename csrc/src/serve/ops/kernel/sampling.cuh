@@ -205,61 +205,141 @@ __launch_bounds__(kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
+/// Greedy columns: the bias-adjusted argmax over the allowed tokens, ties to the
+/// lower id, with token_counts left alone -- what the candidate route's greedy branch
+/// produced, from one key per token, so the result is identical however the row is
+/// split. Each CTA takes one kSamplerGreedyChunkItems chunk of one row and the last
+/// to finish reduces the chunk maxima.
+///
+/// The candidate route read a greedy row in 512-item tiles, one CTA each: at 64
+/// columns of a 151,936-token vocabulary that was 19,008 CTAs and 81 us for 19 MB
+/// on an H100, bound by scheduling and two outstanding 2-byte loads per thread.
+/// Rows without bias or a barred token are read 16 bytes at a time.
+///
+/// Launched after sampling_partial_topk_kernel, whose first CTA zeroes the row's
+/// group_done counter; the last CTA here zeroes it again for the next call.
+__launch_bounds__(kSamplerBlock) __global__
+    void sampling_greedy_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+                                const SamplingConfig* cfg_ptr, std::int32_t token_domain,
+                                std::int32_t physical_rows, std::int32_t chunks,
+                                SamplingWorkspace workspace) {
+    const int col = static_cast<int>(blockIdx.y);
+    const int chunk = static_cast<int>(blockIdx.x);
+    __shared__ unsigned long long warp_keys[kSamplerBlock / 32];
+    __shared__ int is_last;
+
+    const __nv_bfloat16* row = logits + static_cast<std::int64_t>(col) * physical_rows;
+    const int begin          = chunk * kSamplerGreedyChunkItems;
+    const int end            = min(token_domain, begin + kSamplerGreedyChunkItems);
+    // The chunk is requested before the row's config arrives, so the two latencies
+    // overlap; a stochastic row's CTA reads its chunk for nothing, from L2, where the
+    // head just left it. The config's few fields are read through a reference.
+    constexpr int kVector = 8;
+    constexpr int kUnroll = kSamplerGreedyChunkItems / (kSamplerBlock * kVector);
+    const bool aligned    = (reinterpret_cast<std::uintptr_t>(row + begin) & 15u) == 0;
+    const int vector_end  = aligned ? begin + (end - begin) / kVector * kVector : begin;
+    uint4 packed[kUnroll];
+#pragma unroll
+    for (int step = 0; step < kUnroll; ++step) {
+        const int v   = begin + (step * kSamplerBlock + static_cast<int>(threadIdx.x)) * kVector;
+        packed[step]  = v < vector_end ? *reinterpret_cast<const uint4*>(row + v) : make_uint4(0, 0, 0, 0);
+    }
+    const SamplingConfig& cfg = cfg_ptr[col];
+    if (cfg.temperature > 0.0f) { return; }
+    const float* bias = cfg.logit_bias;
+    const bool plain  = bias == nullptr && cfg.token_bitmask == nullptr && cfg.suppressed_count == 0;
+    unsigned long long best = 0ull;
+    int scalar_begin        = begin;
+    if (plain) {
+#pragma unroll
+        for (int step = 0; step < kUnroll; ++step) {
+            const int v = begin + (step * kSamplerBlock + static_cast<int>(threadIdx.x)) * kVector;
+            if (v < vector_end) {
+                const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed[step]);
+#pragma unroll
+                for (int i = 0; i < kVector; ++i) {
+                    // + 0: the sum the biased path forms, so a denormal flushes the same way.
+                    const unsigned long long key = sampling_sort_key(__bfloat162float(values[i]) + 0.0F, v + i);
+                    if (key > best) { best = key; }
+                }
+            }
+        }
+        scalar_begin = vector_end;
+    }
+    for (int v = scalar_begin + static_cast<int>(threadIdx.x); v < end; v += kSamplerBlock) {
+        // The raw logit plus bias: a greedy row takes no temperature or penalty, and
+        // a barred token is skipped outright.
+        if (!plain && sampling_suppressed(cfg, v)) { continue; }
+        const float x = __bfloat162float(row[v]) + (bias != nullptr ? bias[v] : 0.0F);
+        const unsigned long long key = sampling_sort_key(x, v);
+        if (key > best) { best = key; }
+    }
+    best = sampling_block_max_key(best, warp_keys);
+    if (threadIdx.x == 0) {
+        workspace.partial_keys[sampling_partial_offset(workspace, col, chunk, 0)] = best;
+        __threadfence();
+        is_last = atomicAdd(&workspace.group_done[col], 1) + 1 == chunks ? 1 : 0;
+    }
+    __syncthreads();
+    if (!is_last) { return; }
+    best = 0ull;
+    for (int p = static_cast<int>(threadIdx.x); p < chunks; p += kSamplerBlock) {
+        const unsigned long long key = __ldcg(&workspace.partial_keys[sampling_partial_offset(workspace, col, p, 0)]);
+        if (key > best) { best = key; }
+    }
+    best = sampling_block_max_key(best, warp_keys);
+    if (threadIdx.x == 0) {
+        out[col]                  = sampling_key_index(best);
+        workspace.group_done[col] = 0;
+    }
+}
+
+// Candidate tiles of the rows sampled from a bounded candidate set (a stochastic row that
+// is neither wide nor greedy): the best `cap` keys of each 512-token tile. A resident
+// grid walks the [batch][partial] tiles (see sampling_for_each_unit); the first CTA zeroes
+// every row's group_done counter, which the greedy and finalize launches after it count on.
 __launch_bounds__(kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
-                                      SamplingWorkspace workspace) {
-    const int col            = static_cast<int>(blockIdx.y);
-    const int partial        = static_cast<int>(blockIdx.x);
-    const SamplingConfig cfg = cfg_ptr[col];
-    if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
-    if (sampling_wide(cfg)) { return; } // sampling_full_vocab_kernel owns this column
-
+                                      std::int32_t batch, SamplingWorkspace workspace) {
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
-    __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
-    unsigned long long keys[kSamplerItemsPerThread];
-
-    const bool greedy       = !(cfg.temperature > 0.0f);
-    const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
-    const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
-    const int tile_start    = partial * kSamplerPartialTileItems;
-#pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v < token_domain && !(greedy && sampling_suppressed(cfg, v))) {
-            const float raw = __bfloat162float(logits[base + v]);
-            // The stochastic path bars a token inside sampling_adjusted_logit; the
-            // greedy one reads the raw logit, so it is barred here instead.
-            const float x = greedy ? raw + (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F)
-                                   : sampling_adjusted_logit(raw, v, cfg);
-            keys[item]      = sampling_sort_key(x, v);
-        } else {
-            keys[item] = 0ull;
-        }
+    __shared__ SamplingRowAdmission rows;
+    if (blockIdx.x == 0) {
+        for (int col = threadIdx.x; col < batch; col += blockDim.x) { workspace.group_done[col] = 0; }
     }
-    if (greedy) {
-        unsigned long long best = keys[0];
+    const auto candidate_route = [&](int col) {
+        const SamplingConfig& cfg = cfg_ptr[col];
+        return cfg.temperature > 0.0f && !sampling_wide(cfg);
+    };
+    sampling_for_each_unit(rows, batch, 1, div_up(token_domain, kSamplerPartialTileItems), nullptr,
+                           candidate_route, [&](int col, int, int partial) {
+        const SamplingConfig cfg = cfg_ptr[col];
+        unsigned long long keys[kSamplerItemsPerThread];
+        const int cap           = sampling_candidate_cap(cfg, token_domain);
+        const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
+        const int tile_start    = partial * kSamplerPartialTileItems;
 #pragma unroll
-        for (int item = 1; item < kSamplerItemsPerThread; ++item) {
-            if (keys[item] > best) { best = keys[item]; }
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int v = tile_start + item * blockDim.x + threadIdx.x;
+            if (v < token_domain) {
+                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+                keys[item]    = sampling_sort_key(x, v);
+            } else {
+                keys[item] = 0ull;
+            }
         }
-        best = sampling_block_max_key(best, greedy_warp_keys);
-        if (threadIdx.x == 0) {
-            const int off               = sampling_partial_offset(workspace, col, partial, 0);
-            workspace.partial_keys[off] = best;
-        }
-        return;
-    }
-    SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+        SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int rank = threadIdx.x * kSamplerItemsPerThread + item;
-        if (rank < cap) {
-            const int off               = sampling_partial_offset(workspace, col, partial, rank);
-            workspace.partial_keys[off] = keys[item];
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int rank = threadIdx.x * kSamplerItemsPerThread + item;
+            if (rank < cap) {
+                const int off               = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] = keys[item];
+            }
         }
-    }
+        __syncthreads(); // sort_storage is reused by the next tile
+    });
 }
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
@@ -276,12 +356,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ int is_last;
-    __shared__ unsigned long long greedy_warp_keys[kSamplerGroupBlock / 32];
     unsigned long long keys[kSamplerGroupItemsPerThread];
 
     if (sampling_wide(cfg)) { return; } // sampling_full_vocab_kernel owns this column
-    const bool greedy = !(cfg.temperature > 0.0f);
-    const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
+    if (!(cfg.temperature > 0.0f)) { return; } // sampling_greedy_kernel owns this column
+    const int cap = sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned
     // workspace does not rely on prior contents or a separate memset launch.
 
@@ -289,36 +368,6 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     int group_partials    = partial_blocks - group_begin;
     if (group_partials < 0) { group_partials = 0; }
     if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
-
-    if (greedy) {
-        unsigned long long best = 0ull;
-        for (int p = tid; p < group_partials; p += blockDim.x) {
-            const int off = sampling_partial_offset(workspace, col, group_begin + p, 0);
-            if (workspace.partial_keys[off] > best) { best = workspace.partial_keys[off]; }
-        }
-        best = sampling_block_max_key(best, greedy_warp_keys);
-        if (tid == 0) {
-            const int out_off = sampling_partial_offset(workspace, col, partial_blocks + group, 0);
-            workspace.partial_keys[out_off] = best;
-            __threadfence();
-            const int done = atomicAdd(&workspace.group_done[col], 1) + 1;
-            is_last        = (done == group_count) ? 1 : 0;
-        }
-        __syncthreads();
-        if (!is_last) { return; }
-
-        best = 0ull;
-        for (int p = tid; p < group_count; p += blockDim.x) {
-            const int off = sampling_partial_offset(workspace, col, partial_blocks + p, 0);
-            if (workspace.partial_keys[off] > best) { best = workspace.partial_keys[off]; }
-        }
-        best = sampling_block_max_key(best, greedy_warp_keys);
-        if (tid == 0) {
-            out[col]                  = sampling_key_index(best);
-            workspace.group_done[col] = 0;
-        }
-        return;
-    }
 
     const int group_n = group_partials * cap;
 #pragma unroll

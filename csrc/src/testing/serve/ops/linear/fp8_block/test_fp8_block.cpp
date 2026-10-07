@@ -282,7 +282,7 @@ int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t toke
     };
     const bool hopper  = ops::detail::fp8_block::sm90_gemm_available();
     const bool gemv    = !ops::detail::fp8_block::quantizes_activations(w, tokens);
-    const bool chained = gemv || !hopper || tokens <= 128;
+    const bool chained = gemv || !hopper || tokens <= ops::detail::fp8_block::staged_max_tokens();
     // GEMV: one launch; the tile: quantize + one launch; Hopper: quantize + GEMM + split
     const std::size_t want_nodes = gemv ? 1 : !chained ? 1 + parts.size() : hopper ? 3 : 2;
     cudaStream_t stream;
@@ -454,7 +454,7 @@ int main() {
     }
     // q/k/v of a 4:1:1 head layout, q/k/gate/v of a gated one, and a qkv/z pair: decode GEMV
     // widths, Hopper's staged widths (narrow and swapped tiles), and wide rounds it runs apart.
-    for (std::int32_t tokens : {1, 2, 3, 20, 64, 100, 200}) {
+    for (std::int32_t tokens : {1, 2, 3, 20, 64, 100, 200, 576, 1100}) {
         failures += run_chain({512, 128, 128}, 1024, tokens);
     }
     failures += run_chain({256, 128, 256, 128}, 512, 48);

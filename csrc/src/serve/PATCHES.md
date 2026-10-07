@@ -4104,3 +4104,51 @@ attention, MLP, norm, SiLU and batch-invariance tests pass (five NVFP4 tests ski
 greedy through the CLI and eight concurrent chat requests through the server pass for
 Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B (one-stream CLI decode
 217, 81, 673, 573 and 104 tok/s).
+
+## 108
+
+**Sampling, the W8 LM head and staged projections at 64 users (2026-10-07, after #107).** After
+#107 Qwen3-8B-FP8 on one H100 decoded 78 tok/s a stream at 64 users against vLLM's 94. Of the
+round's time past vLLM's, the FP8 GEMMs were about half, the LM head and sampling about a third.
+Everything below is engine-wide.
+
+- **A greedy route through the sampler** (`ops/kernel/sampling.cuh`, `sampling_greedy_kernel`). A
+  greedy column needs only the argmax over its allowed tokens, but went through the candidate
+  route: one CTA per 512-token tile, 19,008 CTAs and 81 us for the 19 MB of 64 columns of a
+  151,936-token vocabulary, bound by scheduling and 2-byte loads. A greedy CTA now reads one
+  8,192-token chunk of one row with 16-byte loads (a row with a bias or a barred token a token at a
+  time) and the last to finish reduces the chunk maxima: 12 us. One key per token, ties to the lower
+  id, so the result is the old route's bits however the row is split.
+- **Only the rows that need them walk the candidate passes** (`sampling_sorted.cuh`,
+  `sampling_for_each_unit`). The candidate tiles, the sorted tiles and their merge passes launched a
+  CTA per (tile, row) and returned early on rows that skip them, greedy rows included, or walked the
+  rows from each CTA. A resident grid now counts each chunk of 256 rows' units in shared memory (a
+  prefix sum) and strides over the admitted ones only: the top-k tiles 81 -> 15 us at 64 greedy
+  columns, and a round's eight merge passes cost nothing when no row samples.
+- **`sampled_logprob` reads 16 bytes at a time** (`ops/launcher/sampled_logprob.cu`), four loads in
+  flight a thread: one block per column read a whole row twice with one 2-byte load in flight, 33 us
+  whatever the batch; 16 us at 64 columns.
+- **32-row CTAs for wide W8 heads** (`ops/linear/w8/w8_rowsplit_gemm_splitk.cu`). Every CTA stages
+  its columns' activations for the whole K, so 16-row CTAs over a vocabulary head read them from L2
+  eight times over the weight's own bytes. When the weight still gives two 32-row CTAs an SM, a CTA
+  takes two 16-row tiles (bit-identical: each output's K order is the kernel's). Qwen3-8B's head
+  (151936 x 4096) alone: 376 -> 331 us at one token, 659 -> 520 us at 64. Narrower weights keep one
+  tile (6144 x 4096 would go 17 -> 20 us).
+- **Hopper's staged projections to 1,024 tokens** (`ops/linear/fp8_block/fp8_block.cu`). q/k/v
+  ranges of one parent ran as one GEMM into a staging plane only up to 128 tokens; past that they ran
+  apart, where a 1024-row k or v range at 576 tokens (a 512-token prompt beside 64 decode rows) is 40
+  tiles on 132 SMs: Qwen3-8B's q, k and v took 26.8 + 12.6 + 13.0 us, against 31.1 for vLLM's one
+  GEMM. The plane is rows x tokens BF16 (12 MiB for 6,144 rows at the cap);
+  `SUROGATE_SERVE_FP8_BLOCK_STAGED_TOKENS` lowers the cap.
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream: 64
+users 78.5 -> 81.8, 16 users 155.7 -> 160.0, one user 212.6 either way; 32 users with 2,048-token
+prompts 50.9k prompt tok/s (50.7k before).
+
+Tests. `sinfer_sampling_test` runs its greedy contract (penalties and filters that a greedy row
+ignores, ties, padding past the vocabulary) on a 16-byte-aligned row stride and on an odd one, and
+gains a `sampled_logprob` contract against a host log-softmax (three vocabularies, padded and not,
+greedy and tempered columns). The FP8 chain test adds 576 and 1,100 tokens (staged, and past
+the cap). On one Nebius H100 the 44 sampling, speculative, argmax, batch-invariance, MTP, DFlash,
+linear, W8 and head tests pass; end to end, the CLI and eight concurrent server requests pass for
+Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.

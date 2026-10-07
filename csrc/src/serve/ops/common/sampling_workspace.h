@@ -26,6 +26,12 @@ inline constexpr int kSamplerGroupTileItems      = kSamplerGroupBlock * kSampler
 inline constexpr int kSamplerPartialsPerGroup    = 25;
 inline constexpr int kSamplerFastCandidates      = 20;
 inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
+// Vocabulary items one greedy CTA scans. A greedy row needs only its maximum, so it
+// is read in a few wide chunks with 16-byte loads rather than in 512-item candidate
+// tiles; each chunk's maximum lands in that row's partial-key slots.
+inline constexpr int kSamplerGreedyChunkItems    = 8192;
+static_assert(kSamplerGreedyChunkItems % (kSamplerBlock * kSamplerItemsPerThread) == 0,
+              "greedy chunk maxima must fit the row's partial-key slots");
 // Tied to the ops batch bound: a stale cap here does not fail, it silently
 // drops decode rounds wider than the cap onto sample_row at ~4 ms a call
 // (measured at 15% of device time when the ceiling moved to 64 and this
