@@ -1,6 +1,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -147,6 +148,27 @@ bool fp4_tensor_cores(int cc) noexcept {
         start = end + 1;
     }
     return false;
+}
+
+int current_device_sm_count(int fallback) noexcept {
+    constexpr int kCachedDevices = 64;
+    static std::atomic<int> cached[kCachedDevices];
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return fallback;
+    }
+    const bool cacheable = device >= 0 && device < kCachedDevices;
+    if (cacheable) {
+        if (const int sms = cached[device].load(std::memory_order_relaxed); sms > 0) { return sms; }
+    }
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) {
+        (void)cudaGetLastError();
+        return fallback;
+    }
+    if (cacheable) { cached[device].store(sms, std::memory_order_relaxed); }
+    return sms;
 }
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }

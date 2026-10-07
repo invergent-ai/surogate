@@ -18,6 +18,11 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 /// every NVFP4 route asks this rather than comparing the capability with 120.
 bool fp4_tensor_cores(int cc) noexcept;
 
+/// Streaming multiprocessors on the current device: 48 on GB10, 132 on an H100, 170 on an RTX
+/// 5090. Read once per device; `fallback` when the device cannot be queried. For the launch
+/// policies that size a grid in waves, which must not assume one card's SM count.
+int current_device_sm_count(int fallback) noexcept;
+
 struct DeviceContext {
     int device               = 0;
     cudaStream_t stream      = nullptr;
