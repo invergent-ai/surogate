@@ -79,6 +79,14 @@ enum class CacheState : std::uint8_t {
     Warm,
 };
 
+// How a cold sample evicts the weights from L2. Writing the flush buffer leaves L2 full of
+// dirty lines, whose write-back then competes with the round's own reads; a decode step finds
+// mostly clean lines there, the earlier layers' weights. Reading it leaves clean ones.
+enum class FlushKind : std::uint8_t {
+    Write,
+    Read,
+};
+
 struct TokenSweep {
     std::int32_t begin = 1;
     std::int32_t end   = 1;
@@ -95,6 +103,7 @@ struct Options {
     int warmup                      = 5;
     int repeat                      = 50;
     std::uint64_t flush_bytes       = kDefaultFlushBytes;
+    FlushKind flush_kind            = FlushKind::Write;
     std::string csv_out;
     std::string dump; // write the first eager run's output tensor here, raw BF16
 };
@@ -344,6 +353,7 @@ void usage(const char* argv0) {
                  "  --warmup N                       Warmup replays per point (default 5).\n"
                  "  --repeat N                       Measured samples per point (default 50).\n"
                  "  --flush-mib N                    L2 eviction storage (default 256 MiB).\n"
+                 "  --flush write|read               Evict by writing it (default) or reading it.\n"
                  "  --csv-out PATH                   Write result rows as CSV.\n"
                  "  --dump PATH                      Write the first run's output (raw BF16).\n"
                  "  -h, --help                       Show this text.\n",
@@ -391,6 +401,12 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("flush-mib is out of range");
             }
             options.flush_bytes = mib << 20;
+        } else if (argument == "--flush") {
+            const std::string_view kind = next("flush");
+            if (kind != "write" && kind != "read") {
+                throw std::invalid_argument("--flush must be write or read");
+            }
+            options.flush_kind = kind == "read" ? FlushKind::Read : FlushKind::Write;
         } else if (argument == "--csv-out") {
             options.csv_out = next("CSV output path");
         } else if (argument == "--dump") {
@@ -560,10 +576,24 @@ Weight dense_weight(void* data, std::int32_t rows, std::int32_t columns) {
     return result;
 }
 
+// Reads every 16 bytes of the flush buffer; the sink is never written, but the compiler cannot
+// know that, so the loads stay.
+__global__ void flush_read_kernel(const uint4* __restrict__ data, std::size_t count,
+                                  unsigned* __restrict__ sink) {
+    unsigned folded = 0;
+    for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < count;
+         i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+        const uint4 value = data[i];
+        folded ^= value.x ^ value.y ^ value.z ^ value.w;
+    }
+    if (folded == 0x5eed5eedU) { *sink = folded; }
+}
+
 class BenchmarkWeights {
 public:
-    BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes)
-        : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
+    BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes,
+                     FlushKind flush_kind)
+        : flush_kind_(flush_kind), router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
           // The routed pair follows the profile; a GGML profile holds its blocks
           // unrearranged, which is the whole point of measuring it.
           routed_gate_(profile == CodecProfile::Nvfp4Nvfp4
@@ -590,7 +620,7 @@ public:
           shared_down_(bench::make_row_split_weight(QType::W8G32_F16S, kHidden, kIntermediate,
                                                     kIntermediate, {0x73, 0x00, 0x1407})),
           expert_scales_(static_cast<std::size_t>(kNvfp4ExpertArrays) * kExperts * sizeof(float)),
-          flush_(flush_bytes) {
+          flush_(flush_bytes), sink_(sizeof(unsigned)) {
         std::vector<std::uint16_t> router(static_cast<std::size_t>(kRouterRows) * kHidden,
                                           bench::f32_to_bf16(0.0F));
         for (std::int32_t expert = 0; expert < kExperts; ++expert) {
@@ -632,10 +662,21 @@ public:
     [[nodiscard]] const ops::SparseMoeWeights& weights() const noexcept { return weights_; }
 
     void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
+        if (flush_kind_ == FlushKind::Write) {
+            CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
+            return;
+        }
+        int device = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        flush_read_kernel<<<sms * 8, 256, 0, stream>>>(static_cast<const uint4*>(flush_.p),
+                                                       flush_.bytes / sizeof(uint4),
+                                                       static_cast<unsigned*>(sink_.p));
+        CUDA_CHECK(cudaGetLastError());
     }
 
 private:
+    FlushKind flush_kind_;
     DeviceBuffer router_;
     bench::PackedQuantizedWeight routed_gate_;
     bench::PackedQuantizedWeight routed_down_;
@@ -644,6 +685,7 @@ private:
     static constexpr int kNvfp4ExpertArrays = 7;
     DeviceBuffer expert_scales_;
     DeviceBuffer flush_;
+    DeviceBuffer sink_;
     ops::SparseMoeWeights weights_{};
 };
 
@@ -936,16 +978,18 @@ int main(int argc, char** argv) {
         DeviceContext context;
         const double peak_memory_gbps = theoretical_memory_gbps(context.device);
         std::printf("# gpu=%s sm=%d execution=%s timed_scope=full_sparse_moe_device_body "
-                    "cold_flush_mib=%llu theoretical_memory=%.1f GB/s\n",
+                    "cold_flush_mib=%llu flush=%s theoretical_memory=%.1f GB/s\n",
                     context.props.name, context.sm(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
-                    static_cast<unsigned long long>(options.flush_bytes >> 20), peak_memory_gbps);
+                    static_cast<unsigned long long>(options.flush_bytes >> 20),
+                    options.flush_kind == FlushKind::Read ? "read" : "write", peak_memory_gbps);
 
         std::vector<Result> results;
         for (CodecProfile profile : selected_profiles(options.codec)) {
             BenchmarkWeights fixture(profile, options.seed,
-                                     static_cast<std::size_t>(options.flush_bytes));
+                                     static_cast<std::size_t>(options.flush_bytes),
+                                     options.flush_kind);
             for (std::int32_t tokens : selected_tokens(options.tokens)) {
                 std::vector<Result> point =
                     run_point(fixture, profile, tokens, options, context.stream);
