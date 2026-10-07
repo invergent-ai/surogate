@@ -1216,16 +1216,15 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
     validate_target_options(options, geometry);
-    // `!= 120`, not `< 120`. The FP4 archives are pinned `120a`, which is
-    // architecture-specific and loads on exactly sm_120 -- not sm_121 (DGX
-    // Spark), not sm_100/103 (B200/B300). On any of those the driver falls
-    // back to the only other PTX in the fatbin, compute_89, which was built
-    // with __CUDA_ARCH__ == 890 and whose W4A4 body is __trap(). The default
-    // arch set is {sm_89, sm_90a, sm_120a}, with no generic compute_120 PTX to
-    // fall back to; Hopper's sm_90a cubin traps on W4A4 the same way.
-    if (weights_profile_needs_sm120(weights_profile) && device.sm() != 120) {
+    // `fp4_tensor_cores`, not `>= 120`. The FP4 archives are pinned to the build's sm_12x
+    // targets, and an `a` target loads on exactly its own architecture: `120a` on sm_120,
+    // `121a` on sm_121 (DGX Spark), never on sm_100/103 (B200/B300). On a device the build has
+    // no FP4 cubin for, the driver falls back to the only other PTX in the fatbin, compute_89,
+    // which was built with __CUDA_ARCH__ == 890 and whose W4A4 body is __trap(); Hopper's sm_90a
+    // cubin traps on W4A4 the same way.
+    if (weights_profile_needs_sm120(weights_profile) && !fp4_tensor_cores(device.sm())) {
         throw std::invalid_argument(
-            "this checkpoint's NVFP4 weights need compute capability 12.0 or newer; "
+            "this checkpoint's NVFP4 weights need an sm_120 or sm_121 GPU; "
             "serve a non-FP4 export of the model on this device");
     }
     if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {

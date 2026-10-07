@@ -110,7 +110,7 @@ int main() {
         std::fprintf(stderr, "SKIP: no CUDA device\n");
         return 77;
     }
-    if (sinfer::ops::detail::w8_device_compute_capability() < 120) {
+    if (!sinfer::fp4_tensor_cores(sinfer::ops::detail::w8_device_compute_capability())) {
         std::fprintf(stderr, "SKIP: quant-plane test needs an sm_120-class GPU\n");
         return 77;
     }

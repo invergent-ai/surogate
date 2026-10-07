@@ -7,6 +7,7 @@
 // cudaStream_t until now.
 #include <cuda_runtime.h>
 
+#include "core/device.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 
 #include <cmath>
@@ -67,21 +68,22 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
     // prefill-width call takes W4A4 and traps; refusing up front beats proving
     // a given call stays on A16.
     //
-    // `!= 120`, not `< 120`: the FP4 archives are pinned `120a`, which loads
-    // on exactly sm_120. On sm_121 or sm_100 the driver JITs the fatbin's only
-    // other PTX, compute_89, whose W4A4 body is __trap(). The default arch set
-    // is {sm_89, sm_90a, sm_120a}; the sm_90a cubin (H100/H200) is built with
-    // __CUDA_ARCH__ == 900 and its W4A4 body is __trap() as well, and the
-    // `a` PTX beside each cubin JITs only on its own architecture.
+    // `fp4_tensor_cores`, not `>= 120`: the FP4 archives are pinned to the sm_12x targets of the
+    // build (`120a`, `121a` or the family `120f`), and an `a` cubin loads on exactly its own
+    // architecture. On a device the build has no FP4 cubin for (sm_121 under the x86 wheel's
+    // `120a`, sm_100) the driver JITs the fatbin's only other PTX, compute_89, whose W4A4 body
+    // is __trap(). The sm_90a cubin (H100/H200) is built with __CUDA_ARCH__ == 900 and its W4A4
+    // body is __trap() as well, and the `a` PTX beside each cubin JITs only on its own
+    // architecture.
     //
     // This is the chokepoint: every NVFP4 wrapper (linear, linear_swiglu,
     // attn_input_proj, linear_add, gdn_input_proj) calls this before any NVFP4
-    // kernel runs. `w4fp4_plane_for` next door guards the same way, though it
-    // still spells the test `< 120` and inherits the sm_121 hole.
-    if (weight.qtype == QType::NVFP4 && w8_device_compute_capability() != 120) {
+    // kernel runs. `w4fp4_plane_for` next door guards the same way.
+    if (weight.qtype == QType::NVFP4 && !fp4_tensor_cores(w8_device_compute_capability())) {
         throw std::invalid_argument(
             std::string(operation) +
-            ": NVFP4 weights need compute capability 12.0 or newer; this device cannot run them");
+            ": NVFP4 weights need an sm_120 or sm_121 GPU this build carries FP4 code for; this "
+            "device cannot run them");
     }
     if (weight.n <= 0 || weight.k <= 0 || (weight.n % 128) != 0 || (weight.k % 64) != 0) {
         throw std::invalid_argument(std::string(operation) + ": NVFP4 requires N%128=0 and K%64=0");

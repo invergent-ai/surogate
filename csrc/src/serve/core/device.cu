@@ -1,9 +1,11 @@
 #include "core/device.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sinfer {
 namespace {
@@ -129,6 +131,23 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
 }
 
 int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; }
+
+bool fp4_tensor_cores(int cc) noexcept {
+    if (cc != 120 && cc != 121) { return false; }
+    // SINFER_BUILD_CUDA_ARCHS is SUROGATE_SERVE_CUDA_ARCHS, comma-joined (csrc/CMakeLists.txt).
+    const std::string_view built = SINFER_BUILD_CUDA_ARCHS;
+    std::size_t start = 0;
+    while (start <= built.size()) {
+        const std::size_t end = std::min(built.find(',', start), built.size());
+        const std::string_view arch = built.substr(start, end - start);
+        if (arch == (cc == 120 ? "120a" : "121a") || arch == "120f" ||
+            (cc == 121 && arch == "121f")) {
+            return true;
+        }
+        start = end + 1;
+    }
+    return false;
+}
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 

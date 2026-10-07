@@ -227,14 +227,14 @@ public:
         // an explicit opt-in (quality class change).
         if (const char* mode = std::getenv("SUROGATE_SERVE_PREFILL_QUANT");
             mode != nullptr && std::string_view(mode) == "fp4") {
-            if (ops::detail::w8_device_compute_capability() >= 120) {
+            if (fp4_tensor_cores(ops::detail::w8_device_compute_capability())) {
                 ops::detail::w8_prefill_quant_set_mode(ops::detail::PrefillQuantMode::Fp4);
             } else {
                 // NVFP4 needs the sm_120a block-scale tensor cores; explicit
                 // requests degrade loudly, never silently.
                 std::fprintf(stderr,
                              "surogate-serve: SUROGATE_SERVE_PREFILL_QUANT=fp4 requires an "
-                             "sm_120-class GPU (found CC %d.%d); falling back to the default "
+                             "sm_120 or sm_121 GPU (found CC %d.%d); falling back to the default "
                              "quant profile.\n",
                              ops::detail::w8_device_compute_capability() / 10,
                              ops::detail::w8_device_compute_capability() % 10);

@@ -113,8 +113,26 @@ option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
 # so builds at this whole arch set: cuobjdump shows sm_89 cubins AND compute_89 PTX for the
 # w4a4 entries. Their sm_89 bodies are `__trap()`, so the refusal for those is a runtime one
 # (`validate_nvfp4_weight`), not this pinning. Do not read the paragraph above as covering them.
-set(SUROGATE_SERVE_CUDA_ARCHS "89;90a;120a" CACHE STRING
-    "CUDA architectures for the serve engine targets (Ada, Hopper and RTX Blackwell)")
+#
+# On aarch64 the one Blackwell card is GB10 (DGX Spark and its OEM twins), sm_121: a `121a`
+# cubin, which no other device loads, so the default there is that alone. A Grace Hopper
+# (GH200) build adds 90a; `120f` (the sm_12x family target) is the one cubin that loads on both
+# sm_120 and sm_121.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(_SUROGATE_SERVE_DEFAULT_ARCHS "121a")
+else()
+    set(_SUROGATE_SERVE_DEFAULT_ARCHS "89;90a;120a")
+endif()
+set(SUROGATE_SERVE_CUDA_ARCHS "${_SUROGATE_SERVE_DEFAULT_ARCHS}" CACHE STRING
+    "CUDA architectures for the serve engine targets (Ada, Hopper, RTX Blackwell; GB10 on aarch64)")
+# The FP4 families (block-scaled MMA, TMA, cluster launch) are sm_12x hardware and build for the
+# sm_12x targets in the set only: 120a, 121a, and the family targets 120f/121f.
+set(SUROGATE_SERVE_FP4_ARCHS "")
+foreach(_arch IN LISTS SUROGATE_SERVE_CUDA_ARCHS)
+    if(_arch MATCHES "^12[01][af]$")
+        list(APPEND SUROGATE_SERVE_FP4_ARCHS "${_arch}")
+    endif()
+endforeach()
 # A build machine missing FFmpeg or libcurl drops the serve targets with a status
 # line, which is right for a training-only tree and wrong for a wheel: it would
 # publish a package whose `surogate serve` exits 127 and say nothing. The wheel
@@ -968,6 +986,12 @@ add_library(sinfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/runtime/engine/request_memory.cpp)
 sinfer_internal_includes(sinfer_core)
 sinfer_cuda_archive(sinfer_core)
+# Comma-joined: the architecture list is a CMake list, and a `;` inside a compile definition
+# splits it into two definitions and an unterminated quote. `fp4_tensor_cores` reads it, and
+# libsinfer.so reports it (shared_library.cpp).
+string(REPLACE ";" "," SINFER_BUILD_CUDA_ARCHS_TEXT "${SUROGATE_SERVE_CUDA_ARCHS}")
+target_compile_definitions(sinfer_core PRIVATE
+  SINFER_BUILD_CUDA_ARCHS="${SINFER_BUILD_CUDA_ARCHS_TEXT}")
 target_link_libraries(sinfer_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 Threads::Threads ${CMAKE_DL_LIBS})
 # libnuma places the host buffers of an offloaded model (core/numa.*). Optional: without it the
 # engine warns and the operator must run under `numactl --interleave=all` on a multi-socket host.
@@ -999,7 +1023,7 @@ target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
 # sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
 # other architectures link a loud-failure stub instead.
-if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+if(SUROGATE_SERVE_FP4_ARCHS)
   set(SINFER_NVFP4_TMA_REAL ON)
   add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
@@ -1015,9 +1039,10 @@ set_target_properties(sinfer_nvfp4_tma PROPERTIES
 # TMA, cluster launch and block-scaled FP4 MMA are sm_120 hardware. In a multi-architecture
 # build the rest of the engine is compiled for every listed architecture and this is not:
 # an sm_89 cubin of a kernel sm_89 cannot run is fatbin weight and a compile that has to be
-# guarded instruction by instruction. `w4fp4_plane` admits these routes at CC 120 and above.
+# guarded instruction by instruction. `fp4_tensor_cores` (core/device.cu) admits these routes on
+# exactly the devices SUROGATE_SERVE_FP4_ARCHS has cubins for.
 if(SINFER_NVFP4_TMA_REAL)
-  set_target_properties(sinfer_nvfp4_tma PROPERTIES CUDA_ARCHITECTURES 120a)
+  set_target_properties(sinfer_nvfp4_tma PROPERTIES CUDA_ARCHITECTURES "${SUROGATE_SERVE_FP4_ARCHS}")
 endif()
 target_compile_options(sinfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(sinfer_nvfp4_tma PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
@@ -1149,7 +1174,7 @@ target_link_libraries(sinfer_gqa_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cud
 # unchanged. sm_120-only, non-RDC, like the W4A4 TMA archive above; other architectures link a
 # loud-failure stub.
 set(TRTLLM_MOE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/trtllm_moe)
-if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+if(SUROGATE_SERVE_FP4_ARCHS)
   set(SINFER_TRTLLM_MOE_REAL ON)
   file(GLOB TRTLLM_MOE_GENERATED ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120/gemm_grouped/120/*.generated.cu)
   add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
@@ -1204,10 +1229,11 @@ set_target_properties(sinfer_trtllm_moe PROPERTIES
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF
   CUDA_STANDARD 17
   CXX_STANDARD 17)
-# The instantiations vendored here are FlashInfer's for architecture 120, and the kernels are
-# NVFP4: sm_120 alone, like the TMA archive above, whatever else the binary is built for.
+# The instantiations vendored here are FlashInfer's for architecture 120 (the Sm120 kernels,
+# which CUTLASS also compiles for sm_121), and the kernels are NVFP4: the sm_12x targets alone,
+# like the TMA archive above, whatever else the binary is built for.
 if(SINFER_TRTLLM_MOE_REAL)
-  set_target_properties(sinfer_trtllm_moe PROPERTIES CUDA_ARCHITECTURES 120a)
+  set_target_properties(sinfer_trtllm_moe PROPERTIES CUDA_ARCHITECTURES "${SUROGATE_SERVE_FP4_ARCHS}")
 endif()
 target_link_libraries(sinfer_trtllm_moe PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
@@ -1764,9 +1790,6 @@ set_target_properties(sinfer_shared PROPERTIES
   # `gcc -c`, and the whole-archive block below reaches it as input files.
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF
   POSITION_INDEPENDENT_CODE ON)
-# Comma-joined: the architecture list is a CMake list, and a `;` inside a compile definition
-# splits it into two definitions and an unterminated quote.
-string(REPLACE ";" "," SINFER_BUILD_CUDA_ARCHS_TEXT "${SUROGATE_SERVE_CUDA_ARCHS}")
 target_compile_definitions(sinfer_shared PRIVATE
   SINFER_BUILD_CUDA_ARCHS="${SINFER_BUILD_CUDA_ARCHS_TEXT}")
 target_include_directories(sinfer_shared PUBLIC ${SERVE_ROOT})

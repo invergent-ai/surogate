@@ -1,8 +1,11 @@
 #pragma once
 
-// NVFP4 weights run on sm_120 only: ops/linear/nvfp4/nvfp4_format.cpp refuses every other
-// device (Ada and Hopper included), and the MoE runner is built for 120a alone. A test with
-// NVFP4 cases asks this first and skips them elsewhere, keeping its other formats' cases.
+// NVFP4 weights run on the sm_12x devices the build carries FP4 cubins for (sm_120 under 120a,
+// sm_121 under 121a, both under 120f): ops/linear/nvfp4/nvfp4_format.cpp refuses every other
+// device (Ada and Hopper included), and the MoE runner is built for those targets alone. A test
+// with NVFP4 cases asks this first and skips them elsewhere, keeping its other formats' cases.
+
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -17,8 +20,9 @@ inline bool nvfp4_device(const char* what) {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
         return false;
     }
-    if (major == 12 && minor == 0) { return true; }
-    std::printf("SKIP %s: NVFP4 weights need an sm_120 device (this one is sm_%d%d)\n", what, major, minor);
+    if (fp4_tensor_cores(major * 10 + minor)) { return true; }
+    std::printf("SKIP %s: NVFP4 weights need an sm_120/sm_121 device this build has FP4 code for "
+                "(this one is sm_%d%d)\n", what, major, minor);
     return false;
 }
 

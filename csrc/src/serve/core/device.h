@@ -10,6 +10,14 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::sinfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+/// Whether this build holds block-scaled FP4 tensor-core code that a device of compute
+/// capability `cc` (major * 10 + minor) can run. The FP4 families are compiled only for the
+/// sm_12x entries of SUROGATE_SERVE_CUDA_ARCHS: `120a` loads on exactly sm_120 (RTX 50, RTX PRO
+/// 6000), `121a` on exactly sm_121 (GB10: DGX Spark), and the family target `120f` on both. Any
+/// other pairing falls back to the fatbin's compute_89 PTX, whose FP4 bodies are __trap(), so
+/// every NVFP4 route asks this rather than comparing the capability with 120.
+bool fp4_tensor_cores(int cc) noexcept;
+
 struct DeviceContext {
     int device               = 0;
     cudaStream_t stream      = nullptr;
