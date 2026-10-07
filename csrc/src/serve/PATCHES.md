@@ -4323,3 +4323,31 @@ Tests. `sinfer_w8_pipelined_test` checks every row tiling, row grouping and pipe
 against the medium-T kernel bitwise at widths 1 to 129 on a head-like shape, two narrow ones
 (one with K a group short of the deepest pipeline) and rows only 16-row CTAs tile; `bench`
 times them all beside a streaming read. Passes on one Nebius H100 with the linear and W8 tests.
+
+## 113
+
+**FA3 decode on one MMA warpgroup (2026-10-07, after #112).** vLLM's FlashAttention fork runs a
+launch whose segments pack at most 64 query rows (`seqlen_q x heads per KV head <= 64`: decode)
+with a 64-row M tile on one MMA warpgroup, at head dim 64 or 128 without a window (its
+`heuristics.h`, `use_one_mma_wg`; a 1x1x1 64x128 tile in its H100 profiles at 64 users). The
+engine's FA3 decode rows ran the 128-row two-warpgroup tile, which pads a decode row's packed
+query group (4 rows for Qwen3-8B) to 128 and keeps fewer CTAs on the keys at once.
+
+- **`tile_size_fwd_sm90`** (`src/third_party/flash_attn3/tile_size.h`) takes vLLM's
+  `use_one_mma_wg` and returns its BF16 decode tiles (`{64, 192}` at head dim 64, `{64, 128}`
+  causal at 128); `run_flash_fwd` passes it through. The kernel itself already handles one MMA
+  warpgroup (its register split and scheduler barrier have that case upstream).
+- **`gqa_fa3::launch<..., OneMmaWg>`**: four new instantiations (head dim 64 and 128, BF16,
+  causal, split and not), `gqa_fa3_hdim{64,128}_bf16_onewg[_split].cu`. `gqa_fa3.cu` takes them
+  where vLLM would (max_q x query group <= 64, head dim 64 or 128, no window, BF16 cache) for
+  decode and verify rows and narrow prompt segments alike, and `row_splits` sizes the split with
+  the same tile. Windowed layers, head dim 256 and the e4m3 cache keep the 128-row tile.
+  `SUROGATE_SERVE_GQA_FA3_ONE_WG=0` turns it off.
+
+Qwen3-8B-FP8 on one Nebius H100, decode tok/s a stream, in-job A/B off -> on: one user 231.3 ->
+232.8, 16 users 170.5 -> 171.3, 64 users 87.2 -> 88.6 (vLLM 0.31 on the same VM type: 228.8,
+153.6, 92.4).
+
+Tests. Every GQA attention test passes on the H100 (the FA3 rows cases at head dims 64, 128 and
+256, and the round-metadata test, whose global and windowed layers now take different tiles in
+one round); Qwen3-8B-FP8's CLI and eight concurrent server requests pass.

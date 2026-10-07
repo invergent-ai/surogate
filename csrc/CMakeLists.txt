@@ -1112,6 +1112,10 @@ if(SINFER_FP8_BLOCK_SM90_REAL)
     ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16_local_split.cu
     ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_bf16_split.cu
     ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim256_bf16_local_split.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_bf16_onewg.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim64_bf16_onewg_split.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16_onewg.cu
+    ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_hdim128_bf16_onewg_split.cu
     ${SERVE_ROOT}/ops/gqa_sm90/gqa_fa3_combine.cu
     ${SUROGATE_VENDOR_DIR}/flash_attn3/flash_prepare_scheduler.cu)
   target_include_directories(sinfer_gqa_sm90 PRIVATE

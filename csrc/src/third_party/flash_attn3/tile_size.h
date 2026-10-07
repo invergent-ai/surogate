@@ -9,7 +9,7 @@
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
-        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false) {
+        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool use_one_mma_wg=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
@@ -19,6 +19,9 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
                 return {64, 64, false, false};
             } else if (headdim_v == 256) {
                 return {128, 96, true, false};
+            } else if (use_one_mma_wg) {
+                // surogate: vLLM's FlashAttention fork's decode tile (see NOTICE)
+                return {64, 192, true, true};
             } else {
                 // Switch to tile size 192 x 192 for now
                 bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
@@ -30,6 +33,8 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             return {192, is_local || paged_kv_non_TMA ? 128 : 144, false, true};
         } else if (headdim <= 128) {
             bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
+            // surogate: vLLM's FlashAttention fork's decode tile, one MMA warpgroup (see NOTICE)
+            if (use_one_mma_wg) { return {64, use_blockN_128 ? 128 : 176, true, true}; }
             return {128, use_blockN_128 ? 128 : 176, true, true};
             // {128, 192, true, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
