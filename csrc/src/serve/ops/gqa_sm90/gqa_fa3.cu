@@ -44,6 +44,17 @@ const Hardware& hardware() {
     return cached;
 }
 
+// Whether the split combine starts as the forward's programmatic dependent (combine in
+// gqa_fa3_launch.h), as FA3's API launches it; SUROGATE_SERVE_GQA_FA3_PDL=0 launches it after
+// the forward instead.
+bool combine_pdl() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_GQA_FA3_PDL");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool enabled_by_env() {
     static const bool enabled = [] {
         const char* value = std::getenv("SUROGATE_SERVE_GQA_FA3");
@@ -70,11 +81,14 @@ __global__ void prompt_metadata_kernel(const std::int32_t* positions, std::int32
     }
 }
 
-// Row r of a decode or verify batch as segment r (rows_metadata in the header).
+// Row r of a decode or verify batch as segment r (rows_metadata in the header), and the tile
+// counters of the launches that will share it zeroed.
 __global__ void rows_metadata_kernel(const std::int32_t* positions, std::int32_t width,
                                      std::int32_t batch, const std::int32_t* valid_columns,
-                                     const std::int32_t* rows, std::int32_t* metadata) {
+                                     const std::int32_t* rows, std::int32_t* metadata,
+                                     std::int32_t* zero, std::int32_t counters) {
     const std::int32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < counters) { zero[r] = 0; }
     if (r >= batch) { return; }
     std::int32_t valid = valid_columns != nullptr ? valid_columns[r] : width;
     valid              = valid < 0 ? 0 : (valid > width ? width : valid);
@@ -223,10 +237,15 @@ RowSplits row_splits(std::int32_t head_dim, std::int32_t q_heads, std::int32_t k
 
 void rows_metadata(const std::int32_t* positions, std::int32_t width, std::int32_t batch,
                    const std::int32_t* valid_columns, const std::int32_t* rows,
-                   std::int32_t* metadata, cudaStream_t stream) {
+                   std::int32_t* metadata, cudaStream_t stream, std::int32_t* zero,
+                   std::int32_t counters) {
     if (batch <= 0 || width <= 0) { throw std::invalid_argument("gqa_fa3: empty row batch"); }
-    rows_metadata_kernel<<<(batch + 127) / 128, 128, 0, stream>>>(positions, width, batch,
-                                                                   valid_columns, rows, metadata);
+    if (counters < 0 || (counters > 0 && zero == nullptr)) {
+        throw std::invalid_argument("gqa_fa3: invalid tile counters");
+    }
+    const std::int32_t threads = std::max(batch, counters);
+    rows_metadata_kernel<<<(threads + 127) / 128, 128, 0, stream>>>(
+        positions, width, batch, valid_columns, rows, metadata, zero, counters);
     check_launch("rows metadata");
 }
 
@@ -253,7 +272,8 @@ void run(const PagedLaunch& a, void* workspace, std::size_t workspace_capacity,
         a.block_tables == nullptr || a.q_offsets == nullptr || a.q_lengths == nullptr ||
         a.kv_lengths == nullptr || a.kv_rows == nullptr || !(a.scale > 0.0f) ||
         a.sliding_window < 0 || a.max_splits < 1 || a.max_splits > kMaxSplits ||
-        (a.fp8_cache && a.max_splits > 1) ||
+        (a.fp8_cache && a.max_splits > 1) || (!a.prepare && a.scheduler == nullptr) ||
+        (a.scheduler != nullptr && a.tile_counter == nullptr) ||
         static_cast<std::size_t>(a.max_splits) * split_bytes(a.head_dim, a.q_heads, a.total_q) >
             std::max(kPartialBudget, split_bytes(a.head_dim, a.q_heads, a.total_q))) {
         throw std::invalid_argument("gqa_fa3: invalid launch");
@@ -267,7 +287,10 @@ void run(const PagedLaunch& a, void* workspace, std::size_t workspace_capacity,
     const std::size_t rows = static_cast<std::size_t>(a.q_heads) * a.total_q;
     const std::int32_t b_rounded = rounded_segments(a.segments);
     auto* lse       = static_cast<float*>(workspace);
-    auto* scheduler = reinterpret_cast<int*>(static_cast<char*>(workspace) + align_up(rows * sizeof(float)));
+    auto* scheduler = a.scheduler != nullptr
+                          ? a.scheduler
+                          : reinterpret_cast<int*>(static_cast<char*>(workspace) +
+                                                   align_up(rows * sizeof(float)));
     const void* q   = a.q;
     char* cursor    = static_cast<char*>(workspace) + align_up(rows * sizeof(float)) +
                       align_up((static_cast<std::size_t>(b_rounded) * 4 + 1) * sizeof(std::int32_t));
@@ -357,11 +380,12 @@ void run(const PagedLaunch& a, void* workspace, std::size_t workspace_capacity,
     // it whenever it is set, so a window leaves it null, as flash_api.cpp does.
     p.varlen_batch_idx_ptr   = local ? nullptr : scheduler + b_rounded * 2;
     p.num_nheads_in_l2_ptr   = scheduler + b_rounded * 3;
-    p.tile_count_semaphore   = scheduler + b_rounded * 4;
+    p.tile_count_semaphore   = a.scheduler != nullptr ? a.tile_counter : scheduler + b_rounded * 4;
     p.tile_count_semaphore_offset = b_rounded * 4;
-    // The prepare kernel runs every launch: it zeroes the tile counter and reads the device
-    // lengths, which is what lets a captured graph replay with new ones.
-    p.skip_scheduler_metadata_computation = false;
+    // The prepare kernel runs on the device lengths (it also zeroes the tile counter), which is
+    // what lets a captured graph replay with new ones; a launch sharing metadata an earlier one
+    // prepared skips it, its counter zeroed by whoever filled the segment arrays.
+    p.skip_scheduler_metadata_computation = !a.prepare;
     p.prepare_varlen_pdl = false;
     p.arch   = kArch;
     p.num_sm = hardware().sm_count;
@@ -372,7 +396,7 @@ void run(const PagedLaunch& a, void* workspace, std::size_t workspace_capacity,
     // The combine writes the output of every segment the forward split and leaves the rest,
     // which the forward wrote whole.
     p.is_bf16 = true;
-    combine(p, stream);
+    combine(p, stream, combine_pdl());
 }
 
 } // namespace sinfer::ops::detail::gqa_fa3

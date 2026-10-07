@@ -498,6 +498,7 @@ set(sinfer_op_tests
   gdn_gating
   gdn_gating_proj
   rope
+  qk_norm_rope
   vision_pos_embed
   vision_attention
   sampling
@@ -595,6 +596,8 @@ sinfer_add_linear_test(sinfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 sinfer_add_test(sinfer_w8_precision_test SOURCES ops/linear/test_w8_precision.cpp LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_test(sinfer_w8_moe_precision_test SOURCES ops/linear/test_w8_moe_precision.cpp LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_op_test(sinfer_w8_tail_test SOURCES ops/linear/test_w8_tail.cu LIBRARIES sinfer_ops CUDA::cudart)
+# The pipelined W8 kernel against the medium-T one, bit for bit; `bench` times both.
+sinfer_add_op_test(sinfer_w8_pipelined_test SOURCES ops/linear/test_w8_pipelined.cu LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 sinfer_add_op_test(sinfer_linear_nvfp4_cublaslt_test SOURCES ops/linear/test_nvfp4_cublaslt.cpp  LIBRARIES sinfer_ops CUDA::cublasLt)
@@ -657,6 +660,15 @@ foreach(mma 0 1)
   set_tests_properties(sinfer_linear_fp8_block_mma${mma}_test PROPERTIES
     ENVIRONMENT "SUROGATE_SERVE_FP8_BLOCK_MMA=${mma}" SKIP_RETURN_CODE 77)
 endforeach()
+# Hopper's CUTLASS tiles alone, which the DeepGEMM kernel otherwise replaces from 33 tokens.
+add_test(NAME sinfer_linear_fp8_block_deepgemm0_test COMMAND sinfer_linear_fp8_block_test)
+set_tests_properties(sinfer_linear_fp8_block_deepgemm0_test PROPERTIES
+  ENVIRONMENT "SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0" SKIP_RETURN_CODE 77)
+# DeepGEMM against the CUTLASS tiles per shape (a benchmark, not a ctest; serve-tests builds it).
+add_executable(sinfer_fp8_block_gemm_bench ops/linear/fp8_block/bench_fp8_block_gemm.cpp)
+target_include_directories(sinfer_fp8_block_gemm_bench PRIVATE ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_fp8_block_gemm_bench PRIVATE sinfer_shared CUDA::cudart)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_fp8_block_gemm_bench)
 sinfer_add_fused_linear_test(
   sinfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp

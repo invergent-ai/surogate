@@ -1,0 +1,24 @@
+Vendored from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM), `deep_gemm/include/deep_gemm/` at
+commit 057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7 (v2.8.1, 2026-09-30), MIT (see LICENSE). vLLM 0.31
+bundles DeepGEMM 2.8.0 and runs this kernel for fine-grained (128 x 128 block) FP8 checkpoints on
+H100/H200. Here it compiles against the CUTLASS the engine already fetches.
+
+What is here, and why: the sm90 block-scaled FP8 GEMM, `impls/sm90_fp8_gemm_1d2d.cuh` (activation
+scales per token per 128 of K, weight scales per 128 x 128 block, wgmma with the scales applied per
+K block in registers, TMA loads and stores, persistent warp-specialised CTAs, optional 2-CTA TMA
+multicast), and the headers it includes, unchanged except as listed below. The serving engine
+instantiates it ahead of time for a fixed list of tiles and picks one per call with DeepGEMM's own
+cost model (`src/serve/ops/linear/fp8_block/fp8_block_sm90_deepgemm*`). DeepGEMM's Python package,
+its JIT runtime (`csrc/`), the other kernels and the sm100 paths are not taken.
+
+Local changes:
+- `comm/barrier.cuh`: only `cluster_sync_with_relaxed_arrive`, the one helper this kernel calls; the
+  grid and NVLink barriers, and the `layout/` headers they include, are left out.
+- `scheduler/gemm.cuh`: `get_next_block` strides over the launched grid (`gridDim.x`) instead of the
+  `kNumSMs` template argument, so one instantiation runs on any SM count (H100 SXM and PCIe, H200,
+  H20); `kNumSMs` still sizes the L2 swizzle groups.
+- `impls/sm90_fp8_gemm_1d2d.cuh`: a trailing `residual` kernel argument. When it is non-null (it is
+  the output tensor itself), each tile's promoted FP32 accumulators start from the stored BF16
+  values instead of zero, so the output is residual + A . B rounded to BF16 once, which is what the
+  engine's `linear_add` needs; null keeps upstream's behaviour. The loads go out before the first
+  K block, behind its TMA wait (read in the epilogue instead, each waited out a global round trip).

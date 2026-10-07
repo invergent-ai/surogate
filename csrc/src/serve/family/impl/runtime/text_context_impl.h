@@ -38,8 +38,10 @@
 #include "api/ops/position.h"
 #include "api/ops/residual_add.h"
 #include "api/ops/logit_softcap.h"
+#include "api/ops/qk_norm_rope.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/rope.h"
+#include "family/impl/runtime/target_support.h"
 #include "api/ops/scatter.h"
 #include "api/ops/scalar.h"
 #include "api/ops/sigmoid_mul.h"
@@ -1311,6 +1313,36 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
+bool TextContext::fused_qk_norm_rope(const Tensor* q_norm, const Tensor* k_norm, int layer,
+                                     const Tensor& q, const Tensor& k, Tensor& qn, Tensor& kn,
+                                     const Tensor& rope_positions, bool owns_kv, cudaStream_t s) {
+    if constexpr (attention_qk_norm<Variant>() && applies_rotary<Variant>()) {
+        if (cfg_.layer_rotary_dim(layer) <= 0 || q_norm == nullptr ||
+            (owns_kv && k_norm == nullptr) || debug_probes_armed()) {
+            return false;
+        }
+        const auto& g = weights_.geometry;
+        ops::QkNormRope args;
+        args.q = &q, args.q_norm = q_norm, args.q_out = &qn;
+        if (owns_kv) { args.k = &k, args.k_norm = k_norm, args.k_out = &kn; }
+        args.k_heads      = kn.ne[1];
+        args.eps          = cfg_.rms_eps;
+        args.unit_offset  = norm_unit_offset<Variant>();
+        args.positions    = &rope_positions;
+        args.rotary_dim   = cfg_.layer_rotary_dim(layer);
+        args.active_pairs = cfg_.layer_rotary_pairs(layer);
+        args.theta        = layer_rope_theta(layer, g);
+        // The same choice the separate rope makes below: interleaved MRoPE for [T,3] positions
+        // of a model that declares its sections.
+        if (rope_positions.ne[1] == 3 && g.mrope_temporal) {
+            args.sections = {g.mrope_temporal, g.mrope_height, g.mrope_width};
+        }
+        return ops::qk_norm_rope(args, s);
+    } else {
+        return false;
+    }
+}
+
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, Phase ph,
                            KvPlane plane) {
     // The caller counts attending layers; a model that shares planes needs the *plane* index,
@@ -1364,17 +1396,6 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     Tensor kn = attention_qk_norm<Variant>()
                     ? results.normalized_key.view({layer_head_dim, layer_n_kv, T})
                     : k;
-    if constexpr (attention_qk_norm<Variant>()) {
-        ops::rmsnorm(q, *w.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
-        // A layer that owns no key/value planes wrote no key to normalise, and carries no key
-        // norm to normalise it with: it attends over what an earlier layer already normalised
-        // and cached.
-        if (owns_kv) {
-            ops::rmsnorm(k, *w.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
-        }
-    }
-    debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, T}), cfg_.n_layers, s);
-    debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, T}), cfg_.n_layers, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
@@ -1384,8 +1405,23 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     if (weights_.vision_geometry.gemma_version && rope_for_op.ne[1] == 3) {
         rope_for_op = rope_for_op.slice(1, 0, 1).view({T});
     }
+    const bool fused_norm_rope =
+        fused_qk_norm_rope(w.q_norm, w.k_norm, layer, q, k, qn, kn, rope_for_op, owns_kv, s);
+    if constexpr (attention_qk_norm<Variant>()) {
+        if (!fused_norm_rope) {
+            ops::rmsnorm(q, *w.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
+            // A layer that owns no key/value planes wrote no key to normalise, and carries no
+            // key norm to normalise it with: it attends over what an earlier layer already
+            // normalised and cached.
+            if (owns_kv) {
+                ops::rmsnorm(k, *w.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+            }
+        }
+    }
+    debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, T}), cfg_.n_layers, s);
+    debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, T}), cfg_.n_layers, s);
     if constexpr (applies_rotary<Variant>()) {
-        if (cfg_.layer_rotary_dim(layer) > 0) {
+        if (!fused_norm_rope && cfg_.layer_rotary_dim(layer) > 0) {
             const auto& g = weights_.geometry;
             if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
                 ops::rope_interleaved(rope_for_op, cfg_.layer_rotary_dim(layer),
@@ -1450,12 +1486,15 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         Tensor a_batch        = a.view({layer_head_dim, cfg_.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        // The draft head runs outside the stack's layer loop, over its own positions.
+        ops::GqaRoundMetadata* round = mtp ? nullptr : &attention_round_;
         if (owns_kv) {
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                               cfg_.attention_scale, kv_view, layer_envelope, work_, a_batch, s, selection);
+                               cfg_.attention_scale, kv_view, layer_envelope, work_, a_batch, s, selection,
+                               round);
         } else {
             ops::gqa_attention_cached(q_batch, position_batch, valid, kv_table_rows, cfg_.attention_scale,
-                                      kv_view, layer_envelope, work_, a_batch, s, selection);
+                                      kv_view, layer_envelope, work_, a_batch, s, selection, round);
         }
     } else if (owns_kv) {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, cfg_.attention_scale,
@@ -1979,6 +2018,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepst
     }
     const int begin = first_layer < 0 ? stage_first_ : std::max(stage_first_, first_layer);
     const int end = last_layer < 0 ? stage_last_ : std::min(stage_last_, last_layer);
+    attention_round_.begin();
     for (int layer = begin; layer < end; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -2470,6 +2510,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
+    attention_round_.begin();
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -2515,21 +2556,25 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor kn = attention_qk_norm<Variant>()
                                 ? results.normalized_key.view({layer_head_dim, layer_n_kv, total})
                                 : k;
+                Tensor rope_all = text_rope_positions<Variant>(roots.rope_positions);
+                if (weights_.vision_geometry.gemma_version && rope_all.ne[1] == 3) {
+                    rope_all = rope_all.slice(1, 0, 1).view({total});
+                }
+                const bool fused_norm_rope = fused_qk_norm_rope(
+                    full.q_norm, full.k_norm, layer, q, k, qn, kn, rope_all, owns_kv, s);
                 if constexpr (attention_qk_norm<Variant>()) {
-                    ops::rmsnorm(q, *full.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
-                    if (owns_kv) {
-                        ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                    if (!fused_norm_rope) {
+                        ops::rmsnorm(q, *full.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
+                        if (owns_kv) {
+                            ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                        }
                     }
                 }
                 debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, total}), cfg_.n_layers, s);
                 debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, total}), cfg_.n_layers, s);
 
-                Tensor rope_all = text_rope_positions<Variant>(roots.rope_positions);
-                if (weights_.vision_geometry.gemma_version && rope_all.ne[1] == 3) {
-                    rope_all = rope_all.slice(1, 0, 1).view({total});
-                }
                 if constexpr (applies_rotary<Variant>()) {
-                    if (cfg_.layer_rotary_dim(layer) > 0) {
+                    if (!fused_norm_rope && cfg_.layer_rotary_dim(layer) > 0) {
                         const auto& g = weights_.geometry;
                         if (rope_all.ne[1] == 3 && g.mrope_temporal) {
                             ops::rope_interleaved(
@@ -2624,12 +2669,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     if (owns_kv) {
                         ops::gqa_attention(qb, kb, vb, position_batch, decode.valid_columns, decode.kv_table_rows,
                                            cfg_.attention_scale, kv_view, decode_layer_envelope,
-                                           work_, ab, s, decode_selection);
+                                           work_, ab, s, decode_selection, &attention_round_);
                     } else {
                         ops::gqa_attention_cached(qb, position_batch, decode.valid_columns, decode.kv_table_rows,
                                                   cfg_.attention_scale, kv_view,
                                                   decode_layer_envelope, work_, ab, s,
-                                                  decode_selection);
+                                                  decode_selection, &attention_round_);
                     }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
@@ -3173,6 +3218,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
+    attention_round_.begin();
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -3212,13 +3258,6 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 Tensor kn = attention_qk_norm<Variant>()
                                 ? results.normalized_key.view({layer_head_dim, layer_n_kv, total})
                                 : k;
-                if constexpr (attention_qk_norm<Variant>()) {
-                    ops::rmsnorm(q, *full.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
-                    if (owns_kv) {
-                        ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
-                    }
-                }
-
                 Tensor rope_positions = roots.positions;
                 Tensor rope_all       = rope_positions.view({total});
                 if (batch > 0) {
@@ -3228,8 +3267,18 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
+                const bool fused_norm_rope = fused_qk_norm_rope(
+                    full.q_norm, full.k_norm, layer, q, k, qn, kn, rope_all, owns_kv, s);
+                if constexpr (attention_qk_norm<Variant>()) {
+                    if (!fused_norm_rope) {
+                        ops::rmsnorm(q, *full.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
+                        if (owns_kv) {
+                            ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                        }
+                    }
+                }
                 if constexpr (applies_rotary<Variant>()) {
-                    if (cfg_.layer_rotary_dim(layer) > 0) {
+                    if (!fused_norm_rope && cfg_.layer_rotary_dim(layer) > 0) {
                         ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
                                   cfg_.layer_rotary_pairs(layer),
                                   layer_rope_theta(layer, weights_.geometry), qn, kn, s);
@@ -3285,12 +3334,12 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     if (owns_kv) {
                         ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
                                            cfg_.attention_scale, kv_view, decode_layer_envelope,
-                                           work_, ab, s, decode_selection);
+                                           work_, ab, s, decode_selection, &attention_round_);
                     } else {
                         ops::gqa_attention_cached(qb, position_batch, Tensor{}, decode.kv_table_rows,
                                                   cfg_.attention_scale, kv_view,
                                                   decode_layer_envelope, work_, ab, s,
-                                                  decode_selection);
+                                                  decode_selection, &attention_round_);
                     }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().

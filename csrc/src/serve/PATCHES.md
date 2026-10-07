@@ -4152,3 +4152,174 @@ greedy and tempered columns). The FP8 chain test adds 576 and 1,100 tokens (stag
 the cap). On one Nebius H100 the 44 sampling, speculative, argmax, batch-invariance, MTP, DFlash,
 linear, W8 and head tests pass; end to end, the CLI and eight concurrent server requests pass for
 Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.
+
+## 109
+
+**DeepGEMM's Hopper FP8 GEMM for 33-token and wider rounds (2026-10-07, after #108).** vLLM runs
+fine-grained (128 x 128 block) FP8 linears on H100/H200 through DeepGEMM; in-engine profiles at 64
+users put our CUTLASS tiles (#105, #107) at about 1.26x its time per token. Everything below is
+engine-wide: it applies to every block-FP8 linear on sm_90, whatever the model.
+
+- **The kernel** (`src/third_party/deep_gemm`, MIT; its `NOTICE` lists the local changes). DeepGEMM
+  2.8.1's sm90 1D2D kernel: wgmma with the per-128 activation and weight scales applied per K
+  block in registers, TMA loads and stores, persistent warp-specialised CTAs, optional 2-CTA TMA
+  multicast. DeepGEMM JIT-compiles a kernel per shape; here 30 tiles are compiled ahead of time
+  (`ops/linear/fp8_block/fp8_block_sm90_deepgemm_tiles*.cu`) and DeepGEMM's own cost model picks
+  one per call (`fp8_block_sm90_deepgemm.cu`). The residual add of `linear_add` seeds the FP32
+  accumulators from the output, so outputs without a residual are the CUTLASS tiles' bits and with
+  one are within one BF16 ulp (summed before rounding instead of after).
+- **Five tiles run as their 2-CTA twins** (`fp8_block_sm90_deepgemm_tiles.h`,
+  `SINFER_DG_STAND_INS`). With N as a run-time value (DeepGEMM compiles N and K in), the
+  single-CTA 128 x 144, 128 x 160, 128 x 192, 256 x 112 and 256 x 128 tiles spill 80 to 520 bytes
+  of registers in the K loop (`cuobjdump --dump-resource-usage`) and ran 1.2 to 3.2x slower than
+  the CUTLASS tiles. Compiling N in removes the spill; K alone, a larger math register budget
+  (setmaxnreg 240) or less unrolling do not. Their 2-CTA twins don't spill, so those five are not
+  compiled: the cost model still scores them, and a round that picks one launches its twin, 0.67
+  to 0.99x of the CUTLASS tiles' time on those rounds as routed (Qwen3-8B's o projection at 576
+  tokens 26.7 -> 19.5 us, vLLM's DeepGEMM 17.2).
+- **Routing** (`fp8_block_sm90_gemm.cu`). Rounds from 33 tokens take DeepGEMM (narrower ones take
+  the tensor-core kernel or the GEMV of #107/#108), except two picks that measured slower than the
+  CUTLASS tiles, which those keep (`DeepGemmOperands::where_faster`): a 64-row tile past 64 tokens
+  (1.0 to 1.5x; its single math warpgroup waits on its MMAs before promoting each K block) and a
+  256-row tile with a residual (each thread seeds twice the accumulators before its first MMA; up
+  to 1.2x). `SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0` turns the route off, `=N` starts it at N tokens,
+  `=N-M` keeps it to N..M.
+
+GEMM time, one Nebius H100, 16 q/k/v, o, gate/up and down shapes of 0.6B to 70B dense models at
+33 to 2,048 tokens, each timed from a CUDA graph of 200 launches (`sinfer_fp8_block_gemm_bench`, a
+serve-tests binary, not a ctest): DeepGEMM as it picks 0.973x the CUTLASS tiles' total, as routed
+0.959x; on the eight Qwen3-8B and Qwen3.6-27B shapes at 33 to 2,048 tokens the routed total is
+about 1.06x vLLM 0.31's JIT-compiled DeepGEMM (another H100).
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream, with
+vLLM 0.31 on the same VM: 64 users 81.6 -> 85.2 (vLLM 92.7), 16 users 159.9 -> 162.3 (160.5), one
+user 213.5 -> 213.2 (230.7); 32 users with 2,048-token prompts 51.7k -> 52.4k prompt tok/s
+(55.1k). The 64-user TTFT p50 read 24.9 to 31.9 ms over four runs with the route on, 25.6 to 26.3
+off (vLLM 57.3). Qwen3.6-27B-FP8 moves within run-to-run noise: 16 users 52.5 -> 53.0, 64 users
+28.4 -> 28.2, 32 x 2k prefill 14.95k -> 15.10k.
+
+Tests. `sinfer_linear_fp8_block_deepgemm0_test` runs the FP8 block suite with the route off, so
+both routes stay covered; the GEMM bench compares DeepGEMM's output with the CUTLASS tiles' on
+every shape it times (bit-identical on all 160 shape and token points without a residual). On one
+Nebius H100 every serve test the serve-tests target builds passes (210; the speech, TTS and two
+vision tests it doesn't build report Not Run), and the CLI and eight concurrent server requests
+pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4 E4B.
+
+## 110
+
+**Attention metadata once per round (2026-10-07, after #109).** In-engine profiles of Qwen3-8B-FP8
+on an H100 put two small kernels in front of every attention layer's FA3 decode launch: the rows'
+segment arrays (`rows_metadata`, 1.2 us) and FA3's scheduler metadata (`prepare_varlen_num_blocks`,
+2.8 us at one user, 3.8 at 64), against vLLM's per-layer forward and combine alone (it computes the
+scheduler metadata once per step). Both depend only on the round's positions, valid columns,
+block-table rows and the launch geometry, which every layer of a stack shares. Engine-wide: any
+model whose decode or verify rows take FA3 (#106).
+
+- **`ops::GqaRoundMetadata`** (`api/ops/gqa_attention.h`). A round's attention layers pass one to
+  the batched `gqa_attention` / `gqa_attention_cached`; its storage is a slice of the round state
+  (`api/family/round_state.h`, `round attention metadata`, a few KiB at the batch capacity). The
+  first FA3 rows launch over a given input set (the arrays' addresses, width, batch, head geometry,
+  window and split bound; up to four sets, so alternating windows each get theirs) derives the
+  segment arrays and the scheduler metadata into it; the rest of the round's layers read them and
+  skip both kernels. The text runtime begins a round before each layer loop (`run_layers` and both
+  mixed loops); MTP layers and anything without a round compute their own as before. Captured
+  graphs replay it as they capture it: the first layer's launches recompute from the new positions.
+- **A tile counter per layer** (`ops/gqa_sm90/gqa_fa3.{h,cu}`). FA3's dynamic tile scheduler
+  counts tiles with a semaphore that its prepare kernel zeroes and a split launch's combine resets;
+  launches that skip the prepare get one counter each (`PagedLaunch::tile_counter`), all zeroed by
+  the round's `rows_metadata` launch, so no layer reads another's leftover count.
+  `PagedLaunch::scheduler` / `prepare` select the shared metadata, as FA3's
+  `skip_scheduler_metadata_computation` does for vLLM.
+- **The split combine launches with programmatic dependent launch** (`gqa_fa3_combine.cu`), as
+  FA3's own API does; its last CTA waits on the forward before resetting the counter.
+  `SUROGATE_SERVE_GQA_FA3_PDL=0` turns that off, `SUROGATE_SERVE_GQA_ROUND_METADATA=0` the sharing.
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream, with
+the sharing off -> on and vLLM 0.31 on the same VM: one user 213.5 -> 221.1 (vLLM 228.8), 16 users
+163.2 -> 167.0 (153.6), 64 users 85.7 -> 86.7 (92.4); 32 users with 2,048-token prompts 52.2k ->
+52.5k prompt tok/s (55.1k). The combine's PDL is a small part of that (220.3 / 166.2 / 86.3 without
+it). Qwen3.6-27B-FP8: one user 80.3 -> 82.6, 64 users 28.2 -> 28.3.
+
+Tests. `sinfer_gqa_attention_test` adds a four-layer round (alternating 256-token windows, widths
+1 and 4, histories of 40 and 2,600 keys so long rows split): every layer's output with the shared
+metadata is bitwise the output without it, eagerly, after the positions move, and from a captured
+graph replayed at two further positions; on Hopper the round holds two input sets of two launches
+each. On one Nebius H100 every serve test the serve-tests target builds passes (210), and the CLI
+and eight concurrent server requests pass for Qwen3-8B-FP8, Qwen3.6-27B-FP8, Qwen3-0.6B,
+Qwen3.5-0.8B and Gemma 4 E4B.
+
+## 111
+
+**Query/key norm and RoPE in one kernel (2026-10-07, after #110).** Every attention layer of a
+model with per-head query/key RMSNorm (Qwen3, Qwen3.5/3.6, Gemma) ran three launches between its
+QKV projection and attention: the query norm, the key norm and the rope over both. vLLM fuses
+them. Engine-wide: any family with `attention_qk_norm` and a rotary layer, on every GPU.
+
+- **`ops::qk_norm_rope`** (`api/ops/qk_norm_rope.h`, `ops/kernel/qk_norm_rope.cuh`). A warp a
+  head and a block a (token, eight heads), the rope kernel's grid: the warp loads its head,
+  reduces it the way the rmsnorm kernel the separate op would dispatch reduces it
+  (`rmsnorm_d128_bf16x2_kernel` for a plain gain at 128, `rmsnorm_warp_bf16x2_kernel` for 64 to
+  256), rounds the normalised head to BF16 as that op writes it, and rotates it with the angles
+  the rope kernel the separate op would dispatch computes (the generic kernel's double-precision
+  phases, or the fixed Text1D / TextMrope / DFlash tables for the shapes `rope.cu` sends there;
+  `rope_interleaved`'s sections too). The partner channel is in the same lane when `rotary_dim / 4`
+  is a multiple of 32 and a shuffle away when it is a power of two below 32; anything else (and
+  head dims outside 64..256) declines, and the layer runs the separate ops. A layer without keys
+  of its own normalises and rotates only its queries.
+- **The runtime** (`text_context_impl.h`): `attn_mix`, `mixed_chunk_multi` and
+  `mixed_graph_window` try the fused launch first and fall back to the separate ops. The rope
+  positions are derived before the norm now. Debug probes (`SUROGATE_SERVE_DUMP_RESIDUAL`) keep
+  the separate ops, so the post-norm probe still sees the unrotated plane.
+  `SUROGATE_SERVE_QK_NORM_ROPE=0` turns the fusion off.
+- **A rotated pair's roundings are spelled out** (`rope.cuh`, `rope_rotated_first/second`):
+  `__fmaf_rn(first, c, -__fmul_rn(second, s))` and `__fmaf_rn(second, c, __fmul_rn(first, s))`,
+  in the generic kernel, the fixed kernels and the fused one. Left to the compiler, the fixed
+  kernels contracted `first * c - second * s` the other way from the generic kernel, so a few
+  values in a million differed by one BF16 step between kernels that must agree. The fixed
+  kernels' outputs move by that much on those values.
+- `rmsnorm_fp32_kernel` moved from `rmsnorm.cuh` into its launcher: the header now has a second
+  includer, and a non-template kernel defined in it was a duplicate symbol at link.
+
+Qwen3-8B-FP8 on one Nebius H100, 512-token prompts and 128 new tokens, decode tok/s a stream,
+fusion off -> on: one user 223.6 -> 228.6, 64 users 87.1 -> 87.4; 32 users with 2,048-token
+prompts 52.3k -> 52.1k prompt tok/s (noise).
+
+Tests. `sinfer_qk_norm_rope_test`: 15 geometries (Qwen3 / Llama heads, the DFlash shape,
+Qwen3.6's fixed-table and interleaved heads, Gemma's full and partial rotations, narrow heads,
+queries only) at 1, 3, 64 and 333 tokens from positions 0, 9,000 and 250,000, each bitwise the
+separate rmsnorm + rope; two geometries outside the domain decline without writing. On one
+Nebius H100 it and every rope, rmsnorm and linear test pass, and Qwen3-8B-FP8's CLI and eight
+concurrent server requests pass.
+
+## 112
+
+**A pipelined W8 kernel for small rounds (2026-10-07, after #111).** On an H100 the
+batch-consistent W8G32 route (`launch_w8_consistent`) read Qwen3-8B's W8 vocabulary head
+(151936 x 4096) at 2.0 TB/s at one token, 330 us against a 197 us streaming read of its codes:
+the medium-T kernel stages one 256-wide K group at a time and loads that group's scales inside
+its MMA loop, so a CTA has about 8 KiB in flight and stalls twice a group.
+
+- **`w8_rowsplit_pipelined_kernel`** (`ops/linear/w8/w8_rowsplit_gemm_pipelined.cuh`). The
+  medium-T kernel's arithmetic -- four K-split warps, each weight rounded once to BF16 from its
+  FP16 group scale, each warp's K slices in the same mma order, the same split combine -- with a
+  `Stages`-deep cp.async pipeline over codes, activations and scales (a row's scales over one
+  group are 16 contiguous bytes), in dynamic shared memory. Every output is the medium-T kernel's
+  bits, so the route stays batch-consistent. `RowGroups = 2` gives a CTA two sets of four warps
+  over one staging of the activations, each set over its own 32 rows; each K step dequantises
+  the weight fragments of every row tile before the activation fragment that feeds them all is
+  loaded.
+- **The schedule** (`w8_rowsplit_gemm_splitk.cu`, from the variants' sweep): up to 8 columns,
+  four groups in flight (the head 330 -> 229 us, 12288 x 4096 30 -> 23 us); 9 to 32 columns, two
+  warp sets a CTA where the rows give each SM four or more 64-row CTAs (the head 311 -> 274 us at
+  16 columns, 380 -> 333 at 32); past 32 columns, or 17 to 32 on 16-row weights, the medium-T
+  kernel as before. On sm_90 by default; `SUROGATE_SERVE_W8_PIPELINED=0` turns it off, `=1` on any
+  device, `SUROGATE_SERVE_W8_ROW_GROUPS=1` drops the shared staging.
+
+Qwen3-8B-FP8 (W8 head) on one Nebius H100, decode tok/s a stream, pipelined off -> on: one user
+226.2 -> 231.3, 16 users 168.6 -> 170.1, 64 users unchanged (the medium-T kernel). vLLM 0.31 on
+the same VM type: 228.8, 153.6, 92.4. With #111, one user 221.1 -> 231.3 since #110.
+
+Tests. `sinfer_w8_pipelined_test` checks every row tiling, row grouping and pipeline depth
+against the medium-T kernel bitwise at widths 1 to 129 on a head-like shape, two narrow ones
+(one with K a group short of the deepest pipeline) and rows only 16-row CTAs tile; `bench`
+times them all beside a streaming read. Passes on one Nebius H100 with the linear and W8 tests.

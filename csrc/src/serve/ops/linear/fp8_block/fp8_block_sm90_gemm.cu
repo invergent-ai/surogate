@@ -3,9 +3,11 @@
 // the narrow tile; the other tiles live in fp8_block_sm90_gemm_{mid,wide}.cu. Built for 90a only.
 
 #include "ops/linear/fp8_block/fp8_block_sm90_gemm.cuh"
+#include "ops/linear/fp8_block/fp8_block_sm90_deepgemm.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <string_view>
 
 namespace sinfer::ops::detail::fp8_block {
@@ -64,6 +66,27 @@ bool run_tile(const TileChoice& tile, const Operands& o, bool residual) {
     return false;
 }
 
+// SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 turns the DeepGEMM route off; =N starts it at N tokens, and
+// =N-M keeps it to N..M tokens. Rounds to 16 tokens take the tensor-core kernel or the GEMV before
+// they reach this GEMM.
+struct TokenRange {
+    int lo, hi;
+};
+
+TokenRange deepgemm_tokens() {
+    static const TokenRange range = [] {
+        constexpr int kMax = std::numeric_limits<int>::max();
+        const char* raw = std::getenv("SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM");
+        if (raw == nullptr || *raw == '\0') { return TokenRange{33, kMax}; }
+        char* end = nullptr;
+        const long lo = std::strtol(raw, &end, 10);
+        if (lo <= 0) { return TokenRange{kMax, kMax}; }
+        const long hi = *end == '-' ? std::strtol(end + 1, nullptr, 10) : kMax;
+        return TokenRange{static_cast<int>(lo), hi >= lo ? static_cast<int>(std::min<long>(hi, kMax)) : kMax};
+    }();
+    return range;
+}
+
 } // namespace
 } // namespace sm90
 
@@ -86,6 +109,13 @@ bool sm90_gemm(const std::uint8_t* act_codes, const float* act_scales, const std
         (n % 8) != 0 || !aligned(act_codes) || !aligned(act_scales) || !aligned(w_codes) ||
         !aligned(w_scales) || !aligned(out_bf16)) {
         return false;
+    }
+    // DeepGEMM's kernel (fp8_block_sm90_deepgemm.h) over deepgemm_tokens(), save the tiles of its
+    // that ran slower than these (where_faster); SUROGATE_SERVE_FP8_BLOCK_DEEPGEMM=0 keeps every
+    // round on these.
+    if (const sm90::TokenRange dg = sm90::deepgemm_tokens(); tokens >= dg.lo && tokens <= dg.hi &&
+        sm90::deepgemm({act_codes, act_scales, w_codes, w_scales, out_bf16, residual, tokens, n, k, stream, true})) {
+        return true;
     }
     // SUROGATE_SERVE_FP8_BLOCK_SM90_TILES=0 keeps vLLM's two tiles, for A/B runs.
     static const bool vllm_tiles = [] {

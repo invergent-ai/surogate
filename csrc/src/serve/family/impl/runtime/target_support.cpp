@@ -50,6 +50,8 @@ bool take_injected_fault(InjectedFault fault) noexcept {
     return false;
 }
 
+bool debug_probes_armed() noexcept { return probe_directory() != nullptr; }
+
 void debug_probe_dump(std::int32_t magic, const char* tag, const Tensor& tensor,
                       std::int32_t layer_count, cudaStream_t stream) {
     const char* dir = probe_directory();

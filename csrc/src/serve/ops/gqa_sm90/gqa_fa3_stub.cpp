@@ -35,7 +35,7 @@ RowSplits row_splits(std::int32_t, std::int32_t, std::int32_t, std::int32_t, std
 }
 
 void rows_metadata(const std::int32_t*, std::int32_t, std::int32_t, const std::int32_t*,
-                   const std::int32_t*, std::int32_t*, cudaStream_t) {
+                   const std::int32_t*, std::int32_t*, cudaStream_t, std::int32_t*, std::int32_t) {
     unavailable();
 }
 

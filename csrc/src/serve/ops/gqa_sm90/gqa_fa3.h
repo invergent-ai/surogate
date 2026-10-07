@@ -64,6 +64,16 @@ struct PagedLaunch {
     /// The most CTAs one segment's keys may be spread over (row_splits), 1 for none. The scratch
     /// must have been sized for it (workspace_bytes with `splits`).
     std::int32_t max_splits = 1;
+    /// FA3's scheduler metadata (scheduler_ints(segments)) outside the scratch, for launches over
+    /// the same segment arrays and geometry to share; null keeps it in the scratch. A launch with
+    /// `prepare` computes it there from the segment arrays (FA3's prepare kernel); one without
+    /// reads what such a launch computed, as FA3 does with vLLM's per-step scheduler metadata.
+    std::int32_t* scheduler = nullptr;
+    bool prepare            = true;
+    /// With `scheduler`: this launch's tile counter, zero when the launch begins. The forward
+    /// leaves it nonzero (a split launch's combine zeroes it again), so launches that share
+    /// metadata take one counter each.
+    std::int32_t* tile_counter = nullptr;
 };
 
 /// True when this build carries the sm_90a kernel, the current device is an sm_90 part and
@@ -138,6 +148,13 @@ struct RowSplits {
     return 4 * segments + 1;
 }
 
+/// Device I32 scratch FA3's scheduler metadata over `segments` takes outside a launch's scratch
+/// (PagedLaunch::scheduler): four per-segment vectors, each rounded to four entries (16-byte
+/// aligned, as FA3 lays them out).
+[[nodiscard]] inline std::int32_t scheduler_ints(std::int32_t segments) noexcept {
+    return (segments + 3) / 4 * 4 * 4;
+}
+
 /// A one-segment launch's arrays, filled on the stream from the round's device positions: the
 /// segment is all `tokens` columns and sees `positions[0] + tokens` keys. `metadata` holds
 /// metadata_ints(1) ints laid out [offsets(2) | lengths(1) | kv_lengths(1) | rows(1)], and the
@@ -156,10 +173,12 @@ void segment_kv_lengths(const std::int32_t* positions, const std::int32_t* q_off
 /// `r * width .. + valid`, where `valid` is `valid_columns[r]` (device; null means every column),
 /// and it sees `positions[r * width] + valid` keys of block-table row `rows[r]` (device; null
 /// means row r). A row with no valid column is an empty segment. `metadata` holds
-/// metadata_ints(batch) ints.
+/// metadata_ints(batch) ints. The same launch zeroes `counters` ints at `zero` (the tile counters
+/// of launches that will share these arrays' scheduler metadata).
 void rows_metadata(const std::int32_t* positions, std::int32_t width, std::int32_t batch,
                    const std::int32_t* valid_columns, const std::int32_t* rows,
-                   std::int32_t* metadata, cudaStream_t stream);
+                   std::int32_t* metadata, cudaStream_t stream, std::int32_t* zero = nullptr,
+                   std::int32_t counters = 0);
 
 void run(const PagedLaunch& args, void* workspace, std::size_t workspace_capacity,
          cudaStream_t stream);

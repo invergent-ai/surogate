@@ -1927,6 +1927,143 @@ int verify_fp8_current_tokens_match_cached(int dim, int heads, int kv_heads) {
     return failures;
 }
 
+// A round's layers share Hopper's per-row arrays and FA3 scheduler metadata through an
+// ops::GqaRoundMetadata: each layer of a shared round must match the same layer run on its own,
+// bit for bit, over global and windowed layers (two input sets), whole and split histories, and
+// rounds whose positions moved, eagerly and replayed from a captured graph. Elsewhere the round
+// is ignored and the outputs match trivially.
+int verify_round_metadata_sharing() {
+    int failures = 0;
+    constexpr int dim = 128, heads = 32, kv_heads = 8, batch = 5, layers = 4;
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    for (const int width : {1, 4}) {
+        for (const int history : {40, 2600}) {
+            const int pages_per_row = (history + 80 + width + kPagedKVPageSize - 1) / kPagedKVPageSize;
+            DeviceArena arena(160U << 20);
+            PagedKVBatchLayerView cache;
+            cache.head_dim     = dim;
+            cache.num_kv_heads = kv_heads;
+            cache.dtype        = DType::BF16;
+            cache.k_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, pages_per_row * batch});
+            cache.v_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, pages_per_row * batch});
+            cache.block_tables = arena.alloc(DType::I32, {pages_per_row, batch});
+            std::uint32_t seed = 977U + static_cast<std::uint32_t>(width * 31 + history);
+            const auto fill = [&](Tensor t) {
+                std::vector<std::uint16_t> host(static_cast<std::size_t>(t.numel()));
+                for (auto& x : host) {
+                    seed = seed * 1664525U + 1013904223U;
+                    x    = f32_to_bf16(static_cast<float>(seed >> 8) / 8388608.0F - 1.0F);
+                }
+                CUDA_CHECK(cudaMemcpy(t.data, host.data(), t.bytes(), cudaMemcpyHostToDevice));
+            };
+            fill(cache.k_pages);
+            fill(cache.v_pages);
+            std::vector<int> table(static_cast<std::size_t>(pages_per_row) * batch);
+            for (int row = 0; row < batch; ++row) {
+                for (int page = 0; page < pages_per_row; ++page) {
+                    table[row * pages_per_row + page] = ((batch - 1 - row) * pages_per_row + page * 7) %
+                                                        (pages_per_row * batch);
+                }
+            }
+            // Pages are distinct across rows only up to the permutation above; that rows share a
+            // page now and then changes nothing here, where no row is appended to.
+            CUDA_CHECK(cudaMemcpy(cache.block_tables.data, table.data(), cache.block_tables.bytes(),
+                                  cudaMemcpyHostToDevice));
+            Tensor positions = arena.alloc(DType::I32, {width, batch});
+            Tensor valid     = arena.alloc(DType::I32, {batch});
+            Tensor rows      = arena.alloc(DType::I32, {batch});
+            const std::vector<int> valid_counts = width == 1 ? std::vector<int>{1, 1, 1, 1, 1}
+                                                             : std::vector<int>{4, 3, 4, 1, 2};
+            const std::vector<int> row_ids{2, 0, 4, 1, 3};
+            const auto set_positions = [&](int shift) {
+                std::vector<int> pos(static_cast<std::size_t>(width) * batch);
+                for (int row = 0; row < batch; ++row) {
+                    const int base = history - 9 * row + shift;
+                    for (int col = 0; col < width; ++col) {
+                        pos[row * width + col] = base + std::min(col, valid_counts[row] - 1);
+                    }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(positions.data, pos.data(), positions.bytes(),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            };
+            CUDA_CHECK(cudaMemcpy(valid.data, valid_counts.data(), valid.bytes(), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(rows.data, row_ids.data(), rows.bytes(), cudaMemcpyHostToDevice));
+            std::vector<Tensor> queries, shared, alone;
+            for (int layer = 0; layer < layers; ++layer) {
+                queries.push_back(arena.alloc(DType::BF16, {dim, heads, width, batch}));
+                fill(queries.back());
+                shared.push_back(arena.alloc(DType::BF16, {dim, heads, width, batch}));
+                alone.push_back(arena.alloc(DType::BF16, {dim, heads, width, batch}));
+            }
+            const auto envelope_of = [&](int layer) {
+                return ops::GqaExecutionEnvelope{
+                    1, static_cast<std::uint32_t>(pages_per_row * kPagedKVPageSize), layer % 2 ? 256 : 0};
+            };
+            WorkspaceArena scratch(std::max<std::size_t>(256, ops::gqa_attention_workspace_capacity_bytes(
+                dim, heads, kv_heads, cache.dtype, envelope_of(0), batch, width, width)));
+            Tensor storage = arena.alloc(DType::I32, {ops::GqaRoundMetadata::storage_ints(batch)});
+            ops::GqaRoundMetadata round(storage, batch);
+            const Tensor valid_or_all = width == 1 ? Tensor{} : valid;
+            const auto run_round = [&](bool share) {
+                if (share) { round.begin(); }
+                for (int layer = 0; layer < layers; ++layer) {
+                    ops::gqa_attention_cached(queries[layer], positions, valid_or_all, rows, 1.0F / 16.0F,
+                                              cache, envelope_of(layer), scratch,
+                                              share ? shared[layer] : alone[layer], stream, {},
+                                              share ? &round : nullptr);
+                }
+            };
+            const bool hopper = fa3_takes_rows(dim, heads, kv_heads, DType::BF16, width, batch, false);
+            const auto compare = [&](const char* how) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                for (int layer = 0; layer < layers; ++layer) {
+                    const auto a = from_device<std::uint16_t>(shared[layer].data, shared[layer].numel());
+                    const auto b = from_device<std::uint16_t>(alone[layer].data, alone[layer].numel());
+                    if (a != b) {
+                        std::cerr << "round metadata " << how << ": W=" << width << " history=" << history
+                                  << " layer " << layer << " differs from its own launch\n";
+                        ++failures;
+                    }
+                }
+                // Two input sets (the global and the windowed layers), each computed once.
+                const bool shape = hopper ? round.used() == 2 && round.entry(0).launches == 2 &&
+                                                round.entry(1).launches == 2
+                                          : round.used() == 0;
+                if (!shape) {
+                    std::cerr << "round metadata " << how << ": W=" << width << " history=" << history
+                              << " shared " << round.used() << " input sets\n";
+                    ++failures;
+                }
+            };
+            for (const int shift : {0, 37}) {
+                set_positions(shift);
+                run_round(true);
+                run_round(false);
+                compare(shift == 0 ? "eager" : "eager, moved");
+            }
+            // A captured round recomputes the shared metadata whenever it replays.
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+            run_round(true);
+            CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+            for (const int shift : {11, 50}) {
+                set_positions(shift);
+                CUDA_CHECK(cudaGraphLaunch(exec, stream));
+                run_round(false);
+                compare("replayed");
+            }
+            CUDA_CHECK(cudaGraphExecDestroy(exec));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return failures;
+}
+
 int verify_fp8_image_attention() {
     int failures = 0;
     constexpr int dim = 256, tokens = 130;
@@ -2254,6 +2391,7 @@ int main() {
     failures += verify_fp8_current_tokens_match_cached(128, 32, 4);
     failures += verify_fp8_image_attention();
     failures += verify_fp8_wide_prompts();
+    failures += verify_round_metadata_sharing();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     for (const Geometry geometry : {Geometry{"fallback_16q8_d64", 16, 8, 64},
                                     Geometry{"fallback_12q4_d256", 12, 4, 256},
