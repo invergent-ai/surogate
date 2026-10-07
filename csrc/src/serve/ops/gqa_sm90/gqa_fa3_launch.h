@@ -1,9 +1,10 @@
 #pragma once
 // sinfer::ops - the FlashAttention-3 forward instantiations behind gqa_fa3::run (see gqa_fa3.h).
-// gqa_fa3.cu picks one by head dim, cache dtype, mask and split; gqa_fa3_launch_impl.cuh defines
-// them, and each gqa_fa3_hdim<D>_<dtype>[_local][_split].cu instantiates one so the eighteen
-// compile in parallel (split ones over BF16 only: see gqa_fa3.h). gqa_fa3_combine.cu holds the
-// split-KV combine.
+// gqa_fa3.cu picks one by head dim, cache dtype, mask, split and M tile; gqa_fa3_launch_impl.cuh
+// defines them, and each gqa_fa3_hdim<D>_<dtype>[_local][_onewg][_split].cu instantiates one so
+// the twenty-two compile in parallel (split ones over BF16 only: see gqa_fa3.h; one-warpgroup ones
+// at head dim 64 and 128, BF16, causal only, as vLLM's fork builds them). gqa_fa3_combine.cu holds
+// the split-KV combine.
 
 #include "flash.h"
 
@@ -17,8 +18,11 @@ namespace sinfer::ops::detail::gqa_fa3 {
 /// group packed into the M tile. Over e4m3 queries, keys and values when `Fp8`, else BF16; the
 /// output is BF16 either way. With `Split` each segment's keys may be spread over up to
 /// `num_splits` CTAs, as many as the scheduler's prepare kernel gives it on the device; a segment
-/// it splits writes FP32 partials for `combine`, the rest write the output directly.
-template <int HeadDim, bool Fp8, bool Local, bool Split>
+/// it splits writes FP32 partials for `combine`, the rest write the output directly. With
+/// `OneMmaWg` the M tile is 64 packed query rows on one MMA warpgroup instead of 128 on two: the
+/// decode tile of vLLM's FlashAttention fork, for launches whose segments pack at most 64 rows
+/// (use_one_mma_wg in gqa_fa3.cu).
+template <int HeadDim, bool Fp8, bool Local, bool Split, bool OneMmaWg = false>
 void launch(Flash_fwd_params& params, cudaStream_t stream);
 
 /// FA3's split-KV combine: merges the partials of every segment the forward split into the BF16

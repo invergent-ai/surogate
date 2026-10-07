@@ -55,6 +55,26 @@ bool combine_pdl() {
     return enabled;
 }
 
+// vLLM's FlashAttention fork runs a launch whose segments pack at most 64 query rows (decode, and
+// verify rows of a narrow group) on one MMA warpgroup with a 64-row M tile, at head dim 64 or 128
+// without a window (its heuristics.h, use_one_mma_wg; here over a BF16 cache, the only one built
+// that way). A decode row packs its query group into 64 rows where the two-warpgroup tile pads it
+// to 128, and the smaller CTA leaves more of them in flight on the keys.
+// SUROGATE_SERVE_GQA_FA3_ONE_WG=0 keeps the 128-row tile.
+bool one_mma_wg_by_env() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_GQA_FA3_ONE_WG");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool use_one_mma_wg(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
+                    std::int32_t max_q, bool fp8_cache, bool local) {
+    return one_mma_wg_by_env() && !fp8_cache && !local && (head_dim == 64 || head_dim == 128) &&
+           static_cast<std::int64_t>(max_q) * (q_heads / kv_heads) <= 64;
+}
+
 bool enabled_by_env() {
     static const bool enabled = [] {
         const char* value = std::getenv("SUROGATE_SERVE_GQA_FA3");
@@ -128,7 +148,10 @@ __global__ void quantize_query_kernel(const uint4* __restrict__ q, uint2* __rest
 }
 
 template <int HeadDim, bool Split>
-void dispatch_dim(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream) {
+void dispatch_dim(Flash_fwd_params& p, bool fp8, bool local, bool one_wg, cudaStream_t stream) {
+    if constexpr (HeadDim != 256) {
+        if (one_wg) { return launch<HeadDim, false, false, Split, true>(p, stream); }
+    }
     if constexpr (!Split) {
         if (fp8) {
             return local ? launch<HeadDim, true, true, false>(p, stream)
@@ -140,11 +163,11 @@ void dispatch_dim(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream
 }
 
 template <bool Split>
-void dispatch(Flash_fwd_params& p, bool fp8, bool local, cudaStream_t stream) {
+void dispatch(Flash_fwd_params& p, bool fp8, bool local, bool one_wg, cudaStream_t stream) {
     switch (p.d) {
-    case 64:  return dispatch_dim<64, Split>(p, fp8, local, stream);
-    case 128: return dispatch_dim<128, Split>(p, fp8, local, stream);
-    default:  return dispatch_dim<256, Split>(p, fp8, local, stream);
+    case 64:  return dispatch_dim<64, Split>(p, fp8, local, one_wg, stream);
+    case 128: return dispatch_dim<128, Split>(p, fp8, local, one_wg, stream);
+    default:  return dispatch_dim<256, Split>(p, fp8, local, false, stream);
     }
 }
 
@@ -219,9 +242,10 @@ RowSplits row_splits(std::int32_t head_dim, std::int32_t q_heads, std::int32_t k
     const int num_sms = hardware().sm_count;
     if (num_sms <= 0) { return {}; }
     const bool local = sliding_window > 0;
-    const auto tile  = tile_size_fwd_sm90(head_dim, head_dim, !local, local, /*element_size=*/2,
-                                          /*v_colmajor=*/false, /*paged_kv_non_TMA=*/true,
-                                          /*softcap=*/false);
+    const auto tile  = tile_size_fwd_sm90(
+        head_dim, head_dim, !local, local, /*element_size=*/2, /*v_colmajor=*/false,
+        /*paged_kv_non_TMA=*/true, /*softcap=*/false,
+        use_one_mma_wg(head_dim, q_heads, kv_heads, max_q, fp8_cache, local));
     const int block_m = std::get<0>(tile);
     const int block_n = std::get<1>(tile);
     // A window loads at most its own keys plus one M tile's worth (FA3's seqlen_k_loaded).
@@ -391,8 +415,10 @@ void run(const PagedLaunch& a, void* workspace, std::size_t workspace_capacity,
     p.num_sm = hardware().sm_count;
     // q/k/v descale pointers stay null: 1.0, the cache's (absent) scale.
 
-    if (a.max_splits == 1) { return dispatch<false>(p, a.fp8_cache, local, stream); }
-    dispatch<true>(p, a.fp8_cache, local, stream);
+    const bool one_wg =
+        use_one_mma_wg(a.head_dim, a.q_heads, a.kv_heads, a.max_q, a.fp8_cache, local);
+    if (a.max_splits == 1) { return dispatch<false>(p, a.fp8_cache, local, one_wg, stream); }
+    dispatch<true>(p, a.fp8_cache, local, one_wg, stream);
     // The combine writes the output of every segment the forward split and leaves the rest,
     // which the forward wrote whole.
     p.is_bf16 = true;

@@ -4323,3 +4323,69 @@ Tests. `sinfer_w8_pipelined_test` checks every row tiling, row grouping and pipe
 against the medium-T kernel bitwise at widths 1 to 129 on a head-like shape, two narrow ones
 (one with K a group short of the deepest pipeline) and rows only 16-row CTAs tile; `bench`
 times them all beside a streaming read. Passes on one Nebius H100 with the linear and W8 tests.
+
+## 113
+
+**FA3 decode on one MMA warpgroup (2026-10-07, after #112).** vLLM's FlashAttention fork runs a
+launch whose segments pack at most 64 query rows (`seqlen_q x heads per KV head <= 64`: decode)
+with a 64-row M tile on one MMA warpgroup, at head dim 64 or 128 without a window (its
+`heuristics.h`, `use_one_mma_wg`; a 1x1x1 64x128 tile in its H100 profiles at 64 users). The
+engine's FA3 decode rows ran the 128-row two-warpgroup tile, which pads a decode row's packed
+query group (4 rows for Qwen3-8B) to 128 and keeps fewer CTAs on the keys at once.
+
+- **`tile_size_fwd_sm90`** (`src/third_party/flash_attn3/tile_size.h`) takes vLLM's
+  `use_one_mma_wg` and returns its BF16 decode tiles (`{64, 192}` at head dim 64, `{64, 128}`
+  causal at 128); `run_flash_fwd` passes it through. The kernel itself already handles one MMA
+  warpgroup (its register split and scheduler barrier have that case upstream).
+- **`gqa_fa3::launch<..., OneMmaWg>`**: four new instantiations (head dim 64 and 128, BF16,
+  causal, split and not), `gqa_fa3_hdim{64,128}_bf16_onewg[_split].cu`. `gqa_fa3.cu` takes them
+  where vLLM would (max_q x query group <= 64, head dim 64 or 128, no window, BF16 cache) for
+  decode and verify rows and narrow prompt segments alike, and `row_splits` sizes the split with
+  the same tile. Windowed layers, head dim 256 and the e4m3 cache keep the 128-row tile.
+  `SUROGATE_SERVE_GQA_FA3_ONE_WG=0` turns it off.
+
+Qwen3-8B-FP8 on one Nebius H100, decode tok/s a stream, in-job A/B off -> on: one user 231.3 ->
+232.8, 16 users 170.5 -> 171.3, 64 users 87.2 -> 88.6 (vLLM 0.31 on the same VM type: 228.8,
+153.6, 92.4).
+
+Tests. Every GQA attention test passes on the H100 (the FA3 rows cases at head dims 64, 128 and
+256, and the round-metadata test, whose global and windowed layers now take different tiles in
+one round); Qwen3-8B-FP8's CLI and eight concurrent server requests pass.
+
+## 114
+
+**W8 batch-consistent GEMM on Hopper's wgmma, and a dequantisation off the conversion unit
+(2026-10-07, after #113).** At 64 users Qwen3-8B-FP8's W8 LM head (151936 x 4096) was the
+largest gap to vLLM in an nsys profile: the consistent route's medium-T kernel took 515 us a
+64-token round, where vLLM's BF16 head takes 432.
+
+- **The dequantisation** (`w8_small_t_bf16_pair_from_s8(values, scale)` in
+  `w8_small_t_mma.cuh`, shared by the medium-T, pipelined, small-T and GDN input-projection
+  kernels) converted each code with I2F, which issues 16 results a clock an SM and bounded the
+  kernels. A code with its sign bit flipped is now the low byte of the float 2^23 + (code + 128),
+  and subtracting 2^23 + 128 leaves it exactly (PRMT and FADD), so the FP32 products and their
+  BF16 roundings are unchanged; `sinfer_w8_pipelined_test` checks every code pair against every
+  finite FP16 scale. On the H100 head: the pipelined kernel at one token 227 -> 216 us (a plain
+  read of the codes takes 197), the medium-T kernel 327 -> 270.
+- **`w8_rowsplit_wgmma_sm90.cu`** (in the 90a archive; a stub elsewhere): the medium-T kernel's
+  arithmetic with a warpgroup in each K-split warp's place and each k16 step one wgmma m64nNk16,
+  A (the dequantised weights) from registers and B (the activations) from shared memory. A
+  probe on the H100 found a chained wgmma k16 step rounds exactly like mma.sync m16n8k16 (0 of
+  16.8M outputs differ), so every output keeps the medium-T kernel's bits. One producer warp
+  loads codes, scales and activations with TMA (128-byte swizzle, which is the activations'
+  K-major wgmma layout) into four stages behind full/empty mbarriers, and each group is
+  dequantised into one of two register sets while the previous group's wgmmas run. 64 rows a
+  CTA: a 544-thread CTA leaves 96 registers a thread, and two row tiles at 64 columns spilled.
+  Head at 64 tokens 507 -> 365 us, at 40 and 48 460/500 -> 384/368; a 12288 x 4096 projection
+  at 64 tokens 44.8 -> 42.1, 4096 x 12288 81 -> 64. Up to 32 tokens the pipelined kernel stays
+  faster, so `launch_w8_consistent` sends a 64-token slice here from 33 columns
+  (`SUROGATE_SERVE_W8_WGMMA_MIN_COLUMNS`; `SUROGATE_SERVE_W8_WGMMA=0` turns it off).
+
+Qwen3-8B-FP8 on one Nebius H100, decode tok/s a stream, in-job A/B with the wgmma route off ->
+on: one user 233.3 -> 233.4, 16 users 171.7 -> 171.6, 64 users 88.9 -> 90.1 (vLLM 0.31 on the
+same VM type: 228.8, 153.6, 92.4).
+
+Tests. `sinfer_w8_pipelined_test` (pipelined and wgmma kernels bit-identical to the medium-T
+kernel at 1-129 columns over four shapes, plus the exhaustive dequantisation check) and every
+W8 and linear op test pass on the H100; Qwen3-8B-FP8's CLI and eight concurrent server
+requests (identical outputs) pass.

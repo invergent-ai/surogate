@@ -3,6 +3,7 @@
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_pipelined.cuh"
+#include "ops/linear/w8/w8_rowsplit_wgmma_sm90.h"
 #include "ops/linear/w8/w8_launch.h"
 
 #include <array>
@@ -159,10 +160,22 @@ void launch_w8_consistent(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     const DeviceTraits traits = device_traits();
     const bool row_pairs = w.n % 32 == 0 && w.n / 32 >= 2 * traits.sms;
     const bool pipelined = pipelined_route();
+    const bool wgmma     = w8_wgmma_available();
     for_each_token_slice(x.ne[1], 64, [&](int begin, int count) {
         const Tensor input = x.slice(1, begin, count);
         Tensor result = out.slice(1, begin, count);
         const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(result.data), w.n};
+        // Hopper from 33 columns: the same arithmetic on wgmma (w8_rowsplit_wgmma_sm90.h), the
+        // tensor rate a wide round needs. It declines shapes it does not tile, which keep the
+        // kernels below.
+        if (wgmma && count >= w8_wgmma_min_columns() &&
+            w8_wgmma_consistent({static_cast<const __nv_bfloat16*>(input.data),
+                                 static_cast<const std::uint8_t*>(w.qdata),
+                                 static_cast<const std::uint8_t*>(w.scales),
+                                 static_cast<__nv_bfloat16*>(result.data), w.n, w.k, count},
+                                stream)) {
+            return;
+        }
         if (pipelined) {
             const auto* activations = static_cast<const __nv_bfloat16*>(input.data);
             // From the variants' sweep on an H100 (sinfer_w8_pipelined_test bench; Qwen3-8B's W8

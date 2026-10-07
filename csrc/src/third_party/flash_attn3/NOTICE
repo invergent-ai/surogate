@@ -14,5 +14,9 @@ decode route runs (`src/serve/ops/gqa_sm90/gqa_fa3_*_split.cu`, `gqa_fa3_combine
 Python/PyTorch API (`flash_api.cpp`, whose split heuristic `gqa_fa3.cu` follows), the backward and
 the generated instantiation files are not.
 
-Local change: `cuda_check.h` throws `std::runtime_error` where upstream prints and calls
+Local changes: `cuda_check.h` throws `std::runtime_error` where upstream prints and calls
 `exit(1)`, so a failed launch surfaces as an engine error instead of ending the server.
+`tile_size_fwd_sm90` takes `use_one_mma_wg` and returns the BF16 decode tiles of vLLM's
+FlashAttention fork (https://github.com/vllm-project/flash-attention, `hopper/tile_size.h` at
+2e3a669: 64 rows on one MMA warpgroup at head dim 64 and 128), and `run_flash_fwd` takes the
+matching `Use_one_mma_wg` template argument (serve/PATCHES.md #113).

@@ -53,11 +53,18 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
 }
 
 // Match the large-T GEMM: scale in FP32, then round each weight once to BF16.
+//
+// The codes become floats off the conversion unit, which issues 16 results a clock an SM and
+// bounded the W8 kernels' dequantisation: with its sign bit flipped, a code is the low byte of
+// the float 2^23 + (code + 128), and subtracting 2^23 + 128 leaves the code exactly. The products
+// and their BF16 roundings are then bit for bit those of a converted code (an exhaustive check
+// over every code pair and FP16 scale is in sinfer_w8_pipelined_test).
 __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values, float scale) {
+    const unsigned flipped = values ^ 0x8080u;
+    const float lo = __uint_as_float(__byte_perm(flipped, 0x4B000000u, 0x7440)) - 8388736.0f;
+    const float hi = __uint_as_float(__byte_perm(flipped, 0x4B000000u, 0x7441)) - 8388736.0f;
     W8SmallTBf16PairBits result;
-    result.pair = __floats2bfloat162_rn(
-        static_cast<float>(static_cast<std::int8_t>(values)) * scale,
-        static_cast<float>(static_cast<std::int8_t>(values >> 8)) * scale);
+    result.pair = __floats2bfloat162_rn(lo * scale, hi * scale);
     return result.bits;
 }
 

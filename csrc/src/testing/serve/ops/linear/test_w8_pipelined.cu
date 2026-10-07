@@ -1,14 +1,17 @@
-// The pipelined W8G32 kernel (w8_rowsplit_gemm_pipelined.cuh) against the medium-T split-K kernel
-// whose arithmetic it keeps: for every row tiling, row grouping and pipeline depth, at every width
-// the batch-consistent route can give it, the two must write the same bits. With `bench` it also
-// times them all, from CUDA graphs, on a vocabulary head and the usual linear shapes, beside a
-// plain streaming read of the same bytes (what HBM gives).
+// The pipelined W8G32 kernel (w8_rowsplit_gemm_pipelined.cuh) and, on an H100, the wgmma one
+// (w8_rowsplit_wgmma_sm90.h) against the medium-T split-K kernel whose arithmetic they keep: for
+// every row tiling, row grouping and pipeline depth, at every width the batch-consistent route can
+// give them, they must write the same bits. With `bench` it also times them all, from CUDA graphs,
+// on a vocabulary head and the usual linear shapes, beside a plain streaming read of the same
+// bytes (what HBM gives). First, the shared code-to-BF16 dequantisation against the plain
+// converted-code formula, over every code pair and every finite FP16 scale.
 //
 //   sinfer_w8_pipelined_test            correctness only (a ctest)
 //   sinfer_w8_pipelined_test bench [n k ...]
 
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_pipelined.cuh"
+#include "ops/linear/w8/w8_rowsplit_wgmma_sm90.h"
 #include "ops/op_tester.h"
 
 #include <cuda_fp16.h>
@@ -142,6 +145,15 @@ bool launch_variant(const Variant& v, const Problem& p, const __nv_bfloat16* x, 
     return launch_bucket<64>(v, p, x, out, count, stream);
 }
 
+// The wgmma kernel; false where it declines (no sm_90a, rows it does not tile, or more than 64
+// columns).
+bool launch_wgmma(const Problem& p, const __nv_bfloat16* x, __nv_bfloat16* out, int count,
+                  cudaStream_t stream) {
+    return w8_wgmma_consistent({x, static_cast<const std::uint8_t*>(p.codes.p),
+                                static_cast<const std::uint8_t*>(p.scales.p), out, p.n, p.k, count},
+                               stream);
+}
+
 int check(const Problem& p, int count, cudaStream_t stream) {
     std::vector<float> xs(static_cast<std::size_t>(p.k) * count);
     fill_uniform(xs, 31 + count, -3.0F, 3.0F);
@@ -175,8 +187,53 @@ int check(const Problem& p, int count, cudaStream_t stream) {
             ++failures;
         }
     }
+    got.fill(0x7f);
+    cuda_synchronize();
+    if (launch_wgmma(p, xp, static_cast<__nv_bfloat16*>(got.p), count, stream)) {
+        cuda_synchronize(stream);
+        ++ran;
+        const auto b = from_device<std::uint16_t>(got, elements);
+        std::size_t differ = 0;
+        for (std::size_t i = 0; i < elements; ++i) { differ += a[i] != b[i]; }
+        if (differ != 0) {
+            std::cerr << "FAIL " << label << " wgmma: " << differ << " of " << elements
+                      << " outputs differ\n";
+            ++failures;
+        }
+    }
     if (failures == 0) { std::cout << "PASS " << label << " (" << ran << " variants)\n"; }
     return failures;
+}
+
+// Block b takes FP16 scale bits b, its threads every code pair: the W8 kernels' dequantisation
+// must write the bits of the converted codes scaled in FP32 and rounded once to BF16.
+__global__ void dequant_exhaustive_kernel(unsigned long long* mismatches) {
+    const auto scale_bits = static_cast<unsigned short>(blockIdx.x);
+    if ((scale_bits & 0x7c00u) == 0x7c00u) { return; } // infinities and NaNs
+    const float scale = __half2float(__ushort_as_half(scale_bits));
+    unsigned long long differ = 0;
+    for (unsigned pair = threadIdx.x; pair < 65536u; pair += blockDim.x) {
+        W8SmallTBf16PairBits want;
+        want.pair = __floats2bfloat162_rn(static_cast<float>(static_cast<std::int8_t>(pair)) * scale,
+                                          static_cast<float>(static_cast<std::int8_t>(pair >> 8)) * scale);
+        differ += want.bits != w8_small_t_bf16_pair_from_s8(pair, scale);
+    }
+    if (differ != 0) { atomicAdd(mismatches, differ); }
+}
+
+int check_dequant(cudaStream_t stream) {
+    DeviceBuffer count(sizeof(unsigned long long));
+    cuda_check(cudaMemsetAsync(count.p, 0, sizeof(unsigned long long), stream), "clear");
+    dequant_exhaustive_kernel<<<65536, 256, 0, stream>>>(static_cast<unsigned long long*>(count.p));
+    cuda_check(cudaGetLastError(), "dequant launch");
+    cuda_synchronize(stream);
+    const auto differ = from_device<unsigned long long>(count, 1)[0];
+    if (differ != 0) {
+        std::cerr << "FAIL dequant: " << differ << " code pair x scale cases differ\n";
+        return 1;
+    }
+    std::cout << "PASS dequant: every code pair x finite FP16 scale\n";
+    return 0;
 }
 
 __global__ void stream_read_kernel(const uint4* data, std::size_t vectors, unsigned* sink) {
@@ -227,7 +284,7 @@ void bench(const Problem& p, cudaStream_t stream) {
     const double code_bytes = static_cast<double>(p.codes.bytes);
     std::printf("n=%6d k=%6d  streaming read of the codes %7.1f us (%.2f TB/s)\n", p.n, p.k, read_us,
                 code_bytes / read_us * 1e-6);
-    for (const int count : {1, 2, 4, 8, 16, 32, 64}) {
+    for (const int count : {1, 2, 4, 8, 16, 24, 32, 40, 48, 64}) {
         std::vector<float> xs(static_cast<std::size_t>(p.k) * count);
         fill_uniform(xs, 7 + count, -3.0F, 3.0F);
         DeviceBuffer x = to_device_bf16(xs);
@@ -243,6 +300,11 @@ void bench(const Problem& p, cudaStream_t stream) {
             const double us = graph_us([&] { launch_variant(v, p, xp, op, count, stream); }, stream, iters);
             std::printf("n=%6d k=%6d T=%3d  %-14s %8.1f us (%.2f TB/s)  ratio %.3f\n", p.n, p.k, count,
                         v.name().c_str(), us, bytes / us * 1e-6, us / ref);
+        }
+        if (launch_wgmma(p, xp, op, count, stream)) {
+            const double us = graph_us([&] { launch_wgmma(p, xp, op, count, stream); }, stream, iters);
+            std::printf("n=%6d k=%6d T=%3d  %-14s %8.1f us (%.2f TB/s)  ratio %.3f\n", p.n, p.k, count,
+                        "wgmma", us, bytes / us * 1e-6, us / ref);
         }
     }
 }
@@ -263,7 +325,7 @@ int main(int argc, char** argv) {
         for (const auto& [n, k] : shapes) { bench(make_problem(n, k, 3), stream); }
         return 0;
     }
-    int failures = 0;
+    int failures = check_dequant(stream);
     // A head-like shape that every variant tiles; narrower ones, K one group short of the deepest
     // pipeline, and rows only 16-row CTAs tile.
     const Problem wide    = make_problem(128 * (sms() + 3), 4096, 11);
@@ -277,9 +339,10 @@ int main(int argc, char** argv) {
         failures += check(odd, count, stream);
     }
     if (failures != 0) {
-        std::cerr << failures << " pipelined W8 case(s) differ from the medium-T kernel\n";
+        std::cerr << failures << " pipelined or wgmma W8 case(s) differ from the medium-T kernel\n";
         return 1;
     }
-    std::cout << "pipelined W8: bit-identical to the medium-T kernel\n";
+    std::cout << "pipelined" << (w8_wgmma_available() ? " and wgmma" : "")
+              << " W8: bit-identical to the medium-T kernel\n";
     return 0;
 }
