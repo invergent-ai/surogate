@@ -37,8 +37,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
-#include <functional>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -96,49 +97,90 @@ int main(int argc, char** argv) {
         // worker carried the request. OpenMP keeps its team per master thread,
         // so a changing master means a fresh team per request — measured as the
         // difference between 69 ms in a CLI loop and over a second through the
-        // server. The handler posts work here and waits for its result.
+        // server. Handlers queue their request here and wait for its result.
+        //
+        // The thread also batches ACROSS requests: whatever queued while a forward
+        // ran goes into the next one together. One short text is a forward of a
+        // few dozen tokens whose ~500 launches cost the same as one of thousands,
+        // so sixteen clients sending one text each took sixteen forwards where one
+        // does. Nothing waits to gather a batch: an idle server runs a request the
+        // moment it arrives, and requests merge only when they queued anyway.
+        struct Job {
+            const std::vector<std::vector<std::int32_t>>* sequences = nullptr;
+            std::size_t tokens = 0;
+            std::vector<std::vector<float>> vectors;
+            std::exception_ptr failure;
+            bool done = false;
+        };
+        // A round is at most one forward's worth of tokens, so a request never
+        // waits behind a forward it is not in. The GPU encoder fits
+        // max_batch_tokens in a forward; the CPU one packs up to max_tokens.
+        const auto round_budget = static_cast<std::size_t>(
+            host_model ? config.max_tokens : config.max_batch_tokens);
         std::mutex queue_mutex;
         std::condition_variable queue_wake;
-        std::function<void()> pending;
+        std::condition_variable done_wake;
+        std::deque<Job*> queue;
         bool stopping = false;
+        const auto run_alone = [&](Job& job) {
+            try {
+                job.vectors = embed_batch(*job.sequences);
+            } catch (...) { job.failure = std::current_exception(); }
+        };
+        const auto run_round = [&](const std::vector<Job*>& round) {
+            if (round.size() == 1) {
+                run_alone(*round.front());
+                return;
+            }
+            std::vector<std::vector<std::int32_t>> merged;
+            for (const Job* job : round) {
+                merged.insert(merged.end(), job->sequences->begin(), job->sequences->end());
+            }
+            try {
+                std::vector<std::vector<float>> vectors = embed_batch(merged);
+                auto next = vectors.begin();
+                for (Job* job : round) {
+                    const auto count = static_cast<std::ptrdiff_t>(job->sequences->size());
+                    job->vectors.assign(std::make_move_iterator(next),
+                                        std::make_move_iterator(next + count));
+                    next += count;
+                }
+            } catch (...) {
+                // Run each request on its own so a failure stays with the
+                // request that caused it rather than failing its neighbours.
+                for (Job* job : round) {
+                    job->vectors.clear();
+                    run_alone(*job);
+                }
+            }
+        };
         std::thread runner([&] {
             while (true) {
-                std::function<void()> job;
+                std::vector<Job*> round;
                 {
                     std::unique_lock<std::mutex> lock(queue_mutex);
-                    queue_wake.wait(lock, [&] { return stopping || pending; });
-                    if (stopping && !pending) { return; }
-                    job = std::move(pending);
-                    pending = nullptr;
-                    // Wake posters blocked on the slot being occupied.
-                    queue_wake.notify_all();
+                    queue_wake.wait(lock, [&] { return stopping || !queue.empty(); });
+                    if (queue.empty()) { return; }
+                    // First come, first served; a request larger than the budget
+                    // still runs, alone.
+                    std::size_t tokens = 0;
+                    while (!queue.empty() &&
+                           (round.empty() || tokens + queue.front()->tokens <= round_budget)) {
+                        tokens += queue.front()->tokens;
+                        round.push_back(queue.front());
+                        queue.pop_front();
+                    }
                 }
-                job();
+                run_round(round);
+                {
+                    // A job lives on its handler's stack: once `done` is set
+                    // under the lock, the handler may return and free it.
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    for (Job* job : round) { job->done = true; }
+                }
+                done_wake.notify_all();
             }
         });
-        const auto run_on_model_thread = [&](std::function<void()> job) {
-            std::mutex done_mutex;
-            std::condition_variable done_wake;
-            bool done = false;
-            {
-                // The slot holds one job. A second poster must wait for the
-                // runner to take the first — overwriting it would drop that job
-                // on the floor and leave its requester waiting on a result that
-                // can never come, which is exactly how the first concurrent
-                // benchmark hung one request for its full HTTP timeout.
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                queue_wake.wait(lock, [&] { return !pending; });
-                pending = [&] {
-                    job();
-                    std::lock_guard<std::mutex> done_lock(done_mutex);
-                    done = true;
-                    done_wake.notify_one();
-                };
-            }
-            queue_wake.notify_all();
-            std::unique_lock<std::mutex> lock(done_mutex);
-            done_wake.wait(lock, [&] { return done; });
-        };
 
         httplib::Server server;
         sinfer::serve::disable_nagle(server);
@@ -181,19 +223,22 @@ int main(int argc, char** argv) {
                 prompt_tokens += sequence.size();
             }
             try {
-                // One forward for the whole request, executed on the model
-                // thread: OpenMP keeps its team per master thread, and running
-                // the forward from whichever httplib worker carried the request
-                // rebuilt the team every time — the difference between 69 ms in
-                // a CLI loop and over a second through the server.
-                std::vector<std::vector<float>> vectors;
-                std::exception_ptr failure;
-                run_on_model_thread([&] {
-                    try {
-                        vectors = embed_batch(sequences);
-                    } catch (...) { failure = std::current_exception(); }
-                });
-                if (failure) { std::rethrow_exception(failure); }
+                // Executed on the model thread, possibly in one forward with
+                // other requests that queued alongside it.
+                Job job;
+                job.sequences = &sequences;
+                job.tokens    = prompt_tokens;
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    queue.push_back(&job);
+                }
+                queue_wake.notify_one();
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    done_wake.wait(lock, [&] { return job.done; });
+                }
+                if (job.failure) { std::rethrow_exception(job.failure); }
+                std::vector<std::vector<float>>& vectors = job.vectors;
                 for (std::size_t index = 0; index < vectors.size(); ++index) {
                     data.push_back(json{{"object", "embedding"},
                                         {"index", index},
