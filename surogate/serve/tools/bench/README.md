@@ -223,3 +223,13 @@ Prompt and generated throughput both divide by the full window, including prompt
 TTFT includes either reasoning or answer text. The runner checks response lengths, stream
 completion, token accounting, and embedding dimensions and finiteness. Any request error
 makes it exit unsuccessfully.
+
+## Long-context agentic benchmark
+
+`agentic_long_bench.py` measures how prompt caching holds up in a multi-turn tool loop at long
+context, against any OpenAI-compatible server. Each agent opens a conversation at about `--start`
+tokens (a system prompt every agent shares, its own task, and earlier tool calls and results), then
+appends one reply and one tool result per turn until the prompt reaches `--max`. Per turn it
+records the cached tokens the server reports (`usage.prompt_tokens_details.cached_tokens`; vLLM
+needs `--enable-prompt-tokens-details`), the time to first token and the decode speed, and
+summarizes the cold first turn apart from the warm ones.
