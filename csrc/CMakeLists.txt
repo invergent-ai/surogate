@@ -1351,6 +1351,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/output.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/fused.cu
   ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
   ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
   ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu

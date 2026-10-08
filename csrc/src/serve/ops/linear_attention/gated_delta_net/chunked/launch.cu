@@ -6,9 +6,25 @@
 #include <cuda_bf16.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
+#include <string_view>
 
 namespace sinfer::ops::detail::gated_delta_net {
+namespace {
+
+// SUROGATE_SERVE_GDN_PREFILL=fused walks each value head's prompt in one kernel (fused.cuh)
+// instead of the three staged kernels.
+bool fused_prefill() {
+    static const bool value = [] {
+        const char* text = std::getenv("SUROGATE_SERVE_GDN_PREFILL");
+        return text != nullptr && std::string_view(text) == "fused";
+    }();
+    return value;
+}
+
+} // namespace
+
 std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens) {
     if (tokens <= 0) { return 0; }
     return chunked::workspace_bytes(value_heads, tokens);
@@ -18,6 +34,26 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
                     const Tensor& beta, float scale, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
                     std::size_t workspace_bytes, cudaStream_t stream) {
+    if (fused_prefill()) {
+        chunked::fused_config fused{};
+        fused.H_qk         = q.ne[1];
+        fused.H_v          = v.ne[1];
+        fused.L            = q.ne[2];
+        fused.q            = static_cast<const __nv_bfloat16*>(q.data);
+        fused.k            = static_cast<const __nv_bfloat16*>(k.data);
+        fused.v            = static_cast<const __nv_bfloat16*>(v.data);
+        fused.g            = static_cast<const float*>(g.data);
+        fused.beta         = static_cast<const float*>(beta.data);
+        fused.state_in     = static_cast<const __nv_bfloat16*>(ssm_state_in.data);
+        fused.state_out    = static_cast<__nv_bfloat16*>(ssm_state_out.data);
+        fused.out          = static_cast<__nv_bfloat16*>(out.data);
+        fused.scale        = scale;
+        fused.valid_tokens = out.ne[2];
+        fused.stream       = stream;
+        CUDA_CHECK(chunked::launch_fused(fused));
+        return;
+    }
+
     const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2]);
     if (workspace == nullptr || workspace_bytes < layout.total_bytes) { throw std::bad_alloc(); }
 
