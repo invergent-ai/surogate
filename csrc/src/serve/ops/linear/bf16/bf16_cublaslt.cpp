@@ -32,8 +32,10 @@ struct PlanKey {
     std::int32_t k;
     std::int32_t tokens;
     std::int32_t ldc; // output elements per column; rows for a contiguous [rows, tokens]
+    bool fp32_reduction = false;
     bool operator==(const PlanKey& other) const noexcept {
-        return rows == other.rows && k == other.k && tokens == other.tokens && ldc == other.ldc;
+        return rows == other.rows && k == other.k && tokens == other.tokens && ldc == other.ldc &&
+               fp32_reduction == other.fp32_reduction;
     }
 };
 
@@ -42,7 +44,8 @@ struct PlanKeyHash {
         return (static_cast<std::size_t>(key.rows) * 0x9E3779B1u) ^
                (static_cast<std::size_t>(key.k) * 0x85EBCA77u) ^
                (static_cast<std::size_t>(key.tokens) * 0xC2B2AE3Du) ^
-               (static_cast<std::size_t>(key.ldc) * 0x27D4EB2Fu);
+               (static_cast<std::size_t>(key.ldc) * 0x27D4EB2Fu) ^
+               static_cast<std::size_t>(key.fp32_reduction);
     }
 };
 
@@ -140,6 +143,16 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key) {
                                                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                &workspace_bytes, sizeof(workspace_bytes)),
           "workspace");
+    if (key.fp32_reduction) {
+        // A split-K algorithm otherwise may sum its partial products in the output type,
+        // rounding each to BF16 first; the compute type keeps that sum in FP32.
+        const auto schemes = static_cast<std::uint32_t>(CUBLASLT_REDUCTION_SCHEME_NONE) |
+                             static_cast<std::uint32_t>(CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE);
+        check(cublasLtMatmulPreferenceSetAttribute(preference,
+                                                   CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                                                   &schemes, sizeof(schemes)),
+              "reduction schemes");
+    }
     cublasLtMatmulHeuristicResult_t result{};
     int found_count = 0;
     check(cublasLtMatmulAlgoGetHeuristic(state.handle, plan.op, plan.a, plan.b, plan.c, plan.c,
@@ -223,7 +236,7 @@ void bf16_cublaslt_gemm_accumulate(const Weight& weight, const Tensor& x, Tensor
 
 void bf16_cublaslt_gemm_raw(const void* weight, std::int32_t n, std::int32_t k, const void* x,
                             std::int32_t tokens, void* out, std::int32_t ldc, float beta,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, bool fp32_reduction) {
     const auto aligned = [](const void* pointer) {
         return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & 15u) == 0;
     };
@@ -239,7 +252,7 @@ void bf16_cublaslt_gemm_raw(const void* weight, std::int32_t n, std::int32_t k, 
     }
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);
-    const Plan& plan  = plan_for(state, PlanKey{n, k, tokens, ldc});
+    const Plan& plan  = plan_for(state, PlanKey{n, k, tokens, ldc, fp32_reduction});
     const float alpha = 1.0F;
     check(cublasLtMatmul(state.handle, plan.op, &alpha, weight, plan.a, x, plan.b, &beta, out,
                          plan.c, out, plan.c, &plan.algo, state.workspace, kWorkspaceBytes, stream),

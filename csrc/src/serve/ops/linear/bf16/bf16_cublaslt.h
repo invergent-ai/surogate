@@ -31,9 +31,11 @@ void bf16_cublaslt_gemm_accumulate(const Weight& weight, const Tensor& x, Tensor
 /// out[0:n, 0:tokens] = alpha·(W·x) + beta·out for raw BF16 operands, with an explicit output
 /// leading dimension so a caller may write a row range of a taller matrix. W is [n, k] with k
 /// contiguous, x is [k, tokens] with k contiguous, out has `ldc` elements per column.
-/// n, k and ldc must be multiples of 8 and every pointer 16-byte aligned.
+/// n, k and ldc must be multiples of 8 and every pointer 16-byte aligned. `fp32_reduction`
+/// keeps a split-K algorithm's partial sums in FP32 instead of rounding each to BF16, so a
+/// width that cuBLASLt splits rounds the result once, as an unsplit width does.
 void bf16_cublaslt_gemm_raw(const void* weight, std::int32_t n, std::int32_t k, const void* x,
                             std::int32_t tokens, void* out, std::int32_t ldc, float beta,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool fp32_reduction = false);
 
 } // namespace sinfer::ops::detail

@@ -19,6 +19,7 @@
 #include "encoder/embedding_tokenizer.h"
 #include "artifact/typed_binding.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
+#include "ops/linear/bf16/bf16_invariant_gemm.h"
 #include "core/unified_memory.h"
 
 #include <cuda_runtime.h>
@@ -31,6 +32,7 @@
 #include <tuple>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sinfer::encoder {
@@ -104,6 +106,7 @@ struct TextEmbedding::Impl {
     std::unique_ptr<DeviceBuffer> dense_weights;
     std::vector<DenseLayer> dense;
     std::int32_t dense_min_tokens = 1;
+    bool dense_invariant = false; // measurement only: SUROGATE_SERVE_ENCODER_DENSE_INVARIANT=1
     std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
@@ -218,6 +221,9 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
             throw std::invalid_argument("SUROGATE_SERVE_ENCODER_DENSE_TOKENS must be a token count, 0 for off");
         }
         impl.dense_min_tokens = static_cast<std::int32_t>(value);
+    }
+    if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_DENSE_INVARIANT"); raw != nullptr) {
+        impl.dense_invariant = std::string_view(raw) == "1";
     }
     // cuBLASLt's raw route takes extents that are multiples of 8, and the copy cannot undo a
     // column permutation a GGUF-sourced weight may carry; either keeps the model on W8.
@@ -428,8 +434,13 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     const bool dense = !impl.dense.empty() && total >= impl.dense_min_tokens;
     const auto dense_linear = [&](const void* weight, std::int32_t rows, std::int32_t columns,
                                   const Tensor& in, Tensor& out) {
+        if (impl.dense_invariant) {
+            ops::detail::bf16_invariant_gemm(weight, rows, columns, in.data, total, out.data, rows,
+                                             false, stream);
+            return;
+        }
         ops::detail::bf16_cublaslt_gemm_raw(weight, rows, columns, in.data, total, out.data, rows,
-                                            0.0F, stream);
+                                            0.0F, stream, /*fp32_reduction*/ true);
     };
 
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
