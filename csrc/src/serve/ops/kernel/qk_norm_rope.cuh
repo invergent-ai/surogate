@@ -24,9 +24,10 @@ namespace sinfer::ops {
 /// 128, plain gain) or rmsnorm_warp_bf16x2_kernel's (head dims 64 to 256).
 enum class QkNormForm { D128, Warp };
 
-/// Which rope kernel's coefficients the rotation reproduces: rope_generic_kernel's, or
-/// rope_fixed_kernel's Text1D / TextMrope tables.
-enum class QkRopeAngles { Generic, Text1D, TextMrope };
+/// Which rope kernel's coefficients the rotation reproduces: rope_generic_kernel's,
+/// rope_fixed_kernel's Text1D / TextMrope tables, or rope_table_apply_kernel's (read from a
+/// rope_table, position-major).
+enum class QkRopeAngles { Generic, Text1D, TextMrope, Table };
 
 inline constexpr int kQkNormRopeWarps = 8;
 
@@ -37,7 +38,7 @@ static __global__ __launch_bounds__(kQkNormRopeWarps * 32) void qk_norm_rope_ker
         const std::int32_t* positions, std::int32_t axes, std::int32_t head_dim,
         std::int32_t rotary_dim, std::int32_t active_pairs, float theta, std::int32_t height_pairs,
         std::int32_t width_pairs, std::int32_t q_heads, std::int32_t k_heads, std::int32_t tokens,
-        float eps) {
+        float eps, const float2* table) {
     constexpr int kMaxSlots = 4; // BF16x2 slots a lane holds: head dims up to 256
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
@@ -76,6 +77,10 @@ static __global__ __launch_bounds__(kQkNormRopeWarps * 32) void qk_norm_rope_ker
             generic_pair_sincos(positions, axes, tokens, token, pair, head_dim, rotary_dim,
                                 active_pairs, theta, height_pairs, width_pairs, 1.0F,
                                 &sin_cache[pair], &cos_cache[pair]);
+        } else if constexpr (Angles == QkRopeAngles::Table) {
+            const float2 cs = table[static_cast<std::int64_t>(positions[token]) * half + pair];
+            cos_cache[pair] = cs.x;
+            sin_cache[pair] = cs.y;
         } else {
             fixed_sincos<Angles == QkRopeAngles::Text1D ? RopeKernelMode::Text1D : RopeKernelMode::TextMrope>(
                 positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);

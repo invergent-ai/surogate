@@ -203,6 +203,12 @@ int main() {
     failures += run_case("rmsnorm offset unaligned [128,32]", {128, 32}, true, 1301U, 4.0F, true);
     failures += run_case("rmsnorm plain unaligned [128,8]", {128, 8}, false, 1302U, 4.0F, true);
     failures += run_case("rmsnorm plain near-zero [128,32]", {128, 32}, false, 1303U, 1.0e-5F);
+    // Widths between the fixed routes, on the CTA kernel with a partly idle last pass:
+    // EmbeddingGemma's 768, Gemma 3 1B's 1152, and Gemma 3 12B's and 27B's 3840 and 5376.
+    failures += run_case("rmsnorm offset [768,37]", {768, 37}, true, 1311U);
+    failures += run_case("rmsnorm plain [1152,9]", {1152, 9}, false, 1312U);
+    failures += run_case("rmsnorm offset [3840,3]", {3840, 3}, true, 1313U);
+    failures += run_case("rmsnorm plain [5376,2]", {5376, 2}, false, 1314U);
 
     // The accumulating form, against the two-kernel sequence it replaces. 640 is
     // Gemma 3's hidden extent and the shape the engine actually runs; the others
@@ -215,6 +221,8 @@ int main() {
     failures += run_composition_case("rmsnorm_add plain [128,32]", {128, 32}, false, 1405U);
     failures += run_composition_case("rmsnorm_add plain [2048,9]", {2048, 9}, false, 1406U);
     failures += run_composition_case("rmsnorm_add plain [5120,3]", {5120, 3}, false, 1407U);
+    failures += run_composition_case("rmsnorm_add offset [768,37]", {768, 37}, true, 1408U);
+    failures += run_composition_case("rmsnorm_add plain [1152,5]", {1152, 5}, false, 1409U);
     // The weightless form Gemma 4's attention value takes. 256 and 512 are its two head
     // widths -- the value plane is viewed as [head_dim, kv_heads * columns], so the head
     // width *is* this op's ne[0] -- and the rest cover the warp, d128, cta, generic and

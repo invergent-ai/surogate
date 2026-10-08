@@ -186,7 +186,7 @@ __launch_bounds__(Block) __global__
 }
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
-// values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
+// values per lane. A width the CTA vector span does not divide leaves the last pass partly idle.
 template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
@@ -197,7 +197,6 @@ __launch_bounds__(Block) __global__
     if (row >= rows) { return; }
 
     const int pairs             = d / 2;
-    const int pairs_per_thread  = pairs / Block;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[MaxPairsPerThread];
     float2 gains[MaxPairsPerThread], operands[MaxPairsPerThread];
@@ -207,8 +206,8 @@ __launch_bounds__(Block) __global__
     // barriers) they do not need: issued after it, they added a second memory round trip.
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
-        if (k < pairs_per_thread) {
-            const int pair  = static_cast<int>(threadIdx.x) + k * Block;
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
             values[k]       = x[row_base + pair];
             gains[k]        = rmsnorm_gain2<Epilogue>(weight, pair);
             operands[k]     = float2{0.0f, 0.0f};
@@ -229,8 +228,8 @@ __launch_bounds__(Block) __global__
 
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
-        if (k < pairs_per_thread) {
-            const int pair  = static_cast<int>(threadIdx.x) + k * Block;
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = gains[k];
             const float2 zf = operands[k];

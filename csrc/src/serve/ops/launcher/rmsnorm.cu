@@ -83,6 +83,31 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
                 reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+    } else if (aligned2 && d % 64 == 0 && d <= 8192) {
+        // The widths between the shapes above -- 640, 768 and 1152 (Gemma 3 270M, EmbeddingGemma,
+        // Gemma 3 1B), 3840 and 5376 (Gemma 3 12B, 27B) -- on the same vectorised CTA kernel,
+        // its last pass partly idle. The generic kernel below read each element twice, one
+        // BF16 at a time: 53.5 us a call at [768, 7040] on a DGX Spark.
+        const auto grid = static_cast<unsigned int>(rows);
+        if (d <= 1536) {
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 128, 6><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+        } else if (d <= 3072) {
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6><<<grid, 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+        } else {
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8><<<grid, 512, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+        }
     } else {
         rmsnorm_generic_kernel<Epilogue><<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
             x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps);

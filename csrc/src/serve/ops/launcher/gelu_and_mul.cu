@@ -16,6 +16,31 @@ void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, bool tanh_approx,
                          cudaStream_t stream, bool round_gate) {
     const std::int64_t n = out.numel();
     constexpr int kBlock = 256;
+    const auto aligned16 = [](const void* p) {
+        return (reinterpret_cast<std::uintptr_t>(p) & (alignof(Bf16x8Pack) - 1)) == 0;
+    };
+    if (n % 8 == 0 && aligned16(gate.data) && aligned16(up.data) && aligned16(out.data)) {
+        // 16-byte packs, one load per operand per eight values, where the four-pair stream
+        // below issues a 4-byte load per pair (149 us a call on EmbeddingGemma's [1152, 7040]
+        // plane on a DGX Spark).
+        const std::int64_t packs = n / 8;
+        const auto grid = static_cast<unsigned int>(
+            std::clamp<std::int64_t>(div_up(packs, static_cast<std::int64_t>(kBlock)), 1, 65535));
+        const auto* g = static_cast<const Bf16x8Pack*>(gate.data);
+        const auto* u = static_cast<const Bf16x8Pack*>(up.data);
+        auto* o       = static_cast<Bf16x8Pack*>(out.data);
+        if (round_gate && tanh_approx) {
+            gelu_and_mul_bf16x8_kernel<true, true><<<grid, kBlock, 0, stream>>>(g, u, o, packs);
+        } else if (round_gate) {
+            gelu_and_mul_bf16x8_kernel<false, true><<<grid, kBlock, 0, stream>>>(g, u, o, packs);
+        } else if (tanh_approx) {
+            gelu_and_mul_bf16x8_kernel<true><<<grid, kBlock, 0, stream>>>(g, u, o, packs);
+        } else {
+            gelu_and_mul_bf16x8_kernel<false><<<grid, kBlock, 0, stream>>>(g, u, o, packs);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const std::int64_t pairs = n / 2;
     const auto grid = static_cast<unsigned int>(std::clamp<std::int64_t>(
         div_up(pairs, static_cast<std::int64_t>(kBlock) * kGeluAndMulPairsPerThread), 1, 65535));

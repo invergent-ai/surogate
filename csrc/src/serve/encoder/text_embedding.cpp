@@ -9,6 +9,7 @@
 #include "api/ops/l2norm.h"
 #include "api/ops/linear.h"
 #include "api/ops/mean_pool.h"
+#include "api/ops/qk_norm_rope.h"
 #include "api/ops/residual_add.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/rope.h"
@@ -22,7 +23,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -114,6 +117,14 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     impl.device = &device;
     impl.reader = std::make_unique<artifact::Reader>(path);
     impl.config = TextEmbeddingConfig::from_artifact(*impl.reader);
+    // How many tokens one forward takes. Not below the longest sequence, which must fit a forward.
+    if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_BATCH_TOKENS"); raw != nullptr && *raw != '\0') {
+        const long value = std::strtol(raw, nullptr, 10);
+        if (value <= 0 || value > (1L << 20)) {
+            throw std::invalid_argument("SUROGATE_SERVE_ENCODER_BATCH_TOKENS must be a positive token count");
+        }
+        impl.config.max_batch_tokens = std::max(static_cast<std::int32_t>(value), impl.config.max_tokens);
+    }
 
     const TextEmbeddingConfig& config = impl.config;
     const auto hidden       = static_cast<std::uint64_t>(config.hidden);
@@ -264,8 +275,8 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         const auto capacity = std::max(total, impl.arena_tokens);
         const auto scratch_bytes = std::max(attention_bytes, impl.attention_workspace_bytes);
         const std::size_t arena_bytes = sizeof(std::uint16_t) * static_cast<std::size_t>(capacity) *
-            (7ULL * config.hidden + 2ULL * config.intermediate + 2ULL * config.query_size() +
-             2ULL * config.kv_size()) + (1u << 20);
+            (7ULL * config.hidden + 2ULL * config.intermediate + 3ULL * config.query_size() +
+             3ULL * config.kv_size()) + (1u << 20);
         // Release obsolete scratch before growing it. A long request must get a
         // recoverable error if its working set cannot fit beside the model.
         impl.arena.reset(); impl.inputs.reset(); impl.attention_workspace.reset();
@@ -305,6 +316,10 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     Tensor key      = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor value    = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor attn_out = arena.alloc(DType::BF16, {config.query_size(), total});
+    // Where the fused per-head norm and RoPE write the queries and keys: it reads the projections
+    // and may not write over them.
+    Tensor query_normed = arena.alloc(DType::BF16, {config.query_size(), total});
+    Tensor key_normed   = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor gate     = arena.alloc(DType::BF16, {config.intermediate, total});
     Tensor up       = arena.alloc(DType::BF16, {config.intermediate, total});
 
@@ -329,33 +344,47 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
                                     {impl.matrix(w.key, config.kv_size(), config.hidden), key},
                                     {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
 
-        // Per-head QK norm: each head's features are contiguous, so the
-        // [head_dim, heads * tokens] view is exactly the rows rmsnorm reduces
-        // over -- and it does not care about sequence boundaries either.
-        Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * total});
-        Tensor key_heads(key.data, DType::BF16, {config.head_dim, config.kv_heads * total});
-        ops::rmsnorm(query_heads, impl.norm(w.query_norm, config.head_dim), config.rms_epsilon,
-                     config.gemma, query_heads, stream);
-        ops::rmsnorm(key_heads, impl.norm(w.key_norm, config.head_dim), config.rms_epsilon, config.gemma,
-                     key_heads, stream);
-
-        // rope reads its position per column, and positions restart per
-        // sequence, so this too runs once for the batch.
+        // Per-head QK norm, then RoPE. Each head's features are contiguous, so the
+        // [head_dim, heads, tokens] view is exactly the rows the norm reduces over -- and
+        // neither step cares about sequence boundaries, since rope reads its position per
+        // column and positions restart per sequence. One launch does both into the normed
+        // planes; outside its domain the two norms and the rope run in place.
+        const Tensor query_gain = impl.norm(w.query_norm, config.head_dim);
+        const Tensor key_gain   = impl.norm(w.key_norm, config.head_dim);
+        const Tensor& rope_table = global ? impl.rope_global : impl.rope_local;
         Tensor query_rope(query.data, DType::BF16, {config.head_dim, config.query_heads, total});
         Tensor key_rope(key.data, DType::BF16, {config.head_dim, config.kv_heads, total});
-        ops::rope_from_table(position_tensor, global ? impl.rope_global : impl.rope_local,
-                             query_rope, key_rope, stream);
+        Tensor query_rope_out(query_normed.data, DType::BF16, {config.head_dim, config.query_heads, total});
+        Tensor key_rope_out(key_normed.data, DType::BF16, {config.head_dim, config.kv_heads, total});
+        ops::QkNormRope fused;
+        fused.q = &query_rope, fused.q_norm = &query_gain, fused.q_out = &query_rope_out;
+        fused.k = &key_rope, fused.k_norm = &key_gain, fused.k_out = &key_rope_out;
+        fused.k_heads = config.kv_heads, fused.eps = config.rms_epsilon, fused.unit_offset = config.gemma;
+        fused.positions = &position_tensor, fused.rotary_dim = config.head_dim;
+        fused.active_pairs = config.head_dim / 2;
+        fused.theta = global ? config.rope_theta_global : config.rope_theta_local;
+        fused.table = &rope_table;
+        const bool normed = ops::qk_norm_rope(fused, stream);
+        if (!normed) {
+            Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * total});
+            Tensor key_heads(key.data, DType::BF16, {config.head_dim, config.kv_heads * total});
+            ops::rmsnorm(query_heads, query_gain, config.rms_epsilon, config.gemma, query_heads, stream);
+            ops::rmsnorm(key_heads, key_gain, config.rms_epsilon, config.gemma, key_heads, stream);
+            ops::rope_from_table(position_tensor, rope_table, query_rope, key_rope, stream);
+        }
+        const Tensor& query_ready = normed ? query_normed : query;
+        const Tensor& key_ready   = normed ? key_normed : key;
 
         // Attention is the one step that must not cross a boundary. The whole batch goes in
         // one launch; a head dim the batched kernel lacks runs the op per sequence.
-        if (!ops::encoder_attention_batch(query, key, value, segment_tensor, longest, window,
+        if (!ops::encoder_attention_batch(query_ready, key_ready, value, segment_tensor, longest, window,
                                           config.attention_scale, attn_out, stream,
                                           config.kv_heads, !config.mean_pooling)) {
             for (std::int32_t index = 0; index < batch; ++index) {
                 const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
                 const std::int32_t length = lengths[static_cast<std::size_t>(index)];
-                const Tensor q_slice      = query.slice(1, offset, length);
-                const Tensor k_slice      = key.slice(1, offset, length);
+                const Tensor q_slice      = query_ready.slice(1, offset, length);
+                const Tensor k_slice      = key_ready.slice(1, offset, length);
                 const Tensor v_slice      = value.slice(1, offset, length);
                 Tensor out_slice          = attn_out.slice(1, offset, length);
                 ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
@@ -367,11 +396,14 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
 
         ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
                     stream);
+        // x += post_attention_norm(attn): one pass over the planes, where a norm in place
+        // and a residual add were two, with the same bits.
         if (config.gemma) {
-            ops::rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden), config.rms_epsilon,
-                         true, attn, stream);
+            ops::rmsnorm_add(attn, impl.norm(w.post_attention_norm, config.hidden),
+                             config.rms_epsilon, true, x, stream);
+        } else {
+            ops::residual_add(attn, x, stream); // x += attn
         }
-        ops::residual_add(attn, x, stream); // x += attn
 
         // --- MLP, between the other two ------------------------------------
         ops::rmsnorm(x, impl.norm(w.pre_feedforward_norm, config.hidden), config.rms_epsilon, config.gemma,
@@ -383,10 +415,11 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         else { ops::silu_mul(gate, up, gate, stream); }
         ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
         if (config.gemma) {
-            ops::rmsnorm(attn, impl.norm(w.post_feedforward_norm, config.hidden), config.rms_epsilon,
-                         true, attn, stream);
+            ops::rmsnorm_add(attn, impl.norm(w.post_feedforward_norm, config.hidden),
+                             config.rms_epsilon, true, x, stream);
+        } else {
+            ops::residual_add(attn, x, stream);
         }
-        ops::residual_add(attn, x, stream);
     }
 
     ops::rmsnorm(x, impl.norm(impl.final_norm, config.hidden), config.rms_epsilon, config.gemma, h,

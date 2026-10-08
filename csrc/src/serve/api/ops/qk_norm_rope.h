@@ -31,14 +31,19 @@ struct QkNormRope {
     float theta             = 0.0F;
     /// Nonzero: the rotation is rope_interleaved's with these temporal/height/width sections.
     std::array<int, 3> sections{};
+    /// Optional FP32 [2, rotary_dim / 2, positions] rope_table built for this rotation: the
+    /// coefficients are read from it rather than derived per token, and the result is the bits
+    /// ops::rope_from_table leaves after the two norms. [T] positions within the table, no
+    /// sections; `theta` and `active_pairs` are still validated, and are the table's.
+    const Tensor* table = nullptr;
 };
 
 /**
  * `q_out = rope(rmsnorm(q, q_norm))` and the same for the keys, in one launch: the bits
  * ops::rmsnorm(q, q_norm, eps, unit_offset, q_out) and ops::rmsnorm(k, ...) followed by
  * ops::rope(positions, rotary_dim, active_pairs, theta, q_out, k_out) -- or ops::rope_interleaved
- * with `sections` -- leave in the output planes, exactly. Two norm launches and a rope launch per
- * attention layer become one (vLLM fuses the same pair).
+ * with `sections`, or ops::rope_from_table with `table` -- leave in the output planes, exactly.
+ * Two norm launches and a rope launch per attention layer become one (vLLM fuses the same pair).
  *
  * Returns false, launching nothing, outside its domain, and the caller runs the separate ops:
  * head dims 64, 128, 192 and 256 on the rmsnorm kernels' aligned paths, a rotation whose partner

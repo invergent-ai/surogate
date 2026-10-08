@@ -1,6 +1,7 @@
 // ops::qk_norm_rope against the two ops it fuses: for every geometry in its domain the fused
 // launch must leave exactly the bits ops::rmsnorm on the queries and keys followed by ops::rope
-// (or ops::rope_interleaved) leave, and outside it it must decline without writing anything.
+// (or ops::rope_interleaved, or ops::rope_from_table) leave, and outside it it must decline
+// without writing anything.
 #include "api/ops/qk_norm_rope.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/rope.h"
@@ -31,6 +32,7 @@ struct Case {
     std::array<int, 3> sections{}; ///< nonzero: rope_interleaved
     bool keys = true;
     bool expect_fused = true;
+    float table_scale = 0.0F;      ///< nonzero: the angles come from a rope_table with this scale
 };
 
 std::vector<std::uint16_t> random_bf16(std::size_t n, std::mt19937& rng, float lo, float hi) {
@@ -77,6 +79,11 @@ int run(const Case& c, int tokens, int first_position, std::uint32_t seed) {
     DeviceBuffer qw_dev = to_device(qw_host), kw_dev = to_device(kw_host);
     DeviceBuffer pos_dev = to_device(pos_host);
     DeviceBuffer q_ref(qn * 2), k_ref(kn * 2), q_got(qn * 2), k_got(kn * 2);
+    // A table holds every position the run reaches and no more.
+    const int table_positions = first_position + tokens;
+    DeviceBuffer table_dev(c.table_scale != 0.0F
+                               ? sizeof(float) * 2 * (c.rotary_dim / 2) * static_cast<std::size_t>(table_positions)
+                               : sizeof(float) * 2);
     q_got.fill(0x5a), k_got.fill(0x5a);
     q_ref.fill(0x5a), k_ref.fill(0x5a);
 
@@ -96,7 +103,11 @@ int run(const Case& c, int tokens, int first_position, std::uint32_t seed) {
     // it was handed (here the reference's own normalised keys).
     ops::rmsnorm(q, qw, eps, c.unit_offset, qr, nullptr);
     ops::rmsnorm(k, kw, eps, c.unit_offset, kr, nullptr);
-    if (c.sections[0] != 0) {
+    Tensor table(table_dev.p, DType::FP32, {2, c.rotary_dim / 2, table_positions});
+    if (c.table_scale != 0.0F) {
+        ops::rope_table(c.head_dim, c.rotary_dim, active_pairs, c.theta, c.table_scale, table, nullptr);
+        ops::rope_from_table(positions, table, qr, kr, nullptr);
+    } else if (c.sections[0] != 0) {
         ops::rope_interleaved(positions, c.rotary_dim, c.theta, c.sections, qr, kr, nullptr);
     } else {
         ops::rope(positions, c.rotary_dim, active_pairs, c.theta, qr, kr, nullptr);
@@ -108,6 +119,7 @@ int run(const Case& c, int tokens, int first_position, std::uint32_t seed) {
     args.k_heads = c.k_heads, args.eps = eps, args.unit_offset = c.unit_offset;
     args.positions = &positions, args.rotary_dim = c.rotary_dim, args.active_pairs = active_pairs;
     args.theta = c.theta, args.sections = c.sections;
+    if (c.table_scale != 0.0F) { args.table = &table; }
     const bool fused = ops::qk_norm_rope(args, nullptr);
     cuda_synchronize();
 
@@ -167,6 +179,13 @@ int main() {
         // Queries alone: a layer that reads an earlier layer's keys.
         {"queries only d128", 128, 128, 32, 8, 1, 1.0e6F, false, 0, {}, false},
         {"queries only d256/r64", 256, 64, 24, 4, 1, 1.0e7F, true, 0, {}, false},
+        // Angles from a rope_table: EmbeddingGemma's local and global layers (3 query heads over
+        // one key head), a scaled table, a partial rotation, and queries alone.
+        {"embeddinggemma local d256/r256 3q1k table", 256, 256, 3, 1, 1, 1.0e4F, true, 0, {}, true, true, 1.0F},
+        {"embeddinggemma global d256/r256 3q1k table", 256, 256, 3, 1, 1, 1.0e6F, true, 0, {}, true, true, 1.0F},
+        {"d128/r128 32q8k scaled table", 128, 128, 32, 8, 1, 1.0e6F, false, 0, {}, true, true, 0.125F},
+        {"d256/r64 16q2k table", 256, 64, 16, 2, 1, 1.0e7F, true, 0, {}, true, true, 1.0F},
+        {"queries only d256/r256 table", 256, 256, 8, 4, 1, 1.0e4F, true, 0, {}, false, true, 1.0F},
         // Outside the domain: declined.
         {"d128/r96 declined", 128, 96, 8, 2, 1, 1.0e4F, false, 0, {}, true, false},
         {"d512/r512 declined", 512, 512, 4, 1, 1, 1.0e6F, true, 64, {}, true, false},
@@ -175,7 +194,11 @@ int main() {
     std::uint32_t seed = 11;
     for (const Case& c : cases) {
         for (const int tokens : {1, 3, 64, 333}) {
-            for (const int first : {0, 9000, 250000}) { failures += run(c, tokens, first, seed++); }
+            for (const int first : {0, 9000, 250000}) {
+                // A table of 250,000 positions is 128 MB a run; the table cases stop at 9,000.
+                if (c.table_scale != 0.0F && first > 9000) { continue; }
+                failures += run(c, tokens, first, seed++);
+            }
         }
     }
     if (failures != 0) {
