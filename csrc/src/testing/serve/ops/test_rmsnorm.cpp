@@ -116,6 +116,59 @@ int run_composition_case(const char* label, const Shape& shape, bool unit_offset
     return failures;
 }
 
+/// The sandwich against the two ops it stands for: rmsnorm_add onto the residual, then rmsnorm
+/// of the result. Both the updated residual and the normalised output must match bit for bit,
+/// on the fused kernel's widths and on the ones it hands back to the two ops.
+int run_sandwich_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
+                      bool bf16x2_unaligned = false) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d), next_weight(shape.d), prior(count);
+    fill_uniform(input, seed, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 1U, unit_offset ? -0.5F : 0.25F, unit_offset ? 0.5F : 1.75F);
+    fill_uniform(next_weight, seed + 2U, unit_offset ? -0.5F : 0.25F, unit_offset ? 0.5F : 1.75F);
+    fill_uniform(prior, seed + 3U, -8.0F, 8.0F);
+    round_to_bf16(input);
+    round_to_bf16(weight);
+    round_to_bf16(next_weight);
+    round_to_bf16(prior);
+
+    DeviceInput device_input       = make_input(input, bf16x2_unaligned);
+    DeviceInput device_weight      = make_input(weight, false);
+    DeviceInput device_next_weight = make_input(next_weight, false);
+    Tensor input_tensor = tensor_for(device_input.data, shape);
+    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+    Tensor next_weight_tensor(device_next_weight.data, DType::BF16, {shape.d});
+
+    DeviceInput fused_residual = make_input(prior, false);
+    Tensor fused_residual_tensor = tensor_for(fused_residual.data, shape);
+    GuardedDeviceBuffer fused_out(count * sizeof(std::uint16_t));
+    fused_out.fill(0xff);
+    Tensor fused_out_tensor = tensor_for(fused_out.data(), shape);
+    ops::rmsnorm_add_rmsnorm(input_tensor, weight_tensor, next_weight_tensor, kEps, unit_offset,
+                             fused_residual_tensor, fused_out_tensor, nullptr);
+
+    DeviceInput staged_residual = make_input(prior, false);
+    Tensor staged_residual_tensor = tensor_for(staged_residual.data, shape);
+    GuardedDeviceBuffer staged_out(count * sizeof(std::uint16_t));
+    staged_out.fill(0xff);
+    Tensor staged_out_tensor = tensor_for(staged_out.data(), shape);
+    ops::rmsnorm_add(input_tensor, weight_tensor, kEps, unit_offset, staged_residual_tensor, nullptr);
+    ops::rmsnorm(staged_residual_tensor, next_weight_tensor, kEps, unit_offset, staged_out_tensor,
+                 nullptr);
+    cuda_synchronize();
+
+    const std::string residual_label = std::string(label) + " residual";
+    const std::string out_label      = std::string(label) + " output";
+    int failures = verify_exact(residual_label.c_str(),
+                                from_device<std::uint16_t>(fused_residual.data, count),
+                                from_device<std::uint16_t>(staged_residual.data, count));
+    failures += verify_exact(out_label.c_str(), from_device<std::uint16_t>(fused_out.data(), count),
+                             from_device<std::uint16_t>(staged_out.data(), count));
+    failures += verify_output_storage(out_label, fused_out, false);
+    failures += verify_preserved(std::string(label) + " preserves input", device_input);
+    return failures;
+}
+
 /// The weightless form, twice over.
 ///
 /// Once against an oracle that has no weight in it at all -- not a ones vector, because the
@@ -223,6 +276,18 @@ int main() {
     failures += run_composition_case("rmsnorm_add plain [5120,3]", {5120, 3}, false, 1407U);
     failures += run_composition_case("rmsnorm_add offset [768,37]", {768, 37}, true, 1408U);
     failures += run_composition_case("rmsnorm_add plain [1152,5]", {1152, 5}, false, 1409U);
+    // The sandwich: on each block size of the one-pass kernel (768 and 1152 on 128 threads,
+    // 2048 offset on 256, 3840 and 5120 on 512), and on widths it hands to the two ops (a plain
+    // 2048 takes the d2048 kernel, 256 the warp kernel, 130 the generic one, and an unaligned row).
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm offset [768,37]", {768, 37}, true, 1601U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm plain [1152,9]", {1152, 9}, false, 1602U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm offset [2048,5]", {2048, 5}, true, 1603U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm offset [3840,3]", {3840, 3}, true, 1604U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm plain [5120,3]", {5120, 3}, false, 1605U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm plain [2048,4]", {2048, 4}, false, 1606U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm offset [256,4,9]", {256, 4, 9}, true, 1607U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm offset [130,9]", {130, 9}, true, 1608U);
+    failures += run_sandwich_case("rmsnorm_add_rmsnorm unaligned [768,5]", {768, 5}, true, 1609U, true);
     // The weightless form Gemma 4's attention value takes. 256 and 512 are its two head
     // widths -- the value plane is viewed as [head_dim, kv_heads * columns], so the head
     // width *is* this op's ne[0] -- and the rest cover the warp, d128, cta, generic and

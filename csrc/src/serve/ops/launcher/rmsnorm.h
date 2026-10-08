@@ -15,6 +15,11 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
                     const Tensor* z, Tensor& out, cudaStream_t stream);
 void rmsnorm_add_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                         Tensor& out, cudaStream_t stream);
+/// The fused sandwich, or false (launching nothing) where the two separate launches would not
+/// both take the CTA kernel it reproduces.
+bool rmsnorm_add_rmsnorm_launch(const Tensor& x, const Tensor& weight, const Tensor& next_weight,
+                                float eps, bool unit_offset, Tensor& residual, Tensor& out,
+                                cudaStream_t stream);
 void rmsnorm_unweighted_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
 
 void rmsnorm_fp32_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out, cudaStream_t stream);

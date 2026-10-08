@@ -41,6 +41,27 @@ void rmsnorm_add(const Tensor& x, const Tensor& weight, float eps, bool unit_off
                  cudaStream_t stream);
 
 /**
+ * The two norms around a residual add, as a sandwich-norm layer closes one block and opens the
+ * next (Gemma's post-attention norm, residual add, pre-feedforward norm):
+ *
+ *   residual[d,r] = residual[d,r] + bf16(x[d,r] * inv_r(x) * gain[d])
+ *   ideal[d,r]    = residual[d,r] * inv_r(residual) * next_gain[d]
+ *
+ * with both gains `1 + w` under `unit_offset`. The bits are those `rmsnorm_add(x, weight, eps,
+ * unit_offset, residual)` followed by `rmsnorm(residual, next_weight, eps, unit_offset, out)`
+ * leave; where its one-pass kernel covers the width (aligned rows wider than 256, up to 8192, on
+ * the CTA kernel both ops would take) the second norm reads the residual from registers rather
+ * than memory, and elsewhere it runs those two ops.
+ *
+ * `x`, `residual` and `out` are same-shaped contiguous BF16 tensors, none aliasing another; the
+ * gains are BF16 [D]. Shape, weight and eps rules are `rmsnorm`'s. There is no workspace or
+ * persistent state side effect.
+ */
+void rmsnorm_add_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& next_weight,
+                         float eps, bool unit_offset, Tensor& residual, Tensor& out,
+                         cudaStream_t stream);
+
+/**
  * The same normalisation with no gain at all:
  *
  *   inv_r      = 1 / sqrt((1/D) * sum_d x[d,r]^2 + eps)

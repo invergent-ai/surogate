@@ -330,6 +330,15 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     // relative to every block's contribution.
     ops::scale(x, config.embedding_scale, stream);
 
+    // The norm that opens each layer: layer 0's here, every later one (and the final norm) in
+    // the same pass as the residual add that closes the layer before it.
+    const auto opening_norm = [&](std::int32_t layer) {
+        return layer < config.layers
+                   ? impl.norm(impl.layers[static_cast<std::size_t>(layer)].input_norm, config.hidden)
+                   : impl.norm(impl.final_norm, config.hidden);
+    };
+    ops::rmsnorm(x, opening_norm(0), config.rms_epsilon, /*unit_offset*/ config.gemma, h, stream);
+
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
         const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
         const bool global         = config.is_global(layer);
@@ -337,9 +346,8 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
 
         // --- attention, between the sandwich norms -------------------------
         // Every projection runs once over the whole batch: the sequences are
-        // adjacent columns and a GEMM does not care where one ends.
-        ops::rmsnorm(x, impl.norm(w.input_norm, config.hidden), config.rms_epsilon,
-                     /*unit_offset*/ config.gemma, h, stream);
+        // adjacent columns and a GEMM does not care where one ends. h is the
+        // input norm of x.
         ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
                                     {impl.matrix(w.key, config.kv_size(), config.hidden), key},
                                     {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
@@ -396,34 +404,35 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
 
         ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
                     stream);
-        // x += post_attention_norm(attn): one pass over the planes, where a norm in place
-        // and a residual add were two, with the same bits.
+        // x += post_attention_norm(attn), then h = pre_feedforward_norm(x): one pass over the
+        // planes where an in-place norm, a residual add and a norm were three, with their bits.
+        const Tensor pre_feedforward_norm = impl.norm(w.pre_feedforward_norm, config.hidden);
         if (config.gemma) {
-            ops::rmsnorm_add(attn, impl.norm(w.post_attention_norm, config.hidden),
-                             config.rms_epsilon, true, x, stream);
+            ops::rmsnorm_add_rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden),
+                                     pre_feedforward_norm, config.rms_epsilon, true, x, h, stream);
         } else {
             ops::residual_add(attn, x, stream); // x += attn
+            ops::rmsnorm(x, pre_feedforward_norm, config.rms_epsilon, false, h, stream);
         }
 
         // --- MLP, between the other two ------------------------------------
-        ops::rmsnorm(x, impl.norm(w.pre_feedforward_norm, config.hidden), config.rms_epsilon, config.gemma,
-                     h, stream);
         ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
                                     {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
         // gelu_pytorch_tanh, per the checkpoint's hidden_activation.
         if (config.gemma) { ops::gelu_mul(gate, up, ops::GeluMode::Tanh, gate, stream); }
         else { ops::silu_mul(gate, up, gate, stream); }
         ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
+        // x += post_feedforward_norm(attn), then h = the next layer's input norm of x -- or
+        // after the last layer, the final norm.
+        const Tensor next_norm = opening_norm(layer + 1);
         if (config.gemma) {
-            ops::rmsnorm_add(attn, impl.norm(w.post_feedforward_norm, config.hidden),
-                             config.rms_epsilon, true, x, stream);
+            ops::rmsnorm_add_rmsnorm(attn, impl.norm(w.post_feedforward_norm, config.hidden),
+                                     next_norm, config.rms_epsilon, true, x, h, stream);
         } else {
             ops::residual_add(attn, x, stream);
+            ops::rmsnorm(x, next_norm, config.rms_epsilon, false, h, stream);
         }
     }
-
-    ops::rmsnorm(x, impl.norm(impl.final_norm, config.hidden), config.rms_epsilon, config.gemma, h,
-                 stream);
 
     // --- pool, project, normalise -------------------------------------------
     // Pooling is per sequence; the projection that follows is one GEMM over all
