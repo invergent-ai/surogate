@@ -5,7 +5,8 @@
 // the same way -- by a model producing wrong numbers -- and both are invisible until a real
 // checkpoint lands on them:
 //
-//   * scale rows are read 16 bytes at a time, which needs `k % 256 == 0`  (EmbeddingGemma);
+//   * scale rows are read 16 bytes at a time, which needs `k % 256 == 0`  (EmbeddingGemma),
+//     except by the row-split routes, which read them in 8-byte halves and need `k % 128 == 0`;
 //   * rows are tiled in groups of 128, which needs `n % 128 == 0`         (Gemma 4 26B-A4B).
 //
 // The second was measured against `transformers` on the mixture's feed-forward, n = 2,112 and
@@ -28,6 +29,7 @@ using sinfer::ops::LinearPolicy;
 using sinfer::ops::detail::W8Launch;
 using sinfer::ops::detail::kW8MmaRowAlignmentN;
 using sinfer::ops::detail::kW8MmaScaleRowAlignmentK;
+using sinfer::ops::detail::kW8RowSplitMmaScaleRowAlignmentK;
 using sinfer::ops::detail::launch_w8_simt_r8_c4;
 using sinfer::ops::detail::select_w8_launch;
 
@@ -48,6 +50,7 @@ void expect_simt(std::int32_t n, std::int32_t k, std::int32_t t, const char* why
 int main() {
     static_assert(kW8MmaRowAlignmentN == 128);
     static_assert(kW8MmaScaleRowAlignmentK == 256);
+    static_assert(kW8RowSplitMmaScaleRowAlignmentK == 128);
 
     // Gemma 4 26B-A4B, the shape that found the row constraint. 2,112 is 16.5 x 128, so every
     // width must stay off the MMA routes -- including the ones a tuned entry might claim.
@@ -57,6 +60,14 @@ int main() {
     // Its down projection misses the K constraint instead, and must be refused for that.
     for (const std::int32_t t : {17, 27, 512}) {
         expect_simt(2816, 2112, t, "k = 2112 is not a multiple of 256");
+    }
+    // EmbeddingGemma's down projection, k = 1152: 8-byte-aligned scale rows, which the row-split
+    // MMA routes take above the small-T band. On SIMT it was 63% of a batched request.
+    for (const std::int32_t t : {17, 128, 129, 7040}) {
+        if (select_w8_launch(768, 1152, t, LinearPolicy::A16Only) == launch_w8_simt_r8_c4) {
+            std::printf("FAIL n=768 k=1152 t=%d: EmbeddingGemma's down projection fell to SIMT\n", t);
+            ++failures;
+        }
     }
     // A shape that meets both must NOT be pushed to SIMT above the small-T band -- the guards
     // are a floor on correctness, not an excuse to abandon the tuned routes. The 12B's

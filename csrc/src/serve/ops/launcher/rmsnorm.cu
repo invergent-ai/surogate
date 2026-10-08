@@ -30,6 +30,65 @@ __global__ void rmsnorm_fp32_kernel(const float* x, const __nv_bfloat16* weight,
     }
 }
 
+// The block size of the CTA kernel launch_rmsnorm runs an aligned row of width `d` on, or 0 for
+// another kernel. Only for widths the d128, warp and d2048 kernels have not taken first.
+constexpr int rmsnorm_cta_block(std::int32_t d) {
+    if (d >= 512 && d <= 3072 && d % 512 == 0) { return 256; }
+    if (d > 3072 && d <= 8192 && d % 1024 == 0) { return 512; }
+    // The widths between those -- 640, 768 and 1152 (Gemma 3 270M, EmbeddingGemma, Gemma 3 1B),
+    // 3840 and 5376 (Gemma 3 12B, 27B) -- on the same kernel, its last pass partly idle. The
+    // generic kernel reads each element twice, one BF16 at a time: 53.5 us a call at
+    // [768, 7040] on a DGX Spark.
+    if (d % 64 == 0 && d <= 8192) { return d <= 1536 ? 128 : (d <= 3072 ? 256 : 512); }
+    return 0;
+}
+
+// The CTA kernel's register budget at each block size it is launched with.
+template <int Block>
+inline constexpr int kRmsCtaMaxPairs = Block == 512 ? 8 : 6;
+
+template <RmsEpilogue Epilogue, int Block>
+void launch_rmsnorm_cta(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                        const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
+                        std::int64_t rows, float eps, cudaStream_t stream) {
+    rmsnorm_cta_bf16x2_kernel<Epilogue, Block, kRmsCtaMaxPairs<Block>>
+        <<<static_cast<unsigned int>(rows), Block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat162*>(x),
+            reinterpret_cast<const __nv_bfloat162*>(weight),
+            reinterpret_cast<const __nv_bfloat162*>(z), reinterpret_cast<__nv_bfloat162*>(out), d,
+            rows, eps);
+}
+
+template <bool UnitOffset, int Block>
+void launch_rmsnorm_add_rmsnorm_cta(const Tensor& x, const Tensor& weight,
+                                    const Tensor& next_weight, Tensor& residual, Tensor& out,
+                                    std::int32_t d, std::int64_t rows, float eps,
+                                    cudaStream_t stream) {
+    rmsnorm_add_rmsnorm_cta_bf16x2_kernel<UnitOffset, Block, kRmsCtaMaxPairs<Block>>
+        <<<static_cast<unsigned int>(rows), Block, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(x.data),
+            static_cast<const __nv_bfloat162*>(weight.data),
+            static_cast<const __nv_bfloat162*>(next_weight.data),
+            static_cast<__nv_bfloat162*>(residual.data), static_cast<__nv_bfloat162*>(out.data), d,
+            rows, eps);
+}
+
+template <bool UnitOffset>
+void launch_rmsnorm_add_rmsnorm(int block, const Tensor& x, const Tensor& weight,
+                                const Tensor& next_weight, Tensor& residual, Tensor& out,
+                                std::int32_t d, std::int64_t rows, float eps, cudaStream_t stream) {
+    if (block == 128) {
+        launch_rmsnorm_add_rmsnorm_cta<UnitOffset, 128>(x, weight, next_weight, residual, out, d,
+                                                        rows, eps, stream);
+    } else if (block == 256) {
+        launch_rmsnorm_add_rmsnorm_cta<UnitOffset, 256>(x, weight, next_weight, residual, out, d,
+                                                        rows, eps, stream);
+    } else {
+        launch_rmsnorm_add_rmsnorm_cta<UnitOffset, 512>(x, weight, next_weight, residual, out, d,
+                                                        rows, eps, stream);
+    }
+}
+
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
@@ -69,20 +128,12 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
             reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
-    } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6>
-            <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-    } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8>
-            <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+    } else if (const int block = aligned2 ? rmsnorm_cta_block(d) : 0; block == 128) {
+        launch_rmsnorm_cta<Epilogue, 128>(x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps, stream);
+    } else if (block == 256) {
+        launch_rmsnorm_cta<Epilogue, 256>(x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps, stream);
+    } else if (block == 512) {
+        launch_rmsnorm_cta<Epilogue, 512>(x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps, stream);
     } else {
         rmsnorm_generic_kernel<Epilogue><<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
             x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps);
@@ -90,6 +141,32 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
 }
 
 } // namespace
+
+bool rmsnorm_add_rmsnorm_launch(const Tensor& x, const Tensor& weight, const Tensor& next_weight,
+                                float eps, bool unit_offset, Tensor& residual, Tensor& out,
+                                cudaStream_t stream) {
+    const std::int32_t d    = x.ne[0];
+    const std::int64_t rows = x.numel() / d;
+    const auto addresses    = reinterpret_cast<std::uintptr_t>(x.data) |
+                           reinterpret_cast<std::uintptr_t>(weight.data) |
+                           reinterpret_cast<std::uintptr_t>(next_weight.data) |
+                           reinterpret_cast<std::uintptr_t>(residual.data) |
+                           reinterpret_cast<std::uintptr_t>(out.data);
+    const bool aligned2 = (addresses & (alignof(__nv_bfloat162) - 1)) == 0;
+    // Only where both separate launches would take the CTA kernel, with the same block: widths
+    // up to 256 take the warp kernels, and a plain gain at 2048 the d2048 kernel.
+    const int block = aligned2 && d > 256 && !(d == 2048 && !unit_offset) ? rmsnorm_cta_block(d) : 0;
+    if (block == 0) { return false; }
+    if (unit_offset) {
+        launch_rmsnorm_add_rmsnorm<true>(block, x, weight, next_weight, residual, out, d, rows, eps,
+                                         stream);
+    } else {
+        launch_rmsnorm_add_rmsnorm<false>(block, x, weight, next_weight, residual, out, d, rows,
+                                          eps, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 
 void rmsnorm_add_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                         Tensor& out, cudaStream_t stream) {

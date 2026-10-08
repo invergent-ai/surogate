@@ -73,6 +73,16 @@ bool qk_norm_rope(const QkNormRope& args, cudaStream_t stream) {
         (args.rotary_dim & 1) != 0) {
         throw std::invalid_argument("qk_norm_rope: theta must be positive and rotary_dim even");
     }
+    if (args.table != nullptr) {
+        const Tensor& table = *args.table;
+        if (table.dtype != DType::FP32 || table.ne[0] != 2 || table.ne[1] != args.rotary_dim / 2 ||
+            table.ne[2] < 1 || table.ne[3] != 1 || !table.is_contiguous() || table.data == nullptr) {
+            throw std::invalid_argument("qk_norm_rope: table must be a contiguous FP32 [2, rotary_dim/2, positions] rope_table");
+        }
+        if (args.sections[0] != 0 || positions.ne[1] != 1) {
+            throw std::invalid_argument("qk_norm_rope: a table rotation takes [T] positions and no sections");
+        }
+    }
     QkNormRope launch = args;
     if (args.sections[0] != 0) {
         const int pairs = args.rotary_dim / 2;

@@ -49,7 +49,8 @@ namespace {
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                   const Tensor* z, Tensor& out, cudaStream_t stream,
-                  GatedRmsGate gate = GatedRmsGate::Silu, bool accumulate = false) {
+                  GatedRmsGate gate = GatedRmsGate::Silu, bool accumulate = false,
+                  bool validate_only = false) {
     const bool fp32_input = x.dtype == DType::FP32 && z == nullptr && !accumulate;
     if ((!fp32_input && x.dtype != DType::BF16) || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
         (z != nullptr && z->dtype != DType::BF16)) {
@@ -85,14 +86,15 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
 
+    if (accumulate && x.data == out.data) {
+        throw std::invalid_argument("rmsnorm_add: x must not alias out");
+    }
+    if (validate_only) { return; }
     if (fp32_input) {
         detail::rmsnorm_fp32_launch(x, weight, eps, unit_offset, out, stream);
         return;
     }
     if (accumulate) {
-        if (x.data == out.data) {
-            throw std::invalid_argument("rmsnorm_add: x must not alias out");
-        }
         detail::rmsnorm_add_launch(x, weight, eps, unit_offset, out, stream);
         return;
     }
@@ -137,6 +139,37 @@ void rmsnorm_add(const Tensor& x, const Tensor& weight, float eps, bool unit_off
                  cudaStream_t stream) {
     rmsnorm_impl(x, weight, eps, unit_offset, nullptr, out, stream, GatedRmsGate::Silu,
                  /*accumulate=*/true);
+}
+
+void rmsnorm_add_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& next_weight,
+                         float eps, bool unit_offset, Tensor& residual, Tensor& out,
+                         cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || residual.dtype != DType::BF16 || next_weight.dtype != DType::BF16) {
+        throw std::invalid_argument("rmsnorm_add_rmsnorm: x/residual/next_weight must be BF16");
+    }
+    require_same_shape(x, residual, "residual");
+    if (next_weight.ne[0] != x.ne[0] || next_weight.ne[1] != 1 || next_weight.ne[2] != 1 ||
+        next_weight.ne[3] != 1 || !next_weight.is_contiguous() ||
+        (numel_allow_zero(x, "x") != 0 && next_weight.data == nullptr)) {
+        throw std::invalid_argument("rmsnorm_add_rmsnorm: next_weight must be 1-D with ne[0] == x.ne[0]");
+    }
+    if (out.data != nullptr && (out.data == x.data || out.data == residual.data)) {
+        throw std::invalid_argument("rmsnorm_add_rmsnorm: out must not alias x or residual");
+    }
+    // Everything else -- shapes, contiguity, eps, x not aliasing residual -- is the two ops' own
+    // validation, which the fallback runs and the fused route shares.
+    const Tensor& residual_view = residual;
+    rmsnorm_impl(residual_view, next_weight, eps, unit_offset, nullptr, out, nullptr,
+                 GatedRmsGate::Silu, /*accumulate=*/false, /*validate_only=*/true);
+    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, residual, nullptr, GatedRmsGate::Silu,
+                 /*accumulate=*/true, /*validate_only=*/true);
+    if (x.numel() == 0) { return; }
+    if (detail::rmsnorm_add_rmsnorm_launch(x, weight, next_weight, eps, unit_offset, residual, out,
+                                           stream)) {
+        return;
+    }
+    rmsnorm_add(x, weight, eps, unit_offset, residual, stream);
+    rmsnorm(residual, next_weight, eps, unit_offset, out, stream);
 }
 
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,

@@ -125,6 +125,76 @@ int run(const Case& shape, std::uint32_t seed) {
     return verify_reduction(label, got, reference, encoder_attention_bf16_criterion());
 }
 
+/// encoder_attention_batch over sequences laid end to end, against the oracle run on each
+/// sequence alone: nothing may leak across a boundary, and every owned column is written.
+int run_batch(const char* name, std::int32_t q_heads, std::int32_t head_dim, std::int32_t kv_heads,
+              std::int32_t window, bool causal, const std::vector<std::int32_t>& lengths,
+              std::uint32_t seed) {
+    std::vector<std::int32_t> segments;
+    std::int32_t total = 0, longest = 0;
+    for (const std::int32_t length : lengths) {
+        segments.push_back(total);
+        total += length;
+        longest = std::max(longest, length);
+    }
+    segments.insert(segments.end(), lengths.begin(), lengths.end());
+    const auto batch            = static_cast<std::int32_t>(lengths.size());
+    const std::int64_t q_rows   = static_cast<std::int64_t>(q_heads) * head_dim;
+    const std::int64_t kv_rows  = static_cast<std::int64_t>(kv_heads) * head_dim;
+    const float scale           = 1.0F / std::sqrt(static_cast<float>(head_dim));
+
+    std::vector<float> q(static_cast<std::size_t>(q_rows) * total);
+    std::vector<float> k(static_cast<std::size_t>(kv_rows) * total);
+    std::vector<float> v(static_cast<std::size_t>(kv_rows) * total);
+    fill_uniform(q, seed, -2.0F, 2.0F);
+    fill_uniform(k, seed + 101, -2.0F, 2.0F);
+    fill_uniform(v, seed + 202, -2.0F, 2.0F);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+
+    std::vector<double> reference(q.size(), 0.0);
+    for (std::int32_t index = 0; index < batch; ++index) {
+        const std::int32_t offset = segments[static_cast<std::size_t>(index)];
+        const std::int32_t length = lengths[static_cast<std::size_t>(index)];
+        const auto slice = [&](const std::vector<float>& all, std::int64_t rows) {
+            return std::vector<float>(all.begin() + offset * rows,
+                                      all.begin() + (offset + length) * rows);
+        };
+        const Case shape{name, q_heads, head_dim, length, window, kv_heads, causal};
+        const std::vector<double> one =
+            oracle(slice(q, q_rows), slice(k, kv_rows), slice(v, kv_rows), shape, scale);
+        std::copy(one.begin(), one.end(), reference.begin() + offset * q_rows);
+    }
+
+    DeviceBuffer device_q   = to_device_bf16(q);
+    DeviceBuffer device_k   = to_device_bf16(k);
+    DeviceBuffer device_v   = to_device_bf16(v);
+    DeviceBuffer device_seg = to_device(segments);
+    DeviceBuffer device_out(q.size() * sizeof(std::uint16_t));
+    const auto q_width  = static_cast<std::int32_t>(q_rows);
+    const auto kv_width = static_cast<std::int32_t>(kv_rows);
+    Tensor tq(device_q.p, DType::BF16, {q_width, total});
+    Tensor tk(device_k.p, DType::BF16, {kv_width, total});
+    Tensor tv(device_v.p, DType::BF16, {kv_width, total});
+    Tensor tseg(device_seg.p, DType::I32, {batch, 2});
+    Tensor output(device_out.p, DType::BF16, {q_width, total});
+
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    const bool ran = ops::encoder_attention_batch(tq, tk, tv, tseg, longest, window, scale, output,
+                                                  stream, kv_heads, causal);
+    cuda_synchronize(stream);
+    cuda_check(cudaStreamDestroy(stream), "stream destroy");
+    if (!ran) {
+        std::cerr << "encoder_attention_batch " << name << ": declined a supported head dim\n";
+        return 1;
+    }
+    const std::vector<double> got = from_device_bf16(device_out, q.size());
+    return verify_reduction(std::string("encoder_attention_batch ") + name, got, reference,
+                            encoder_attention_bf16_criterion());
+}
+
 } // namespace
 
 int main() {
@@ -151,6 +221,28 @@ int main() {
     failures += run({"Harrier Qwen GQA causal", 16, 128, 273, 0, 8, true}, 21);
     failures += run({"Harrier Gemma GQA window", 32, 128, 73, 17, 16, true}, 22);
     failures += run({"causal window across tile", 4, 32, 513, 37, 2, true}, 23);
+    // The batched kernel, over lengths either side of its 64-row and 32-key tiles, a one-token
+    // sequence, and EmbeddingGemma's window straddled within a batch.
+    failures += run_batch("EmbeddingGemma window=512", 3, 256, 1, 512, false,
+                          {1, 63, 64, 65, 220, 600, 7}, 31);
+    failures += run_batch("global", 3, 256, 1, 0, false, {130, 5, 64}, 32);
+    failures += run_batch("narrow window", 3, 256, 1, 8, false, {97, 33}, 33);
+    failures += run_batch("Harrier Qwen GQA causal", 16, 128, 8, 0, true, {273, 1, 40}, 34);
+    failures += run_batch("Harrier Gemma GQA window causal", 32, 128, 16, 17, true, {73, 9}, 35);
+    {
+        // A head dim it has no kernel for is declined, and nothing is launched.
+        std::vector<float> q(4 * 32 * 8, 0.0F), kv(2 * 32 * 8, 0.0F);
+        DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(kv), dv = to_device_bf16(kv);
+        DeviceBuffer dseg = to_device(std::vector<std::int32_t>{0, 8});
+        DeviceBuffer dout(q.size() * sizeof(std::uint16_t));
+        Tensor tq(dq.p, DType::BF16, {4 * 32, 8}), tk(dk.p, DType::BF16, {2 * 32, 8});
+        Tensor tv(dv.p, DType::BF16, {2 * 32, 8}), tseg(dseg.p, DType::I32, {1, 2});
+        Tensor tout(dout.p, DType::BF16, {4 * 32, 8});
+        if (ops::encoder_attention_batch(tq, tk, tv, tseg, 8, 0, 0.125F, tout, nullptr, 2, false)) {
+            std::cerr << "encoder_attention_batch: ran head dim 32, which it has no kernel for\n";
+            ++failures;
+        }
+    }
     if (ops::encoder_attention_workspace_bytes(32, 32768) > (2ULL << 30)) {
         std::cerr << "attention scratch grew quadratically\n";
         ++failures;

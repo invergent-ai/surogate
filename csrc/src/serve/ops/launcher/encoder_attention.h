@@ -17,6 +17,13 @@ void encoder_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                               std::int32_t window, float scale, Tensor& out, void* workspace,
                               cudaStream_t stream, std::int32_t kv_heads, bool causal);
 
+/// The batched FlashAttention launch; false (nothing launched) for a head dim it has no kernel
+/// for. Inputs already validated by the wrapper.
+bool encoder_attention_batch_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                    const Tensor& segments, std::int32_t longest,
+                                    std::int32_t window, float scale, Tensor& out,
+                                    cudaStream_t stream, std::int32_t kv_heads, bool causal);
+
 void encoder_attention_prewarm();
 
 } // namespace sinfer::ops::detail

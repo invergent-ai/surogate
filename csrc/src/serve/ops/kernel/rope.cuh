@@ -377,4 +377,74 @@ static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_generic_ke
     }
 }
 
+// The generic kernel's coefficients for positions [0, positions), computed once: entry
+// `position * half + pair` holds (cos, sin) exactly as generic_pair_sincos derives them for that
+// position on a one-dimensional rotation. A thread per entry.
+static __global__ void rope_table_kernel(float2* table, std::int32_t positions, std::int32_t head_dim,
+                                         std::int32_t rotary_dim, std::int32_t active_pairs,
+                                         float theta, float frequency_scale) {
+    const int half          = rotary_dim / 2;
+    const std::int64_t entry = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (entry >= static_cast<std::int64_t>(positions) * half) { return; }
+    const std::int32_t position = static_cast<std::int32_t>(entry / half);
+    const int pair              = static_cast<int>(entry % half);
+    float sine = 0.0F, cosine = 1.0F;
+    generic_pair_sincos(&position, 1, 1, 0, pair, head_dim, rotary_dim, active_pairs, theta, -1, -1,
+                        frequency_scale, &sine, &cosine);
+    table[entry] = make_float2(cosine, sine);
+}
+
+// rope_generic_kernel with its coefficients read from a rope_table_kernel table instead of
+// derived: the same grid, loads and rotation, so the same bits. The derivation is double-precision
+// pow and sincos per pair per token, which a GPU with little FP64 (every one but the datacenter
+// parts) pays for on every column of a long prompt; the table pays it once per position.
+template <int Pairs>
+static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_table_apply_kernel(
+        const std::int32_t* positions, const float2* table, __nv_bfloat16* q, __nv_bfloat16* k,
+        std::int32_t head_dim, std::int32_t rotary_dim, std::int32_t q_heads, std::int32_t k_heads,
+        std::int32_t tokens, std::int64_t q_token_stride, std::int64_t k_token_stride) {
+    const int token = static_cast<int>(blockIdx.x);
+    if (token >= tokens) { return; }
+    const int half          = rotary_dim / 2;
+    constexpr int kStride   = 32 * Pairs;
+    constexpr int kSteps    = kRopeMaxHalf / kStride;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int combined_head = static_cast<int>(blockIdx.y) * kRopeGenericWarps + (static_cast<int>(threadIdx.x) >> 5);
+    if (combined_head >= q_heads + k_heads) { return; }
+    const bool is_q = combined_head < q_heads;
+    const int head  = is_q ? combined_head : combined_head - q_heads;
+    __nv_bfloat16* row = (is_q ? q : k) + static_cast<std::int64_t>(token) * (is_q ? q_token_stride : k_token_stride) +
+                         static_cast<std::int64_t>(head) * head_dim;
+    const float2* coefficients = table + static_cast<std::int64_t>(positions[token]) * half;
+#pragma unroll
+    for (int step = 0; step < kSteps; ++step) {
+        const int pair = step * kStride + lane * Pairs;
+        if (pair >= half) { continue; }
+        float first[Pairs], second[Pairs];
+        if constexpr (Pairs == 2) {
+            const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(row + pair));
+            const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(row + pair + half));
+            first[0] = a.x; first[1] = a.y;
+            second[0] = b.x; second[1] = b.y;
+        } else {
+            first[0]  = __bfloat162float(row[pair]);
+            second[0] = __bfloat162float(row[pair + half]);
+        }
+        float out_first[Pairs], out_second[Pairs];
+#pragma unroll
+        for (int j = 0; j < Pairs; ++j) {
+            const float2 cs = coefficients[pair + j];
+            out_first[j]    = rope_rotated_first(first[j], second[j], cs.x, cs.y);
+            out_second[j]   = rope_rotated_second(first[j], second[j], cs.x, cs.y);
+        }
+        if constexpr (Pairs == 2) {
+            *reinterpret_cast<__nv_bfloat162*>(row + pair) = __floats2bfloat162_rn(out_first[0], out_first[1]);
+            *reinterpret_cast<__nv_bfloat162*>(row + pair + half) = __floats2bfloat162_rn(out_second[0], out_second[1]);
+        } else {
+            row[pair]        = __float2bfloat16_rn(out_first[0]);
+            row[pair + half] = __float2bfloat16_rn(out_second[0]);
+        }
+    }
+}
+
 } // namespace sinfer::ops

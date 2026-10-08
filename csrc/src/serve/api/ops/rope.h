@@ -62,6 +62,28 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta, Tensor& q,
           Tensor& k, cudaStream_t stream, float frequency_scale = 1.0F);
 
+/**
+ * The generic kernel's coefficients, derived once for every position a caller will rotate:
+ * `table` is F32 [2, rotary_dim / 2, positions], contiguous -- (cos, sin) per pair, a position's
+ * pairs adjacent -- for a one-dimensional rotation of `head_dim`-wide heads with these
+ * rotary_dim, active_pairs, theta and frequency_scale. Each entry is the pair the generic kernel
+ * computes for that position, bit for bit.
+ */
+void rope_table(int head_dim, int rotary_dim, int active_pairs, float theta,
+                float frequency_scale, Tensor& table, cudaStream_t stream);
+
+/**
+ * ops::rope over I32 [T] positions with its coefficients read from a rope_table `table` instead of
+ * derived per token. The output is bit for bit what ops::rope writes when it takes the generic
+ * kernel -- every geometry but the fixed modes listed above -- for the table's own parameters.
+ * Positions must lie in [0, positions of the table); q and k as for ops::rope, head dim
+ * table.ne[1] * 2 or wider. Deriving the angles costs double-precision pow and sincos per pair per
+ * token, which a GPU with little FP64 pays on every column of a long prompt; the table pays it once
+ * per position.
+ */
+void rope_from_table(const Tensor& positions, const Tensor& table, Tensor& q, Tensor& k,
+                     cudaStream_t stream);
+
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);

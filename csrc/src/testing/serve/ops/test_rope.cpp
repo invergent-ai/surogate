@@ -438,6 +438,50 @@ int run_vision_packed_case() {
     return failures;
 }
 
+/// rope_from_table against ops::rope on the generic kernel: the same bits, for positions that
+/// restart per sequence as an encoder batch's do.
+int run_table_case(const char* label, int head_dim, float theta, float frequency_scale, int q_heads,
+                   int k_heads, int tokens, int table_positions) {
+    const int pairs = head_dim / 2;
+    std::vector<float> q(static_cast<std::size_t>(head_dim) * q_heads * tokens);
+    std::vector<float> k(static_cast<std::size_t>(head_dim) * k_heads * tokens);
+    fill_uniform(q, 71, -3.0F, 3.0F);
+    fill_uniform(k, 72, -3.0F, 3.0F);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (int t = 0; t < tokens; ++t) { positions[static_cast<std::size_t>(t)] = (t * 37) % table_positions; }
+    positions.back() = table_positions - 1;
+
+    DeviceBuffer q_generic = to_device_bf16(q), k_generic = to_device_bf16(k);
+    DeviceBuffer q_table = to_device_bf16(q), k_table = to_device_bf16(k);
+    DeviceBuffer position_device = to_device(positions);
+    DeviceBuffer table_device(sizeof(float) * 2 * static_cast<std::size_t>(pairs) * table_positions);
+    const Tensor position_tensor(position_device.p, DType::I32, {tokens});
+    Tensor table(table_device.p, DType::FP32, {2, pairs, table_positions});
+    Tensor qg(q_generic.p, DType::BF16, {head_dim, q_heads, tokens});
+    Tensor kg(k_generic.p, DType::BF16, {head_dim, k_heads, tokens});
+    Tensor qt(q_table.p, DType::BF16, {head_dim, q_heads, tokens});
+    Tensor kt(k_table.p, DType::BF16, {head_dim, k_heads, tokens});
+
+    ops::rope(position_tensor, head_dim, pairs, theta, qg, kg, nullptr, frequency_scale);
+    ops::rope_table(head_dim, head_dim, pairs, theta, frequency_scale, table, nullptr);
+    ops::rope_from_table(position_tensor, table, qt, kt, nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto bits = [](const DeviceBuffer& buffer, std::size_t n) {
+        std::vector<std::uint16_t> out(n);
+        cuda_check(cudaMemcpy(out.data(), buffer.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                   "copy back");
+        return out;
+    };
+    if (bits(q_generic, q.size()) != bits(q_table, q.size()) ||
+        bits(k_generic, k.size()) != bits(k_table, k.size())) {
+        std::cerr << "FAIL rope_from_table " << label << ": differs from the generic kernel\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -447,6 +491,12 @@ int main() {
     }
 
     int failures = 0;
+
+    // The encoders' table-driven rope, bit for bit the generic kernel: EmbeddingGemma's local and
+    // global layers, and a scaled 128-wide head.
+    failures += run_table_case("EmbeddingGemma local", 256, 10'000.0F, 1.0F, 3, 1, 600, 2048);
+    failures += run_table_case("EmbeddingGemma global", 256, 1.0e6F, 1.0F, 3, 1, 600, 2048);
+    failures += run_table_case("scaled 128-wide head", 128, 1.0e6F, 0.125F, 32, 16, 77, 32768);
 
     Geometry harrier{"Harrier 27B scaled RoPE", 128, 128, 1, 13, 1.0e6F};
     harrier.frequency_scale = 0.125F;

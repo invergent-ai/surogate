@@ -125,8 +125,10 @@ public:
     /// The sequences are concatenated, so every projection sees one wide matrix
     /// and batches for free -- and the projections are where the work is: at 512
     /// tokens they are 108 GFLOP against attention's 19. Only attention is
-    /// per-sequence, because one sequence must not attend to the next; it runs
-    /// as a loop over column slices, which costs a few launches and no padding.
+    /// per-sequence, because one sequence must not attend to the next. For head
+    /// dims 128 and 256 one launch covers the batch, each query block reading
+    /// only its own sequence's keys; other head dims loop over the sequences.
+    /// Neither pads.
     ///
     /// Sequences may differ in length and there is no limit on how many: a
     /// request larger than `max_batch_tokens` is split into forwards that fit,

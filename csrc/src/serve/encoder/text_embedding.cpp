@@ -1,6 +1,7 @@
 #include "encoder/embedding_input.h"
 #include "encoder/text_embedding.h"
 
+#include "api/ops/batch_invariant.h"
 #include "api/ops/cast.h"
 #include "api/ops/embedding.h"
 #include "api/ops/encoder_attention.h"
@@ -9,6 +10,7 @@
 #include "api/ops/l2norm.h"
 #include "api/ops/linear.h"
 #include "api/ops/mean_pool.h"
+#include "api/ops/qk_norm_rope.h"
 #include "api/ops/residual_add.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/rope.h"
@@ -22,8 +24,12 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <numeric>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -73,7 +79,33 @@ struct TextEmbedding::Impl {
     std::int32_t arena_tokens = 0;
     std::unique_ptr<DeviceBuffer> attention_workspace;
     std::size_t attention_workspace_bytes = 0;
-    std::unique_ptr<DeviceBuffer> positions;
+    /// A forward's token ids, positions and sequence segments, uploaded in one copy: four
+    /// I32 per token of capacity (ids, positions, and at most one offset and length each).
+    std::unique_ptr<DeviceBuffer> inputs;
+    /// RoPE coefficients for every position a sequence can hold, local and global layers'
+    /// (rope_table): derived once at load instead of in double precision on every column.
+    std::unique_ptr<DeviceBuffer> rope_local_table;
+    std::unique_ptr<DeviceBuffer> rope_global_table;
+    Tensor rope_local;
+    Tensor rope_global;
+    /// BF16 copies of every layer's projections, which forwards of at least `dense_min_tokens`
+    /// tokens run on cuBLASLt instead of the W8 kernels. Decoded once at load by the W8
+    /// embedding gather, whose rounding is the one the W8 kernels apply to every tile they
+    /// stage, so both routes multiply the same BF16 values. Empty when
+    /// SUROGATE_SERVE_ENCODER_DENSE_TOKENS=0, under --batch-invariant, or for a model cuBLASLt
+    /// cannot take.
+    struct DenseLayer {
+        const void* query;
+        const void* key;
+        const void* value;
+        const void* output;
+        const void* gate;
+        const void* up;
+        const void* down;
+    };
+    std::unique_ptr<DeviceBuffer> dense_weights;
+    std::vector<DenseLayer> dense;
+    std::int32_t dense_min_tokens = 1;
     std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
@@ -96,7 +128,8 @@ const TextEmbeddingConfig& TextEmbedding::config() const noexcept { return impl_
 const EmbeddingTokenizer& TextEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
 
 std::uint64_t TextEmbedding::weight_bytes() const noexcept {
-    return impl_->materialized.stats().device_capacity_bytes;
+    return impl_->materialized.stats().device_capacity_bytes +
+           (impl_->dense_weights ? impl_->dense_weights->bytes : 0);
 }
 
 TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceContext& device) {
@@ -106,6 +139,14 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     impl.device = &device;
     impl.reader = std::make_unique<artifact::Reader>(path);
     impl.config = TextEmbeddingConfig::from_artifact(*impl.reader);
+    // How many tokens one forward takes. Not below the longest sequence, which must fit a forward.
+    if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_BATCH_TOKENS"); raw != nullptr && *raw != '\0') {
+        const long value = std::strtol(raw, nullptr, 10);
+        if (value <= 0 || value > (1L << 20)) {
+            throw std::invalid_argument("SUROGATE_SERVE_ENCODER_BATCH_TOKENS must be a positive token count");
+        }
+        impl.config.max_batch_tokens = std::max(static_cast<std::int32_t>(value), impl.config.max_tokens);
+    }
 
     const TextEmbeddingConfig& config = impl.config;
     const auto hidden       = static_cast<std::uint64_t>(config.hidden);
@@ -154,6 +195,91 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     }
     impl.tokenizer = std::make_unique<EmbeddingTokenizer>(EmbeddingTokenizer::from_artifact(*impl.reader));
     impl.materialized = artifact::materialize(*impl.reader, binder.finish(), device);
+
+    const auto build_rope_table = [&](std::unique_ptr<DeviceBuffer>& buffer, Tensor& table, float theta,
+                                float frequency_scale) {
+        const std::int32_t pairs = config.head_dim / 2;
+        buffer = std::make_unique<DeviceBuffer>(sizeof(float) * 2 * static_cast<std::size_t>(pairs) *
+                                                static_cast<std::size_t>(config.max_tokens));
+        table = Tensor(buffer->p, DType::FP32, {2, pairs, config.max_tokens});
+        ops::rope_table(config.head_dim, config.head_dim, pairs, theta, frequency_scale, table,
+                        device.stream);
+    };
+    build_rope_table(impl.rope_local_table, impl.rope_local, config.rope_theta_local, 1.0F);
+    build_rope_table(impl.rope_global_table, impl.rope_global, config.rope_theta_global,
+                     config.rope_frequency_scale);
+
+    // The projections on BF16 copies through cuBLASLt, for every forward by default. The W8
+    // kernels dequantise each weight tile again in every CTA that stages it; on a DGX Spark the
+    // copies took EmbeddingGemma's GEMM time from 461 to 337 ms over 16 requests of 32 texts and
+    // lifted each of four measured loads by 15-18%, for 203 MB more device memory.
+    // SUROGATE_SERVE_ENCODER_DENSE_TOKENS=N runs only forwards of N tokens or more on them, and 0
+    // keeps every forward on the W8 kernels without making the copies.
+    if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_DENSE_TOKENS"); raw != nullptr && *raw != '\0') {
+        const long value = std::strtol(raw, nullptr, 10);
+        if (value < 0 || value > (1L << 20)) {
+            throw std::invalid_argument("SUROGATE_SERVE_ENCODER_DENSE_TOKENS must be a token count, 0 for off");
+        }
+        impl.dense_min_tokens = static_cast<std::int32_t>(value);
+    }
+    // cuBLASLt picks its algorithm per forward width, so on the copies a text's vector moves with
+    // the requests it shares a forward with: min cosine 0.9993 against the same text alone over
+    // 240 mixed requests on a DGX Spark, where the W8 kernels give 1.0. --batch-invariant keeps
+    // every forward on those; bf16_invariant_gemm on the copies measured slower than them.
+    if (ops::batch_invariant()) { impl.dense_min_tokens = 0; }
+    // cuBLASLt's raw route takes extents that are multiples of 8, and the copy cannot undo a
+    // column permutation a GGUF-sourced weight may carry; either keeps the model on W8.
+    const bool dense_shapes = query_size % 8 == 0 && config.kv_size() % 8 == 0 && hidden % 8 == 0 &&
+                              intermediate % 8 == 0;
+    const bool dense_columns = std::all_of(impl.layers.begin(), impl.layers.end(), [&](const LayerWeights& w) {
+        for (const auto& [handle, rows, columns] :
+             {std::tuple{w.query, query_size, hidden}, std::tuple{w.key, std::uint64_t(config.kv_size()), hidden},
+              std::tuple{w.value, std::uint64_t(config.kv_size()), hidden}, std::tuple{w.output, hidden, query_size},
+              std::tuple{w.gate, intermediate, hidden}, std::tuple{w.up, intermediate, hidden},
+              std::tuple{w.down, hidden, intermediate}}) {
+            if (impl.matrix(handle, static_cast<std::int32_t>(rows), static_cast<std::int32_t>(columns))
+                    .input_group_map != nullptr) {
+                return false;
+            }
+        }
+        return true;
+    });
+    if (impl.dense_min_tokens > 0 && dense_shapes && dense_columns) {
+        const auto q_rows = static_cast<std::int32_t>(query_size);
+        const std::int32_t kv_rows = config.kv_size();
+        const std::size_t per_layer =
+            2 * query_size * hidden + 2 * static_cast<std::uint64_t>(kv_rows) * hidden + 3 * intermediate * hidden;
+        impl.dense_weights = std::make_unique<DeviceBuffer>(per_layer * static_cast<std::size_t>(config.layers) *
+                                                            sizeof(std::uint16_t));
+        // Row ids 0..rows-1: gathered "embeddings" of a weight are its rows, decoded into
+        // [columns, rows] -- the row-major BF16 matrix cuBLASLt takes.
+        const std::int32_t max_rows = std::max({q_rows, kv_rows, config.hidden, config.intermediate});
+        std::vector<std::int32_t> row_ids(static_cast<std::size_t>(max_rows));
+        std::iota(row_ids.begin(), row_ids.end(), 0);
+        const DeviceBuffer ids(row_ids.size() * sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemcpy(ids.p, row_ids.data(), row_ids.size() * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
+        auto* cursor = static_cast<std::uint16_t*>(impl.dense_weights->p);
+        const auto decode = [&](artifact::ObjectHandle handle, std::int32_t rows, std::int32_t columns) {
+            const Weight w8 = impl.matrix(handle, rows, columns);
+            const Tensor row_tensor(ids.p, DType::I32, {rows});
+            Tensor decoded(cursor, DType::BF16, {columns, rows});
+            ops::embedding(row_tensor, w8, decoded, device.stream);
+            const void* matrix = cursor;
+            cursor += static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
+            return matrix;
+        };
+        const auto h_rows = config.hidden;
+        const auto i_rows = config.intermediate;
+        for (const LayerWeights& w : impl.layers) {
+            impl.dense.push_back({decode(w.query, q_rows, h_rows), decode(w.key, kv_rows, h_rows),
+                                  decode(w.value, kv_rows, h_rows), decode(w.output, h_rows, q_rows),
+                                  decode(w.gate, i_rows, h_rows), decode(w.up, i_rows, h_rows),
+                                  decode(w.down, h_rows, i_rows)});
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
 
     ops::encoder_attention_prewarm();
     ops::detail::bf16_cublaslt_prewarm();
@@ -242,19 +368,19 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         const auto capacity = std::max(total, impl.arena_tokens);
         const auto scratch_bytes = std::max(attention_bytes, impl.attention_workspace_bytes);
         const std::size_t arena_bytes = sizeof(std::uint16_t) * static_cast<std::size_t>(capacity) *
-            (7ULL * config.hidden + 2ULL * config.intermediate + 2ULL * config.query_size() +
-             2ULL * config.kv_size()) + (1u << 20);
+            (7ULL * config.hidden + 2ULL * config.intermediate + 3ULL * config.query_size() +
+             3ULL * config.kv_size()) + (1u << 20);
         // Release obsolete scratch before growing it. A long request must get a
         // recoverable error if its working set cannot fit beside the model.
-        impl.arena.reset(); impl.positions.reset(); impl.attention_workspace.reset();
+        impl.arena.reset(); impl.inputs.reset(); impl.attention_workspace.reset();
         impl.arena_tokens = 0; impl.attention_workspace_bytes = 0;
         std::size_t free = 0, bytes = 0;
         CUDA_CHECK(device_mem_get_info(&free, &bytes));
-        if (arena_bytes + scratch_bytes + static_cast<std::size_t>(capacity) * 8 + (64u << 20) > free) {
+        if (arena_bytes + scratch_bytes + static_cast<std::size_t>(capacity) * 16 + (64u << 20) > free) {
             throw std::runtime_error("embedding request does not fit GPU memory; shorten the input or use --device cpu");
         }
         impl.arena = std::make_unique<DeviceArena>(arena_bytes);
-        impl.positions = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(capacity) * sizeof(std::int32_t));
+        impl.inputs = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(capacity) * 4 * sizeof(std::int32_t));
         impl.attention_workspace = std::make_unique<DeviceBuffer>(scratch_bytes);
         impl.arena_tokens = capacity;
         impl.attention_workspace_bytes = scratch_bytes;
@@ -262,15 +388,19 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     DeviceArena& arena = *impl.arena;
     arena.reset();
 
-    CUDA_CHECK(cudaMemcpyAsync(impl.positions->p, positions.data(),
-                               positions.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                               stream));
-    DeviceBuffer ids(static_cast<std::size_t>(total) * sizeof(std::int32_t));
-    CUDA_CHECK(cudaMemcpyAsync(ids.p, flat.data(),
-                               static_cast<std::size_t>(total) * sizeof(std::int32_t),
+    // Ids, positions, then the segments batched attention reads (offsets, then lengths): one
+    // copy into a buffer that lives as long as the arena, where a small request used to pay a
+    // cudaMalloc and a second copy.
+    flat.insert(flat.end(), positions.begin(), positions.end());
+    flat.insert(flat.end(), offsets.begin(), offsets.end());
+    flat.insert(flat.end(), lengths.begin(), lengths.end());
+    CUDA_CHECK(cudaMemcpyAsync(impl.inputs->p, flat.data(), flat.size() * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
-    const Tensor id_tensor(ids.p, DType::I32, {total});
-    const Tensor position_tensor(impl.positions->p, DType::I32, {total});
+    auto* const inputs = static_cast<std::int32_t*>(impl.inputs->p);
+    const Tensor id_tensor(inputs, DType::I32, {total});
+    const Tensor position_tensor(inputs + total, DType::I32, {total});
+    const Tensor segment_tensor(inputs + 2 * static_cast<std::ptrdiff_t>(total), DType::I32,
+                                {batch, 2});
 
     Tensor x        = arena.alloc(DType::BF16, {config.hidden, total});
     Tensor h        = arena.alloc(DType::BF16, {config.hidden, total});
@@ -279,6 +409,10 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     Tensor key      = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor value    = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor attn_out = arena.alloc(DType::BF16, {config.query_size(), total});
+    // Where the fused per-head norm and RoPE write the queries and keys: it reads the projections
+    // and may not write over them.
+    Tensor query_normed = arena.alloc(DType::BF16, {config.query_size(), total});
+    Tensor key_normed   = arena.alloc(DType::BF16, {config.kv_size(), total});
     Tensor gate     = arena.alloc(DType::BF16, {config.intermediate, total});
     Tensor up       = arena.alloc(DType::BF16, {config.intermediate, total});
 
@@ -289,77 +423,140 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     // relative to every block's contribution.
     ops::scale(x, config.embedding_scale, stream);
 
+    // The norm that opens each layer: layer 0's here, every later one (and the final norm) in
+    // the same pass as the residual add that closes the layer before it.
+    const auto opening_norm = [&](std::int32_t layer) {
+        return layer < config.layers
+                   ? impl.norm(impl.layers[static_cast<std::size_t>(layer)].input_norm, config.hidden)
+                   : impl.norm(impl.final_norm, config.hidden);
+    };
+    ops::rmsnorm(x, opening_norm(0), config.rms_epsilon, /*unit_offset*/ config.gemma, h, stream);
+
+    // Forwards of dense_min_tokens or more run the projections on the BF16 copies, if any.
+    const bool dense = !impl.dense.empty() && total >= impl.dense_min_tokens;
+    const auto dense_linear = [&](const void* weight, std::int32_t rows, std::int32_t columns,
+                                  const Tensor& in, Tensor& out) {
+        ops::detail::bf16_cublaslt_gemm_raw(weight, rows, columns, in.data, total, out.data, rows,
+                                            0.0F, stream);
+    };
+
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
         const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
         const bool global         = config.is_global(layer);
-        const float theta         = global ? config.rope_theta_global : config.rope_theta_local;
         const std::int32_t window = global ? 0 : config.sliding_window;
 
         // --- attention, between the sandwich norms -------------------------
         // Every projection runs once over the whole batch: the sequences are
-        // adjacent columns and a GEMM does not care where one ends.
-        ops::rmsnorm(x, impl.norm(w.input_norm, config.hidden), config.rms_epsilon,
-                     /*unit_offset*/ config.gemma, h, stream);
-        ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
-                                    {impl.matrix(w.key, config.kv_size(), config.hidden), key},
-                                    {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
+        // adjacent columns and a GEMM does not care where one ends. h is the
+        // input norm of x.
+        if (dense) {
+            const Impl::DenseLayer& d = impl.dense[static_cast<std::size_t>(layer)];
+            dense_linear(d.query, config.query_size(), config.hidden, h, query);
+            dense_linear(d.key, config.kv_size(), config.hidden, h, key);
+            dense_linear(d.value, config.kv_size(), config.hidden, h, value);
+        } else {
+            ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
+                                        {impl.matrix(w.key, config.kv_size(), config.hidden), key},
+                                        {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
+        }
 
-        // Per-head QK norm: each head's features are contiguous, so the
-        // [head_dim, heads * tokens] view is exactly the rows rmsnorm reduces
-        // over -- and it does not care about sequence boundaries either.
-        Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * total});
-        Tensor key_heads(key.data, DType::BF16, {config.head_dim, config.kv_heads * total});
-        ops::rmsnorm(query_heads, impl.norm(w.query_norm, config.head_dim), config.rms_epsilon,
-                     config.gemma, query_heads, stream);
-        ops::rmsnorm(key_heads, impl.norm(w.key_norm, config.head_dim), config.rms_epsilon, config.gemma,
-                     key_heads, stream);
-
-        // rope reads its position per column, and positions restart per
-        // sequence, so this too runs once for the batch.
+        // Per-head QK norm, then RoPE. Each head's features are contiguous, so the
+        // [head_dim, heads, tokens] view is exactly the rows the norm reduces over -- and
+        // neither step cares about sequence boundaries, since rope reads its position per
+        // column and positions restart per sequence. One launch does both into the normed
+        // planes; outside its domain the two norms and the rope run in place.
+        const Tensor query_gain = impl.norm(w.query_norm, config.head_dim);
+        const Tensor key_gain   = impl.norm(w.key_norm, config.head_dim);
+        const Tensor& rope_table = global ? impl.rope_global : impl.rope_local;
         Tensor query_rope(query.data, DType::BF16, {config.head_dim, config.query_heads, total});
         Tensor key_rope(key.data, DType::BF16, {config.head_dim, config.kv_heads, total});
-        ops::rope(position_tensor, config.head_dim, config.head_dim / 2, theta, query_rope, key_rope, stream,
-                  global ? config.rope_frequency_scale : 1.0F);
+        Tensor query_rope_out(query_normed.data, DType::BF16, {config.head_dim, config.query_heads, total});
+        Tensor key_rope_out(key_normed.data, DType::BF16, {config.head_dim, config.kv_heads, total});
+        ops::QkNormRope fused;
+        fused.q = &query_rope, fused.q_norm = &query_gain, fused.q_out = &query_rope_out;
+        fused.k = &key_rope, fused.k_norm = &key_gain, fused.k_out = &key_rope_out;
+        fused.k_heads = config.kv_heads, fused.eps = config.rms_epsilon, fused.unit_offset = config.gemma;
+        fused.positions = &position_tensor, fused.rotary_dim = config.head_dim;
+        fused.active_pairs = config.head_dim / 2;
+        fused.theta = global ? config.rope_theta_global : config.rope_theta_local;
+        fused.table = &rope_table;
+        const bool normed = ops::qk_norm_rope(fused, stream);
+        if (!normed) {
+            Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * total});
+            Tensor key_heads(key.data, DType::BF16, {config.head_dim, config.kv_heads * total});
+            ops::rmsnorm(query_heads, query_gain, config.rms_epsilon, config.gemma, query_heads, stream);
+            ops::rmsnorm(key_heads, key_gain, config.rms_epsilon, config.gemma, key_heads, stream);
+            ops::rope_from_table(position_tensor, rope_table, query_rope, key_rope, stream);
+        }
+        const Tensor& query_ready = normed ? query_normed : query;
+        const Tensor& key_ready   = normed ? key_normed : key;
 
-        // Attention is the one step that must not cross a boundary.
-        for (std::int32_t index = 0; index < batch; ++index) {
-            const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
-            const std::int32_t length = lengths[static_cast<std::size_t>(index)];
-            const Tensor q_slice      = query.slice(1, offset, length);
-            const Tensor k_slice      = key.slice(1, offset, length);
-            const Tensor v_slice      = value.slice(1, offset, length);
-            Tensor out_slice          = attn_out.slice(1, offset, length);
-            ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
-                                   out_slice, impl.attention_workspace->p,
-                                   impl.attention_workspace_bytes, stream, config.kv_heads, !config.mean_pooling);
+        // Attention is the one step that must not cross a boundary. The whole batch goes in
+        // one launch; a head dim the batched kernel lacks runs the op per sequence.
+        if (!ops::encoder_attention_batch(query_ready, key_ready, value, segment_tensor, longest, window,
+                                          config.attention_scale, attn_out, stream,
+                                          config.kv_heads, !config.mean_pooling)) {
+            for (std::int32_t index = 0; index < batch; ++index) {
+                const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
+                const std::int32_t length = lengths[static_cast<std::size_t>(index)];
+                const Tensor q_slice      = query_ready.slice(1, offset, length);
+                const Tensor k_slice      = key_ready.slice(1, offset, length);
+                const Tensor v_slice      = value.slice(1, offset, length);
+                Tensor out_slice          = attn_out.slice(1, offset, length);
+                ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
+                                       out_slice, impl.attention_workspace->p,
+                                       impl.attention_workspace_bytes, stream, config.kv_heads,
+                                       !config.mean_pooling);
+            }
         }
 
-        ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
-                    stream);
+        if (dense) {
+            dense_linear(impl.dense[static_cast<std::size_t>(layer)].output, config.hidden,
+                         config.query_size(), attn_out, attn);
+        } else {
+            ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
+                        stream);
+        }
+        // x += post_attention_norm(attn), then h = pre_feedforward_norm(x): one pass over the
+        // planes where an in-place norm, a residual add and a norm were three, with their bits.
+        const Tensor pre_feedforward_norm = impl.norm(w.pre_feedforward_norm, config.hidden);
         if (config.gemma) {
-            ops::rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden), config.rms_epsilon,
-                         true, attn, stream);
+            ops::rmsnorm_add_rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden),
+                                     pre_feedforward_norm, config.rms_epsilon, true, x, h, stream);
+        } else {
+            ops::residual_add(attn, x, stream); // x += attn
+            ops::rmsnorm(x, pre_feedforward_norm, config.rms_epsilon, false, h, stream);
         }
-        ops::residual_add(attn, x, stream); // x += attn
 
         // --- MLP, between the other two ------------------------------------
-        ops::rmsnorm(x, impl.norm(w.pre_feedforward_norm, config.hidden), config.rms_epsilon, config.gemma,
-                     h, stream);
-        ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
-                                    {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
+        if (dense) {
+            const Impl::DenseLayer& d = impl.dense[static_cast<std::size_t>(layer)];
+            dense_linear(d.gate, config.intermediate, config.hidden, h, gate);
+            dense_linear(d.up, config.intermediate, config.hidden, h, up);
+        } else {
+            ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
+                                        {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
+        }
         // gelu_pytorch_tanh, per the checkpoint's hidden_activation.
         if (config.gemma) { ops::gelu_mul(gate, up, ops::GeluMode::Tanh, gate, stream); }
         else { ops::silu_mul(gate, up, gate, stream); }
-        ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
-        if (config.gemma) {
-            ops::rmsnorm(attn, impl.norm(w.post_feedforward_norm, config.hidden), config.rms_epsilon,
-                         true, attn, stream);
+        if (dense) {
+            dense_linear(impl.dense[static_cast<std::size_t>(layer)].down, config.hidden,
+                         config.intermediate, gate, attn);
+        } else {
+            ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
         }
-        ops::residual_add(attn, x, stream);
+        // x += post_feedforward_norm(attn), then h = the next layer's input norm of x -- or
+        // after the last layer, the final norm.
+        const Tensor next_norm = opening_norm(layer + 1);
+        if (config.gemma) {
+            ops::rmsnorm_add_rmsnorm(attn, impl.norm(w.post_feedforward_norm, config.hidden),
+                                     next_norm, config.rms_epsilon, true, x, h, stream);
+        } else {
+            ops::residual_add(attn, x, stream);
+            ops::rmsnorm(x, next_norm, config.rms_epsilon, false, h, stream);
+        }
     }
-
-    ops::rmsnorm(x, impl.norm(impl.final_norm, config.hidden), config.rms_epsilon, config.gemma, h,
-                 stream);
 
     // --- pool, project, normalise -------------------------------------------
     // Pooling is per sequence; the projection that follows is one GEMM over all

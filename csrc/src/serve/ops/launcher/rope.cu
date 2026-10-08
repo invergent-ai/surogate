@@ -266,4 +266,38 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pair
     CUDA_CHECK(cudaGetLastError());
 }
 
+void rope_table_launch(int head_dim, int rotary_dim, int active_pairs, float theta,
+                       float frequency_scale, Tensor& table, cudaStream_t stream) {
+    const auto positions = static_cast<std::int32_t>(table.ne[2]);
+    const std::int64_t entries = static_cast<std::int64_t>(positions) * (rotary_dim / 2);
+    constexpr int kBlock = 256;
+    rope_table_kernel<<<static_cast<unsigned>((entries + kBlock - 1) / kBlock), kBlock, 0, stream>>>(
+        static_cast<float2*>(table.data), positions, head_dim, rotary_dim, active_pairs, theta,
+        frequency_scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_from_table_launch(const Tensor& positions, const Tensor& table, Tensor& q, Tensor& k,
+                            cudaStream_t stream) {
+    const int tokens     = q.ne[2];
+    const int heads      = q.ne[1] + k.ne[1];
+    const int rotary_dim = static_cast<int>(table.ne[1]) * 2;
+    const dim3 grid(static_cast<unsigned>(tokens),
+                    static_cast<unsigned>((heads + kRopeGenericWarps - 1) / kRopeGenericWarps));
+    const bool paired = (rotary_dim / 2) % 2 == 0 && q.ne[0] % 2 == 0 && bf16x2_aligned(q) &&
+                        bf16x2_aligned(k);
+    const auto launch = [&](auto kernel) {
+        kernel<<<grid, kRopeGenericWarps * 32, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data), static_cast<const float2*>(table.data),
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), q.ne[0],
+            rotary_dim, q.ne[1], k.ne[1], tokens, token_stride(&q), token_stride(&k));
+    };
+    if (paired) {
+        launch(rope_table_apply_kernel<2>);
+    } else {
+        launch(rope_table_apply_kernel<1>);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace sinfer::ops::detail

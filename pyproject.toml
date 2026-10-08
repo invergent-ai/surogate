@@ -83,6 +83,11 @@ dependencies = [
     # so converting a checkpoint died at ModuleNotFoundError on a fresh install (found on a DGX
     # Spark, 2026-10-07).
     "compressed-tensors",
+    # Same class: convert/common/gguf_source.py and gguf/bridge.py import it, so serving any GGUF
+    # (EmbeddingGemma, Harrier, Qwen3.8-Flash-Next, GLM-5.3) died at ModuleNotFoundError in the
+    # converter on a fresh install. vLLM depends on it, which is how it went unnoticed (found on a
+    # DGX Spark, 2026-10-08).
+    "gguf",
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

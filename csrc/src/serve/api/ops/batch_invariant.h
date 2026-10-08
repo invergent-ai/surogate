@@ -19,7 +19,9 @@
 //     (ops/wrapper/gqa_attention.cpp).
 //
 // The server also turns off CUDA graphs and prefix reuse and refuses speculative decoding in
-// this mode (serve/serve_options.cpp). Other weight formats keep their own routes (the GGML and
+// this mode (serve/serve_options.cpp). The embedding server takes the same switch and keeps the
+// encoder's projections on the W8 kernels instead of their BF16 cuBLASLt copies
+// (encoder/text_embedding.cpp). Other weight formats keep their own routes (the GGML and
 // K-quant ones are width-invariant by construction; FP8, NVFP4 and W8 are not verified), and
 // images and multi-GPU pipelines are not covered.
 //

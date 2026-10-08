@@ -60,10 +60,11 @@ Common server options (full list: surogate serve --engine-help):
 --generate runs one shot and has its own spellings for a few options
 (--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
 
---embed serves an encoder model: --device N|cpu chooses the backend, and
---frontend DIR optionally overrides the tokenizer embedded in the GGUF. CPU serving wants
-OMP_WAIT_POLICY=ACTIVE and OMP_NUM_THREADS set to the physical cores of one NUMA
-node.
+--embed serves an encoder model: --device N|cpu chooses the backend,
+--frontend DIR optionally overrides the tokenizer embedded in the GGUF, and
+--batch-invariant makes a text's vector independent of the requests it is batched
+with, for some GPU throughput. CPU serving wants OMP_WAIT_POLICY=ACTIVE and
+OMP_NUM_THREADS set to the physical cores of one NUMA node.
 
 --stt serves surogate speech recognition models on GPU or CPU. Use --lm PATH to add
 a language model. See docs/inference/speech.md for file uploads and live audio.
@@ -135,7 +136,7 @@ _SWITCH_OPTIONS = {
     "generate": _COMMON_SWITCHES | frozenset("""
         --raw-output --print-token-ids --prefill-warmup --no-cuda-graph
     """.split()),
-    "embed": frozenset(),
+    "embed": frozenset({"--batch-invariant"}),
     "stt": frozenset(),
     "tts": frozenset(),
 }

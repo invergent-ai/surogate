@@ -21,4 +21,10 @@ void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, floa
 void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                         Tensor& x, cudaStream_t stream);
 
+void rope_table_launch(int head_dim, int rotary_dim, int active_pairs, float theta,
+                       float frequency_scale, Tensor& table, cudaStream_t stream);
+
+void rope_from_table_launch(const Tensor& positions, const Tensor& table, Tensor& q, Tensor& k,
+                            cudaStream_t stream);
+
 } // namespace sinfer::ops::detail

@@ -186,7 +186,7 @@ __launch_bounds__(Block) __global__
 }
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
-// values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
+// values per lane. A width the CTA vector span does not divide leaves the last pass partly idle.
 template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
@@ -197,7 +197,6 @@ __launch_bounds__(Block) __global__
     if (row >= rows) { return; }
 
     const int pairs             = d / 2;
-    const int pairs_per_thread  = pairs / Block;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[MaxPairsPerThread];
     float2 gains[MaxPairsPerThread], operands[MaxPairsPerThread];
@@ -207,8 +206,8 @@ __launch_bounds__(Block) __global__
     // barriers) they do not need: issued after it, they added a second memory round trip.
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
-        if (k < pairs_per_thread) {
-            const int pair  = static_cast<int>(threadIdx.x) + k * Block;
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
             values[k]       = x[row_base + pair];
             gains[k]        = rmsnorm_gain2<Epilogue>(weight, pair);
             operands[k]     = float2{0.0f, 0.0f};
@@ -229,14 +228,96 @@ __launch_bounds__(Block) __global__
 
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
-        if (k < pairs_per_thread) {
-            const int pair  = static_cast<int>(threadIdx.x) + k * Block;
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = gains[k];
             const float2 zf = operands[k];
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+        }
+    }
+}
+
+// rmsnorm_add into the residual, then rmsnorm of the updated residual, one CTA per row: the two
+// rmsnorm_cta_bf16x2_kernel launches a sandwich-norm layer makes between blocks (OffsetAdd or
+// PlainAdd, then Offset or Plain), with the second reading the residual from registers instead of
+// memory. Every load, sum, rounding and store is the one those launches make, in their order, so
+// the bits are theirs.
+template <bool UnitOffset, int Block, int MaxPairsPerThread>
+__launch_bounds__(Block) __global__
+    void rmsnorm_add_rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x,
+                                               const __nv_bfloat162* weight,
+                                               const __nv_bfloat162* next_weight,
+                                               __nv_bfloat162* residual, __nv_bfloat162* out,
+                                               std::int32_t d, std::int64_t rows, float eps) {
+    constexpr RmsEpilogue kAdd  = UnitOffset ? RmsEpilogue::OffsetAdd : RmsEpilogue::PlainAdd;
+    constexpr RmsEpilogue kNorm = UnitOffset ? RmsEpilogue::Offset : RmsEpilogue::Plain;
+    static_assert(Block % kWarpSize == 0);
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) { return; }
+
+    const int pairs             = d / 2;
+    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+    __nv_bfloat162 values[MaxPairsPerThread];
+    float2 gains[MaxPairsPerThread], next_gains[MaxPairsPerThread], operands[MaxPairsPerThread];
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k = 0; k < MaxPairsPerThread; ++k) {
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
+            values[k]       = x[row_base + pair];
+            gains[k]        = rmsnorm_gain2<kAdd>(weight, pair);
+            next_gains[k]   = rmsnorm_gain2<kNorm>(next_weight, pair);
+            operands[k]     = __bfloat1622float2(residual[row_base + pair]);
+            const float2 xf = __bfloat1622float2(values[k]);
+            sum += xf.x * xf.x + xf.y * xf.y;
+        }
+    }
+
+    __shared__ float warp_sums[Block / kWarpSize];
+    __shared__ float next_warp_sums[Block / kWarpSize];
+    __shared__ float inv_shared;
+    __shared__ float next_inv_shared;
+    const float block_sum = block_reduce_sum<Block>(sum, warp_sums);
+    if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(d) + eps); }
+    __syncthreads();
+    const float inv = inv_shared;
+
+    // The residual as rmsnorm_add stores it, and the second norm's sums over those stored values.
+    float next_sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < MaxPairsPerThread; ++k) {
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
+            const float2 xf = __bfloat1622float2(values[k]);
+            values[k]       = __floats2bfloat162_rn(
+                rmsnorm_epilogue<kAdd>(xf.x, inv, gains[k].x, operands[k].x),
+                rmsnorm_epilogue<kAdd>(xf.y, inv, gains[k].y, operands[k].y));
+            residual[row_base + pair] = values[k];
+            const float2 rf = __bfloat1622float2(values[k]);
+            next_sum += rf.x * rf.x + rf.y * rf.y;
+        }
+    }
+
+    const float next_block_sum = block_reduce_sum<Block>(next_sum, next_warp_sums);
+    if (threadIdx.x == 0) {
+        next_inv_shared = rsqrtf(next_block_sum / static_cast<float>(d) + eps);
+    }
+    __syncthreads();
+    const float next_inv = next_inv_shared;
+
+#pragma unroll
+    for (int k = 0; k < MaxPairsPerThread; ++k) {
+        const int pair = static_cast<int>(threadIdx.x) + k * Block;
+        if (pair < pairs) {
+            const float2 rf = __bfloat1622float2(values[k]);
+            const float2 wf = next_gains[k];
+            out[row_base + pair] =
+                __floats2bfloat162_rn(rmsnorm_epilogue<kNorm>(rf.x, next_inv, wf.x, 0.0f),
+                                      rmsnorm_epilogue<kNorm>(rf.y, next_inv, wf.y, 0.0f));
         }
     }
 }

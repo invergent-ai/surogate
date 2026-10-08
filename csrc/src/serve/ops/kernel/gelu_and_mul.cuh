@@ -56,6 +56,27 @@ __launch_bounds__(256) __global__
     }
 }
 
+/// The same product with 16-byte packs, for three 16-byte-aligned planes whose size is a
+/// multiple of eight: one load per operand where the kernel above issues four, each pair through
+/// the same `gelu_mul_pair`, so the same bits.
+template <bool TanhApprox, bool RoundGate = false>
+__launch_bounds__(256) __global__
+    void gelu_and_mul_bf16x8_kernel(const Bf16x8Pack* gate, const Bf16x8Pack* up, Bf16x8Pack* out,
+                                    std::int64_t packs) {
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+         i < packs; i += stride) {
+        const Bf16x8Pack g = load_vec<Bf16x8Pack>(gate + i);
+        const Bf16x8Pack u = load_vec<Bf16x8Pack>(up + i);
+        Bf16x8Pack result;
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            result.pair[pair] = gelu_mul_pair<TanhApprox, RoundGate>(g.pair[pair], u.pair[pair]);
+        }
+        store_vec(out + i, result);
+    }
+}
+
 /// The same product over one fused `[gate; up]` plane: column t of `gate_up` holds the K gate
 /// values then the K up values (a `[2K, T]` matmul output), and column t of `out` is their
 /// product. Same `gelu_mul_pair`, so a fused and a split projection of the same numbers give the

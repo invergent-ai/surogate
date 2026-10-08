@@ -27,7 +27,8 @@ void launch(const QkNormRope& a, int k_heads, cudaStream_t stream) {
         bf2(a.q), bf2(a.k), bf2(a.q_norm), bf2(a.k_norm), out2(a.q_out), out2(a.k_out),
         static_cast<const std::int32_t*>(a.positions->data), a.positions->ne[1], q.ne[0],
         a.rotary_dim, a.active_pairs, a.theta, interleaved ? a.sections[1] : -1,
-        interleaved ? a.sections[2] : -1, q.ne[1], k_heads, tokens, a.eps);
+        interleaved ? a.sections[2] : -1, q.ne[1], k_heads, tokens, a.eps,
+        a.table == nullptr ? nullptr : static_cast<const float2*>(a.table->data));
 }
 
 template <RmsEpilogue Epilogue, QkNormForm Form>
@@ -35,6 +36,7 @@ void launch_angles(const QkNormRope& a, int k_heads, QkRopeAngles angles, cudaSt
     switch (angles) {
     case QkRopeAngles::Text1D: launch<Epilogue, Form, QkRopeAngles::Text1D>(a, k_heads, stream); break;
     case QkRopeAngles::TextMrope: launch<Epilogue, Form, QkRopeAngles::TextMrope>(a, k_heads, stream); break;
+    case QkRopeAngles::Table: launch<Epilogue, Form, QkRopeAngles::Table>(a, k_heads, stream); break;
     default: launch<Epilogue, Form, QkRopeAngles::Generic>(a, k_heads, stream); break;
     }
 }
@@ -66,11 +68,14 @@ bool qk_norm_rope_launch(const QkNormRope& a, cudaStream_t stream) {
     // The coefficients rope.cu's dispatch would compute: its fixed Text1D / TextMrope kernels for
     // a whole rotation of the shapes they are compiled for, the generic kernel for everything else
     // (its DFlash shape included, which the generic kernel computes the fixed kernel's way).
-    // rope_interleaved always runs the generic kernel.
+    // rope_interleaved always runs the generic kernel. A table is what rope_from_table reads.
     QkRopeAngles angles = QkRopeAngles::Generic;
     const bool whole    = a.active_pairs == a.rotary_dim / 2;
-    if (a.sections[0] == 0 && whole && a.rotary_dim == 64 && a.theta == 1.0e7F && head_dim == 256 &&
-        ((q.ne[1] == 24 && a.k_heads == 4) || (q.ne[1] == 16 && a.k_heads == 2))) {
+    if (a.table != nullptr) {
+        angles = QkRopeAngles::Table;
+    } else if (a.sections[0] == 0 && whole && a.rotary_dim == 64 && a.theta == 1.0e7F &&
+               head_dim == 256 &&
+               ((q.ne[1] == 24 && a.k_heads == 4) || (q.ne[1] == 16 && a.k_heads == 2))) {
         angles = axes == 1 ? QkRopeAngles::Text1D : QkRopeAngles::TextMrope;
     }
 

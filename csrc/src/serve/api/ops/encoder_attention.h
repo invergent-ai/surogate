@@ -53,6 +53,29 @@ void encoder_attention(const Tensor& q, const Tensor& k, const Tensor& v, std::i
                        float scale, Tensor& out, void* workspace, std::size_t workspace_bytes,
                        cudaStream_t stream, std::int32_t kv_heads = 1, bool causal = false);
 
+/**
+ * encoder_attention over a batch of sequences, all of them in one launch.
+ *
+ * The batch lies end to end: sequence `s` owns columns [offset_s, offset_s + length_s) of `q`,
+ * `k`, `v` and `out`, and attends only within them, by the contract above with the sequence's own
+ * positions. `segments` is a contiguous device I32 [batch, 2]: the `batch` offsets, then the
+ * `batch` lengths, each length positive and the sequences disjoint and inside the tensors.
+ * `longest` is the largest length; it sizes the grid. Columns no sequence owns are not written.
+ *
+ * A FlashAttention-2 kernel on the tensor cores: scores in FP32 with an online softmax, the
+ * probabilities rounded to BF16 against each key tile's maximum, no workspace. The numerical
+ * criterion is the one above.
+ *
+ * Returns false, launching nothing, outside its domain -- head dims 128 and 256, at most 65,535
+ * sequences -- and the caller runs encoder_attention per sequence.
+ * SUROGATE_SERVE_ENCODER_FLASH_ATTENTION=0 declines every call.
+ */
+[[nodiscard]] bool encoder_attention_batch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                           const Tensor& segments, std::int32_t longest,
+                                           std::int32_t window, float scale, Tensor& out,
+                                           cudaStream_t stream, std::int32_t kv_heads = 1,
+                                           bool causal = false);
+
 inline constexpr std::int32_t kEncoderAttentionQueryTile = 256;
 
 /// Scratch bytes for one query tile; memory grows linearly in the sequence length.
