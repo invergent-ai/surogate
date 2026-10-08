@@ -4420,3 +4420,33 @@ wall time 1,307 -> 1,119 s. Checkpoint restores 21 -> 26, appends 132 -> 134. St
 
 Tests. The A/B above, both runs without errors or warnings in the server log. The store's own
 test, `sinfer_conversation_checkpoints_test`, sets its count directly and is unaffected.
+
+## 116
+
+**Shorter prompts prefill first (2026-10-08, after #115).** Staged prompts share each round's
+prefill window in staging order (`launch_mixed_round` fills it from the front), so the prompt at
+the front takes all of it until it finishes. In arrival order a follow-up turn of a few thousand
+tokens waited behind every new conversation's 100k-token prompt staged before it: eight agents on
+the 35B on a DGX Spark, conversations started 5 s apart, gave the first follow-up turns 141, 100,
+65 and 25 s to their first token, the prompts ahead of them ~35 s each.
+
+- **`ConcurrentExecutor::stage_prefill`** (`runtime/engine/concurrent_executor.h`) stages an
+  admitted prompt ahead of the staged prompts in a larger size class, a class being a factor of four
+  in tokens still to compute (`bit_width(prefill_remaining) / 2`), and behind the rest. Prompts of
+  similar size keep their arrival order, so a long prompt waits only while much shorter ones are
+  staged, and a prompt's class is fixed when it is staged. Pipeline stages keep arrival order
+  (every stage must run the same rounds). `PrefillLaneSet::insert` keeps the set's order.
+- `SUROGATE_SERVE_PREFILL_ORDER=arrival` keeps arrival order.
+
+DGX Spark, the 35B NVFP4 with FP8 KV, `--max-num-seqs 16 --max-model-len 204800`, eight agents
+from about 100k to 130k tokens (`agentic_long_bench.py --agents 8 --max 130000`), one build with
+arrival order -> the new order: the four follow-up turns sent while new conversations prefilled
+141.2 / 100.5 / 65.3 / 25.4 -> 3.6 / 2.3 / 3.5 / 2.2 s to their first token, warm-turn time to first
+token p50 3.8 -> 2.4 s and p90 25.4 -> 4.2 s. Output 23.0 -> 22.9 tok/s, wall time 705 -> 715 s,
+slowest cold start 287.5 -> 295.7 s to its first token. Those early turns then decode at 1.4-2.2
+tok/s instead of 6-8, because while a long prompt prefills a decode row gets one token a mixed
+round (~0.75 s at 100k context), so they finish about when they did before; the first token is
+what this change moves.
+
+Tests. The A/B above, both runs without errors or warnings in the server log, and a one-word chat
+answered correctly.
