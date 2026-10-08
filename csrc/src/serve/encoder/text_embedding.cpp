@@ -73,7 +73,15 @@ struct TextEmbedding::Impl {
     std::int32_t arena_tokens = 0;
     std::unique_ptr<DeviceBuffer> attention_workspace;
     std::size_t attention_workspace_bytes = 0;
-    std::unique_ptr<DeviceBuffer> positions;
+    /// A forward's token ids, positions and sequence segments, uploaded in one copy: four
+    /// I32 per token of capacity (ids, positions, and at most one offset and length each).
+    std::unique_ptr<DeviceBuffer> inputs;
+    /// RoPE coefficients for every position a sequence can hold, local and global layers'
+    /// (rope_table): derived once at load instead of in double precision on every column.
+    std::unique_ptr<DeviceBuffer> rope_local_table;
+    std::unique_ptr<DeviceBuffer> rope_global_table;
+    Tensor rope_local;
+    Tensor rope_global;
     std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
@@ -154,6 +162,20 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     }
     impl.tokenizer = std::make_unique<EmbeddingTokenizer>(EmbeddingTokenizer::from_artifact(*impl.reader));
     impl.materialized = artifact::materialize(*impl.reader, binder.finish(), device);
+
+    const auto build_rope_table = [&](std::unique_ptr<DeviceBuffer>& buffer, Tensor& table, float theta,
+                                float frequency_scale) {
+        const std::int32_t pairs = config.head_dim / 2;
+        buffer = std::make_unique<DeviceBuffer>(sizeof(float) * 2 * static_cast<std::size_t>(pairs) *
+                                                static_cast<std::size_t>(config.max_tokens));
+        table = Tensor(buffer->p, DType::FP32, {2, pairs, config.max_tokens});
+        ops::rope_table(config.head_dim, config.head_dim, pairs, theta, frequency_scale, table,
+                        device.stream);
+    };
+    build_rope_table(impl.rope_local_table, impl.rope_local, config.rope_theta_local, 1.0F);
+    build_rope_table(impl.rope_global_table, impl.rope_global, config.rope_theta_global,
+                     config.rope_frequency_scale);
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
 
     ops::encoder_attention_prewarm();
     ops::detail::bf16_cublaslt_prewarm();
@@ -246,15 +268,15 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
              2ULL * config.kv_size()) + (1u << 20);
         // Release obsolete scratch before growing it. A long request must get a
         // recoverable error if its working set cannot fit beside the model.
-        impl.arena.reset(); impl.positions.reset(); impl.attention_workspace.reset();
+        impl.arena.reset(); impl.inputs.reset(); impl.attention_workspace.reset();
         impl.arena_tokens = 0; impl.attention_workspace_bytes = 0;
         std::size_t free = 0, bytes = 0;
         CUDA_CHECK(device_mem_get_info(&free, &bytes));
-        if (arena_bytes + scratch_bytes + static_cast<std::size_t>(capacity) * 8 + (64u << 20) > free) {
+        if (arena_bytes + scratch_bytes + static_cast<std::size_t>(capacity) * 16 + (64u << 20) > free) {
             throw std::runtime_error("embedding request does not fit GPU memory; shorten the input or use --device cpu");
         }
         impl.arena = std::make_unique<DeviceArena>(arena_bytes);
-        impl.positions = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(capacity) * sizeof(std::int32_t));
+        impl.inputs = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(capacity) * 4 * sizeof(std::int32_t));
         impl.attention_workspace = std::make_unique<DeviceBuffer>(scratch_bytes);
         impl.arena_tokens = capacity;
         impl.attention_workspace_bytes = scratch_bytes;
@@ -262,15 +284,19 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     DeviceArena& arena = *impl.arena;
     arena.reset();
 
-    CUDA_CHECK(cudaMemcpyAsync(impl.positions->p, positions.data(),
-                               positions.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                               stream));
-    DeviceBuffer ids(static_cast<std::size_t>(total) * sizeof(std::int32_t));
-    CUDA_CHECK(cudaMemcpyAsync(ids.p, flat.data(),
-                               static_cast<std::size_t>(total) * sizeof(std::int32_t),
+    // Ids, positions, then the segments batched attention reads (offsets, then lengths): one
+    // copy into a buffer that lives as long as the arena, where a small request used to pay a
+    // cudaMalloc and a second copy.
+    flat.insert(flat.end(), positions.begin(), positions.end());
+    flat.insert(flat.end(), offsets.begin(), offsets.end());
+    flat.insert(flat.end(), lengths.begin(), lengths.end());
+    CUDA_CHECK(cudaMemcpyAsync(impl.inputs->p, flat.data(), flat.size() * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
-    const Tensor id_tensor(ids.p, DType::I32, {total});
-    const Tensor position_tensor(impl.positions->p, DType::I32, {total});
+    auto* const inputs = static_cast<std::int32_t*>(impl.inputs->p);
+    const Tensor id_tensor(inputs, DType::I32, {total});
+    const Tensor position_tensor(inputs + total, DType::I32, {total});
+    const Tensor segment_tensor(inputs + 2 * static_cast<std::ptrdiff_t>(total), DType::I32,
+                                {batch, 2});
 
     Tensor x        = arena.alloc(DType::BF16, {config.hidden, total});
     Tensor h        = arena.alloc(DType::BF16, {config.hidden, total});
@@ -292,7 +318,6 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
         const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
         const bool global         = config.is_global(layer);
-        const float theta         = global ? config.rope_theta_global : config.rope_theta_local;
         const std::int32_t window = global ? 0 : config.sliding_window;
 
         // --- attention, between the sandwich norms -------------------------
@@ -318,20 +343,26 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         // sequence, so this too runs once for the batch.
         Tensor query_rope(query.data, DType::BF16, {config.head_dim, config.query_heads, total});
         Tensor key_rope(key.data, DType::BF16, {config.head_dim, config.kv_heads, total});
-        ops::rope(position_tensor, config.head_dim, config.head_dim / 2, theta, query_rope, key_rope, stream,
-                  global ? config.rope_frequency_scale : 1.0F);
+        ops::rope_from_table(position_tensor, global ? impl.rope_global : impl.rope_local,
+                             query_rope, key_rope, stream);
 
-        // Attention is the one step that must not cross a boundary.
-        for (std::int32_t index = 0; index < batch; ++index) {
-            const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
-            const std::int32_t length = lengths[static_cast<std::size_t>(index)];
-            const Tensor q_slice      = query.slice(1, offset, length);
-            const Tensor k_slice      = key.slice(1, offset, length);
-            const Tensor v_slice      = value.slice(1, offset, length);
-            Tensor out_slice          = attn_out.slice(1, offset, length);
-            ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
-                                   out_slice, impl.attention_workspace->p,
-                                   impl.attention_workspace_bytes, stream, config.kv_heads, !config.mean_pooling);
+        // Attention is the one step that must not cross a boundary. The whole batch goes in
+        // one launch; a head dim the batched kernel lacks runs the op per sequence.
+        if (!ops::encoder_attention_batch(query, key, value, segment_tensor, longest, window,
+                                          config.attention_scale, attn_out, stream,
+                                          config.kv_heads, !config.mean_pooling)) {
+            for (std::int32_t index = 0; index < batch; ++index) {
+                const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
+                const std::int32_t length = lengths[static_cast<std::size_t>(index)];
+                const Tensor q_slice      = query.slice(1, offset, length);
+                const Tensor k_slice      = key.slice(1, offset, length);
+                const Tensor v_slice      = value.slice(1, offset, length);
+                Tensor out_slice          = attn_out.slice(1, offset, length);
+                ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
+                                       out_slice, impl.attention_workspace->p,
+                                       impl.attention_workspace_bytes, stream, config.kv_heads,
+                                       !config.mean_pooling);
+            }
         }
 
         ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,

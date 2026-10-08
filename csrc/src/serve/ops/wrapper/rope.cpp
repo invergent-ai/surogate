@@ -207,6 +207,59 @@ void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta
     detail::rope_launch(positions, rotary_dim, active_pairs, theta, q, k, stream, frequency_scale);
 }
 
+void rope_table(int head_dim, int rotary_dim, int active_pairs, float theta,
+                float frequency_scale, Tensor& table, cudaStream_t stream) {
+    if (!std::isfinite(theta) || theta <= 0.0F || !std::isfinite(frequency_scale) ||
+        frequency_scale <= 0.0F) {
+        throw std::invalid_argument("rope_table: theta and frequency_scale must be finite and positive");
+    }
+    if (rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > head_dim ||
+        rotary_dim / 2 > kTextHeadDim) {
+        throw std::invalid_argument("rope_table: rotary_dim must be even, positive, within the head and at most 512");
+    }
+    require_active_pairs(active_pairs, rotary_dim);
+    if (table.dtype != DType::FP32 || !table.is_contiguous() || table.ne[0] != 2 ||
+        table.ne[1] != rotary_dim / 2 || table.ne[2] <= 0 || table.ne[3] != 1 ||
+        table.data == nullptr) {
+        throw std::invalid_argument("rope_table: table must be contiguous FP32 [2, rotary_dim/2, positions]");
+    }
+    detail::rope_table_launch(head_dim, rotary_dim, active_pairs, theta, frequency_scale, table,
+                              stream);
+}
+
+void rope_from_table(const Tensor& positions, const Tensor& table, Tensor& q, Tensor& k,
+                     cudaStream_t stream) {
+    if (table.dtype != DType::FP32 || !table.is_contiguous() || table.ne[0] != 2 ||
+        table.ne[1] <= 0 || table.ne[2] <= 0 || table.ne[3] != 1 || table.data == nullptr) {
+        throw std::invalid_argument("rope_from_table: table must be a rope_table table");
+    }
+    if (positions.dtype != DType::I32) {
+        throw std::invalid_argument("rope_from_table: positions must be I32");
+    }
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
+        throw std::invalid_argument("rope_from_table: q/k must be BF16");
+    }
+    (void)numel_allow_zero(positions, "positions");
+    const std::int64_t q_numel = numel_allow_zero(q, "q");
+    (void)numel_allow_zero(k, "k");
+    const std::int32_t tokens   = q.ne[2];
+    const std::int32_t head_dim = q.ne[0];
+    if (position_axes(positions, tokens) != 1) {
+        throw std::invalid_argument("rope_from_table: positions must be one-dimensional [T]");
+    }
+    if (table.ne[1] * 2 > head_dim) {
+        throw std::invalid_argument("rope_from_table: the table rotates more than the head holds");
+    }
+    require_tensor_layout(q, "q", head_dim, q.ne[1], tokens);
+    require_tensor_layout(k, "k", head_dim, k.ne[1], tokens);
+    if (q_numel == 0) { return; }
+    require_positions_storage(positions);
+    if (q.data == nullptr || k.data == nullptr) {
+        throw std::invalid_argument("rope_from_table: q/k data must be non-null");
+    }
+    detail::rope_from_table_launch(positions, table, q, k, stream);
+}
+
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream) {
     rope(positions, rotary_dim, rotary_dim / 2, theta, x, stream);
 }

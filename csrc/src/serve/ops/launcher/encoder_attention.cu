@@ -13,14 +13,21 @@
 // per-head QK norm and rope leave them in -- so the batch strides do the work:
 // Q advances one head per batch element while the shared K and V advance none.
 //
-// The only translation unit that includes this op's kernel header.
+// encoder_attention_batch does not come through here: a whole batch goes to the FlashAttention
+// kernel (encoder_flash_attention.cuh) in one launch, where this path paid a pair of products and
+// a softmax per sequence per query tile. This path stays for the head dims that kernel lacks.
+//
+// The only translation unit that includes this op's kernel headers.
 // See docs/op-development.md §2.
 #include "ops/launcher/encoder_attention.h"
 #include "api/ops/encoder_attention.h"
 #include <algorithm>
 
 #include "core/device.h" // CUDA_CHECK
+#include "ops/common/math.h"
+#include "ops/kernel/encoder_flash_attention.cuh"
 #include "ops/kernel/encoder_softmax.cuh"
+#include "ops/kernel/func_attribute.cuh"
 
 #include <cublasLt.h>
 
@@ -125,9 +132,44 @@ void matmul(DeviceState& state, const Desc& desc, const void* a, const Layout& l
           "matmul");
 }
 
+template <int HeadDim>
+void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& segments,
+                  std::int32_t longest, std::int32_t window, float scale, Tensor& out,
+                  cudaStream_t stream, std::int32_t kv_heads, bool causal) {
+    constexpr int kSmemBytes = kEncoderFlashSmemBytes<HeadDim>;
+    CUDA_CHECK(set_func_attribute_per_device(encoder_flash_attention_kernel<HeadDim>,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             kSmemBytes));
+    const auto batch   = static_cast<std::int32_t>(segments.ne[0]);
+    const auto q_heads = static_cast<unsigned>(q.ne[0] / HeadDim);
+    const dim3 grid(static_cast<unsigned>(div_up(longest, kEncoderFlashBr)),
+                    static_cast<unsigned>(batch), q_heads);
+    encoder_flash_attention_kernel<HeadDim><<<grid, kEncoderFlashThreads, kSmemBytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(segments.data),
+        batch, kv_heads, window, causal, scale, static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void encoder_attention_prewarm() { (void)state_for_current_device(); }
+
+bool encoder_attention_batch_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                    const Tensor& segments, std::int32_t longest,
+                                    std::int32_t window, float scale, Tensor& out,
+                                    cudaStream_t stream, std::int32_t kv_heads, bool causal) {
+    switch (k.ne[0] / kv_heads) {
+    case 128:
+        launch_flash<128>(q, k, v, segments, longest, window, scale, out, stream, kv_heads, causal);
+        return true;
+    case 256:
+        launch_flash<256>(q, k, v, segments, longest, window, scale, out, stream, kv_heads, causal);
+        return true;
+    default:
+        return false;
+    }
+}
 
 void encoder_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                               std::int32_t window, float scale, Tensor& out, void* workspace,
