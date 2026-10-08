@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <numeric>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <atomic>
 #include <chrono>
@@ -565,6 +566,10 @@ private:
         std::vector<std::uint64_t> lane_plan_versions;
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
+        /// Prompt tokens its prefill has still to compute, and the size class it was staged in
+        /// (`stage_prefill`).
+        std::uint32_t prefill_remaining      = 0;
+        std::uint32_t prefill_class          = 0;
         std::uint64_t backfill_epoch         = 0;
         BackfillClass backfill_class         = BackfillClass::None;
 
@@ -871,6 +876,36 @@ private:
         return cancelled;
     }
 
+    /// Stages an admitted prompt for prefill. Staged prompts share each round's window in order,
+    /// so the one at the front takes all of it until it finishes; in arrival order a follow-up
+    /// turn of a few thousand tokens then waited behind every new conversation's 100k-token
+    /// prompt (141 s to its first token with eight agents on a DGX Spark, the prompts ahead of
+    /// it ~35 s each). A prompt now goes ahead of the staged prompts in a larger size class,
+    /// a class being a factor of four in tokens still to compute, and behind the rest, so
+    /// prompts of similar size keep their arrival order and a long one waits only while much
+    /// shorter ones are staged. SUROGATE_SERVE_PREFILL_ORDER=arrival keeps arrival order.
+    /// Pipeline stages keep arrival order: every stage must run the same rounds.
+    void stage_prefill(std::uint32_t lane) {
+        static const bool kArrivalOrder = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_PREFILL_ORDER");
+            return raw != nullptr && std::string(raw) == "arrival";
+        }();
+        Request& request = *slots_[lane];
+        request.prefill_class =
+            kPipelined || kArrivalOrder
+                ? 0U
+                : static_cast<std::uint32_t>(std::bit_width(request.prefill_remaining) / 2);
+        std::size_t position = prefill_lanes_.size();
+        for (std::size_t i = 0; i < prefill_lanes_.size(); ++i) {
+            const auto& staged = slots_[prefill_lanes_.span()[i]];
+            if (staged != nullptr && staged->prefill_class > request.prefill_class) {
+                position = i;
+                break;
+            }
+        }
+        prefill_lanes_.insert(position, lane);
+    }
+
     void release_prefill_owner(std::uint32_t lane) noexcept {
         prefill_lanes_.erase(lane);
         instance_.request_memory.deactivate_lane(lane);
@@ -985,6 +1020,7 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->prefill_remaining -= std::min(request->prefill_remaining, step.processed_prompt_tokens);
         consume_service_work(request, 1);
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
@@ -1256,6 +1292,7 @@ private:
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
+            request->prefill_remaining      = summary.prompt_tokens - summary.reusable_prompt_tokens;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
@@ -1267,7 +1304,7 @@ private:
                     instance_.request_memory.activate_lane(lane, summary.transient_bytes, summary.transient_alignment);
                     transient = instance_.request_memory.region(lane);
                 }
-                prefill_lanes_.add(lane);
+                stage_prefill(lane);
             }
             publish_runtime_stats();
             target_started                = true;
@@ -1278,7 +1315,7 @@ private:
                 // A fully cached prompt can still defer its first-token step (DFlash
                 // pipeline stages do this to preserve execution order). Register it
                 // even though there were no suffix tokens to reserve above.
-                prefill_lanes_.add(lane);
+                stage_prefill(lane);
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             const bool ran = first.processed_prompt_tokens != 0 || first.complete;
@@ -2280,14 +2317,36 @@ private:
                         first_prefill && first_prefill->options.execution.gpu_prefix;
                     if ((!membership.empty() || field_batch) &&
                         instance_.program->mixed_round_supported(prefill_lanes_.front(), membership.size)) {
+                        if (!membership.empty() && decode_share_credit_s_ > 0.0) {
+                            const auto t_decode = Clock::now();
+                            last_round_ = LastRound{"decode",
+                                                    static_cast<std::uint32_t>(membership.size), 0,
+                                                    last_round_.index + 1};
+                            run_decode_round(membership);
+                            const double seconds =
+                                std::chrono::duration<double>(Clock::now() - t_decode).count();
+                            decode_share_credit_s_ -= seconds;
+                            seg_timer_.decode += seconds;
+                            seg_timer_.decode_rounds += 1;
+                            previous_unit_was_decode = true;
+                            continue;
+                        }
                         const auto t_mixed = Clock::now();
                         last_round_ = LastRound{"mixed",
                                                 static_cast<std::uint32_t>(membership.size),
                                                 prefill_lanes_.front(), last_round_.index + 1};
                         run_mixed_round(membership);
-                        seg_timer_.mixed +=
+                        const double mixed_seconds =
                             std::chrono::duration<double>(Clock::now() - t_mixed).count();
+                        seg_timer_.mixed += mixed_seconds;
                         seg_timer_.mixed_rounds += 1;
+                        if (!membership.empty() && decode_share() > 0.0 &&
+                            mixed_seconds > kDecodeShareMinMixedRound) {
+                            decode_share_credit_s_ = std::min(
+                                kDecodeShareCreditCap,
+                                decode_share_credit_s_ +
+                                    mixed_seconds * decode_share() / (1.0 - decode_share()));
+                        }
                         // The mixed round carried the decode batch, so the
                         // admission branch may run next (PATCHES.md #32).
                         previous_unit_was_decode = true;
@@ -2302,6 +2361,7 @@ private:
                     }
                     continue;
                 }
+                decode_share_credit_s_ = 0.0;
 
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
                     const auto t_admit         = Clock::now();
@@ -2436,6 +2496,23 @@ private:
         return target;
     }
 
+    /// Fraction of the time decoding sequences get to themselves while long prompts prefill. A
+    /// mixed round gives each decoding sequence one token, and with a long prompt at a long
+    /// context a mixed round takes most of a second (0.75 s with a 100k-token prompt on the 35B
+    /// on a DGX Spark), so an agent's reply crawled at about 1.4 tok/s until every staged prompt
+    /// was done. After each mixed round that carried decode rows and took longer than
+    /// `kDecodeShareMinMixedRound`, decode-only rounds run for share / (1 - share) of its time;
+    /// prompts keep the rest. Shorter mixed rounds already decode at 4 tok/s or more and earn
+    /// nothing. SUROGATE_SERVE_DECODE_SHARE, in [0, 0.9]; 0 leaves every round mixed.
+    static double decode_share() {
+        static const double share = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_DECODE_SHARE");
+            if (raw == nullptr || *raw == '\0') { return 0.25; }
+            return std::clamp(std::strtod(raw, nullptr), 0.0, 0.9);
+        }();
+        return share;
+    }
+
     static std::uint32_t mixed_prefill_batch_wait_rounds() {
         static const std::uint32_t rounds = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_PREFILL_BATCH_WAIT");
@@ -2447,6 +2524,11 @@ private:
     }
 
     std::uint32_t deferred_mixed_rounds_ = 0;
+    /// Seconds of decode-only rounds still owed to the decoding sequences while prompts prefill
+    /// (`decode_share`). Negative once a decode round overran it; cleared when nothing prefills.
+    double decode_share_credit_s_ = 0.0;
+    static constexpr double kDecodeShareCreditCap     = 2.0;
+    static constexpr double kDecodeShareMinMixedRound = 0.25;
 
     struct SegmentTimer {
         bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TIMING") != nullptr;
@@ -2515,9 +2597,14 @@ private:
             return std::find(lanes_.begin(), lanes_.begin() + static_cast<std::ptrdiff_t>(size_),
                              lane) != lanes_.begin() + static_cast<std::ptrdiff_t>(size_);
         }
-        void add(std::uint32_t lane) {
-            if (full() || contains(lane)) { throw std::logic_error("prefill lane set overflow"); }
-            lanes_[size_++] = lane;
+        void add(std::uint32_t lane) { insert(size_, lane); }
+        void insert(std::size_t position, std::uint32_t lane) {
+            if (full() || contains(lane) || position > size_) {
+                throw std::logic_error("prefill lane set overflow");
+            }
+            for (std::size_t i = size_; i > position; --i) { lanes_[i] = lanes_[i - 1]; }
+            lanes_[position] = lane;
+            ++size_;
         }
         // Erasing keeps the order so the round's card owner stays stable.
         void erase(std::uint32_t lane) noexcept {
