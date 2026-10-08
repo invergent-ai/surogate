@@ -49,6 +49,11 @@ std::vector<int> offsets_of(const std::vector<int>& t) {
     return off;
 }
 
+// Member functions check through require_cuda rather than REQUIRE: CUDA 13.0's cudafe++ (the DGX
+// Spark's toolkit) never finishes on some REQUIREs inside member functions of this file's classes.
+void require_cuda(cudaError_t status) { REQUIRE(status == cudaSuccess); }
+void require_cublas(cublasStatus_t status) { REQUIRE(status == CUBLAS_STATUS_SUCCESS); }
+
 struct Bf16 {
     std::vector<float> host;  // the bf16-rounded values
     nv_bfloat16* dev = nullptr;
@@ -60,8 +65,8 @@ struct Bf16 {
             h[i] = __float2bfloat16(scale == 0.0f ? 0.0f : u(rng));
             host[i] = __bfloat162float(h[i]);
         }
-        REQUIRE(cudaMalloc(&dev, std::max<std::size_t>(n, 1) * sizeof(nv_bfloat16)) == cudaSuccess);
-        REQUIRE(cudaMemcpy(dev, h.data(), n * sizeof(nv_bfloat16), cudaMemcpyHostToDevice) == cudaSuccess);
+        require_cuda(cudaMalloc(&dev, std::max<std::size_t>(n, 1) * sizeof(nv_bfloat16)));
+        require_cuda(cudaMemcpy(dev, h.data(), n * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
     }
     Bf16(const Bf16&) = delete;
     ~Bf16() {
@@ -69,8 +74,8 @@ struct Bf16 {
     }
     std::vector<float> read() const {
         std::vector<nv_bfloat16> h(host.size());
-        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-        REQUIRE(cudaMemcpy(h.data(), dev, h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost) == cudaSuccess);
+        require_cuda(cudaDeviceSynchronize());
+        require_cuda(cudaMemcpy(h.data(), dev, h.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
         std::vector<float> out(h.size());
         for (std::size_t i = 0; i < h.size(); ++i)
             out[i] = __bfloat162float(h[i]);
@@ -83,8 +88,8 @@ struct Offsets {
     int* dev = nullptr;
     explicit Offsets(std::vector<int> off)
         : host(std::move(off)) {
-        REQUIRE(cudaMalloc(&dev, host.size() * sizeof(int)) == cudaSuccess);
-        REQUIRE(cudaMemcpy(dev, host.data(), host.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess);
+        require_cuda(cudaMalloc(&dev, host.size() * sizeof(int)));
+        require_cuda(cudaMemcpy(dev, host.data(), host.size() * sizeof(int), cudaMemcpyHostToDevice));
     }
     ~Offsets() {
         cudaFree(dev);
@@ -118,8 +123,8 @@ struct Handles {
     cublasHandle_t cublas{};
     cudaStream_t stream{};
     Handles() {
-        REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
-        REQUIRE(cublasCreate(&cublas) == CUBLAS_STATUS_SUCCESS);
+        require_cuda(cudaStreamCreate(&stream));
+        require_cublas(cublasCreate(&cublas));
     }
     ~Handles() {
         cublasDestroy(cublas);
@@ -497,19 +502,19 @@ TEST_CASE("MoE grouped GEMM holds no lock another GPU's worker waits for", "[moe
         nv_bfloat16 *w = nullptr, *x = nullptr, *y = nullptr;
         void setup(int d) {
             dev = d;
-            REQUIRE(cudaSetDevice(dev) == cudaSuccess);
-            REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-            REQUIRE(cublasCreate(&cublas) == CUBLAS_STATUS_SUCCESS);
+            require_cuda(cudaSetDevice(dev));
+            require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            require_cublas(cublasCreate(&cublas));
             off.assign(E + 1, 0);
             for (int e = 0; e < E; ++e)
                 off[e + 1] = off[e] + 1 + (e * 37) % 64;
-            REQUIRE(cudaMalloc(&d_off, off.size() * sizeof(int)) == cudaSuccess);
-            REQUIRE(cudaMemcpy(d_off, off.data(), off.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess);
-            REQUIRE(cudaMalloc(&w, sizeof(nv_bfloat16) * E * D * R) == cudaSuccess);
-            REQUIRE(cudaMalloc(&x, sizeof(nv_bfloat16) * off.back() * R) == cudaSuccess);
-            REQUIRE(cudaMalloc(&y, sizeof(nv_bfloat16) * off.back() * D) == cudaSuccess);
-            REQUIRE(cudaMemset(w, 0, sizeof(nv_bfloat16) * E * D * R) == cudaSuccess);
-            REQUIRE(cudaMemset(x, 0, sizeof(nv_bfloat16) * off.back() * R) == cudaSuccess);
+            require_cuda(cudaMalloc(&d_off, off.size() * sizeof(int)));
+            require_cuda(cudaMemcpy(d_off, off.data(), off.size() * sizeof(int), cudaMemcpyHostToDevice));
+            require_cuda(cudaMalloc(&w, sizeof(nv_bfloat16) * E * D * R));
+            require_cuda(cudaMalloc(&x, sizeof(nv_bfloat16) * off.back() * R));
+            require_cuda(cudaMalloc(&y, sizeof(nv_bfloat16) * off.back() * D));
+            require_cuda(cudaMemset(w, 0, sizeof(nv_bfloat16) * E * D * R));
+            require_cuda(cudaMemset(x, 0, sizeof(nv_bfloat16) * off.back() * R));
         }
         void run() {
             cudaSetDevice(dev);
@@ -688,22 +693,22 @@ TEST_CASE("The bf16 MoE forward neither waits for its GPU nor holds a lock anoth
         const int n = 1408, k = 2816;  // Gemma 4 26B-A4B gate_up: N = 2 x 704, K = hidden
         void setup(int d, int tokens_per_expert) {
             dev = d;
-            REQUIRE(cudaSetDevice(dev) == cudaSuccess);
-            REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-            REQUIRE(cublasCreate(&cublas) == CUBLAS_STATUS_SUCCESS);
+            require_cuda(cudaSetDevice(dev));
+            require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            require_cublas(cublasCreate(&cublas));
             cudnn = create_cudnn_handle();  // only the pre-#212 cuDNN forward used it
             off.assign(E + 1, 0);
             for (int e = 0; e < E; ++e)
                 off[e + 1] = off[e] + tokens_per_expert;
-            REQUIRE(cudaMalloc(&d_off, off.size() * sizeof(int)) == cudaSuccess);
-            REQUIRE(cudaMemcpy(d_off, off.data(), off.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess);
-            REQUIRE(cudaMalloc(&w, sizeof(nv_bfloat16) * E * n * k) == cudaSuccess);
-            REQUIRE(cudaMalloc(&x, sizeof(nv_bfloat16) * off.back() * k) == cudaSuccess);
-            REQUIRE(cudaMalloc(&y, sizeof(nv_bfloat16) * off.back() * n) == cudaSuccess);
-            REQUIRE(cudaMemset(w, 0, sizeof(nv_bfloat16) * E * n * k) == cudaSuccess);
-            REQUIRE(cudaMemset(x, 0, sizeof(nv_bfloat16) * off.back() * k) == cudaSuccess);
-            REQUIRE(cudaMalloc(&ws, 64 << 20) == cudaSuccess);
-            REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+            require_cuda(cudaMalloc(&d_off, off.size() * sizeof(int)));
+            require_cuda(cudaMemcpy(d_off, off.data(), off.size() * sizeof(int), cudaMemcpyHostToDevice));
+            require_cuda(cudaMalloc(&w, sizeof(nv_bfloat16) * E * n * k));
+            require_cuda(cudaMalloc(&x, sizeof(nv_bfloat16) * off.back() * k));
+            require_cuda(cudaMalloc(&y, sizeof(nv_bfloat16) * off.back() * n));
+            require_cuda(cudaMemset(w, 0, sizeof(nv_bfloat16) * E * n * k));
+            require_cuda(cudaMemset(x, 0, sizeof(nv_bfloat16) * off.back() * k));
+            require_cuda(cudaMalloc(&ws, 64 << 20));
+            require_cuda(cudaDeviceSynchronize());
         }
         void forward(const recipes::Recipe& r) {
             cudaSetDevice(dev);

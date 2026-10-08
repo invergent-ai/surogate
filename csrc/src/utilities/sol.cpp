@@ -465,21 +465,22 @@ sPerfSpecs B300_SXM = {.Chip = "GB100",
                        .FP8_16_TFlops = 5000,
                        .FP4_32_TFlops = 10000};
 
-// These are mostly guesswork at this point!
-// the spec sheet claims 1 pFLOP fp4+sparsity; assume this is mostly like a 5090;
-// TODO get better estimates for these values
+// GB10 (DGX Spark) runs BF16 and FP8 with FP32 accumulation at full rate, like the RTX PRO
+// 6000 rather than the GeForce cards: 1024 dense BF16 FLOP per clock per SM. Measured on a DGX
+// Spark with torch matmul and _scaled_mm at 16384x4096x4096: ~100 TFLOP/s BF16 and ~190 FP8
+// at the ~2.3 GHz the GPU holds under sustained load.
 sPerfSpecs GB10 = {.Chip = "GB10",
                    .SMs = 48,
                    .CoresPerSM = 128,
                    .TensorPerSM = 4,
                    .BoostClock = 2418,
-                   .TF32_TFlops = 29.71,
-                   .BF16_TFlops = 59.42,
-                   .FP16_32_TFlops = 59.42,
+                   .TF32_TFlops = 59.42,
+                   .BF16_TFlops = 118.84,
+                   .FP16_32_TFlops = 118.84,
                    .FP16_16_TFlops = 118.84,
-                   .INT8_TFlops = 118.84,
+                   .INT8_TFlops = 237.68,
                    .INT4_TFlops = -1,
-                   .FP8_32_TFlops = 118.84,
+                   .FP8_32_TFlops = 237.68,
                    .FP8_16_TFlops = 237.68,
                    .FP4_32_TFlops = 475.36};
 

@@ -243,7 +243,7 @@ def test_compressed_source_folds_nested_text_tower_names(monkeypatch, tmp_path):
         "model.language_model.layers.0.mlp.gate.weight": (4, 8),
         "lm_head.weight": (500, 8),
     }
-    quantized = SimpleNamespace(scheme=SimpleNamespace(weights=object()))
+    quantized = SimpleNamespace(scheme=SimpleNamespace(weights=SimpleNamespace(num_bits=4)))
     plain = SimpleNamespace(scheme=None)
     resolved = SimpleNamespace(modules={
         "model.language_model.layers.0.mlp.shared_expert.gate_proj": quantized,
@@ -399,3 +399,145 @@ def test_fp8_export_with_other_block_sizes_is_refused():
     assert is_fp8_block_export({"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}})
     with pytest.raises(ValueError, match="128 x 128 block scales"):
         is_fp8_block_export({"quantization_config": {"quant_method": "fp8", "weight_block_size": [1, 128]}})
+
+
+#: The Linears a mixed-precision compressed-tensors export keeps as FP8 rows, by suffix.
+_FP8_CHANNEL_LINEARS = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+                        "in_proj_qkv.weight", "in_proj_z.weight", "out_proj.weight")
+
+
+def _nvfp4_linear(generator, rows, columns):
+    packed = torch.randint(0, 256, (rows, columns // 2), generator=generator, dtype=torch.uint8)
+    scales = (torch.rand((rows, columns // 16), generator=generator) * 4 + 0.5).to(torch.float8_e4m3fn)
+    return {"weight_packed": packed, "weight_scale": scales,
+            "weight_global_scale": torch.tensor([448.0 * 6.0 / 3.0]),
+            "input_global_scale": torch.tensor([448.0 * 6.0 / 5.0])}
+
+
+def _save_mixed_export(root, c, g, ranking, monkeypatch, convert):
+    """An llm-compressor mixed export: NVFP4 experts and shared expert, FP8 per-channel
+    attention, linear attention and output head with BF16 multipliers, the MTP block in BF16."""
+    from safetensors.torch import save_file
+    from surogate.serve.convert.common.draft_head import compute_shortlist
+    generator = torch.Generator().manual_seed(11)
+    tensors = {}
+    for name, source in source_requirements(recipe.build_recipes(g)).items():
+        if name.startswith("model.") and ".mlp.experts." in name:
+            continue  # the stacked spelling; this export stores per expert, packed
+        stem = name[: -len(".weight")]
+        if name.startswith("model.") and ".shared_expert." in name:
+            for suffix, tensor in _nvfp4_linear(generator, *source.shape).items():
+                tensors[f"{stem}.{suffix}"] = tensor
+        elif (name.startswith("model.") and name.endswith(_FP8_CHANNEL_LINEARS)) or name == "lm_head.weight":
+            rows, columns = source.shape
+            tensors[name] = (torch.rand(source.shape, generator=generator) * 8 - 4).to(torch.float8_e4m3fn)
+            # multipliers far from one, so a recipe that read the codes as values would show
+            tensors[stem + ".weight_scale"] = (torch.rand((rows, 1), generator=generator) * .01 + .01).to(torch.bfloat16)
+        else:
+            tensors[name] = torch.randn(source.shape, generator=generator).to(torch.bfloat16)
+    for layer in range(g.layers):
+        for expert in range(g.experts):
+            for projection, shape in (("gate_proj", (g.intermediate, g.hidden)),
+                                      ("up_proj", (g.intermediate, g.hidden)),
+                                      ("down_proj", (g.hidden, g.intermediate))):
+                stem = f"model.layers.{layer}.mlp.experts.{expert}.{projection}"
+                for suffix, tensor in _nvfp4_linear(generator, *shape).items():
+                    tensors[f"{stem}.{suffix}"] = tensor
+    root.mkdir()
+    weights = {"num_bits": 8, "type": "float", "strategy": "channel", "symmetric": True, "dynamic": False}
+    activations = {"num_bits": 8, "type": "float", "strategy": "token", "symmetric": True, "dynamic": True}
+    nvfp4 = {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16,
+             "symmetric": True, "dynamic": False}
+    c["quantization_config"] = {
+        "quant_method": "compressed-tensors", "format": "mixed-precision", "quantization_status": "compressed",
+        "ignore": ["re:^mtp.*"] + [f"model.layers.{layer}.mlp.gate" for layer in range(g.layers)],
+        "config_groups": {
+            "group_0": {"format": "float-quantized", "weights": weights, "input_activations": activations,
+                        "targets": [r"re:.*self_attn\.(q|k|v|o)_proj$",
+                                    r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$", "re:.*lm_head"]},
+            "group_1": {"format": "nvfp4-pack-quantized", "weights": nvfp4,
+                        "input_activations": dict(nvfp4, dynamic="local"),
+                        "targets": [r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$",
+                                    r"re:.*shared_expert\.(gate|up|down)_proj$"]},
+        },
+    }
+    (root / "config.json").write_text(json.dumps(c))
+    save_file(tensors, root / "model.safetensors")
+    (root / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {str(i): i for i in range(500)}}}))
+    (root / "tokenizer_config.json").write_text('{}')
+    (root / "chat_template.jinja").write_text('{{ messages }}')
+    (root / "generation_config.json").write_text('{}')
+    np.arange(g.vocab, dtype='<i8')[::-1].copy().tofile(ranking)
+    monkeypatch.setattr(convert.draft_head, "compute_shortlist", lambda _path, root, *, geometry:
+                        compute_shortlist(ranking, root, n=geometry.draft_vocab, vocab=geometry.vocab,
+                                          tokenizer_vocab_size=geometry.token_domain))
+    return tensors
+
+
+def test_mixed_nvfp4_fp8_export_keeps_every_stored_word(tmp_path, monkeypatch):
+    from surogate.serve.artifact.container import Artifact
+    from surogate.serve.artifact.layouts import dequantize_row_split, row_scale_f32_geometry
+    from surogate.serve.convert.common.inventory import FP8_ROW_F32
+    from surogate.serve.convert.qwen3_5_moe import convert
+    c = config_for()
+    c.update(moe_intermediate_size=128, shared_expert_intermediate_size=128)
+    g = inv.geometry_from_config(c, token_domain=500)
+    model = tmp_path / "mixed"
+    stored = _save_mixed_export(model, c, g, tmp_path / "counts.i64", monkeypatch, convert)
+    output = tmp_path / "model.sinfer"
+    report = json.loads(convert.convert(model, None, output, device="cpu").read_text())
+    assert report["quantization"]["compressed_tensors"]["shared_expert"] == "w8"
+
+    def fp8_rows(artifact, name):
+        obj = artifact.find(name)
+        assert obj.format == FP8_ROW_F32
+        shape = tuple(obj.shape)
+        geometry = row_scale_f32_geometry(obj.format, shape)
+        payload = bytearray(artifact.payload(obj))
+        codes = torch.frombuffer(payload[: geometry.code_plane_bytes], dtype=torch.uint8).reshape(shape)
+        begin = geometry.scale_plane_offset
+        scales = torch.frombuffer(payload[begin : begin + geometry.scale_plane_bytes], dtype=torch.float32)
+        return codes, scales
+
+    def source_rows(name):
+        # The stored BF16 multipliers widen exactly to the artifact's FP32.
+        return (stored[name].view(torch.uint8),
+                stored[name[: -len(".weight")] + ".weight_scale"].reshape(-1).to(torch.float32))
+
+    with Artifact(output) as artifact:
+        assert artifact.identity.weights_id == "compressed-tensors"
+        # Each FP8 Linear's codes and multipliers, row for row as stored.
+        for name, source in (("text/layers/0/attention/key", "model.layers.0.self_attn.k_proj.weight"),
+                             ("text/layers/0/attention/value", "model.layers.0.self_attn.v_proj.weight"),
+                             ("text/layers/2/attention/output", "model.layers.2.self_attn.o_proj.weight"),
+                             ("text/layers/1/gdn/query_key_value", "model.layers.1.linear_attn.in_proj_qkv.weight"),
+                             ("text/layers/1/gdn/z", "model.layers.1.linear_attn.in_proj_z.weight"),
+                             ("text/layers/3/gdn/output", "model.layers.3.linear_attn.out_proj.weight"),
+                             ("text/output_head", "lm_head.weight")):
+            codes, scales = fp8_rows(artifact, name)
+            expected_codes, expected_scales = source_rows(source)
+            assert torch.equal(codes, expected_codes), name
+            assert torch.equal(scales, expected_scales), name
+        # q_proj holds [query; gate] per head; the split objects take their halves in head order.
+        q_codes, q_scales = source_rows("model.layers.2.self_attn.q_proj.weight")
+        heads, dim = c["num_attention_heads"], c["head_dim"]
+        for name, half in (("text/layers/2/attention/query", 0), ("text/layers/2/attention/gate", 1)):
+            rows = torch.cat([torch.arange(h * 2 * dim + half * dim, h * 2 * dim + (half + 1) * dim)
+                              for h in range(heads)])
+            codes, scales = fp8_rows(artifact, name)
+            assert torch.equal(codes, q_codes[rows]) and torch.equal(scales, q_scales[rows]), name
+        # The draft head gathers rows of the FP8 output head: the values the codes stand for.
+        ids = torch.frombuffer(bytearray(artifact.payload(artifact.find("text/draft_head_token_ids"))),
+                               dtype=torch.int32).long()
+        draft = artifact.find("text/draft_head")
+        values = dequantize_row_split(bytes(artifact.payload(draft)), draft.format, tuple(draft.shape),
+                                      dtype=torch.float32)
+        head_codes, head_scales = stored["lm_head.weight"], stored["lm_head.weight_scale"]
+        reference = (head_codes.float() * head_scales.float())[ids]
+        assert torch.allclose(values, reference, rtol=0, atol=float(reference.abs().max()) / 8)
+        # The routed experts stay NVFP4 (their words: test_routed_nvfp4_preserves_codes_...); the
+        # shared expert is the W8 its kernels read.
+        assert artifact.find("text/layers/1/moe/routed_gate_up").format == "NVFP4"
+        assert artifact.find("text/layers/1/moe/shared_gate_up").format == inv.W8
+        # The MTP block, which the export leaves in BF16, keeps the base converter's W8.
+        assert artifact.find("mtp/layer/attention/output").format == inv.W8

@@ -235,17 +235,55 @@ struct Nvfp4CodecFor {
     static constexpr bool kD3PackedWord8        = false;
     static constexpr bool kD3SingleValuePerLane = false;
 
-    __device__ static __forceinline__ float scale_of(const std::uint8_t* scales,
-                                                     std::int64_t group_index) {
+    __device__ static __forceinline__ std::int64_t scale_offset(std::int64_t group_index) {
         constexpr int kTilesPerRow = kGroupsPerRow / 4;
         const int row              = static_cast<int>(group_index / kGroupsPerRow);
         const int group            = static_cast<int>(group_index - static_cast<std::int64_t>(row) * kGroupsPerRow);
         const int row_inner        = row & 127;
-        const std::int64_t offset =
-            (static_cast<std::int64_t>(row >> 7) * kTilesPerRow + (group >> 2)) * 512 +
-            static_cast<std::int64_t>(row_inner & 31) * 16 +
-            static_cast<std::int64_t>(row_inner >> 5) * 4 + (group & 3);
-        return detail::decode_nvfp4_e4m3(scales[offset]);
+        return (static_cast<std::int64_t>(row >> 7) * kTilesPerRow + (group >> 2)) * 512 +
+               static_cast<std::int64_t>(row_inner & 31) * 16 +
+               static_cast<std::int64_t>(row_inner >> 5) * 4 + (group & 3);
+    }
+
+    __device__ static __forceinline__ float scale_of(const std::uint8_t* scales,
+                                                     std::int64_t group_index) {
+        return detail::decode_nvfp4_e4m3(scales[scale_offset(group_index)]);
+    }
+
+    // The wide path (WideRows below): sixteen code bytes are 32 values, two whole groups, and
+    // the two groups' scales are adjacent bytes of a tile (`group % 4` runs fastest; the first
+    // group is even), one 16-bit load.
+    static constexpr int kWideValues = 32;
+
+    __device__ static __forceinline__ uint4 wide_codes(const std::uint8_t* codes,
+                                                       std::int64_t group_index, int /*part*/) {
+        return load_vec<uint4>(codes + group_index * (kGroupK / 2));
+    }
+
+    __device__ static __forceinline__ std::uint32_t wide_scales(const std::uint8_t* scales,
+                                                                std::int64_t group_index) {
+        return *reinterpret_cast<const std::uint16_t*>(scales + scale_offset(group_index));
+    }
+
+    /// Accumulates values [8 piece, 8 piece + 8) of a wide load against `x`: the eight products,
+    /// then their group's scale once.
+    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
+                                                      int piece, const float (&x)[8], float& acc) {
+        const std::uint32_t word = piece == 0   ? codes.x
+                                   : piece == 1 ? codes.y
+                                   : piece == 2 ? codes.z
+                                                : codes.w;
+        float part = 0.0f;
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 decoded =
+                detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(word >> (8 * pair)));
+            part = fmaf(decoded.x, x[2 * pair], part);
+            part = fmaf(decoded.y, x[2 * pair + 1], part);
+        }
+        const float scale =
+            detail::decode_nvfp4_e4m3(static_cast<std::uint8_t>(scale_bits >> (piece < 2 ? 0 : 8)));
+        acc = fmaf(part, scale, acc);
     }
 
     __device__ static __forceinline__ void
@@ -294,6 +332,35 @@ struct W8Codec {
             // Arithmetic shift out of the word sign-extends the byte.
             const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
             weights[item]  = w8_a16_weight(static_cast<std::int8_t>(code), scale);
+        }
+    }
+
+    // The wide path (WideRows below): sixteen code bytes are half a group, under its one scale.
+    static constexpr int kWideValues = 16;
+
+    __device__ static __forceinline__ uint4 wide_codes(const std::uint8_t* codes,
+                                                       std::int64_t group_index, int part) {
+        return load_vec<uint4>(codes + group_index * W8RowSplitStorage::kCodeBytesPerGroup +
+                               part * 16);
+    }
+
+    __device__ static __forceinline__ std::uint32_t wide_scales(const std::uint8_t* scales,
+                                                                std::int64_t group_index) {
+        return *reinterpret_cast<const std::uint16_t*>(scales + group_index * 2);
+    }
+
+    /// Accumulates values [8 piece, 8 piece + 8) of a wide load against `x`, each weight
+    /// rounded as load_eight rounds it.
+    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
+                                                      int piece, const float (&x)[8], float& acc) {
+        const float scale =
+            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
+        const std::uint32_t words[2] = {piece == 0 ? codes.x : codes.z,
+                                        piece == 0 ? codes.y : codes.w};
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
+            acc = fmaf(w8_a16_weight(static_cast<std::int8_t>(code), scale), x[item], acc);
         }
     }
 };
@@ -356,11 +423,165 @@ inline constexpr int kStoredGroups =
     ((K + Codec::kStoredKAlignment - 1) / Codec::kStoredKAlignment) * Codec::kStoredKAlignment /
     Codec::kGroupK;
 
+/// The wide decode path: every lane loads its rows' codes sixteen bytes at a time, and a warp
+/// issues all of its loads for a dot product before it uses any.
+///
+/// The packed paths below load four or eight bytes a lane and keep one warp step in flight, so
+/// a warp makes a DRAM round trip per step -- eight of them across a 2048-wide NVFP4 or W8
+/// row. On a DGX Spark this took surogate/Surogate3.7-35B-A3B-NVFP4's one-user decode from
+/// 72.3 to 73.7 tok/s, and the W8 profile's one-token round from 150.5 to 148.5 us. Going
+/// further did not pay there (08b24ce, reverted): a D3 kernel that issued every warp's loads
+/// before staging the input held three blocks per SM instead of five and lost more than it
+/// gained, and D4 loads issued before its programmatic wait slowed the round. A codec offers
+/// this path with kWideValues (the values sixteen of its code bytes hold, whole groups or a
+/// whole share of one), wide_codes, wide_scales and wide_piece.
+template <class Codec>
+concept WideCodec = requires { Codec::kWideValues; };
+
+/// `Rows` rows of K values: kLoads sixteen-byte loads a lane. A row of 32 or more loads takes
+/// whole warp steps; a shorter one takes a share of the lanes and a step covers several rows.
+/// The rows are evenly spaced, row r at `first + r * stride`, which is what every caller reads:
+/// a gate row and its up row, or consecutive down rows.
+template <class Codec, int K, int Rows>
+struct WideRows {
+    static constexpr int kChunks = K / Codec::kWideValues;
+    static constexpr int kLoads  = Rows * kChunks / 32;
+    static constexpr int kPieces = Codec::kWideValues / 8;
+    /// Loads i and i + kSteps read the same chunk of different rows, so they share the input.
+    static constexpr int kSteps = kChunks >= 32 ? kChunks / 32 : 1;
+
+    /// Which row and which of its sixteen-byte chunks a lane's `load`-th load reads.
+    __device__ static __forceinline__ void slot(int lane, int load, int& row, int& chunk) {
+        if constexpr (kChunks >= 32) {
+            row   = load / kSteps;
+            chunk = load % kSteps * 32 + lane;
+        } else {
+            row   = load * (32 / kChunks) + lane / kChunks;
+            chunk = lane % kChunks;
+        }
+    }
+
+    /// Issues every load of the lane's share of the rows into the first kLoads entries.
+    template <int N>
+    __device__ static __forceinline__ void load(const std::uint8_t* codes, const std::uint8_t* scales,
+                                                int first, int stride, uint4 (&packed)[N],
+                                                std::uint32_t (&scale_bits)[N]) {
+        static_assert(N >= kLoads);
+        constexpr int kGroups = kStoredGroups<Codec, K>;
+        const int lane        = static_cast<int>(threadIdx.x) & 31;
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) {
+            int row, chunk;
+            slot(lane, i, row, chunk);
+            const int part = chunk * Codec::kWideValues % Codec::kGroupK / Codec::kWideValues;
+            const std::int64_t group = static_cast<std::int64_t>(first + row * stride) * kGroups +
+                                       chunk * Codec::kWideValues / Codec::kGroupK;
+            packed[i]     = Codec::wide_codes(codes, group, part);
+            scale_bits[i] = Codec::wide_scales(scales, group);
+        }
+    }
+
+    /// Finishes the dot products against `x(k, values)`, which fills the eight values from k,
+    /// and leaves each row's sum in lane 0's `result`. The input is read once per chunk and
+    /// piece and feeds every load of that chunk. Each load sums into its own accumulator, which
+    /// joins its row's sum at the end; the order is fixed, so the sums are deterministic.
+    template <int N, class X>
+    __device__ static __forceinline__ void dot(const uint4 (&packed)[N],
+                                               const std::uint32_t (&scale_bits)[N], X&& x,
+                                               float (&result)[Rows]) {
+        static_assert(N >= kLoads);
+        const int lane = static_cast<int>(threadIdx.x) & 31;
+        float acc[kLoads];
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) { acc[i] = 0.0f; }
+#pragma unroll
+        for (int step = 0; step < kSteps; ++step) {
+            int row, chunk;
+            slot(lane, step, row, chunk);
+#pragma unroll
+            for (int piece = 0; piece < kPieces; ++piece) {
+                float values[8];
+                x(chunk * Codec::kWideValues + piece * 8, values);
+#pragma unroll
+                for (int i = step; i < kLoads; i += kSteps) {
+                    Codec::wide_piece(packed[i], scale_bits[i], piece, values, acc[i]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) {
+                int row, chunk;
+                slot(lane, i, row, chunk);
+                if (row == r) { sum += acc[i]; }
+            }
+            result[r] = warp_reduce_sum(sum);
+        }
+    }
+};
+
+/// Whether `Rows` rows of K take the wide path: a codec that has one, rows stored unpadded,
+/// whole loads for every lane, and no more than eight of them, which is what a lane holds in
+/// registers beside the rest of the kernel.
+template <class Codec, int K, int Rows>
+inline constexpr bool kWideRows = [] {
+    if constexpr (WideCodec<Codec>) {
+        constexpr int kChunks = K / Codec::kWideValues;
+        return K % Codec::kWideValues == 0 && kStoredGroups<Codec, K> * Codec::kGroupK == K &&
+               (kChunks % 32 == 0 || 32 % kChunks == 0) && Rows * kChunks % 32 == 0 &&
+               Rows * kChunks / 32 <= 8;
+    } else {
+        return false;
+    }
+}();
+
+/// A staged BF16 input as WideRows::dot reads it.
+struct SharedBf16Input {
+    const __nv_bfloat16* x;
+    __device__ __forceinline__ void operator()(int k, float (&values)[8]) const {
+        const uint4 input = load_vec<uint4>(x + k);
+        const float2 x0   = bf16x2_bits_to_float2(input.x);
+        const float2 x1   = bf16x2_bits_to_float2(input.y);
+        const float2 x2   = bf16x2_bits_to_float2(input.z);
+        const float2 x3   = bf16x2_bits_to_float2(input.w);
+        values[0] = x0.x; values[1] = x0.y; values[2] = x1.x; values[3] = x1.y;
+        values[4] = x2.x; values[5] = x2.y; values[6] = x3.x; values[7] = x3.y;
+    }
+};
+
+/// An FP32 input in global memory as WideRows::dot reads it.
+struct GlobalF32Input {
+    const float* x;
+    __device__ __forceinline__ void operator()(int k, float (&values)[8]) const {
+        const float4 x0 = load_vec<float4>(x + k);
+        const float4 x1 = load_vec<float4>(x + k + 4);
+        values[0] = x0.x; values[1] = x0.y; values[2] = x0.z; values[3] = x0.w;
+        values[4] = x1.x; values[5] = x1.y; values[6] = x1.z; values[7] = x1.w;
+    }
+};
+
 template <class Codec, int K>
 __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const std::uint8_t* high,
                                              const std::uint8_t* scales, int row0, int row1,
                                              const __nv_bfloat16* x, int k_begin, int k_end,
                                              float& result0, float& result1) {
+    if constexpr (kWideRows<Codec, K, 2>) {
+        // Every caller reads whole rows; the wide path has no partial range.
+        (void)high;
+        (void)k_begin;
+        (void)k_end;
+        using Wide = WideRows<Codec, K, 2>;
+        uint4 packed[Wide::kLoads];
+        std::uint32_t scale_bits[Wide::kLoads];
+        Wide::load(codes, scales, row0, row1 - row0, packed, scale_bits);
+        float result[2];
+        Wide::dot(packed, scale_bits, SharedBf16Input{x}, result);
+        result0 = result[0];
+        result1 = result[1];
+        return;
+    }
     constexpr int kGroups = kStoredGroups<Codec, K>;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc0            = 0.0f;
@@ -604,6 +825,18 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
                                               const std::uint8_t* scales, int row_base,
                                               const float* x, int first_group, int last_group,
                                               float (&result)[Rows]) {
+    if constexpr (kWideRows<Codec, kIntermediate, Rows>) {
+        // Every caller reads whole rows; the wide path has no partial range.
+        (void)high;
+        (void)first_group;
+        (void)last_group;
+        using Wide = WideRows<Codec, kIntermediate, Rows>;
+        uint4 packed[Wide::kLoads];
+        std::uint32_t scale_bits[Wide::kLoads];
+        Wide::load(codes, scales, row_base, 1, packed, scale_bits);
+        Wide::dot(packed, scale_bits, GlobalF32Input{x}, result);
+        return;
+    }
     constexpr int kGroups = kStoredGroups<Codec, kIntermediate>;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc[Rows];

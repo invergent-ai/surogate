@@ -6,6 +6,7 @@
 #include "api/ops/linear_swiglu_down_add.h"
 #include "api/ops/silu_mul.h"
 #include "ops/linear/fp8_block/fp8_block.h"
+#include "ops/linear/fp8_block/fp8_block_sm120_gemm.h"
 #include "ops/linear/fp8_block/fp8_block_sm90_gemm.h"
 #include "ops/op_tester.h"
 
@@ -220,25 +221,27 @@ int run(const Case& c) {
 // Consecutive row ranges of one parent (q/k/v, q/k/gate/v) through linear_projections, which
 // runs them as one launch: each output must hold exactly the rows the whole-parent linear writes,
 // eagerly, replayed from a graph, with no arena and in arenas with and without the staging room.
-int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t tokens) {
+int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t tokens, bool per_row = false) {
     std::int32_t rows = 0;
     for (auto r : parts) { rows += r; }
     std::mt19937 rng(static_cast<unsigned>(99 + rows + 7 * k + 13 * tokens));
     std::uniform_real_distribution<float> uw(-1.0f, 1.0f), us(0.5f, 2.0f), ux(-3.0f, 3.0f);
     const std::size_t scale_off = (static_cast<std::size_t>(rows) * k + 255) / 256 * 256;
-    std::vector<std::uint8_t> payload(scale_off + static_cast<std::size_t>(rows / 128) * (k / 128) * 4);
+    const std::size_t cells = per_row ? static_cast<std::size_t>(rows) : static_cast<std::size_t>(rows / 128) * (k / 128);
+    std::vector<std::uint8_t> payload(scale_off + cells * 4);
     for (std::size_t i = 0; i < static_cast<std::size_t>(rows) * k; ++i) { payload[i] = float_to_e4m3(uw(rng)); }
-    for (std::size_t i = 0; i < static_cast<std::size_t>(rows / 128) * (k / 128); ++i) {
+    for (std::size_t i = 0; i < cells; ++i) {
         const float v = us(rng) * 0.01f;
         std::memcpy(payload.data() + scale_off + 4 * i, &v, 4);
     }
     DeviceBuffer d_payload(payload.size());
     d_payload.copy_from_host(payload.data(), payload.size());
     Weight w{};
-    w.payload = d_payload.p; w.payload_bytes = payload.size(); w.qtype = QType::FP8_E4M3FN_BLK128_F32S;
+    w.payload = d_payload.p; w.payload_bytes = payload.size();
+    w.qtype = per_row ? QType::FP8_E4M3FN_ROW_F32S : QType::FP8_E4M3FN_BLK128_F32S;
     w.layout = QuantLayout::Fp8Block128; w.group_size = 128; w.group = 128; w.ndim = 2;
     w.qdata = d_payload.p; w.scales = static_cast<std::uint8_t*>(d_payload.p) + scale_off; w.scale_dtype = DType::FP32;
-    w.scale_ne[0] = 128; w.scale_ne[1] = 128;
+    w.scale_ne[0] = per_row ? k : 128; w.scale_ne[1] = per_row ? 1 : 128;
     w.n = rows; w.k = k; w.shape[0] = rows; w.shape[1] = k; w.padded_shape[0] = rows; w.padded_shape[1] = k;
     std::vector<__nv_bfloat16> hx(static_cast<std::size_t>(k) * tokens);
     for (auto& v : hx) { v = __float2bfloat16(ux(rng)); }
@@ -280,11 +283,13 @@ int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t toke
         }
         return same;
     };
-    const bool hopper  = ops::detail::fp8_block::sm90_gemm_available();
+    // Hopper's or the sm_12x CUTLASS kernel, whichever this device runs (per-row: sm_12x only).
+    const bool cutlass = (!per_row && ops::detail::fp8_block::sm90_gemm_available()) ||
+                         ops::detail::fp8_block::sm120_gemm_available();
     const bool gemv    = !ops::detail::fp8_block::quantizes_activations(w, tokens);
-    const bool chained = gemv || !hopper || tokens <= ops::detail::fp8_block::staged_max_tokens();
-    // GEMV: one launch; the tile: quantize + one launch; Hopper: quantize + GEMM + split
-    const std::size_t want_nodes = gemv ? 1 : !chained ? 1 + parts.size() : hopper ? 3 : 2;
+    const bool chained = gemv || !cutlass || tokens <= ops::detail::fp8_block::staged_max_tokens();
+    // GEMV: one launch; the tile: quantize + one launch; CUTLASS: quantize + GEMM + split
+    const std::size_t want_nodes = gemv ? 1 : !chained ? 1 + parts.size() : cutlass ? 3 : 2;
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     bool ok = true;
@@ -308,9 +313,9 @@ int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t toke
         CHECK_CUDA(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
         std::size_t nodes = 0;
         CHECK_CUDA(cudaGraphGetNodes(graph, nullptr, &nodes));
-        // The tight arena has no staging room: Hopper's chained launch falls back to one GEMM
+        // The tight arena has no staging room: a CUTLASS chained launch falls back to one GEMM
         // per range.
-        const std::size_t expect = arena == 2 && hopper && !gemv ? 1 + parts.size() : want_nodes;
+        const std::size_t expect = arena == 2 && cutlass && !gemv ? 1 + parts.size() : want_nodes;
         ok &= nodes == expect;
         if (arena == 0) { nodes_seen = nodes; }
         CHECK_CUDA(cudaGraphLaunch(exec, stream));
@@ -319,7 +324,7 @@ int run_chain(std::vector<std::int32_t> parts, std::int32_t k, std::int32_t toke
         CHECK_CUDA(cudaGraphExecDestroy(exec)); CHECK_CUDA(cudaGraphDestroy(graph));
     }
     CHECK_CUDA(cudaStreamDestroy(stream));
-    std::printf("  chain [");
+    std::printf("  chain%s [", per_row ? " per-row" : "");
     for (std::size_t i = 0; i < parts.size(); ++i) { std::printf(i ? " %d" : "%d", parts[i]); }
     std::printf("] k=%d T=%-4d nodes=%zu  %s\n", k, tokens, nodes_seen, ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
@@ -449,7 +454,12 @@ int main() {
                           Case{24576, 512, 4, true}, Case{5120, 1024, 4, false, true},
                           Case{256, 512, 12, false}, Case{512, 1024, 16, true},
                           Case{384, 1024, 9, false, true}, Case{1024, 3584, 7, false, true},
-                          Case{20480, 256, 6, false}, Case{20480, 256, 13, true}}) {
+                          Case{20480, 256, 6, false}, Case{20480, 256, 13, true},
+                          // Per-row weights on sm_12x's CUTLASS tiles (fp8_block_sm120_gemm.cu,
+                          // as GB10's 48 SMs pick them): the narrow tile at 20 tokens, the swapped
+                          // 64-token one at 50, and at 300 and 1027 whichever the waves favour.
+                          Case{1024, 2048, 20, false, true}, Case{2048, 1024, 50, false, true},
+                          Case{1536, 1024, 300, true, true}, Case{1024, 1024, 1027, false, true}}) {
         failures += run(c);
     }
     // q/k/v of a 4:1:1 head layout, q/k/gate/v of a gated one, and a qkv/z pair: decode GEMV
@@ -461,6 +471,8 @@ int main() {
     failures += run_chain({768, 256}, 512, 128);
     failures += run_chain({4096, 1024, 1024}, 1024, 4);
     failures += run_chain({8192, 2048, 2048}, 1024, 4); // each range under 96 blocks, the parent not
+    // Per-row parents (a compressed-tensors qkv/z pair): staged on sm_12x, apart past its widths.
+    for (std::int32_t tokens : {3, 20, 64, 300}) { failures += run_chain({768, 256}, 512, tokens, true); }
     // Decode GEMV widths keep the pair; the narrow, swapped and wide tiles take the fused route.
     for (std::int32_t tokens : {3, 5, 64, 100, 300}) { failures += run_swiglu(512, 256, tokens, 0.0f); }
     failures += run_swiglu(384, 512, 40, 1.5f);

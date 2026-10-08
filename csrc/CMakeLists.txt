@@ -860,6 +860,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/kernels/test-moe-grouped-gemm.cu
         src/testing/kernels/test-matmul-autotune.cpp
         src/testing/kernels/test-mem-eff-splits.cu
+        src/testing/kernels/test-lora-accum.cu
         src/testing/kernels/test-chunked-attention.cu
         src/testing/kernels/test-spark-numerics.cu
         src/testing/kernels/test-qwen35-shared.cu
@@ -869,6 +870,8 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     target_link_libraries(integration-tests PRIVATE
         surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only
     )
+    # cuDNN from the pip wheel (all a DGX Spark has) is not on the default include path.
+    target_include_directories(integration-tests PRIVATE ${CUDNN_INCLUDE_DIR})
     target_compile_options(integration-tests PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
@@ -1111,6 +1114,31 @@ set_source_files_properties(
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10;--diag-suppress=39,161,174,177,186,940;--expt-extended-lambda>")
 target_link_libraries(sinfer_fp8_block_sm90 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
+# RTX Blackwell's and GB10's block-scaled FP8 GEMM: CUTLASS's sm_120 blockwise-scaling kernel
+# (TMA, FP8 mma.sync), the one vLLM runs for fine-grained FP8 checkpoints there. Built for the
+# sm_12x targets only, like the FP4 archives, whole-program for the same ptxas reason, and a build
+# without one links a stub that declines every call.
+if(SUROGATE_SERVE_FP4_ARCHS)
+  add_library(sinfer_fp8_block_sm120 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm_mid.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm_mid_row.cu
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_gemm_wide.cu)
+  set_target_properties(sinfer_fp8_block_sm120 PROPERTIES CUDA_ARCHITECTURES "${SUROGATE_SERVE_FP4_ARCHS}")
+else()
+  add_library(sinfer_fp8_block_sm120 STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block_sm120_stub.cpp)
+endif()
+sinfer_internal_includes(sinfer_fp8_block_sm120)
+target_include_directories(sinfer_fp8_block_sm120 PRIVATE
+  ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+set_target_properties(sinfer_fp8_block_sm120 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(sinfer_fp8_block_sm120 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+target_link_libraries(sinfer_fp8_block_sm120 PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # FlashAttention-3's Hopper forward (src/third_party/flash_attn3, BSD-3-Clause; NOTICE there),
 # the attention vLLM runs on H100/H200: head dims 64, 128 and 256 over the paged cache, causal or
@@ -1613,7 +1641,28 @@ endif()
 # --embed` execs it, so it has to exist after `make serve-build` like the engine
 # does. Same source as the old serve_tests target, which is now gone.
 add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
-add_subdirectory(${SERVE_ROOT}/speech)
+# The speech (STT) server decodes audio with FFmpeg, so it is built only with FFmpeg: a host
+# without FFmpeg development libraries configures with -DSINFER_ENABLE_FFMPEG=OFF and builds
+# everything else. -DSUROGATE_BUILD_SPEECH=OFF leaves it out on any host.
+option(SUROGATE_BUILD_SPEECH "Serve: build the speech (STT) server; needs FFmpeg development libraries" ON)
+if(SUROGATE_BUILD_SPEECH AND SINFER_ENABLE_FFMPEG)
+  add_subdirectory(${SERVE_ROOT}/speech)
+  set(SUROGATE_STT_TARGETS surogate-stt surogate-stt-lm)
+else()
+  set(SUROGATE_STT_TARGETS)
+  # pyproject.toml's build targets and the Makefile name surogate-stt. Keep the name a target,
+  # so those lists work unchanged, and have it say what it is.
+  add_custom_target(surogate-stt
+    COMMAND ${CMAKE_COMMAND} -E echo "surogate-stt: not built (needs SUROGATE_BUILD_SPEECH=ON and FFmpeg)"
+    VERBATIM)
+  # A warning, not an error: pip builds always set SUROGATE_REQUIRE_SERVE (pyproject.toml), and
+  # they are how a host without FFmpeg development libraries builds everything else.
+  if(SUROGATE_REQUIRE_SERVE)
+    message(WARNING "serve: surogate-stt and surogate-stt-lm are not built (SUROGATE_BUILD_SPEECH="
+                    "${SUROGATE_BUILD_SPEECH}, SINFER_ENABLE_FFMPEG=${SINFER_ENABLE_FFMPEG}), so "
+                    "`surogate serve --stt` will not work with this build.")
+  endif()
+endif()
 add_subdirectory(${SERVE_ROOT}/tts)
 target_include_directories(surogate-embed PRIVATE
   ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
@@ -1631,7 +1680,7 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # constructor, which then died with SIGILL on hosts without it (seen on one of Modal's H100
 # machines; four other serve tests that build a pool died the same way).
 sinfer_cuda_archive(sinfer_ops)
-target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
@@ -1784,7 +1833,7 @@ endif()
 set(SINFER_SHARED_ARCHIVES "")
 foreach(candidate IN ITEMS
     sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
-    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
+    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
     sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
     sinfer_product_load_progress sinfer_product_cuda_visibility)
   if(TARGET ${candidate})
@@ -1920,7 +1969,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 INSTALL_RPATH "${SINFER_LIB_RPATH}"
                 BUILD_WITH_INSTALL_RPATH OFF
                 INSTALL_RPATH_USE_LINK_PATH FALSE)
-            install(TARGETS surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
+            install(TARGETS ${SUROGATE_STT_TARGETS} surogate-tts surogate-tts-worker RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR} COMPONENT serve)
             install(TARGETS sinfer sinfer-serve surogate-embed
                     RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
                     COMPONENT serve)
@@ -1939,7 +1988,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
             endif()
         else()
             install(TARGETS sinfer_tts_bridge LIBRARY DESTINATION bin COMPONENT serve)
-            install(TARGETS sinfer sinfer-serve surogate-embed surogate-stt surogate-stt-lm surogate-tts surogate-tts-worker sinfer_shared
+            install(TARGETS sinfer sinfer-serve surogate-embed ${SUROGATE_STT_TARGETS} surogate-tts surogate-tts-worker sinfer_shared
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib
                     COMPONENT serve)

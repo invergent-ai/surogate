@@ -136,8 +136,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                                Metadata metadata, Tensor& out,
                                                cudaStream_t stream,
                                                GqaBlockMask selection = {}) {
-    if (q.ne[1] != Geometry::QHeads) {
-        if (selection.words && cache.dtype == DType::I8) {
+    // A query group the registry does not carry runs the BF16 and e4m3 caches through the
+    // geometry's tensor-core kernel, its grid sized by the tensors' query heads; over int8, whose
+    // kernel bakes the geometry's query count into its addressing, the generic kernel.
+    if (q.ne[1] != Geometry::QHeads && cache.dtype == DType::I8) {
+        if (selection.words) {
             throw std::invalid_argument(
                 "gqa_attention: the QSA selection is not served over an int8 KV cache");
         }
@@ -152,9 +155,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 q.ne[0], q.ne[1], cache.num_kv_heads, q.ne[2], scale,
                 static_cast<__nv_bfloat16*>(out.data), selection);
         };
-        if (cache.dtype == DType::BF16) { launch.template operator()<__nv_bfloat16>(); }
-        else if (cache.dtype == DType::FP8_E4M3FN) { launch.template operator()<std::uint8_t>(); }
-        else { launch.template operator()<std::int8_t>(); }
+        launch.template operator()<std::int8_t>();
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -203,7 +204,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<__nv_bfloat16*>(out.data), tokens, selection);
     } else if (cache.dtype == DType::FP8_E4M3FN) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+                                  static_cast<unsigned>(q.ne[1]), 1u);
         if (selection.words != nullptr) {
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>,
@@ -229,7 +230,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+                                  static_cast<unsigned>(q.ne[1]), 1u);
         if (selection.words != nullptr) {
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>,

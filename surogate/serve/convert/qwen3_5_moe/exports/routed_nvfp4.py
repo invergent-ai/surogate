@@ -27,6 +27,10 @@ ALPHA_SUFFIX = "_alpha"
 # The block scale plane is one e4m3 byte per 16 values; the code plane two values per byte.
 _BLOCK = 16
 
+#: Group formats a routed-NVFP4 source may declare: its experts' NVFP4, and the FP8 a
+#: mixed-precision export keeps elsewhere (attention, linear attention, the output head).
+MIXED_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
+
 
 def _nvfp4_spec(name: str, shape: tuple[int, ...]) -> TensorSpec:
     return TensorSpec(
@@ -111,14 +115,17 @@ def validate_config(config: Mapping[str, object], geometry: inventory.Geometry) 
     formats = set()
     if isinstance(groups, Mapping):
         for group in groups.values():
-            if isinstance(group, Mapping) and "format" in group:
+            if isinstance(group, Mapping) and group.get("format"):
                 formats.add(group["format"])
-    if "format" in quant:
+    # A mixed-precision export names each group's format: NVFP4 for the experts and, beside
+    # it, FP8 for projections the compressed-tensors source keeps as FP8 rows. The experts'
+    # own words are checked tensor by tensor in preflight_source.
+    if quant.get("format") and not (quant["format"] == "mixed-precision" and formats):
         formats.add(quant["format"])
-    if formats != {"nvfp4-pack-quantized"}:
+    if "nvfp4-pack-quantized" not in formats or not formats <= MIXED_FORMATS:
         raise ValueError(
             f"routed NVFP4 source has formats {sorted(formats)}, expected "
-            "['nvfp4-pack-quantized']"
+            "['nvfp4-pack-quantized'], optionally with 'float-quantized' groups"
         )
     text = config.get("text_config", config)
     layers = text.get("num_hidden_layers")
@@ -132,7 +139,7 @@ def validate_config(config: Mapping[str, object], geometry: inventory.Geometry) 
         raise ValueError("routed NVFP4 requires hidden and expert widths divisible by 16")
     return {
         "quant_method": method,
-        "format": sorted(formats)[0],
+        "format": "nvfp4-pack-quantized" if formats == {"nvfp4-pack-quantized"} else "mixed-precision",
         "num_hidden_layers": layers,
         "num_experts": experts,
     }

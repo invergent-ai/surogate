@@ -30,7 +30,10 @@ Use `--device cpu` to run without a GPU. CPU-only PyTorch is supported. From a
 source checkout, build with `make serve-build`, or use `make serve-stt-build`
 to build just the speech server without a CUDA toolkit. The latter needs a C++
 compiler, FFmpeg development libraries, and PyTorch in the active environment;
-set `STT_PYTHON=/path/to/python` to choose that environment.
+set `STT_PYTHON=/path/to/python` to choose that environment. A source build
+configured with `-DSINFER_ENABLE_FFMPEG=OFF` (for a host without FFmpeg
+development libraries) or `-DSUROGATE_BUILD_SPEECH=OFF` leaves the speech
+server out and builds everything else.
 Installed wheels include the speech server. For a private
 Hugging Face repository, authenticate with `hf auth login` or set `HF_TOKEN`.
 

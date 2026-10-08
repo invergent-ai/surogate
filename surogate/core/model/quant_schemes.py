@@ -66,6 +66,20 @@ class CheckpointModule:
     packed: bool
     #: Shape of ``weight`` or ``weight_packed`` if the module stores one.
     weight_shape: tuple[int, ...] | None
+    #: Whether a ``weight_scale`` sits beside the weight: every quantized module has one.
+    scaled: bool = False
+
+
+def packs_weights(scheme: QuantizationScheme | None) -> bool:
+    """Whether a scheme's weights are stored packed, in ``weight_packed``.
+
+    compressed-tensors packs sub-byte codes (NVFP4, int4) several to a byte; an
+    eight-bit scheme (``float-quantized`` FP8, ``int-quantized`` int8) stores its
+    codes one per element in ``weight`` with the quantized dtype, and its
+    multipliers in ``weight_scale``.
+    """
+
+    return scheme is not None and scheme.weights is not None and scheme.weights.num_bits < 8
 
 
 @dataclass(frozen=True)
@@ -86,23 +100,30 @@ class ResolvedQuantization:
         return (item for item in self.modules.values() if item.scheme is not None)
 
     def check_against_checkpoint(self) -> None:
-        """The config must explain every packed tensor and claim no unpacked one.
+        """The config must explain every quantized tensor and claim no plain one.
 
-        A disagreement in either direction means the file is not what its
-        config says, and nothing downstream should guess which side to
-        believe.
+        A scheme that packs its weights (see ``packs_weights``) must find
+        ``weight_packed``; an eight-bit one must find its codes in ``weight``
+        with a ``weight_scale`` beside them, and no packed tensor. Every packed
+        module must be claimed by a packing scheme. A disagreement in any
+        direction means the file is not what its config says, and nothing
+        downstream should guess which side to believe.
         """
 
         claimed_not_packed = sorted(
             name for name, item in self.modules.items()
-            if item.scheme is not None and item.scheme.weights is not None
-            and not item.module.packed
+            if packs_weights(item.scheme) and not item.module.packed
         )
         packed_not_claimed = sorted(
             name for name, item in self.modules.items()
-            if item.module.packed and (item.scheme is None or item.scheme.weights is None)
+            if item.module.packed and not packs_weights(item.scheme)
         )
-        if not claimed_not_packed and not packed_not_claimed:
+        claimed_unscaled = sorted(
+            name for name, item in self.modules.items()
+            if item.scheme is not None and item.scheme.weights is not None
+            and not packs_weights(item.scheme) and not item.module.scaled
+        )
+        if not claimed_not_packed and not packed_not_claimed and not claimed_unscaled:
             return
         lines = ["quantization_config disagrees with the checkpoint's tensors:"]
         if claimed_not_packed:
@@ -113,7 +134,12 @@ class ResolvedQuantization:
         if packed_not_claimed:
             lines.append(
                 f"  {len(packed_not_claimed)} module(s) with {PACKED_WEIGHT} match no "
-                f"config group (or are ignored), e.g. {packed_not_claimed[:3]}"
+                f"config group that packs (or are ignored), e.g. {packed_not_claimed[:3]}"
+            )
+        if claimed_unscaled:
+            lines.append(
+                f"  {len(claimed_unscaled)} module(s) the config quantizes to eight bits have "
+                f"no weight_scale, e.g. {claimed_unscaled[:3]}"
             )
         raise ValueError("\n".join(lines))
 
@@ -130,6 +156,12 @@ def read_tensor_shapes(model_dir: str | Path) -> dict[str, tuple[int, ...]]:
     never a tensor, so a 24 GB checkpoint answers in milliseconds.
     """
 
+    return {name: shape for name, (shape, _) in read_tensor_headers(model_dir).items()}
+
+
+def read_tensor_headers(model_dir: str | Path) -> dict[str, tuple[tuple[int, ...], str]]:
+    """Every tensor name with its shape and safetensors dtype (``"BF16"``, ``"F8_E4M3"``)."""
+
     model = Path(model_dir)
     index = model / "model.safetensors.index.json"
     if index.is_file():
@@ -139,15 +171,15 @@ def read_tensor_shapes(model_dir: str | Path) -> dict[str, tuple[int, ...]]:
         shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise FileNotFoundError(f"{model}: no safetensors shards")
-    shapes: dict[str, tuple[int, ...]] = {}
+    headers: dict[str, tuple[tuple[int, ...], str]] = {}
     for shard in shards:
         with shard.open("rb") as handle:
             (length,) = struct.unpack("<Q", handle.read(8))
             header = json.loads(handle.read(length))
         for name, entry in header.items():
             if name != "__metadata__":
-                shapes[name] = tuple(entry["shape"])
-    return shapes
+                headers[name] = (tuple(entry["shape"]), str(entry["dtype"]))
+    return headers
 
 
 def checkpoint_modules(shapes: Mapping[str, tuple[int, ...]]) -> dict[str, CheckpointModule]:
@@ -160,6 +192,7 @@ def checkpoint_modules(shapes: Mapping[str, tuple[int, ...]]) -> dict[str, Check
     """
 
     packed: set[str] = set()
+    scaled: set[str] = set()
     weight_shape: dict[str, tuple[int, ...]] = {}
     owners: set[str] = set()
     for name, shape in shapes.items():
@@ -172,8 +205,10 @@ def checkpoint_modules(shapes: Mapping[str, tuple[int, ...]]) -> dict[str, Check
             weight_shape[owner] = shape
         elif parameter == "weight" and owner not in weight_shape:
             weight_shape[owner] = shape
+        elif parameter == "weight_scale":
+            scaled.add(owner)
     return {
-        owner: CheckpointModule(owner, owner in packed, weight_shape.get(owner))
+        owner: CheckpointModule(owner, owner in packed, weight_shape.get(owner), owner in scaled)
         for owner in sorted(owners)
     }
 

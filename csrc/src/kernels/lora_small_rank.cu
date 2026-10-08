@@ -4,6 +4,7 @@
 
 #include "kernels.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 
@@ -52,6 +53,79 @@ __global__ void lora_accum_b_small_rank_bf16_kernel(nv_bfloat16* __restrict__ ou
     output[out_idx] = __float2bfloat16(value);
 }
 
+// The same update, eight output columns a thread. A block owns 128 columns and keeps their B rows
+// in shared memory as FP32, then walks a strip of rows: one 16-byte read and one write of the
+// output per thread and row, and the intermediate row (R values, the same for the 16 threads of a
+// row) from L1. That is all the memory traffic the update needs. A GEMM into a scratch buffer and
+// an add afterwards move the output slice four times, and on a GPU short of bandwidth for its
+// compute -- the DGX Spark's GB10 -- the LoRA projections are bound by exactly that traffic.
+// The sum runs over r in order with fused multiply-adds and the output is rounded once.
+constexpr int kVecCols = 8;
+constexpr int kVecColThreads = 16;
+constexpr int kVecRowThreads = 16;
+constexpr int kVecBlockCols = kVecCols * kVecColThreads;
+constexpr int kVecRowsPerBlock = 64;
+
+template <int R>
+__global__ void __launch_bounds__(kVecColThreads* kVecRowThreads)
+    lora_accum_b_vec8_bf16_kernel(nv_bfloat16* __restrict__ output,
+                                  const nv_bfloat16* __restrict__ B,
+                                  const nv_bfloat16* __restrict__ intermediate,
+                                  int BT,
+                                  int total_out_features,
+                                  int out_features,
+                                  int output_offset,
+                                  float scaling) {
+    // Thread x's columns 8x..8x+3 sit at 4x and 8x+4..8x+7 at 64 + 4x, so the eight threads of a
+    // quarter warp read distinct banks.
+    __shared__ __align__(16) float s_b[R][kVecBlockCols];
+    const int block_col = blockIdx.x * kVecBlockCols;
+    const int thread = threadIdx.y * kVecColThreads + threadIdx.x;
+    for (int i = thread; i < R * kVecBlockCols; i += kVecColThreads * kVecRowThreads) {
+        const int c = i / R, r = i % R;
+        const int slot = ((c & 7) >> 2) * (kVecBlockCols / 2) + (c >> 3) * 4 + (c & 3);
+        s_b[r][slot] = (block_col + c < out_features) ? __bfloat162float(B[(long)(block_col + c) * R + r]) : 0.0f;
+    }
+    __syncthreads();
+
+    const int col = block_col + threadIdx.x * kVecCols;
+    if (col >= out_features) return;
+    const int row_begin = static_cast<int>(blockIdx.y) * kVecRowsPerBlock;
+    const int row_end = min(BT, row_begin + kVecRowsPerBlock);
+    for (int row = row_begin + static_cast<int>(threadIdx.y); row < row_end; row += kVecRowThreads) {
+        float inter[R];
+        const uint4* inter_row = reinterpret_cast<const uint4*>(intermediate + (long)row * R);
+#pragma unroll
+        for (int v = 0; v < R / 8; ++v) {
+            const uint4 packed = inter_row[v];
+            const nv_bfloat16* values = reinterpret_cast<const nv_bfloat16*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) inter[v * 8 + j] = __bfloat162float(values[j]);
+        }
+        float acc[kVecCols] = {};
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float4 lo = *reinterpret_cast<const float4*>(&s_b[r][threadIdx.x * 4]);
+            const float4 hi = *reinterpret_cast<const float4*>(&s_b[r][kVecBlockCols / 2 + threadIdx.x * 4]);
+            acc[0] = __fmaf_rn(inter[r], lo.x, acc[0]);
+            acc[1] = __fmaf_rn(inter[r], lo.y, acc[1]);
+            acc[2] = __fmaf_rn(inter[r], lo.z, acc[2]);
+            acc[3] = __fmaf_rn(inter[r], lo.w, acc[3]);
+            acc[4] = __fmaf_rn(inter[r], hi.x, acc[4]);
+            acc[5] = __fmaf_rn(inter[r], hi.y, acc[5]);
+            acc[6] = __fmaf_rn(inter[r], hi.z, acc[6]);
+            acc[7] = __fmaf_rn(inter[r], hi.w, acc[7]);
+        }
+        uint4* out = reinterpret_cast<uint4*>(output + (long)row * total_out_features + output_offset + col);
+        uint4 packed = *out;
+        nv_bfloat16* values = reinterpret_cast<nv_bfloat16*>(&packed);
+#pragma unroll
+        for (int j = 0; j < kVecCols; ++j)
+            values[j] = __float2bfloat16_rn(__fmaf_rn(scaling, acc[j], __bfloat162float(values[j])));
+        *out = packed;
+    }
+}
+
 template <int R>
 static void launch_lora_accum_b_small_rank_bf16(Tensor& output,
                                                 const Tensor& B,
@@ -62,6 +136,26 @@ static void launch_lora_accum_b_small_rank_bf16(Tensor& output,
                                                 int output_offset,
                                                 float scaling,
                                                 cudaStream_t stream) {
+    // Eight columns a thread wherever every row of the slice starts on a 16-byte boundary.
+    const bool vectorized = out_features % kVecCols == 0 && output_offset % kVecCols == 0 &&
+                            total_out_features % kVecCols == 0 &&
+                            reinterpret_cast<std::uintptr_t>(output.Data) % 16 == 0 &&
+                            reinterpret_cast<std::uintptr_t>(intermediate.Data) % 16 == 0;
+    if (vectorized) {
+        const dim3 block(kVecColThreads, kVecRowThreads);
+        const dim3 grid((out_features + kVecBlockCols - 1) / kVecBlockCols,
+                        (BT + kVecRowsPerBlock - 1) / kVecRowsPerBlock);
+        lora_accum_b_vec8_bf16_kernel<R><<<grid, block, 0, stream>>>(output.get<nv_bfloat16>(),
+                                                                     B.get<nv_bfloat16>(),
+                                                                     intermediate.get<nv_bfloat16>(),
+                                                                     BT,
+                                                                     total_out_features,
+                                                                     out_features,
+                                                                     output_offset,
+                                                                     scaling);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     dim3 block(16, 16);
     dim3 grid((out_features + block.x - 1) / block.x, (BT + block.y - 1) / block.y);
     lora_accum_b_small_rank_bf16_kernel<R><<<grid, block, 0, stream>>>(output.get<nv_bfloat16>(),
@@ -185,6 +279,17 @@ bool lora_accum_b_small_rank_bf16(Tensor& output,
             return true;
         case 32:
             launch_lora_accum_b_small_rank_bf16<32>(output,
+                                                    B,
+                                                    intermediate,
+                                                    BT,
+                                                    total_out_features,
+                                                    out_features,
+                                                    output_offset,
+                                                    scaling,
+                                                    stream);
+            return true;
+        case 64:
+            launch_lora_accum_b_small_rank_bf16<64>(output,
                                                     B,
                                                     intermediate,
                                                     BT,

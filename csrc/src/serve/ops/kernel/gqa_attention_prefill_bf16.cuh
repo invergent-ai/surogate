@@ -123,7 +123,10 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const C
 
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
-// bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
+// bottom-right causal alignment (query row i sees keys [0, base_pos + i]). The grid's q_heads
+// is the tensors' query head count: the geometry's own, or a query group the registry does not
+// carry (Qwen3-8B's 32 over 8) over the geometry's KV heads and head dimension, which are all
+// the staging and the tiles depend on.
 // `Sparse` adds the QSA block selection (design/INFERENCE.md, phase 4): one bit per block of
 // `SparseBlock` cells for every query row of the chunk. `Sparse == false` is the dense kernel.
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
@@ -168,12 +171,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
     const int q0      = q_block * Br;
-    const int kv_head = q_head / Geometry::GroupSize;
+    const int q_heads = static_cast<int>(gridDim.y);
+    const int kv_head = q_head / (q_heads / Geometry::KVHeads);
     const int tokens  = metadata.valid_tokens(width);
 
-    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
+    if (q0 >= width) { return; }
     if (q0 >= tokens) {
-        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads);
+        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads,
+                                               q_heads);
         return;
     }
     const int base_pos              = positions[0];
@@ -212,11 +217,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Stage Q into smem once via cp.async (overlaps with the K(0) prologue load
     // below); it stays resident for the whole key loop. Global Q rows are D bf16
-    // contiguous, with a token stride of D*QHeads.
+    // contiguous, with a token stride of D*q_heads.
     {
         constexpr int VecPerRow      = D / 8;
-        constexpr int QRowStride     = D * Geometry::QHeads; // global stride between tokens
-        const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
+        const int QRowStride         = D * q_heads; // global stride between tokens
+        const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0, q_heads);
         if (q0 + Br <= tokens) {
 #pragma unroll
             for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
@@ -518,15 +523,16 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qrow0 = q0 + warp_row0 + gid;
         const int qrow1 = q0 + warp_row0 + gid + 8;
         if (qrow0 < tokens) {
-            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0)]) =
+            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0, q_heads)]) =
                 pack_bf16x2(l0 > 0.0f ? acc[n][0] / l0 : 0.0f, l0 > 0.0f ? acc[n][1] / l0 : 0.0f);
         }
         if (qrow1 < tokens) {
-            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1)]) =
+            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1, q_heads)]) =
                 pack_bf16x2(l1 > 0.0f ? acc[n][2] / l1 : 0.0f, l1 > 0.0f ? acc[n][3] / l1 : 0.0f);
         }
     }
-    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
+    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads,
+                                           q_heads);
 }
 
 } // namespace sinfer::ops

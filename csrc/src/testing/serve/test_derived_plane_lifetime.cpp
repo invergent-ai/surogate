@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/engine_context.h"
 #include "core/sleep.h"
+#include "core/unified_memory.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/marlin/marlin_repack.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
@@ -211,8 +212,12 @@ int main() {
         DeviceContext device(0);
         if (!fp4_tensor_cores(detail::w8_device_compute_capability())) { return 77; }
         test_owners(false);
-        test_owners(true);
-        test_pipeline_devices(std::min(count, 2));
+        // The engine refuses sleep mode on a GPU that shares system memory: there a sleeping
+        // region's pinned backup comes out of the same memory, so free memory cannot rise.
+        if (!device_is_integrated(0)) {
+            test_owners(true);
+            test_pipeline_devices(std::min(count, 2));
+        }
         std::cout << "derived-plane ownership, sleep and teardown: OK\n";
     } catch (const std::exception& error) {
         ops::bind_ops_context(nullptr);

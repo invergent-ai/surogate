@@ -12,6 +12,7 @@
 #include "api/ops/lora_store.h"
 #include "core/engine_context.h"
 #include "core/sleep.h"
+#include "core/unified_memory.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
@@ -196,6 +197,20 @@ public:
           device(options.device) {
         if (!options.borrowed_weights.empty() && !options.devices.empty()) {
             throw std::invalid_argument("borrowed weights currently require a single device");
+        }
+        if (options.sleep_enable) {
+            // Sleep frees GPU memory by moving a model to pinned host memory. On a GPU that
+            // allocates from system memory (the DGX Spark's GB10, Jetson) that is the same RAM,
+            // so a sleeping model would free nothing and hold its weights twice.
+            const auto placement = options.devices.empty() ? std::vector<int>{options.device} : options.devices;
+            for (int gpu : placement) {
+                if (device_is_integrated(gpu)) {
+                    throw std::invalid_argument(
+                        "sleep mode is not available on GPU " + std::to_string(gpu) +
+                        ": it shares the system's memory (DGX Spark, Jetson), so a sleeping model "
+                        "would free none of it; start without --enable-sleep-mode");
+                }
+            }
         }
         // The engine's op-layer state home. Bound here so everything target
         // construction creates -- Marlin scratch and adoption, LoRA banks,

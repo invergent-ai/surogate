@@ -141,7 +141,8 @@ serve FP8, GGUF or BF16 checkpoints instead.
 On the DGX Spark the GPU shares the machine's 128 GB with the system. The engine counts as free
 what the system can still hand over (`MemAvailable` from `/proc/meminfo`, which includes
 reclaimable page cache) less 8 GiB it leaves to the host; set
-`SUROGATE_UNIFIED_MEMORY_RESERVE_MIB` to keep more or less back.
+`SUROGATE_UNIFIED_MEMORY_RESERVE_MIB` to keep more or less back. Sleep mode is not available
+there: with no separate system RAM to park a model in, sleeping would free nothing.
 See the [CLI reference](cli.md#devices) for models that can use several GPUs.
 
 CPU-only serving supports **embedding models** and requires AVX-512. Generative models need
