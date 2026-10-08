@@ -13,14 +13,20 @@
 namespace sinfer::ops::detail::gated_delta_net {
 namespace {
 
-// SUROGATE_SERVE_GDN_PREFILL=fused walks each value head's prompt in one kernel (fused.cuh)
-// instead of the three staged kernels.
-bool fused_prefill() {
-    static const bool value = [] {
+// The one-kernel prefill (fused.cuh) walks each value head's prompt in one CTA, so it suits a GPU
+// that one CTA a head at least half fills: on a DGX Spark (48 SMs) it runs 4-5x the three staged
+// kernels for the 35B's 32 value heads and the 27B's 48, whose workspace round trips the Spark's
+// memory cannot hide. On larger GPUs the staged path's chunk-parallel stages are unmeasured
+// against it and stay. SUROGATE_SERVE_GDN_PREFILL=fused or =staged overrides.
+bool fused_prefill(std::int32_t value_heads) {
+    static const int forced = [] {
         const char* text = std::getenv("SUROGATE_SERVE_GDN_PREFILL");
-        return text != nullptr && std::string_view(text) == "fused";
+        if (text == nullptr) { return -1; }
+        const std::string_view mode(text);
+        return mode == "fused" ? 1 : mode == "staged" ? 0 : -1;
     }();
-    return value;
+    if (forced >= 0) { return forced == 1; }
+    return 2 * value_heads >= current_device_sm_count(170);
 }
 
 } // namespace
@@ -34,7 +40,7 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
                     const Tensor& beta, float scale, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
                     std::size_t workspace_bytes, cudaStream_t stream) {
-    if (fused_prefill()) {
+    if (fused_prefill(v.ne[1])) {
         chunked::fused_config fused{};
         fused.H_qk         = q.ne[1];
         fused.H_v          = v.ne[1];
