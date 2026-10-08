@@ -2317,14 +2317,36 @@ private:
                         first_prefill && first_prefill->options.execution.gpu_prefix;
                     if ((!membership.empty() || field_batch) &&
                         instance_.program->mixed_round_supported(prefill_lanes_.front(), membership.size)) {
+                        if (!membership.empty() && decode_share_credit_s_ > 0.0) {
+                            const auto t_decode = Clock::now();
+                            last_round_ = LastRound{"decode",
+                                                    static_cast<std::uint32_t>(membership.size), 0,
+                                                    last_round_.index + 1};
+                            run_decode_round(membership);
+                            const double seconds =
+                                std::chrono::duration<double>(Clock::now() - t_decode).count();
+                            decode_share_credit_s_ -= seconds;
+                            seg_timer_.decode += seconds;
+                            seg_timer_.decode_rounds += 1;
+                            previous_unit_was_decode = true;
+                            continue;
+                        }
                         const auto t_mixed = Clock::now();
                         last_round_ = LastRound{"mixed",
                                                 static_cast<std::uint32_t>(membership.size),
                                                 prefill_lanes_.front(), last_round_.index + 1};
                         run_mixed_round(membership);
-                        seg_timer_.mixed +=
+                        const double mixed_seconds =
                             std::chrono::duration<double>(Clock::now() - t_mixed).count();
+                        seg_timer_.mixed += mixed_seconds;
                         seg_timer_.mixed_rounds += 1;
+                        if (!membership.empty() && decode_share() > 0.0 &&
+                            mixed_seconds > kDecodeShareMinMixedRound) {
+                            decode_share_credit_s_ = std::min(
+                                kDecodeShareCreditCap,
+                                decode_share_credit_s_ +
+                                    mixed_seconds * decode_share() / (1.0 - decode_share()));
+                        }
                         // The mixed round carried the decode batch, so the
                         // admission branch may run next (PATCHES.md #32).
                         previous_unit_was_decode = true;
@@ -2339,6 +2361,7 @@ private:
                     }
                     continue;
                 }
+                decode_share_credit_s_ = 0.0;
 
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
                     const auto t_admit         = Clock::now();
@@ -2473,6 +2496,23 @@ private:
         return target;
     }
 
+    /// Fraction of the time decoding sequences get to themselves while long prompts prefill. A
+    /// mixed round gives each decoding sequence one token, and with a long prompt at a long
+    /// context a mixed round takes most of a second (0.75 s with a 100k-token prompt on the 35B
+    /// on a DGX Spark), so an agent's reply crawled at about 1.4 tok/s until every staged prompt
+    /// was done. After each mixed round that carried decode rows and took longer than
+    /// `kDecodeShareMinMixedRound`, decode-only rounds run for share / (1 - share) of its time;
+    /// prompts keep the rest. Shorter mixed rounds already decode at 4 tok/s or more and earn
+    /// nothing. SUROGATE_SERVE_DECODE_SHARE, in [0, 0.9]; 0 leaves every round mixed.
+    static double decode_share() {
+        static const double share = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_DECODE_SHARE");
+            if (raw == nullptr || *raw == '\0') { return 0.25; }
+            return std::clamp(std::strtod(raw, nullptr), 0.0, 0.9);
+        }();
+        return share;
+    }
+
     static std::uint32_t mixed_prefill_batch_wait_rounds() {
         static const std::uint32_t rounds = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_PREFILL_BATCH_WAIT");
@@ -2484,6 +2524,11 @@ private:
     }
 
     std::uint32_t deferred_mixed_rounds_ = 0;
+    /// Seconds of decode-only rounds still owed to the decoding sequences while prompts prefill
+    /// (`decode_share`). Negative once a decode round overran it; cleared when nothing prefills.
+    double decode_share_credit_s_ = 0.0;
+    static constexpr double kDecodeShareCreditCap     = 2.0;
+    static constexpr double kDecodeShareMinMixedRound = 0.25;
 
     struct SegmentTimer {
         bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TIMING") != nullptr;

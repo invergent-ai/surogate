@@ -4450,3 +4450,36 @@ what this change moves.
 
 Tests. The A/B above, both runs without errors or warnings in the server log, and a one-word chat
 answered correctly.
+
+## 117
+
+**Replies keep decoding while long prompts prefill (2026-10-08, after #116).** A mixed round gives
+each decoding sequence one token, and a round that carries a chunk of a 100k-token prompt at that
+context takes ~0.75 s on the 35B on a DGX Spark, so while new conversations' prompts prefilled,
+the replies of the conversations already running crawled at 1.4-2.2 tok/s. With #116 such a turn
+got its first token in 2-4 s and then took up to 151 s to finish its 200 tokens.
+
+- **`ConcurrentExecutor::decode_share`** (`runtime/engine/concurrent_executor.h`): after each mixed
+  round that carried decode rows and took longer than 0.25 s (`kDecodeShareMinMixedRound`; a
+  shorter round already decodes at 4 tok/s or more), decode-only rounds run for share / (1 - share)
+  of its time, so the decoding sequences get that share of the time while long prompts prefill and
+  the prompts keep the rest. The owed time is capped at 2 s and dropped once nothing prefills.
+  Default 0.25; `SUROGATE_SERVE_DECODE_SHARE` sets it in [0, 0.9], 0 turns it off.
+
+DGX Spark, the 35B NVFP4 with FP8 KV, `--max-num-seqs 16 --max-model-len 204800`, eight agents
+starting 5 s apart, each from about 100k to 130k tokens (`agentic_long_bench.py --agents 8 --max
+130000`), with #116's ordering, share 0 / 0.25 / 0.5 (before the 0.25 s threshold, which these
+rounds all exceed):
+
+| | 0 | 0.25 | 0.5 |
+|---|---|---|---|
+| Warm turn, send to last token, p50 / p90 / worst | 37.6 / 69.6 / 151.3 s | 27.6 / 50.6 / 58.3 s | 15.6 / 18.9 / 23.1 s |
+| Warm-turn time to first token, p50 / p90 | 2.4 / 4.2 s | 3.1 / 4.3 s | 3.5 / 5.2 s |
+| New conversation's first token, p50 / worst | 180 / 296 s | 271 / 480 s | 401 / 679 s |
+| Output tok/s, all agents | 22.9 | 23.1 | 20.1 |
+
+The share moves time from new conversations' prompts to the turns of conversations already
+running: at 0.5 those turns were 2.4x faster, the new conversations started 2.3x later and output
+fell 12%; 0.25 kept the output.
+
+Tests. The runs above, each without errors or warnings in the server log.
