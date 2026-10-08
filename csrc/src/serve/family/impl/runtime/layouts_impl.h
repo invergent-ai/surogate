@@ -435,10 +435,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // template drops the turn's thinking once a new user message arrives, re-renders a tool
     // call, or trims a reply's whitespace); a lane without one prefills the whole conversation
     // again. The budget was an eighth of one context's KV, which gave the 35B Qwen3.5-MoE seven
-    // checkpoints for sixteen lanes at a 200k context with FP8 KV, and one at 32k: eight agents
-    // then recomputed three 100k-token turns. A checkpoint costs what the lane's live recurrent
-    // state does (32 MiB there) and is mapped only while a lane holds one; the count does not
-    // depend on the KV capacity, so the memory curve stays affine.
+    // checkpoints for sixteen lanes at a 200k context with FP8 KV, and one at 32k. Eight agents
+    // on a DGX Spark then recomputed four 100k-token conversations in 160 turns; one per lane,
+    // none. A checkpoint costs what the lane's live recurrent state does (32 MiB there) and is
+    // mapped only while a lane holds one; the count does not depend on the KV capacity, so the
+    // memory curve stays affine.
     // SUROGATE_SERVE_CONVERSATION_CHECKPOINTS=N keeps fewer (at least one) where memory is short.
     out.checkpoints.capacity = plan.max_concurrency;
     if (out.checkpoints.slot_bytes) {

@@ -4389,3 +4389,34 @@ Tests. `sinfer_w8_pipelined_test` (pipelined and wgmma kernels bit-identical to 
 kernel at 1-129 columns over four shapes, plus the exhaustive dequantisation check) and every
 W8 and linear op test pass on the H100; Qwen3-8B-FP8's CLI and eight concurrent server
 requests (identical outputs) pass.
+
+## 115
+
+**One turn checkpoint per lane (2026-10-08, after #114).** A retained conversation on a model with
+recurrent state (Qwen3.5/3.6, Qwen3-Next, LFM2) resumes from its turn checkpoint whenever the next
+prompt does not extend it token for token: the template drops the turn's thinking once a new user
+message arrives, re-renders a tool call, or trims a reply's whitespace. A lane without one prefills
+the whole conversation again. The checkpoint store was sized at an eighth of one context's KV,
+which gave the 35B Qwen3.5-MoE (surogate/Surogate3.7-35B-A3B-NVFP4, 32 MiB of recurrent state a
+lane) seven checkpoints for sixteen lanes at a 204,800-token context with FP8 KV, and one at 32k.
+When more conversations than checkpoints were active, capturing a turn's checkpoint took the
+least recently used one from an idle lane, and that conversation's next turn, if it could not
+append, fell back to the shared system prompt.
+
+- **`persistent_layout`** (`family/impl/runtime/layouts_impl.h`) sizes the store at one checkpoint
+  per lane. Each costs what the lane's live recurrent state does and is mapped only while a lane
+  holds one; the count does not depend on the KV capacity, so automatic KV sizing stays affine.
+  `SUROGATE_SERVE_CONVERSATION_CHECKPOINTS=N` keeps fewer (at least one) where memory is short.
+- The startup `KV capacity` line ends with `turn-checkpoints=N x size` for models that have them
+  (`MemorySummary::conversation_checkpoints`, `conversation_checkpoint_bytes`).
+
+DGX Spark, the 35B NVFP4 with FP8 KV, `--max-num-seqs 16 --max-model-len 204800`, eight agents
+each running a conversation from about 100k to 160k tokens (`agentic_long_bench.py --agents 8
+--max 160000`), one build with the count set to 7 -> the new default of 16: turns that recomputed
+their conversation 4 -> 0 (warm turns' computed tokens at most 122,437 -> 4,186), output 25.9 ->
+30.0 tok/s across the agents, warm-turn time to first token p50 5.3 -> 3.8 s and p90 14.0 -> 7.9 s,
+wall time 1,307 -> 1,119 s. Checkpoint restores 21 -> 26, appends 132 -> 134. Startup reservation
++288 MiB.
+
+Tests. The A/B above, both runs without errors or warnings in the server log. The store's own
+test, `sinfer_conversation_checkpoints_test`, sets its count directly and is unaffected.
