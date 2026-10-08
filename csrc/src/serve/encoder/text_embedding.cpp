@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -85,6 +86,23 @@ struct TextEmbedding::Impl {
     std::unique_ptr<DeviceBuffer> rope_global_table;
     Tensor rope_local;
     Tensor rope_global;
+    /// BF16 copies of every layer's projections, for forwards of at least `dense_min_tokens`
+    /// tokens, which run them on cuBLASLt instead of the W8 kernels. Decoded at load by the
+    /// W8 embedding gather, whose rounding is the one the W8 kernels apply to each tile they
+    /// stage, so both routes multiply the same BF16 values. Empty unless
+    /// SUROGATE_SERVE_ENCODER_DENSE_TOKENS is set.
+    struct DenseLayer {
+        const void* query;
+        const void* key;
+        const void* value;
+        const void* output;
+        const void* gate;
+        const void* up;
+        const void* down;
+    };
+    std::unique_ptr<DeviceBuffer> dense_weights;
+    std::vector<DenseLayer> dense;
+    std::int32_t dense_min_tokens = 0;
     std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
@@ -107,7 +125,8 @@ const TextEmbeddingConfig& TextEmbedding::config() const noexcept { return impl_
 const EmbeddingTokenizer& TextEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
 
 std::uint64_t TextEmbedding::weight_bytes() const noexcept {
-    return impl_->materialized.stats().device_capacity_bytes;
+    return impl_->materialized.stats().device_capacity_bytes +
+           (impl_->dense_weights ? impl_->dense_weights->bytes : 0);
 }
 
 TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceContext& device) {
@@ -186,6 +205,51 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     build_rope_table(impl.rope_local_table, impl.rope_local, config.rope_theta_local, 1.0F);
     build_rope_table(impl.rope_global_table, impl.rope_global, config.rope_theta_global,
                      config.rope_frequency_scale);
+
+    if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_DENSE_TOKENS"); raw != nullptr && *raw != '\0') {
+        const long value = std::strtol(raw, nullptr, 10);
+        if (value <= 0 || value > (1L << 20)) {
+            throw std::invalid_argument("SUROGATE_SERVE_ENCODER_DENSE_TOKENS must be a positive token count");
+        }
+        impl.dense_min_tokens = static_cast<std::int32_t>(value);
+        const auto q_rows = static_cast<std::int32_t>(query_size);
+        const std::int32_t kv_rows = config.kv_size();
+        const std::size_t per_layer =
+            2 * query_size * hidden + 2 * static_cast<std::uint64_t>(kv_rows) * hidden + 3 * intermediate * hidden;
+        impl.dense_weights = std::make_unique<DeviceBuffer>(per_layer * static_cast<std::size_t>(config.layers) *
+                                                            sizeof(std::uint16_t));
+        // Row ids 0..rows-1: gathered "embeddings" of a weight are its rows, decoded into
+        // [columns, rows] -- the row-major BF16 matrix cuBLASLt takes.
+        const std::int32_t max_rows = std::max({q_rows, kv_rows, config.hidden, config.intermediate});
+        std::vector<std::int32_t> row_ids(static_cast<std::size_t>(max_rows));
+        std::iota(row_ids.begin(), row_ids.end(), 0);
+        const DeviceBuffer ids(row_ids.size() * sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemcpy(ids.p, row_ids.data(), row_ids.size() * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice));
+        auto* cursor = static_cast<std::uint16_t*>(impl.dense_weights->p);
+        const auto decode = [&](artifact::ObjectHandle handle, std::int32_t rows, std::int32_t columns) {
+            const Weight w8 = impl.matrix(handle, rows, columns);
+            if (w8.input_group_map != nullptr) {
+                throw std::runtime_error("SUROGATE_SERVE_ENCODER_DENSE_TOKENS: a projection keeps its "
+                                         "columns permuted, which the BF16 copy does not undo");
+            }
+            const Tensor row_tensor(ids.p, DType::I32, {rows});
+            Tensor decoded(cursor, DType::BF16, {columns, rows});
+            ops::embedding(row_tensor, w8, decoded, device.stream);
+            const void* matrix = cursor;
+            cursor += static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
+            return matrix;
+        };
+        const auto h_rows = config.hidden;
+        const auto i_rows = config.intermediate;
+        for (const LayerWeights& w : impl.layers) {
+            impl.dense.push_back({decode(w.query, q_rows, h_rows), decode(w.key, kv_rows, h_rows),
+                                  decode(w.value, kv_rows, h_rows), decode(w.output, h_rows, q_rows),
+                                  decode(w.gate, i_rows, h_rows), decode(w.up, i_rows, h_rows),
+                                  decode(w.down, h_rows, i_rows)});
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
 
     ops::encoder_attention_prewarm();
@@ -339,6 +403,14 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     };
     ops::rmsnorm(x, opening_norm(0), config.rms_epsilon, /*unit_offset*/ config.gemma, h, stream);
 
+    // Long forwards run the projections on the BF16 copies, when there are any.
+    const bool dense = !impl.dense.empty() && total >= impl.dense_min_tokens;
+    const auto dense_linear = [&](const void* weight, std::int32_t rows, std::int32_t columns,
+                                  const Tensor& in, Tensor& out) {
+        ops::detail::bf16_cublaslt_gemm_raw(weight, rows, columns, in.data, total, out.data, rows,
+                                            0.0F, stream);
+    };
+
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
         const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
         const bool global         = config.is_global(layer);
@@ -348,9 +420,16 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         // Every projection runs once over the whole batch: the sequences are
         // adjacent columns and a GEMM does not care where one ends. h is the
         // input norm of x.
-        ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
-                                    {impl.matrix(w.key, config.kv_size(), config.hidden), key},
-                                    {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
+        if (dense) {
+            const Impl::DenseLayer& d = impl.dense[static_cast<std::size_t>(layer)];
+            dense_linear(d.query, config.query_size(), config.hidden, h, query);
+            dense_linear(d.key, config.kv_size(), config.hidden, h, key);
+            dense_linear(d.value, config.kv_size(), config.hidden, h, value);
+        } else {
+            ops::linear_projections(h, {{impl.matrix(w.query, config.query_size(), config.hidden), query},
+                                        {impl.matrix(w.key, config.kv_size(), config.hidden), key},
+                                        {impl.matrix(w.value, config.kv_size(), config.hidden), value}}, nullptr, stream);
+        }
 
         // Per-head QK norm, then RoPE. Each head's features are contiguous, so the
         // [head_dim, heads, tokens] view is exactly the rows the norm reduces over -- and
@@ -402,8 +481,13 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
             }
         }
 
-        ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
-                    stream);
+        if (dense) {
+            dense_linear(impl.dense[static_cast<std::size_t>(layer)].output, config.hidden,
+                         config.query_size(), attn_out, attn);
+        } else {
+            ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
+                        stream);
+        }
         // x += post_attention_norm(attn), then h = pre_feedforward_norm(x): one pass over the
         // planes where an in-place norm, a residual add and a norm were three, with their bits.
         const Tensor pre_feedforward_norm = impl.norm(w.pre_feedforward_norm, config.hidden);
@@ -416,12 +500,23 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
         }
 
         // --- MLP, between the other two ------------------------------------
-        ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
-                                    {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
+        if (dense) {
+            const Impl::DenseLayer& d = impl.dense[static_cast<std::size_t>(layer)];
+            dense_linear(d.gate, config.intermediate, config.hidden, h, gate);
+            dense_linear(d.up, config.intermediate, config.hidden, h, up);
+        } else {
+            ops::linear_projections(h, {{impl.matrix(w.gate, config.intermediate, config.hidden), gate},
+                                        {impl.matrix(w.up, config.intermediate, config.hidden), up}}, nullptr, stream);
+        }
         // gelu_pytorch_tanh, per the checkpoint's hidden_activation.
         if (config.gemma) { ops::gelu_mul(gate, up, ops::GeluMode::Tanh, gate, stream); }
         else { ops::silu_mul(gate, up, gate, stream); }
-        ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
+        if (dense) {
+            dense_linear(impl.dense[static_cast<std::size_t>(layer)].down, config.hidden,
+                         config.intermediate, gate, attn);
+        } else {
+            ops::linear(gate, impl.matrix(w.down, config.hidden, config.intermediate), attn, stream);
+        }
         // x += post_feedforward_norm(attn), then h = the next layer's input norm of x -- or
         // after the last layer, the final norm.
         const Tensor next_norm = opening_norm(layer + 1);
