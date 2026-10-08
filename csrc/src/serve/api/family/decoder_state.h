@@ -215,6 +215,8 @@ struct DecoderState {
     [[nodiscard]] std::size_t checkpoint_peak_bytes() const noexcept;
     void reset_checkpoint_peak() noexcept;
     [[nodiscard]] std::size_t checkpoint_reservation_bytes() const noexcept;
+    /// Turn checkpoints the store can hold at once; zero when a lane has no state to keep.
+    [[nodiscard]] std::uint32_t checkpoint_capacity() const noexcept;
     void flush_checkpoint_releases();
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;

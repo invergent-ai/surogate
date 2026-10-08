@@ -369,6 +369,10 @@ std::size_t DecoderState::checkpoint_reservation_bytes() const noexcept {
     return checkpoints_ ? checkpoints_->layout.reservation_bytes() : 0;
 }
 
+std::uint32_t DecoderState::checkpoint_capacity() const noexcept {
+    return checkpoints_ && checkpoints_->layout.slot_bytes ? checkpoints_->layout.capacity : 0;
+}
+
 std::size_t DecoderState::checkpoint_peak_bytes() const noexcept {
     return checkpoints_ ? std::max(checkpoints_->peak_bytes, checkpoint_mapped_bytes()) : 0;
 }

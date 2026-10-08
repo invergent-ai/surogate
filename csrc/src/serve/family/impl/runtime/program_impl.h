@@ -4832,6 +4832,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+
+    out.conversation_checkpoints      = decoder->checkpoint_capacity();
+    out.conversation_checkpoint_bytes = decoder->checkpoint_reservation_bytes();
     return out;
 }
 

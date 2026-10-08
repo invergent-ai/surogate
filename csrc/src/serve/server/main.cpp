@@ -222,6 +222,11 @@ int main(int argc, char** argv) {
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes);
+        if (memory.conversation_checkpoints != 0) {
+            capacity << " turn-checkpoints=" << memory.conversation_checkpoints << 'x'
+                     << format_bytes(memory.conversation_checkpoint_bytes /
+                                     memory.conversation_checkpoints);
+        }
         if (options.gpu_memory_limit_bytes != 0) {
             // free-after-weights and free-after-startup above are within this budget.
             capacity << " gpu-memory-limit=" << format_bytes(options.gpu_memory_limit_bytes);
