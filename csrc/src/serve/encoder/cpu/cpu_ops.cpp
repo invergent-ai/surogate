@@ -845,7 +845,12 @@ const char* gemm_backend_name() {
     case GemmBackend::Builtin:
         break;
     }
+    // Off x86 the builtin is the plain C++ loops, not the AVX-512 microkernel.
+#if defined(__x86_64__)
     return "builtin-avx512";
+#else
+    return "builtin-scalar";
+#endif
 }
 
 
