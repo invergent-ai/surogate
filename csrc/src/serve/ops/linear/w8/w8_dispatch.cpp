@@ -145,11 +145,10 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     // gemma-3-270m, hidden 640: attention query (4 x 256), key and value (1 x 256),
     // the two MLP projections, and the tied lm head. 640 is not a multiple of 256,
-    // so -- exactly as for EmbeddingGemma's 1152 below -- the MMA routes cannot
-    // take any of these shapes: their 16-byte scale-row staging would read eight
-    // bytes off on every odd row, and `launch_route` throws rather than do it.
-    // SIMT loads scales narrowly and is exact at any k. This is a correctness
-    // constraint, not a tuning choice.
+    // so only the row-split MMA routes could take these shapes, staging 8-byte
+    // aligned scale rows in halves as they do for EmbeddingGemma's 1152 below; every
+    // other MMA family would read eight bytes off on every odd row. Nobody has
+    // measured them there, so they stay on SIMT, which is exact at any k.
     case 640:
         switch (n) {
         case 1024:
@@ -164,13 +163,15 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 1152:
         // EmbeddingGemma's MLP down projection, and the one k here that is not a
-        // multiple of 256 -- so the MMA routes cannot take it at all: their
-        // 16-byte scale-row staging would read eight bytes off on every odd row.
-        // SIMT loads scales narrowly and is exact at any k. This is a correctness
-        // constraint, not a tuning choice, and it is enforced in launch_route.
+        // multiple of 256. Its scale rows start only 8-byte aligned, which the
+        // row-split MMA routes stage in two halves (k % 128 == 0, checked in
+        // launch_route); the other MMA families would read eight bytes off on every
+        // odd row. On SIMT this GEMM was 63% of a 32 x 220-token request on a DGX
+        // Spark: 4.96 ms a layer against 144 us for each MMA projection beside it.
         if (n == 768) { // mlp down
             if (t <= 16) { return launch_w8_simt_r8_c4; }
-            return launch_w8_simt_r8_c8;
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
         }
         break;
     case 1024:

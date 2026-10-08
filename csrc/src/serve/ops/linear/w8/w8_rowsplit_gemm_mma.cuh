@@ -63,7 +63,7 @@ __device__ __forceinline__ int w8g32_swz64(int row, int col) {
 }
 
 template <class Cfg, bool Full, W8Epilogue Epilogue = W8Epilogue::Store,
-          class Output = W8ContiguousOutput>
+          class Output = W8ContiguousOutput, bool ScaleRows8 = false>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, std::int32_t m, std::int32_t k,
@@ -165,7 +165,20 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 const int grow =
                     kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
                 auto* dst = &Sr[row * Cfg::SCALE_CACHE_BYTES];
-                if constexpr (Full) {
+                if constexpr (ScaleRows8) {
+                    // A scale row is `kg` binary16 values. When kg % 8 != 0 (k % 256 != 0,
+                    // EmbeddingGemma's k = 1152) rows start only 8-byte aligned -- the launcher
+                    // requires that much -- so the row's eight-group cache is filled as two
+                    // 8-byte halves, zero past the row's end.
+                    const bool valid_row   = output_tile.valid(grow, m);
+                    const int valid_scales = valid_row ? min(8, kg - g0) : 0;
+                    const int low          = min(4, valid_scales);
+                    const std::uint8_t* src =
+                        &scales[(static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0) * 2];
+                    sinfer::ops::cp_async_zfill<8>(dst, src, low * 2);
+                    sinfer::ops::cp_async_zfill<8>(dst + 8, valid_scales > 4 ? src + 8 : src,
+                                                   (valid_scales - low) * 2);
+                } else if constexpr (Full) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                 } else {

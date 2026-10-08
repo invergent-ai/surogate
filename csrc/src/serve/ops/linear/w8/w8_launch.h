@@ -22,6 +22,12 @@ namespace sinfer::ops::detail {
 // on the SIMT routes.
 inline constexpr std::int32_t kW8MmaScaleRowAlignmentK = 256;
 
+// The runtime-shaped row-split GEMM (w8_rowsplit_gemm_mma.cuh) is the exception: it stages a
+// row that starts only 8 bytes aligned as two 8-byte copies, so it needs `k % 128 == 0`. That
+// is what puts EmbeddingGemma's MLP down projection (k = 1152) on tensor cores. Every other
+// MMA family, and the generic fallback in w8_dispatch.cpp, keeps the 256 rule.
+inline constexpr std::int32_t kW8RowSplitMmaScaleRowAlignmentK = 128;
+
 // The MMA routes are given the same row-alignment floor the Marlin band needs, and the reason
 // is what the shape that found it went on to prove.
 //

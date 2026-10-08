@@ -21,18 +21,31 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::BM)),
                     static_cast<unsigned>(div_up(cols, Schedule::BN)), 1u);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), rows};
-    w8_rowsplit_gemm_mma_kernel<Schedule, Full><<<grid, Schedule::THREADS, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
+    const auto launch = [&](auto kernel) {
+        kernel<<<grid, Schedule::THREADS, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
+    };
+    // Scale rows of k % 256 != 0 start only 8-byte aligned and are staged in halves; every
+    // other shape keeps the kernel it had.
+    if ((padded_k % kW8MmaScaleRowAlignmentK) != 0) {
+        launch(w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, W8ContiguousOutput,
+                                           true>);
+    } else {
+        launch(w8_rowsplit_gemm_mma_kernel<Schedule, Full>);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    if ((w.k % kW8MmaScaleRowAlignmentK) != 0) {
+    // The row-split kernel stages a scale row that is only 8-byte aligned in two halves, so it
+    // needs k % 128 == 0 rather than the 256 the other MMA families do (w8_launch.h).
+    if ((w.padded_shape[1] % kW8RowSplitMmaScaleRowAlignmentK) != 0 ||
+        (w.padded_shape[1] % Schedule::BK) != 0) {
         throw std::invalid_argument(
-            "w8 MMA route requires k % 256 == 0 for 16-byte-aligned scale rows; k=" +
-            std::to_string(w.k) + " must use a SIMT route");
+            "w8 row-split MMA route requires k % 128 == 0 for 8-byte-aligned scale rows; k=" +
+            std::to_string(w.padded_shape[1]) + " must use a SIMT route");
     }
     const bool full = (w.n % Schedule::BM) == 0 && (x.ne[1] % Schedule::BN) == 0 &&
                       w.k == w.padded_shape[1] && (w.k % Schedule::BK) == 0;
