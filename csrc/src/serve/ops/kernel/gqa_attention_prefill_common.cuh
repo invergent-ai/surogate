@@ -38,6 +38,22 @@ static_assert(kGqaPrefillSmemBytes<256> == 65536);
 // The 512-wide arena may not exceed it either: 101,376 bytes is what the card opts in to.
 static_assert(kGqaPrefillSmemBytes<512> == 98304);
 
+// An e4m3 cache can't be staged with cp.async straight into the bf16 tiles: its codes have to
+// be widened on the way. Where the arena has room, the kernel lands the next key block's raw
+// codes, K and V, with cp.async into a second arena behind the tiles a whole iteration ahead and
+// widens them in shared memory, so the cache reads overlap the tensor-core work as the bf16
+// cache's do. A 512-wide head has no room and widens straight from global memory.
+template <int HeadDim>
+inline constexpr int kGqaPrefillFp8RawBytes = 2 * kGqaPrefillBcFor<HeadDim> * HeadDim;
+template <int HeadDim>
+inline constexpr bool kGqaPrefillFp8Raw =
+    kGqaPrefillSmemBytes<HeadDim> + kGqaPrefillFp8RawBytes<HeadDim> <= 101376;
+template <int HeadDim>
+inline constexpr int kGqaPrefillFp8SmemBytes =
+    kGqaPrefillSmemBytes<HeadDim> + (kGqaPrefillFp8Raw<HeadDim> ? kGqaPrefillFp8RawBytes<HeadDim> : 0);
+static_assert(kGqaPrefillFp8SmemBytes<256> == 81920);
+static_assert(!kGqaPrefillFp8Raw<512>);
+
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
     /// Causal sliding window, zero for unbounded. A query at absolute position i

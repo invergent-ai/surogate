@@ -174,8 +174,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     // Both dtype-specialized kernels size their arena from the geometry's head
     // dimension; at 256 both exceed the default 48 KiB dynamic-smem ceiling, and
     // raising the limit for a kernel that would fit anyway is harmless.
-    constexpr int kSmemBytes   = kGqaPrefillSmemBytes<Geometry::HeadDim>;
-    constexpr int kI8SmemBytes = kGqaPrefillI8SmemBytes<Geometry::HeadDim>;
+    constexpr int kSmemBytes    = kGqaPrefillSmemBytes<Geometry::HeadDim>;
+    constexpr int kFp8SmemBytes = kGqaPrefillFp8SmemBytes<Geometry::HeadDim>;
+    constexpr int kI8SmemBytes  = kGqaPrefillI8SmemBytes<Geometry::HeadDim>;
     CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
     if constexpr (kGqaI8PrefillRegistered<Geometry>) {
@@ -208,9 +209,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         if (selection.words != nullptr) {
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kFp8SmemBytes));
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>
-                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
+                <<<attention_grid, kGqaPrefillThreads, kFp8SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const std::uint8_t*>(cache_k.data),
                     static_cast<const std::uint8_t*>(cache_v.data), metadata,
@@ -219,9 +220,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         } else {
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kFp8SmemBytes));
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
-                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
+                <<<attention_grid, kGqaPrefillThreads, kFp8SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const std::uint8_t*>(cache_k.data),
                     static_cast<const std::uint8_t*>(cache_v.data), metadata,

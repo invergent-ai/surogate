@@ -121,6 +121,49 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const C
     }
 }
 
+// Land one [Bc, D] block of e4m3 codes in the raw arena with cp.async, unswizzled. Keys past
+// max_query_abs are zeroed, which widens to +0, for the same reason gqa_prefill_stage_kv zeroes
+// them: a stale code can be a NaN.
+template <typename Geometry>
+__device__ __forceinline__ void gqa_prefill_stage_raw_fp8(std::uint8_t* dst,
+                                                          const std::uint8_t* cache, int kv_head,
+                                                          int k0, int max_query_abs,
+                                                          int physical_page, int tid) {
+    constexpr int D         = Geometry::HeadDim;
+    constexpr int Bc        = kGqaPrefillBcFor<Geometry::HeadDim>;
+    constexpr int VecPerRow = D / 16; // 16 codes per 16B cp.async
+    const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    const std::uint8_t* cache_block =
+        cache + paged_kv_element_offset<D, Geometry::KVHeads>(physical_page, kv_head,
+                                                              k0 & kPagedKVPageMask, 0);
+#pragma unroll
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += kGqaPrefillThreads) {
+        const int key_l = chunk / VecPerRow;
+        const int d     = (chunk % VecPerRow) * 16;
+        if (full_tile || (k0 + key_l) <= max_query_abs) {
+            cp_async<16, Cache::cg>(&dst[key_l * D + d], &cache_block[key_l * D + d]);
+        } else {
+            store_vec(&dst[key_l * D + d], make_int4(0, 0, 0, 0));
+        }
+    }
+}
+
+// Widen a raw block into the swizzled bf16 tile, with the codec gqa_prefill_stage_kv uses, so
+// the tile holds the same bits either way.
+template <int D>
+__device__ __forceinline__ void gqa_prefill_widen_fp8(__nv_bfloat16* dst, const std::uint8_t* raw,
+                                                      int tid) {
+    constexpr int Bc        = kGqaPrefillBcFor<D>;
+    constexpr int VecPerRow = D / 8;
+#pragma unroll
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += kGqaPrefillThreads) {
+        const int key_l = chunk / VecPerRow;
+        const int d     = (chunk % VecPerRow) * 8;
+        store_vec(&dst[key_l * D + gqa_prefill_swz(key_l, d)],
+                  gqa_kv_dequant_fp8x8_raw(load_vec<int2>(&raw[key_l * D + d])));
+    }
+}
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]). The grid's q_heads
@@ -164,6 +207,10 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
     __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
+    // e4m3 codes of the next key block (kGqaPrefillFp8Raw), K then V, [Bc, D] each.
+    constexpr bool kRawFp8 = GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8Raw<D>;
+    std::uint8_t* k_raw    = reinterpret_cast<std::uint8_t*>(v_s + Bc * D);
+    std::uint8_t* v_raw    = k_raw + Bc * D;
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -274,11 +321,20 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     // always indexed it this way.
     int physical_page    = block_table[(n_block_min * Bc) >> kPagedKVPageShift];
 
-    // Prologue: commit Q, then kick off the first key block the loop will read.
-    // The loop's wait<0> below drains both.
+    // Prologue: commit Q, then kick off the first key block the loop will read (K, or the raw
+    // K and V codes). The loop's wait<0> below drains both.
     sinfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, n_block_min * Bc, max_query_abs,
-                                           physical_page, tid);
+    if constexpr (kRawFp8) {
+        const auto* codes_k = reinterpret_cast<const std::uint8_t*>(cache_k);
+        const auto* codes_v = reinterpret_cast<const std::uint8_t*>(cache_v);
+        gqa_prefill_stage_raw_fp8<Geometry>(k_raw, codes_k, kv_head, n_block_min * Bc,
+                                            max_query_abs, physical_page, tid);
+        gqa_prefill_stage_raw_fp8<Geometry>(v_raw, codes_v, kv_head, n_block_min * Bc,
+                                            max_query_abs, physical_page, tid);
+    } else {
+        gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, n_block_min * Bc,
+                                               max_query_abs, physical_page, tid);
+    }
     sinfer::ops::cp_commit();
 
     for (int kb = n_block_min; kb < n_block_max; ++kb) {
@@ -289,10 +345,28 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         sinfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
-        // Overlap V(kb) load against the QK MMA below.
-        gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
-                                       tid);
-        sinfer::ops::cp_commit();
+        if constexpr (kRawFp8) {
+            // Widen this block's codes into the tiles the previous block's MMAs are done with,
+            // then land the next block's codes behind this block's whole QK, softmax and PV.
+            gqa_prefill_widen_fp8<D>(k_s, k_raw, tid);
+            gqa_prefill_widen_fp8<D>(v_s, v_raw, tid);
+            __syncthreads();
+            if (kb + 1 < n_block_max) {
+                physical_page       = next_physical_page;
+                const auto* codes_k = reinterpret_cast<const std::uint8_t*>(cache_k);
+                const auto* codes_v = reinterpret_cast<const std::uint8_t*>(cache_v);
+                gqa_prefill_stage_raw_fp8<Geometry>(k_raw, codes_k, kv_head, (kb + 1) * Bc,
+                                                    max_query_abs, physical_page, tid);
+                gqa_prefill_stage_raw_fp8<Geometry>(v_raw, codes_v, kv_head, (kb + 1) * Bc,
+                                                    max_query_abs, physical_page, tid);
+                sinfer::ops::cp_commit();
+            }
+        } else {
+            // Overlap V(kb) load against the QK MMA below.
+            gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs,
+                                                   physical_page, tid);
+            sinfer::ops::cp_commit();
+        }
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -477,15 +551,17 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         m0 = nm0;
         m1 = nm1;
 
-        sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
-        __syncthreads();
+        if constexpr (!kRawFp8) {
+            sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+            __syncthreads();
 
-        // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-        if (kb + 1 < n_block_max) {
-            physical_page = next_physical_page;
-            gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                           physical_page, tid);
-            sinfer::ops::cp_commit();
+            // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
+            if (kb + 1 < n_block_max) {
+                physical_page = next_physical_page;
+                gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc,
+                                                       max_query_abs, physical_page, tid);
+                sinfer::ops::cp_commit();
+            }
         }
 
         // Form each tile output before rescaling it. P is rounded against
