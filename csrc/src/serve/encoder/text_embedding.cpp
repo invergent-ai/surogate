@@ -1,6 +1,7 @@
 #include "encoder/embedding_input.h"
 #include "encoder/text_embedding.h"
 
+#include "api/ops/batch_invariant.h"
 #include "api/ops/cast.h"
 #include "api/ops/embedding.h"
 #include "api/ops/encoder_attention.h"
@@ -91,7 +92,8 @@ struct TextEmbedding::Impl {
     /// tokens run on cuBLASLt instead of the W8 kernels. Decoded once at load by the W8
     /// embedding gather, whose rounding is the one the W8 kernels apply to every tile they
     /// stage, so both routes multiply the same BF16 values. Empty when
-    /// SUROGATE_SERVE_ENCODER_DENSE_TOKENS=0, or for a model cuBLASLt cannot take.
+    /// SUROGATE_SERVE_ENCODER_DENSE_TOKENS=0, under --batch-invariant, or for a model cuBLASLt
+    /// cannot take.
     struct DenseLayer {
         const void* query;
         const void* key;
@@ -210,8 +212,9 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     // The projections on BF16 copies through cuBLASLt, for every forward by default. The W8
     // kernels dequantise each weight tile again in every CTA that stages it; on a DGX Spark the
     // copies took EmbeddingGemma's GEMM time from 461 to 337 ms over 16 requests of 32 texts and
-    // lifted each of four measured loads by 15-18%, for 203 MB more device memory. SUROGATE_SERVE_ENCODER_DENSE_TOKENS=N runs only forwards of N tokens or more on
-    // them, and 0 keeps every forward on the W8 kernels without making the copies.
+    // lifted each of four measured loads by 15-18%, for 203 MB more device memory.
+    // SUROGATE_SERVE_ENCODER_DENSE_TOKENS=N runs only forwards of N tokens or more on them, and 0
+    // keeps every forward on the W8 kernels without making the copies.
     if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_DENSE_TOKENS"); raw != nullptr && *raw != '\0') {
         const long value = std::strtol(raw, nullptr, 10);
         if (value < 0 || value > (1L << 20)) {
@@ -219,6 +222,11 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
         }
         impl.dense_min_tokens = static_cast<std::int32_t>(value);
     }
+    // cuBLASLt picks its algorithm per forward width, so on the copies a text's vector moves with
+    // the requests it shares a forward with: min cosine 0.9993 against the same text alone over
+    // 240 mixed requests on a DGX Spark, where the W8 kernels give 1.0. --batch-invariant keeps
+    // every forward on those; bf16_invariant_gemm on the copies measured slower than them.
+    if (ops::batch_invariant()) { impl.dense_min_tokens = 0; }
     // cuBLASLt's raw route takes extents that are multiples of 8, and the copy cannot undo a
     // column permutation a GGUF-sourced weight may carry; either keeps the model on W8.
     const bool dense_shapes = query_size % 8 == 0 && config.kv_size() % 8 == 0 && hidden % 8 == 0 &&

@@ -23,6 +23,7 @@
 // covers the microsecond gaps between phases instead of starving a second team.
 // It must be an environment variable because libgomp reads it before main.
 
+#include "api/ops/batch_invariant.h"
 #include "core/device.h"
 #include "encoder/options.h"
 #include "encoder/embedding_request.h"
@@ -66,6 +67,10 @@ int main(int argc, char** argv) {
         const auto& host = options.host;
         const auto& device = options.device;
         const int port = options.port;
+        // Before the model loads: the GPU encoder decides at load whether to make the BF16
+        // copies its fastest route needs, and that route is the one that is not invariant.
+        sinfer::ops::set_batch_invariant(options.batch_invariant);
+        if (options.batch_invariant) { std::fputs("batch-invariant numerics enabled\n", stderr); }
 
         // One of the two encoders, behind the same three calls the handler uses.
         std::unique_ptr<sinfer::DeviceContext> gpu_device;

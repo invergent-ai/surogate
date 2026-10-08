@@ -59,6 +59,14 @@ int main() {
         check(parse_options(argv.size(), argv.data()).served_model_name == name,
               "native model ID preserves supplied argument");
     }
+    for (const bool invariant : {false, true}) {
+        std::vector<std::string> arguments{"embed", "model.sinfer"};
+        if (invariant) { arguments.emplace_back("--batch-invariant"); }
+        std::vector<char*> argv;
+        for (auto& argument : arguments) { argv.push_back(argument.data()); }
+        check(parse_options(argv.size(), argv.data()).batch_invariant == invariant,
+              "--batch-invariant parsed");
+    }
 
     const auto full = encode_embedding({3.0F, 4.0F, 12.0F}, 3, false);
     check(full == Json::array({3.0F, 4.0F, 12.0F}), "full-size output unchanged");

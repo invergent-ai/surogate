@@ -15,6 +15,8 @@ struct Options {
     std::string served_model_name;
     int port = 8413;
     int device_index = 0;
+    // --batch-invariant: a text's vector does not depend on what else shares its forward.
+    bool batch_invariant = false;
 };
 
 inline int parse_integer(std::string_view value, const char* flag, int minimum, int maximum) {
@@ -48,6 +50,8 @@ inline Options parse_options(int argc, char** argv) {
             if (options.served_model_name.empty()) {
                 throw std::invalid_argument("--served-model-name must not be empty");
             }
+        } else if (arg == "--batch-invariant") {
+            options.batch_invariant = true;
         } else if (arg == "--device") {
             options.device = next();
             if (options.device != "cpu") {
@@ -67,9 +71,12 @@ inline Options parse_options(int argc, char** argv) {
 
 inline std::string usage_text(const char* program) {
     return std::string("usage: ") + program +
-           " <model.sinfer> [--host H] [--port N] [--device N|cpu] [--served-model-name NAME]\n"
+           " <model.sinfer> [--host H] [--port N] [--device N|cpu] [--served-model-name NAME]"
+           " [--batch-invariant]\n"
            "Serve /v1/embeddings. Defaults: host 127.0.0.1, port 8413, device 0.\n"
-           "The served model name defaults to the supplied model argument.\n";
+           "The served model name defaults to the supplied model argument.\n"
+           "--batch-invariant makes a text's vector independent of the requests it is batched\n"
+           "with, for some GPU throughput.\n";
 }
 
 } // namespace sinfer::encoder
