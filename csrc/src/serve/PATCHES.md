@@ -4522,3 +4522,78 @@ first change and 1.08-1.11x more from the second (72.2 TFLOP/s at 32k).
 Tests. `sinfer_gqa_attention_test`, `sinfer_gqa_long_context_test`, `sinfer_sparse_gqa_batch_test`
 and `sinfer_mixed_attention_workspace_test` pass on the Spark. A 9,277-token summary at temperature
 0 is identical through the cp.async change and differs in one word after the running maximum.
+
+## 119
+
+**Prompt attention over an FP8 cache takes its query-key product in FP8 (2026-10-08, after #118).**
+After #118 the cold 108,173-token prompt to the 35B NVFP4 on a DGX Spark took 33.5 s to its first
+token, against vLLM 0.31's 32.4 s, and the prompt kernel still ran its Q Kᵀ on bf16 tensor cores
+over K codes it first widened to bf16.
+
+- **`gqa_prefill_quantize_q_fp8`** (`ops/kernel/gqa_attention_prefill_bf16.cuh`) rounds each query
+  row of the tile to e4m3 against its own absolute maximum, and the kernel's `QkFp8` variant
+  multiplies those codes with the cache's K codes straight from their cp.async slot, m16n8k32 on the
+  e4m3 tensor cores (twice the bf16 rate), scaling each score row by its query scale. Only V is still
+  widened. The arena (`kGqaPrefillFp8QkSmemBytes`, 49,408 bytes at head dim 256) holds one block of
+  codes, so two CTAs share an SM; a two-slot variant that lands codes a full block ahead, one CTA to
+  an SM, was slower (27.6 s) and is gone.
+- Head dims 128 and 256, dense prompts, every GPU the tensor-core prompt kernel serves (all but
+  Hopper, whose FlashAttention-3 FP8 kernel already rounds queries and probabilities to e4m3).
+  **`ops::prompt_attention_fp8_query`** is on by default; `SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK=0`
+  starts the process with the bf16 product. `--batch-invariant` keeps prompts off this kernel.
+- `sinfer_gqa_attention_test` runs the wide FP8 prompts through the kernel both ways, the FP8 one
+  against an oracle whose queries are rounded the same way, under the bf16 bound.
+
+DGX Spark, the 35B NVFP4 with FP8 KV. Cold prompt as in #118; NLL is the mean of
+`prompt_logprobs` over the first 140,000 and 440,000 characters of wikitext-2's test set (33,633
+and 103,310 tokens); "vs bf16 Q Kᵀ" is the per-token mean |difference| and top-1 agreement. The
+split-KV route (`SUROGATE_SERVE_GQA_PROMPT_KERNEL_MIN_COLUMNS=0`) is a second exact route, for
+scale.
+
+| | bf16 Q Kᵀ | FP8 Q Kᵀ | split-KV route |
+|---|---|---|---|
+| Time to first token | 33.5 s | 24.0 s | |
+| Mean NLL, 32k / 100k | 1.73544 / 1.75340 | 1.73777 / 1.75472 | 1.73571 / – |
+| vs bf16 Q Kᵀ, 32k | | 0.161, 92.2% | 0.156, 92.3% |
+
+With #120 as well, FP8 Q Kᵀ scores 1.73415 / 1.75337 and the exact route 1.73529 / 1.75298: the
+NLL moves between routes by about as much as FP8 moves it. `sinfer_causal_softmax_attention_bench
+--entry cached --kv-dtype fp8`, 2,048-token chunks: head dim 256 (16 over 2) 1.83x with no context
+up to 2.09x at 98k (52.5 -> 109.6 TFLOP/s); its 256-key chunks 1.33-2.08x; head dim 128 (32 over
+8) 1.05-1.39x.
+
+## 120
+
+**One-kernel Gated DeltaNet prefill (2026-10-08, after #119).** The chunked prefill ran three
+kernels: prepare_wy_wu wrote W and U, state_passing walked the chunks writing v_new and every
+chunk's state, and output read them all back. On a DGX Spark that workspace traffic is most of
+the time: 11.9 ms for 16,384 tokens of the 35B's 32 value heads, about 2.3 s of a cold 108k prompt,
+where vLLM's fused FlashInfer kernel spends about 0.44 s.
+
+- **`chunked/fused.cuh`** walks one value head's whole prompt in one CTA of eight warps, 64 tokens
+  a chunk, with the head's 128x128 FP32 state in registers (sixteen value rows a warp). Only Q, K,
+  V, the gates, the output and the end state cross memory. Four warps build T with
+  prepare_wy_wu's own triangular solve while the other four take the decayed causal Q Kᵀ; every
+  product is taken transposed, value rows first, so the register state is the A operand; the
+  next chunk's tiles land by cp.async a phase ahead. 88,576 bytes of shared memory.
+- Precision: the state is rounded to bf16 at every chunk boundary, as state_passing rounds it, so
+  a prompt split across prefill calls keeps its bits; delta enters the state update as bf16, as
+  FLA's chunked kernels take it (state_passing keeps it TF32).
+- It is the default where one CTA a value head at least half fills the GPU (`2 * value heads >=
+  SMs`: the Spark, for the 35B and the 27B); larger GPUs keep the staged kernels, unmeasured against
+  it. `SUROGATE_SERVE_GDN_PREFILL=fused` or `=staged` overrides.
+- `sinfer_gated_delta_net_bench` allocated FP32 states the Op no longer takes and did not compile;
+  it passes BF16 ones.
+
+`sinfer_gated_delta_net_bench --chunked-only --qk-heads 16`, DGX Spark, cold L2, median:
+
+| Value heads, tokens | staged | fused | |
+|---|---|---|---|
+| 32, 4,096 | 2,822.9 µs | 724.7 µs | 3.90x |
+| 32, 16,384 | 11,855.6 µs | 2,769.6 µs | 4.28x |
+| 32, 65,536 | 48,872.1 µs | 10,943.1 µs | 4.47x |
+| 48, 16,384 | 15,531.6 µs | 2,853.5 µs | 5.44x |
+
+Cold 108,173-token prompt to the 35B NVFP4: 33.5 -> 31.7 s with the bf16 Q Kᵀ, 24.0 -> 22.3 s with
+#119's FP8 one (vLLM 0.31: 32.4 s). Wikitext NLL 1.73529 / 1.75298 against the staged path's
+1.73544 / 1.75340 (#119's table). `sinfer_gated_delta_net_test` passes either way.
