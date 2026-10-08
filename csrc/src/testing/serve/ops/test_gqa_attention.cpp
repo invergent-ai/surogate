@@ -2241,8 +2241,9 @@ int verify_workspace_capacity_contract() {
 // kernels for rows, whose sums FA3's FP8 accumulator would lose over a long history (see
 // test_gqa_long_context.cpp); --batch-invariant keeps the split-KV tiles,
 // which read the same codes with BF16 queries and keep the BF16 bound. Elsewhere the default run
-// takes the tensor-core prompt kernel from 64 columns (BF16 queries over the widened codes), and
-// the tiles below that. Keys and queries span [-2, 2], so scores reach the peaked softmax a QK-normed model
+// takes the tensor-core prompt kernel from 64 columns, and the tiles below that. The prompt kernel
+// runs twice: with BF16 queries over the widened codes, and with its FP8 query-key product
+// (ops::prompt_attention_fp8_query) against an oracle whose queries are rounded the same way. Keys and queries span [-2, 2], so scores reach the peaked softmax a QK-normed model
 // sees, over scattered pages and histories that cross FA3's 128-key tiles.
 int verify_fp8_wide_prompts() {
     struct Case {
@@ -2325,51 +2326,84 @@ int verify_fp8_wide_prompts() {
                 }
             }
         }
-        std::vector<double> reference(q.numel());
-        std::vector<double> scores(keys);
-        for (int col = 0; col < c.tokens; ++col) {
-            const int last  = c.history + col;
-            const int first = c.window > 0 ? std::max(0, last - c.window + 1) : 0;
-            for (int h = 0; h < heads; ++h) {
-                const int g = h / group;
-                const float* query = q_values.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
-                double peak = -std::numeric_limits<double>::infinity();
-                for (int t = first; t <= last; ++t) {
-                    const double* key = kd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
-                    double dot = 0;
-                    for (int d = 0; d < dim; ++d) { dot += query[d] * key[d]; }
-                    scores[t] = dot * scale;
-                    peak      = std::max(peak, scores[t]);
-                }
-                double total = 0;
-                for (int t = first; t <= last; ++t) { total += scores[t] = std::exp(scores[t] - peak); }
-                double* row = reference.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
-                for (int t = first; t <= last; ++t) {
-                    const double* value = vd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
-                    const double weight = scores[t] / total;
-                    for (int d = 0; d < dim; ++d) { row[d] += weight * value[d]; }
+        const auto attend = [&](const std::vector<float>& queries) {
+            std::vector<double> reference(q.numel());
+            std::vector<double> scores(keys);
+            for (int col = 0; col < c.tokens; ++col) {
+                const int last  = c.history + col;
+                const int first = c.window > 0 ? std::max(0, last - c.window + 1) : 0;
+                for (int h = 0; h < heads; ++h) {
+                    const int g = h / group;
+                    const float* query = queries.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
+                    double peak = -std::numeric_limits<double>::infinity();
+                    for (int t = first; t <= last; ++t) {
+                        const double* key = kd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
+                        double dot = 0;
+                        for (int d = 0; d < dim; ++d) { dot += query[d] * key[d]; }
+                        scores[t] = dot * scale;
+                        peak      = std::max(peak, scores[t]);
+                    }
+                    double total = 0;
+                    for (int t = first; t <= last; ++t) { total += scores[t] = std::exp(scores[t] - peak); }
+                    double* row = reference.data() + (static_cast<std::size_t>(col) * heads + h) * dim;
+                    for (int t = first; t <= last; ++t) {
+                        const double* value = vd.data() + (static_cast<std::size_t>(t) * kv_heads + g) * dim;
+                        const double weight = scores[t] / total;
+                        for (int d = 0; d < dim; ++d) { row[d] += weight * value[d]; }
+                    }
                 }
             }
+            return reference;
+        };
+        const std::vector<double> reference = attend(q_values);
+        // The prompt kernel's FP8 query-key product (ops::prompt_attention_fp8_query) rounds each
+        // query row to e4m3 against its own absolute maximum; its oracle rounds the queries the
+        // same way, so the bf16 bound still holds.
+        const bool fp8_query = major != 9 && c.tokens >= 64 && (dim == 128 || dim == 256);
+        std::vector<double> reference_q8;
+        if (fp8_query) {
+            std::vector<float> q8_values(q_values.size());
+            for (std::size_t row = 0; row < q_values.size(); row += dim) {
+                float amax = 0.0F;
+                for (int d = 0; d < dim; ++d) { amax = std::max(amax, std::abs(q_values[row + d])); }
+                const float inv = amax > 0.0F ? 448.0F / amax : 0.0F;
+                const float row_scale = amax * (1.0F / 448.0F);
+                for (int d = 0; d < dim; ++d) {
+                    q8_values[row + d] = fp8_reference_value(fp8_reference_code(q_values[row + d] * inv)) * row_scale;
+                }
+            }
+            reference_q8 = attend(q8_values);
         }
 
         Tensor query_pos = positions.slice(0, c.history, c.tokens);
         const ops::GqaExecutionEnvelope envelope{1, pages * kPagedKVPageSize, c.window};
-        for (const bool invariant : {false, true}) {
-            ops::set_batch_invariant(invariant);
+        struct Run {
+            bool invariant;
+            bool fp8_query;
+        };
+        const bool default_fp8_query = ops::prompt_attention_fp8_query();
+        for (const Run run : {Run{false, false}, Run{false, true}, Run{true, false}}) {
+            if (run.fp8_query && !fp8_query) { continue; }
+            ops::set_batch_invariant(run.invariant);
+            ops::set_prompt_attention_fp8_query(run.fp8_query);
             Tensor out = arena.alloc(DType::BF16, {dim, heads, c.tokens});
             WorkspaceArena scratch(std::max<std::size_t>(256, ops::gqa_attention_workspace_capacity_bytes(
                 dim, heads, kv_heads, cache.dtype, envelope, 1, c.tokens, c.tokens)));
             ops::gqa_attention_cached(q, query_pos, scale, cache, envelope, scratch, out, nullptr);
             cuda_synchronize();
             ops::set_batch_invariant(false);
-            const bool flash = !invariant && major == 9 && c.tokens >= 32;
-            const bool kernel = !invariant && major != 9 && c.tokens >= 64;
+            ops::set_prompt_attention_fp8_query(default_fp8_query);
+            const bool flash = !run.invariant && major == 9 && c.tokens >= 32;
+            const bool kernel = !run.invariant && major != 9 && c.tokens >= 64;
+            const bool q8 = kernel && run.fp8_query;
             const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
                                       " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +
                                       " window=" + std::to_string(c.window) +
-                                      (flash ? " flash-attention-3" : kernel ? " prompt kernel" : " tiles");
+                                      (flash ? " flash-attention-3" : q8 ? " prompt kernel fp8 query" :
+                                       kernel ? " prompt kernel" : " tiles");
             failures += verify_attention(label, bf16_bits_to_double(from_device<std::uint16_t>(out.data, out.numel())),
-                                         reference, flash ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
+                                         q8 ? reference_q8 : reference,
+                                         flash ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
         }
     }
     return failures;

@@ -229,11 +229,11 @@ __device__ __forceinline__ void gqa_prefill_widen_fp8_slice(__nv_bfloat16* dst,
 // the staging and the tiles depend on.
 // `Sparse` adds the QSA block selection (design/INFERENCE.md, phase 4): one bit per block of
 // `SparseBlock` cells for every query row of the chunk. `Sparse == false` is the dense kernel.
-// `QkFp8Slots` (an e4m3 cache only) takes S = Q Kᵀ on the e4m3 tensor cores, with that many raw
-// blocks in flight (kGqaPrefillFp8QkSmemBytes); zero keeps it in bf16.
+// `QkFp8` (an e4m3 cache only) takes S = Q Kᵀ on the e4m3 tensor cores, one raw block in
+// flight (kGqaPrefillFp8QkSmemBytes), two CTAs to an SM; false keeps it in bf16.
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
-          bool Sparse = false, int SparseBlock = 4, int QkFp8Slots = 0>
-__launch_bounds__(kGqaPrefillThreads, QkFp8Slots == 1 ? 2 : 1) __global__
+          bool Sparse = false, int SparseBlock = 4, bool QkFp8 = false>
+__launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const CacheT* __restrict__ cache_k,
                                            const CacheT* __restrict__ cache_v,
@@ -264,16 +264,15 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8Slots == 1 ? 2 : 1) __global__
 
     // e4m3 Q Kᵀ: the Q and K tiles are e4m3 codes, a byte a value, and the contraction steps
     // are 32 wide; the ldmatrix byte geometry is the bf16 one's (gqa_prefill_swz8).
-    constexpr bool kQk8 = QkFp8Slots > 0;
-    static_assert(!kQk8 || (GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8QkRegistered<D> &&
-                            (QkFp8Slots == 1 || QkFp8Slots == 2)));
+    constexpr bool kQk8 = QkFp8;
+    static_assert(!kQk8 || (GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8QkRegistered<D>));
     constexpr unsigned QkRowBytes  = kQk8 ? static_cast<unsigned>(D) : RowBytes;
     constexpr unsigned QkEightRows = QkRowBytes * 8u;
     // e4m3 codes in flight: two [Bc, D] slots each for K and V on the widening path
-    // (kGqaPrefillFp8Raw), QkFp8Slots each for the e4m3 one. Block j's codes live in slot
+    // (kGqaPrefillFp8Raw), one each for the e4m3 one. Block j's codes live in slot
     // (j - n_block_min) % Slots.
     constexpr bool kRawFp8 = GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8Raw<D> && !kQk8;
-    constexpr int Slots    = kQk8 ? QkFp8Slots : 2;
+    constexpr int Slots    = kQk8 ? 1 : 2;
 
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
     __nv_bfloat16* q_s;  // [Br, D] swizzled; e4m3 codes under kQk8
@@ -478,14 +477,8 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8Slots == 1 ? 2 : 1) __global__
         sinfer::ops::cp_wait<0>();
         __syncthreads();
 
-        if constexpr (kQk8) {
-            // Two slots: the next block's codes land behind this whole block. One slot waits
-            // for the barrier after QK, which frees it.
-            if constexpr (Slots == 2) {
-                if (kb + 1 < n_block_max) { stage_qk8(kb + 1, page1); }
-                sinfer::ops::cp_commit();
-            }
-        } else if constexpr (kRawFp8) {
+        // The e4m3 Q Kᵀ path's next block waits for the barrier after QK, which frees its slot.
+        if constexpr (kRawFp8) {
             if (kb + 1 < n_block_max) {
                 gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, kb + 1), codes_v, kv_head,
                                                     (kb + 1) * Bc, max_query_abs, page1, tid);
@@ -495,7 +488,7 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8Slots == 1 ? 2 : 1) __global__
                                                     (kb + 2) * Bc, max_query_abs, page2, tid);
             }
             sinfer::ops::cp_commit();
-        } else {
+        } else if constexpr (!kQk8) {
             // Overlap V(kb) load against the QK MMA below.
             gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs,
                                                    physical_page, tid);
@@ -707,10 +700,8 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8Slots == 1 ? 2 : 1) __global__
 
         if constexpr (kQk8) {
             __syncthreads(); // v_s holds V(kb); every warp is done with this block's codes
-            if constexpr (Slots == 1) {
-                if (kb + 1 < n_block_max) { stage_qk8(kb + 1, page1); }
-                sinfer::ops::cp_commit();
-            }
+            if (kb + 1 < n_block_max) { stage_qk8(kb + 1, page1); }
+            sinfer::ops::cp_commit();
         } else if constexpr (kRawFp8) {
             __syncthreads(); // v_s holds V(kb); every warp is done reading k_s
         } else {

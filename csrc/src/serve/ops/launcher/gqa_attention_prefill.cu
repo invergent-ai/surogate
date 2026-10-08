@@ -8,6 +8,7 @@
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <type_traits>
@@ -132,20 +133,6 @@ void refuse_i8_prefill() {
                                 " bytes, which is not a cp.async transfer width)");
 }
 
-// SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK=1 or 2 takes an e4m3 cache's prompt S = Q Kᵀ on the e4m3
-// tensor cores, with that many blocks of codes in flight (gqa_attention_prefill_bf16.cuh); unset
-// or 0 keeps it in bf16. Q is rounded to e4m3 against each row's maximum, so the scores are not
-// the bf16 product's.
-int prompt_fp8_qk_slots() {
-    static const int value = [] {
-        const char* text = std::getenv("SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK");
-        if (text == nullptr) { return 0; }
-        const std::string_view mode(text);
-        return mode == "1" ? 1 : mode == "2" ? 2 : 0;
-    }();
-    return value;
-}
-
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                float scale, const CacheView& cache,
@@ -234,24 +221,23 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                     static_cast<const std::int32_t*>(positions.data), scale,
                     static_cast<__nv_bfloat16*>(out.data), tokens, selection);
         } else {
-            const auto launch = [&]<int QkSlots>() {
+            const auto launch = [&]<bool QkFp8>() {
                 constexpr int bytes =
-                    QkSlots == 0 ? kFp8SmemBytes
-                                 : kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim, QkSlots>;
+                    QkFp8 ? kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim> : kFp8SmemBytes;
                 CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                     gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
-                                                      QkSlots>,
+                                                      QkFp8>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-                if constexpr (QkSlots == 1) {
+                if constexpr (QkFp8) {
                     // Two CTAs share an SM only when its whole carveout is shared memory.
                     CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                         gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false,
-                                                          4, QkSlots>,
+                                                          4, QkFp8>,
                         cudaFuncAttributePreferredSharedMemoryCarveout,
                         cudaSharedmemCarveoutMaxShared));
                 }
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
-                                                  QkSlots>
+                                                  QkFp8>
                     <<<attention_grid, kGqaPrefillThreads, bytes, stream>>>(
                         static_cast<const __nv_bfloat16*>(q.data),
                         static_cast<const std::uint8_t*>(cache_k.data),
@@ -260,16 +246,13 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                         static_cast<__nv_bfloat16*>(out.data), tokens, selection);
             };
             if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
-                const int qk_slots = prompt_fp8_qk_slots();
-                if (qk_slots == 1) {
-                    launch.template operator()<1>();
-                } else if (qk_slots == 2) {
-                    launch.template operator()<2>();
+                if (::sinfer::ops::prompt_attention_fp8_query()) {
+                    launch.template operator()<true>();
                 } else {
-                    launch.template operator()<0>();
+                    launch.template operator()<false>();
                 }
             } else {
-                launch.template operator()<0>();
+                launch.template operator()<false>();
             }
         }
     } else {
@@ -535,3 +518,26 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
 }
 
 } // namespace sinfer::ops::detail
+
+namespace sinfer::ops {
+namespace {
+
+std::atomic<bool>& prompt_attention_fp8_query_switch() {
+    static std::atomic<bool> value{[] {
+        const char* text = std::getenv("SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK");
+        return text == nullptr || std::string_view(text) != "0";
+    }()};
+    return value;
+}
+
+} // namespace
+
+void set_prompt_attention_fp8_query(bool enabled) noexcept {
+    prompt_attention_fp8_query_switch().store(enabled, std::memory_order_relaxed);
+}
+
+bool prompt_attention_fp8_query() noexcept {
+    return prompt_attention_fp8_query_switch().load(std::memory_order_relaxed);
+}
+
+} // namespace sinfer::ops
