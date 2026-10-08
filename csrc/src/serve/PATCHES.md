@@ -4483,3 +4483,42 @@ running: at 0.5 those turns were 2.4x faster, the new conversations started 2.3x
 fell 12%; 0.25 kept the output.
 
 Tests. The runs above, each without errors or warnings in the server log.
+
+## 118
+
+**Prompt attention over an FP8 cache lands its codes with cp.async and keeps a running maximum
+(2026-10-08, after #117).** On a DGX Spark a cold 108,173-token prompt to the 35B NVFP4 with FP8 KV
+took 42.2 s to its first token, against vLLM 0.31's 32.4 s (on BF16 KV: its FP8 KV does not start on
+GB10), and the prompt kernel `gqa_attention_prefill_bf16_kernel` was 59% of the GPU time. Over an
+e4m3 cache it widened every K and V block to bf16 with plain loads between its barriers, so the
+cache reads did not overlap the tensor cores, and it rescaled the output against each block's own
+maximum.
+
+- **`gqa_prefill_stage_raw_fp8`** (`ops/kernel/gqa_attention_prefill_bf16.cuh`) lands a block's e4m3
+  codes with cp.async in an arena behind the bf16 tiles (`kGqaPrefillFp8SmemBytes`, 96 KiB at head
+  dim 256), two slots each for K and V, a block ahead; **`gqa_prefill_widen_fp8_slice`** widens them
+  in shared memory in slices between the QK and PV MMAs, with the codec of the old path. A 512-wide
+  head has no room and keeps widening from global memory.
+- The kernel's softmax is FlashAttention-2's: P = exp2(S - m) against the running maximum feeds the
+  tensor cores straight into the output, which is rescaled only when a row's maximum moved (a
+  warp vote), and each thread's share of the row sum is added across the quad once, at the end.
+  The prompt bits are no longer the split-KV kernels'; `--batch-invariant` keeps prompts on those.
+
+DGX Spark, the 35B NVFP4 with FP8 KV, one cold 108,173-token prompt (`agentic_long_bench.py
+--agents 1 --start 100000 --max 100500`):
+
+| | main | codes by cp.async | + running maximum | vLLM 0.31 |
+|---|---|---|---|---|
+| Time to first token | 42.2 s | 35.4 s | 33.4 s | 32.4 s |
+| Prefill rate | 2,576 tok/s | 3,076 tok/s | 3,261 tok/s | |
+| Prompt attention, nsys | 28.0 s | 21.1 s | 19.0 s | 14.1 s |
+| GPU kernel time, nsys | 47.5 s | 40.8 s | 38.7 s | 35.1 s |
+
+`sinfer_causal_softmax_attention_bench --entry cached --kv-dtype fp8 --execution graph --cache
+cold`, 2,048-token chunks, head dim 256 (16 query heads over 2): 35.2 -> 47.5 -> 52.7 TFLOP/s at
+98k context, 1.10x then 1.09x with no context. Head dim 128 (32 over 8) gains 1.08-1.59x from the
+first change and 1.08-1.11x more from the second (72.2 TFLOP/s at 32k).
+
+Tests. `sinfer_gqa_attention_test`, `sinfer_gqa_long_context_test`, `sinfer_sparse_gqa_batch_test`
+and `sinfer_mixed_attention_workspace_test` pass on the Spark. A 9,277-token summary at temperature
+0 is identical through the cp.async change and differs in one word after the running maximum.
