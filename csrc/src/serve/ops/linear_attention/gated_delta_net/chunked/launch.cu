@@ -6,9 +6,31 @@
 #include <cuda_bf16.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
+#include <string_view>
 
 namespace sinfer::ops::detail::gated_delta_net {
+namespace {
+
+// The one-kernel prefill (fused.cuh) walks each value head's prompt in one CTA, so it suits a GPU
+// that one CTA a head at least half fills: on a DGX Spark (48 SMs) it runs 4-5x the three staged
+// kernels for the 35B's 32 value heads and the 27B's 48, whose workspace round trips the Spark's
+// memory cannot hide. On larger GPUs the staged path's chunk-parallel stages are unmeasured
+// against it and stay. SUROGATE_SERVE_GDN_PREFILL=fused or =staged overrides.
+bool fused_prefill(std::int32_t value_heads) {
+    static const int forced = [] {
+        const char* text = std::getenv("SUROGATE_SERVE_GDN_PREFILL");
+        if (text == nullptr) { return -1; }
+        const std::string_view mode(text);
+        return mode == "fused" ? 1 : mode == "staged" ? 0 : -1;
+    }();
+    if (forced >= 0) { return forced == 1; }
+    return 2 * value_heads >= current_device_sm_count(170);
+}
+
+} // namespace
+
 std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens) {
     if (tokens <= 0) { return 0; }
     return chunked::workspace_bytes(value_heads, tokens);
@@ -18,6 +40,26 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
                     const Tensor& beta, float scale, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
                     std::size_t workspace_bytes, cudaStream_t stream) {
+    if (fused_prefill(v.ne[1])) {
+        chunked::fused_config fused{};
+        fused.H_qk         = q.ne[1];
+        fused.H_v          = v.ne[1];
+        fused.L            = q.ne[2];
+        fused.q            = static_cast<const __nv_bfloat16*>(q.data);
+        fused.k            = static_cast<const __nv_bfloat16*>(k.data);
+        fused.v            = static_cast<const __nv_bfloat16*>(v.data);
+        fused.g            = static_cast<const float*>(g.data);
+        fused.beta         = static_cast<const float*>(beta.data);
+        fused.state_in     = static_cast<const __nv_bfloat16*>(ssm_state_in.data);
+        fused.state_out    = static_cast<__nv_bfloat16*>(ssm_state_out.data);
+        fused.out          = static_cast<__nv_bfloat16*>(out.data);
+        fused.scale        = scale;
+        fused.valid_tokens = out.ne[2];
+        fused.stream       = stream;
+        CUDA_CHECK(chunked::launch_fused(fused));
+        return;
+    }
+
     const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2]);
     if (workspace == nullptr || workspace_bytes < layout.total_bytes) { throw std::bad_alloc(); }
 

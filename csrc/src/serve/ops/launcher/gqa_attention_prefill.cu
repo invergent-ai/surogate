@@ -8,11 +8,14 @@
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 
+#include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <type_traits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sinfer::ops::detail {
 namespace {
@@ -174,8 +177,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     // Both dtype-specialized kernels size their arena from the geometry's head
     // dimension; at 256 both exceed the default 48 KiB dynamic-smem ceiling, and
     // raising the limit for a kernel that would fit anyway is harmless.
-    constexpr int kSmemBytes   = kGqaPrefillSmemBytes<Geometry::HeadDim>;
-    constexpr int kI8SmemBytes = kGqaPrefillI8SmemBytes<Geometry::HeadDim>;
+    constexpr int kSmemBytes    = kGqaPrefillSmemBytes<Geometry::HeadDim>;
+    constexpr int kFp8SmemBytes = kGqaPrefillFp8SmemBytes<Geometry::HeadDim>;
+    constexpr int kI8SmemBytes  = kGqaPrefillI8SmemBytes<Geometry::HeadDim>;
     CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
     if constexpr (kGqaI8PrefillRegistered<Geometry>) {
@@ -208,25 +212,48 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         if (selection.words != nullptr) {
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kFp8SmemBytes));
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>
-                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
+                <<<attention_grid, kGqaPrefillThreads, kFp8SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const std::uint8_t*>(cache_k.data),
                     static_cast<const std::uint8_t*>(cache_v.data), metadata,
                     static_cast<const std::int32_t*>(positions.data), scale,
                     static_cast<__nv_bfloat16*>(out.data), tokens, selection);
         } else {
-            CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
-                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::uint8_t*>(cache_k.data),
-                    static_cast<const std::uint8_t*>(cache_v.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+            const auto launch = [&]<bool QkFp8>() {
+                constexpr int bytes =
+                    QkFp8 ? kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim> : kFp8SmemBytes;
+                CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                    gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
+                                                      QkFp8>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+                if constexpr (QkFp8) {
+                    // Two CTAs share an SM only when its whole carveout is shared memory.
+                    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false,
+                                                          4, QkFp8>,
+                        cudaFuncAttributePreferredSharedMemoryCarveout,
+                        cudaSharedmemCarveoutMaxShared));
+                }
+                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
+                                                  QkFp8>
+                    <<<attention_grid, kGqaPrefillThreads, bytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::uint8_t*>(cache_k.data),
+                        static_cast<const std::uint8_t*>(cache_v.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+            };
+            if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
+                if (::sinfer::ops::prompt_attention_fp8_query()) {
+                    launch.template operator()<true>();
+                } else {
+                    launch.template operator()<false>();
+                }
+            } else {
+                launch.template operator()<false>();
+            }
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
@@ -491,3 +518,26 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
 }
 
 } // namespace sinfer::ops::detail
+
+namespace sinfer::ops {
+namespace {
+
+std::atomic<bool>& prompt_attention_fp8_query_switch() {
+    static std::atomic<bool> value{[] {
+        const char* text = std::getenv("SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK");
+        return text == nullptr || std::string_view(text) != "0";
+    }()};
+    return value;
+}
+
+} // namespace
+
+void set_prompt_attention_fp8_query(bool enabled) noexcept {
+    prompt_attention_fp8_query_switch().store(enabled, std::memory_order_relaxed);
+}
+
+bool prompt_attention_fp8_query() noexcept {
+    return prompt_attention_fp8_query_switch().load(std::memory_order_relaxed);
+}
+
+} // namespace sinfer::ops

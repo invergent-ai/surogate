@@ -121,6 +121,106 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const C
     }
 }
 
+// Byte offset of code `d` of row `row` in an e4m3 tile whose 16-byte chunks are XOR-swizzled by
+// row, the byte image of gqa_prefill_swz's bf16 tiles: an m16n8k32 e4m3 fragment covers the same
+// 32 bytes of a row as an m16n8k16 bf16 one, so the ldmatrix addressing carries over unchanged.
+template <int D>
+__device__ __forceinline__ int gqa_prefill_swz8(int row, int d) {
+    return row * D + ((((d >> 4) ^ (row & 7)) << 4) | (d & 15));
+}
+
+// Land one [Bc, D] block of e4m3 codes in the raw arena with cp.async, unswizzled for widening or
+// swizzled for the e4m3 tensor cores to read as they are. Keys past max_query_abs are zeroed,
+// which widens to +0, for the same reason gqa_prefill_stage_kv zeroes them: a stale code can be a
+// NaN.
+template <typename Geometry, bool Swizzle = false>
+__device__ __forceinline__ void gqa_prefill_stage_raw_fp8(std::uint8_t* dst,
+                                                          const std::uint8_t* cache, int kv_head,
+                                                          int k0, int max_query_abs,
+                                                          int physical_page, int tid) {
+    constexpr int D         = Geometry::HeadDim;
+    constexpr int Bc        = kGqaPrefillBcFor<Geometry::HeadDim>;
+    constexpr int VecPerRow = D / 16; // 16 codes per 16B cp.async
+    const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    const std::uint8_t* cache_block =
+        cache + paged_kv_element_offset<D, Geometry::KVHeads>(physical_page, kv_head,
+                                                              k0 & kPagedKVPageMask, 0);
+#pragma unroll
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += kGqaPrefillThreads) {
+        const int key_l = chunk / VecPerRow;
+        const int d     = (chunk % VecPerRow) * 16;
+        std::uint8_t* p = &dst[Swizzle ? gqa_prefill_swz8<D>(key_l, d) : key_l * D + d];
+        if (full_tile || (k0 + key_l) <= max_query_abs) {
+            cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
+        } else {
+            store_vec(p, make_int4(0, 0, 0, 0));
+        }
+    }
+}
+
+// Quantize this warp's 16 query rows of the tile to e4m3, each against its own absolute maximum
+// (mapped to 448), into the swizzled e4m3 Q tile, and record each row's scale. A row is D / 8
+// lanes of eight values; rows past `rows_valid` are zero, with a zero scale.
+template <int D>
+__device__ __forceinline__ void gqa_prefill_quantize_q_fp8(std::uint8_t* q8, float* q_scale,
+                                                           const __nv_bfloat16* q_block,
+                                                           int row_stride, int rows_valid,
+                                                           int warp_row0, int lane) {
+    constexpr int LanesPerRow = D / 8;
+    constexpr int RowsPerStep = 32 / LanesPerRow;
+    static_assert(LanesPerRow <= 32 && 16 % RowsPerStep == 0);
+    const int d = (lane % LanesPerRow) * 8;
+#pragma unroll
+    for (int r = 0; r < 16; r += RowsPerStep) {
+        const int row = warp_row0 + r + lane / LanesPerRow;
+        int4 raw      = make_int4(0, 0, 0, 0);
+        if (row < rows_valid) { raw = load_vec<int4>(&q_block[row * row_stride + d]); }
+        const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        float2 x[4];
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            x[i] = __bfloat1622float2(pairs[i]);
+            amax = fmaxf(amax, fmaxf(fabsf(x[i].x), fabsf(x[i].y)));
+        }
+        amax            = warp_max<LanesPerRow>(amax);
+        const float inv = amax > 0.0f ? 448.0f / amax : 0.0f;
+        unsigned codes[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            codes[i] = __nv_cvt_float2_to_fp8x2(make_float2(x[i].x * inv, x[i].y * inv),
+                                                __NV_SATFINITE, __NV_E4M3);
+        }
+        store_vec(&q8[gqa_prefill_swz8<D>(row, d)],
+                  make_int2(static_cast<int>(codes[0] | (codes[1] << 16)),
+                            static_cast<int>(codes[2] | (codes[3] << 16))));
+        if (lane % LanesPerRow == 0) { q_scale[row] = amax * (1.0f / 448.0f); }
+    }
+}
+
+// Widen raw codes into the swizzled bf16 tile, with the codec gqa_prefill_stage_kv uses, so the
+// tile holds the same bits either way. A thread widens the 8-code chunks `tid + i * Threads`;
+// the slice form hands out chunks [begin, end) of those, so a caller can spread one block's
+// widening over the steps of an MMA loop.
+template <int D>
+inline constexpr int kGqaPrefillWidenChunks =
+    kGqaPrefillBcFor<D> * D / 8 / kGqaPrefillThreads;
+
+template <int D>
+__device__ __forceinline__ void gqa_prefill_widen_fp8_slice(__nv_bfloat16* dst,
+                                                            const std::uint8_t* raw, int tid,
+                                                            int begin, int end) {
+    constexpr int VecPerRow = D / 8;
+#pragma unroll
+    for (int i = begin; i < end; ++i) {
+        const int chunk = tid + i * kGqaPrefillThreads;
+        const int key_l = chunk / VecPerRow;
+        const int d     = (chunk % VecPerRow) * 8;
+        store_vec(&dst[key_l * D + gqa_prefill_swz(key_l, d)],
+                  gqa_kv_dequant_fp8x8_raw(load_vec<int2>(&raw[key_l * D + d])));
+    }
+}
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]). The grid's q_heads
@@ -129,9 +229,11 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const C
 // the staging and the tiles depend on.
 // `Sparse` adds the QSA block selection (design/INFERENCE.md, phase 4): one bit per block of
 // `SparseBlock` cells for every query row of the chunk. `Sparse == false` is the dense kernel.
+// `QkFp8` (an e4m3 cache only) takes S = Q Kᵀ on the e4m3 tensor cores, one raw block in
+// flight (kGqaPrefillFp8QkSmemBytes), two CTAs to an SM; false keeps it in bf16.
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
-          bool Sparse = false, int SparseBlock = 4>
-__launch_bounds__(kGqaPrefillThreads, 1) __global__
+          bool Sparse = false, int SparseBlock = 4, bool QkFp8 = false>
+__launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const CacheT* __restrict__ cache_k,
                                            const CacheT* __restrict__ cache_v,
@@ -160,10 +262,40 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     constexpr unsigned EightRows   = RowBytes * 8u;                  // 4096 at D=256
     constexpr unsigned SixteenRows = RowBytes * 16u;                 // 8192 at D=256
 
+    // e4m3 Q Kᵀ: the Q and K tiles are e4m3 codes, a byte a value, and the contraction steps
+    // are 32 wide; the ldmatrix byte geometry is the bf16 one's (gqa_prefill_swz8).
+    constexpr bool kQk8 = QkFp8;
+    static_assert(!kQk8 || (GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8QkRegistered<D>));
+    constexpr unsigned QkRowBytes  = kQk8 ? static_cast<unsigned>(D) : RowBytes;
+    constexpr unsigned QkEightRows = QkRowBytes * 8u;
+    // e4m3 codes in flight: two [Bc, D] slots each for K and V on the widening path
+    // (kGqaPrefillFp8Raw), one each for the e4m3 one. Block j's codes live in slot
+    // (j - n_block_min) % Slots.
+    constexpr bool kRawFp8 = GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8Raw<D> && !kQk8;
+    constexpr int Slots    = kQk8 ? 1 : 2;
+
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
-    __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
-    __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
-    __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
+    __nv_bfloat16* q_s;  // [Br, D] swizzled; e4m3 codes under kQk8
+    __nv_bfloat16* k_s;  // [Bc, D] swizzled; unused under kQk8, which reads K from its codes
+    __nv_bfloat16* v_s;  // [Bc, D] swizzled
+    std::uint8_t* k_raw;
+    std::uint8_t* v_raw;
+    float* q_scale_s = nullptr; // [Br] e4m3 Q row scales
+    if constexpr (kQk8) {
+        auto* bytes = reinterpret_cast<std::uint8_t*>(gqa_smem);
+        q_s         = gqa_smem;
+        q_scale_s   = reinterpret_cast<float*>(bytes + Br * D);
+        k_raw       = reinterpret_cast<std::uint8_t*>(q_scale_s + Br);
+        v_raw       = k_raw + Slots * Bc * D;
+        v_s         = reinterpret_cast<__nv_bfloat16*>(v_raw + Slots * Bc * D);
+        k_s         = nullptr;
+    } else {
+        q_s   = gqa_smem;
+        k_s   = q_s + Br * D;
+        v_s   = k_s + Bc * D;
+        k_raw = reinterpret_cast<std::uint8_t*>(v_s + Bc * D);
+        v_raw = k_raw + 2 * Bc * D;
+    }
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -196,16 +328,17 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Per-lane precomputed swizzled ldmatrix base addresses (see gqa_prefill_swz_addr).
     const unsigned q_sbase = smem_addr(q_s);
-    const unsigned k_sbase = smem_addr(k_s);
+    // Under kQk8 the K fragments come from the first raw slot, a slot's bytes further per slot.
+    const unsigned k_sbase = kQk8 ? smem_addr(k_raw) : smem_addr(k_s);
     const unsigned v_sbase = smem_addr(v_s);
     // Q A-fragment: row = warp_row0 + a_rowoff, col = k*16 + a_coloff.
-    const unsigned q_lane_base = q_sbase + static_cast<unsigned>(warp_row0 + a_rowoff) * RowBytes;
+    const unsigned q_lane_base = q_sbase + static_cast<unsigned>(warp_row0 + a_rowoff) * QkRowBytes;
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
     const unsigned q_r         = static_cast<unsigned>(a_rin << 4);
     // K B-fragment via ldmatrix.x4 (2 n-tiles/instr): lanes 16-31 fetch the +8-key
     // half (one EightRows step), lanes with bit3 set fetch the +8 d-contract half.
-    const unsigned k_lane_base =
-        k_sbase + static_cast<unsigned>(b_rin) * RowBytes + static_cast<unsigned>(lane >> 4) * EightRows;
+    const unsigned k_lane_base = k_sbase + static_cast<unsigned>(b_rin) * QkRowBytes +
+                                 static_cast<unsigned>(lane >> 4) * QkEightRows;
     const unsigned k_as = static_cast<unsigned>((b_koff >> 3) << 4);
     const unsigned k_r  = static_cast<unsigned>(b_rin << 4);
     // V B-fragment via ldmatrix.x4.trans (2 n-tiles/instr): row = k*16 + (bit3)*8 + b_rin,
@@ -217,8 +350,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Stage Q into smem once via cp.async (overlaps with the K(0) prologue load
     // below); it stays resident for the whole key loop. Global Q rows are D bf16
-    // contiguous, with a token stride of D*q_heads.
-    {
+    // contiguous, with a token stride of D*q_heads. The e4m3 Q is quantized in the
+    // prologue instead, behind the first block's codes.
+    if constexpr (!kQk8) {
         constexpr int VecPerRow      = D / 8;
         const int QRowStride         = D * q_heads; // global stride between tokens
         const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0, q_heads);
@@ -272,27 +406,94 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     // A key block and a KV page were the same thing while a block was 64 keys; at 16 they are
     // not, and the page is the one the block's first key lives in. The INT8 prompt kernel
     // always indexed it this way.
-    int physical_page    = block_table[(n_block_min * Bc) >> kPagedKVPageShift];
+    const auto page_of = [&](int kb) { return block_table[(kb * Bc) >> kPagedKVPageShift]; };
+    int physical_page  = page_of(n_block_min);
 
-    // Prologue: commit Q, then kick off the first key block the loop will read.
-    // The loop's wait<0> below drains both.
+    // The raw pipeline, block kb (s = kb - n_block_min):
+    //   wait, barrier  K(kb) is widened in k_s; V(kb) and K(kb+1) codes have landed
+    //   land           V(kb+1) codes into V slot (s+1)&1, K(kb+2) codes into K slot s&1
+    //   QK             widening V(kb) into v_s between the contraction steps
+    //   barrier        v_s holds V(kb); every warp is done reading k_s
+    //   PV             widening K(kb+1) into k_s between the output tiles
+    // so a block's codes land a full block ahead of their widening, and the widening runs in the
+    // shadow of the tensor-core work instead of between barriers.
+    const auto* codes_k = reinterpret_cast<const std::uint8_t*>(cache_k);
+    const auto* codes_v = reinterpret_cast<const std::uint8_t*>(cache_v);
+    const auto raw_slot = [&](std::uint8_t* base, int kb) {
+        return base + ((kb - n_block_min) & (Slots - 1)) * (Bc * D);
+    };
+    // The e4m3 path lands K swizzled, for its ldmatrix, and V plain, for the widening.
+    const auto stage_qk8 = [&](int kb, int page) {
+        gqa_prefill_stage_raw_fp8<Geometry, true>(raw_slot(k_raw, kb), codes_k, kv_head, kb * Bc,
+                                                  max_query_abs, page, tid);
+        gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, kb), codes_v, kv_head, kb * Bc,
+                                            max_query_abs, page, tid);
+    };
+    // This thread's two rows' e4m3 Q scales, times the softmax scale (kQk8).
+    float qk_scale0 = scale, qk_scale1 = scale;
+
+    // Prologue: commit Q, then kick off the first key block the loop will read (K, or the codes
+    // of K and V and of the next block's K, widening the first K). The e4m3 path lands the first
+    // block's codes and quantizes Q behind them.
     sinfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, n_block_min * Bc, max_query_abs,
-                                           physical_page, tid);
-    sinfer::ops::cp_commit();
+    if constexpr (kQk8) {
+        stage_qk8(n_block_min, physical_page);
+        sinfer::ops::cp_commit();
+        // A warp quantizes and reads only its own 16 rows, so its own barrier publishes them.
+        gqa_prefill_quantize_q_fp8<D>(reinterpret_cast<std::uint8_t*>(q_s), q_scale_s,
+                                      q + gqa_prefill_q_index<Geometry>(q_head, 0, q0, q_heads),
+                                      D * q_heads, tokens - q0, warp_row0, lane);
+        __syncwarp();
+        qk_scale0 = q_scale_s[warp_row0 + gid] * scale;
+        qk_scale1 = q_scale_s[warp_row0 + gid + 8] * scale;
+    } else if constexpr (kRawFp8) {
+        gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(k_raw, n_block_min), codes_k, kv_head,
+                                            n_block_min * Bc, max_query_abs, physical_page, tid);
+        gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, n_block_min), codes_v, kv_head,
+                                            n_block_min * Bc, max_query_abs, physical_page, tid);
+        sinfer::ops::cp_commit();
+        if (n_block_min + 1 < n_block_max) {
+            gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(k_raw, n_block_min + 1), codes_k, kv_head,
+                                                (n_block_min + 1) * Bc, max_query_abs,
+                                                page_of(n_block_min + 1), tid);
+        }
+        sinfer::ops::cp_commit();
+        sinfer::ops::cp_wait<1>(); // Q and the first block's codes
+        __syncthreads();
+        gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, n_block_min), tid, 0,
+                                       kGqaPrefillWidenChunks<D>);
+    } else {
+        gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, n_block_min * Bc,
+                                               max_query_abs, physical_page, tid);
+        sinfer::ops::cp_commit();
+    }
 
     for (int kb = n_block_min; kb < n_block_max; ++kb) {
-        const int k0                 = kb * Bc;
-        const int next_physical_page =
-            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift] : physical_page;
+        const int k0 = kb * Bc;
+        // Read ahead of the wait, so the table load hides behind it.
+        const int page1 = (kb + 1 < n_block_max) ? page_of(kb + 1) : physical_page;
+        const int page2 = (kRawFp8 && kb + 2 < n_block_max) ? page_of(kb + 2) : physical_page;
 
-        sinfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+        sinfer::ops::cp_wait<0>();
         __syncthreads();
 
-        // Overlap V(kb) load against the QK MMA below.
-        gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
-                                       tid);
-        sinfer::ops::cp_commit();
+        // The e4m3 Q Kᵀ path's next block waits for the barrier after QK, which frees its slot.
+        if constexpr (kRawFp8) {
+            if (kb + 1 < n_block_max) {
+                gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, kb + 1), codes_v, kv_head,
+                                                    (kb + 1) * Bc, max_query_abs, page1, tid);
+            }
+            if (kb + 2 < n_block_max) {
+                gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(k_raw, kb + 2), codes_k, kv_head,
+                                                    (kb + 2) * Bc, max_query_abs, page2, tid);
+            }
+            sinfer::ops::cp_commit();
+        } else if constexpr (!kQk8) {
+            // Overlap V(kb) load against the QK MMA below.
+            gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs,
+                                                   physical_page, tid);
+            sinfer::ops::cp_commit();
+        }
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -306,7 +507,49 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // Swizzled ldmatrix addresses via precomputed per-lane bases + immediates.
         unsigned af[2][4];
         unsigned bf[2][QKNt][2];
-        {
+        if constexpr (kQk8) {
+            // The same pipeline over D / 32 steps of e4m3 codes, K straight from its raw slot;
+            // V's codes are widened between the steps.
+            constexpr int Ks8    = D / 32;
+            constexpr int Chunks = kGqaPrefillWidenChunks<D>;
+            const unsigned k_slot_base =
+                k_lane_base + static_cast<unsigned>(((kb - n_block_min) & (Slots - 1)) * Bc * D);
+            ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
+                        gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
+#pragma unroll
+            for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
+                            gqa_prefill_swz_addr(
+                                k_slot_base + static_cast<unsigned>(nt2) * QkEightRows, 0u, k_as,
+                                k_r));
+            }
+#pragma unroll
+            for (int k = 0; k < Ks8; ++k) {
+                const int cur = k & 1;
+                const int nxt = cur ^ 1;
+                if (k + 1 < Ks8) {
+                    const unsigned ck = static_cast<unsigned>((k + 1) << 5);
+                    ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
+                                gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
+#pragma unroll
+                    for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                        ldmatrix_x4(bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0],
+                                    bf[nxt][nt2 + 1][1],
+                                    gqa_prefill_swz_addr(
+                                        k_slot_base + static_cast<unsigned>(nt2) * QkEightRows, ck,
+                                        k_as, k_r));
+                    }
+                }
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
+                                 af[cur][0], af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0],
+                                 bf[cur][nt][1]);
+                }
+                gqa_prefill_widen_fp8_slice<D>(v_s, raw_slot(v_raw, kb), tid, k * Chunks / Ks8,
+                                               (k + 1) * Chunks / Ks8);
+            }
+        } else {
             ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
                         gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
 #pragma unroll
@@ -316,34 +559,42 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                                 k_lane_base + static_cast<unsigned>(nt2) * EightRows, 0u, k_as,
                                 k_r));
             }
-        }
 #pragma unroll
-        for (int k = 0; k < QKKs; ++k) {
-            const int cur = k & 1;
-            const int nxt = cur ^ 1;
-            if (k + 1 < QKKs) {
-                const unsigned ck = static_cast<unsigned>((k + 1) << 5);
-                ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
-                            gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
+            for (int k = 0; k < QKKs; ++k) {
+                const int cur = k & 1;
+                const int nxt = cur ^ 1;
+                if (k + 1 < QKKs) {
+                    const unsigned ck = static_cast<unsigned>((k + 1) << 5);
+                    ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
+                                gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
 #pragma unroll
-                for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                    ldmatrix_x4(
-                        bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0], bf[nxt][nt2 + 1][1],
-                        gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2) * EightRows,
-                                             ck, k_as, k_r));
+                    for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                        ldmatrix_x4(
+                            bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0], bf[nxt][nt2 + 1][1],
+                            gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2) * EightRows,
+                                                 ck, k_as, k_r));
+                    }
                 }
-            }
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
-                         af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
+                             af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                }
+                if constexpr (kRawFp8) {
+                    constexpr int Chunks = kGqaPrefillWidenChunks<D>;
+                    gqa_prefill_widen_fp8_slice<D>(v_s, raw_slot(v_raw, kb), tid, k * Chunks / QKKs,
+                                                   (k + 1) * Chunks / QKKs);
+                }
             }
         }
 
+        // qk_scale0/1 are the softmax scale itself unless Q was quantized.
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i) { score[nt][i] *= scale; }
+            score[nt][0] *= qk_scale0;
+            score[nt][1] *= qk_scale0;
+            score[nt][2] *= qk_scale1;
+            score[nt][3] *= qk_scale1;
         }
 
         const int row0             = warp_row0 + gid;
@@ -371,7 +622,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 ? block_mask.words + static_cast<std::int64_t>(qrow1) * block_mask.stride
                 : nullptr;
 
-        // Block row-max on scaled scores, matching decode.
+        // Block row-max on scaled scores.
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
         if (full_score_tile) {
 #pragma unroll
@@ -407,92 +658,80 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);
 
-        const float nm0        = fmaxf(m0, bm0);
-        const float nm1        = fmaxf(m1, bm1);
-        // A window can mask a whole tile, leaving both maxima at -inf; the rescale
-        // would then be exp2(-inf + inf) = NaN and would poison the row's accumulator
-        // for every later tile. The running sums are zero there, so alpha is too.
-        // (The decode kernels have carried this guard since they were written.)
-        const float alpha0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx(((m0 - nm0) * Log2E));
-        const float alpha1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx(((m1 - nm1) * Log2E));
-
-        // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
-        // Reduce each tile before accumulating the denominator, matching decode.
-        const float beta0 = (bm0 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm0 - nm0) * Log2E);
-        const float beta1 = (bm1 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm1 - nm1) * Log2E);
-        float bl0 = 0.0f, bl1 = 0.0f;
-        unsigned p_frag[PVKs][4];
-        if (full_score_tile) {
-#pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 = exp2_approx(((score[nt][0] - bm0) * Log2E));
-                const float p01 = exp2_approx(((score[nt][1] - bm0) * Log2E));
-                const float p10 = exp2_approx(((score[nt][2] - bm1) * Log2E));
-                const float p11 = exp2_approx(((score[nt][3] - bm1) * Log2E));
-                bl0 += p00 + p01;
-                bl1 += p10 + p11;
-                const int pk = nt >> 1;
-                if ((nt & 1) == 0) {
-                    p_frag[pk][0] = pack_bf16x2(p00, p01);
-                    p_frag[pk][1] = pack_bf16x2(p10, p11);
-                } else {
-                    p_frag[pk][2] = pack_bf16x2(p00, p01);
-                    p_frag[pk][3] = pack_bf16x2(p10, p11);
-                }
-            }
-        } else {
-#pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 = (score[nt][0] > -CUDART_INF_F)
-                                      ? exp2_approx(((score[nt][0] - bm0) * Log2E))
-                                      : 0.0f;
-                const float p01 = (score[nt][1] > -CUDART_INF_F)
-                                      ? exp2_approx(((score[nt][1] - bm0) * Log2E))
-                                      : 0.0f;
-                const float p10 = (score[nt][2] > -CUDART_INF_F)
-                                      ? exp2_approx(((score[nt][2] - bm1) * Log2E))
-                                      : 0.0f;
-                const float p11 = (score[nt][3] > -CUDART_INF_F)
-                                      ? exp2_approx(((score[nt][3] - bm1) * Log2E))
-                                      : 0.0f;
-                bl0 += p00 + p01;
-                bl1 += p10 + p11;
-                const int pk = nt >> 1;
-                if ((nt & 1) == 0) {
-                    p_frag[pk][0] = pack_bf16x2(p00, p01);
-                    p_frag[pk][1] = pack_bf16x2(p10, p11);
-                } else {
-                    p_frag[pk][2] = pack_bf16x2(p00, p01);
-                    p_frag[pk][3] = pack_bf16x2(p10, p11);
-                }
-            }
-        }
-
-        bl0 = warp_sum<4>(bl0, FullMask);
-        bl1 = warp_sum<4>(bl1, FullMask);
-        l0 = __fmaf_rn(l0, alpha0, bl0 * beta0);
-        l1 = __fmaf_rn(l1, alpha1, bl1 * beta1);
+        // Online softmax against the running maximum, as FlashAttention-2 does: P = exp2(S - m)
+        // feeds the tensor cores straight into the output accumulator, which is rescaled only
+        // when some row's maximum moved. Bits differ from the split-KV kernels', which round P
+        // against each tile's own maximum; --batch-invariant keeps prompts on those.
+        const float nm0 = fmaxf(m0, bm0);
+        const float nm1 = fmaxf(m1, bm1);
+        // A row with no visible key yet keeps an infinite maximum and contributes nothing; its
+        // exponent base is taken as zero so -inf - -inf never makes a NaN.
+        const float base0  = (nm0 == -CUDART_INF_F) ? 0.0f : nm0 * Log2E;
+        const float base1  = (nm1 == -CUDART_INF_F) ? 0.0f : nm1 * Log2E;
+        const float alpha0 = (m0 == nm0) ? 1.0f : exp2_approx(fmaf(m0, Log2E, -base0));
+        const float alpha1 = (m1 == nm1) ? 1.0f : exp2_approx(fmaf(m1, Log2E, -base1));
         m0 = nm0;
         m1 = nm1;
 
-        sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
-        __syncthreads();
+        // P, repacked into the PV A-fragment layout, and this thread's share of each row sum;
+        // the quad's shares are added once, after the last block. A masked score is -inf, whose
+        // exp2 is zero.
+        float bl0 = 0.0f, bl1 = 0.0f;
+        unsigned p_frag[PVKs][4];
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            const float p00 = exp2_approx(fmaf(score[nt][0], Log2E, -base0));
+            const float p01 = exp2_approx(fmaf(score[nt][1], Log2E, -base0));
+            const float p10 = exp2_approx(fmaf(score[nt][2], Log2E, -base1));
+            const float p11 = exp2_approx(fmaf(score[nt][3], Log2E, -base1));
+            bl0 += p00 + p01;
+            bl1 += p10 + p11;
+            const int pk = nt >> 1;
+            if ((nt & 1) == 0) {
+                p_frag[pk][0] = pack_bf16x2(p00, p01);
+                p_frag[pk][1] = pack_bf16x2(p10, p11);
+            } else {
+                p_frag[pk][2] = pack_bf16x2(p00, p01);
+                p_frag[pk][3] = pack_bf16x2(p10, p11);
+            }
+        }
+        l0 = fmaf(l0, alpha0, bl0);
+        l1 = fmaf(l1, alpha1, bl1);
 
-        // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-        if (kb + 1 < n_block_max) {
-            physical_page = next_physical_page;
-            gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                           physical_page, tid);
+        if constexpr (kQk8) {
+            __syncthreads(); // v_s holds V(kb); every warp is done with this block's codes
+            if (kb + 1 < n_block_max) { stage_qk8(kb + 1, page1); }
             sinfer::ops::cp_commit();
+        } else if constexpr (kRawFp8) {
+            __syncthreads(); // v_s holds V(kb); every warp is done reading k_s
+        } else {
+            sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+            __syncthreads();
+
+            // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
+            if (kb + 1 < n_block_max) {
+                physical_page = page1;
+                gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc,
+                                                       max_query_abs, physical_page, tid);
+                sinfer::ops::cp_commit();
+            }
         }
 
-        // Form each tile output before rescaling it. P is rounded against
-        // this tile's maximum, independent of earlier tiles or split boundaries.
+        // The maximum settles early in a long scan, so most blocks skip the rescale; the vote
+        // keeps the branch warp-uniform.
+        if (__any_sync(FullMask, alpha0 != 1.0f || alpha1 != 1.0f)) {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
+        }
+
+        // O += P V.
 #pragma unroll
         for (int n2 = 0; n2 < PVNt; n2 += 2) {
-            float tile_acc[2][4] = {};
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned vf[4];
@@ -500,23 +739,25 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 ldmatrix_x4_t(vf[0], vf[1], vf[2], vf[3],
                     gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k) * SixteenRows,
                                          col, v_as, v_r));
-                mma_bf16(tile_acc[0][0], tile_acc[0][1], tile_acc[0][2], tile_acc[0][3],
-                         p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[0], vf[1]);
-                mma_bf16(tile_acc[1][0], tile_acc[1][1], tile_acc[1][2], tile_acc[1][3],
+                mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0],
+                         p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[0], vf[1]);
+                mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
                          p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[2], vf[3]);
             }
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    acc[n2 + j][i] = __fmaf_rn(acc[n2 + j][i], i < 2 ? alpha0 : alpha1,
-                                               tile_acc[j][i] * (i < 2 ? beta0 : beta1));
+            if constexpr (kRawFp8) {
+                constexpr int Groups = PVNt / 2;
+                constexpr int Chunks = kGqaPrefillWidenChunks<D>;
+                const int g          = n2 >> 1;
+                if (kb + 1 < n_block_max) {
+                    gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, kb + 1), tid,
+                                                   g * Chunks / Groups, (g + 1) * Chunks / Groups);
                 }
             }
         }
     }
 
-    // Use the same final division as decode before rounding the output to BF16.
+    l0 = warp_sum<4>(l0, FullMask);
+    l1 = warp_sum<4>(l1, FullMask);
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0    = n * 8 + 2 * lid;

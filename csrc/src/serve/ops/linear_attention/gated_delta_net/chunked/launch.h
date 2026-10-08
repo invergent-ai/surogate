@@ -106,6 +106,30 @@ struct chunk_output_config {
     cudaStream_t stream = nullptr;
 };
 
+// The one-kernel prefill (fused.cuh): q and k are padded to L, v, g and beta hold valid_tokens
+// rows, out receives valid_tokens rows. state_in may alias state_out.
+struct fused_config {
+    std::int32_t H_qk = 0;
+    std::int32_t H_v  = 0;
+    std::int32_t L    = 0;
+
+    const __nv_bfloat16* q        = nullptr;
+    const __nv_bfloat16* k        = nullptr;
+    const __nv_bfloat16* v        = nullptr;
+    const float* g                = nullptr;
+    const float* beta             = nullptr;
+    const __nv_bfloat16* state_in = nullptr;
+
+    __nv_bfloat16* state_out = nullptr;
+    __nv_bfloat16* out       = nullptr;
+
+    float scale = 0.0f;
+
+    // Zero means all L columns are valid.
+    std::int32_t valid_tokens = 0;
+    cudaStream_t stream = nullptr;
+};
+
 struct stage_validator {
     const char* name;
     std::int32_t H_qk;
@@ -155,5 +179,6 @@ struct stage_validator {
 cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg);
 cudaError_t launch_state_passing(const state_passing_config& cfg);
 cudaError_t launch_output(const chunk_output_config& cfg);
+cudaError_t launch_fused(const fused_config& cfg);
 
 } // namespace sinfer::ops::detail::gated_delta_net::chunked

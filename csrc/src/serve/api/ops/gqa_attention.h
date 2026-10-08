@@ -260,4 +260,16 @@ void gqa_attention_packed_prompts(const Tensor& q, const Tensor& k, const Tensor
                                   Tensor& out, cudaStream_t stream,
                                   std::int32_t max_lanes_per_launch = 0);
 
+/**
+ * Prompt attention over an e4m3 cache takes its query-key product in FP8 (PATCHES.md #119). Where
+ * the tensor-core prompt kernel serves a prompt (every GPU but Hopper, at head dim 128 or 256),
+ * each query row is rounded to e4m3 against its own absolute maximum and multiplies the cache's K
+ * codes on the e4m3 tensor cores at twice the bf16 rate; the probabilities still meet V in bf16.
+ * Hopper's FlashAttention-3 FP8 kernel already rounds its queries (and probabilities) to e4m3.
+ * On by default; SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK=0 starts the process with the bf16
+ * product. Process-wide; a relaxed atomic, read at each launch.
+ */
+void set_prompt_attention_fp8_query(bool enabled) noexcept;
+[[nodiscard]] bool prompt_attention_fp8_query() noexcept;
+
 } // namespace sinfer::ops

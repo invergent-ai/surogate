@@ -426,7 +426,7 @@ double running_logical_bytes(const Problem& problem) {
         static_cast<double>(problem.value_heads) * tokens * batch * sizeof(float);
     const double state_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
                                gated_delta_net_detail::kStateDim * problem.value_heads * batch *
-                               sizeof(float);
+                               sizeof(std::uint16_t);
     return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + 2.0 * state_bytes;
 }
 
@@ -441,7 +441,7 @@ double snapshot_logical_bytes(const Problem& problem) {
         static_cast<double>(problem.value_heads) * tokens * batch * sizeof(float);
     const double state_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
                                gated_delta_net_detail::kStateDim * problem.value_heads * batch *
-                               sizeof(float);
+                               sizeof(std::uint16_t);
     return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + (1.0 + tokens) * state_bytes +
            2.0 * batch * sizeof(std::int32_t);
 }
@@ -463,7 +463,7 @@ double gate_tensor_bytes(const Problem& problem) {
 
 double state_tensor_bytes(const Problem& problem) {
     return static_cast<double>(gated_delta_net_detail::kStateDim) *
-           gated_delta_net_detail::kStateDim * problem.value_heads * problem.batch * sizeof(float);
+           gated_delta_net_detail::kStateDim * problem.value_heads * problem.batch * sizeof(std::uint16_t);
 }
 
 double chunk_state_tensor_bytes(const Problem& problem) {
@@ -562,8 +562,8 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
 
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer state_in  = make_zeros(state_elements * sizeof(float));
-    DeviceBuffer state_out = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_in  = make_zeros(state_elements * sizeof(std::uint16_t));
+    DeviceBuffer state_out = make_zeros(state_elements * sizeof(std::uint16_t));
 
     Tensor q       = operands.query();
     Tensor k       = operands.key();
@@ -571,10 +571,10 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
     Tensor g       = operands.gate();
     Tensor beta    = operands.beta_tensor();
     Tensor out     = operands.output();
-    Tensor ssm_in  = Tensor(state_in.p, DType::FP32,
+    Tensor ssm_in  = Tensor(state_in.p, DType::BF16,
                             {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                              problem.value_heads});
-    Tensor ssm_out = Tensor(state_out.p, DType::FP32,
+    Tensor ssm_out = Tensor(state_out.p, DType::BF16,
                             {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                              problem.value_heads});
 
@@ -618,7 +618,7 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
     const std::int32_t slots =
         problem.batch == 1 ? kSnapshotSlots : problem.batch * tokens + problem.batch;
-    DeviceBuffer states = make_zeros(state_elements * slots * sizeof(float));
+    DeviceBuffer states = make_zeros(state_elements * slots * sizeof(std::uint16_t));
     std::vector<std::int32_t> initial_host(static_cast<std::size_t>(problem.batch));
     std::vector<std::int32_t> base_host(static_cast<std::size_t>(problem.batch));
     if (problem.batch == 1) {
@@ -651,7 +651,7 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
     Tensor g    = operands.gate();
     Tensor beta = operands.beta_tensor();
     Tensor out  = operands.output();
-    Tensor ssm_states(states.p, DType::FP32,
+    Tensor ssm_states(states.p, DType::BF16,
                       {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                        problem.value_heads, slots});
     Tensor valid;
@@ -713,8 +713,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
 
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer state_in             = make_zeros(state_elements * sizeof(float));
-    DeviceBuffer state_out            = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_in             = make_zeros(state_elements * sizeof(std::uint16_t));
+    DeviceBuffer state_out            = make_zeros(state_elements * sizeof(std::uint16_t));
     const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
         problem.qk_heads, problem.value_heads, false, tokens, tokens);
     DeviceBuffer workspace = make_zeros(workspace_bytes);
@@ -725,10 +725,10 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
     Tensor g       = operands.gate();
     Tensor beta    = operands.beta_tensor();
     Tensor out     = operands.output();
-    Tensor ssm_in  = Tensor(state_in.p, DType::FP32,
+    Tensor ssm_in  = Tensor(state_in.p, DType::BF16,
                             {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                              problem.value_heads});
-    Tensor ssm_out = Tensor(state_out.p, DType::FP32,
+    Tensor ssm_out = Tensor(state_out.p, DType::BF16,
                             {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                              problem.value_heads});
 
@@ -788,10 +788,10 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
     state.U         = static_cast<const __nv_bfloat16*>(U.data);
     state.k         = static_cast<const __nv_bfloat16*>(k.data);
     state.g_cumsum  = static_cast<const float*>(g_cumsum.data);
-    state.state_in  = static_cast<const float*>(ssm_in.data);
+    state.state_in  = static_cast<const __nv_bfloat16*>(ssm_in.data);
     state.v_new     = static_cast<__nv_bfloat16*>(v_new.data);
     state.h_chunk   = static_cast<__nv_bfloat16*>(h_chunk.data);
-    state.state_out = static_cast<float*>(ssm_out.data);
+    state.state_out = static_cast<__nv_bfloat16*>(ssm_out.data);
 
     chunked_detail::chunk_output_config output{};
     output.H_qk     = problem.qk_heads;
