@@ -55,6 +55,22 @@ inline constexpr int kGqaPrefillFp8SmemBytes =
 static_assert(kGqaPrefillFp8SmemBytes<256> == 98304);
 static_assert(!kGqaPrefillFp8Raw<512>);
 
+// FP8 query-key product (opt-in, SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK): Q is quantized to e4m3
+// against each row's absolute maximum and multiplies the cache's K codes as they land, on the
+// e4m3 tensor cores at twice the bf16 rate; only V is widened. The arena holds the e4m3 Q tile
+// and its row scales, `Slots` raw blocks each of K and V codes, and the widened V tile. One slot
+// keeps it under half of an SM's 100 KiB at head dim 256, so two CTAs share an SM; two slots
+// land a block's codes a full block ahead instead. The 16-byte swizzle needs eight chunks a row.
+template <int HeadDim>
+inline constexpr bool kGqaPrefillFp8QkRegistered = HeadDim == 128 || HeadDim == 256;
+template <int HeadDim, int Slots>
+inline constexpr int kGqaPrefillFp8QkSmemBytes =
+    kGqaPrefillBr * HeadDim + kGqaPrefillBr * static_cast<int>(sizeof(float)) +
+    Slots * 2 * kGqaPrefillBcFor<HeadDim> * HeadDim +
+    kGqaPrefillBcFor<HeadDim> * HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+static_assert(kGqaPrefillFp8QkSmemBytes<256, 1> == 49408);
+static_assert(kGqaPrefillFp8QkSmemBytes<256, 2> == 65792);
+
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
     /// Causal sliding window, zero for unbounded. A query at absolute position i

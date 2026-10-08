@@ -9,10 +9,12 @@
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstddef>
+#include <cstdlib>
 #include <type_traits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sinfer::ops::detail {
 namespace {
@@ -130,6 +132,20 @@ void refuse_i8_prefill() {
                                 " bytes, which is not a cp.async transfer width)");
 }
 
+// SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK=1 or 2 takes an e4m3 cache's prompt S = Q Kᵀ on the e4m3
+// tensor cores, with that many blocks of codes in flight (gqa_attention_prefill_bf16.cuh); unset
+// or 0 keeps it in bf16. Q is rounded to e4m3 against each row's maximum, so the scores are not
+// the bf16 product's.
+int prompt_fp8_qk_slots() {
+    static const int value = [] {
+        const char* text = std::getenv("SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK");
+        if (text == nullptr) { return 0; }
+        const std::string_view mode(text);
+        return mode == "1" ? 1 : mode == "2" ? 2 : 0;
+    }();
+    return value;
+}
+
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                float scale, const CacheView& cache,
@@ -218,16 +234,43 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                     static_cast<const std::int32_t*>(positions.data), scale,
                     static_cast<__nv_bfloat16*>(out.data), tokens, selection);
         } else {
-            CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kFp8SmemBytes));
-            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
-                <<<attention_grid, kGqaPrefillThreads, kFp8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::uint8_t*>(cache_k.data),
-                    static_cast<const std::uint8_t*>(cache_v.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+            const auto launch = [&]<int QkSlots>() {
+                constexpr int bytes =
+                    QkSlots == 0 ? kFp8SmemBytes
+                                 : kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim, QkSlots>;
+                CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                    gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
+                                                      QkSlots>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+                if constexpr (QkSlots == 1) {
+                    // Two CTAs share an SM only when its whole carveout is shared memory.
+                    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false,
+                                                          4, QkSlots>,
+                        cudaFuncAttributePreferredSharedMemoryCarveout,
+                        cudaSharedmemCarveoutMaxShared));
+                }
+                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
+                                                  QkSlots>
+                    <<<attention_grid, kGqaPrefillThreads, bytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::uint8_t*>(cache_k.data),
+                        static_cast<const std::uint8_t*>(cache_v.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+            };
+            if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
+                const int qk_slots = prompt_fp8_qk_slots();
+                if (qk_slots == 1) {
+                    launch.template operator()<1>();
+                } else if (qk_slots == 2) {
+                    launch.template operator()<2>();
+                } else {
+                    launch.template operator()<0>();
+                }
+            } else {
+                launch.template operator()<0>();
+            }
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
