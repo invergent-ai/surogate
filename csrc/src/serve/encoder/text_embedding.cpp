@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -86,11 +87,11 @@ struct TextEmbedding::Impl {
     std::unique_ptr<DeviceBuffer> rope_global_table;
     Tensor rope_local;
     Tensor rope_global;
-    /// BF16 copies of every layer's projections, for forwards of at least `dense_min_tokens`
-    /// tokens, which run them on cuBLASLt instead of the W8 kernels. Decoded at load by the
-    /// W8 embedding gather, whose rounding is the one the W8 kernels apply to each tile they
-    /// stage, so both routes multiply the same BF16 values. Empty unless
-    /// SUROGATE_SERVE_ENCODER_DENSE_TOKENS is set.
+    /// BF16 copies of every layer's projections, which forwards of at least `dense_min_tokens`
+    /// tokens run on cuBLASLt instead of the W8 kernels. Decoded once at load by the W8
+    /// embedding gather, whose rounding is the one the W8 kernels apply to every tile they
+    /// stage, so both routes multiply the same BF16 values. Empty when
+    /// SUROGATE_SERVE_ENCODER_DENSE_TOKENS=0, or for a model cuBLASLt cannot take.
     struct DenseLayer {
         const void* query;
         const void* key;
@@ -102,7 +103,7 @@ struct TextEmbedding::Impl {
     };
     std::unique_ptr<DeviceBuffer> dense_weights;
     std::vector<DenseLayer> dense;
-    std::int32_t dense_min_tokens = 0;
+    std::int32_t dense_min_tokens = 1;
     std::unique_ptr<EmbeddingTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
@@ -206,12 +207,36 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
     build_rope_table(impl.rope_global_table, impl.rope_global, config.rope_theta_global,
                      config.rope_frequency_scale);
 
+    // The projections on BF16 copies through cuBLASLt, for every forward by default. The W8
+    // kernels dequantise each weight tile again in every CTA that stages it; on a DGX Spark the
+    // copies took EmbeddingGemma's GEMM time from 461 to 337 ms over 16 requests of 32 texts and
+    // lifted each of four measured loads by 15-18%, for 203 MB more device memory. SUROGATE_SERVE_ENCODER_DENSE_TOKENS=N runs only forwards of N tokens or more on
+    // them, and 0 keeps every forward on the W8 kernels without making the copies.
     if (const char* raw = std::getenv("SUROGATE_SERVE_ENCODER_DENSE_TOKENS"); raw != nullptr && *raw != '\0') {
         const long value = std::strtol(raw, nullptr, 10);
-        if (value <= 0 || value > (1L << 20)) {
-            throw std::invalid_argument("SUROGATE_SERVE_ENCODER_DENSE_TOKENS must be a positive token count");
+        if (value < 0 || value > (1L << 20)) {
+            throw std::invalid_argument("SUROGATE_SERVE_ENCODER_DENSE_TOKENS must be a token count, 0 for off");
         }
         impl.dense_min_tokens = static_cast<std::int32_t>(value);
+    }
+    // cuBLASLt's raw route takes extents that are multiples of 8, and the copy cannot undo a
+    // column permutation a GGUF-sourced weight may carry; either keeps the model on W8.
+    const bool dense_shapes = query_size % 8 == 0 && config.kv_size() % 8 == 0 && hidden % 8 == 0 &&
+                              intermediate % 8 == 0;
+    const bool dense_columns = std::all_of(impl.layers.begin(), impl.layers.end(), [&](const LayerWeights& w) {
+        for (const auto& [handle, rows, columns] :
+             {std::tuple{w.query, query_size, hidden}, std::tuple{w.key, std::uint64_t(config.kv_size()), hidden},
+              std::tuple{w.value, std::uint64_t(config.kv_size()), hidden}, std::tuple{w.output, hidden, query_size},
+              std::tuple{w.gate, intermediate, hidden}, std::tuple{w.up, intermediate, hidden},
+              std::tuple{w.down, hidden, intermediate}}) {
+            if (impl.matrix(handle, static_cast<std::int32_t>(rows), static_cast<std::int32_t>(columns))
+                    .input_group_map != nullptr) {
+                return false;
+            }
+        }
+        return true;
+    });
+    if (impl.dense_min_tokens > 0 && dense_shapes && dense_columns) {
         const auto q_rows = static_cast<std::int32_t>(query_size);
         const std::int32_t kv_rows = config.kv_size();
         const std::size_t per_layer =
@@ -229,10 +254,6 @@ TextEmbedding TextEmbedding::load(const std::filesystem::path& path, DeviceConte
         auto* cursor = static_cast<std::uint16_t*>(impl.dense_weights->p);
         const auto decode = [&](artifact::ObjectHandle handle, std::int32_t rows, std::int32_t columns) {
             const Weight w8 = impl.matrix(handle, rows, columns);
-            if (w8.input_group_map != nullptr) {
-                throw std::runtime_error("SUROGATE_SERVE_ENCODER_DENSE_TOKENS: a projection keeps its "
-                                         "columns permuted, which the BF16 copy does not undo");
-            }
             const Tensor row_tensor(ids.p, DType::I32, {rows});
             Tensor decoded(cursor, DType::BF16, {columns, rows});
             ops::embedding(row_tensor, w8, decoded, device.stream);
@@ -403,7 +424,7 @@ std::vector<std::vector<float>> TextEmbedding::embed_chunk(
     };
     ops::rmsnorm(x, opening_norm(0), config.rms_epsilon, /*unit_offset*/ config.gemma, h, stream);
 
-    // Long forwards run the projections on the BF16 copies, when there are any.
+    // Forwards of dense_min_tokens or more run the projections on the BF16 copies, if any.
     const bool dense = !impl.dense.empty() && total >= impl.dense_min_tokens;
     const auto dense_linear = [&](const void* weight, std::int32_t rows, std::int32_t columns,
                                   const Tensor& in, Tensor& out) {
