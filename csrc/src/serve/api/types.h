@@ -823,6 +823,10 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // Models with recurrent state: turn checkpoints the engine can hold at once, and the device
+    // memory reserved for them (mapped only while a lane holds one).
+    std::uint32_t conversation_checkpoints        = 0;
+    std::size_t conversation_checkpoint_bytes     = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive

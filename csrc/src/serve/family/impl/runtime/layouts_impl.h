@@ -26,6 +26,7 @@
 #include "api/ops/swa.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -429,16 +430,25 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.checkpoints.slot_bytes = checkpoint_builder.finish(kElasticKvGranuleBytes, "conversation snapshot");
     out.checkpoints.lanes = plan.max_concurrency;
+    // One turn checkpoint per lane. A retained conversation on a model with recurrent state can
+    // resume from its checkpoint when the next prompt does not extend it token for token (the
+    // template drops the turn's thinking once a new user message arrives, re-renders a tool
+    // call, or trims a reply's whitespace); a lane without one prefills the whole conversation
+    // again. The budget was an eighth of one context's KV, which gave the 35B Qwen3.5-MoE seven
+    // checkpoints for sixteen lanes at a 200k context with FP8 KV, and one at 32k: eight agents
+    // then recomputed three 100k-token turns. A checkpoint costs what the lane's live recurrent
+    // state does (32 MiB there) and is mapped only while a lane holds one; the count does not
+    // depend on the KV capacity, so the memory curve stays affine.
+    // SUROGATE_SERVE_CONVERSATION_CHECKPOINTS=N keeps fewer (at least one) where memory is short.
     out.checkpoints.capacity = plan.max_concurrency;
     if (out.checkpoints.slot_bytes) {
-        const auto& pool = out.decoder.text_kv.pool;
-        const auto context_bytes = checked_mul(pool.payload_bytes() / pool.spec.page_group_count,
-                                                page_count(plan.capacity), "context KV bytes");
-        // Reserve up to one eighth of a context's KV footprint (at least one
-        // snapshot), independent of physical KV capacity so its curve remains
-        // affine. Physical snapshot pages are mapped only when requested.
-        out.checkpoints.capacity = static_cast<std::uint32_t>(std::clamp<std::size_t>(
-            context_bytes / 8 / out.checkpoints.slot_bytes, 1, plan.max_concurrency));
+        static const std::uint32_t limit = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_CONVERSATION_CHECKPOINTS");
+            return raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 0U;
+        }();
+        if (limit != 0) {
+            out.checkpoints.capacity = std::min(limit, plan.max_concurrency);
+        }
     }
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
