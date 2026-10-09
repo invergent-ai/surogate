@@ -906,7 +906,8 @@ struct StashAccess {
 /// and copies the accepted key, value and gate columns to the lane's pending planes, where the
 /// next verify applies them (`RecordAccess::fold_pending`). A copy, not a pointer into the
 /// records, because the next verify overwrites the records while other blocks of it still read.
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+/// `static` for the reason recurrent_fp32_kernel gives: the Kimi delta rule includes this file.
+static __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     replay_stash_kernel(const __grid_constant__ StashAccess access) {
     const FoldAccess<>& records      = access.records;
     const RecurrentCoordinates coord = records.coordinates();
