@@ -1325,9 +1325,22 @@ private:
             // New candidate readouts can be staged together in a DFlash engine.
             // Keep GPU-prefix admissions on their old route: changing their batch
             // width also changes the arithmetic of their batched full-vocabulary head.
+            // An MTP engine stages its prompts together too: its verify round carries every
+            // staged prompt's chunk (launch_mixed_round -> launch_mtp_round), so a burst of
+            // arrivals shares one mixed round instead of taking a round each, which at 16
+            // lanes on a DGX Spark held the last of a burst 1-3 s for its first token.
+            // SUROGATE_SERVE_MTP_STAGE_TOGETHER=0 restores one prompt per pass.
+            static const bool kMtpStagesTogether = [] {
+                const char* value = std::getenv("SUROGATE_SERVE_MTP_STAGE_TOGETHER");
+                return value == nullptr || std::string(value) != "0";
+            }();
+            const auto& execution = request->options.execution;
+            const bool staged_together =
+                speculative_backend_ == SpeculativeBackend::Mtp
+                    ? kMtpStagesTogether && !execution.gpu_prefix && !execution.save_gpu_prefix
+                    : dflash_candidate_readout(speculative_backend_, execution);
             ran_gpu_unit = ran || kPipelined ||
-                           (speculative_backend_ != SpeculativeBackend::None &&
-                            !dflash_candidate_readout(speculative_backend_, request->options.execution));
+                           (speculative_backend_ != SpeculativeBackend::None && !staged_together);
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
