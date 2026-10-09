@@ -382,6 +382,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         if (speculative_backend == SpeculativeBackend::DFlash) {
             dflash_record_storage = replay_records;
         }
+        if (replay_records->defers_fold()) {
+            deferred_fold_columns.assign(static_cast<std::size_t>(replay_records->spec.pending_slots), 0);
+            CUDA_CHECK(cudaMemsetAsync(replay_records->pending_columns.data, 0,
+                                       replay_records->pending_columns.bytes(), device.stream));
+            std::fprintf(stderr, "engine: MTP folds each round's accepted linear-attention "
+                                 "transitions into the next verify (SUROGATE_SERVE_DEFER_GDN_FOLD=0 "
+                                 "folds every round)\n");
+        }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None && !model.gdn_layers.empty())) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
@@ -1100,13 +1108,41 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         anything_to_fold = anything_to_fold || fold_rows[row].commit_columns > 0;
     }
+    // A lane that goes on decoding keeps its accepted transitions for its next verify, which
+    // reads its state anyway and applies them first: the round then reads the recurrent state
+    // once rather than twice. A finishing or cancelled lane folds now; its state is what a
+    // later turn reuses. Every row's count is set here, so a verify never sees a stale one.
+    const bool defer = replay_records && replay_records->defers_fold();
+    std::array<ops::GdnReplayFoldRow, kMaximumBatchColumns> fold_now{};
+    std::array<ops::GdnReplayFoldRow, kMaximumBatchColumns> fold_later{};
+    bool anything_now = false, anything_later = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        fold_now[row]   = fold_rows[row];
+        fold_later[row] = {fold_rows[row].linear_state_slot, 0};
+        if (defer && fold_rows[row].commit_columns > 0 && !cancelled[row] && !terminal[row]) {
+            fold_later[row]             = fold_rows[row];
+            fold_now[row].commit_columns = 0;
+        }
+        anything_now   = anything_now || fold_now[row].commit_columns > 0;
+        anything_later = anything_later || fold_later[row].commit_columns > 0;
+        if (defer) {
+            deferred_fold_columns.at(lanes[row]) = fold_later[row].commit_columns;
+            deferred_fold_counts_dirty           = true;
+        }
+    }
     const auto tail_started = Clock::now();
     try {
-        if (anything_to_fold && replay_records) {
+        if (anything_now && replay_records) {
             ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
-                                 std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                                 std::span<const ops::GdnReplayFoldRow>(fold_now.data(), lanes.size()),
                                  device.stream);
         }
+        if (anything_later) {
+            ops::gdn_replay_stash(*replay_records, decoder->linear_attention.all_layers_view(),
+                                  std::span<const ops::GdnReplayFoldRow>(fold_later.data(), lanes.size()),
+                                  device.stream);
+        }
+        if (defer) { flush_deferred_fold_counts(); }
         // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
         // included; its snapshots hold the state after each column, and the committed prefix's
         // last one is what the next round must start from.
@@ -1484,6 +1520,11 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    // A deferred fold belongs to the request: the lane's next one starts from its own state.
+    if (sequence.lane < deferred_fold_columns.size() && deferred_fold_columns[sequence.lane] != 0) {
+        deferred_fold_columns[sequence.lane] = 0;
+        deferred_fold_counts_dirty           = true;
+    }
     request.prefill.reset();
     request.gpu_prefix.reset();
     request.save_gpu_prefix.reset();
@@ -1504,6 +1545,36 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
+}
+
+void ProgramImplCore::flush_deferred_fold_counts() {
+    if (!deferred_fold_counts_dirty || !replay_records || !replay_records->defers_fold()) { return; }
+    // Pageable source: the copy is staged before this returns, so the counts can change after.
+    CUDA_CHECK(cudaMemcpyAsync(replay_records->pending_columns.data, deferred_fold_columns.data(),
+                               deferred_fold_columns.size() * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, device.stream));
+    deferred_fold_counts_dirty = false;
+}
+
+void ProgramImplCore::settle_deferred_folds(std::span<const std::uint32_t> lanes) {
+    if (!replay_records || !replay_records->defers_fold()) { return; }
+    std::vector<ops::GdnReplayFoldRow> rows;
+    for (const std::uint32_t lane : lanes) {
+        if (lane < deferred_fold_columns.size() && deferred_fold_columns[lane] > 0) {
+            rows.push_back({LinearStateSlots::current_state_slot(lane, max_concurrency),
+                            deferred_fold_columns[lane]});
+            deferred_fold_columns[lane] = 0;
+        }
+    }
+    if (rows.empty()) { return; }
+    for (std::size_t first = 0; first < rows.size(); first += kMaximumBatchColumns) {
+        const std::size_t count = std::min<std::size_t>(kMaximumBatchColumns, rows.size() - first);
+        ops::gdn_replay_fold_pending(*replay_records, decoder->linear_attention.all_layers_view(),
+                                     std::span<const ops::GdnReplayFoldRow>(rows.data() + first, count),
+                                     device.stream);
+    }
+    deferred_fold_counts_dirty = true;
+    flush_deferred_fold_counts();
 }
 
 family::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -3352,6 +3423,10 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             throw std::logic_error("mixed round does not support this staged prefill");
         }
     }
+    // Decode lanes that ride here without verifying run one column in place, so their
+    // deferred folds land first; verifying ones apply them in the record (launch_mtp_round
+    // brought the counts up to date).
+    if (!mtp_verify) { settle_deferred_folds(lanes); }
     // The first staged prompt owns the card (its KV view and cursor); every prompt's KV is
     // addressed per segment through the batch view and its own table row.
     const std::uint32_t prefill_lane = prefill_lanes.front();
@@ -4145,6 +4220,10 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
     ops::ScopedLoraBaseRound base_scope(base_round);
     const auto started = Clock::now();
     try {
+        // A verify applies its lanes' deferred folds itself; a narrow round updates the state
+        // in place, so they land first.
+        if (narrow) { settle_deferred_folds(lanes); }
+        flush_deferred_fold_counts();
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);

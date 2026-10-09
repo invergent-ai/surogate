@@ -528,10 +528,62 @@ struct RecordAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
+    /// Deferred folds (scalar gate only; null when none are planned): this layer's pending
+    /// transitions per lane slot, `[.., pending_width, pending_slots]` like the records, and
+    /// how many each slot has.
+    const __nv_bfloat16* pending_key   = nullptr;
+    const __nv_bfloat16* pending_value = nullptr;
+    const uint2* pending_gate          = nullptr;
+    const std::int32_t* pending_columns = nullptr;
+    std::int32_t pending_slots          = 0;
+    std::int32_t pending_width          = 0;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
                                 static_cast<std::int32_t>(blockIdx.z), heads);
+    }
+
+    /// Applies the transitions the lane's previous round accepted and the fold deferred, and
+    /// stores the result: the state the fold would have written, made here while the verify
+    /// holds it in registers instead of by a pass of its own. The registers then carry exactly
+    /// what the verify would have read back, rounding included, so the round is unchanged bit
+    /// for bit. The block owns its tile of the state, so nothing else reads what it writes.
+    __device__ __forceinline__ void fold_pending(const RecurrentCoordinates& coord,
+                                                 float (&state)[kDvPerWarp][kQkPerLane]) const {
+        if constexpr (Gate == ForgetGate::Scalar) {
+            if (pending_columns == nullptr) { return; }
+            const std::int32_t slot = initial_slots[coord.batch];
+            if (slot < 0 || slot >= pending_slots) { return; }
+            const std::int32_t pending = pending_columns[slot];
+            if (pending <= 0) { return; }
+            for (std::int32_t token = 0; token < pending; ++token) {
+                const std::int64_t column = static_cast<std::int64_t>(slot) * pending_width + token;
+                RawQkLane key = load_raw_qk_lane(
+                    pending_key + (column * heads.H_qk + coord.qk_head) * kStateDim, coord.dqk_base);
+                normalize_qk_lane<true>(key.value, coord.lane);
+                const RawValueLane value = load_value_lane(
+                    pending_value + (column * heads.H_v + coord.value_head) * kStateDim, coord.lane,
+                    coord.dv_base);
+                const RawGatePair gate =
+                    load_record_gate(pending_gate, column * heads.H_v + coord.value_head);
+                apply_transition<Gate>(state, key.value, value.value, gate);
+            }
+            // The pool is writable; the record form only ever reads it, hence the const view.
+            GdnStateStorage* destination = const_cast<GdnStateStorage*>(state_read_base(coord));
+#pragma unroll
+            for (int r = 0; r < kDvPerWarp; ++r) {
+                store_qk_lane(state[r],
+                              destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                              coord.dqk_base);
+#pragma unroll
+                for (int c = 0; c < kQkPerLane; ++c) {
+                    state[r][c] = __bfloat162float(__float2bfloat16_rn(state[r][c]));
+                }
+            }
+        } else {
+            (void)coord;
+            (void)state;
+        }
     }
 
     __device__ __forceinline__ std::int32_t
@@ -637,6 +689,10 @@ struct FoldAccess {
     std::int32_t value_heads;
     std::int32_t conv_channels;
     GdnReplayFoldKernelRows rows;
+    /// A deferred fold's records sit at the lane's slot rather than at the round's row, and
+    /// its convolution history was published when the round was resolved.
+    bool records_by_slot = false;
+    bool publish_conv    = true;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -666,7 +722,8 @@ struct FoldAccess {
     }
 
     __device__ __forceinline__ std::int64_t record_outer(const RecurrentCoordinates& coord) const {
-        return static_cast<std::int64_t>(coord.layer) * record_capacity + coord.batch;
+        return static_cast<std::int64_t>(coord.layer) * record_capacity +
+               (records_by_slot ? rows.row[coord.batch].linear_state_slot : coord.batch);
     }
 
     __device__ __forceinline__ GdnStateStorage* state_read_base(const RecurrentCoordinates& coord) const {
@@ -717,6 +774,7 @@ struct FoldAccess {
 
     __device__ __forceinline__ void publish_final_conv_history(const RecurrentCoordinates& coord,
                                                                std::int32_t commit) const {
+        if (!publish_conv) { return; }
         const std::int32_t tile_block =
             static_cast<std::int32_t>(coord.value_head) * 8 + coord.state_tile;
         if (tile_block >= conv_channels / 128) { return; }
@@ -768,6 +826,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         load_qk_lane(state[r], initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
                      coord.dqk_base);
     }
+    if constexpr (Mode == RecurrentMode::Record) { access.fold_pending(coord, state); }
 
     RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
     if constexpr (Mode == RecurrentMode::Record) { access.store_key(coord, 0, key); }
@@ -830,6 +889,57 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Record, true>(access, coord, access.width,
                                                      access.active_columns(coord));
+}
+
+/// Where a resolved round's accepted transitions wait for the lane's next verify.
+struct StashAccess {
+    FoldAccess<> records;
+    __nv_bfloat16* pending_key;
+    __nv_bfloat16* pending_value;
+    uint2* pending_gate;
+    std::int32_t pending_slots;
+    std::int32_t pending_width;
+};
+
+/// The fold's grid, doing what the fold does except the recurrence: it publishes the
+/// convolution history (which the next verify's convolution reads before any recurrent state)
+/// and copies the accepted key, value and gate columns to the lane's pending planes, where the
+/// next verify applies them (`RecordAccess::fold_pending`). A copy, not a pointer into the
+/// records, because the next verify overwrites the records while other blocks of it still read.
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+    replay_stash_kernel(const __grid_constant__ StashAccess access) {
+    const FoldAccess<>& records      = access.records;
+    const RecurrentCoordinates coord = records.coordinates();
+    const std::int32_t commit        = records.active_columns(coord);
+    if (commit == 0) { return; }
+    records.publish_final_conv_history(coord, commit);
+
+    const std::int32_t slot = records.rows.row[coord.batch].linear_state_slot;
+    const std::int64_t pending_outer =
+        static_cast<std::int64_t>(coord.layer) * access.pending_slots + slot;
+    const std::int32_t group = records.value_heads / records.qk_heads;
+    const bool writes_key =
+        coord.state_tile == 0 && coord.warp == 0 && static_cast<std::int32_t>(coord.value_head) % group == 0;
+    for (std::int32_t token = 0; token < commit; ++token) {
+        const std::int64_t column = pending_outer * access.pending_width + token;
+        if (coord.lane < kDvPerWarp) {
+            access.pending_value[(column * records.value_heads + coord.value_head) * kStateDim +
+                                 coord.dv_base + coord.lane] =
+                records.value_ptr(coord, token)[coord.dv_base + coord.lane];
+        }
+        if (writes_key) {
+            store_vec(access.pending_key + (column * records.qk_heads + coord.qk_head) * kStateDim +
+                          coord.dqk_base,
+                      load_vec<Bf16x4Pack>(records.key_ptr(coord, token) + coord.dqk_base));
+        }
+        if (coord.state_tile == 0 && coord.warp == 0 && coord.lane == 0) {
+            const std::int64_t source =
+                (records.record_outer(coord) * records.width + token) * records.value_heads +
+                coord.value_head;
+            access.pending_gate[column * records.value_heads + coord.value_head] =
+                records.gate_record[source];
+        }
+    }
 }
 
 template <ForgetGate Gate = ForgetGate::Scalar>

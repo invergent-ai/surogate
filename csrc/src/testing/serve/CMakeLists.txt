@@ -632,6 +632,9 @@ sinfer_add_op_test(sinfer_gated_delta_net_replay_record_test
 sinfer_add_op_test(sinfer_gdn_replay_fold_test
   SOURCES ops/test_gdn_replay_fold.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_gdn_deferred_fold_test
+  SOURCES ops/test_gdn_deferred_fold.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_kimi_delta_net_replay_test
   SOURCES ops/test_kimi_delta_net_replay.cpp
   LIBRARIES sinfer_ops)

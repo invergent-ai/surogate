@@ -464,6 +464,11 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    /// Applies the lanes' deferred folds now, for a round that reads their state without the
+    /// replay-record verify that would apply them (an ordinary, narrow or one-column round).
+    void settle_deferred_folds(std::span<const std::uint32_t> lanes);
+    /// Brings the device's deferred fold counts up to date before a round can read them.
+    void flush_deferred_fold_counts();
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     void evict_archived_prefixes() noexcept;
@@ -621,6 +626,11 @@ public:
     WorkspaceArena work;
     std::unique_ptr<family::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
+    /// Each lane's deferred GDN fold (replay_records->defers_fold()): the transitions its last
+    /// round accepted and its next verify applies, as the device's pending_columns holds them
+    /// once `deferred_fold_counts_dirty` is flushed. Zero for a lane with nothing pending.
+    std::vector<std::int32_t> deferred_fold_columns;
+    bool deferred_fold_counts_dirty = false;
     std::optional<DFlashPersistentState> dflash;
     family::RoundState io;
     Tensor prefill_hidden;
