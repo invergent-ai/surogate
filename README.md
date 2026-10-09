@@ -110,7 +110,7 @@ Each comparison ran both engines on the same kind of GPU with the same requests.
 | DGX Spark | Qwen3-8B · FP8 | 8 users, decode | **182.4 tok/s** | vLLM: 153.6 | **1.19×** |
 | DGX Spark | Qwen3-8B · FP8 | 32 users, decode | 470.4 tok/s | vLLM: 496.0 | 0.95× |
 | DGX Spark | Qwen3-8B · FP8 | 8 users, 2,048-token prompts, prefill | **5,939 tok/s** | vLLM: 5,632 | **1.05×** |
-| DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 1 user, decode | **31.4 tok/s** (67.2 with MTP on benchmark prose) | vLLM: does not fit in 121.7 GiB | — |
+| DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 1 user, decode | **31.4 tok/s** (with MTP: 45.9 on real text, 67.2 on benchmark prose) | vLLM: does not fit in 121.7 GiB | — |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 16 users, real text, MTP | **115.7 tok/s** (97.2 without MTP) | vLLM: does not fit | — |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | cold 32k-token prompt, prefill | **2,008 tok/s** | llama.cpp (UD-IQ4_XS GGUF): 629 | **3.2×** |
 | DGX Spark | EmbeddingGemma-300M · W8 | 16 clients, one text per request | **2,442 texts/s** | vLLM (BF16): 510-562 | **4.3×** |
