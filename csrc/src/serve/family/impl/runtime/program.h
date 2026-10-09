@@ -19,6 +19,7 @@
 #include "family/impl/runtime/dflash_context.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/prefix_identity.h"
+#include "family/impl/archive_storage.h"
 #include "family/impl/radix_prefix_cache.h"
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/vision_context.h"
@@ -324,10 +325,14 @@ struct SharedPrefix {
     ~SharedPrefix() { if (storage) storage->free.push_back(slot); }
 };
 
+/// A finished lane's prefix kept in host memory after its lane went to another request. Every
+/// byte lives in `storage`; the views below are its tensors and KV planes.
 struct ArchivedSequence {
     SequenceState state;
-    PagedKVHostImage text, backend;
-    std::vector<std::vector<std::byte>> current, checkpoint;
+    family::detail::ArchiveBlock storage;
+    std::uint32_t text_pages = 0, backend_pages = 0;
+    std::vector<std::byte*> text, backend;
+    std::vector<std::span<std::byte>> current, checkpoint;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -634,7 +639,12 @@ public:
     std::vector<RequestControl> requests;
     // Host snapshots retain complete continuation state without reserving another active
     // lane or increasing the GPU KV pool. Each pipeline stage has a bounded local cache.
-    family::detail::RadixPrefixCache<ArchivedSequence> archived_prefixes{512ULL << 20};
+    static constexpr std::size_t kArchivedPrefixBytes = 512ULL << 20;
+    family::detail::RadixPrefixCache<ArchivedSequence> archived_prefixes{kArchivedPrefixBytes};
+    /// Page-locked storage for `archived_prefixes`, made at the first archive; null if the host
+    /// refused it (`archive_arena_refused`), and images then use the heap.
+    std::shared_ptr<family::detail::PinnedArchiveArena> archive_arena;
+    bool archive_arena_refused = false;
     std::unordered_map<const GpuPrefixKey*, std::shared_ptr<GpuPrefix>> gpu_prefixes;
     void prune_gpu_prefixes();
     void capture_gpu_prefix(SequenceState& sequence, const std::shared_ptr<const GpuPrefixKey>& key,

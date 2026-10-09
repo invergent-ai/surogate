@@ -53,21 +53,7 @@ std::size_t tensor_image_bytes(std::span<const Tensor> tensors) {
     return bytes;
 }
 
-std::vector<std::vector<std::byte>> download_prefix_state(std::span<const Tensor> tensors,
-                                                         cudaStream_t stream) {
-    std::vector<std::vector<std::byte>> image;
-    image.reserve(tensors.size());
-    for (const auto& tensor : tensors) {
-        if (!tensor.is_contiguous()) { throw std::logic_error("noncontiguous prefix state"); }
-        image.emplace_back(tensor.bytes());
-        CUDA_CHECK(cudaMemcpyAsync(image.back().data(), tensor.data, tensor.bytes(),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    return image;
-}
-
-void upload_prefix_state(const std::vector<std::vector<std::byte>>& image,
+void upload_prefix_state(std::span<const std::span<std::byte>> image,
                          std::span<const Tensor> tensors, cudaStream_t stream) {
     if (image.size() != tensors.size()) { throw std::logic_error("prefix state layout changed"); }
     for (std::size_t i = 0; i < tensors.size(); ++i) {
@@ -104,16 +90,68 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         bytes += sequence.ledger.size() * (9 * sizeof(TokenId) + 1);
         bytes += sequence.cached_scores.size() * sizeof(TokenScore);
         for (const auto& score : sequence.cached_scores) { bytes += score.top.size() * sizeof(TokenLogprob); }
+
+        // One block holds the whole image: every state tensor and KV plane at an aligned offset.
+        const auto& text_pool = decoder->text_kv.pool();
+        const auto text_ids = sequence.kv->text.page_ids();
+        const PagedKVPool* backend_pool = sequence.kv->backend ? &backend_kv_cache()->pool() : nullptr;
+        const auto backend_ids = sequence.kv->backend ? sequence.kv->backend->page_ids()
+                                                      : std::span<const std::int32_t>{};
+        std::size_t payload = 0;
+        for (const auto& tensor : current) { payload += family::detail::archive_aligned(tensor.bytes()); }
+        for (const auto& tensor : saved) { payload += family::detail::archive_aligned(tensor.bytes()); }
+        for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+            payload += family::detail::archive_aligned(text_pool.image_plane_bytes(plane, text_ids.size()));
+        }
+        for (std::size_t plane = 0; backend_pool && plane < backend_pool->plane_count(); ++plane) {
+            payload += family::detail::archive_aligned(backend_pool->image_plane_bytes(plane, backend_ids.size()));
+        }
         if (!archived_prefixes.reserve(bytes)) { return; }
+
+        // Evicting above may have returned the range this image fits in.
+        if (!archive_arena && !archive_arena_refused) {
+            archive_arena = family::detail::PinnedArchiveArena::create(kArchivedPrefixBytes + (16ULL << 20));
+            archive_arena_refused = !archive_arena;
+        }
+        std::optional<family::detail::ArchiveBlock> pinned;
+        if (archive_arena) { pinned = archive_arena->allocate(payload); }
         auto image = std::make_shared<ArchivedSequence>();
+        image->storage = pinned ? std::move(*pinned) : family::detail::heap_archive_block(payload);
         image->state.copy_metadata(sequence);
         if (!checkpoint) { image->state.rewrite_checkpoint = {}; }
-        image->current = download_prefix_state(current, device.stream);
-        if (checkpoint) { image->checkpoint = download_prefix_state(saved, device.stream); }
-        image->text = decoder->text_kv.pool().download_pages(sequence.kv->text.page_ids(), device.stream);
-        if (sequence.kv->backend) {
-            image->backend = backend_kv_cache()->pool().download_pages(sequence.kv->backend->page_ids(), device.stream);
+        std::byte* cursor = image->storage.data;
+        const auto take = [&](std::size_t size) {
+            std::byte* at = cursor;
+            cursor += family::detail::archive_aligned(size);
+            return std::span<std::byte>(at, size);
+        };
+        const auto download = [&](std::span<const Tensor> tensors, std::vector<std::span<std::byte>>& out) {
+            out.reserve(tensors.size());
+            for (const auto& tensor : tensors) {
+                if (!tensor.is_contiguous()) { throw std::logic_error("noncontiguous prefix state"); }
+                out.push_back(take(tensor.bytes()));
+                CUDA_CHECK(cudaMemcpyAsync(out.back().data(), tensor.data, tensor.bytes(),
+                                           cudaMemcpyDeviceToHost, device.stream));
+            }
+        };
+        download(current, image->current);
+        if (checkpoint) { download(saved, image->checkpoint); }
+        image->text_pages = static_cast<std::uint32_t>(text_ids.size());
+        for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+            image->text.push_back(take(text_pool.image_plane_bytes(plane, text_ids.size())).data());
         }
+        text_pool.download_pages_to(text_ids, image->text, device.stream);
+        if (backend_pool) {
+            image->backend_pages = static_cast<std::uint32_t>(backend_ids.size());
+            for (std::size_t plane = 0; plane < backend_pool->plane_count(); ++plane) {
+                image->backend.push_back(take(backend_pool->image_plane_bytes(plane, backend_ids.size())).data());
+            }
+            backend_pool->download_pages_to(backend_ids, image->backend, device.stream);
+        }
+        // A page-locked image needs no wait: the stream orders its copies before the lane's next
+        // round overwrites the state, and before any restore reads them. A heap image has been
+        // copied by now; the fence makes sure of it before the block can be freed.
+        if (!image->storage.pinned) { CUDA_CHECK(cudaStreamSynchronize(device.stream)); }
         (void)archived_prefixes.insert(image->state.ledger, boundaries, image, bytes);
     } catch (const std::bad_alloc&) {
         // Retention is opportunistic. An unavailable host allocation must not
@@ -129,9 +167,14 @@ void ProgramImplCore::restore_archived_sequence(SequenceState& sequence, const R
     const auto backend_tokens = speculative_backend == SpeculativeBackend::Mtp
         ? plan.reuse_base - 1 : speculative_backend == SpeculativeBackend::DFlash ? plan.reuse_base : 0;
     materialize_sequence_kv(sequence, plan.reuse_base, backend_tokens);
-    decoder->text_kv.pool().upload_pages(image.text, sequence.kv->text.page_ids(), device.stream);
+    const auto planes = [](const std::vector<std::byte*>& views) {
+        return std::vector<const std::byte*>(views.begin(), views.end());
+    };
+    decoder->text_kv.pool().upload_pages_from(planes(image.text), image.text_pages,
+                                             sequence.kv->text.page_ids(), device.stream);
     if (sequence.kv->backend) {
-        backend_kv_cache()->pool().upload_pages(image.backend, sequence.kv->backend->page_ids(), device.stream);
+        backend_kv_cache()->pool().upload_pages_from(planes(image.backend), image.backend_pages,
+                                                    sequence.kv->backend->page_ids(), device.stream);
     }
     upload_prefix_state(image.current, prefix_state_tensors(sequence, false), device.stream);
     if (sequence.rewrite_checkpoint.valid) {

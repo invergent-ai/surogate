@@ -216,6 +216,15 @@ public:
                                                  cudaStream_t stream) const;
     void upload_pages(const PagedKVHostImage& image, std::span<const std::int32_t> page_ids,
                        cudaStream_t stream) const;
+    // The same image in caller-owned host memory, one destination per plane of
+    // `image_plane_bytes(plane, page_ids.size())` bytes. Nothing waits: into page-locked memory
+    // the copies stay asynchronous on `stream`, which orders them against later use.
+    [[nodiscard]] std::size_t image_plane_bytes(std::size_t plane, std::size_t pages) const;
+    void download_pages_to(std::span<const std::int32_t> page_ids, std::span<std::byte* const> planes,
+                           cudaStream_t stream) const;
+    /// `planes` hold an image of `image_pages` pages; its first `page_ids.size()` are restored.
+    void upload_pages_from(std::span<const std::byte* const> planes, std::uint32_t image_pages,
+                           std::span<const std::int32_t> page_ids, cudaStream_t stream) const;
 
     /// The demand-mapped plane region, or null for a pool inside the arena.
     [[nodiscard]] ElasticKvRegion* elastic_region() noexcept { return elastic_.get(); }
