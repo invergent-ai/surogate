@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -18,9 +20,30 @@ constexpr int kBlock    = 4;   // the only registered compress ratio
 constexpr int kWarp     = 32;
 constexpr int kPerLane  = kHeadDim / kWarp; // 4 values of the head per lane
 constexpr int kWarps    = 4;
-// Scratch the selection may use for block scores, whatever the context length.
-constexpr std::int64_t kSelectScratchBytes = 64LL << 20;
+// Scratch the selection may use for block scores, whatever the context length. Small enough to
+// stay in L2 between the scoring kernel that writes it and the cut that reads it four times.
+constexpr std::int64_t kSelectScratchBytes = 16LL << 20;
 constexpr int kThreads  = kWarps * kWarp;
+
+// Scoring: eight lanes share one block key, two 16-byte loads each, and a warp step covers
+// the sixteen pooled keys of one page.
+constexpr int kScoreThreads = 128;
+constexpr int kScoreLanes   = 8;
+constexpr int kScoreGroups  = kWarp / kScoreLanes;          // blocks per warp per unrolled step
+constexpr int kScoreDims    = kHeadDim / kScoreLanes;       // 16 dims of every head per lane
+constexpr int kScoreUnroll  = 4;
+constexpr int kWarpBlocks   = kScoreGroups * kScoreUnroll;  // 16
+constexpr int kScoreStep    = kScoreThreads / kWarp * kWarpBlocks;
+constexpr int kMinScoreSpan = 4 * kScoreStep;
+static_assert(kWarpBlocks * kBlock == kPagedKVPageSize, "a warp step reads one page's pooled keys");
+
+// The cut: radix selection of each row's budget-th largest score, 8 bits per pass.
+constexpr int kCutThreads = 512;
+constexpr int kCutWarps   = kCutThreads / kWarp;
+constexpr int kCutUnroll  = 8; // loads in flight per thread: the cut is latency bound
+constexpr int kRadixBits  = 8;
+constexpr int kRadixBins  = 1 << kRadixBits;
+constexpr int kLaneBins   = kRadixBins / kWarp;
 
 // Raw and pooled keys occupy disjoint regions within each physical page.
 template <bool Pooled = false>
@@ -155,8 +178,10 @@ __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ position
     for (int i = 0; i < kPerLane; ++i) { block_dst[i] = __float2bfloat16(value[i]); }
 }
 
-// One CTA per query row: scores every complete block, finds the budget's threshold, and writes
-// the row's block bitmask. One warp handles one block at a time.
+// The first selection, kept as the control behind SUROGATE_SERVE_QSA_SELECT=bisect. One CTA per
+// query row: scores every complete block, finds the budget's threshold, and writes the row's
+// block bitmask. One warp handles one block at a time. A decode round has one row per sequence,
+// so a long history was read by one SM.
 template <int Heads>
 __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
                                   const std::int32_t* __restrict__ positions,
@@ -263,6 +288,270 @@ __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
         if (__float_as_uint(row_scores[b]) != threshold) { continue; }
         if (atomicSub(&ties_left, 1) > 0) { atomicOr(&row_mask[b >> 5], 1U << (b & 31)); }
     }
+}
+
+// Scores a span of one row's complete blocks into `scores`. The spans spread a row over the GPU,
+// so a decode round of a single query reads its long history on every SM. Eight lanes share one
+// block key: lane `member` holds dims [8m, 8m+8) and [64+8m, 64+8m+8) of every head, which costs
+// three shuffles per head and block where the control spends five.
+template <int Heads>
+__global__ void __launch_bounds__(kScoreThreads)
+    qsa_score_kernel(const __nv_bfloat16* __restrict__ q,
+                     const std::int32_t* __restrict__ positions,
+                     const std::int32_t* __restrict__ table_rows, std::int32_t columns_per_row,
+                     std::int32_t row_offset, const std::int32_t* __restrict__ block_tables,
+                     std::int32_t table_stride, const __nv_bfloat16* __restrict__ plane,
+                     int budget_blocks, int span, float* __restrict__ scores, int score_stride) {
+    const int row    = static_cast<int>(blockIdx.y);
+    const int scored = (positions[row] + 1) / kBlock;
+    const int begin  = static_cast<int>(blockIdx.x) * span;
+    if (scored <= budget_blocks || begin >= scored) { return; } // the cut writes the identity
+    const int end    = min(begin + span, scored);
+    const int lane   = static_cast<int>(threadIdx.x) % kWarp;
+    const int warp   = static_cast<int>(threadIdx.x) / kWarp;
+    const int group  = lane / kScoreLanes;
+    const int member = lane % kScoreLanes;
+    const std::int32_t* block_table =
+        block_tables +
+        static_cast<std::int64_t>(table_rows[(row_offset + row) / columns_per_row]) * table_stride;
+
+    float qv[Heads][kScoreDims];
+#pragma unroll
+    for (int h = 0; h < Heads; ++h) {
+        const __nv_bfloat16* src =
+            q + (static_cast<std::int64_t>(row) * Heads + h) * kHeadDim + member * 8;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const uint4 packed = *reinterpret_cast<const uint4*>(src + half * (kHeadDim / 2));
+            const auto* pairs  = reinterpret_cast<const __nv_bfloat162*>(&packed);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 v              = __bfloat1622float2(pairs[i]);
+                qv[h][half * 8 + 2 * i]     = v.x;
+                qv[h][half * 8 + 2 * i + 1] = v.y;
+            }
+        }
+    }
+
+    float* row_scores = scores + static_cast<std::int64_t>(row) * score_stride;
+    // `begin` and `span` are whole steps, so every warp step starts a page.
+    for (int first = begin + warp * kWarpBlocks; first < end; first += kScoreStep) {
+        const __nv_bfloat16* page =
+            plane + indexer_offset<true>(block_table, first * kBlock) + member * 8;
+        uint4 keys[kScoreUnroll][2];
+#pragma unroll
+        for (int u = 0; u < kScoreUnroll; ++u) {
+            const int slot           = u * kScoreGroups + group;
+            const __nv_bfloat16* key = page + slot * kHeadDim;
+            if (first + slot < end) {
+                keys[u][0] = *reinterpret_cast<const uint4*>(key);
+                keys[u][1] = *reinterpret_cast<const uint4*>(key + kHeadDim / 2);
+            } else {
+                keys[u][0] = keys[u][1] = make_uint4(0U, 0U, 0U, 0U);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kScoreUnroll; ++u) {
+            float kv[kScoreDims];
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&keys[u][half]);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 v           = __bfloat1622float2(pairs[i]);
+                    kv[half * 8 + 2 * i]     = v.x;
+                    kv[half * 8 + 2 * i + 1] = v.y;
+                }
+            }
+            float total = 0.0F;
+#pragma unroll
+            for (int h = 0; h < Heads; ++h) {
+                float dot = 0.0F;
+#pragma unroll
+                for (int i = 0; i < kScoreDims; ++i) { dot += qv[h][i] * kv[i]; }
+                dot = warp_sum<kScoreLanes>(dot);
+                total += fmaxf(dot, 0.0F); // rectified per head, as in the reference
+            }
+            const int block = first + u * kScoreGroups + group;
+            if (member == 0 && block < end) { row_scores[block] = total; }
+        }
+    }
+}
+
+// One CTA per query row. The scores are non-negative, so their bit patterns order like the
+// floats, and four 8-bit radix passes find the budget-th largest exactly. Blocks above it are
+// in; blocks equal to it fill the rest of the budget in block order, the reference's tie order.
+__global__ void __launch_bounds__(kCutThreads)
+    qsa_cut_kernel(const std::int32_t* __restrict__ positions, std::uint32_t* __restrict__ mask,
+                   int words, int budget_blocks, const float* __restrict__ scores,
+                   int score_stride) {
+    const int row      = static_cast<int>(blockIdx.x);
+    const int visible  = positions[row] + 1;
+    const int scored   = visible / kBlock;
+    const int touched  = (visible + kBlock - 1) / kBlock;
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int lane     = tid % kWarp;
+    const int warp     = tid / kWarp;
+    const bool covered = scored <= budget_blocks; // the selection is the identity
+    std::uint32_t* row_mask = mask + static_cast<std::int64_t>(row) * words;
+    const auto* bits =
+        reinterpret_cast<const unsigned*>(scores + static_cast<std::int64_t>(row) * score_stride);
+
+    __shared__ unsigned histogram[kCutWarps][kRadixBins];
+    __shared__ unsigned cut_prefix;
+    __shared__ unsigned cut_rank;
+    __shared__ int warp_ties[kCutWarps];
+
+    unsigned threshold = 0U;
+    unsigned ties_in   = 0U; // blocks equal to the threshold that the budget admits
+    if (!covered) {
+        unsigned prefix = 0U, decided = 0U, rank = static_cast<unsigned>(budget_blocks);
+        for (int shift = 32 - kRadixBits; shift >= 0; shift -= kRadixBits) {
+            for (int i = tid; i < kCutWarps * kRadixBins; i += kCutThreads) {
+                histogram[i / kRadixBins][i % kRadixBins] = 0U;
+            }
+            __syncthreads();
+            for (int base = 0; base < scored; base += kCutThreads * kCutUnroll) {
+                unsigned value[kCutUnroll];
+#pragma unroll
+                for (int u = 0; u < kCutUnroll; ++u) {
+                    const int b = base + u * kCutThreads + tid;
+                    value[u]    = b < scored ? bits[b] : 0U;
+                }
+#pragma unroll
+                for (int u = 0; u < kCutUnroll; ++u) {
+                    const int b        = base + u * kCutThreads + tid;
+                    const bool counted = b < scored && (value[u] & decided) == prefix;
+                    const unsigned digit =
+                        counted ? (value[u] >> shift) & (kRadixBins - 1) : kRadixBins;
+                    // One shared atomic per distinct digit in the warp: the high digits of
+                    // similar scores collide.
+                    const unsigned peers = __match_any_sync(kFullWarpMask, digit);
+                    if (counted && lane == __ffs(peers) - 1) {
+                        atomicAdd(&histogram[warp][digit], static_cast<unsigned>(__popc(peers)));
+                    }
+                }
+            }
+            __syncthreads();
+            for (int bin = tid; bin < kRadixBins; bin += kCutThreads) {
+                unsigned total = 0U;
+#pragma unroll
+                for (int w = 0; w < kCutWarps; ++w) { total += histogram[w][bin]; }
+                histogram[0][bin] = total;
+            }
+            __syncthreads();
+            if (warp == 0) {
+                // Lane l holds bins 255-8l down to 248-8l; the scan runs from the largest bin.
+                unsigned count[kLaneBins];
+                unsigned sum = 0U;
+#pragma unroll
+                for (int i = 0; i < kLaneBins; ++i) {
+                    count[i] = histogram[0][kRadixBins - 1 - lane * kLaneBins - i];
+                    sum += count[i];
+                }
+                unsigned running = sum;
+#pragma unroll
+                for (int offset = 1; offset < kWarp; offset <<= 1) {
+                    const unsigned other = __shfl_up_sync(kFullWarpMask, running, offset);
+                    if (lane >= offset) { running += other; }
+                }
+                const unsigned crossing = __ballot_sync(kFullWarpMask, running >= rank);
+                if (lane == __ffs(crossing) - 1) {
+                    unsigned above = running - sum;
+#pragma unroll
+                    for (int i = 0; i < kLaneBins; ++i) {
+                        if (above + count[i] >= rank) {
+                            const unsigned bin = kRadixBins - 1 - lane * kLaneBins - i;
+                            cut_prefix         = prefix | (bin << shift);
+                            cut_rank           = rank - above;
+                            break;
+                        }
+                        above += count[i];
+                    }
+                }
+            }
+            __syncthreads();
+            prefix = cut_prefix;
+            rank   = cut_rank;
+            decided |= static_cast<unsigned>(kRadixBins - 1) << shift;
+        }
+        threshold = prefix;
+        ties_in   = rank;
+    }
+
+    // Each warp writes a contiguous run of words; lane l of word w reads block 32w + l.
+    const int per_warp = (words + kCutWarps - 1) / kCutWarps;
+    const int w_begin  = min(words, warp * per_warp);
+    const int w_end    = min(words, w_begin + per_warp);
+    const auto score_of = [&](int w) {
+        const int b = w * kWarp + lane;
+        return w < w_end && b < scored && !covered ? bits[b] : 0U;
+    };
+    unsigned tie_rank = 0U; // ties in the words before this one
+    if (!covered) {
+        unsigned ties = 0U;
+        for (int w0 = w_begin; w0 < w_end; w0 += kCutUnroll) {
+            unsigned value[kCutUnroll];
+#pragma unroll
+            for (int u = 0; u < kCutUnroll; ++u) { value[u] = score_of(w0 + u); }
+#pragma unroll
+            for (int u = 0; u < kCutUnroll; ++u) {
+                const int b = (w0 + u) * kWarp + lane;
+                ties += __popc(__ballot_sync(
+                    kFullWarpMask, w0 + u < w_end && b < scored && value[u] == threshold));
+            }
+        }
+        if (lane == 0) { warp_ties[warp] = static_cast<int>(ties); }
+        __syncthreads();
+        for (int w = 0; w < warp; ++w) { tie_rank += static_cast<unsigned>(warp_ties[w]); }
+    }
+    for (int w0 = w_begin; w0 < w_end; w0 += kCutUnroll) {
+        unsigned value[kCutUnroll];
+#pragma unroll
+        for (int u = 0; u < kCutUnroll; ++u) { value[u] = score_of(w0 + u); }
+#pragma unroll
+        for (int u = 0; u < kCutUnroll; ++u) {
+            const int w = w0 + u;
+            if (w >= w_end) { break; } // uniform across the warp
+            const int b         = w * kWarp + lane;
+            const bool complete = b < scored;
+            unsigned word =
+                __ballot_sync(kFullWarpMask, complete && (covered || value[u] > threshold)) |
+                __ballot_sync(kFullWarpMask, !complete && b < touched); // the open tail
+            unsigned tied =
+                __ballot_sync(kFullWarpMask, complete && !covered && value[u] == threshold);
+            const unsigned count = static_cast<unsigned>(__popc(tied));
+            const unsigned quota = ties_in > tie_rank ? ties_in - tie_rank : 0U;
+            if (quota >= count) {
+                word |= tied;
+            } else {
+                for (unsigned i = 0; i < quota; ++i) { // the lowest `quota` tied blocks
+                    word |= tied & (0U - tied);
+                    tied &= tied - 1U;
+                }
+            }
+            tie_rank += count;
+            if (lane == 0) { row_mask[w] = word; }
+        }
+    }
+}
+
+int multiprocessors() {
+    int device = 0, sms = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return 1;
+    }
+    return std::max(sms, 1);
+}
+
+// Blocks per scoring CTA: enough CTAs to cover the GPU twice, each scoring at least four steps.
+int score_span(int rows, std::int64_t blocks) {
+    const std::int64_t wanted = std::max<std::int64_t>(1, (2 * multiprocessors() + rows - 1) / rows);
+    const std::int64_t most   = std::max<std::int64_t>(1, (blocks + kMinScoreSpan - 1) / kMinScoreSpan);
+    const std::int64_t splits = std::min(wanted, most);
+    const std::int64_t span   = (blocks + splits - 1) / splits;
+    return static_cast<int>((span + kScoreStep - 1) / kScoreStep * kScoreStep);
 }
 
 void require(bool condition, const char* message) {
@@ -382,18 +671,37 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
     Tensor scores     = workspace.alloc(DType::FP32, {blocks, tile});
     const auto stride = static_cast<int>(blocks);
     const int budget  = geometry.top_k / geometry.block;
+    // SUROGATE_SERVE_QSA_SELECT=bisect runs the one-CTA-per-row control.
+    static const bool bisect = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_QSA_SELECT");
+        return value != nullptr && std::string(value) == "bisect";
+    }();
+    const int span = score_span(std::min(tile, rows), blocks);
     // One tile of query rows at a time: the rows are independent, and the per-row scratch is
     // what would otherwise scale with the context length.
     const auto launch = [&](auto heads, int first, int count) {
-        qsa_select_kernel<decltype(heads)::value><<<count, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data) +
-                static_cast<std::int64_t>(first) * kHeadDim * geometry.heads,
-            static_cast<const std::int32_t*>(positions.data) + first,
-            static_cast<const std::int32_t*>(table_rows.data), columns_per_row, first,
-            static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
-            static_cast<const __nv_bfloat16*>(cache.indexer_pages.data),
-            static_cast<std::uint32_t*>(mask.data) + static_cast<std::int64_t>(first) * words,
-            words, budget, static_cast<float*>(scores.data), stride);
+        constexpr int kHeads = decltype(heads)::value;
+        const auto* q_rows = static_cast<const __nv_bfloat16*>(q.data) +
+                             static_cast<std::int64_t>(first) * kHeadDim * geometry.heads;
+        const auto* row_positions = static_cast<const std::int32_t*>(positions.data) + first;
+        const auto* tables        = static_cast<const std::int32_t*>(cache.block_tables.data);
+        const auto* plane         = static_cast<const __nv_bfloat16*>(cache.indexer_pages.data);
+        auto* row_mask = static_cast<std::uint32_t*>(mask.data) + static_cast<std::int64_t>(first) * words;
+        auto* row_scores = static_cast<float*>(scores.data);
+        if (bisect) {
+            qsa_select_kernel<kHeads><<<count, kThreads, 0, stream>>>(
+                q_rows, row_positions, static_cast<const std::int32_t*>(table_rows.data),
+                columns_per_row, first, tables, cache.block_tables.ne[0], plane, row_mask, words,
+                budget, row_scores, stride);
+            return;
+        }
+        const dim3 grid((blocks + span - 1) / span, count);
+        qsa_score_kernel<kHeads><<<grid, kScoreThreads, 0, stream>>>(
+            q_rows, row_positions, static_cast<const std::int32_t*>(table_rows.data),
+            columns_per_row, first, tables, cache.block_tables.ne[0], plane, budget, span,
+            row_scores, stride);
+        qsa_cut_kernel<<<count, kCutThreads, 0, stream>>>(row_positions, row_mask, words, budget,
+                                                         row_scores, stride);
     };
     for (int first = 0; first < rows; first += tile) {
         const int count = std::min(tile, rows - first);
