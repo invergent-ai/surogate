@@ -3310,7 +3310,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
     }();
     if (speculative_backend == SpeculativeBackend::Mtp && mtp_mixed_verify && !verify &&
         !lanes.empty() && !prefill_lanes.empty() && !pipeline_stage() &&
-        !narrow_round_for(lanes.size()) && !requests.at(prefill_lanes.front()).target_only) {
+        !narrow_round_for(lanes.size()) && !requests.at(prefill_lanes.front()).target_only &&
+        prefill_chunk > static_cast<std::uint32_t>(lanes.size()) * (draft_window + 1U)) {
         auto handle = launch_mtp_round(lanes, budgets, prefill_lanes);
         mixed_in_flight_.id = handle.id;
         return handle;
@@ -3462,10 +3463,26 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         // tokens in turn until the window is spent, so a round packs as many short prompts
         // as fit and still chunks a long one exactly as before (#80).
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+        // A prompt cut at its recurrent boundary brings the rest after it as a second segment
+        // when the window has room: splits[i] is then its first segment's length. A chat
+        // prompt's boundary (where the next turn's template would rewrite it) sits a few tokens
+        // before its end, and a round of its own for those few tokens cost a whole round, the
+        // decode lanes' verify included. The second segment starts from exactly the state and
+        // keys the first leaves, as a chunk of the next round would, so the boundary still cuts
+        // the recurrent scan where it did; a rewrite checkpoint there is copied layer by layer
+        // between the two. SUROGATE_SERVE_MIXED_SPLIT=0 keeps a round per segment.
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> splits{};
+        static const bool kSplitPrompts = [] {
+            const char* value = std::getenv("SUROGATE_SERVE_MIXED_SPLIT");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
         std::array<schedule::VisionChunk, runtime::kMaximumMixedPrefills> vision_chunks{};
         std::uint32_t window_left = mixed_chunk_cap;
         std::size_t staged_count  = 0;
         const bool invariant_cuts = ops::batch_invariant();
+        const bool split_prompts  = kSplitPrompts && !invariant_cuts && !flash && !target_only &&
+                                   !pipeline_stage() && decoder->ple.empty() &&
+                                   schedule::TextContext::mixed_split_segments_supported();
         for (std::size_t i = 0; i < prefill_lanes.size() && window_left > 0; ++i) {
             const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
             const std::uint32_t want = entry.prompt_tokens - entry.cursor;
@@ -3480,6 +3497,14 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             }
             if (const auto boundary = entry.chunk_boundary(); boundary && entry.cursor < *boundary) {
                 nominals[i] = std::min(nominals[i], *boundary - entry.cursor);
+                if (split_prompts && !entry.vision && nominals[i] == *boundary - entry.cursor &&
+                    *boundary < entry.prompt_tokens && window_left > nominals[i] &&
+                    (!entry.shared_capture || *entry.shared_capture <= entry.cursor) &&
+                    (!entry.rewrite_checkpoint_capture ||
+                     entry.rewrite_checkpoint_capture->frontier == *boundary)) {
+                    splits[i] = nominals[i];
+                    nominals[i] += std::min(window_left - nominals[i], entry.prompt_tokens - *boundary);
+                }
             }
             if (entry.vision) {
                 nominals[i] = entry.vision->chunk_length(entry.cursor, nominals[i]);
@@ -3514,7 +3539,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         // Target-only packs have no ordinary decode frame. Their lone-prompt graph
         // route is advance_prefill; a packed chunk stays eager even if it fills the window.
         const bool graph_planned = !kNoMixedGraph && !head && !flash && !target_only && staged_count == 1 &&
-                                   staged.use_graph && prefill_graphs.has_value() &&
+                                   splits[0] == 0 && staged.use_graph && prefill_graphs.has_value() &&
                                    batch_bucket == rows && graph_nominal > 0 &&
                                    (!boundary || staged.cursor >= *boundary ||
                                     staged.cursor + graph_nominal <= *boundary);
@@ -3693,8 +3718,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             }
         }
         if (!graph_hit) {
-            std::array<schedule::TextContext::MixedPrefillSegment, runtime::kMaximumMixedPrefills>
+            std::array<schedule::TextContext::MixedPrefillSegment, 2 * runtime::kMaximumMixedPrefills>
                 segments{};
+            std::size_t segment_count = 0;
             for (std::size_t i = 0; i < staged_count; ++i) {
                 SequenceState& sequence              = sequences[prefill_lanes[i]];
                 const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
@@ -3711,35 +3737,48 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     }
                 }
-                segments[i] = schedule::TextContext::MixedPrefillSegment{
-                    .ids = std::span<const TokenId>(entry.prompt.token_ids)
-                               .subspan(entry.cursor, nominals[i]),
-                    .kv_base      = static_cast<std::int32_t>(entry.cursor),
-                    .kv_table_row = sequence.kv->text.bound_row(),
-                    .state_slot   = static_cast<std::int32_t>(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency)),
-                    .finalize         = false,
-                    .mtp_kv_table_row = head && stage_holds_head()
-                                            ? sequence.kv->backend->bound_row()
-                                            : -1,
-                    .mtp_kv = head && stage_holds_head() ? mtp_kv_view(sequence)
-                                                          : family::PagedKVCacheView{},
-                    // Every column but the prompt's last pairs with the prompt's next token;
-                    // the last pairs with the token the zero-suffix step samples (the bridge).
-                    .mtp_shifted_ids =
-                        head ? std::span<const TokenId>(entry.prompt.token_ids)
-                                   .subspan(entry.cursor + 1,
-                                            std::min(nominals[i],
-                                                     entry.prompt_tokens - entry.cursor - 1))
-                             : std::span<const TokenId>{},
-                    .lora_slot = requests[prefill_lanes[i]].lora_slot,
-                    .prompt = &entry.prompt,
-                    .vision = entry.vision ? &vision_chunks[i] : nullptr,
+                const auto segment = [&](std::uint32_t begin, std::uint32_t length, std::int32_t capture) {
+                    return schedule::TextContext::MixedPrefillSegment{
+                        .ids = std::span<const TokenId>(entry.prompt.token_ids).subspan(begin, length),
+                        .kv_base      = static_cast<std::int32_t>(begin),
+                        .kv_table_row = sequence.kv->text.bound_row(),
+                        .state_slot   = static_cast<std::int32_t>(
+                            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency)),
+                        .finalize         = false,
+                        .mtp_kv_table_row = head && stage_holds_head()
+                                                ? sequence.kv->backend->bound_row()
+                                                : -1,
+                        .mtp_kv = head && stage_holds_head() ? mtp_kv_view(sequence)
+                                                              : family::PagedKVCacheView{},
+                        // Every column but the prompt's last pairs with the prompt's next token;
+                        // the last pairs with the token the zero-suffix step samples (the bridge).
+                        .mtp_shifted_ids =
+                            head ? std::span<const TokenId>(entry.prompt.token_ids)
+                                       .subspan(begin + 1, std::min(length, entry.prompt_tokens - begin - 1))
+                                 : std::span<const TokenId>{},
+                        .lora_slot = requests[prefill_lanes[i]].lora_slot,
+                        .prompt = &entry.prompt,
+                        .vision = entry.vision ? &vision_chunks[i] : nullptr,
+                        .capture_slot = capture,
+                    };
                 };
+                if (splits[i] == 0) {
+                    segments[segment_count++] = segment(entry.cursor, nominals[i], -1);
+                    continue;
+                }
+                // The prompt's two segments; a rewrite checkpoint at the boundary between them is
+                // taken in the round, layer by layer (consume copies the boundary's hidden).
+                const bool capture = entry.rewrite_checkpoint_capture &&
+                                     entry.rewrite_checkpoint_capture->frontier == entry.cursor + splits[i];
+                segments[segment_count++] = segment(
+                    entry.cursor, splits[i],
+                    capture ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
+                            : -1);
+                segments[segment_count++] = segment(entry.cursor + splits[i], nominals[i] - splits[i], -1);
             }
             chunk = card.mixed_chunk_multi(
                 std::span<const schedule::TextContext::MixedPrefillSegment>(segments.data(),
-                                                                            staged_count),
+                                                                            segment_count),
                 slice, schedule::TextContext::MixedPrefillFinalize{}, flash ? &mixed_sink : nullptr);
         }
 
@@ -3820,6 +3859,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         mixed_in_flight_.graph_hit    = graph_hit;
         mixed_in_flight_.chunk        = chunk;
         mixed_in_flight_.nominals     = nominals;
+        mixed_in_flight_.splits       = splits;
         mixed_in_flight_.mtp_verify   = mtp_verify;
         return runtime::RoundHandle{.id = mixed_in_flight_.id, .rows = mixed_in_flight_.rows};
     } catch (...) {
@@ -3847,6 +3887,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
     const bool graph_hit                              = flight.graph_hit;
     const schedule::PrefillChunkResult chunk          = flight.chunk;
     const std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals = flight.nominals;
+    const std::array<std::uint32_t, runtime::kMaximumMixedPrefills> splits   = flight.splits;
     const std::uint32_t prefill_lane = prefill_lanes.front();
     SequenceState& prefill_sequence  = sequences[prefill_lane];
     RequestControl& prefill_request  = requests[prefill_lane];
@@ -3972,6 +4013,14 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                     schedule::dflash_append_context(context, features, positions, count, lane, row, {processed, processed});
                 }
                 sequence.dflash_context_frontier = entry.cursor + processed;
+            }
+            if (splits[i] > 0 && entry.rewrite_checkpoint_capture &&
+                entry.cursor + splits[i] == entry.rewrite_checkpoint_capture->frontier) {
+                // The prompt's two segments took the checkpoint's state between them, layer by
+                // layer; its hidden is the first segment's last column.
+                Tensor hidden = prefill_hidden.slice(1, column + splits[i] - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data, hidden.data,
+                    hidden.bytes(), cudaMemcpyDeviceToDevice, device.stream));
             }
             entry.cursor += processed;
             if (entry.vision) { entry.vision->release_encoded_media_payloads(); }

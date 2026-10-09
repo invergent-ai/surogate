@@ -722,6 +722,8 @@ public:
         bool graph_hit           = false;
         schedule::PrefillChunkResult chunk{};
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+        /// Per prompt, its first segment's length when it brought two (0: one segment).
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> splits{};
         /// The decode lanes verified their drafts in this round (an MTP round carrying the
         /// prompts): consume reads them through consume_mtp_round.
         bool mtp_verify = false;
