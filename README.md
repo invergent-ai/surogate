@@ -70,6 +70,71 @@ Responsiveness matters, too. At 100 users, Qwen3.5-4B delivers **40 ms median ti
 
 Need more throughput? Qwen3-0.6B FP4 LoRA scales from **36,400 tok/s on one RTX 5090 to 136,200 tok/s on four**: 3.74× aggregate throughput. Qwen3-8B reaches **27,100 tok/s** on the same four-card setup.
 
+### Every model and GPU we have measured
+
+Each comparison ran both engines on the same kind of GPU with the same requests. A ratio above 1× favours Surogate. The rows where the other engine leads stay in the table.
+
+**Serving.** Decode and prefill are tokens/s summed over all users, except where a row says "per user".
+
+| GPU | Model · weights | Load | Surogate | Other engine | Ratio |
+|---|---|---|---:|---:|---:|
+| RTX 5090 | Qwen3.5-0.8B · GGUF Q4_K_M | 1 user, decode | **802 tok/s** | vLLM (NVFP4): 346 | **2.32×** |
+| RTX 5090 | Qwen3.5-0.8B · GGUF Q4_K_M | 8 users, decode | **2,765 tok/s** | llama.cpp: 683 | **4.05×** |
+| RTX 5090 | Qwen3.5-4B · NVFP4 | 1 user, decode | **313 tok/s** | vLLM: 249 | **1.26×** |
+| RTX 5090 | Qwen3.5-4B · NVFP4 | 100 users, decode | **5,345 tok/s** | vLLM: 4,481 | **1.19×** |
+| RTX 5090 | Qwen3.8-27B · NVFP4 | 1 user, decode | 70.1 tok/s (107.3 with MTP on benchmark prose) | vLLM: 71.6 | 0.98× |
+| RTX 5090 | Qwen3.8-27B · NVFP4 | 100 users, decode | **1,321 tok/s** | vLLM: 1,109 | **1.19×** |
+| RTX 5090 | Qwen3.8-27B · NVFP4 | 100 users, 2,048-token prompts, prefill | 12,006 tok/s | vLLM: 12,402 | 0.97× |
+| RTX 5090 | Qwen3.6-35B-A3B · NVFP4 | 100 users, decode | **2,607 tok/s** | vLLM: 2,162 | **1.21×** |
+| RTX 5090 | Qwen3.8-Flash-Next · GGUF, experts in host RAM | 1 user, decode | **35.2 tok/s** | llama.cpp: 20.8 | **1.69×** |
+| RTX 5090 | Qwen3.8-Flash-Next · GGUF, experts in host RAM | 16 users, decode | **96.7 tok/s** | llama.cpp: 56.8 | **1.70×** |
+| 8× RTX 5090 | GLM-5.3-Flash · GGUF | 16 users, decode | **292.9 tok/s** | llama.cpp: 41.9 | **7.0×** |
+| H100 | Qwen3-8B · FP8 | 1 user, decode | **233.4 tok/s** | vLLM: 228.8 | **1.02×** |
+| H100 | Qwen3-8B · FP8 | 16 users, decode per user | **171.6 tok/s** | vLLM: 153.6 | **1.12×** |
+| H100 | Qwen3-8B · FP8 | 64 users, decode per user | 90.1 tok/s | vLLM: 92.4 | 0.98× |
+| H100 | Qwen3-8B · FP8 | 32 users, 2,048-token prompts, prefill | 52.5k tok/s | vLLM: 55.1k | 0.95× |
+| H100 | Qwen3-8B · FP8 | same load, time to first token (p50) | 661 ms | vLLM: 325 ms | 0.49× |
+| H100 | Qwen3.6-35B-A3B · FP8 | 1 user, decode | **282 tok/s** | vLLM: 251 | **1.12×** |
+| H100 | Qwen3.6-35B-A3B · FP8 | 64 users, decode | **2,291 tok/s** | vLLM: 1,923 | **1.19×** |
+| H100 | Qwen3.6-35B-A3B · FP8 | 32 users, 2,048-token prompts, prefill | 35.7k tok/s | vLLM: 39.5k | 0.90× |
+| H100 | Qwen3.6-35B-A3B · FP8 | 32 agents, 6k shared system prompt, 8 turns | **331 turns/min** | vLLM: 269 | **1.23×** |
+| H100 | Qwen3.6-27B · FP8 | 64 users, decode | 1,434 tok/s | vLLM: 1,626 | 0.88× |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 1 user, decode | **70.4 tok/s** | vLLM: 60.8 | **1.16×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 8 users, decode | **220.8 tok/s** | vLLM: 204.8 | **1.08×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 32 users, decode | **473.6 tok/s** | vLLM: 406.4 | **1.17×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 8 users, 2,048-token prompts, prefill | **6,042 tok/s** | vLLM: 5,069 | **1.19×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | cold 108k-token prompt, time to first token | **22.2 s** | vLLM: 32.4 s | **1.46×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | agents at 100k-200k context, warm-turn time to first token (p50), 1 / 8 agents | 2.2 s / **4.7 s** | vLLM: 1.8 s / 7.6 s | 0.82× / **1.62×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 16 users, real text, MTP | **444.7 tok/s** (362.8 without MTP) | not measured | — |
+| DGX Spark | Qwen3-8B · FP8 | 1 user, decode | **28.8 tok/s** | vLLM: 22.4 | **1.29×** |
+| DGX Spark | Qwen3-8B · FP8 | 8 users, decode | **182.4 tok/s** | vLLM: 153.6 | **1.19×** |
+| DGX Spark | Qwen3-8B · FP8 | 32 users, decode | 470.4 tok/s | vLLM: 496.0 | 0.95× |
+| DGX Spark | Qwen3-8B · FP8 | 8 users, 2,048-token prompts, prefill | **5,939 tok/s** | vLLM: 5,632 | **1.05×** |
+| DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 1 user, decode | **31.4 tok/s** (67.2 with MTP on benchmark prose) | vLLM: does not fit in 121.7 GiB | — |
+| DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 16 users, real text, MTP | **115.7 tok/s** (97.2 without MTP) | vLLM: does not fit | — |
+| DGX Spark | Qwen3.8-Flash-Next · NVFP4 | cold 32k-token prompt, prefill | **2,008 tok/s** | llama.cpp (UD-IQ4_XS GGUF): 629 | **3.2×** |
+| DGX Spark | EmbeddingGemma-300M · W8 | 16 clients, one text per request | **2,442 texts/s** | vLLM (BF16): 510-562 | **4.3×** |
+| DGX Spark | EmbeddingGemma-300M · W8 | 4 clients, 32 texts per request | **814 texts/s** | vLLM (BF16): 745 | **1.09×** |
+
+Also measured, without another engine alongside: single-user decode of Qwen3-0.6B at 685 tok/s and Qwen3.5-0.8B at 563 tok/s on an H100; Qwen3-0.6B at 220 tok/s, Qwen3.5-4B NVFP4 at 73 tok/s, Gemma 3 1B Q8_0 at 138 tok/s and Qwen3.6-27B NVFP4 at 12.0 tok/s on a DGX Spark, the last at the Spark's memory-bandwidth limit.
+
+**Training.** LoRA, tokens/s.
+
+| GPU | Model | Surogate | Unsloth | Ratio |
+|---|---|---:|---:|---:|
+| H100 80 GB | Qwen3-0.6B | **53,900 · BF16** | 21,300 · BF16 | **2.53×** |
+| H100 80 GB | Qwen3-8B | **11,600 · FP8** | 8,900 · BF16 | **1.30×** |
+| H100 80 GB | Qwen3-14B | **7,200 · FP8** | 5,600 · BF16 | **1.29×** |
+| RTX 5090 | Qwen3-0.6B | **30,100 · BF16** | 22,100 · BF16 | **1.36×** |
+| RTX 5090 | Qwen3-8B | **6,900 · FP4** | 3,500 · BF16 | **1.97×** |
+| 4× RTX 5090 | Qwen3-0.6B | **136,200 · FP4** | — | — |
+| 4× RTX 5090 | Qwen3-8B | **27,100 · FP4** | — | — |
+| DGX Spark | Qwen3-0.6B | ~7,100 · FP8 | — | — |
+| DGX Spark | Qwen3-8B | 1,433 · FP8 | — | — |
+| DGX Spark | Qwen3.6-35B-A3B | 674 · FP8 | — | — |
+
+<sub>RTX 5090 serving rows: 2026-08-30 to 2026-09-07, cards at a 400 W limit, vLLM 0.27.1 and llama.cpp CUDA builds. H100 and DGX Spark rows: 2026-10-05 to 2026-10-09, vLLM 0.31. On the DGX Spark, vLLM's FP8 KV cache fails to start, so vLLM ran a BF16 cache; Surogate ran a BF16 cache for the 35B's short-prompt rows and an FP8 cache for its long-context and MTP rows and for Flash-Next. Qwen3.8-Flash-Next's NVFP4 release needs 123.5 GiB in vLLM on a 121.7 GiB Spark; a public vLLM preview with MTP is reported at 31-41 tok/s for one user there (not measured here). Surogate's Flash-Next rows run the 105 GB artifact converted from that release, and its prefill row is against llama.cpp on Unsloth's UD-IQ4_XS GGUF. Benchmark prose is the repeated 512-token text the throughput rows use, where up to 95% of MTP drafts are accepted; "real text" means distinct Wikipedia passages, where 52-54% are. Full methods: <a href="surogate/serve/BENCHMARKS.md">serving benchmarks</a>, <a href="docs/reference/benchmarks.md">training benchmarks</a>, and the pull requests behind each result (#296-#308).</sub>
+
 ## Two engines. One workflow.
 
 ### Training engine
@@ -148,7 +213,7 @@ Additional architecture definitions include [Gemma 3](surogate/dsl/models/gemma3
 | **Qwen3 / Qwen3 MoE** | Dense and mixture-of-experts text models. |
 | **Qwen3.5 / Qwen3.6 / Qwen3.8** | Dense hybrid models, including supported BF16, FP8, and NVFP4 exports. |
 | **Qwen3.5 / Qwen3.6 MoE** | Including 35B-A3B; optional speculative decoding with compatible draft weights. |
-| **Qwen3.8 Flash-Next** | GGUF, CPU offload, GPU expert caching, and multiple GPUs. |
+| **Qwen3.8 Flash-Next** | GGUF and NVIDIA's NVFP4 release, MTP, CPU offload, GPU expert caching, and multiple GPUs. |
 | **GLM-5.3-Flash** | GGUF, CPU/GPU expert compute, multiple GPUs, and MTP. |
 | **Llama** | Llama-family text models, including TinyLlama. |
 | **Gemma 3 / Gemma 4** | Text generation; Gemma 4 dense, E-series, and MoE variants. |
