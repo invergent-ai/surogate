@@ -13,7 +13,9 @@
 #include "core/device_footprint.h"
 #include "core/engine_context.h"
 #include "core/elastic_kv_region.h"
+#include "core/memory_trace.h"
 #include "core/unified_memory.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
@@ -405,6 +407,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
+    if (memory_trace_enabled()) {
+        std::fprintf(stderr,
+                     "mem-trace sizing: derived planes projected %zu MiB, elastic KV unmapped "
+                     "elsewhere %zu MiB\n",
+                     derived_residency_bytes >> 20, elastic_kv_unmapped_commitment(device.device) >> 20);
+        trace_memory_phase("weights loaded, KV sized against this");
+    }
     // Elastic pools on this device have mapped only what they use so far; what they may still
     // map is not free for this engine's cap, or two engines would fill against each other.
     runtime::KvCapacityResolution capacity_resolution = resolve_kv_capacity_within_limit(
@@ -435,6 +444,17 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         options.load_progress.callback("runtime reservation", reserved, reserved);
     }
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    if (memory_trace_enabled()) {
+        std::fprintf(stderr,
+                     "mem-trace startup: runtime plan %zu MiB, of which KV still unmapped %zu "
+                     "MiB; derived planes w8 %zu MiB, marlin %zu MiB, ggml scratch %zu MiB\n",
+                     static_cast<std::size_t>(reserved >> 20),
+                     elastic_kv_unmapped_commitment(device.device) >> 20,
+                     ops::detail::w8_derived_plane_bytes() >> 20,
+                     ops::detail::marlin_plane_bytes() >> 20,
+                     ops::detail::ggml::scratch_bytes() >> 20);
+        trace_memory_phase("startup done");
+    }
 
     LoadSummary summary;
     summary.target               = std::string(target_key);

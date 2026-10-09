@@ -1,5 +1,6 @@
 #include "family/impl/runtime/target_support.h"
 #include "core/device_footprint.h"
+#include "core/memory_trace.h"
 #include "core/sleep.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -478,6 +479,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
+    trace_memory_phase("program state bound");
     // Both cuBLASLt routes build their handle and workspace on first use, and capture cannot
     // cudaMalloc. Build them here, while nothing is capturing (#85).
     ops::detail::nvfp4_cublaslt_prewarm();
@@ -486,6 +488,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // state is a 32 MiB workspace, and allocating that inside the capture window charges it
     // to the graph allowance. qwen4exp already prewarms it for the same reason.
     ops::detail::bf16_cublaslt_prewarm();
+    trace_memory_phase("cuBLASLt prewarmed");
     // Adapters are bound by now (the target binds them with its frontend), so this is the
     // engine's answer for its whole life: which flavors its rounds take and, below, which
     // graphs it captures for them.
@@ -1967,6 +1970,7 @@ void ProgramImplCore::prepare_graphs() {
         };
         warm_ordinary();
         warm_base_rounds(warm_ordinary);
+        trace_memory_phase("decode warmed");
 
         // Warmup above has run every op once, so every weight that can adopt
         // Marlin residency already has. Close adoption HERE — before the first
@@ -2081,6 +2085,7 @@ void ProgramImplCore::prepare_graphs() {
             warm_wide();
             if (narrow_reachable) { warm_narrow(); }
         });
+        trace_memory_phase("MTP decode warmed");
 
         for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
             const bool base_round = kRoundFlavors[flavor];
@@ -2275,6 +2280,7 @@ void ProgramImplCore::prepare_graphs() {
     const std::size_t excluded  = plane_bytes + kv_growth;
     const std::size_t consumed  = counted > excluded ? counted - excluded : 0;
     graph_observed_bytes = consumed;
+    trace_memory_phase("decode graphs captured");
     if (consumed > graph_allowance_bytes) {
         // Refuse only on a figure that is this engine's own. Unattributed, the
         // number counts every process on the card: a second engine loading its
@@ -2381,6 +2387,7 @@ void ProgramImplCore::prepare_graphs() {
             device.synchronize();
         };
         warm_prefill();
+        trace_memory_phase("prefill warmed");
         // The base flavor's prefill routes read planes of their own (the wide sparse-MoE
         // family, the fused projections). Derive them now as well: its buckets are captured
         // on first use, under a live request, and a capture may look a plane up but never
@@ -2402,6 +2409,7 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
         work.reset();
         prefill_graphs->finish_startup();
+        trace_memory_phase("prefill graphs captured");
     }
 
     for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }
