@@ -172,10 +172,11 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
     // A native GGUF parent: its rows are the file's blocks, typed per segment when the file
-    // quantised the components differently; the public view knows both.
-    if (block.layout == QuantLayout::GgmlBlocks) { return ops::weight_rows(block, row_begin, row_count); }
-    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
-        block.layout != QuantLayout::RowSplit) {
+    // quantised the components differently; the public view knows both. A contiguous BF16
+    // parent -- the MTP head of an NVFP4 export, kept unquantized -- is plain rows, and block
+    // FP8 has its own view; the public op cuts those too and refuses layouts it can't.
+    if (block.layout != QuantLayout::RowSplit) { return ops::weight_rows(block, row_begin, row_count); }
+    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n) {
         throw std::logic_error("invalid target row view");
     }
     const std::uint64_t groups    = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
