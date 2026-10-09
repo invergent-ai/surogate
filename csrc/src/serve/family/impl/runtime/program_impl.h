@@ -2039,27 +2039,43 @@ void ProgramImplCore::prepare_graphs() {
         // The narrow round's family, when a width limit can reach it. Its ingress shape is
         // the round's own: nothing drafted, one valid column, rope positions at stride one.
         const bool narrow_reachable = speculative_max_lanes != kSpeculateAtAnyWidth;
+        // As for the ordinary family, a route that stages through the engine-slot scratch sizes
+        // it by the round's width and a capture may not grow it, so each warm-up runs the widest
+        // round before the one-lane round the captures start from. Warming one lane alone left a
+        // block-FP8 projection that runs as a GEMV at four columns (a 35B-A3B with three drafts,
+        // off Hopper) to first need its scratch at eight, inside the two-lane capture, and MTP
+        // refused to start above one sequence.
         const auto warm_wide = [&] {
-            prepare_representative(code_warm.min, 1);
-            device.synchronize();
-            schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                       mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                       nullptr);
-            device.synchronize();
+            const auto round = [&](std::uint32_t batch_size) {
+                prepare_representative(code_warm.min, batch_size);
+                device.synchronize();
+                schedule::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
+                                           draft_window,
+                                           mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                           nullptr);
+                device.synchronize();
+            };
+            if (batch_capacity > 1) { round(batch_capacity); }
+            round(1);
         };
         const auto warm_narrow = [&] {
-            prepare_representative(code_warm.min, 1);
-            for (std::uint32_t row = 0; row < batch_capacity; ++row) {
-                mtp_host_ingress->current_extents[row]      = 0;
-                mtp_host_ingress->target_valid_columns[row] = 1;
-                mtp_host_ingress->target_rope_positions[row] =
-                    checked_i32(code_warm.min, "graph representative narrow rope position");
-            }
-            device.synchronize();
-            schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                       mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                       nullptr, /*narrow=*/true);
-            device.synchronize();
+            const auto round = [&](std::uint32_t batch_size) {
+                prepare_representative(code_warm.min, batch_size);
+                for (std::uint32_t row = 0; row < batch_capacity; ++row) {
+                    mtp_host_ingress->current_extents[row]      = 0;
+                    mtp_host_ingress->target_valid_columns[row] = 1;
+                    mtp_host_ingress->target_rope_positions[row] =
+                        checked_i32(code_warm.min, "graph representative narrow rope position");
+                }
+                device.synchronize();
+                schedule::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
+                                           draft_window,
+                                           mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                           nullptr, /*narrow=*/true);
+                device.synchronize();
+            };
+            if (batch_capacity > 1) { round(batch_capacity); }
+            round(1);
         };
         warm_base_rounds([&] {
             warm_wide();
