@@ -1,7 +1,9 @@
 """The NVFP4 safetensors release of a hyper-connected hybrid converts with its words intact."""
 
 import json
+import math
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -15,19 +17,33 @@ from tests.serve.test_qwen4exp_checkpoint_config import config_for
 PARTS, PART_ROWS = 2, 100
 
 
-def _release(path):
-    """A tiny ModelOpt export: NVFP4 experts, one FP8 n-gram table, BF16 everything else."""
-    config = config_for(vision=True)
+def _release(path, *, mtp=False):
+    """A tiny ModelOpt export: NVFP4 experts, one FP8 n-gram table, BF16 everything else, and
+    with `mtp` a NextN head whose experts are FP8 with 128 x 128 block scales."""
+    config = config_for(vision=True, mtp=mtp)
     text = config["text_config"]
     text["split_ngram_parts"] = PARTS
-    g = inv.geometry_from_config(checkpoint.text_config(config), ple_table_rows=PARTS * PART_ROWS,
+    g = inv.geometry_from_config(checkpoint.text_config(config, mtp=mtp), ple_table_rows=PARTS * PART_ROWS,
                                  token_domain=500)
     generator = torch.Generator().manual_seed(5)
     tensors = {}
-    for name, item in source_requirements(checkpoint.build_recipes(g)).items():
+    recipes = checkpoint.build_recipes(g) + (checkpoint.build_mtp_recipes(g) if mtp else ())
+    for name, item in source_requirements(recipes).items():
         tensors[name.replace("model.", "model.language_model.", 1) if name.startswith("model.") else name] = (
             torch.randn(item.shape, generator=generator) * 0.1).to(torch.bfloat16)
     quantized = {}
+    if mtp:
+        quantized[checkpoint.MTP_EXPERTS] = {"quant_algo": "FP8_PB_WO", "group_size": 128}
+        for expert in range(g.experts):
+            for projection, (n, k) in (("gate_proj", (g.intermediate, g.hidden)),
+                                       ("up_proj", (g.intermediate, g.hidden)),
+                                       ("down_proj", (g.hidden, g.intermediate))):
+                base = f"{checkpoint.MTP_EXPERTS}.{expert}.{projection}."
+                tensors[base + "weight"] = (torch.randn((n, k), generator=generator) * 100).clamp(
+                    -440, 440).to(torch.float8_e4m3fn)
+                tensors[base + "weight_scale_inv"] = (
+                    torch.rand((math.ceil(n / 128), math.ceil(k / 128)), generator=generator) * 1e-3 + 1e-4
+                ).to(torch.bfloat16)
     for layer in range(g.layers):
         quantized[f"model.language_model.layers.{layer}.mlp.experts"] = {"quant_algo": "NVFP4", "group_size": 16}
         for expert in range(g.experts):
@@ -64,6 +80,73 @@ def _release(path):
     (path / "generation_config.json").write_text(json.dumps({"eos_token_id": 1}))
     (path / "preprocessor_config.json").write_text(json.dumps({"patch_size": 16}))
     return g, tensors
+
+
+def _w8(artifact, name):
+    obj = artifact.find(name)
+    return dequantize_row_split(bytes(artifact.payload(obj)), obj.format, tuple(obj.shape), dtype=torch.float32)
+
+
+def _direct(artifact, name):
+    obj = artifact.find(name)
+    return decode_direct(bytes(artifact.payload(obj)), obj.format, tuple(obj.shape))
+
+
+def _fp8_expert(stored, expert, projection):
+    base = f"{checkpoint.MTP_EXPERTS}.{expert}.{projection}."
+    weight = stored[base + "weight"].float()
+    scale = stored[base + "weight_scale_inv"].float()
+    blocks = scale.repeat_interleave(128, 0)[:weight.shape[0]].repeat_interleave(128, 1)[:, :weight.shape[1]]
+    return weight * blocks
+
+
+def _close(values, reference):
+    return torch.allclose(values, reference, atol=float(reference.abs().max()) / 100)
+
+
+def test_release_converts_nextn_head(tmp_path):
+    g, stored = _release(tmp_path / "release", mtp=True)
+    assert g.mtp_layers == 1
+    output = checkpoint.convert(tmp_path / "release", tmp_path / "out.sinfer", device="cpu")
+    with Artifact(output) as artifact:
+        names = {obj.name for obj in artifact.objects}
+        assert "mtp/input_projection" in names and "mtp/layer/mlp/routed_gate_up_scale" not in names
+        # The two input projections are the engine's [e; h] matmul's column halves.
+        fold = _w8(artifact, "mtp/input_projection")
+        assert _close(fold, torch.cat([stored["mtp.fc_embedding.weight"], stored["mtp.fc_hidden.weight"]], 1).float())
+        # Zero-centred norms fold; the attention q norm stays as HF stores it.
+        assert torch.equal(_direct(artifact, "mtp/embedding_norm").float(),
+                           (stored["mtp.pre_fc_norm_embedding.weight"].float() + 1).bfloat16().float())
+        assert torch.equal(_direct(artifact, "mtp/hidden_norm"), stored["mtp.pre_fc_norm_hidden.weight"].float() + 1)
+        assert torch.equal(_direct(artifact, "mtp/head_hc/norm"),
+                           stored["mtp.hyper_connection_mixer.hc_norm.weight"].float() + 1)
+        assert torch.equal(_direct(artifact, "mtp/layer/attention/query_norm").float(),
+                           stored[checkpoint.MTP_BLOCK + "self_attn.q_norm.weight"].float())
+        # Routed experts: FP8 blocks times their scale, gate then up, at W8.
+        expert = 1
+        gate_up = _w8(artifact, "mtp/layer/mlp/routed_gate_up")
+        rows = slice(expert * 2 * g.intermediate, (expert + 1) * 2 * g.intermediate)
+        assert _close(gate_up[rows], torch.cat([_fp8_expert(stored, expert, "gate_proj"),
+                                                _fp8_expert(stored, expert, "up_proj")]))
+        down = _w8(artifact, "mtp/layer/mlp/routed_down")
+        assert _close(down[expert * g.hidden:(expert + 1) * g.hidden], _fp8_expert(stored, expert, "down_proj"))
+        # The trunk keeps its NVFP4 experts beside the W8 draft ones.
+        assert artifact.find("text/layers/0/mlp/routed_gate_up").format == checkpoint.NVFP4
+
+    text_only = checkpoint.convert(tmp_path / "release", tmp_path / "text.sinfer", device="cpu", mtp=False)
+    with Artifact(text_only) as artifact:
+        assert not any(obj.name.startswith("mtp/") for obj in artifact.objects)
+
+
+def test_nextn_head_refuses_what_the_engine_would_run_differently():
+    text = checkpoint.text_config(config_for(mtp=True), mtp=True)
+    checkpoint.validate_mtp(text)
+    for change in ({"mtp_use_dedicated_embeddings": True},
+                   {"mtp": {"layer_types": ["linear_attention"]}},
+                   {"mtp": {"mtp_use_hidden_state_from_layer": 3}},
+                   {"mtp_num_hidden_layers": 2}):
+        with pytest.raises(ValueError):
+            checkpoint.validate_mtp({**text, **change})
 
 
 def test_release_converts(tmp_path):

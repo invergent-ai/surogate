@@ -13,7 +13,10 @@ n-gram RMS-norm weight zero-centred (the module computes `(1 + w) * x`), and the
 folded `1 + w`, as the GGUF carries them. The attention q/k norms are the exception the engine
 shares with HF, and the GDN norm is not zero-centred in either.
 
-Text only for now: the vision tower and the NextN head stay in the checkpoint.
+The NextN draft head is converted unless `--no-mtp` asks otherwise. Its experts are FP8 with a
+scale per 128 x 128 block in the release; they are dequantised and stored W8, as the GGUF path
+stores them, so `--spec mtp` runs them through the same device MoE as any W8 layer. The vision
+tower stays in the checkpoint.
 """
 
 from __future__ import annotations
@@ -55,6 +58,10 @@ _NVFP4_BLOCK = 16
 
 _DIRECT = {inv.BF16: torch.bfloat16, inv.FP32: torch.float32, inv.I32: torch.int32}
 _EXPERTS = re.compile(r"model\.language_model\.layers\.(\d+)\.mlp\.experts")
+MTP_BLOCK = "mtp.layers.0."
+MTP_EXPERTS = MTP_BLOCK + "mlp.experts"
+MTP_ROUTED = ("mtp/layer/mlp/routed_gate_up", "mtp/layer/mlp/routed_down")
+_FP8_BLOCK = 128
 _NGRAM_TABLE = re.compile(r"model\.language_model\.layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding")
 
 
@@ -63,13 +70,45 @@ _NGRAM_TABLE = re.compile(r"model\.language_model\.layers\.(\d+)\.ple\.ple_embed
 # --------------------------------------------------------------------------------------------
 
 
-def text_config(config: Mapping) -> dict:
-    """The text tower's config as the geometry resolver reads it, without the NextN head."""
+def text_config(config: Mapping, *, mtp: bool = False) -> dict:
+    """The text tower's config as the geometry resolver reads it; the NextN head only if asked."""
     text = dict(config.get("text_config", config))
     text.update(architectures=["Qwen4ExpForCausalLM"], model_type="qwen4_exp",
                 image_token_id=config.get("image_token_id", text.get("image_token_id")),
-                mtp_num_hidden_layers=0)
+                mtp_num_hidden_layers=int(text.get("mtp_num_hidden_layers") or 0) if mtp else 0)
     return text
+
+
+def validate_mtp(text: Mapping) -> None:
+    """Refuse a NextN head the engine's draft path would run differently than the release.
+
+    The engine carries one draft block, a full-attention trunk block fed by the shared token
+    embedding and the trunk's last wide residual, at the trunk's RoPE.
+    """
+    if int(text.get("mtp_num_hidden_layers") or 0) != 1:
+        raise ValueError("the engine's draft head is one block; mtp_num_hidden_layers must be 1")
+    if text.get("mtp_use_dedicated_embeddings"):
+        raise ValueError("a NextN head with its own embedding table is not supported")
+    head = text.get("mtp") or {}
+    if list(head.get("layer_types", ["full_attention"])) != ["full_attention"]:
+        raise ValueError(f"the NextN block must be full attention, not {head.get('layer_types')}")
+    if head.get("mtp_use_hidden_state_from_layer") is not None:
+        raise ValueError("the NextN head must read the trunk's last hidden state")
+    trunk = (text.get("rope_parameters") or {}).get("rope_theta", text.get("rope_theta"))
+    if "rope_theta" in head and trunk is not None and float(head["rope_theta"]) != float(trunk):
+        raise ValueError("the NextN block's RoPE differs from the trunk's, which the engine reuses")
+
+
+def mtp_expert_quantization(config: Mapping) -> str | None:
+    """`FP8_PB_WO` for 128 x 128 block-scaled FP8 draft experts, None for BF16 ones."""
+    quantized = (config.get("quantization_config") or {}).get("quantized_layers") or {}
+    entry = quantized.get(MTP_EXPERTS)
+    if entry is None:
+        return None
+    if entry.get("quant_algo") == "FP8_PB_WO" and entry.get("group_size") == _FP8_BLOCK:
+        return "FP8_PB_WO"
+    raise ValueError(f"{MTP_EXPERTS}: quant_algo {entry.get('quant_algo')!r} is not one this "
+                     "converter reads")
 
 
 def validate_quantization(config: Mapping, layers: int) -> int:
@@ -90,7 +129,7 @@ def validate_quantization(config: Mapping, layers: int) -> int:
     for name, entry in quantized.items():
         algo = entry.get("quant_algo") if isinstance(entry, Mapping) else None
         if name.startswith("mtp."):
-            continue  # the NextN head is not converted
+            continue  # the NextN head's experts: `mtp_expert_quantization`
         if (match := _EXPERTS.fullmatch(name)) and algo == "NVFP4" and entry.get("group_size") == 16:
             experts.add(int(match[1]))
         elif (match := _NGRAM_TABLE.fullmatch(name)) and algo == "FP8":
@@ -253,9 +292,36 @@ def build_recipes(g: inv.Geometry) -> tuple[TensorRecipe, ...]:
     return tuple(recipes)
 
 
+def build_mtp_recipes(g: inv.Geometry) -> tuple[TensorRecipe, ...]:
+    """The NextN head's dense objects; its routed experts are built separately.
+
+    The engine runs one matmul over `[e; h_s]` per residual stream, so the release's two input
+    projections are its column halves, the embedding's first.
+    """
+    layer = "mtp/layer/"
+    recipes = [
+        TensorRecipe("mtp/embedding_norm", source("mtp.pre_fc_norm_embedding.weight", (g.hidden,))),
+        TensorRecipe("mtp/hidden_norm", source("mtp.pre_fc_norm_hidden.weight", (g.residual,))),
+        TensorRecipe("mtp/input_projection", Concat((
+            source("mtp.fc_embedding.weight", (g.hidden, g.hidden)),
+            source("mtp.fc_hidden.weight", (g.hidden, g.hidden)),
+        ), 1)),
+    ]
+    recipes += _hyper_connection(g, MTP_BLOCK + "attn_hyper_connection.", layer + "hc_attn/", True)
+    recipes += _attention(g, MTP_BLOCK, layer + "attention/")
+    recipes += _hyper_connection(g, MTP_BLOCK + "mlp_hyper_connection.", layer + "hc_ffn/", True)
+    recipes += _mlp(g, MTP_BLOCK, layer + "mlp/")
+    recipes += _hyper_connection(g, "mtp.hyper_connection_mixer.", "mtp/head_hc/", False)
+    return tuple(recipes)
+
+
 def unit_offset_objects(g: inv.Geometry) -> frozenset[str]:
     """The norms HF stores zero-centred and the engine reads folded (`1 + w`)."""
     names = {"text/output_hc/norm"}
+    if g.mtp_layers:
+        names.update(("mtp/embedding_norm", "mtp/hidden_norm", "mtp/head_hc/norm",
+                      "mtp/layer/hc_attn/norm", "mtp/layer/hc_ffn/norm",
+                      "mtp/layer/attention/indexer/query_norm", "mtp/layer/attention/indexer/key_norm"))
     for layer in range(g.layers):
         dst = f"text/layers/{layer}/"
         names.update((dst + "hc_attn/norm", dst + "hc_ffn/norm"))
@@ -460,6 +526,70 @@ class RoutedLayers:
         return value if isinstance(value, bytes) else encode_direct(value, inv.FP32)
 
 
+class MtpExperts:
+    """The NextN head's routed experts as the logical matrices the W8 encoder quantises.
+
+    Stacked as the GGUF path stacks them: gate then up within each expert, down per expert.
+    FP8 block-scaled experts are dequantised first (`weight_scale_inv` multiplies its block).
+    """
+
+    def __init__(self, reader: ShardReader, g: inv.Geometry, quantization: str | None) -> None:
+        self.reader, self.g, self.fp8 = reader, g, quantization == "FP8_PB_WO"
+
+    def _leaves(self, expert: int, projection: str) -> tuple[str, ...]:
+        base = f"{MTP_EXPERTS}.{expert}.{projection}."
+        return (base + "weight", base + "weight_scale_inv") if self.fp8 else (base + "weight",)
+
+    def _shape(self, projection: str) -> tuple[int, int]:
+        g = self.g
+        return (g.hidden, g.intermediate) if projection == "down_proj" else (g.intermediate, g.hidden)
+
+    def preflight(self) -> None:
+        names = [leaf for expert in range(self.g.experts)
+                 for projection in ("gate_proj", "up_proj", "down_proj")
+                 for leaf in self._leaves(expert, projection)]
+        metadata = self.reader.metadata(names)
+        for expert in range(self.g.experts):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                rows, columns = self._shape(projection)
+                leaves = self._leaves(expert, projection)
+                expected = [(leaves[0], (rows, columns), "F8_E4M3" if self.fp8 else "BF16")]
+                if self.fp8:
+                    expected.append((leaves[1], (math.ceil(rows / _FP8_BLOCK), math.ceil(columns / _FP8_BLOCK)),
+                                     None))
+                for name, shape, dtype in expected:
+                    actual = metadata[name]
+                    if actual.shape != shape or (dtype and actual.dtype != dtype) or (
+                            dtype is None and actual.dtype not in ("BF16", "F16", "F32")):
+                        raise ValueError(f"{name}: stored {actual.dtype} {actual.shape}, expected {shape}")
+
+    def _projection(self, expert: int, projection: str, device: torch.device) -> torch.Tensor:
+        rows, columns = self._shape(projection)
+        leaves = self._leaves(expert, projection)
+        weight = self.reader.get(leaves[0]).to(device).to(torch.float32)
+        if not self.fp8:
+            return weight
+        scale = self.reader.get(leaves[1]).to(device).to(torch.float32)
+        if not bool(torch.isfinite(scale).all()):
+            raise ValueError(f"{leaves[1]}: a block scale is not finite")
+        blocks = scale.repeat_interleave(_FP8_BLOCK, 0)[:rows].repeat_interleave(_FP8_BLOCK, 1)[:, :columns]
+        return weight * blocks
+
+    def tensor(self, name: str, device: torch.device) -> torch.Tensor:
+        g = self.g
+        if name == MTP_ROUTED[0]:
+            out = torch.empty((g.experts * 2 * g.intermediate, g.hidden), dtype=torch.float32, device=device)
+            for expert in range(g.experts):
+                for half, projection in enumerate(("gate_proj", "up_proj")):
+                    begin = (expert * 2 + half) * g.intermediate
+                    out[begin:begin + g.intermediate] = self._projection(expert, projection, device)
+            return out
+        out = torch.empty((g.experts * g.hidden, g.intermediate), dtype=torch.float32, device=device)
+        for expert in range(g.experts):
+            out[expert * g.hidden:(expert + 1) * g.hidden] = self._projection(expert, "down_proj", device)
+        return out
+
+
 # --------------------------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------------------------
@@ -473,16 +603,20 @@ def encode(tensor: torch.Tensor, spec, device: torch.device) -> bytes:
     raise ValueError(f"{spec.name}: nothing here encodes {spec.format}")
 
 
-def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None = None) -> Path:
+def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None = None,
+            mtp: bool = True) -> Path:
     started = time.perf_counter()
     model_dir = Path(model_dir)
     output = Path(out_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     target = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     config = json.loads((model_dir / "config.json").read_text())
-    text = text_config(config)
+    mtp = mtp and int(text_config(config, mtp=True).get("mtp_num_hidden_layers") or 0) > 0
+    text = text_config(config, mtp=mtp)
     layers = int(text.get("num_hidden_layers", 0))
     table_layer = validate_quantization(config, layers)
+    if mtp:
+        validate_mtp(text)
 
     with ShardReader.for_directory(model_dir) as reader:
         ple_layers = [i - 1 for i in text.get("ple_layer_ids") or []]
@@ -499,22 +633,27 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
                                      token_domain=tokenizer_domain(model_dir))
         if g.hidden % _NVFP4_BLOCK or g.intermediate % _NVFP4_BLOCK:
             raise ValueError("routed NVFP4 requires hidden and expert widths divisible by 16")
-        tensor_specs, object_specs = inv.active_specs(geometry=g, vision=False, mtp=False)
+        tensor_specs, object_specs = inv.active_specs(geometry=g, vision=False, mtp=mtp)
         tensor_specs = routed_nvfp4_specs(tensor_specs, g)
         object_specs = routed_nvfp4_specs(object_specs, g)
 
-        recipes = {item.object_name: item for item in build_recipes(g)}
+        recipes = {item.object_name: item
+                   for item in build_recipes(g) + (build_mtp_recipes(g) if mtp else ())}
         unit_offset = unit_offset_objects(g)
         hashes = table.hash_words(g.ple_ngram, g.ple_heads) if table else {}
-        planned = set(recipes) | set(hashes) | {inv.PLE_TABLE_RESOURCE}
+        draft_experts = MtpExperts(reader, g, mtp_expert_quantization(config)) if mtp else None
+        planned = set(recipes) | set(hashes) | {inv.PLE_TABLE_RESOURCE} | (set(MTP_ROUTED) if mtp else set())
         stray = [s.name for s in tensor_specs if s.name not in planned and not is_routed_object(s.name)]
         if stray or not unit_offset <= set(recipes):
             raise ValueError(f"objects with no source: {stray[:8]}")
         preflight = preflight_source_reader(reader, tuple(recipes.values()))
         preflight_experts(reader, g)
+        if draft_experts:
+            draft_experts.preflight()
         print(f"preflight: {preflight.source_tensor_count} dense sources, "
               f"{g.layers} layers of {g.experts} NVFP4 experts, "
-              f"n-gram table {g.ple_table_rows} rows", flush=True)
+              f"n-gram table {g.ple_table_rows} rows, "
+              f"NextN head {'converted' if mtp else 'left out'}", flush=True)
 
         # A text-only artifact must not offer pixels: the processor configs the release ships
         # stay out, and the engine then refuses `--vision` against it.
@@ -542,6 +681,10 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
                     payload = hashes[spec.name]
                 elif is_routed_object(spec.name):
                     payload = routed.payload(spec.name)
+                elif spec.name in MTP_ROUTED:
+                    tensor = draft_experts.tensor(spec.name, target)
+                    payload = encode(tensor, spec, target)
+                    del tensor
                 else:
                     tensor = materialize_recipe(recipes[spec.name], reader)
                     if spec.name in unit_offset:
@@ -578,9 +721,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default=None, help="where the dense and table quantisers run")
     # The ingest path asks every converter the same way; this one never converts either.
     parser.add_argument("--no-vision", action="store_true", help="accepted; the tower is never converted")
-    parser.add_argument("--no-mtp", action="store_true", help="accepted; the NextN head is never converted")
+    parser.add_argument("--no-mtp", action="store_true", help="leave the NextN draft head out")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.out, device=args.device, mtp=not args.no_mtp)
     return 0
 
 
