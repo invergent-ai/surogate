@@ -625,11 +625,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--no-mtp", action="store_true",
                         help="source checkpoint has no MTP (nextn) block; "
                              "emit the artifact variant without mtp/* objects")
-    parser.add_argument("--mtp-format", choices=("bf16", "w8"), default="bf16",
+    parser.add_argument("--mtp-format", choices=("bf16", "w8"),
                         help="nvfp4-all/nvfp4-uniform exports of a checkpoint whose MTP block is "
-                             "unquantized: store its matrices in this format (the norms stay BF16). "
-                             "The block runs several times a decode round, so its bytes count "
-                             "several times on a bandwidth-bound GPU.")
+                             "unquantized: store its matrices in this format (default w8; the norms "
+                             "stay BF16). The block runs several times a decode round, so its bytes "
+                             "count several times on a bandwidth-bound GPU.")
     args = parser.parse_args(argv)
     _model = Path(args.model)
     _config = _load_config(_model)
@@ -651,20 +651,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.dflash_model is not None:
         raise ValueError("--dflash-model currently requires the groupwise-int or bf16 conversion profile")
     writer = _export_writer(profile)
-    if args.mtp_format != "bf16":
+    options = {}
+    if args.mtp_format is not None:
         if profile not in (inventory.NVFP4_ALL, inventory.NVFP4_UNIFORM):
             raise ValueError("--mtp-format applies to the nvfp4-all and nvfp4-uniform exports")
         from .exports.quantized import MTP_FORMATS
-        writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
-                       mtp_format=MTP_FORMATS[args.mtp_format])
-        return
+        options["mtp_format"] = MTP_FORMATS[args.mtp_format]
     if profile in DUAL_SOURCE_PROFILES:
         if args.quantized_model is None:
-            writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
+            writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
+                           **options)
         else:
-            writer.convert(args.model, args.quantized_model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
+            writer.convert(args.model, args.quantized_model, args.out, device=args.device, mtp=not args.no_mtp,
+                           vision=not args.no_vision, **options)
         return
-    writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
+    writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
+                   **options)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from . import quantized
 
 
 def convert(model_dir, quantized_or_out, out_path=None, *, device="cuda", resources_from=None, mtp=True, vision=True,
-            mtp_format=inventory.BF16):
+            mtp_format=quantized.DEFAULT_MTP_FORMAT[inventory.NVFP4_UNIFORM]):
     """Use one checkpoint, or a quantized checkpoint with a complete fallback checkpoint."""
     return quantized.convert(
         model_dir, quantized_or_out if out_path is None else out_path,

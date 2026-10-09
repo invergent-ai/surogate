@@ -202,6 +202,12 @@ def _split_gdn(entry):
 #: matrices are not among them, so such an artifact would fail at startup.
 MTP_FORMATS = {"bf16": inv.BF16, "w8": inv.W8}
 
+#: The all-quantized exports store a BF16 MTP block in W8 unless told otherwise. The block only
+#: drafts -- verification decides every token -- so its precision can cost acceptance but never
+#: output, and on the 27B at 8 bits it cost neither: the same tokens per round as BF16, and a
+#: decode round ~5 ms shorter on a DGX Spark. The other exports keep the source's BF16.
+DEFAULT_MTP_FORMAT = {inv.NVFP4_ALL: inv.W8, inv.NVFP4_UNIFORM: inv.W8}
+
 
 def build(geometry, profile, sources, *, mtp_format=inv.BF16):
     """Build an artifact plan from config dimensions and actual per-object source formats.
@@ -495,12 +501,15 @@ def main(argv=None, *, profile=None):
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-mtp", action="store_true")
-    parser.add_argument("--mtp-format", choices=sorted(MTP_FORMATS), default="bf16",
-                        help="store an unquantized MTP block's matrices in this format")
+    parser.add_argument("--mtp-format", choices=sorted(MTP_FORMATS),
+                        help="store an unquantized MTP block's matrices in this format "
+                             "(default: w8 for nvfp4-all and nvfp4-uniform, bf16 otherwise)")
     parser.add_argument("--no-vision", action="store_true")
     args = parser.parse_args(argv)
     source = args.quantized_model or args.model
     profile = profile or profile_for_checkpoint(conversion.load_json(source / "config.json"))
+    mtp_format = (MTP_FORMATS[args.mtp_format] if args.mtp_format is not None
+                  else DEFAULT_MTP_FORMAT.get(profile, inv.BF16))
     return convert(args.model, args.out, profile=profile, quantized_model_dir=args.quantized_model,
                    device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
-                   mtp_format=MTP_FORMATS[args.mtp_format])
+                   mtp_format=mtp_format)

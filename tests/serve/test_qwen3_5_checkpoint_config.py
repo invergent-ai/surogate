@@ -172,8 +172,10 @@ def test_fp8_block_scales_widen_to_fp32(tmp_path, scale_dtype):
     assert torch.equal(stored, scales.float().reshape(-1))
 
 
-@pytest.mark.parametrize("mtp,vision,tied", [(True, True, False), (False, False, True)])
-def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monkeypatch, mtp, vision, tied):
+@pytest.mark.parametrize("mtp,vision,tied,mtp_format", [(True, True, False, inv.BF16), (False, False, True, inv.BF16),
+                                                     (True, False, False, inv.W8)])
+def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monkeypatch, mtp, vision, tied,
+                                                                  mtp_format):
     from safetensors.torch import save_file
     import numpy as np
     from surogate.serve.artifact.container import Artifact
@@ -203,7 +205,7 @@ def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monk
     np.arange(g.vocab, dtype="<i8").tofile(ranking)
     monkeypatch.setattr(base_convert, "_tools_root", lambda: tmp_path)
     output = quantized.convert(tmp_path, tmp_path / "artifact.sinfer", profile=inv.NVFP4_ALL,
-                               device="cpu", mtp=mtp, vision=vision)
+                               device="cpu", mtp=mtp, vision=vision, mtp_format=mtp_format)
     report = json.loads((tmp_path / "artifact.sinfer.conversion.json").read_text())
     assert report["config_summary"]["mtp_layers"] == int(mtp)
     with Artifact.open(output) as artifact:
@@ -215,8 +217,10 @@ def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monk
         assert any(obj.name.startswith("mtp/") for obj in artifact.objects) == mtp
         assert any(obj.name.startswith("vision/") for obj in artifact.objects) == vision
         if mtp:
-            assert artifact.find("mtp/input_projection").format == inv.BF16
-            assert artifact.find("mtp/layer/attention/query_key_gate_value").format == inv.BF16
+            assert artifact.find("mtp/input_projection").format == mtp_format
+            assert artifact.find("mtp/layer/attention/query_key_gate_value").format == mtp_format
+            assert artifact.find("mtp/layer/mlp/down").format == mtp_format
+            assert artifact.find("mtp/final_norm").format == inv.BF16
         if vision:
             assert artifact.find("vision/layers/0/mlp/fc1").format == inv.BF16
         assert tuple(artifact.layer_types) == g.layer_types
