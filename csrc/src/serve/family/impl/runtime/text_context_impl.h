@@ -28,6 +28,7 @@
 #include "api/ops/gdn_gating.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "api/ops/gqa_attention.h"
 #include "api/ops/linear.h"
 #include "api/ops/lora_store.h"
@@ -2775,9 +2776,22 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                 state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
                                 decode.linear_state_slots, decode.linear_state_slots, qb, kb, vb, s);
                         } else {
-                            for (const auto* part : {&qb, &kb, &vb}) {
-                                CUDA_CHECK(cudaMemsetAsync(part->data, 0, part->bytes(), s));
+                            // The verify columns rode the projection above, and a projected
+                            // plane is what the conv record holds: copy it there and convolve
+                            // from it, instead of streaming the input projection's weights a
+                            // second time for these columns (the record form projects them
+                            // again, then runs this same convolution).
+                            if (!decode.replay_records) { throw std::logic_error("mixed verification has no replay records"); }
+                            auto records = decode.replay_records->layer(gidx, batch);
+                            if (records.conv.ne[0] != qkv_b.ne[0] || records.conv.ne[1] != width ||
+                                records.conv.ne[2] != batch) {
+                                throw std::logic_error("mixed verification conv record does not match the projection");
                             }
+                            CUDA_CHECK(cudaMemcpyAsync(records.conv.data, qkv_b.data, qkv_b.bytes(),
+                                                       cudaMemcpyDeviceToDevice, s));
+                            ops::detail::gdn_projected_conv_record_launch(records.conv, *gdn.conv1d,
+                                state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                                decode.linear_state_slots, qb, kb, vb, s);
                         }
                     }
                     if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
@@ -2786,20 +2800,6 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 debug_probe<Variant>("mixed_gdn_conv_key", kc, cfg_.n_layers, s);
                 debug_probe<Variant>("mixed_gdn_conv_value", vc, cfg_.n_layers, s);
 
-                if (batch > 0 && width > 1) {
-                    if (!decode.replay_records) { throw std::logic_error("mixed verification has no replay records"); }
-                    auto records = decode.replay_records->layer(gidx, batch);
-                    Tensor input = h.slice(1, prefill_cols, decode_columns).view({cfg_.hidden, width, batch});
-                    Tensor query = qc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
-                    Tensor key = kc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
-                    Tensor value = vc.slice(1, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
-                    Tensor gate = z.slice(2, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
-                    ops::ScopedLoraColumns verify_lora(roots.lora_slots.slice(0, prefill_cols, decode_columns));
-                    Variant::gdn_input_projection_record(input, *gdn.projection, *gdn.conv1d,
-                        state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
-                        decode.linear_state_slots, records.conv, query, key, value, gate,
-                        Phase::Verify, work_, s);
-                }
                 Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor vv          = vc.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
