@@ -178,7 +178,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .sampling        = frame.sampling,
                                  .lora_columns = adapter_columns,
                              },
-                             envelopes.target_verify);
+                             envelopes.target_verify, state.mixed_target);
 
         ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
                                     licensed_counts, rope_deltas, alignment_ids, next_extents,

@@ -722,6 +722,9 @@ public:
         bool graph_hit           = false;
         schedule::PrefillChunkResult chunk{};
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+        /// The decode lanes verified their drafts in this round (an MTP round carrying the
+        /// prompts): consume reads them through consume_mtp_round.
+        bool mtp_verify = false;
     };
     MixedInFlight mixed_in_flight_{};
     std::uint64_t mixed_in_flight_counter_ = 0;
@@ -822,9 +825,12 @@ private:
     /// the egress into each lane's `SpeculativeOutcome` and records the pending candidate.
     /// A stage without the head runs the verify forward only and leaves the lanes pending
     /// with nothing produced, for `adopt_speculative_outcome`.
+    /// With `prefill_lanes`, the staged prompts' chunks ride the verify forward as a mixed
+    /// round does (launch_mixed_round routes there), so the lanes keep verifying drafts.
     [[nodiscard]] runtime::RoundHandle
     launch_mtp_round(std::span<const std::uint32_t> lanes,
-                     std::span<const runtime::RoundBudget> budgets);
+                     std::span<const runtime::RoundBudget> budgets,
+                     std::span<const std::uint32_t> prefill_lanes = {});
     [[nodiscard]] runtime::BatchedGeneratedRound consume_mtp_round(runtime::RoundHandle handle);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,

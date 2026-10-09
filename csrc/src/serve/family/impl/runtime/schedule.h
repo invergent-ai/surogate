@@ -94,6 +94,9 @@ struct OrdinaryBatchContext {
     Tensor chain_one;
 };
 
+struct TargetVerifyFrameView;
+using MixedTargetForward = std::function<void(TextContext&, TargetVerifyFrameView, ops::GqaExecutionEnvelope)>;
+
 struct MtpBatchContext {
     ExecutionCore execution;
     const family::PagedKVCache& text_cache;
@@ -104,10 +107,10 @@ struct MtpBatchContext {
     Tensor& continuation_hidden_store;
     /// Device I32 scalar holding 1: the narrow round advances the frontiers by it in-graph.
     Tensor one;
+    /// Set when staged prompts ride this verify round: the trunk forward runs as a mixed
+    /// round, the prompts' chunks beside the lanes' draft columns.
+    MixedTargetForward mixed_target;
 };
-
-struct TargetVerifyFrameView;
-using MixedTargetForward = std::function<void(TextContext&, TargetVerifyFrameView, ops::GqaExecutionEnvelope)>;
 
 struct DFlashBatchContext {
     ExecutionCore execution;

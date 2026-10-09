@@ -3298,11 +3298,32 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         mixed_in_flight_.id = handle.id;
         return handle;
     }
+    // Under the draft head the decode lanes verify their drafts in the round that carries the
+    // prompts: launch_mtp_round runs its verify forward as this mixed round (it comes back
+    // here with the verify frame), so a prompt arriving costs the running lanes no drafts.
+    // SUROGATE_SERVE_MTP_MIXED_VERIFY=0 keeps the older shape: decode lanes one column each,
+    // nothing proposed, and the round after it verifying nothing. Pipeline stages and narrow
+    // rounds keep it too.
+    static const bool mtp_mixed_verify = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_MTP_MIXED_VERIFY");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    if (speculative_backend == SpeculativeBackend::Mtp && mtp_mixed_verify && !verify &&
+        !lanes.empty() && !prefill_lanes.empty() && !pipeline_stage() &&
+        !narrow_round_for(lanes.size()) && !requests.at(prefill_lanes.front()).target_only) {
+        auto handle = launch_mtp_round(lanes, budgets, prefill_lanes);
+        mixed_in_flight_.id = handle.id;
+        return handle;
+    }
     const bool target_only = !prefill_lanes.empty() && requests.at(prefill_lanes.front()).target_only;
     const bool flash = speculative_backend == SpeculativeBackend::DFlash && !target_only;
     const auto verify_width = verify ? static_cast<std::uint32_t>(verify->ids.ne[0]) : 1U;
     const auto decode_columns = static_cast<std::uint32_t>(lanes.size()) * verify_width;
     const bool head = speculative_backend == SpeculativeBackend::Mtp && !target_only;
+    // The decode lanes belong to the speculative round that launched this one: it staged
+    // their columns, and it samples, accepts and aligns them.
+    const bool mtp_verify = head && verify != nullptr;
+    const bool speculative_decode = flash || mtp_verify;
     if (lanes.size() > batch_capacity ||
         budgets.size() != lanes.size() ||
         prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills ||
@@ -3384,7 +3405,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             }
         }
 
-        for (std::size_t row = 0; !flash && row < lanes.size(); ++row) {
+        for (std::size_t row = 0; !speculative_decode && row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
             RequestControl& request            = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
@@ -3415,7 +3436,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         if (batch_bucket < rows) {
             throw std::logic_error("mixed round bucket is smaller than the decode row count");
         }
-        for (std::int32_t row = rows; !flash && row < batch_bucket; ++row) {
+        for (std::int32_t row = rows; !speculative_decode && row < batch_bucket; ++row) {
             const std::size_t pad                          = static_cast<std::size_t>(row);
             ordinary_host_ingress->tokens[pad]             = ordinary_host_ingress->tokens[0];
             ordinary_host_ingress->cache_positions[pad]    = ordinary_host_ingress->cache_positions[0];
@@ -3426,8 +3447,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             ordinary_host_ingress->lora_slots[pad]         = ordinary_host_ingress->lora_slots[0];
         }
         family::OrdinaryDecodeState ordinary;
-        if (!flash && !target_only) { ordinary = *io.ordinary; }
-        if (!flash && !target_only) { CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
+        if (!speculative_decode && !target_only) { ordinary = *io.ordinary; }
+        if (!speculative_decode && !target_only) { CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
                                    sizeof(family::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    device.stream)); }
 
@@ -3555,7 +3576,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         }
 
         schedule::TextContext::MixedDecodeSlice slice;
-        if (!flash && !target_only) {
+        if (!speculative_decode && !target_only) {
             slice.ids                = ordinary.tokens.slice(0, 0, rows);
             slice.lora_slots         = ordinary.lora_slots.slice(0, 0, rows);
             slice.cache_positions    = ordinary.cache_positions.slice(0, 0, rows);
@@ -3570,7 +3591,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         if (verify) {
             const auto columns = static_cast<std::int32_t>(decode_columns);
             slice.ids = verify->ids.view({columns});
-            slice.lora_slots = io.dflash_decode->lora_slots.slice(0, 0, rows);
+            slice.lora_slots = (flash ? io.dflash_decode->lora_slots : io.mtp_decode->lora_slots)
+                                   .slice(0, 0, rows);
             slice.cache_positions = verify->cache_positions.view({columns});
             slice.rope_positions = verify->rope_positions.view({columns});
             slice.kv_table_rows = verify->kv_table_rows;
@@ -3728,14 +3750,15 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 .view({model.geometry.dflash.feature_rows, static_cast<int>(verify_width), rows});
             ops::scatter_bf16_batch(features, verify->lanes, verify->valid_columns,
                                     dflash->pending_features, device.stream);
-            if (stage_holds_head()) {
-                Tensor logits = verify->target_logits.view({verify->target_logits.ne[0], static_cast<int>(decode_columns)});
-                Tensor tokens = verify->target_tokens.view({static_cast<int>(decode_columns)});
-                ops::argmax(logits, tokens, cfg.token_domain, device.stream);
-            }
+        }
+        if (speculative_decode && verify && stage_holds_head()) {
+            // The verify forward's own argmax, which the accept reads as the target tokens.
+            Tensor logits = verify->target_logits.view({verify->target_logits.ne[0], static_cast<int>(decode_columns)});
+            Tensor tokens = verify->target_tokens.view({static_cast<int>(decode_columns)});
+            ops::argmax(logits, tokens, cfg.token_domain, device.stream);
         }
         if (round_trace_enabled()) { std::fprintf(stderr, "round-trace: mixed graph_hit=%d verify_width=%u\n", int(graph_hit), verify_width); }
-        if (rows > 0 && !flash) {
+        if (rows > 0 && !speculative_decode) {
             Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
             Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
             Tensor lanes_tensor    = ordinary.lanes.slice(0, 0, rows);
@@ -3797,6 +3820,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         mixed_in_flight_.graph_hit    = graph_hit;
         mixed_in_flight_.chunk        = chunk;
         mixed_in_flight_.nominals     = nominals;
+        mixed_in_flight_.mtp_verify   = mtp_verify;
         return runtime::RoundHandle{.id = mixed_in_flight_.id, .rows = mixed_in_flight_.rows};
     } catch (...) {
         try {
@@ -3828,17 +3852,21 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
     RequestControl& prefill_request  = requests[prefill_lane];
     try {
         const bool flash = speculative_backend == SpeculativeBackend::DFlash && !prefill_request.target_only;
-        runtime::BatchedGeneratedRound flash_round;
-        if (flash && !lanes.empty()) { flash_round = consume_dflash_round(handle); }
+        // The decode lanes verified drafts in an MTP round that carried the prompts: that
+        // round's consume reads and records them, as for a round without prompts.
+        const bool mtp_verify = flight.mtp_verify;
+        runtime::BatchedGeneratedRound speculative_round;
+        if (flash && !lanes.empty()) { speculative_round = consume_dflash_round(handle); }
+        else if (mtp_verify) { speculative_round = consume_mtp_round(handle); }
         else { device.synchronize(); }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         round_trace_state(decoder->linear_attention, device.stream, "post-round");
         const bool head = speculative_backend == SpeculativeBackend::Mtp && !prefill_request.target_only;
-        for (std::size_t row = 0; !flash && row < lanes.size(); ++row) {
+        for (std::size_t row = 0; !flash && !mtp_verify && row < lanes.size(); ++row) {
             append_completion_score(lanes[row], ordinary_host_egress->scores[row]);
         }
-        if (head) {
+        if (head && !mtp_verify) {
             // Under the draft head the decode rows resolve as a narrow round's do: one token
             // licensed per lane, nothing proposed, the recurrent state updated in place with
             // nothing to fold. The stage with the head decides and exports the decision; the
@@ -3904,12 +3932,12 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
         }
 
         runtime::MixedRoundResult result;
-        if (!flash && !lanes.empty()) { result.round = runtime::BatchedGeneratedRound{
+        if (!flash && !mtp_verify && !lanes.empty()) { result.round = runtime::BatchedGeneratedRound{
             .tokens   = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
                                                lanes.size()),
             .logprobs = std::span<const float>(ordinary_host_egress->sampled_logprobs.data(),
                                                lanes.size())}; }
-        if (flash) { result.round = flash_round; }
+        if (flash || mtp_verify) { result.round = speculative_round; }
         // Each staged prompt advances by its own chunk; the graph path processes exactly the
         // first one, so its count matches what the forward consumed.
         // The plan (which prompts, how many tokens each) was fixed before the forward, so a
@@ -4018,7 +4046,8 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
 
 runtime::RoundHandle
 ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
-                                  std::span<const runtime::RoundBudget> budgets) {
+                                  std::span<const runtime::RoundBudget> budgets,
+                                  std::span<const std::uint32_t> prefill_lanes) {
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
@@ -4058,8 +4087,12 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
 
     // Too many lanes in flight to pay for a verify: the narrow round, one column per lane.
     const bool narrow  = narrow_round_for(lanes.size());
-    // No row selects an adapter: the base routes, as in launch_ordinary_round.
-    const bool base_round = base_round_for(lanes);
+    if (narrow && !prefill_lanes.empty()) {
+        throw std::logic_error("a narrow MTP round cannot carry staged prompts");
+    }
+    // No row selects an adapter, staged prompts included: the base routes, as in
+    // launch_ordinary_round.
+    const bool base_round = base_round_for(lanes, prefill_lanes);
     ops::ScopedLoraBaseRound base_scope(base_round);
     const auto started = Clock::now();
     try {
@@ -4067,7 +4100,8 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
         DecodeGraphFamily& family = (narrow ? mtp_narrow_graphs : mtp_graphs).of(base_round);
-        if (use_cuda_graph && !family.profiles.empty()) {
+        // A round carrying prompts runs eagerly: the prompts' chunks are not in any graph.
+        if (use_cuda_graph && !family.profiles.empty() && prefill_lanes.empty()) {
             DecodeGraphProfile& profile =
                 select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, narrow ? "MTP narrow batch" : "MTP batch");
@@ -4133,6 +4167,15 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                                  tail_hidden_store,
                                                  chain_one};
         schedule_state.execution.constraints = speculative_constraints.get();
+        if (!prefill_lanes.empty()) {
+            // The verify forward is the mixed round: each staged prompt's chunk beside the
+            // lanes' draft columns, the head aligned over the prompts' segments there and
+            // over the lanes' accepted columns after the accept, as in any wide round.
+            schedule_state.mixed_target = [&](schedule::TextContext&, schedule::TargetVerifyFrameView frame,
+                                              ops::GqaExecutionEnvelope) {
+                (void)launch_mixed_round(prefill_lanes, lanes, budgets, &frame);
+            };
+        }
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -4150,6 +4193,9 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
         try {
             device.synchronize();
         } catch (...) {}
+        for (const auto lane : prefill_lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
