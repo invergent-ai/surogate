@@ -2162,7 +2162,11 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         Tensor raw_keys = work_.alloc(DType::BF16, {geometry.head_dim, tokens});
         ops::detail::bf16_cublaslt_gemm(indexer.key, hidden, raw_keys, s);
         Tensor indexer_positions = rope_positions.numel() == tokens ? rope_positions.view({tokens}) : rope_positions;
-        ops::qsa_indexer_append(raw_keys, cache_positions, table_rows, columns_per_row,
+        // A batched verify round binds its positions as [width, batch]; the indexer reads one
+        // per column.
+        const Tensor column_positions =
+            cache_positions.numel() == tokens ? cache_positions.view({tokens}) : cache_positions;
+        ops::qsa_indexer_append(raw_keys, column_positions, table_rows, columns_per_row,
                                 indexer.key_norm, geometry, cache, s, indexer_positions);
         if (!sparse) { return ops::GqaBlockMask{}; }
 
@@ -2190,7 +2194,7 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
             ops::rope(indexer_positions, geometry.rotary_dim, geometry.rope_theta, heads_norm, s);
         }
 
-        ops::qsa_indexer_select(heads_norm, cache_positions, table_rows, columns_per_row, geometry,
+        ops::qsa_indexer_select(heads_norm, column_positions, table_rows, columns_per_row, geometry,
                                 cache, keys, work_, mask, s);
         return ops::GqaBlockMask{.words  = static_cast<const std::uint32_t*>(mask.data),
                                  .stride = words,
