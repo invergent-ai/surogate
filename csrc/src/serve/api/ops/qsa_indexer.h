@@ -23,9 +23,15 @@
 
 namespace sinfer::ops {
 
-// Per page: 64 raw keys, 16 pooled keys, and 16 aligned int32[4] block positions.
-// The latter retain the first member's three mRoPE axes across chunk boundaries.
-inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 162;
+// Per page: 64 raw keys, 16 pooled keys, and 16 aligned int32[4] block positions (162 of the
+// width). The latter retain the first member's three mRoPE axes across chunk boundaries. The
+// rest is padding, and it is what keeps an elastic pool's granule small: the region maps runs
+// of pages in which every plane spans whole 2 MiB quanta, and a 162-wide page (20,736 bytes,
+// 2^8 x 81) needed 8,192 pages per run. Rounded up to a whole run, the capacity it committed
+// overshot the planned KV by up to 8 GiB, and Flash-Next refused a 131,072-token context and
+// MTP at 32 sequences on a DGX Spark. At 192 (24,576 bytes, 2^13 x 3) a run is 256 pages, for
+// 4.4% more KV bytes per token.
+inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 192;
 
 struct QsaIndexerGeometry {
     std::int32_t head_dim   = 0; // indexer key/query width

@@ -36,6 +36,9 @@ constexpr int kWarpBlocks   = kScoreGroups * kScoreUnroll;  // 16
 constexpr int kScoreStep    = kScoreThreads / kWarp * kWarpBlocks;
 constexpr int kMinScoreSpan = 4 * kScoreStep;
 static_assert(kWarpBlocks * kBlock == kPagedKVPageSize, "a warp step reads one page's pooled keys");
+static_assert(kPagedKVPageSize * kHeadDim * (kBlock + 1) / kBlock + kPagedKVPageSize / kBlock * 4 * 2 <=
+                  kPagedKVPageSize * kQsaIndexerStorageHeadDim,
+              "raw keys, pooled keys and block positions fit in a page");
 
 // The cut: radix selection of each row's budget-th largest score, 8 bits per pass.
 constexpr int kCutThreads = 512;

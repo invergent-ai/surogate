@@ -468,10 +468,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
     // The reservation charges the planes' exact bytes, which grow linearly with the page
     // count as the capacity curve requires; the padded span the region reserves (each plane
-    // on a mapping quantum) is virtual and at most one granule wider.
+    // on a mapping quantum) is virtual and at most one granule wider. The region commits its
+    // cap in whole granules, though, up to one granule past the cap's pages, so that last
+    // granule is charged too: one granule less a page, a constant that keeps the curve affine.
     if (out.decoder.text_kv.pool.spec.elastic) {
         const std::size_t per_page = out.decoder.text_kv.payload_bytes() / physical_pages;
-        out.elastic_plane_bytes    = per_page * plan.main_page_groups;
+        const std::uint32_t granule = std::max(out.decoder.text_kv.pool.elastic_granule_pages, 1U);
+        out.elastic_plane_bytes =
+            per_page * (static_cast<std::size_t>(plan.main_page_groups) + granule - 1U);
     }
     return out;
 }
