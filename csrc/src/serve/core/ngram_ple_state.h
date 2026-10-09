@@ -21,12 +21,18 @@ struct NgramPleStatePoolSpec {
     std::int32_t channels       = 0; ///< streams * hidden
     std::int32_t slot_count     = 1;
     std::int32_t eos_token      = 0; ///< the reset value of the token history
+    /// Columns of a speculative round whose state each slot keeps (0: none). A verify round
+    /// writes the state after every column of its segment here, so the columns the round
+    /// commits can be restored when it rejects the rest.
+    std::int32_t snapshot_width = 0;
 };
 
 struct NgramPleStatePoolLayout {
     NgramPleStatePoolSpec spec;
     LayoutRegion history;
     LayoutRegion conv;
+    LayoutRegion history_snapshots;
+    LayoutRegion conv_snapshots;
 };
 
 [[nodiscard]] NgramPleStatePoolLayout plan_ngram_ple_state_pool(LayoutBuilder& builder,
@@ -35,6 +41,12 @@ struct NgramPleStatePoolLayout {
 struct NgramPleStatePool {
     Tensor history;    ///< I32 [history_tokens, slots]
     Tensor conv_state; ///< BF16 [conv_history, channels, slots]
+    /// The state after each of a segment's first `snapshot_width` columns, laid out per
+    /// (slot, column) as one slot of `history` and `conv_state`: I32
+    /// [history_tokens, snapshot_width, slots] and BF16 [conv_history, channels,
+    /// snapshot_width, slots]. Empty when the spec keeps none.
+    Tensor history_snapshots;
+    Tensor conv_snapshots;
     NgramPleStatePoolSpec spec;
     std::vector<const NgramPleStatePool*> checkpoint_slots;
 
@@ -51,6 +63,9 @@ struct NgramPleStatePool {
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     /// Token history becomes EOS, the convolution history zero.
     void reset_slot(std::int32_t slot, cudaStream_t stream = nullptr);
+    /// The slot's state becomes the one its last segment left after `column` (0-based): what a
+    /// speculative round that committed `column + 1` of its columns should have written.
+    void commit_snapshot(std::int32_t slot, std::int32_t column, cudaStream_t stream = nullptr);
 };
 
 } // namespace sinfer

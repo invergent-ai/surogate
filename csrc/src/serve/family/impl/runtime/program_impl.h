@@ -1104,6 +1104,17 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                                  std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                                  device.stream);
         }
+        // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
+        // included; its snapshots hold the state after each column, and the committed prefix's
+        // last one is what the next round must start from.
+        if (anything_to_fold && !decoder->ple.empty() && decoder->ple.spec.snapshot_width > 0) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (fold_rows[row].commit_columns > 0) {
+                    decoder->ple.commit_snapshot(fold_rows[row].linear_state_slot,
+                                                 fold_rows[row].commit_columns - 1, device.stream);
+                }
+            }
+        }
 
         // The correction re-selects a column of the round's device frame, which only the
         // stage with the head filled -- and which matters only there, where the tail hidden

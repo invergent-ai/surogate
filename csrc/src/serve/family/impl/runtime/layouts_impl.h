@@ -219,6 +219,16 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
 }
 
+/// A speculative round's verify writes the PLE state after each of its columns, so a round
+/// that rejects some can commit the state its last accepted column left.
+std::optional<NgramPleStatePoolSpec> speculative_ple_spec(std::optional<NgramPleStatePoolSpec> spec,
+                                                          const SequencePlanImpl& plan) {
+    if (spec && plan.speculative_backend != SpeculativeBackend::None) {
+        spec->snapshot_width = static_cast<std::int32_t>(plan.draft_window + 1U);
+    }
+    return spec;
+}
+
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::int32_t linear_state_slots =
         LinearStateSlots::state_slot_count(plan.max_concurrency);
@@ -291,7 +301,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
                          },
-                     .ple = ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
+                     .ple = speculative_ple_spec(
+                         ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
+                         plan),
                  });
     LayoutBuilder checkpoint_builder;
     auto checkpoint_linear = out.decoder.linear_attention.spec;
@@ -300,7 +312,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         plan_linear_attention_state_pool(checkpoint_builder, checkpoint_linear);
     if (out.decoder.ple) {
         auto checkpoint_ple = out.decoder.ple->spec;
-        checkpoint_ple.slot_count = 1;
+        checkpoint_ple.slot_count     = 1;
+        checkpoint_ple.snapshot_width = 0;
         out.checkpoints.ple = plan_ngram_ple_state_pool(checkpoint_builder, checkpoint_ple);
     }
     if (plan.speculative_backend != SpeculativeBackend::None && geometry_gdn_layers(plan.geometry) > 0) {
