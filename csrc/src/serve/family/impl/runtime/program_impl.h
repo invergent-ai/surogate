@@ -974,13 +974,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                          staged.elapsed_seconds * 1e3);
         }
         request.lifecycle      = Lifecycle::Prefilling;
+        // A reused prefix's MTP bridge is one head column: it runs here, and the suffix after
+        // it then rides the decode rounds as a fresh prompt does, instead of prefilling alone
+        // at admission while every running lane waits for it (a multi-second stall for a long
+        // suffix). SUROGATE_SERVE_MTP_REUSE_MIXED=0 keeps the classic order below.
+        static const bool reuse_mixed = [] {
+            const char* value = std::getenv("SUROGATE_SERVE_MTP_REUSE_MIXED");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        if (reuse_mixed && defer_first_chunk && staged.mtp_bridge == MtpBridgeMode::BeforeSuffix &&
+            !pipeline_stage() && !staged.vision && request.prompt_logprobs < 0) {
+            (void)advance_prefill(sequence, request, true);
+        }
         // Deferred first chunk (PATCHES.md #30): leave the staged prefill to
         // the executor loop so it can ride a mixed round with the active
         // decode lanes -- or, for a shape no mixed round takes, a lone prefill
         // step. A draft-head prompt defers too: on a pipeline the deferred path
         // is the one that respects stage ownership, and a first chunk run at
         // admission shares a stage's boundary buffers with whatever round is in
-        // flight there. Bridged MTP reuse keeps the classic order.
+        // flight there. A bridge the block above did not run (a pipeline stage, an image
+        // prompt, prompt logprobs, or SUROGATE_SERVE_MTP_REUSE_MIXED=0) keeps the classic order.
         if (defer_first_chunk &&
             ((pipeline_stage() && !request_plan.target_only && speculative_backend == SpeculativeBackend::DFlash) ||
              (staged.mtp_bridge == MtpBridgeMode::None && staged.cursor < staged.prompt_tokens))) {
@@ -2654,7 +2667,8 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 }
 
 runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
-                                                            RequestControl& request) {
+                                                            RequestControl& request,
+                                                            bool bridge_only) {
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -2769,6 +2783,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.mtp_kv_valid = staged.base;
             staged.mtp_bridge     = MtpBridgeMode::None;
+        }
+        if (bridge_only) {
+            staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+            return runtime::PrefillStepResult{.summary = summary, .processed_prompt_tokens = 0};
         }
 
         if (staged.cursor < staged.prompt_tokens) {

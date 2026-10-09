@@ -821,8 +821,11 @@ private:
     void copy_round_token();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
+    /// One step of a staged prompt: its next chunk, or with `bridge_only` just a reused
+    /// prefix's MTP bridge (the chunk is left to a later step).
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
-                                                             RequestControl& request);
+                                                             RequestControl& request,
+                                                             bool bridge_only = false);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
