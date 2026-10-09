@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "artifact/linear_storage.h"
 #include "artifact/typed_binding.h"
+#include "family/impl/load/routed_nvfp4.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -115,6 +116,22 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
                             NumericFormat& format, family::BankPlanes& half) {
         const auto rows    = static_cast<std::int32_t>(*shape.begin());
         const auto columns = static_cast<std::int32_t>(*(shape.begin() + 1));
+        const auto* stored = std::get_if<artifact::TensorDescriptor>(binder.reader().find(name));
+        if (stored != nullptr && stored->format == NumericFormat::NVFP4) {
+            // The NVFP4 release's experts: device resident, run by the TRT-LLM runner. The host
+            // bank and its slot cache read W8 or GGML planes only, so an offload is refused
+            // rather than served at a format nothing reads.
+            if (binder.offloads(name) && g_layer_placement == TensorPlacement::Device) {
+                throw artifact::ArtifactError(
+                    name + ": NVFP4 routed experts stay on the device; serve this artifact without "
+                           "--host-moe-layers or --gpu-layers");
+            }
+            format = NumericFormat::NVFP4;
+            const artifact::ObjectHandle handle =
+                artifact::bind_tensor(binder, name, NumericFormat::NVFP4, shape, g_layer_placement);
+            family::require_identity_divisor(binder, handle, name, rows, columns);
+            return handle;
+        }
         if (!binder.offloads(name) || g_layer_placement == TensorPlacement::ValidateOnly) {
             const auto binding = artifact::bind_linear(binder, name, rows, columns, g_layer_placement);
             format = binding.format;
@@ -135,7 +152,7 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
         }
         return binding.object;
     };
-    return MoePlan{
+    MoePlan plan{
         .router_shared_gate = device(binder, prefix + "router_shared_gate", NumericFormat::BF16,
                                      {g.experts + 1, g.hidden}),
         .routed_gate_up = routed(prefix + "routed_gate_up", {g.experts * 2 * g.intermediate, g.hidden},
@@ -150,6 +167,25 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
         .shared_down =
             linear(binder, prefix + "shared_down", static_cast<std::uint64_t>(g.hidden), static_cast<std::uint64_t>(g.shared_intermediate)),
     };
+    // NVFP4 carries its second level per expert per projection; the gate/up block stacks up and
+    // gate, so it has two entries per expert and down one.
+    if (plan.routed_gate_up_format == NumericFormat::NVFP4) {
+        plan.routed_gate_up_scale =
+            device(binder, prefix + "routed_gate_up_scale", NumericFormat::FP32, {2 * g.experts});
+        plan.routed_gate_up_act_scale =
+            device(binder, prefix + "routed_gate_up_act_scale", NumericFormat::FP32, {g.experts});
+        plan.routed_gate_up_alpha =
+            device(binder, prefix + "routed_gate_up_alpha", NumericFormat::FP32, {g.experts});
+    }
+    if (plan.routed_down_format == NumericFormat::NVFP4) {
+        plan.routed_down_scale =
+            device(binder, prefix + "routed_down_scale", NumericFormat::FP32, {g.experts});
+        plan.routed_down_act_scale =
+            device(binder, prefix + "routed_down_act_scale", NumericFormat::FP32, {g.experts});
+        plan.routed_down_alpha =
+            device(binder, prefix + "routed_down_alpha", NumericFormat::FP32, {g.experts});
+    }
+    return plan;
 }
 
 template <class T>
@@ -201,6 +237,9 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     // own layout, copied straight through.
     const auto routed = [&](artifact::ObjectHandle handle, family::BankPlanes planes,
                             NumericFormat format, std::int32_t rows, std::int32_t columns) {
+        if (format == NumericFormat::NVFP4) {
+            return family::routed_nvfp4_weight(backing, handle, rows, columns);
+        }
         if (bank.find(handle) == nullptr) {
             return artifact::materialized_weight(backing, handle, format, rows, columns);
         }
@@ -226,6 +265,19 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     out.op.shared_down = artifact::materialized_linear(backing, plan.shared_down,
                                                        g.hidden, g.shared_intermediate);
     out.op.experts_per_token = g.experts_per_token;
+    const auto scales = [&](const std::optional<artifact::ObjectHandle>& handle, std::int32_t count) {
+        return handle.has_value()
+                   ? static_cast<const float*>(
+                         artifact::materialized_tensor(backing, *handle, NumericFormat::FP32, {count}).data)
+                   : nullptr;
+    };
+    const auto experts = static_cast<std::int32_t>(g.experts);
+    out.op.routed_gate_up_scale     = scales(plan.routed_gate_up_scale, 2 * experts);
+    out.op.routed_gate_up_act_scale = scales(plan.routed_gate_up_act_scale, experts);
+    out.op.routed_gate_up_alpha     = scales(plan.routed_gate_up_alpha, experts);
+    out.op.routed_down_scale        = scales(plan.routed_down_scale, experts);
+    out.op.routed_down_act_scale    = scales(plan.routed_down_act_scale, experts);
+    out.op.routed_down_alpha        = scales(plan.routed_down_alpha, experts);
     out.mix                  = std::move(mix);
     if (const auto* object = bank.find(plan.routed_gate_up)) {
         out.host_gate_up = static_cast<const std::byte*>(object->host);

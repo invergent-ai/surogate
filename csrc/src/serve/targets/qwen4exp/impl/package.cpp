@@ -56,6 +56,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.architecture == target_key && identity.weights_id == "w8-hc-v1") {
         return WeightsProfile::W8HyperConnection;
     }
+    if (identity.architecture == target_key && identity.weights_id == "routed-nvfp4-hc-v1") {
+        return WeightsProfile::RoutedNvfp4HyperConnection;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
@@ -181,6 +184,21 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     // handle and workspace before any capture (plans themselves are host-side).
     ops::detail::bf16_cublaslt_prewarm();
     detail::Variant::prewarm_device_scratch(model.impl_->data.runtime.geometry);
+    // Routed NVFP4 experts run on the vendored TRT-LLM runner, which picks its grouped GEMMs'
+    // tactics per round width by measurement. That launches and synchronises, so it happens
+    // before the program captures its graphs; every layer shares the geometry, so tuning against
+    // one layer's weights tunes them all.
+    const auto prepare = [&](const auto& layers) {
+        for (const auto& layer : layers) {
+            if (layer.post_mixer.op.routed_gate_up.qtype == QType::NVFP4) {
+                ops::sparse_moe_prepare(layer.post_mixer.op, ops::kSparseMoeTrtllmPrepareWidth,
+                                        device.stream);
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!prepare(model.impl_->data.runtime.gdn_layers)) { prepare(model.impl_->data.runtime.full_layers); }
     detail::Variant::prepare_expert_split(model.impl_->data.runtime);
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
