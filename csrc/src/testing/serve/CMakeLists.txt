@@ -539,6 +539,9 @@ sinfer_add_op_test(sinfer_kimi_delta_net_test
 sinfer_add_op_test(sinfer_manifold_hyper_connection_test
   SOURCES ops/test_manifold_hyper_connection.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_hyper_connection_test
+  SOURCES ops/test_hyper_connection.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_test
     SOURCES ops/test_sparse_moe.cpp
     LIBRARIES sinfer_ops)

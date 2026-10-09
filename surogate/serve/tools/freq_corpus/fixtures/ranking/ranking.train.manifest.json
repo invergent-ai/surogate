@@ -1,5 +1,8 @@
 {
   "artifact_type": "freq_measure_ranking",
+  "compatible_tokenizer_sha256": [
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  ],
   "corpus": "tools/freq_corpus/fixtures/corpus/train.jsonl",
   "counts_file": "ranking.train.counts.i64",
   "counts_layout": "int64 LE; row 0 = total[vocab]; rows 1..5 = strata[vocab] in strata_order",
@@ -23,7 +26,9 @@
     "code",
     "math"
   ],
+  "tokenizer_attestation": "tokenizer_sha256 is tokenizer.json of Qwen/Qwen3.5-27B, Qwen/Qwen3.6-27B and Qwen/Qwen3.6-35B-A3B on Hugging Face (byte-identical, checked 2026-10-09). compatible_tokenizer_sha256 lists tokenizers with the same BPE vocabulary, merges and added tokens at the same ids, plus added tokens at ids this one leaves unassigned: nvidia/Qwen3.8-Flash-Next-NVFP4 (seven audio tokens, 248070-248076).",
   "tokenizer_dir": "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
+  "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
   "top_tokens": [
     {
       "count": 1520733,

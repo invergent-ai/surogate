@@ -112,12 +112,13 @@ def geometry_from_config(config: Mapping, *, ple_table_rows: int = 0,
     return g
 
 
-def geometry_block(g: Geometry) -> dict:
+def geometry_block(g: Geometry, *, draft_vocab: int = 0) -> dict:
+    """`draft_vocab` is the shortlist draft head's row count, 0 when the artifact has none."""
     from surogate.serve.artifact.geometry import validate_resolved_geometry
     values = hybrid.geometry_block(g)
     # The shared checkpoint resolver validates this interleaved partition. Publish
     # it explicitly so both decoder attention and the QSA indexer use the image axes.
-    values.update(residual=g.residual, draft_vocab=0,
+    values.update(residual=g.residual, draft_vocab=draft_vocab,
                   mrope_temporal=11, mrope_height=11, mrope_width=10, **{
         name: getattr(g, name) for name in (
             "hc_streams", "hc_low_rank", "indexer_heads", "indexer_head_dim",

@@ -81,10 +81,18 @@ struct NgramPleColumns {
  * [ngram-1, slots] (oldest predecessor first, EOS where none) and `conv_state` BF16
  * [(kernel-1)*dilation, streams*hidden, slots] (the last normalised columns seen, oldest
  * first).
+ *
+ * `history_snapshots` I32 [ngram-1, width, slots] and `conv_snapshots` BF16
+ * [(kernel-1)*dilation, streams*hidden, width, slots], when given, receive the state after
+ * each of a segment's first `width` columns, whether or not the column closes the segment: a
+ * speculative round commits only the prefix of its columns that was accepted, and restores
+ * the state its last accepted column left from here.
  */
 struct NgramPleState {
     Tensor history;
     Tensor conv_state;
+    Tensor history_snapshots;
+    Tensor conv_snapshots;
 };
 
 /**

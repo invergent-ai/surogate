@@ -73,16 +73,26 @@ __global__ void rows_kernel(const int* __restrict__ ids, const int* __restrict__
 }
 
 // The last column of a segment rewrites its slot's history with the segment's last tokens
-// (older entries come from the previous history when the segment is shorter than it).
+// (older entries come from the previous history when the segment is shorter than it). The
+// snapshot form instead writes the history after each of a segment's first `snapshot_width`
+// columns to that column's snapshot, and runs first: it reads the history the in-place form
+// then replaces.
+template <bool kSnapshot>
 __global__ void history_update_kernel(const int* __restrict__ ids,
                                       const int* __restrict__ segment_begin,
                                       const int* __restrict__ slots,
                                       const int* __restrict__ segment_last, int history_len,
-                                      int slot_count, int* __restrict__ history) {
+                                      int slot_count, int* __restrict__ history,
+                                      int snapshot_width, int* __restrict__ snapshots) {
     const int t = static_cast<int>(blockIdx.x);
-    if (segment_last[t] == 0 || threadIdx.x != 0) { return; }
+    if (threadIdx.x != 0) { return; }
     const int begin = segment_begin[t];
     const int slot  = slots[t];
+    if constexpr (kSnapshot) {
+        if (t - begin >= snapshot_width) { return; }
+    } else {
+        if (segment_last[t] == 0) { return; }
+    }
     int fresh[kNgramPleMaxNgram];
     for (int j = 0; j < history_len; ++j) {
         // entry j (oldest first) is the token history_len-j columns before the next column
@@ -95,7 +105,10 @@ __global__ void history_update_kernel(const int* __restrict__ ids,
             fresh[j]        = older > history_len ? -1 : history[slot * history_len + (history_len - older)];
         }
     }
-    for (int j = 0; j < history_len; ++j) { history[slot * history_len + j] = fresh[j]; }
+    int* destination = kSnapshot ? snapshots + (static_cast<std::int64_t>(slot) * snapshot_width +
+                                                 (t - begin)) * history_len
+                                 : history + slot * history_len;
+    for (int j = 0; j < history_len; ++j) { destination[j] = fresh[j]; }
 }
 
 // Decodes head rows into the [heads*head_dim, T] embedding (BF16) from IQ4_NL blocks.
@@ -241,29 +254,39 @@ __global__ void ple_conv_kernel(const __nv_bfloat16* __restrict__ gated,
 }
 
 // The last column of a segment rewrites its slot's convolution state with the last `history`
-// normalised columns (older ones from the previous state when the segment is shorter).
+// normalised columns (older ones from the previous state when the segment is shorter). The
+// snapshot form writes the state after each of a segment's first `snapshot_width` columns to
+// that column's snapshot instead, and runs before the in-place form, as the history's does.
+template <bool kSnapshot>
 __global__ void ple_conv_state_update_kernel(const __nv_bfloat16* __restrict__ normalized,
                                          const int* __restrict__ segment_begin,
                                          const int* __restrict__ slots,
                                          const int* __restrict__ segment_last, int width,
                                          int history, int slot_count,
-                                         __nv_bfloat16* __restrict__ conv_state) {
+                                         __nv_bfloat16* __restrict__ conv_state,
+                                         int snapshot_width,
+                                         __nv_bfloat16* __restrict__ snapshots) {
     const int t = static_cast<int>(blockIdx.y);
-    if (segment_last[t] == 0) { return; }
     const int c = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
     if (c >= width) { return; }
     const int begin = segment_begin[t];
     const int slot  = slots[t];
+    if constexpr (kSnapshot) {
+        if (t - begin >= snapshot_width) { return; }
+    } else {
+        if (segment_last[t] == 0) { return; }
+    }
     float fresh[16];
     for (int j = 0; j < history; ++j) {
         // entry j (oldest first) is history-j columns before the next column
         fresh[j] = conv_input(normalized, conv_state, width, c, t + 1, history - j, begin, slot,
                               history, slot_count);
     }
-    for (int j = 0; j < history; ++j) {
-        conv_state[(static_cast<std::int64_t>(slot) * width + c) * history + j] =
-            __float2bfloat16_rn(fresh[j]);
-    }
+    __nv_bfloat16* destination =
+        kSnapshot ? snapshots + ((static_cast<std::int64_t>(slot) * snapshot_width + (t - begin)) *
+                                     width + c) * history
+                  : conv_state + (static_cast<std::int64_t>(slot) * width + c) * history;
+    for (int j = 0; j < history; ++j) { destination[j] = __float2bfloat16_rn(fresh[j]); }
 }
 
 __global__ void mark_last_kernel(int* __restrict__ flags, const int* __restrict__ count, int base,
@@ -421,6 +444,23 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
             "ngram_ple: conv_state must be BF16 [history, streams*hidden, slots]");
     }
 
+    const bool snapshots = state.history_snapshots.data != nullptr;
+    const std::int32_t snapshot_width = snapshots ? state.history_snapshots.ne[1] : 0;
+    if (snapshots != (state.conv_snapshots.data != nullptr)) {
+        throw std::invalid_argument("ngram_ple: snapshots come as a history and conv pair");
+    }
+    if (snapshots &&
+        (state.history_snapshots.dtype != DType::I32 ||
+         state.history_snapshots.ne[0] != hash.ngram - 1 || snapshot_width <= 0 ||
+         state.history_snapshots.ne[2] != slot_count || !state.history_snapshots.is_contiguous() ||
+         state.conv_snapshots.dtype != DType::BF16 || state.conv_snapshots.ne[0] != history ||
+         state.conv_snapshots.ne[1] != width || state.conv_snapshots.ne[2] != snapshot_width ||
+         state.conv_snapshots.ne[3] != slot_count || !state.conv_snapshots.is_contiguous())) {
+        throw std::invalid_argument(
+            "ngram_ple: snapshots must be I32 [ngram-1, columns, slots] and BF16 "
+            "[history, streams*hidden, columns, slots]");
+    }
+
     auto scope        = workspace.scope();
     Tensor rows       = workspace.alloc(DType::I32, {hash.heads, tokens});
     Tensor embedding  = workspace.alloc(DType::BF16, {embed_dim, tokens});
@@ -440,8 +480,14 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
         ids, begin, slots, history_ptr, hash, hash.ngram - 1, slot_count,
         static_cast<int*>(rows.data));
     CUDA_CHECK(cudaGetLastError());
-    history_update_kernel<<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
-        ids, begin, slots, last, hash.ngram - 1, slot_count, history_ptr);
+    if (snapshots) {
+        history_update_kernel<true><<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
+            ids, begin, slots, last, hash.ngram - 1, slot_count, history_ptr, snapshot_width,
+            static_cast<int*>(state.history_snapshots.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    history_update_kernel<false><<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
+        ids, begin, slots, last, hash.ngram - 1, slot_count, history_ptr, 0, nullptr);
     CUDA_CHECK(cudaGetLastError());
     gather_kernel<<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(
         static_cast<const int*>(rows.data), static_cast<const std::uint8_t*>(table.rows),
@@ -467,9 +513,16 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
         width, conv_kernel, conv_dilation, history, slot_count,
         static_cast<__nv_bfloat16*>(residual.data));
     CUDA_CHECK(cudaGetLastError());
-    ple_conv_state_update_kernel<<<conv_grid, kThreads, 0, stream>>>(
+    if (snapshots) {
+        ple_conv_state_update_kernel<true><<<conv_grid, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(normalized.data), begin, slots, last, width,
+            history, slot_count, conv_state, snapshot_width,
+            static_cast<__nv_bfloat16*>(state.conv_snapshots.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ple_conv_state_update_kernel<false><<<conv_grid, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(normalized.data), begin, slots, last, width, history,
-        slot_count, conv_state);
+        slot_count, conv_state, 0, nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 

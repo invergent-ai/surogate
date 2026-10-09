@@ -45,6 +45,18 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    // Qwen3.8-Flash-Next's shortlist draft head (hidden 2560). Not measured yet: the
+    // shape-generic GEMV at T=1, SIMT through the draft widths of an 8-lane round, and the
+    // runtime MMA tile beyond; the exact small-T draft-head kernels are built for 2048 and
+    // 5120 only.
+    case 2560:
+        if (n == 131072) {
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 8) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     case 2048:
         if (n == 131072) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }

@@ -107,6 +107,11 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type in ("gemma3", "gemma3_text") and hidden > 0 and layers > 0:
         return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3",
                                gguf_repack=True)
+    # Qwen3.8-Flash-Next's safetensors release (NVFP4 experts, an FP8 n-gram table). Its GGUFs
+    # take the GGUF-native path; this is the checkpoint directory.
+    if model_type == "qwen4_exp" and hidden > 0 and layers > 0:
+        return ConverterTarget("qwen4exp", "surogate.serve.convert.qwen4exp.checkpoint",
+                               "Qwen3.8-Flash-Next")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
         return ConverterTarget("qwen3_5_moe",
                                "surogate.serve.convert.qwen3_5_moe.convert",

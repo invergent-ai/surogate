@@ -24,7 +24,7 @@ void validate_slot(const NgramPleStatePool& pool, std::int32_t slot, const char*
 NgramPleStatePoolLayout plan_ngram_ple_state_pool(LayoutBuilder& builder,
                                                   const NgramPleStatePoolSpec& spec) {
     if (spec.history_tokens <= 0 || spec.conv_history <= 0 || spec.channels <= 0 ||
-        spec.slot_count <= 0) {
+        spec.slot_count <= 0 || spec.snapshot_width < 0) {
         throw std::invalid_argument("NgramPleStatePool spec must be positive");
     }
     const Tensor history_shape(nullptr, DType::I32, {spec.history_tokens, spec.slot_count});
@@ -34,6 +34,13 @@ NgramPleStatePoolLayout plan_ngram_ple_state_pool(LayoutBuilder& builder,
     layout.spec    = spec;
     layout.history = builder.add(history_shape.bytes(), kArenaAlign, "PLE token history");
     layout.conv    = builder.add(conv_shape.bytes(), kArenaAlign, "PLE conv history");
+    if (spec.snapshot_width > 0) {
+        const auto columns = static_cast<std::size_t>(spec.snapshot_width);
+        layout.history_snapshots = builder.add(history_shape.bytes() * columns, kArenaAlign,
+                                               "PLE token history per speculative column");
+        layout.conv_snapshots    = builder.add(conv_shape.bytes() * columns, kArenaAlign,
+                                               "PLE conv history per speculative column");
+    }
     return layout;
 }
 
@@ -44,7 +51,15 @@ NgramPleStatePool::NgramPleStatePool(DeviceSpan backing, const NgramPleStatePool
       conv_state(layout.conv.bind(backing).data, DType::BF16,
                  std::initializer_list<std::int32_t>{layout.spec.conv_history,
                                                      layout.spec.channels, layout.spec.slot_count}),
-      spec(layout.spec) {}
+      spec(layout.spec) {
+    if (spec.snapshot_width > 0) {
+        history_snapshots = Tensor(layout.history_snapshots.bind(backing).data, DType::I32,
+                                   {spec.history_tokens, spec.snapshot_width, spec.slot_count});
+        conv_snapshots    = Tensor(layout.conv_snapshots.bind(backing).data, DType::BF16,
+                                   {spec.conv_history, spec.channels, spec.snapshot_width,
+                                    spec.slot_count});
+    }
+}
 
 Tensor NgramPleStatePool::history_slot(std::int32_t slot) const {
     validate_slot(*this, slot, "NgramPleStatePool history_slot");
@@ -78,6 +93,27 @@ void NgramPleStatePool::copy_slot(std::int32_t src, std::int32_t dst, cudaStream
     const Tensor conv_dst = conv_slot(dst);
     CUDA_CHECK(cudaMemcpyAsync(conv_dst.data, conv_src.data, conv_src.bytes(),
                                cudaMemcpyDeviceToDevice, stream));
+}
+
+void NgramPleStatePool::commit_snapshot(std::int32_t slot, std::int32_t column,
+                                        cudaStream_t stream) {
+    if (empty() || spec.snapshot_width <= 0) {
+        throw std::logic_error("NgramPleStatePool commit_snapshot: the pool keeps no snapshots");
+    }
+    if (slot < 0 || slot >= spec.slot_count || column < 0 || column >= spec.snapshot_width) {
+        throw std::out_of_range("NgramPleStatePool commit_snapshot: slot or column out of range");
+    }
+    const std::int64_t entry = static_cast<std::int64_t>(slot) * spec.snapshot_width + column;
+    const Tensor history_dst = history_slot(slot);
+    const Tensor conv_dst    = conv_slot(slot);
+    CUDA_CHECK(cudaMemcpyAsync(history_dst.data,
+                               static_cast<const std::int32_t*>(history_snapshots.data) +
+                                   entry * spec.history_tokens,
+                               history_dst.bytes(), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(conv_dst.data,
+                               static_cast<const std::uint8_t*>(conv_snapshots.data) +
+                                   entry * static_cast<std::int64_t>(conv_dst.bytes()),
+                               conv_dst.bytes(), cudaMemcpyDeviceToDevice, stream));
 }
 
 void NgramPleStatePool::reset_slot(std::int32_t slot, cudaStream_t stream) {

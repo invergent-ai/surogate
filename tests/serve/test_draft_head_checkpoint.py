@@ -1,6 +1,7 @@
 """Bundled token ranks need provenance; output-head padding is not a tokenizer."""
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -52,6 +53,23 @@ def test_matching_tokenizer_attestation_enables_frequency_ranks(tmp_path):
     path = root / "tokenizer.json"
     path.write_text(path.read_text().replace('"a"', '"renamed"'))
     assert shortlist(root, ranking).selected.tolist() == [0, 1, 7]
+
+
+def test_attested_compatible_tokenizer_enables_frequency_ranks(tmp_path):
+    root, ranking = fixture(tmp_path)
+    digest = hashlib.sha256((root / "tokenizer.json").read_bytes()).hexdigest()
+    manifest = {"vocab": 16, "tokenizer_sha256": "0" * 64, "compatible_tokenizer_sha256": [digest]}
+    (tmp_path / "ranking.train.manifest.json").write_text(json.dumps(manifest))
+    assert shortlist(root, ranking).selected.tolist() == [6, 3, 7]
+    manifest["compatible_tokenizer_sha256"] = digest
+    (tmp_path / "ranking.train.manifest.json").write_text(json.dumps(manifest))
+    assert shortlist(root, ranking).selected.tolist() == [0, 1, 7]
+
+
+def test_bundled_ranking_attests_its_tokenizer():
+    manifest = json.loads((Path(draft_head.__file__).resolve().parents[2] / "tools" /
+                           draft_head.DEFAULT_RANKING).with_name("ranking.train.manifest.json").read_text())
+    assert manifest["vocab"] == 248320 and len(manifest["tokenizer_sha256"]) == 64
 
 
 def test_explicit_ranking_is_checked_against_actual_token_ids(tmp_path):

@@ -293,7 +293,7 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 | `--dflash-model PATH` | Matching separate Muse-Glimmer DFlash GGUF; see [Muse-Glimmer](#muse-glimmer) |
 | `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec`. With `--spec-adaptive`, sets the maximum |
 | `--spec-adaptive` | Adjust DFlash draft length to measured throughput. Can temporarily stop drafting and retry it later. Off by default |
-| `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
+| `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1, or `all` on a DGX Spark (GB10) outside a pipeline; `all` keeps checking at every concurrency level. Does not affect DFlash |
 | `--lm-head-draft` | Use a smaller draft vocabulary when the checkpoint provides one |
 
 For workloads where DFlash acceptance or concurrency varies, use `--spec dflash --draft-tokens 15 --spec-adaptive`. The engine learns from completed decode rounds, so short requests may finish before it has enough measurements. It keeps separate measurements for different batch sizes and context lengths. Adaptive mode uses more GPU memory and can take longer to start. Calibration and periodic retries add some overhead; compare throughput on your workload. This option also works with vision prompts, BF16 or FP8 caches, and pipeline serving. Omitting `--spec-adaptive` keeps the requested draft length fixed. Changing draft lengths can also change individual token scores or greedy wording through numerical rounding, especially with an FP8 cache.

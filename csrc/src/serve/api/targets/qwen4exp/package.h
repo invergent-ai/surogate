@@ -36,7 +36,23 @@ struct Variant;
 
 enum class WeightsProfile : std::uint8_t {
     W8HyperConnection,
+    // The NVFP4 release converted from its own directory: routed experts keep the export's
+    // NVFP4 words and per-expert scales and stay on the device; everything else is W8 or BF16 as
+    // `W8HyperConnection` has it.
+    RoutedNvfp4HyperConnection,
 };
+
+/// Do these weights need the sm_120 block-scaled FP4 MMA? The routed NVFP4 experts run on
+/// `sinfer_trtllm_moe`, which is built for sm_12x only.
+[[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile profile) noexcept {
+    switch (profile) {
+    case WeightsProfile::W8HyperConnection:
+        return false;
+    case WeightsProfile::RoutedNvfp4HyperConnection:
+        return true;
+    }
+    return false;
+}
 
 using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
@@ -46,8 +62,8 @@ SINFER_TARGET_LOAD_TYPES(qwen4exp::Package);
 
 } // namespace detail
 
-/// Qwen3.8-Flash-Next: 48 hybrid layers with four residual streams, 512 routed experts held in
-/// pinned host memory, and an n-gram memory at layer 1.
+/// Qwen3.8-Flash-Next: 48 hybrid layers with four residual streams, 512 routed experts (in
+/// pinned host memory from a GGUF, on the device as NVFP4), and an n-gram memory at layer 1.
 struct Package {
     /// The checkpoints this target serves. One entry here, because this architecture
     /// ships as one model; the registry asks every package the same question.

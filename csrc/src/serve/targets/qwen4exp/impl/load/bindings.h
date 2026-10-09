@@ -20,6 +20,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -43,8 +44,8 @@ using family::host_w8_weight;
 
 struct HyperConnectionPlan {
     artifact::ObjectHandle norm;
-    artifact::ObjectHandle down;
-    artifact::ObjectHandle up;
+    artifact::LinearBinding down; ///< BF16 or W8 row-split, as the artifact stores it
+    artifact::LinearBinding up;
     artifact::ObjectHandle inject; ///< unset for the output mixer
 };
 
@@ -64,6 +65,15 @@ struct MoePlan {
     family::BankPlanes routed_down_planes    = family::BankPlanes::Native;
     artifact::LinearBinding shared_gate_up;
     artifact::LinearBinding shared_down;
+    /// NVFP4 experts' per-expert calibration: the second-level scale (two per expert for the
+    /// stacked [up; gate] block), the activation scale and the epilogue alpha. Set exactly when
+    /// that half is NVFP4.
+    std::optional<artifact::ObjectHandle> routed_gate_up_scale;
+    std::optional<artifact::ObjectHandle> routed_gate_up_act_scale;
+    std::optional<artifact::ObjectHandle> routed_gate_up_alpha;
+    std::optional<artifact::ObjectHandle> routed_down_scale;
+    std::optional<artifact::ObjectHandle> routed_down_act_scale;
+    std::optional<artifact::ObjectHandle> routed_down_alpha;
 };
 
 struct IndexerPlan {
@@ -141,6 +151,10 @@ struct BindingPlan {
     std::vector<TextLayerPlan> text_layers;
     HyperConnectionPlan output_mix;
     artifact::LinearBinding output_head;
+    /// The shortlist head `--lm-head-draft` proposes through and the vocabulary id of each of
+    /// its rows; bound when the artifact carries them.
+    artifact::LinearBinding draft_head{};
+    artifact::ObjectHandle draft_head_token_ids{};
     artifact::ObjectHandle ple_table;
     // The hash constants are read out of the artifact at bind time (the reader is gone by
     // the time the model is constructed).

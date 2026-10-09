@@ -391,7 +391,8 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
     }
     ops::NgramPleColumns ple_columns{columns.ids, columns.segment_begin, columns.slots,
                                      columns.segment_last};
-    ops::NgramPleState state{ple_state->history, ple_state->conv_state};
+    ops::NgramPleState state{ple_state->history, ple_state->conv_state,
+                             ple_state->history_snapshots, ple_state->conv_snapshots};
     maybe_dump_block("ple_in", residual, stream);
     ops::ngram_ple_forward(residual, ple_columns, model.ple.hash, model.ple.table, model.ple.op,
                            state, g.hc_streams, g.ple_conv_kernel,

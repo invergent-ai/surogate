@@ -3,6 +3,7 @@
 #include "targets/gemma4_moe/impl/config.h"
 
 #include "artifact/typed_binding.h"
+#include "family/impl/load/routed_nvfp4.h"
 
 #include <array>
 #include <bit>
@@ -20,6 +21,8 @@ namespace sinfer::targets::gemma4_moe::detail {
 namespace {
 
 using artifact::NumericFormat;
+using family::require_identity_divisor;
+using family::routed_nvfp4_weight;
 
 static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
               "Gemma 4 attention is ungated; a gated projection would be read at the wrong stride");
@@ -32,63 +35,6 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::W8G32_F16S;
     }
     throw std::invalid_argument("gemma4_moe: invalid weights profile");
-}
-
-/// One routed NVFP4 bank as the MoE kernels read it.
-///
-/// `artifact::materialized_linear` would pair it with a dense input divisor the routed profile
-/// does not have: the experts' second level and activation divisors are per expert, in their
-/// own arrays, so the Weight is built here with both of its own divisors at one -- which
-/// `require_identity_divisor` has checked the payload states.
-Weight routed_nvfp4_weight(const artifact::MaterializedArtifact& materialized,
-                           artifact::ObjectHandle handle, std::int32_t rows, std::int32_t columns) {
-    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
-                                                static_cast<std::uint64_t>(columns)};
-    const artifact::BlockScaleGeometry geometry =
-        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
-    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
-    Weight out{};
-    out.payload              = bytes;
-    out.payload_bytes        = geometry.encoded_bytes;
-    out.qtype                = QType::NVFP4;
-    out.group_size           = 16;
-    out.ndim                 = 2;
-    out.qdata                = bytes;
-    out.scales               = bytes + geometry.scale_plane_offset;
-    out.n                    = rows;
-    out.k                    = columns;
-    out.group                = 16;
-    out.layout               = QuantLayout::BlockScaleK16M128x4;
-    out.scale_dtype          = DType::FP8_E4M3FN;
-    out.shape[0]             = rows;
-    out.shape[1]             = columns;
-    out.padded_shape[0]      = rows;
-    out.padded_shape[1]      = columns;
-    out.weight_scale_divisor = 1.0F;
-    out.input_scale_divisor  = 1.0F;
-    return out;
-}
-
-/// The payload's per-tensor divisor word must be the identity: the routed profile carries its
-/// second level per expert, and a per-tensor value here would be dropped on the floor.
-void require_identity_divisor(const artifact::Binder& binder, artifact::ObjectHandle handle,
-                              std::string_view name, std::int32_t rows, std::int32_t columns) {
-    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
-                                                static_cast<std::uint64_t>(columns)};
-    const artifact::BlockScaleGeometry geometry =
-        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
-    const artifact::PayloadSpan payload = binder.payload(handle);
-    if (payload.data.size() < geometry.weight_divisor_offset + sizeof(std::uint32_t)) {
-        throw artifact::ArtifactError(std::string(name) + ": NVFP4 payload is short of its divisor");
-    }
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, payload.data.data() + geometry.weight_divisor_offset, sizeof(bits));
-    if (std::bit_cast<float>(bits) != 1.0F) {
-        throw artifact::ArtifactError(
-            std::string(name) +
-            ": routed NVFP4 must carry a per-tensor divisor of 1.0; the second level belongs in "
-            "the per-expert scale object");
-    }
 }
 
 /// A routed bank at the format the artifact stores it in. NVFP4 is bound as the plain tensor

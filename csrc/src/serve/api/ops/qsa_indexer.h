@@ -23,9 +23,15 @@
 
 namespace sinfer::ops {
 
-// Per page: 64 raw keys, 16 pooled keys, and 16 aligned int32[4] block positions.
-// The latter retain the first member's three mRoPE axes across chunk boundaries.
-inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 162;
+// Per page: 64 raw keys, 16 pooled keys, and 16 aligned int32[4] block positions (162 of the
+// width). The latter retain the first member's three mRoPE axes across chunk boundaries. The
+// rest is padding, and it is what keeps an elastic pool's granule small: the region maps runs
+// of pages in which every plane spans whole 2 MiB quanta, and a 162-wide page (20,736 bytes,
+// 2^8 x 81) needed 8,192 pages per run. Rounded up to a whole run, the capacity it committed
+// overshot the planned KV by up to 8 GiB, and Flash-Next refused a 131,072-token context and
+// MTP at 32 sequences on a DGX Spark. At 192 (24,576 bytes, 2^13 x 3) a run is 256 pages, for
+// 4.4% more KV bytes per token.
+inline constexpr std::int32_t kQsaIndexerStorageHeadDim = 192;
 
 struct QsaIndexerGeometry {
     std::int32_t head_dim   = 0; // indexer key/query width
@@ -76,6 +82,24 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
                         std::int32_t columns_per_row, const QsaIndexerGeometry& geometry,
                         PagedKVBatchLayerView cache, std::int32_t keys, WorkspaceArena& workspace,
                         Tensor& mask, cudaStream_t stream);
+
+/// Query columns per list of `qsa_tile_union`: the prompt attention kernel's tile.
+inline constexpr std::int32_t kQsaTileRows = 64;
+
+/// Ints in one list of `qsa_tile_union` over a `keys`-long history: room for every block.
+[[nodiscard]] std::int32_t qsa_tile_union_stride(std::int32_t keys, std::int32_t block);
+
+/// Bytes of `qsa_tile_union`'s lists and counts for `rows` mask rows, as the arena lays them out.
+[[nodiscard]] std::size_t qsa_tile_union_bytes(std::int32_t rows, std::int32_t keys,
+                                               std::int32_t block);
+
+/// For each tile of `kQsaTileRows` consecutive rows of `qsa_indexer_select`'s mask, the blocks
+/// any of its rows selected, in ascending order. Attention over one sequence's prompt chunk
+/// then reads only those blocks' keys.
+///   mask   I32 [words, rows]
+///   blocks I32 [qsa_tile_union_stride(), tiles]   tiles = ceil(rows / kQsaTileRows)
+///   counts I32 [tiles]                            the length of each list
+void qsa_tile_union(const Tensor& mask, Tensor& blocks, Tensor& counts, cudaStream_t stream);
 
 /// Transient bytes `qsa_indexer_select` needs for `rows` queries over a `keys`-long history.
 [[nodiscard]] std::size_t qsa_indexer_select_workspace_capacity_bytes(

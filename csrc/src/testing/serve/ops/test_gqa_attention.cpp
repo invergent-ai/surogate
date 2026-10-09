@@ -4,6 +4,7 @@
 #include "core/paged_kv_cache.h"
 #include "api/ops/batch_invariant.h"
 #include "api/ops/gqa_attention.h"
+#include "api/ops/qsa_indexer.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/fp8_reference.h"
 #include "ops/op_tester.h"
@@ -1526,15 +1527,25 @@ int verify_split_numerator_precision() {
         constexpr int mask_stride = 64;
         Tensor mask = arena.alloc(DType::I32, {mask_stride, tokens});
         std::vector<std::uint32_t> mask_words(mask.numel(), 0);
+        // Every fifth column shifts its selection, so a 64-column tile's union holds blocks that
+        // most of its columns must still mask; block 0 keeps every column's selection nonempty.
+        const auto selected_block = [](int column, int block) {
+            return block == 0 || (block + column / 5) % 3 == 0;
+        };
         for (int col = 0; col < tokens; ++col) {
-            for (int block = 0; block * 4 < tokens; block += 3) {
-                mask_words[col * mask_stride + block / 32] |= 1U << (block % 32);
+            for (int block = 0; block * 4 < tokens; ++block) {
+                if (selected_block(col, block)) {
+                    mask_words[col * mask_stride + block / 32] |= 1U << (block % 32);
+                }
             }
         }
         CUDA_CHECK(cudaMemcpy(mask.data, mask_words.data(), mask.bytes(), cudaMemcpyHostToDevice));
         for (const bool sparse : {false, true}) {
           for (const int width : {1, 4, 16, tokens}) {
             for (const int window : {0, 47}) {
+              // A one-sequence prompt also runs from qsa_tile_union's per-tile block lists.
+              for (const bool gather : {false, true}) {
+                if (gather && (!sparse || width != tokens)) { continue; }
                 const int begin = tokens - width;
                 Tensor queries = q.slice(2, begin, width);
                 Tensor query_pos = positions.slice(0, begin, width);
@@ -1549,6 +1560,16 @@ int verify_split_numerator_precision() {
                     selection.stride = mask_stride;
                     selection.block = 4;
                 }
+                if (gather) {
+                    const int tiles = (width + ops::kQsaTileRows - 1) / ops::kQsaTileRows;
+                    Tensor tile_blocks = arena.alloc(DType::I32, {mask_stride * 32, tiles});
+                    Tensor tile_counts = arena.alloc(DType::I32, {tiles});
+                    ops::qsa_tile_union(mask.slice(1, begin, width), tile_blocks, tile_counts, nullptr);
+                    selection.tile_blocks = static_cast<const std::int32_t*>(tile_blocks.data);
+                    selection.tile_counts = static_cast<const std::int32_t*>(tile_counts.data);
+                    selection.tile_stride = tile_blocks.ne[0];
+                    selection.tile_rows   = ops::kQsaTileRows;
+                }
                 ops::gqa_attention_cached(queries, query_pos, 1.0F / 16.0F,
                                           cache, envelope, scratch, result, nullptr, selection);
                 cuda_synchronize();
@@ -1562,7 +1583,7 @@ int verify_split_numerator_precision() {
                             float sum = 0;
                             int selected = 0;
                             for (int t = first; t <= last; ++t) {
-                                if (sparse && (t / 4) % 3 != 0) { continue; }
+                                if (sparse && !selected_block(last, t / 4)) { continue; }
                                 sum += bf16_to_f32(values[(t * kv_heads + h / 2) * dim + d]);
                                 ++selected;
                             }
@@ -1573,9 +1594,11 @@ int verify_split_numerator_precision() {
                 }
                 if (mismatches) {
                     std::cerr << "Split numerator precision dtype=" << int(dtype) << " width=" << width
-                              << " sparse=" << sparse << " window=" << window << ": " << mismatches << " mismatches\n";
+                              << " sparse=" << sparse << " gather=" << gather << " window=" << window
+                              << ": " << mismatches << " mismatches\n";
                     ++failures;
                 }
+              }
             }
           }
         }

@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "artifact/linear_storage.h"
 #include "artifact/typed_binding.h"
+#include "family/impl/load/routed_nvfp4.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sinfer::targets::qwen4exp::detail {
 namespace {
@@ -66,8 +68,18 @@ HyperConnectionPlan bind_hc(const family::TextGeometry& g, artifact::Binder& bin
                             bool with_inject) {
     HyperConnectionPlan plan;
     plan.norm = device(binder, prefix + "norm", NumericFormat::FP32, {g.residual});
-    plan.down = device(binder, prefix + "down", NumericFormat::BF16, {g.hc_low_rank, g.residual});
-    plan.up   = device(binder, prefix + "up", NumericFormat::BF16, {g.residual, g.hc_low_rank});
+    // The low-rank projections are BF16 in a GGUF-made artifact and W8 in one converted from
+    // the NVFP4 release; the mixer runs either.
+    const auto projection = [&](const std::string& name, std::uint64_t rows, std::uint64_t columns) {
+        artifact::LinearBinding binding =
+            linear(binder, name, static_cast<std::int32_t>(rows), static_cast<std::int32_t>(columns));
+        if (binding.format != NumericFormat::BF16 && binding.format != NumericFormat::W8G32_F16S) {
+            throw artifact::ArtifactError(name + " must be BF16 or W8G32_F16S");
+        }
+        return binding;
+    };
+    plan.down = projection(prefix + "down", g.hc_low_rank, g.residual);
+    plan.up   = projection(prefix + "up", g.residual, g.hc_low_rank);
     if (with_inject) {
         plan.inject = device(binder, prefix + "inject", NumericFormat::BF16, {g.hc_streams, g.residual});
     }
@@ -115,6 +127,22 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
                             NumericFormat& format, family::BankPlanes& half) {
         const auto rows    = static_cast<std::int32_t>(*shape.begin());
         const auto columns = static_cast<std::int32_t>(*(shape.begin() + 1));
+        const auto* stored = std::get_if<artifact::TensorDescriptor>(binder.reader().find(name));
+        if (stored != nullptr && stored->format == NumericFormat::NVFP4) {
+            // The NVFP4 release's experts: device resident, run by the TRT-LLM runner. The host
+            // bank and its slot cache read W8 or GGML planes only, so an offload is refused
+            // rather than served at a format nothing reads.
+            if (binder.offloads(name) && g_layer_placement == TensorPlacement::Device) {
+                throw artifact::ArtifactError(
+                    name + ": NVFP4 routed experts stay on the device; serve this artifact without "
+                           "--host-moe-layers or --gpu-layers");
+            }
+            format = NumericFormat::NVFP4;
+            const artifact::ObjectHandle handle =
+                artifact::bind_tensor(binder, name, NumericFormat::NVFP4, shape, g_layer_placement);
+            family::require_identity_divisor(binder, handle, name, rows, columns);
+            return handle;
+        }
         if (!binder.offloads(name) || g_layer_placement == TensorPlacement::ValidateOnly) {
             const auto binding = artifact::bind_linear(binder, name, rows, columns, g_layer_placement);
             format = binding.format;
@@ -135,7 +163,7 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
         }
         return binding.object;
     };
-    return MoePlan{
+    MoePlan plan{
         .router_shared_gate = device(binder, prefix + "router_shared_gate", NumericFormat::BF16,
                                      {g.experts + 1, g.hidden}),
         .routed_gate_up = routed(prefix + "routed_gate_up", {g.experts * 2 * g.intermediate, g.hidden},
@@ -150,6 +178,25 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
         .shared_down =
             linear(binder, prefix + "shared_down", static_cast<std::uint64_t>(g.hidden), static_cast<std::uint64_t>(g.shared_intermediate)),
     };
+    // NVFP4 carries its second level per expert per projection; the gate/up block stacks up and
+    // gate, so it has two entries per expert and down one.
+    if (plan.routed_gate_up_format == NumericFormat::NVFP4) {
+        plan.routed_gate_up_scale =
+            device(binder, prefix + "routed_gate_up_scale", NumericFormat::FP32, {2 * g.experts});
+        plan.routed_gate_up_act_scale =
+            device(binder, prefix + "routed_gate_up_act_scale", NumericFormat::FP32, {g.experts});
+        plan.routed_gate_up_alpha =
+            device(binder, prefix + "routed_gate_up_alpha", NumericFormat::FP32, {g.experts});
+    }
+    if (plan.routed_down_format == NumericFormat::NVFP4) {
+        plan.routed_down_scale =
+            device(binder, prefix + "routed_down_scale", NumericFormat::FP32, {g.experts});
+        plan.routed_down_act_scale =
+            device(binder, prefix + "routed_down_act_scale", NumericFormat::FP32, {g.experts});
+        plan.routed_down_alpha =
+            device(binder, prefix + "routed_down_alpha", NumericFormat::FP32, {g.experts});
+    }
+    return plan;
 }
 
 template <class T>
@@ -170,11 +217,9 @@ ops::HyperConnectionWeights load_hc(const family::TextGeometry& g, const artifac
     ops::HyperConnectionWeights out;
     out.norm = artifact::materialized_tensor(backing, plan.norm, NumericFormat::FP32,
                                              {static_cast<std::int32_t>(g.residual)});
-    out.down = artifact::materialized_weight(backing, plan.down, NumericFormat::BF16,
-                                             static_cast<std::int32_t>(g.hc_low_rank),
+    out.down = artifact::materialized_linear(backing, plan.down, static_cast<std::int32_t>(g.hc_low_rank),
                                              static_cast<std::int32_t>(g.residual));
-    out.up   = artifact::materialized_weight(backing, plan.up, NumericFormat::BF16,
-                                             static_cast<std::int32_t>(g.residual),
+    out.up   = artifact::materialized_linear(backing, plan.up, static_cast<std::int32_t>(g.residual),
                                              static_cast<std::int32_t>(g.hc_low_rank));
     if (with_inject) {
         out.inject = artifact::materialized_weight(backing, plan.inject, NumericFormat::BF16,
@@ -201,6 +246,9 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     // own layout, copied straight through.
     const auto routed = [&](artifact::ObjectHandle handle, family::BankPlanes planes,
                             NumericFormat format, std::int32_t rows, std::int32_t columns) {
+        if (format == NumericFormat::NVFP4) {
+            return family::routed_nvfp4_weight(backing, handle, rows, columns);
+        }
         if (bank.find(handle) == nullptr) {
             return artifact::materialized_weight(backing, handle, format, rows, columns);
         }
@@ -226,12 +274,41 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     out.op.shared_down = artifact::materialized_linear(backing, plan.shared_down,
                                                        g.hidden, g.shared_intermediate);
     out.op.experts_per_token = g.experts_per_token;
+    const auto scales = [&](const std::optional<artifact::ObjectHandle>& handle, std::int32_t count) {
+        return handle.has_value()
+                   ? static_cast<const float*>(
+                         artifact::materialized_tensor(backing, *handle, NumericFormat::FP32, {count}).data)
+                   : nullptr;
+    };
+    const auto experts = static_cast<std::int32_t>(g.experts);
+    out.op.routed_gate_up_scale     = scales(plan.routed_gate_up_scale, 2 * experts);
+    out.op.routed_gate_up_act_scale = scales(plan.routed_gate_up_act_scale, experts);
+    out.op.routed_gate_up_alpha     = scales(plan.routed_gate_up_alpha, experts);
+    out.op.routed_down_scale        = scales(plan.routed_down_scale, experts);
+    out.op.routed_down_act_scale    = scales(plan.routed_down_act_scale, experts);
+    out.op.routed_down_alpha        = scales(plan.routed_down_alpha, experts);
     out.mix                  = std::move(mix);
     if (const auto* object = bank.find(plan.routed_gate_up)) {
         out.host_gate_up = static_cast<const std::byte*>(object->host);
         out.host_down = static_cast<const std::byte*>(bank.object(plan.routed_down).host);
     }
     return out;
+}
+
+// The shortlist's ids must be distinct tokens of the tokenizer: the proposal maps a row's
+// argmax back through them.
+void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle,
+                        const family::TextGeometry& g) {
+    const auto bytes = binder.payload(handle).data;
+    std::vector<bool> seen(static_cast<std::size_t>(g.token_domain), false);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(g.draft_vocab); ++i) {
+        std::uint32_t id = 0;
+        std::memcpy(&id, bytes.data() + i * sizeof(std::uint32_t), sizeof(id));
+        if (id >= seen.size() || seen[id]) {
+            throw artifact::ArtifactError("invalid draft-head token ids");
+        }
+        seen[id] = true;
+    }
 }
 
 } // namespace
@@ -325,6 +402,25 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
 
     out.output_mix  = bind_hc(g, binder, "text/output_hc/", false);
     out.output_head = linear(binder, "text/output_head", g.output_rows, g.hidden);
+
+    // The shortlist draft head: rows of the output head for the most frequent tokens, which
+    // `--lm-head-draft` proposes through instead of the full vocabulary. Bound whenever the
+    // artifact carries it, resident only when the run asked for it.
+    const bool has_draft_head = binder.has("text/draft_head");
+    if (features.optimized_proposal() && (!has_draft_head || g.draft_vocab <= 0)) {
+        throw std::runtime_error(
+            "--lm-head-draft needs an artifact converted with a draft head (text/draft_head)");
+    }
+    if (has_draft_head) {
+        const TensorPlacement placement =
+            features.optimized_proposal() ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
+        out.draft_head = artifact::bind_linear(binder, "text/draft_head", g.draft_vocab, g.hidden,
+                                               placement);
+        out.draft_head_token_ids = artifact::bind_tensor(
+            binder, "text/draft_head_token_ids", NumericFormat::I32,
+            {static_cast<std::uint64_t>(g.draft_vocab)}, placement);
+        validate_draft_ids(binder, out.draft_head_token_ids, g);
+    }
 
     // The NextN draft head. Bound whenever the artifact carries one, because every object an
     // artifact holds has to be consumed by the target that reads it -- but resident only when
@@ -594,6 +690,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.output_head = artifact::materialized_linear(backing, plan.output_head,
                                                         static_cast<std::int32_t>(g.output_rows),
                                                         static_cast<std::int32_t>(g.hidden));
+    if (plan.features.optimized_proposal()) {
+        auto& proposal     = runtime.optimized_proposal.emplace();
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, g.draft_vocab,
+                                                           static_cast<std::int32_t>(g.hidden));
+        proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
+                                                           NumericFormat::I32, {g.draft_vocab});
+    }
 
     if (g.ple_ngram) {
         PleWeights& ple = runtime.ple;

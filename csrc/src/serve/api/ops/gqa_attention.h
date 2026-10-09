@@ -24,6 +24,14 @@ struct GqaBlockMask {
     // A query inside this block can read every image key; its left window is unchanged.
     std::int32_t image_begin = 0;
     std::int32_t image_end = 0;
+    /// Optional, for one sequence's prompt: per tile of `tile_rows` query columns, the blocks any
+    /// of its rows selected, ascending, `tile_stride` ints apart, with their count in
+    /// `tile_counts` (qsa_tile_union). The prompt kernel then reads only those blocks' keys
+    /// instead of masking the rest; each row still applies its own bits.
+    const std::int32_t* tile_blocks = nullptr;
+    const std::int32_t* tile_counts = nullptr;
+    std::int32_t tile_stride        = 0;
+    std::int32_t tile_rows          = 0;
     __host__ __device__ std::int32_t last_key(std::int32_t query) const {
         return query >= image_begin && query < image_end ? image_end - 1 : query;
     }

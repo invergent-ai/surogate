@@ -54,7 +54,11 @@ struct GqaSmallTTcSmem {
     static constexpr int kQkvBytes = kQkvRows * Geometry::HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
     static constexpr int kPBytes   = WarpsPerCta * 16 * kBc * static_cast<int>(sizeof(__nv_bfloat16));
     static constexpr int kPageBytes = kPageIds * static_cast<int>(sizeof(std::int32_t));
-    static constexpr int kBytes    = kQkvBytes + kPBytes + kPageBytes;
+    // A QSA selection's gathered blocks: one id per block of a key partition (2048 keys at
+    // most, blocks of 4), relative to the partition's first key.
+    static constexpr int kBlockIds   = 512;
+    static constexpr int kBlockBytes = kBlockIds * static_cast<int>(sizeof(std::uint16_t));
+    static constexpr int kBytes      = kQkvBytes + kPBytes + kPageBytes + kBlockBytes;
 };
 
 // LaneColumns: each lane's first column is lane_columns[lane] rather than column_begin + lane *
@@ -136,6 +140,8 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     auto* p_s   = reinterpret_cast<__nv_bfloat16*>(gqa_small_t_smem + Smem::kQkvBytes);
     auto* physical_pages_s =
         reinterpret_cast<std::int32_t*>(gqa_small_t_smem + Smem::kQkvBytes + Smem::kPBytes);
+    auto* block_ids_s = reinterpret_cast<std::uint16_t*>(gqa_small_t_smem + Smem::kQkvBytes +
+                                                         Smem::kPBytes + Smem::kPageBytes);
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 
@@ -237,12 +243,63 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         return;
     }
     const int first_tile = (split_start / Bc) * Bc;
-    const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
+    // A QSA selection admits a budget of blocks, a few percent of a long history, and the loop
+    // walked every key of the partition only to mask most of them away. It walks the blocks some
+    // query of this tile selected instead, gathered in key order into tiles of Bc keys; each
+    // query still masks the blocks only its neighbours chose. One warp ORs the tile's mask rows
+    // over the partition (word-aligned: partitions start on multiples of 128 keys) and compacts
+    // the set bits.
+    int selected_blocks = 0;
+    if constexpr (Sparse) {
+        // Partitions start on multiples of 128 keys and span at most 2048: a word boundary, and
+        // a list that fits. A key pair (col0 even) never straddles a block.
+        static_assert(SparseBlock == 4 && Bc % SparseBlock == 0 &&
+                      Smem::kBlockIds * SparseBlock >= 2048);
+        __shared__ int selected_s;
+        if (warp == 0) {
+            const int word0 = split_start / (32 * SparseBlock);
+            const int span  = split_end - split_start;
+            const int words = div_up(span, 32 * SparseBlock);
+            std::uint32_t bits = 0U;
+            if (lane < words) {
+                for (int token = 0; token < valid_tokens; ++token) {
+                    bits |= block_mask.words[(column_base + token) * block_mask.stride + word0 + lane];
+                }
+                const int blocks = div_up(span, SparseBlock) - lane * 32; // inside the partition
+                if (blocks < 32) { bits &= (1U << max(blocks, 0)) - 1U; }
+            }
+            const int count = __popc(bits);
+            int offset      = count;
+#pragma unroll
+            for (int step = 1; step < 32; step <<= 1) {
+                const int other = __shfl_up_sync(FullMask, offset, step);
+                if (lane >= step) { offset += other; }
+            }
+            if (lane == 31) { selected_s = offset; }
+            offset -= count;
+            while (bits != 0U) {
+                block_ids_s[offset++] = static_cast<std::uint16_t>(lane * 32 + __ffs(bits) - 1);
+                bits &= bits - 1U;
+            }
+        }
+        __syncthreads();
+        selected_blocks = selected_s;
+    }
+    const int key_blocks =
+        Sparse ? div_up(selected_blocks * SparseBlock, Bc) : div_up(split_end - first_tile, Bc);
+    // The `column`-th key of gathered tile `kb`, or -1 past the selection.
+    const auto gathered_key = [&](int kb, int column) {
+        const int slot = kb * (Bc / SparseBlock) + column / SparseBlock;
+        return slot < selected_blocks
+                   ? split_start + static_cast<int>(block_ids_s[slot]) * SparseBlock +
+                         column % SparseBlock
+                   : -1;
+    };
 
     if constexpr (CacheInput::writes_cache) {
         // The owning split writes each new row. Current attention reads those rows directly from
@@ -325,7 +382,7 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+        if (!Sparse && kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
@@ -334,7 +391,12 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l      = chunk / (D / 8);
             const int d          = (chunk - key_l * (D / 8)) * 8;
-            const int key        = k0 + key_l;
+            const int key        = Sparse ? gathered_key(kb, key_l) : k0 + key_l;
+            if constexpr (Sparse) {
+                if (key >= split_start) {
+                    physical_page = physical_pages_s[(key >> kPagedKVPageShift) - first_page];
+                }
+            }
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             if (key >= split_start && key < split_end) {
@@ -411,8 +473,9 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         for (int nt = 0; nt < QKNt; ++nt) {
             const int col0 = nt * 8 + 2 * lid;
             const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = col1 + k0;
+            // A gathered pair shares its block: col0 is even and a block is four keys.
+            const int key0 = Sparse ? gathered_key(kb, col0) : k0 + col0;
+            const int key1 = Sparse ? (key0 < 0 ? -1 : key0 + 1) : col1 + k0;
             score[nt][0] = (row0 < row_count && key0 >= split_start && key0 < split_end &&
                             key0 <= qabs0 && gqa_within_window(qabs0, key0, sliding_window) && gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
                                ? score[nt][0] * scale

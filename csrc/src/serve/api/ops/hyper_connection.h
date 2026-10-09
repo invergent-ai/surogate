@@ -16,8 +16,8 @@ namespace sinfer::ops {
  * [s*hidden, (s+1)*hidden).
  *
  *   norm    FP32 [streams*hidden]           per-stream RMSNorm gamma, folded (1 + w)
- *   down    BF16_CTRL [low_rank, streams*hidden]
- *   up      BF16_CTRL [streams*hidden, low_rank]
+ *   down    BF16_CTRL or W8G32_F16S row-split [low_rank, streams*hidden]
+ *   up      BF16_CTRL or W8G32_F16S row-split [streams*hidden, low_rank]
  *   inject  BF16_CTRL [streams, streams*hidden]; n == 0 for a mixer without a combine step
  */
 struct HyperConnectionWeights {
@@ -59,9 +59,12 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int3
  *   inject[s,t] = 2 * sigmoid((inject_w[s,:] · n[:,t]) / streams) [streams, T] (FP32)
  *
  * `residual` is contiguous BF16 [streams*hidden, T]; `mixed` contiguous BF16 [hidden, T];
- * `inject` contiguous FP32 [streams, T] or nullptr when the weights carry no inject rows. The
- * two projections run through cuBLASLt (prewarm before stream capture). Workspace is
- * caller-owned transient storage; nothing persists between calls.
+ * `inject` contiguous FP32 [streams, T] or nullptr when the weights carry no inject rows. BF16
+ * projections run through cuBLASLt (prewarm before stream capture). W8 ones run on the mixer's
+ * own kernels for rounds of up to 64 tokens and, wider, are dequantised to BF16 in the workspace
+ * for the same cuBLASLt GEMM; either way the weights are the BF16 rounding of each dequantised
+ * value, as in every A16 W8 GEMM. Workspace is caller-owned transient storage; nothing persists
+ * between calls.
  */
 void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& weights,
                           std::int32_t streams, float eps, Tensor& mixed, Tensor* inject,

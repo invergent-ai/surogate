@@ -123,9 +123,11 @@ template <class V>
                                                .rotary_dim = 0,
                                                .rope_theta = 0.0F,
                                                .rms_eps    = 0.0F};
-        const std::size_t mask = round_up_256(
-            static_cast<std::size_t>(ops::qsa_block_mask_words(keys, g.indexer_block)) * columns *
-            sizeof(std::int32_t));
+        // The mask, and the per-tile block lists a one-sequence chunk carries beside it.
+        const std::size_t mask =
+            round_up_256(static_cast<std::size_t>(ops::qsa_block_mask_words(keys, g.indexer_block)) *
+                         columns * sizeof(std::int32_t)) +
+            ops::qsa_tile_union_bytes(static_cast<std::int32_t>(columns), keys, g.indexer_block);
         const std::size_t scores =
             ops::qsa_indexer_select_workspace_capacity_bytes(static_cast<std::int32_t>(columns),
                                                              keys, geometry);
@@ -219,6 +221,16 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
 }
 
+/// A speculative round's verify writes the PLE state after each of its columns, so a round
+/// that rejects some can commit the state its last accepted column left.
+std::optional<NgramPleStatePoolSpec> speculative_ple_spec(std::optional<NgramPleStatePoolSpec> spec,
+                                                          const SequencePlanImpl& plan) {
+    if (spec && plan.speculative_backend != SpeculativeBackend::None) {
+        spec->snapshot_width = static_cast<std::int32_t>(plan.draft_window + 1U);
+    }
+    return spec;
+}
+
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::int32_t linear_state_slots =
         LinearStateSlots::state_slot_count(plan.max_concurrency);
@@ -291,7 +303,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
                          },
-                     .ple = ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
+                     .ple = speculative_ple_spec(
+                         ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
+                         plan),
                  });
     LayoutBuilder checkpoint_builder;
     auto checkpoint_linear = out.decoder.linear_attention.spec;
@@ -300,7 +314,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         plan_linear_attention_state_pool(checkpoint_builder, checkpoint_linear);
     if (out.decoder.ple) {
         auto checkpoint_ple = out.decoder.ple->spec;
-        checkpoint_ple.slot_count = 1;
+        checkpoint_ple.slot_count     = 1;
+        checkpoint_ple.snapshot_width = 0;
         out.checkpoints.ple = plan_ngram_ple_state_pool(checkpoint_builder, checkpoint_ple);
     }
     if (plan.speculative_backend != SpeculativeBackend::None && geometry_gdn_layers(plan.geometry) > 0) {
@@ -455,10 +470,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
     // The reservation charges the planes' exact bytes, which grow linearly with the page
     // count as the capacity curve requires; the padded span the region reserves (each plane
-    // on a mapping quantum) is virtual and at most one granule wider.
+    // on a mapping quantum) is virtual and at most one granule wider. The region commits its
+    // cap in whole granules, though, up to one granule past the cap's pages, so that last
+    // granule is charged too: one granule less a page, a constant that keeps the curve affine.
     if (out.decoder.text_kv.pool.spec.elastic) {
         const std::size_t per_page = out.decoder.text_kv.payload_bytes() / physical_pages;
-        out.elastic_plane_bytes    = per_page * plan.main_page_groups;
+        const std::uint32_t granule = std::max(out.decoder.text_kv.pool.elastic_granule_pages, 1U);
+        out.elastic_plane_bytes =
+            per_page * (static_cast<std::size_t>(plan.main_page_groups) + granule - 1U);
     }
     return out;
 }
@@ -529,10 +548,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
         } else if constexpr (has_qsa_indexer_v<Variant>) {
-            const auto mask_bytes = round_up_256(static_cast<std::size_t>(
-                ops::qsa_block_mask_words(envelope.max_visible_keys, plan.geometry.indexer_block)) *
-                last * sizeof(std::int32_t));
-            // Selection retains its mask; projections and scores are released before GQA.
+            const auto mask_bytes =
+                round_up_256(static_cast<std::size_t>(ops::qsa_block_mask_words(
+                                 envelope.max_visible_keys, plan.geometry.indexer_block)) *
+                             last * sizeof(std::int32_t)) +
+                ops::qsa_tile_union_bytes(last, static_cast<std::int32_t>(envelope.max_visible_keys),
+                                          plan.geometry.indexer_block);
+            // Selection retains its mask and tile lists; projections and scores are released
+            // before GQA.
             (void)layout.alloc_bytes(mask_bytes);
             scratch(layout, variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)) - mask_bytes);
@@ -1258,8 +1281,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             options.max_context),
         .adaptive_dflash       = options.speculative.adaptive,
         .draft_window          = options.speculative.draft_tokens,
-        .speculative_max_lanes = options.speculative.max_lanes == 0 ? kDefaultSpeculationLanes
-                                                                    : options.speculative.max_lanes,
+        // A pipeline's stages keep one lane wherever they run, so they always agree.
+        .speculative_max_lanes = options.speculative.max_lanes != 0 ? options.speculative.max_lanes
+                                 : options.pipeline_stage_last != 0 ? kDefaultSpeculationLanes
+                                                                    : default_speculation_lanes(device.sm()),
         .speculative_backend   = options.speculative.backend,
         .kv_dtype              = kv_storage_dtype(kv_storage),
         .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,

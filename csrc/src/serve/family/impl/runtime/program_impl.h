@@ -1,5 +1,6 @@
 #include "family/impl/runtime/target_support.h"
 #include "core/device_footprint.h"
+#include "core/memory_trace.h"
 #include "core/sleep.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -478,6 +479,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
+    trace_memory_phase("program state bound");
     // Both cuBLASLt routes build their handle and workspace on first use, and capture cannot
     // cudaMalloc. Build them here, while nothing is capturing (#85).
     ops::detail::nvfp4_cublaslt_prewarm();
@@ -486,6 +488,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // state is a 32 MiB workspace, and allocating that inside the capture window charges it
     // to the graph allowance. qwen4exp already prewarms it for the same reason.
     ops::detail::bf16_cublaslt_prewarm();
+    trace_memory_phase("cuBLASLt prewarmed");
     // Adapters are bound by now (the target binds them with its frontend), so this is the
     // engine's answer for its whole life: which flavors its rounds take and, below, which
     // graphs it captures for them.
@@ -1103,6 +1106,17 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
                                  std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                                  device.stream);
+        }
+        // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
+        // included; its snapshots hold the state after each column, and the committed prefix's
+        // last one is what the next round must start from.
+        if (anything_to_fold && !decoder->ple.empty() && decoder->ple.spec.snapshot_width > 0) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (fold_rows[row].commit_columns > 0) {
+                    decoder->ple.commit_snapshot(fold_rows[row].linear_state_slot,
+                                                 fold_rows[row].commit_columns - 1, device.stream);
+                }
+            }
         }
 
         // The correction re-selects a column of the round's device frame, which only the
@@ -1956,6 +1970,7 @@ void ProgramImplCore::prepare_graphs() {
         };
         warm_ordinary();
         warm_base_rounds(warm_ordinary);
+        trace_memory_phase("decode warmed");
 
         // Warmup above has run every op once, so every weight that can adopt
         // Marlin residency already has. Close adoption HERE — before the first
@@ -2028,32 +2043,49 @@ void ProgramImplCore::prepare_graphs() {
         // The narrow round's family, when a width limit can reach it. Its ingress shape is
         // the round's own: nothing drafted, one valid column, rope positions at stride one.
         const bool narrow_reachable = speculative_max_lanes != kSpeculateAtAnyWidth;
+        // As for the ordinary family, a route that stages through the engine-slot scratch sizes
+        // it by the round's width and a capture may not grow it, so each warm-up runs the widest
+        // round before the one-lane round the captures start from. Warming one lane alone left a
+        // block-FP8 projection that runs as a GEMV at four columns (a 35B-A3B with three drafts,
+        // off Hopper) to first need its scratch at eight, inside the two-lane capture, and MTP
+        // refused to start above one sequence.
         const auto warm_wide = [&] {
-            prepare_representative(code_warm.min, 1);
-            device.synchronize();
-            schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                       mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                       nullptr);
-            device.synchronize();
+            const auto round = [&](std::uint32_t batch_size) {
+                prepare_representative(code_warm.min, batch_size);
+                device.synchronize();
+                schedule::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
+                                           draft_window,
+                                           mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                           nullptr);
+                device.synchronize();
+            };
+            if (batch_capacity > 1) { round(batch_capacity); }
+            round(1);
         };
         const auto warm_narrow = [&] {
-            prepare_representative(code_warm.min, 1);
-            for (std::uint32_t row = 0; row < batch_capacity; ++row) {
-                mtp_host_ingress->current_extents[row]      = 0;
-                mtp_host_ingress->target_valid_columns[row] = 1;
-                mtp_host_ingress->target_rope_positions[row] =
-                    checked_i32(code_warm.min, "graph representative narrow rope position");
-            }
-            device.synchronize();
-            schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                       mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                       nullptr, /*narrow=*/true);
-            device.synchronize();
+            const auto round = [&](std::uint32_t batch_size) {
+                prepare_representative(code_warm.min, batch_size);
+                for (std::uint32_t row = 0; row < batch_capacity; ++row) {
+                    mtp_host_ingress->current_extents[row]      = 0;
+                    mtp_host_ingress->target_valid_columns[row] = 1;
+                    mtp_host_ingress->target_rope_positions[row] =
+                        checked_i32(code_warm.min, "graph representative narrow rope position");
+                }
+                device.synchronize();
+                schedule::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
+                                           draft_window,
+                                           mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                           nullptr, /*narrow=*/true);
+                device.synchronize();
+            };
+            if (batch_capacity > 1) { round(batch_capacity); }
+            round(1);
         };
         warm_base_rounds([&] {
             warm_wide();
             if (narrow_reachable) { warm_narrow(); }
         });
+        trace_memory_phase("MTP decode warmed");
 
         for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
             const bool base_round = kRoundFlavors[flavor];
@@ -2248,6 +2280,7 @@ void ProgramImplCore::prepare_graphs() {
     const std::size_t excluded  = plane_bytes + kv_growth;
     const std::size_t consumed  = counted > excluded ? counted - excluded : 0;
     graph_observed_bytes = consumed;
+    trace_memory_phase("decode graphs captured");
     if (consumed > graph_allowance_bytes) {
         // Refuse only on a figure that is this engine's own. Unattributed, the
         // number counts every process on the card: a second engine loading its
@@ -2354,6 +2387,7 @@ void ProgramImplCore::prepare_graphs() {
             device.synchronize();
         };
         warm_prefill();
+        trace_memory_phase("prefill warmed");
         // The base flavor's prefill routes read planes of their own (the wide sparse-MoE
         // family, the fused projections). Derive them now as well: its buckets are captured
         // on first use, under a live request, and a capture may look a plane up but never
@@ -2375,6 +2409,7 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
         work.reset();
         prefill_graphs->finish_startup();
+        trace_memory_phase("prefill graphs captured");
     }
 
     for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }
