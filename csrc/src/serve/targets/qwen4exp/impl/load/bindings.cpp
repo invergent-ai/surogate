@@ -67,8 +67,18 @@ HyperConnectionPlan bind_hc(const family::TextGeometry& g, artifact::Binder& bin
                             bool with_inject) {
     HyperConnectionPlan plan;
     plan.norm = device(binder, prefix + "norm", NumericFormat::FP32, {g.residual});
-    plan.down = device(binder, prefix + "down", NumericFormat::BF16, {g.hc_low_rank, g.residual});
-    plan.up   = device(binder, prefix + "up", NumericFormat::BF16, {g.residual, g.hc_low_rank});
+    // The low-rank projections are BF16 in a GGUF-made artifact and W8 in one converted from
+    // the NVFP4 release; the mixer runs either.
+    const auto projection = [&](const std::string& name, std::uint64_t rows, std::uint64_t columns) {
+        artifact::LinearBinding binding =
+            linear(binder, name, static_cast<std::int32_t>(rows), static_cast<std::int32_t>(columns));
+        if (binding.format != NumericFormat::BF16 && binding.format != NumericFormat::W8G32_F16S) {
+            throw artifact::ArtifactError(name + " must be BF16 or W8G32_F16S");
+        }
+        return binding;
+    };
+    plan.down = projection(prefix + "down", g.hc_low_rank, g.residual);
+    plan.up   = projection(prefix + "up", g.residual, g.hc_low_rank);
     if (with_inject) {
         plan.inject = device(binder, prefix + "inject", NumericFormat::BF16, {g.hc_streams, g.residual});
     }
@@ -206,11 +216,9 @@ ops::HyperConnectionWeights load_hc(const family::TextGeometry& g, const artifac
     ops::HyperConnectionWeights out;
     out.norm = artifact::materialized_tensor(backing, plan.norm, NumericFormat::FP32,
                                              {static_cast<std::int32_t>(g.residual)});
-    out.down = artifact::materialized_weight(backing, plan.down, NumericFormat::BF16,
-                                             static_cast<std::int32_t>(g.hc_low_rank),
+    out.down = artifact::materialized_linear(backing, plan.down, static_cast<std::int32_t>(g.hc_low_rank),
                                              static_cast<std::int32_t>(g.residual));
-    out.up   = artifact::materialized_weight(backing, plan.up, NumericFormat::BF16,
-                                             static_cast<std::int32_t>(g.residual),
+    out.up   = artifact::materialized_linear(backing, plan.up, static_cast<std::int32_t>(g.residual),
                                              static_cast<std::int32_t>(g.hc_low_rank));
     if (with_inject) {
         out.inject = artifact::materialized_weight(backing, plan.inject, NumericFormat::BF16,

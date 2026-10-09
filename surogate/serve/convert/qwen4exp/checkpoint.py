@@ -3,8 +3,9 @@
 The release is a ModelOpt `MIXED_PRECISION` export: the routed experts are NVFP4 with a
 second-level scale per expert and projection, the n-gram table is FP8 with one scale, and
 everything else is BF16. The artifact keeps the experts' words and calibration as they are, for
-the TRT-LLM runner on the device; the dense projections become W8, as the GGUF path has them;
-and the table becomes IQ4_NL, the format the n-gram kernel reads, quantised on the GPU with
+the TRT-LLM runner on the device; the dense projections become W8, as the GGUF path has them,
+and so do the hyper-connection mixers' low-rank projections, which the GGUF path keeps BF16 (at
+BF16 they were a fifth of the bytes a decoded token reads); and the table becomes IQ4_NL, the format the n-gram kernel reads, quantised on the GPU with
 llama.cpp's search. Kept at FP8 the table alone is 51 GB, which a 121 GB DGX Spark cannot hold
 beside the 74 GB body.
 
@@ -169,6 +170,16 @@ def routed_nvfp4_specs(specs: Sequence, g: inv.Geometry) -> tuple:
                 continue
         out.append(spec)
     return tuple(out)
+
+
+_MIXER_PROJECTION = re.compile(r".*(?:hc_attn|hc_ffn|output_hc|head_hc)/(?:down|up)")
+
+
+def w8_mixer_specs(specs: Sequence) -> tuple:
+    """Every hyper-connection mixer's low-rank `down` and `up` stored W8 instead of BF16."""
+    return tuple(inv.tensor_spec(spec.name, spec.shape, inv.W8)
+                 if isinstance(spec, TensorSpec) and _MIXER_PROJECTION.fullmatch(spec.name) else spec
+                 for spec in specs)
 
 
 def is_routed_object(name: str) -> bool:
@@ -634,8 +645,8 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         if g.hidden % _NVFP4_BLOCK or g.intermediate % _NVFP4_BLOCK:
             raise ValueError("routed NVFP4 requires hidden and expert widths divisible by 16")
         tensor_specs, object_specs = inv.active_specs(geometry=g, vision=False, mtp=mtp)
-        tensor_specs = routed_nvfp4_specs(tensor_specs, g)
-        object_specs = routed_nvfp4_specs(object_specs, g)
+        tensor_specs = w8_mixer_specs(routed_nvfp4_specs(tensor_specs, g))
+        object_specs = w8_mixer_specs(routed_nvfp4_specs(object_specs, g))
 
         recipes = {item.object_name: item
                    for item in build_recipes(g) + (build_mtp_recipes(g) if mtp else ())}

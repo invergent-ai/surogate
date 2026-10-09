@@ -8,13 +8,19 @@
 // The mixer spreads a token over several blocks and sums the inject dot from per-stream shares,
 // so beside the pointwise comparison it is asked to be bit-reproducible, to give the same mixed
 // input whether or not the inject gates are requested, and to leave its inputs untouched.
+//
+// The low-rank projections may also be W8 row-split. Their oracle weights are then the BF16
+// rounding of each dequantised value, the matrix every A16 W8 GEMM multiplies; the cases cover
+// the narrow rounds the mixer's own W8 kernels serve and a wide one it hands to cuBLASLt.
 #include "api/ops/hyper_connection.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -66,7 +72,38 @@ struct Case {
     int tokens;
     std::uint32_t seed;
     const char* label;
+    bool w8 = false;
 };
+
+// A projection's device weight in the case's format, and the matrix the oracle multiplies.
+struct Projection {
+    std::vector<float> oracle;
+    std::vector<std::uint8_t> bytes;
+    quantized_weight::PackedWeight packed;
+    bool w8 = false;
+};
+
+Projection make_projection(const std::vector<float>& source, int n, int k, bool w8) {
+    Projection out;
+    out.w8 = w8;
+    if (!w8) {
+        out.oracle = source;
+        const auto bits = encode_bf16(source);
+        out.bytes.resize(bits.size() * sizeof(std::uint16_t));
+        std::memcpy(out.bytes.data(), bits.data(), out.bytes.size());
+        return out;
+    }
+    out.packed = quantized_weight::pack_w8g32_row_split(source, n, k);
+    out.bytes  = out.packed.payload;
+    out.oracle = out.packed.dequant;
+    round_to_bf16(out.oracle);
+    return out;
+}
+
+Weight device_projection(const Projection& projection, GuardedDeviceBuffer& buffer, int n, int k) {
+    return projection.w8 ? projection.packed.device_weight(buffer.data())
+                         : bf16_weight(buffer.data(), buffer.bytes(), n, k);
+}
 
 int run_case(const Case& item) {
     const int streams = item.streams, hidden = item.hidden, rank = item.low_rank;
@@ -86,6 +123,10 @@ int run_case(const Case& item) {
     round_to_bf16(down);
     round_to_bf16(up);
     round_to_bf16(inject_w);
+    const Projection down_weight = make_projection(down, rank, width, item.w8);
+    const Projection up_weight   = make_projection(up, width, rank, item.w8);
+    down = down_weight.oracle;
+    up   = up_weight.oracle;
 
     std::vector<double> expected_mixed(static_cast<std::size_t>(hidden) * tokens);
     std::vector<double> expected_inject(static_cast<std::size_t>(streams) * tokens);
@@ -126,25 +167,24 @@ int run_case(const Case& item) {
         }
     }
 
-    const auto residual_bits = encode_bf16(residual), down_bits = encode_bf16(down),
-               up_bits = encode_bf16(up), inject_bits = encode_bf16(inject_w);
+    const auto residual_bits = encode_bf16(residual), inject_bits = encode_bf16(inject_w);
     GuardedDeviceBuffer device_residual(residual_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_gamma(gamma.size() * sizeof(float));
-    GuardedDeviceBuffer device_down(down_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_up(up_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_down(down_weight.bytes.size());
+    GuardedDeviceBuffer device_up(up_weight.bytes.size());
     GuardedDeviceBuffer device_inject_w(inject_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_mixed(expected_mixed.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_inject(expected_inject.size() * sizeof(float));
     device_residual.copy_from_host(residual_bits.data(), device_residual.bytes());
     device_gamma.copy_from_host(gamma.data(), device_gamma.bytes());
-    device_down.copy_from_host(down_bits.data(), device_down.bytes());
-    device_up.copy_from_host(up_bits.data(), device_up.bytes());
+    device_down.copy_from_host(down_weight.bytes.data(), device_down.bytes());
+    device_up.copy_from_host(up_weight.bytes.data(), device_up.bytes());
     device_inject_w.copy_from_host(inject_bits.data(), device_inject_w.bytes());
 
     ops::HyperConnectionWeights weights{
         Tensor(device_gamma.data(), DType::FP32, {width}),
-        bf16_weight(device_down.data(), device_down.bytes(), rank, width),
-        bf16_weight(device_up.data(), device_up.bytes(), width, rank),
+        device_projection(down_weight, device_down, rank, width),
+        device_projection(up_weight, device_up, width, rank),
         bf16_weight(device_inject_w.data(), device_inject_w.bytes(), streams, width)};
     Tensor residual_tensor(device_residual.data(), DType::BF16, {width, tokens});
     Tensor mixed(device_mixed.data(), DType::BF16, {hidden, tokens});
@@ -193,6 +233,8 @@ int run_case(const Case& item) {
     failures += verify_exact((label + " residual unchanged").c_str(),
                              from_device<std::uint16_t>(device_residual.data(), residual_bits.size()),
                              residual_bits);
+    failures += device_down.verify_guards("hc down");
+    failures += device_up.verify_guards("hc up");
     failures += device_residual.verify_guards("hc residual");
     failures += device_mixed.verify_guards("hc mixed");
     failures += device_inject.verify_guards("hc inject");
@@ -213,6 +255,15 @@ int main() {
         {3, 768, 32, 3, 43u, "hc three streams"},
         {8, 512, 64, 2, 47u, "hc maximum streams"},
         {1, 256, 8, 4, 53u, "hc one stream"},
+        // W8 projections: decode, a speculative verify round, a ragged multi-tile round on the
+        // mixer's kernels, and a prefill-width round past them.
+        {4, 2560, 320, 1, 59u, "hc W8 decode, 4 streams x 2560", true},
+        {4, 2560, 320, 4, 61u, "hc W8 verify 4 tokens", true},
+        {4, 2560, 320, 37, 67u, "hc W8 37 tokens", true},
+        {4, 2560, 320, 100, 71u, "hc W8 prefill 100 tokens", true},
+        {2, 1032, 64, 5, 73u, "hc W8 two streams, ragged hidden", true},
+        {8, 512, 64, 2, 79u, "hc W8 maximum streams", true},
+        {1, 256, 8, 3, 83u, "hc W8 one stream, low rank 8", true},
     };
     for (const Case& item : cases) { failures += run_case(item); }
     if (failures != 0) {

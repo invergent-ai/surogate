@@ -130,6 +130,8 @@ def test_release_converts_nextn_head(tmp_path):
                                                 _fp8_expert(stored, expert, "up_proj")]))
         down = _w8(artifact, "mtp/layer/mlp/routed_down")
         assert _close(down[expert * g.hidden:(expert + 1) * g.hidden], _fp8_expert(stored, expert, "down_proj"))
+        assert artifact.find("mtp/head_hc/down").format == inv.W8
+        assert artifact.find("mtp/layer/hc_ffn/up").format == inv.W8
         # The trunk keeps its NVFP4 experts beside the W8 draft ones.
         assert artifact.find("text/layers/0/mlp/routed_gate_up").format == checkpoint.NVFP4
 
@@ -173,6 +175,16 @@ def test_release_converts(tmp_path):
                            (stored[attn + "indexer.k_layernorm.weight"].float() + 1).bfloat16().float())
         qk = stored[attn + "indexer.index_qk_proj.weight"]
         assert torch.equal(direct(prefix + "indexer/key"), qk[g.indexer_heads * g.indexer_head_dim:])
+
+        # The mixers' low-rank projections are W8 too, trunk and output mixer alike.
+        for name, source in (("text/layers/0/hc_attn/down", layer + "attn_hyper_connection.input_mix_weight_down.weight"),
+                             ("text/layers/0/hc_ffn/up", layer + "mlp_hyper_connection.input_mix_weight_up.weight"),
+                             ("text/output_hc/up", None)):
+            obj = artifact.find(name)
+            assert obj.format == inv.W8
+            if source is not None:
+                assert _close(_w8(artifact, name), stored[source].float())
+        assert artifact.find("text/layers/0/hc_attn/inject").format == inv.BF16
 
         # Dense projections are W8 within a W8 step of the release.
         obj = artifact.find("text/layers/0/gdn/query_key_value_z")

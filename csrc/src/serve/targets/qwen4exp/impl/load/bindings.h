@@ -44,8 +44,8 @@ using family::host_w8_weight;
 
 struct HyperConnectionPlan {
     artifact::ObjectHandle norm;
-    artifact::ObjectHandle down;
-    artifact::ObjectHandle up;
+    artifact::LinearBinding down; ///< BF16 or W8 row-split, as the artifact stores it
+    artifact::LinearBinding up;
     artifact::ObjectHandle inject; ///< unset for the output mixer
 };
 
