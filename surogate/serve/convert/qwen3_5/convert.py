@@ -625,7 +625,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--no-mtp", action="store_true",
                         help="source checkpoint has no MTP (nextn) block; "
                              "emit the artifact variant without mtp/* objects")
-    parser.add_argument("--mtp-format", choices=("bf16", "w8", "q6", "q5", "q4"), default="bf16",
+    parser.add_argument("--mtp-format", choices=("bf16", "w8"), default="bf16",
                         help="nvfp4-all/nvfp4-uniform exports of a checkpoint whose MTP block is "
                              "unquantized: store its matrices in this format (the norms stay BF16). "
                              "The block runs several times a decode round, so its bytes count "

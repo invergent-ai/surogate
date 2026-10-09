@@ -197,7 +197,10 @@ def _split_gdn(entry):
 
 
 #: Formats the converter may quantize an unquantized MTP block's matrices to (--mtp-format).
-MTP_FORMATS = {"bf16": inv.BF16, "w8": inv.W8, "q6": inv.Q6, "q5": inv.Q5, "q4": inv.Q4}
+#: W8 only: the runtime's W8 linear serves any shape, while its Q6/Q5/Q4 linears pick kernels
+#: from tables of the shapes those formats ship at (output heads, vision), and an MTP block's
+#: matrices are not among them, so such an artifact would fail at startup.
+MTP_FORMATS = {"bf16": inv.BF16, "w8": inv.W8}
 
 
 def build(geometry, profile, sources, *, mtp_format=inv.BF16):
