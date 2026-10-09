@@ -106,17 +106,28 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         for (std::size_t plane = 0; backend_pool && plane < backend_pool->plane_count(); ++plane) {
             payload += family::detail::archive_aligned(backend_pool->image_plane_bytes(plane, backend_ids.size()));
         }
+        auto step_started = std::chrono::steady_clock::now();
         if (!archived_prefixes.reserve(bytes)) { return; }
+        admit_trace_step("archive: make room", sequence.lane, step_started);
 
         // Evicting above may have returned the range this image fits in.
+        step_started = std::chrono::steady_clock::now();
         if (!archive_arena && !archive_arena_refused) {
             archive_arena = family::detail::PinnedArchiveArena::create(kArchivedPrefixBytes + (16ULL << 20));
             archive_arena_refused = !archive_arena;
         }
+        admit_trace_step("archive: create page-locked arena", sequence.lane, step_started);
+        step_started = std::chrono::steady_clock::now();
         std::optional<family::detail::ArchiveBlock> pinned;
         if (archive_arena) { pinned = archive_arena->allocate(payload); }
         auto image = std::make_shared<ArchivedSequence>();
         image->storage = pinned ? std::move(*pinned) : family::detail::heap_archive_block(payload);
+        if (admit_trace_enabled() && !image->storage.pinned) {
+            std::fprintf(stderr, "admit-trace: lane %u archive of %zu bytes goes to the heap\n",
+                         sequence.lane, payload);
+        }
+        admit_trace_step("archive: allocate image", sequence.lane, step_started);
+        step_started = std::chrono::steady_clock::now();
         image->state.copy_metadata(sequence);
         if (!checkpoint) { image->state.rewrite_checkpoint = {}; }
         std::byte* cursor = image->storage.data;
@@ -152,7 +163,10 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         // round overwrites the state, and before any restore reads them. A heap image has been
         // copied by now; the fence makes sure of it before the block can be freed.
         if (!image->storage.pinned) { CUDA_CHECK(cudaStreamSynchronize(device.stream)); }
+        admit_trace_step("archive: copy image", sequence.lane, step_started);
+        step_started = std::chrono::steady_clock::now();
         (void)archived_prefixes.insert(image->state.ledger, boundaries, image, bytes);
+        admit_trace_step("archive: index image", sequence.lane, step_started);
     } catch (const std::bad_alloc&) {
         // Retention is opportunistic. An unavailable host allocation must not
         // take down a healthy engine; the next request can prefill normally.

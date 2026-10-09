@@ -1127,6 +1127,18 @@ private:
         request->lane_plan_versions[lane] = version;
     }
 
+    /// SUROGATE_SERVE_ADMIT_TRACE=1: one line for each admission step that takes 5 ms or more.
+    static void admit_trace_step(const char* step, std::uint64_t request_id,
+                                 Clock::time_point since) {
+        static const bool enabled = std::getenv("SUROGATE_SERVE_ADMIT_TRACE") != nullptr;
+        if (!enabled) { return; }
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - since).count();
+        if (ms >= 5.0) {
+            std::fprintf(stderr, "admit-trace: request %llu %s %.1f ms\n",
+                         static_cast<unsigned long long>(request_id), step, ms);
+        }
+    }
+
     /// Among free lanes that reuse equally much of a request, the one whose loss costs least:
     /// a lane holding no retained prefix first, then the retained prefix released longest
     /// ago. Picking the lowest index instead handed a new conversation the lane another
@@ -1212,6 +1224,7 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
+            const auto evict_started = Clock::now();
             bool evicted = false;
             // Oldest-released retained prefixes go first.
             std::vector<std::uint32_t> eviction_order(max_concurrency_);
@@ -1232,6 +1245,7 @@ private:
                     evicted = true;
                 }
             }
+            admit_trace_step("evict retained lanes", request->id, evict_started);
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 // `can_admit_lane_after_retained_eviction` chose this lane by summing every
                 // `sequences[other].retained && sequences[other].kv`, with no test on the
@@ -1308,9 +1322,11 @@ private:
             }
             publish_runtime_stats();
             target_started                = true;
+            const auto start_started      = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 /*defer_first_chunk=*/true);
+            admit_trace_step("start prefill", request->id, start_started);
             if (!first.complete && !prefill_lanes_.contains(lane)) {
                 // A fully cached prompt can still defer its first-token step (DFlash
                 // pipeline stages do this to preserve execution order). Register it
@@ -1320,7 +1336,9 @@ private:
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             const bool ran = first.processed_prompt_tokens != 0 || first.complete;
             if (ran || cancel_at_boundary) {
+                const auto resolve_started = Clock::now();
                 resolve_prefill_step(request, first, cancel_at_boundary);
+                admit_trace_step("resolve prefill step", request->id, resolve_started);
             }
             // New candidate readouts can be staged together in a DFlash engine.
             // Keep GPU-prefix admissions on their old route: changing their batch
@@ -1398,7 +1416,9 @@ private:
             }
 
             try {
+                const auto plan_started = Clock::now();
                 ensure_base_plan(head);
+                admit_trace_step("base plan", head->id, plan_started);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1416,7 +1436,9 @@ private:
 
             std::optional<LaneChoice> head_lane;
             try {
+                const auto find_started = Clock::now();
                 head_lane = find_admission_lane(head);
+                admit_trace_step("find lane", head->id, find_started);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1602,6 +1624,7 @@ private:
             const auto t_admit = Clock::now();
             top_up_prefill_lanes();
             seg_timer_.admit += std::chrono::duration<double>(Clock::now() - t_admit).count();
+            admit_trace_step("top-up admission pass (all steps)", 0, t_admit);
         }
         // The round's width, for a draft head deciding whether a verify pays: every lane that
         // is decode-ready, whichever group it rides in.
@@ -2416,6 +2439,7 @@ private:
                     }
                     seg_timer_.admit +=
                         std::chrono::duration<double>(Clock::now() - t_admit).count();
+                    admit_trace_step("admission pass (all steps)", 0, t_admit);
                     if (progress == AdmissionProgress::RanGpuUnit) {
                         previous_unit_was_decode = false;
                         continue;

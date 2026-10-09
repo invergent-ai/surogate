@@ -37,6 +37,19 @@ inline bool round_trace_enabled() {
     static const bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
     return enabled;
 }
+/// SUROGATE_SERVE_ADMIT_TRACE=1: where a slow admission spends its time (archive, restore,
+/// eviction), one line per step that takes 5 ms or more.
+inline bool admit_trace_enabled() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_ADMIT_TRACE") != nullptr;
+    return enabled;
+}
+inline void admit_trace_step(const char* step, std::uint32_t lane,
+                             std::chrono::steady_clock::time_point since) {
+    if (!admit_trace_enabled()) { return; }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
+    if (ms >= 5.0) { std::fprintf(stderr, "admit-trace: lane %u %s %.1f ms\n", lane, step, ms); }
+}
 /// Whether a decision's first token projects only its candidates' head rows (sample_from_hidden).
 /// SUROGATE_SERVE_CANDIDATE_HEAD=0 projects the whole head and samples, as before, for comparison;
 /// the candidate logits are the same bits either way.
@@ -680,11 +693,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request_plan.reuse == ReusePath::FullReset ||
         request_plan.reuse_base < sequence.execution_frontier ||
         is_rewrite_checkpoint_restore(request_plan.reuse)) {
+        const auto archive_started = std::chrono::steady_clock::now();
         archive_sequence(sequence);
+        admit_trace_step("archive previous", lane, archive_started);
     }
+    const auto restore_started = std::chrono::steady_clock::now();
     if (request_plan.device_prefix) { restore_gpu_prefix(sequence, request_plan); }
     else if (request_plan.shared_prefix) { restore_shared_prefix(sequence, request_plan); }
     else if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
+    admit_trace_step("restore prefix", lane, restore_started);
     sequence.target_only = request_plan.target_only;
     request.target_only = request_plan.target_only;
     request.gpu_prefix = request_plan.gpu_prefix;
@@ -1329,11 +1346,15 @@ void ProgramImplCore::evict_archived_prefixes() noexcept {
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
+    const auto started = std::chrono::steady_clock::now();
     archived_prefixes.clear();
     // Retained lanes go only when the pool is short; so do the shared prefixes' pages.
     drop_shared_prefixes();
+    admit_trace_step("evict: drop archived and shared prefixes", lane, started);
     if (!has_retained_lane(lane)) { return; }
+    const auto cleared = std::chrono::steady_clock::now();
     clear_lane(sequences[lane], requests[lane]);
+    admit_trace_step("evict: clear retained lane", lane, cleared);
 }
 
 TokenScoreDelta ProgramImplCore::logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
