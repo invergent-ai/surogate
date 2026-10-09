@@ -111,6 +111,15 @@ inline constexpr std::uint32_t kSpeculateAtAnyWidth = 0xFFFFFFFFu;
 /// then: the round where the head pays, and the only width at which two verifying flights can
 /// never be in flight together on a pipeline.
 inline constexpr std::uint32_t kDefaultSpeculationLanes = 1;
+/// The default for a GPU of compute capability `sm`. On a DGX Spark (GB10, sm_121) decode is
+/// bound by its 222 GiB/s of shared memory well past sixteen lanes, so a verify column costs
+/// little and the head pays at every width. Measured there on real text (distinct passages,
+/// 52-54% of drafts accepted, 2.6 tokens a round; 2026-10-09), against no MTP: the 35B-A3B
+/// gained 27% at eight lanes and 18% at sixteen verifying at any width, and lost 2% and 12%
+/// with one lane; Qwen3.8-Flash-Next gained 57% and 19%.
+[[nodiscard]] constexpr std::uint32_t default_speculation_lanes(int sm) noexcept {
+    return sm == 121 ? kSpeculateAtAnyWidth : kDefaultSpeculationLanes;
+}
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
@@ -119,7 +128,7 @@ struct SpeculativeOptions {
     /// Widest round (decode lanes in flight) that still verifies drafts; wider rounds run the
     /// head's narrow round -- one column per lane through the trunk, the head aligned and
     /// proposing as usual -- so a draft head never costs a throughput-bound batch. 0 takes
-    /// `kDefaultSpeculationLanes`; `kSpeculateAtAnyWidth` verifies always.
+    /// `default_speculation_lanes()`; `kSpeculateAtAnyWidth` verifies always.
     std::uint32_t max_lanes = 0;
     /// Learn DFlash draft length from measured throughput; draft_tokens is the ceiling.
     bool adaptive = false;

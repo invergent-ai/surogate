@@ -1281,8 +1281,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             options.max_context),
         .adaptive_dflash       = options.speculative.adaptive,
         .draft_window          = options.speculative.draft_tokens,
-        .speculative_max_lanes = options.speculative.max_lanes == 0 ? kDefaultSpeculationLanes
-                                                                    : options.speculative.max_lanes,
+        // A pipeline's stages keep one lane wherever they run, so they always agree.
+        .speculative_max_lanes = options.speculative.max_lanes != 0 ? options.speculative.max_lanes
+                                 : options.pipeline_stage_last != 0 ? kDefaultSpeculationLanes
+                                                                    : default_speculation_lanes(device.sm()),
         .speculative_backend   = options.speculative.backend,
         .kv_dtype              = kv_storage_dtype(kv_storage),
         .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,
