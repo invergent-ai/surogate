@@ -196,8 +196,16 @@ def _split_gdn(entry):
     ) for role, part in zip(("query_key_value", "z"), entry.parts))
 
 
-def build(geometry, profile, sources):
-    """Build an artifact plan from config dimensions and actual per-object source formats."""
+#: Formats the converter may quantize an unquantized MTP block's matrices to (--mtp-format).
+MTP_FORMATS = {"bf16": inv.BF16, "w8": inv.W8, "q6": inv.Q6, "q5": inv.Q5, "q4": inv.Q4}
+
+
+def build(geometry, profile, sources, *, mtp_format=inv.BF16):
+    """Build an artifact plan from config dimensions and actual per-object source formats.
+
+    ``mtp_format`` quantizes the MTP block's BF16 matrices (its norms stay BF16): the block runs
+    once to align and once per further draft every round, so on a bandwidth-bound decode its
+    weights are read several times a round."""
     g = geometry
     policy = inv.export_for(profile, g)
     template = inv.build_tensor_specs(g, mtp=bool(g.mtp_layers), vision=bool(inv.vision_tower(g)))
@@ -253,7 +261,7 @@ def build(geometry, profile, sources):
                             f"{name}: this export supports unquantized {component} matrices; "
                             f"found {sorted(source_formats)}. Use --no-{component} to omit this component."
                         )
-                    numeric_format = inv.BF16
+                    numeric_format = mtp_format if name.startswith("mtp/") else inv.BF16
                 spec_out = inv.tensor_spec(name, spec.shape, numeric_format)
             tensors.append(spec_out)
             if spec_out.format == inv.NVFP4:
@@ -412,7 +420,7 @@ def _frontend(root, resources_from, stack):
 
 
 def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="cuda", resources_from=None,
-            mtp=True, vision=True):
+            mtp=True, vision=True, mtp_format=inv.BF16):
     from surogate.serve.convert.common.quantize import pick_device
     from ..convert import _tools_root
     started = time.perf_counter()
@@ -434,7 +442,7 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
         scope = conversion.honour_declared_scope(primary_config, g, primary, what=conversion.checkpoint_label(primary))
         if scope:
             print(scope, flush=True)
-        plan = build(g, profile, sources)
+        plan = build(g, profile, sources, mtp_format=mtp_format)
         object_plan = conversion.build_object_plan(plan.objects, {r.name: r.data for r in resources})
         draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, frontend_root, geometry=g)
         derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_head.materialize_draft_head_token_ids(draft)}
@@ -465,7 +473,7 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
             target_key=inv.TARGET_KEY, recipe_id="qwen3_5-checkpoint-quantized-v3", repo_root=_tools_root(),
             model_dir=primary, out_path=output,
             arguments={"model": str(root), "quantized_model": str(primary), "device": device,
-                       "mtp": mtp, "vision": vision},
+                       "mtp": mtp, "vision": vision, "mtp_format": mtp_format},
             config_summary=checkpoint.geometry_block(g), source_preflight=plan.source_preflight,
             objects=object_plan.objects, elapsed_seconds=time.perf_counter() - started,
             final_bytes=output.stat().st_size, device=resolved_device, ranking_path=draft.ranking,
@@ -484,9 +492,12 @@ def main(argv=None, *, profile=None):
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-mtp", action="store_true")
+    parser.add_argument("--mtp-format", choices=sorted(MTP_FORMATS), default="bf16",
+                        help="store an unquantized MTP block's matrices in this format")
     parser.add_argument("--no-vision", action="store_true")
     args = parser.parse_args(argv)
     source = args.quantized_model or args.model
     profile = profile or profile_for_checkpoint(conversion.load_json(source / "config.json"))
     return convert(args.model, args.out, profile=profile, quantized_model_dir=args.quantized_model,
-                   device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
+                   device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
+                   mtp_format=MTP_FORMATS[args.mtp_format])
