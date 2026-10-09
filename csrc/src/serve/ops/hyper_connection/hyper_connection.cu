@@ -32,15 +32,21 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 }
 
 // One block per (token, stream): n = x * rsqrt(mean(x^2) + eps) * gamma, stored BF16 for the
-// projections.
+// projections. A mixer also keeps the stream's inverse RMS for `finish_kernel` (`inv`, FP32
+// [T, streams]) and, when it combines, this stream's share of each inject row's dot with n in
+// FP32 (`inject_partial`, [T, streams (this one), streams (the row)]).
+template <bool kInject>
 __global__ void stream_norm_kernel(const __nv_bfloat16* __restrict__ residual,
-                                   const float* __restrict__ gamma, int hidden, int streams,
-                                   float eps, __nv_bfloat16* __restrict__ normalized) {
+                                   const float* __restrict__ gamma,
+                                   const __nv_bfloat16* __restrict__ inject_weight, int hidden,
+                                   int streams, float eps, __nv_bfloat16* __restrict__ normalized,
+                                   float* __restrict__ inv_out, float* __restrict__ inject_partial) {
     __shared__ float scratch[kThreads / 32];
     const int token  = static_cast<int>(blockIdx.x) / streams;
     const int stream = static_cast<int>(blockIdx.x) - token * streams;
+    const int width  = hidden * streams;
     const std::int64_t base =
-        static_cast<std::int64_t>(token) * hidden * streams + static_cast<std::int64_t>(stream) * hidden;
+        static_cast<std::int64_t>(token) * width + static_cast<std::int64_t>(stream) * hidden;
     const __nv_bfloat16* x = residual + base;
     float sum_sq           = 0.0F;
     for (int d = static_cast<int>(threadIdx.x); d < hidden; d += kThreads) {
@@ -49,9 +55,29 @@ __global__ void stream_norm_kernel(const __nv_bfloat16* __restrict__ residual,
     }
     const float total = block_sum(sum_sq, scratch);
     const float inv   = rsqrtf(total / static_cast<float>(hidden) + eps);
+    if (inv_out != nullptr && threadIdx.x == 0) { inv_out[blockIdx.x] = inv; }
+    float dots[kMaxStreams] = {};
     for (int d = static_cast<int>(threadIdx.x); d < hidden; d += kThreads) {
         const float v = __bfloat162float(x[d]) * inv * gamma[stream * hidden + d];
         normalized[base + d] = __float2bfloat16_rn(v);
+        if constexpr (kInject) {
+            const __nv_bfloat16* column = inject_weight + static_cast<std::int64_t>(stream) * hidden + d;
+#pragma unroll
+            for (int r = 0; r < kMaxStreams; ++r) {
+                if (r < streams) { dots[r] = fmaf(__bfloat162float(column[static_cast<std::int64_t>(r) * width]), v, dots[r]); }
+            }
+        }
+    }
+    if constexpr (kInject) {
+#pragma unroll
+        for (int r = 0; r < kMaxStreams; ++r) {
+            if (r < streams) {
+                const float share = block_sum(dots[r], scratch);
+                if (threadIdx.x == 0) {
+                    inject_partial[static_cast<std::int64_t>(blockIdx.x) * streams + r] = share;
+                }
+            }
+        }
     }
 }
 
@@ -63,59 +89,39 @@ __global__ void silu_scale_kernel(__nv_bfloat16* __restrict__ values, std::int64
     values[i] = __float2bfloat16_rn(silu(__bfloat162float(values[i]) * scale));
 }
 
-// One block per token: the stream mean of gate * n (n recomputed in FP32 from the residual so
-// the mixed input does not inherit the BF16 rounding of the projection operand) and the
-// inject gates.
+// Grid (token, hidden slice), one thread per hidden index: the stream mean of gate * n, with n
+// recomputed in FP32 from the residual and the norm's inverse RMS so the mixed input does not
+// inherit the BF16 rounding of the projection operand. The first slice of each token also sums
+// the norm's per-stream shares into the inject gates. Spreading a token over its hidden slices
+// matters at decode, where one block per token left all but one SM idle.
 __global__ void finish_kernel(const __nv_bfloat16* __restrict__ residual,
                               const float* __restrict__ gamma,
                               const __nv_bfloat16* __restrict__ gate_logits,
-                              const __nv_bfloat16* __restrict__ inject_weight, int hidden,
-                              int streams, float eps, __nv_bfloat16* __restrict__ mixed,
+                              const float* __restrict__ inv, const float* __restrict__ inject_partial,
+                              int hidden, int streams, __nv_bfloat16* __restrict__ mixed,
                               float* __restrict__ inject) {
-    __shared__ float scratch[kThreads / 32];
-    __shared__ float inv[kMaxStreams];
     const int token         = static_cast<int>(blockIdx.x);
+    const int d             = static_cast<int>(blockIdx.y) * kThreads + static_cast<int>(threadIdx.x);
     const int width         = hidden * streams;
     const std::int64_t base = static_cast<std::int64_t>(token) * width;
-    const __nv_bfloat16* x  = residual + base;
-
-    for (int s = 0; s < streams; ++s) {
-        float sum_sq = 0.0F;
-        for (int d = static_cast<int>(threadIdx.x); d < hidden; d += kThreads) {
-            const float v = __bfloat162float(x[s * hidden + d]);
-            sum_sq        = fmaf(v, v, sum_sq);
-        }
-        const float total = block_sum(sum_sq, scratch);
-        if (threadIdx.x == 0) { inv[s] = rsqrtf(total / static_cast<float>(hidden) + eps); }
-    }
-    __syncthreads();
-
-    const float mean_scale = 1.0F / static_cast<float>(streams);
-    for (int d = static_cast<int>(threadIdx.x); d < hidden; d += kThreads) {
+    const float* token_inv  = inv + static_cast<std::int64_t>(token) * streams;
+    const float mean_scale  = 1.0F / static_cast<float>(streams);
+    if (d < hidden) {
         float acc = 0.0F;
         for (int s = 0; s < streams; ++s) {
-            const int i   = s * hidden + d;
-            const float n = __bfloat162float(x[i]) * inv[s] * gamma[i];
-            acc           = fmaf(sigmoid(__bfloat162float(gate_logits[base + i])), n, acc);
+            const std::int64_t i = base + static_cast<std::int64_t>(s) * hidden + d;
+            const float n        = __bfloat162float(residual[i]) * token_inv[s] * gamma[s * hidden + d];
+            acc                  = fmaf(sigmoid(__bfloat162float(gate_logits[i])), n, acc);
         }
         mixed[static_cast<std::int64_t>(token) * hidden + d] = __float2bfloat16_rn(acc * mean_scale);
     }
-
-    if (inject == nullptr) { return; }
+    if (inject == nullptr || blockIdx.y != 0 || static_cast<int>(threadIdx.x) >= streams) { return; }
+    const int row = static_cast<int>(threadIdx.x);
+    float total   = 0.0F;
     for (int s = 0; s < streams; ++s) {
-        const __nv_bfloat16* row = inject_weight + static_cast<std::int64_t>(s) * width;
-        float dot                = 0.0F;
-        for (int i = static_cast<int>(threadIdx.x); i < width; i += kThreads) {
-            const int stream_of_i = i / hidden;
-            const float n = __bfloat162float(x[i]) * inv[stream_of_i] * gamma[i];
-            dot           = fmaf(__bfloat162float(row[i]), n, dot);
-        }
-        const float total = block_sum(dot, scratch);
-        if (threadIdx.x == 0) {
-            inject[static_cast<std::int64_t>(token) * streams + s] =
-                2.0F * sigmoid(total * mean_scale);
-        }
+        total += inject_partial[(static_cast<std::int64_t>(token) * streams + s) * streams + row];
     }
+    inject[static_cast<std::int64_t>(token) * streams + row] = 2.0F * sigmoid(total * mean_scale);
 }
 
 __global__ void combine_kernel(const float* __restrict__ extra,
@@ -190,10 +196,12 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(std::int32_t streams,
     }
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
     const std::size_t tokens = static_cast<std::size_t>(max_tokens);
-    // normalized [width,T], low-rank [low_rank,T], gate logits [width,T]; 256-byte rounded.
+    // normalized [width,T], low-rank [low_rank,T], gate logits [width,T], the inverse RMS
+    // [streams,T] and the inject shares [streams,streams,T]; 256-byte rounded.
     const auto round = [](std::size_t bytes) { return (bytes + 255) / 256 * 256; };
+    const std::size_t per_stream = static_cast<std::size_t>(streams) * tokens * sizeof(float);
     return round(width * tokens * 2) + round(static_cast<std::size_t>(low_rank) * tokens * 2) +
-           round(width * tokens * 2) + 3 * 256;
+           round(width * tokens * 2) + round(per_stream) + round(per_stream * streams) + 5 * 256;
 }
 
 void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int32_t streams,
@@ -210,9 +218,11 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int3
         norm.data == nullptr) {
         throw std::invalid_argument("hyper_connection: norm must be FP32 [streams*hidden]");
     }
-    stream_norm_kernel<<<static_cast<unsigned>(tokens) * streams, kThreads, 0, stream>>>(
+    if (streams > kMaxStreams) { throw std::invalid_argument("hyper_connection: too many streams"); }
+    stream_norm_kernel<false><<<static_cast<unsigned>(tokens) * streams, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(norm.data),
-        width / streams, streams, eps, static_cast<__nv_bfloat16*>(normalized.data));
+        nullptr, width / streams, streams, eps, static_cast<__nv_bfloat16*>(normalized.data),
+        nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -249,11 +259,22 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
     Tensor normalized = workspace.alloc(DType::BF16, {width, tokens});
     Tensor low        = workspace.alloc(DType::BF16, {low_rank, tokens});
     Tensor gate       = workspace.alloc(DType::BF16, {width, tokens});
+    Tensor inv        = workspace.alloc(DType::FP32, {streams, tokens});
+    Tensor shares     = workspace.alloc(DType::FP32, {streams * streams, tokens});
 
-    stream_norm_kernel<<<static_cast<unsigned>(tokens) * streams, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(residual.data),
-        static_cast<const float*>(weights.norm.data), hidden, streams, eps,
-        static_cast<__nv_bfloat16*>(normalized.data));
+    const unsigned norm_blocks = static_cast<unsigned>(tokens) * streams;
+    const auto* residual_data  = static_cast<const __nv_bfloat16*>(residual.data);
+    const auto* gamma          = static_cast<const float*>(weights.norm.data);
+    if (inject != nullptr) {
+        stream_norm_kernel<true><<<norm_blocks, kThreads, 0, stream>>>(
+            residual_data, gamma, static_cast<const __nv_bfloat16*>(weights.inject.qdata), hidden,
+            streams, eps, static_cast<__nv_bfloat16*>(normalized.data),
+            static_cast<float*>(inv.data), static_cast<float*>(shares.data));
+    } else {
+        stream_norm_kernel<false><<<norm_blocks, kThreads, 0, stream>>>(
+            residual_data, gamma, nullptr, hidden, streams, eps,
+            static_cast<__nv_bfloat16*>(normalized.data), static_cast<float*>(inv.data), nullptr);
+    }
     CUDA_CHECK(cudaGetLastError());
     detail::bf16_cublaslt_gemm(weights.down, normalized, low, stream);
     const std::int64_t low_count = static_cast<std::int64_t>(low_rank) * tokens;
@@ -261,12 +282,12 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
         static_cast<__nv_bfloat16*>(low.data), low_count, 1.0F / static_cast<float>(streams));
     CUDA_CHECK(cudaGetLastError());
     detail::bf16_cublaslt_gemm(weights.up, low, gate, stream);
-    finish_kernel<<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(residual.data),
-        static_cast<const float*>(weights.norm.data),
-        static_cast<const __nv_bfloat16*>(gate.data),
-        has_inject ? static_cast<const __nv_bfloat16*>(weights.inject.qdata) : nullptr, hidden,
-        streams, eps, static_cast<__nv_bfloat16*>(mixed.data),
+    const dim3 finish_grid(static_cast<unsigned>(tokens),
+                           static_cast<unsigned>((hidden + kThreads - 1) / kThreads));
+    finish_kernel<<<finish_grid, kThreads, 0, stream>>>(
+        residual_data, gamma, static_cast<const __nv_bfloat16*>(gate.data),
+        static_cast<const float*>(inv.data), static_cast<const float*>(shares.data), hidden,
+        streams, static_cast<__nv_bfloat16*>(mixed.data),
         inject != nullptr ? static_cast<float*>(inject->data) : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
