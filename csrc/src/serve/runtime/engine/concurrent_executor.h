@@ -1817,6 +1817,16 @@ private:
         const MixedRoundResult mixed = instance_.program->advance_prefill_mixed(
             std::span<const std::uint32_t>(staged.data(), staged_count), lanes,
             membership.budget_span());
+        // What each decode lane got out of the round, for the decode share: a verify round
+        // licenses several tokens per lane, an ordinary one exactly one.
+        last_mixed_tokens_per_lane_ = 1.0;
+        if (!lanes.empty() && mixed.round.row_counts.size() >= lanes.size()) {
+            std::uint64_t licensed = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                licensed += static_cast<std::uint64_t>(std::max(mixed.round.row_counts[row], 1));
+            }
+            last_mixed_tokens_per_lane_ = static_cast<double>(licensed) / static_cast<double>(lanes.size());
+        }
         process_decode_round(membership, mixed.round);
         if (!membership.empty()) ++cumulative_stats_.decode_rounds;
         // Resolve each staged prompt against its own result. resolve_prefill_step can retire a
@@ -2341,7 +2351,7 @@ private:
                         seg_timer_.mixed += mixed_seconds;
                         seg_timer_.mixed_rounds += 1;
                         if (!membership.empty() && decode_share() > 0.0 &&
-                            mixed_seconds > kDecodeShareMinMixedRound) {
+                            mixed_seconds > kDecodeShareMinMixedRound * last_mixed_tokens_per_lane_) {
                             decode_share_credit_s_ = std::min(
                                 kDecodeShareCreditCap,
                                 decode_share_credit_s_ +
@@ -2497,13 +2507,16 @@ private:
     }
 
     /// Fraction of the time decoding sequences get to themselves while long prompts prefill. A
-    /// mixed round gives each decoding sequence one token, and with a long prompt at a long
-    /// context a mixed round takes most of a second (0.75 s with a 100k-token prompt on the 35B
-    /// on a DGX Spark), so an agent's reply crawled at about 1.4 tok/s until every staged prompt
-    /// was done. After each mixed round that carried decode rows and took longer than
-    /// `kDecodeShareMinMixedRound`, decode-only rounds run for share / (1 - share) of its time;
-    /// prompts keep the rest. Shorter mixed rounds already decode at 4 tok/s or more and earn
-    /// nothing. SUROGATE_SERVE_DECODE_SHARE, in [0, 0.9]; 0 leaves every round mixed.
+    /// mixed round gives each decoding sequence one token (an MTP verify round a few), and with
+    /// a long prompt at a long context a mixed round takes most of a second (0.75 s with a
+    /// 100k-token prompt on the 35B on a DGX Spark), so an agent's reply crawled at about
+    /// 1.4 tok/s until every staged prompt was done. After each mixed round that carried decode
+    /// rows and took longer than `kDecodeShareMinMixedRound` per token it gave each lane,
+    /// decode-only rounds run for share / (1 - share) of its time; prompts keep the rest. A
+    /// round whose lanes already decoded at 4 tok/s or more earns nothing: an ordinary mixed
+    /// round under 0.25 s, or an MTP round that verified drafts beside the prompt and licensed
+    /// ~2.7 tokens a lane, under ~0.7 s.
+    /// SUROGATE_SERVE_DECODE_SHARE, in [0, 0.9]; 0 leaves every round mixed.
     static double decode_share() {
         static const double share = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_DECODE_SHARE");
@@ -2527,6 +2540,8 @@ private:
     /// Seconds of decode-only rounds still owed to the decoding sequences while prompts prefill
     /// (`decode_share`). Negative once a decode round overran it; cleared when nothing prefills.
     double decode_share_credit_s_ = 0.0;
+    /// Mean tokens the last mixed round licensed per decode lane (1 for an ordinary round).
+    double last_mixed_tokens_per_lane_ = 1.0;
     static constexpr double kDecodeShareCreditCap     = 2.0;
     static constexpr double kDecodeShareMinMixedRound = 0.25;
 
