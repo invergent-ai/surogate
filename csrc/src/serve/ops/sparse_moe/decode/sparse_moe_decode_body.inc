@@ -537,100 +537,6 @@ inline constexpr bool kWideRows = [] {
     }
 }();
 
-/// The wide path for rows WideRows cannot tile: a chunk count that neither fills whole warp
-/// steps nor divides one (Qwen3.8-Flash-Next's 2560-wide NVFP4 rows are 80 chunks, its
-/// 640-wide ones 20), or more loads than a lane holds at once (its 2560-wide W8 shared pair is
-/// ten). The packed path such rows took keeps one four- or eight-byte load a lane in flight, so
-/// a warp makes a DRAM round trip per step -- ten across a 2560-wide NVFP4 pair.
-///
-/// Here the rows' chunks are numbered row-major and dealt to the lanes in order, a lane's i-th
-/// load reading chunk 32 i + lane, so only the last load can leave lanes idle. Up to eight
-/// loads a lane are issued before any is used; rows that need more take equal batches of at
-/// most eight. A lane's loads read different chunks, so unlike WideRows the input is read once
-/// per load rather than once per chunk; it is staged in shared memory or hot in L1 either way.
-/// Each load sums into its own accumulator, joined to its row's in a fixed order, so the sums
-/// are deterministic.
-template <class Codec, int K, int Rows>
-struct FlatWideRows {
-    static constexpr int kChunks  = K / Codec::kWideValues;
-    static constexpr int kSlots   = Rows * kChunks;
-    static constexpr int kLoads   = (kSlots + 31) / 32;
-    static constexpr int kPieces  = Codec::kWideValues / 8;
-    static constexpr int kBatches = (kLoads + 7) / 8;
-    static constexpr int kBatch   = (kLoads + kBatches - 1) / kBatches;
-
-    /// The dot products of rows `first + r * stride` against `x(k, values)`, which fills the
-    /// eight values from k, left in lane 0's `result`.
-    template <class X>
-    __device__ static __forceinline__ void dot(const std::uint8_t* codes,
-                                               const std::uint8_t* scales, int first, int stride,
-                                               X&& x, float (&result)[Rows]) {
-        constexpr int kGroups = kStoredGroups<Codec, K>;
-        const int lane        = static_cast<int>(threadIdx.x) & 31;
-        float sum[Rows];
-#pragma unroll
-        for (int r = 0; r < Rows; ++r) { sum[r] = 0.0f; }
-        // One batch at a time: unrolled, the compiler issues every batch's loads up front, and a
-        // W8 pair of ten held 130 registers where the decode kernels run near 48.
-#pragma unroll 1
-        for (int batch = 0; batch < kBatches; ++batch) {
-            uint4 packed[kBatch];
-            std::uint32_t scale_bits[kBatch];
-#pragma unroll
-            for (int b = 0; b < kBatch; ++b) {
-                const int load  = batch * kBatch + b;
-                const int slot  = load * 32 + lane;
-                const int row   = slot / kChunks;
-                const int chunk = slot - row * kChunks;
-                if (load < kLoads && slot < kSlots) {
-                    const int part =
-                        chunk * Codec::kWideValues % Codec::kGroupK / Codec::kWideValues;
-                    const std::int64_t group =
-                        static_cast<std::int64_t>(first + row * stride) * kGroups +
-                        chunk * Codec::kWideValues / Codec::kGroupK;
-                    packed[b]     = Codec::wide_codes(codes, group, part);
-                    scale_bits[b] = Codec::wide_scales(scales, group);
-                }
-            }
-#pragma unroll
-            for (int b = 0; b < kBatch; ++b) {
-                const int load  = batch * kBatch + b;
-                const int slot  = load * 32 + lane;
-                const int row   = slot / kChunks;
-                const int chunk = slot - row * kChunks;
-                if (load < kLoads && slot < kSlots) {
-                    float acc = 0.0f;
-#pragma unroll
-                    for (int piece = 0; piece < kPieces; ++piece) {
-                        float values[8];
-                        x(chunk * Codec::kWideValues + piece * 8, values);
-                        Codec::wide_piece(packed[b], scale_bits[b], piece, values, acc);
-                    }
-#pragma unroll
-                    for (int r = 0; r < Rows; ++r) {
-                        if (row == r) { sum[r] += acc; }
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < Rows; ++r) { result[r] = warp_reduce_sum(sum[r]); }
-    }
-};
-
-/// Whether `Rows` rows of K take FlatWideRows: a codec with a wide path, rows stored unpadded,
-/// WideRows unable to take them, and at most two batches of loads.
-template <class Codec, int K, int Rows>
-inline constexpr bool kFlatWideRows = [] {
-    if constexpr (WideCodec<Codec>) {
-        return !kWideRows<Codec, K, Rows> && K % Codec::kWideValues == 0 &&
-               kStoredGroups<Codec, K> * Codec::kGroupK == K &&
-               FlatWideRows<Codec, K, Rows>::kLoads <= 16;
-    } else {
-        return false;
-    }
-}();
-
 /// A staged BF16 input as WideRows::dot reads it.
 struct SharedBf16Input {
     const __nv_bfloat16* x;
@@ -672,17 +578,6 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
         Wide::load(codes, scales, row0, row1 - row0, packed, scale_bits);
         float result[2];
         Wide::dot(packed, scale_bits, SharedBf16Input{x}, result);
-        result0 = result[0];
-        result1 = result[1];
-        return;
-    }
-    if constexpr (kFlatWideRows<Codec, K, 2>) {
-        (void)high;
-        (void)k_begin;
-        (void)k_end;
-        float result[2];
-        FlatWideRows<Codec, K, 2>::dot(codes, scales, row0, row1 - row0, SharedBf16Input{x},
-                                       result);
         result0 = result[0];
         result1 = result[1];
         return;
@@ -940,14 +835,6 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
         std::uint32_t scale_bits[Wide::kLoads];
         Wide::load(codes, scales, row_base, 1, packed, scale_bits);
         Wide::dot(packed, scale_bits, GlobalF32Input{x}, result);
-        return;
-    }
-    if constexpr (kFlatWideRows<Codec, kIntermediate, Rows>) {
-        (void)high;
-        (void)first_group;
-        (void)last_group;
-        FlatWideRows<Codec, kIntermediate, Rows>::dot(codes, scales, row_base, 1,
-                                                      GlobalF32Input{x}, result);
         return;
     }
     constexpr int kGroups = kStoredGroups<Codec, kIntermediate>;
