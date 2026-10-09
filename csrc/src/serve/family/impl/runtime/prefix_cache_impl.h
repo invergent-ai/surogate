@@ -120,6 +120,14 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         step_started = std::chrono::steady_clock::now();
         std::optional<family::detail::ArchiveBlock> pinned;
         if (archive_arena) { pinned = archive_arena->allocate(payload); }
+        // The budget can have room while no single free range does: images differ in size, and
+        // the one evicted to make room may be smaller than this one. Evict further, oldest
+        // first, until a range fits. A heap image costs far more than the prefixes dropped:
+        // pageable copies of a Qwen3.8-27B lane's ~180 MB took 1.4 s on a DGX Spark, with every
+        // decoding lane waiting.
+        while (archive_arena && !pinned && archived_prefixes.evict_oldest()) {
+            pinned = archive_arena->allocate(payload);
+        }
         auto image = std::make_shared<ArchivedSequence>();
         image->storage = pinned ? std::move(*pinned) : family::detail::heap_archive_block(payload);
         if (admit_trace_enabled() && !image->storage.pinned) {

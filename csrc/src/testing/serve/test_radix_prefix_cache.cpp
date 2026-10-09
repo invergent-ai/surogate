@@ -69,4 +69,20 @@ int main() {
         assert(continuations.bytes() <= 20);
     }
 
+    // evict_oldest drops the least recently used value nobody holds, and refuses when every
+    // value is held (an archive then needs a free range more than the budget has room).
+    Cache order(100);
+    const std::array<int, 2> first{11,12}, second{21,22}, third{31,32};
+    assert(order.insert(first, two, std::make_shared<Value>(2, 0), 10));
+    assert(order.insert(second, two, std::make_shared<Value>(2, 0), 10));
+    assert(order.insert(third, two, std::make_shared<Value>(2, 0), 10));
+    auto held = order.match(first, [](const Value& v) { return v.frontier; });
+    assert(order.evict_oldest() && order.bytes() == 20);
+    assert(order.match(first, [](const Value& v) { return v.frontier; }));
+    assert(!order.match(second, [](const Value& v) { return v.frontier; }));
+    assert(order.evict_oldest() && order.bytes() == 10);
+    assert(!order.evict_oldest() && order.bytes() == 10);
+    held.reset();
+    assert(order.evict_oldest() && order.empty());
+    assert(!order.evict_oldest());
 }
