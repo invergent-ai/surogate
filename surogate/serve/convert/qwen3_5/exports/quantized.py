@@ -364,12 +364,15 @@ def _validate_quantization(config):
             raise ValueError(f"quantization group {name}: compressed FP8 requires per-channel scales")
         activation = group.get("input_activations")
         if activation is not None:
+            # Newer compressed-tensors writes dynamic "local" for NVFP4 activations: per-group scales are
+            # computed at run time against the stored static input_global_scale, which is what we read.
+            dynamic = activation.get("dynamic", False) if isinstance(activation, dict) else None
             if not isinstance(activation, dict) or (
                 activation.get("type") != "float" or activation.get("num_bits") != bits
                 or activation.get("symmetric") is not True
                 or activation.get("strategy") not in (("tensor_group",) if bits == 4 else ("tensor", "token"))
                 or (bits == 4 and activation.get("group_size") != 16)
-                or not isinstance(activation.get("dynamic", False), bool)
+                or not (isinstance(dynamic, bool) or (bits == 4 and dynamic == "local"))
             ):
                 raise ValueError(f"quantization group {name}: unsupported input activation quantization")
         if group.get("output_activations") is not None:
