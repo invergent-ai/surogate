@@ -160,7 +160,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--gpu-memory-limit-mib N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft|--full-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
            "[--decision-attempts N]\n"
@@ -644,7 +644,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.max_lora_rank = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-lora-rank"), "max-lora-rank"));
         } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
+            options.speculative.proposal_head          = ProposalHead::Optimized;
+            options.speculative.proposal_head_explicit = true;
+        } else if (arg == "--full-head-draft") {
+            options.speculative.proposal_head          = ProposalHead::Full;
+            options.speculative.proposal_head_explicit = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {

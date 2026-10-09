@@ -101,7 +101,7 @@ _COMMON_VALUES = frozenset("""
     --temperature --top-p --top-k --min-p --presence-penalty --frequency-penalty --seed
 """.split())
 _COMMON_SWITCHES = frozenset("""
-    --vision --lm-head-draft --no-thinking --greedy --spec-adaptive
+    --vision --lm-head-draft --full-head-draft --no-thinking --greedy --spec-adaptive
     --offload-vision --offload-embeddings --offload-output-head
 """.split())
 _VALUE_OPTIONS = {

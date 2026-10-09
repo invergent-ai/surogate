@@ -106,8 +106,12 @@ const char* kv_capacity_mode_name(sinfer::KvCapacityMode mode) {
     return mode == sinfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
-const char* proposal_head_name(sinfer::ProposalHead proposal) {
-    return proposal == sinfer::ProposalHead::Optimized ? "optimized" : "full";
+const char* proposal_head_name(const sinfer::SpeculativeOptions& speculative) {
+    if (speculative.backend == sinfer::SpeculativeBackend::Mtp && !speculative.proposal_head_explicit &&
+        speculative.proposal_head == sinfer::ProposalHead::Full) {
+        return "auto"; // the artifact's shortlist head when it carries one
+    }
+    return speculative.proposal_head == sinfer::ProposalHead::Optimized ? "optimized" : "full";
 }
 
 const char* prefix_reuse_path_name(sinfer::PrefixReusePath path) {
@@ -568,7 +572,7 @@ std::string format_server_start_json(
           {"prefix_reuse", options.allow_prefix_reuse},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
-          {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+          {"proposal_head", proposal_head_name(options.speculative)}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},

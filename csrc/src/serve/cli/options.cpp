@@ -87,7 +87,7 @@ std::string usage_text(const char* argv0) {
            "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype auto|bf16|fp8|fp8_e4m3|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--spec-max-lanes N|all] [--spec-adaptive]\n"
-           "       [--lm-head-draft]\n"
+           "       [--lm-head-draft|--full-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -209,7 +209,11 @@ Options parse_options(int argc, char** argv) {
             options.speculative.max_lanes =
                 spec == "all" ? kSpeculateAtAnyWidth : parse_u32(spec.c_str(), "spec-max-lanes", true);
         } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
+            options.speculative.proposal_head          = ProposalHead::Optimized;
+            options.speculative.proposal_head_explicit = true;
+        } else if (arg == "--full-head-draft") {
+            options.speculative.proposal_head          = ProposalHead::Full;
+            options.speculative.proposal_head_explicit = true;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
