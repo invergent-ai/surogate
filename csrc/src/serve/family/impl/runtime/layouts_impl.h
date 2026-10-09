@@ -123,9 +123,11 @@ template <class V>
                                                .rotary_dim = 0,
                                                .rope_theta = 0.0F,
                                                .rms_eps    = 0.0F};
-        const std::size_t mask = round_up_256(
-            static_cast<std::size_t>(ops::qsa_block_mask_words(keys, g.indexer_block)) * columns *
-            sizeof(std::int32_t));
+        // The mask, and the per-tile block lists a one-sequence chunk carries beside it.
+        const std::size_t mask =
+            round_up_256(static_cast<std::size_t>(ops::qsa_block_mask_words(keys, g.indexer_block)) *
+                         columns * sizeof(std::int32_t)) +
+            ops::qsa_tile_union_bytes(static_cast<std::int32_t>(columns), keys, g.indexer_block);
         const std::size_t scores =
             ops::qsa_indexer_select_workspace_capacity_bytes(static_cast<std::int32_t>(columns),
                                                              keys, geometry);
@@ -546,10 +548,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)layout.alloc_bytes(variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
         } else if constexpr (has_qsa_indexer_v<Variant>) {
-            const auto mask_bytes = round_up_256(static_cast<std::size_t>(
-                ops::qsa_block_mask_words(envelope.max_visible_keys, plan.geometry.indexer_block)) *
-                last * sizeof(std::int32_t));
-            // Selection retains its mask; projections and scores are released before GQA.
+            const auto mask_bytes =
+                round_up_256(static_cast<std::size_t>(ops::qsa_block_mask_words(
+                                 envelope.max_visible_keys, plan.geometry.indexer_block)) *
+                             last * sizeof(std::int32_t)) +
+                ops::qsa_tile_union_bytes(last, static_cast<std::int32_t>(envelope.max_visible_keys),
+                                          plan.geometry.indexer_block);
+            // Selection retains its mask and tile lists; projections and scores are released
+            // before GQA.
             (void)layout.alloc_bytes(mask_bytes);
             scratch(layout, variant_indexer_workspace_bytes<Variant>(
                 plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)) - mask_bytes);

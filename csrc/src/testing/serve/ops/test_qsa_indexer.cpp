@@ -1,8 +1,9 @@
 // QSA sparse indexer: block-key folding (mean, RMSNorm, rope at the block's first position) and
 // block selection (rectified per-head scores, always-visible tail, budget cut on a block
 // boundary) against a scalar reference, on a small paged cache and on a 40k-cell history whose
-// scores spread over many CTAs. `--bench` times one layer's selection at long histories;
-// SUROGATE_SERVE_QSA_SELECT=bisect times the one-CTA-per-row control instead.
+// scores spread over many CTAs, and the per-tile block lists the prompt kernel walks. `--bench`
+// times one layer's selection at long histories; SUROGATE_SERVE_QSA_SELECT=bisect times the
+// one-CTA-per-row control instead.
 #include "api/ops/qsa_indexer.h"
 #include "ops/op_tester.h"
 
@@ -494,6 +495,53 @@ void run_bench() {
     }
 }
 
+// Per-tile block lists: 130 rows (two full tiles and a two-row tail) of a 131,072-key mask, each
+// row a sparse random selection, against the union of each tile's rows in ascending order.
+void run_tile_union_case() {
+    const int keys  = 131072;
+    const int rows  = 130;
+    const int words = sinfer::ops::qsa_block_mask_words(keys, kBlock);
+    const int tiles = (rows + sinfer::ops::kQsaTileRows - 1) / sinfer::ops::kQsaTileRows;
+    const int stride = sinfer::ops::qsa_tile_union_stride(keys, kBlock);
+    std::mt19937 rng(23);
+    std::vector<int> mask(static_cast<std::size_t>(words) * rows, 0);
+    for (auto& word : mask) {
+        // About one bit in 64, and some words left empty.
+        word = static_cast<int>(rng() & rng() & rng() & rng() & rng() & rng());
+    }
+    DeviceBuffer d_mask   = to_device_i32(mask);
+    DeviceBuffer d_blocks(static_cast<std::size_t>(stride) * tiles * sizeof(std::int32_t));
+    DeviceBuffer d_counts(static_cast<std::size_t>(tiles) * sizeof(std::int32_t));
+    Tensor mask_t(d_mask.p, DType::I32, {words, rows});
+    Tensor blocks_t(d_blocks.p, DType::I32, {stride, tiles});
+    Tensor counts_t(d_counts.p, DType::I32, {tiles});
+    sinfer::ops::qsa_tile_union(mask_t, blocks_t, counts_t, nullptr);
+    cudaStreamSynchronize(nullptr);
+    expect(cudaGetLastError() == cudaSuccess, "tile union launched cleanly");
+    const std::vector<int> blocks = from_device_i32(d_blocks, static_cast<std::size_t>(stride) * tiles);
+    const std::vector<int> counts = from_device_i32(d_counts, static_cast<std::size_t>(tiles));
+    for (int tile = 0; tile < tiles; ++tile) {
+        std::vector<int> expected;
+        for (int w = 0; w < words; ++w) {
+            std::uint32_t bits = 0U;
+            for (int r = tile * sinfer::ops::kQsaTileRows;
+                 r < std::min(rows, (tile + 1) * sinfer::ops::kQsaTileRows); ++r) {
+                bits |= static_cast<std::uint32_t>(mask[static_cast<std::size_t>(r) * words + w]);
+            }
+            for (int b = 0; b < 32; ++b) {
+                if ((bits >> b) & 1U) { expected.push_back(w * 32 + b); }
+            }
+        }
+        expect(counts[tile] == static_cast<int>(expected.size()),
+               "tile " + std::to_string(tile) + " lists " + std::to_string(counts[tile]) +
+                   " blocks, expected " + std::to_string(expected.size()));
+        const auto first = blocks.begin() + static_cast<std::ptrdiff_t>(tile) * stride;
+        expect(counts[tile] == static_cast<int>(expected.size()) &&
+                   std::equal(expected.begin(), expected.end(), first),
+               "tile " + std::to_string(tile) + " lists its rows' blocks in ascending order");
+    }
+}
+
 int main(int argc, char** argv) {
     if (cuda_unavailable()) { return 77; }
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
@@ -503,5 +551,6 @@ int main(int argc, char** argv) {
     run_case(false);
     run_case(true);
     run_long_case();
+    run_tile_union_case();
     return failures ? 1 : 0;
 }

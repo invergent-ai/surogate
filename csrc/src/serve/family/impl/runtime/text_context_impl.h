@@ -2155,7 +2155,17 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         const bool sparse = !ops::qsa_selection_is_dense(keys, geometry);
         const std::int32_t words = sparse ? ops::qsa_block_mask_words(keys, geometry.block) : 0;
         Tensor mask = sparse ? work_.alloc(DType::I32, {words, tokens}) : Tensor{};
-        // Only the mask survives selection. Its inputs and scores can be reused by attention.
+        // One sequence's prompt chunk also gets, per tile of the prompt kernel's query columns,
+        // the blocks its columns selected, so that kernel reads those keys alone. A round of a
+        // few columns (decode, a verify) takes the decode kernel, which gathers from the mask.
+        const bool tile_lists = sparse && columns_per_row == tokens && tokens >= 16;
+        const std::int32_t tiles = (tokens + ops::kQsaTileRows - 1) / ops::kQsaTileRows;
+        Tensor tile_blocks =
+            tile_lists ? work_.alloc(DType::I32, {ops::qsa_tile_union_stride(keys, geometry.block), tiles})
+                       : Tensor{};
+        Tensor tile_counts = tile_lists ? work_.alloc(DType::I32, {tiles}) : Tensor{};
+        // Only the mask and the lists survive selection. Its inputs and scores can be reused by
+        // attention.
         auto scratch = work_.scope();
         // The keys are cached raw for every column, whatever the history length: a later query
         // pools them into a block key, so skipping the append below the budget would leave holes.
@@ -2196,9 +2206,19 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
 
         ops::qsa_indexer_select(heads_norm, column_positions, table_rows, columns_per_row, geometry,
                                 cache, keys, work_, mask, s);
-        return ops::GqaBlockMask{.words  = static_cast<const std::uint32_t*>(mask.data),
-                                 .stride = words,
-                                 .block  = geometry.block};
+        if (!tile_lists) {
+            return ops::GqaBlockMask{.words  = static_cast<const std::uint32_t*>(mask.data),
+                                     .stride = words,
+                                     .block  = geometry.block};
+        }
+        ops::qsa_tile_union(mask, tile_blocks, tile_counts, s);
+        return ops::GqaBlockMask{.words       = static_cast<const std::uint32_t*>(mask.data),
+                                 .stride      = words,
+                                 .block       = geometry.block,
+                                 .tile_blocks = static_cast<const std::int32_t*>(tile_blocks.data),
+                                 .tile_counts = static_cast<const std::int32_t*>(tile_counts.data),
+                                 .tile_stride = tile_blocks.ne[0],
+                                 .tile_rows   = ops::kQsaTileRows};
     }
 }
 

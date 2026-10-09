@@ -83,6 +83,24 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
                         PagedKVBatchLayerView cache, std::int32_t keys, WorkspaceArena& workspace,
                         Tensor& mask, cudaStream_t stream);
 
+/// Query columns per list of `qsa_tile_union`: the prompt attention kernel's tile.
+inline constexpr std::int32_t kQsaTileRows = 64;
+
+/// Ints in one list of `qsa_tile_union` over a `keys`-long history: room for every block.
+[[nodiscard]] std::int32_t qsa_tile_union_stride(std::int32_t keys, std::int32_t block);
+
+/// Bytes of `qsa_tile_union`'s lists and counts for `rows` mask rows, as the arena lays them out.
+[[nodiscard]] std::size_t qsa_tile_union_bytes(std::int32_t rows, std::int32_t keys,
+                                               std::int32_t block);
+
+/// For each tile of `kQsaTileRows` consecutive rows of `qsa_indexer_select`'s mask, the blocks
+/// any of its rows selected, in ascending order. Attention over one sequence's prompt chunk
+/// then reads only those blocks' keys.
+///   mask   I32 [words, rows]
+///   blocks I32 [qsa_tile_union_stride(), tiles]   tiles = ceil(rows / kQsaTileRows)
+///   counts I32 [tiles]                            the length of each list
+void qsa_tile_union(const Tensor& mask, Tensor& blocks, Tensor& counts, cudaStream_t stream);
+
 /// Transient bytes `qsa_indexer_select` needs for `rows` queries over a `keys`-long history.
 [[nodiscard]] std::size_t qsa_indexer_select_workspace_capacity_bytes(
     std::int32_t rows, std::int32_t keys, const QsaIndexerGeometry& geometry);

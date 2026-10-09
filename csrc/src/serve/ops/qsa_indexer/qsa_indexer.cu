@@ -557,6 +557,58 @@ int score_span(int rows, std::int64_t blocks) {
     return static_cast<int>((span + kScoreStep - 1) / kScoreStep * kScoreStep);
 }
 
+// One CTA per tile of query rows: the tile's mask words are OR-ed in shared memory, then each
+// thread lists the set bits of a contiguous run of words from its place in the CTA's prefix
+// sum, so the list ascends.
+constexpr int kUnionThreads = 256;
+
+__global__ void __launch_bounds__(kUnionThreads)
+    qsa_tile_union_kernel(const std::uint32_t* __restrict__ mask, int words, int rows,
+                          std::int32_t* __restrict__ blocks, int stride,
+                          std::int32_t* __restrict__ counts) {
+    extern __shared__ std::uint32_t union_words[];
+    __shared__ int warp_counts[kUnionThreads / kWarp];
+    const int tile  = static_cast<int>(blockIdx.x);
+    const int first = tile * kQsaTileRows;
+    const int last  = min(first + kQsaTileRows, rows);
+    const int tid   = static_cast<int>(threadIdx.x);
+    for (int w = tid; w < words; w += kUnionThreads) {
+        std::uint32_t bits = 0U;
+        for (int row = first; row < last; ++row) {
+            bits |= mask[static_cast<std::int64_t>(row) * words + w];
+        }
+        union_words[w] = bits;
+    }
+    __syncthreads();
+    const int per     = (words + kUnionThreads - 1) / kUnionThreads;
+    const int w_begin = min(tid * per, words);
+    const int w_end   = min(w_begin + per, words);
+    int count = 0;
+    for (int w = w_begin; w < w_end; ++w) { count += __popc(union_words[w]); }
+    const int lane = tid % kWarp;
+    const int warp = tid / kWarp;
+    int inclusive  = count;
+#pragma unroll
+    for (int offset = 1; offset < kWarp; offset <<= 1) {
+        const int below = __shfl_up_sync(kFullWarpMask, inclusive, offset);
+        if (lane >= offset) { inclusive += below; }
+    }
+    if (lane == kWarp - 1) { warp_counts[warp] = inclusive; }
+    __syncthreads();
+    int slot = inclusive - count, total = 0;
+    for (int w = 0; w < kUnionThreads / kWarp; ++w) {
+        if (w < warp) { slot += warp_counts[w]; }
+        total += warp_counts[w];
+    }
+    std::int32_t* list = blocks + static_cast<std::int64_t>(tile) * stride;
+    for (int w = w_begin; w < w_end; ++w) {
+        for (std::uint32_t bits = union_words[w]; bits != 0U; bits &= bits - 1U) {
+            list[slot++] = w * kWarp + __ffs(static_cast<int>(bits)) - 1;
+        }
+    }
+    if (tid == 0) { counts[tile] = total; }
+}
+
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa_indexer: ") + message); }
 }
@@ -584,6 +636,35 @@ std::int32_t qsa_select_row_tile(std::int32_t rows, std::int32_t keys,
     const std::int64_t tile = kSelectScratchBytes / (blocks * static_cast<std::int64_t>(sizeof(float)));
     const std::int64_t clamped = std::max<std::int64_t>(1, std::min<std::int64_t>(tile, rows));
     return static_cast<std::int32_t>(clamped);
+}
+
+std::int32_t qsa_tile_union_stride(std::int32_t keys, std::int32_t block) {
+    return qsa_block_mask_words(keys, block) * kWarp;
+}
+
+std::size_t qsa_tile_union_bytes(std::int32_t rows, std::int32_t keys, std::int32_t block) {
+    const auto round_up = [](std::size_t bytes) { return (bytes + 255U) / 256U * 256U; };
+    const auto tiles    = static_cast<std::size_t>((std::max(rows, 1) + kQsaTileRows - 1) / kQsaTileRows);
+    return round_up(static_cast<std::size_t>(qsa_tile_union_stride(keys, block)) * tiles *
+                    sizeof(std::int32_t)) +
+           round_up(tiles * sizeof(std::int32_t));
+}
+
+void qsa_tile_union(const Tensor& mask, Tensor& blocks, Tensor& counts, cudaStream_t stream) {
+    require(mask.dtype == DType::I32 && blocks.dtype == DType::I32 && counts.dtype == DType::I32,
+            "tile union tensors must be I32");
+    const int words = static_cast<int>(mask.ne[0]);
+    const int rows  = static_cast<int>(mask.ne[1]);
+    const int tiles = (rows + kQsaTileRows - 1) / kQsaTileRows;
+    require(blocks.ne[0] == words * kWarp && blocks.ne[1] == tiles && counts.ne[0] == tiles,
+            "tile union lists must be [words * 32, tiles] and counts [tiles]");
+    if (tiles == 0) { return; }
+    const auto smem = static_cast<int>(words * sizeof(std::uint32_t));
+    require(smem <= 48 * 1024, "tile union: the history's mask row exceeds 48 KiB");
+    qsa_tile_union_kernel<<<tiles, kUnionThreads, smem, stream>>>(
+        static_cast<const std::uint32_t*>(mask.data), words, rows,
+        static_cast<std::int32_t*>(blocks.data), static_cast<int>(blocks.ne[0]),
+        static_cast<std::int32_t*>(counts.data));
 }
 
 std::size_t qsa_indexer_select_workspace_capacity_bytes(std::int32_t rows, std::int32_t keys,

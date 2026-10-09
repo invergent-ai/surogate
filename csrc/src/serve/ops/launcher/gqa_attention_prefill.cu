@@ -209,51 +209,51 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     } else if (cache.dtype == DType::FP8_E4M3FN) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(q.ne[1]), 1u);
-        if (selection.words != nullptr) {
+        // A QSA selection takes the same e4m3 Q Kᵀ as the dense chunks: the mask is applied to
+        // the scores either way, and the selection's chunks are the ones past the budget, where
+        // the attention is longest.
+        // With per-tile block lists (one sequence's chunk, qsa_tile_union) it reads only the
+        // blocks the tile's rows selected, instead of every key up to the tile's last query.
+        const auto launch = [&]<bool Sparse, bool QkFp8, bool Gather>() {
+            constexpr int bytes =
+                QkFp8 ? kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim> : kFp8SmemBytes;
+            const auto kernel =
+                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, Sparse, 4,
+                                                  QkFp8, Gather>;
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kFp8SmemBytes));
-            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>
-                <<<attention_grid, kGqaPrefillThreads, kFp8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::uint8_t*>(cache_k.data),
-                    static_cast<const std::uint8_t*>(cache_v.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
-        } else {
-            const auto launch = [&]<bool QkFp8>() {
-                constexpr int bytes =
-                    QkFp8 ? kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim> : kFp8SmemBytes;
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+            if constexpr (QkFp8) {
+                // Two CTAs share an SM only when its whole carveout is shared memory.
                 CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-                    gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
-                                                      QkFp8>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-                if constexpr (QkFp8) {
-                    // Two CTAs share an SM only when its whole carveout is shared memory.
-                    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-                        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false,
-                                                          4, QkFp8>,
-                        cudaFuncAttributePreferredSharedMemoryCarveout,
-                        cudaSharedmemCarveoutMaxShared));
-                }
-                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, false, 4,
-                                                  QkFp8>
-                    <<<attention_grid, kGqaPrefillThreads, bytes, stream>>>(
-                        static_cast<const __nv_bfloat16*>(q.data),
-                        static_cast<const std::uint8_t*>(cache_k.data),
-                        static_cast<const std::uint8_t*>(cache_v.data), metadata,
-                        static_cast<const std::int32_t*>(positions.data), scale,
-                        static_cast<__nv_bfloat16*>(out.data), tokens, selection);
-            };
-            if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
-                if (::sinfer::ops::prompt_attention_fp8_query()) {
-                    launch.template operator()<true>();
-                } else {
-                    launch.template operator()<false>();
-                }
-            } else {
-                launch.template operator()<false>();
+                    kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                    cudaSharedmemCarveoutMaxShared));
             }
+            kernel<<<attention_grid, kGqaPrefillThreads, bytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::uint8_t*>(cache_k.data),
+                static_cast<const std::uint8_t*>(cache_v.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+        };
+        const bool gather = selection.tile_blocks != nullptr && selection.tile_counts != nullptr &&
+                            selection.tile_rows == kGqaPrefillBr && selection.image_end == 0;
+        const auto launch_sparse = [&]<bool QkFp8>() {
+            if (selection.words == nullptr) {
+                launch.template operator()<false, QkFp8, false>();
+            } else if (gather) {
+                launch.template operator()<true, QkFp8, true>();
+            } else {
+                launch.template operator()<true, QkFp8, false>();
+            }
+        };
+        if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
+            if (::sinfer::ops::prompt_attention_fp8_query()) {
+                launch_sparse.template operator()<true>();
+            } else {
+                launch_sparse.template operator()<false>();
+            }
+        } else {
+            launch_sparse.template operator()<false>();
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
@@ -406,6 +406,9 @@ void gqa_attention_prompt_cached_launch(const Tensor& q, const Tensor& positions
             const Tensor table = row_tensor(table_rows, batch, 1);
             GqaBlockMask mask = selection;
             if (mask.words) { mask.words += static_cast<std::int64_t>(batch) * q.ne[2] * mask.stride; }
+            // Tile lists describe one sequence's chunk.
+            mask.tile_blocks = nullptr;
+            mask.tile_counts = nullptr;
             gqa_attention_prompt_cached_launch(q_row, pos, valid, table, scale, cache,
                                                 out_row, stream, sliding_window, mask);
         }
@@ -489,6 +492,9 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             const Tensor table = row_tensor(table_rows, batch, 1);
             GqaBlockMask mask = selection;
             if (mask.words) { mask.words += static_cast<std::int64_t>(batch) * q.ne[2] * mask.stride; }
+            // Tile lists describe one sequence's chunk.
+            mask.tile_blocks = nullptr;
+            mask.tile_counts = nullptr;
             const Tensor k_row = batch_tensor(k, batch), v_row = batch_tensor(v, batch);
             gqa_attention_prompt_launch(q_row, k_row, v_row, pos, valid, table, scale, cache,
                                          out_row, stream, sliding_window, mask);

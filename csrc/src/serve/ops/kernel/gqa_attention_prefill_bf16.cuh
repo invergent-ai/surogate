@@ -231,8 +231,12 @@ __device__ __forceinline__ void gqa_prefill_widen_fp8_slice(__nv_bfloat16* dst,
 // `SparseBlock` cells for every query row of the chunk. `Sparse == false` is the dense kernel.
 // `QkFp8` (an e4m3 cache only) takes S = Q Kᵀ on the e4m3 tensor cores, one raw block in
 // flight (kGqaPrefillFp8QkSmemBytes), two CTAs to an SM; false keeps it in bf16.
+// `Gather` (Sparse only) walks the blocks the tile's rows selected between them
+// (block_mask.tile_blocks, ops::qsa_tile_union) instead of every key of the history: a key block
+// is Bc / SparseBlock of those blocks, in key order, and each row still masks the blocks only its
+// neighbours chose.
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
-          bool Sparse = false, int SparseBlock = 4, bool QkFp8 = false>
+          bool Sparse = false, int SparseBlock = 4, bool QkFp8 = false, bool Gather = false>
 __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const CacheT* __restrict__ cache_k,
@@ -273,6 +277,8 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
     // (j - n_block_min) % Slots.
     constexpr bool kRawFp8 = GqaKvIsFp8<CacheT>::value && kGqaPrefillFp8Raw<D> && !kQk8;
     constexpr int Slots    = kQk8 ? 1 : 2;
+    static_assert(!Gather || (Sparse && Bc % SparseBlock == 0 && SparseBlock % 2 == 0),
+                  "a gathered key block holds whole selection blocks, and a key pair one block");
 
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
     __nv_bfloat16* q_s;  // [Br, D] swizzled; e4m3 codes under kQk8
@@ -389,7 +395,15 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = block_mask.tile_last_key(base_pos + q0, base_pos + q0 + tile_rows - 1);
-    const int n_block_max   = (max_query_abs / Bc) + 1;
+    // Gather: this tile's selected blocks, Bc / SparseBlock to a key block.
+    const std::int32_t* tile_list = nullptr;
+    int tile_selected             = 0;
+    if constexpr (Gather) {
+        tile_list = block_mask.tile_blocks + static_cast<std::int64_t>(q_block) * block_mask.tile_stride;
+        tile_selected = block_mask.tile_counts[q_block];
+    }
+    const int n_block_max =
+        Gather ? (tile_selected * SparseBlock + Bc - 1) / Bc : (max_query_abs / Bc) + 1;
     // A window makes the oldest keys invisible to every query in this tile, so
     // the loop need not start at zero. The tile's earliest query sits at
     // `base_pos + q0`, and it admits keys from `base_pos + q0 - window + 1`;
@@ -400,14 +414,76 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
     // keeps starting at zero.
     const int first_visible_key =
         metadata.window > 0 ? (base_pos + q0) - metadata.window + 1 : 0;
-    const int n_block_min = first_visible_key > 0 ? (first_visible_key / Bc) : 0;
+    const int n_block_min = !Gather && first_visible_key > 0 ? (first_visible_key / Bc) : 0;
 
 
     // A key block and a KV page were the same thing while a block was 64 keys; at 16 they are
     // not, and the page is the one the block's first key lives in. The INT8 prompt kernel
     // always indexed it this way.
-    const auto page_of = [&](int kb) { return block_table[(kb * Bc) >> kPagedKVPageShift]; };
+    // A gathered block reads each key's own page.
+    const auto page_of = [&](int kb) {
+        return Gather ? 0 : block_table[(kb * Bc) >> kPagedKVPageShift];
+    };
     int physical_page  = page_of(n_block_min);
+    // The `column`-th key of gathered block `kb`, or -1 past the selection.
+    const auto gathered_key = [&](int kb, int column) {
+        const int slot = kb * (Bc / SparseBlock) + column / SparseBlock;
+        return slot < tile_selected ? tile_list[slot] * SparseBlock + column % SparseBlock : -1;
+    };
+    // Land key block kb's e4m3 codes (swizzled for the e4m3 tensor cores, or plain for the
+    // widening), or its bf16 rows, from the contiguous history or from the gathered keys. A key
+    // past the tile's last query (an open block's unwritten tail) or past the selection lands as
+    // zeros, as gqa_prefill_stage_kv's tail does.
+    const auto stage_raw = [&]<bool Swizzle>(std::uint8_t* dst, const std::uint8_t* codes, int kb,
+                                             int page) {
+        if constexpr (Gather) {
+            constexpr int VecPerRow = D / 16;
+#pragma unroll
+            for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+                const int key_l = chunk / VecPerRow;
+                const int d     = (chunk % VecPerRow) * 16;
+                std::uint8_t* p = &dst[Swizzle ? gqa_prefill_swz8<D>(key_l, d) : key_l * D + d];
+                const int key   = gathered_key(kb, key_l);
+                if (key >= 0 && key <= max_query_abs) {
+                    cp_async<16, Cache::cg>(
+                        p, &codes[paged_kv_element_offset<D, Geometry::KVHeads>(
+                               block_table[key >> kPagedKVPageShift], kv_head,
+                               key & kPagedKVPageMask, d)]);
+                } else {
+                    store_vec(p, make_int4(0, 0, 0, 0));
+                }
+            }
+        } else {
+            gqa_prefill_stage_raw_fp8<Geometry, Swizzle>(dst, codes, kv_head, kb * Bc,
+                                                         max_query_abs, page, tid);
+        }
+    };
+    const auto stage_rows = [&](__nv_bfloat16* dst, const CacheT* cache, int kb, int page) {
+        if constexpr (Gather) {
+            constexpr int VecPerRow = D / 8;
+#pragma unroll
+            for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+                const int key_l  = chunk / VecPerRow;
+                const int d      = (chunk % VecPerRow) * 8;
+                __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
+                const int key    = gathered_key(kb, key_l);
+                if (key >= 0 && key <= max_query_abs) {
+                    const CacheT* src = &cache[paged_kv_element_offset<D, Geometry::KVHeads>(
+                        block_table[key >> kPagedKVPageShift], kv_head, key & kPagedKVPageMask, d)];
+                    if constexpr (GqaKvIsFp8<CacheT>::value) {
+                        store_vec(p, gqa_kv_dequant_fp8x8_from(src));
+                    } else {
+                        cp_async<16, Cache::cg>(p, src);
+                    }
+                } else {
+                    store_vec(p, make_int4(0, 0, 0, 0));
+                }
+            }
+        } else {
+            gqa_prefill_stage_kv<Geometry, CacheT>(dst, cache, kv_head, kb * Bc, max_query_abs,
+                                                   page, tid);
+        }
+    };
 
     // The raw pipeline, block kb (s = kb - n_block_min):
     //   wait, barrier  K(kb) is widened in k_s; V(kb) and K(kb+1) codes have landed
@@ -424,10 +500,8 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
     };
     // The e4m3 path lands K swizzled, for its ldmatrix, and V plain, for the widening.
     const auto stage_qk8 = [&](int kb, int page) {
-        gqa_prefill_stage_raw_fp8<Geometry, true>(raw_slot(k_raw, kb), codes_k, kv_head, kb * Bc,
-                                                  max_query_abs, page, tid);
-        gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, kb), codes_v, kv_head, kb * Bc,
-                                            max_query_abs, page, tid);
+        stage_raw.template operator()<true>(raw_slot(k_raw, kb), codes_k, kb, page);
+        stage_raw.template operator()<false>(raw_slot(v_raw, kb), codes_v, kb, page);
     };
     // This thread's two rows' e4m3 Q scales, times the softmax scale (kQk8).
     float qk_scale0 = scale, qk_scale1 = scale;
@@ -447,15 +521,14 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         qk_scale0 = q_scale_s[warp_row0 + gid] * scale;
         qk_scale1 = q_scale_s[warp_row0 + gid + 8] * scale;
     } else if constexpr (kRawFp8) {
-        gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(k_raw, n_block_min), codes_k, kv_head,
-                                            n_block_min * Bc, max_query_abs, physical_page, tid);
-        gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, n_block_min), codes_v, kv_head,
-                                            n_block_min * Bc, max_query_abs, physical_page, tid);
+        stage_raw.template operator()<false>(raw_slot(k_raw, n_block_min), codes_k, n_block_min,
+                                             physical_page);
+        stage_raw.template operator()<false>(raw_slot(v_raw, n_block_min), codes_v, n_block_min,
+                                             physical_page);
         sinfer::ops::cp_commit();
         if (n_block_min + 1 < n_block_max) {
-            gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(k_raw, n_block_min + 1), codes_k, kv_head,
-                                                (n_block_min + 1) * Bc, max_query_abs,
-                                                page_of(n_block_min + 1), tid);
+            stage_raw.template operator()<false>(raw_slot(k_raw, n_block_min + 1), codes_k,
+                                                 n_block_min + 1, page_of(n_block_min + 1));
         }
         sinfer::ops::cp_commit();
         sinfer::ops::cp_wait<1>(); // Q and the first block's codes
@@ -463,8 +536,7 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, n_block_min), tid, 0,
                                        kGqaPrefillWidenChunks<D>);
     } else {
-        gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, n_block_min * Bc,
-                                               max_query_abs, physical_page, tid);
+        stage_rows(k_s, cache_k, n_block_min, physical_page);
         sinfer::ops::cp_commit();
     }
 
@@ -480,18 +552,17 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         // The e4m3 Q Kᵀ path's next block waits for the barrier after QK, which frees its slot.
         if constexpr (kRawFp8) {
             if (kb + 1 < n_block_max) {
-                gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(v_raw, kb + 1), codes_v, kv_head,
-                                                    (kb + 1) * Bc, max_query_abs, page1, tid);
+                stage_raw.template operator()<false>(raw_slot(v_raw, kb + 1), codes_v, kb + 1,
+                                                     page1);
             }
             if (kb + 2 < n_block_max) {
-                gqa_prefill_stage_raw_fp8<Geometry>(raw_slot(k_raw, kb + 2), codes_k, kv_head,
-                                                    (kb + 2) * Bc, max_query_abs, page2, tid);
+                stage_raw.template operator()<false>(raw_slot(k_raw, kb + 2), codes_k, kb + 2,
+                                                     page2);
             }
             sinfer::ops::cp_commit();
         } else if constexpr (!kQk8) {
             // Overlap V(kb) load against the QK MMA below.
-            gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs,
-                                                   physical_page, tid);
+            stage_rows(v_s, cache_v, kb, physical_page);
             sinfer::ops::cp_commit();
         }
 
@@ -633,21 +704,24 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         } else {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int key0 = k0 + nt * 8 + 2 * lid;
-                const int key1 = key0 + 1;
-                score[nt][0] = (qrow0 < tokens && key0 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key0, metadata.window) &&
+                // A gathered column past the selection is -1 (both of a pair: a block holds
+                // whole even pairs), and must not reach the mask, whose word -1 / 4 is 0.
+                const int key0 = Gather ? gathered_key(kb, nt * 8 + 2 * lid) : k0 + nt * 8 + 2 * lid;
+                const int key1 = (Gather && key0 < 0) ? -1 : key0 + 1;
+                const bool live = !Gather || key0 >= 0;
+                score[nt][0] = (live && qrow0 < tokens && key0 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key0, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
                                    ? score[nt][0]
                                    : -CUDART_INF_F;
-                score[nt][1] = (qrow0 < tokens && key1 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key1, metadata.window) &&
+                score[nt][1] = (live && qrow0 < tokens && key1 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key1, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
                                    ? score[nt][1]
                                    : -CUDART_INF_F;
-                score[nt][2] = (qrow1 < tokens && key0 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key0, metadata.window) &&
+                score[nt][2] = (live && qrow1 < tokens && key0 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key0, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
                                    ? score[nt][2]
                                    : -CUDART_INF_F;
-                score[nt][3] = (qrow1 < tokens && key1 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key1, metadata.window) &&
+                score[nt][3] = (live && qrow1 < tokens && key1 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key1, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
                                    ? score[nt][3]
                                    : -CUDART_INF_F;
@@ -711,8 +785,7 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
             // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
             if (kb + 1 < n_block_max) {
                 physical_page = page1;
-                gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc,
-                                                       max_query_abs, physical_page, tid);
+                stage_rows(k_s, cache_k, kb + 1, physical_page);
                 sinfer::ops::cp_commit();
             }
         }
