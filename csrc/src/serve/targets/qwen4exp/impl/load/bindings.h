@@ -151,6 +151,10 @@ struct BindingPlan {
     std::vector<TextLayerPlan> text_layers;
     HyperConnectionPlan output_mix;
     artifact::LinearBinding output_head;
+    /// The shortlist head `--lm-head-draft` proposes through and the vocabulary id of each of
+    /// its rows; bound when the artifact carries them.
+    artifact::LinearBinding draft_head{};
+    artifact::ObjectHandle draft_head_token_ids{};
     artifact::ObjectHandle ple_table;
     // The hash constants are read out of the artifact at bind time (the reader is gone by
     // the time the model is constructed).

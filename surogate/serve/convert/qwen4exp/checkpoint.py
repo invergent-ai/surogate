@@ -16,8 +16,10 @@ shares with HF, and the GDN norm is not zero-centred in either.
 
 The NextN draft head is converted unless `--no-mtp` asks otherwise. Its experts are FP8 with a
 scale per 128 x 128 block in the release; they are dequantised and stored W8, as the GGUF path
-stores them, so `--spec mtp` runs them through the same device MoE as any W8 layer. The vision
-tower stays in the checkpoint.
+stores them, so `--spec mtp` runs them through the same device MoE as any W8 layer. Beside it goes
+a shortlist head for `--lm-head-draft`, unless `--no-draft-head`: the output head's rows for the
+131,072 tokens the bundled frequency ranking counts most, at Q4, so a draft step reads about a
+quarter of the full head's 675 MB. The vision tower stays in the checkpoint.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ from surogate.serve.artifact.layouts import encode_direct, encode_nvfp4
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import iq4nl
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
-from surogate.serve.convert.common.inventory import TensorSpec
+from surogate.serve.convert.common.inventory import Q4, TensorSpec
 from surogate.serve.convert.common.qwen4exp import geometry_block
 from surogate.serve.convert.common.recipe import (
     Concat, Reshape, Slice, TensorRecipe, Transpose, attention_qproj_part, materialize_recipe,
@@ -45,6 +47,7 @@ from surogate.serve.convert.common.recipe import (
 )
 from surogate.serve.convert.common.safetensors import ShardReader
 
+from surogate.serve.convert.qwen3_5 import draft_head as shortlist
 from . import inventory as inv
 
 RECIPE_ID = "qwen4exp-modelopt-nvfp4-v1"
@@ -180,6 +183,11 @@ def w8_mixer_specs(specs: Sequence) -> tuple:
     return tuple(inv.tensor_spec(spec.name, spec.shape, inv.W8)
                  if isinstance(spec, TensorSpec) and _MIXER_PROJECTION.fullmatch(spec.name) else spec
                  for spec in specs)
+
+
+def draft_head_specs(g: inv.Geometry) -> tuple[TensorSpec, ...]:
+    return (TensorSpec(shortlist.DRAFT_HEAD_OBJECT, (g.draft_vocab, g.hidden), Q4, inv.ROW_SPLIT_LAYOUT),
+            inv.tensor_spec(shortlist.DRAFT_HEAD_TOKEN_IDS_OBJECT, (g.draft_vocab,), inv.I32))
 
 
 def is_routed_object(name: str) -> bool:
@@ -615,7 +623,7 @@ def encode(tensor: torch.Tensor, spec, device: torch.device) -> bytes:
 
 
 def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None = None,
-            mtp: bool = True) -> Path:
+            mtp: bool = True, draft_head: bool = True) -> Path:
     started = time.perf_counter()
     model_dir = Path(model_dir)
     output = Path(out_path)
@@ -647,6 +655,13 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         tensor_specs, object_specs = inv.active_specs(geometry=g, vision=False, mtp=mtp)
         tensor_specs = w8_mixer_specs(routed_nvfp4_specs(tensor_specs, g))
         object_specs = w8_mixer_specs(routed_nvfp4_specs(object_specs, g))
+        # The shortlist only serves speculation, so it rides with the NextN head.
+        draft = shortlist.compute_shortlist(shortlist.DEFAULT_RANKING, model_dir, geometry=g) \
+            if mtp and draft_head else None
+        if draft is not None:
+            tensor_specs += draft_head_specs(g)
+            object_specs += draft_head_specs(g)
+        draft_vocab = g.draft_vocab if draft is not None else 0
 
         recipes = {item.object_name: item
                    for item in build_recipes(g) + (build_mtp_recipes(g) if mtp else ())}
@@ -654,6 +669,8 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         hashes = table.hash_words(g.ple_ngram, g.ple_heads) if table else {}
         draft_experts = MtpExperts(reader, g, mtp_expert_quantization(config)) if mtp else None
         planned = set(recipes) | set(hashes) | {inv.PLE_TABLE_RESOURCE} | (set(MTP_ROUTED) if mtp else set())
+        if draft is not None:
+            planned |= {spec.name for spec in draft_head_specs(g)}
         stray = [s.name for s in tensor_specs if s.name not in planned and not is_routed_object(s.name)]
         if stray or not unit_offset <= set(recipes):
             raise ValueError(f"objects with no source: {stray[:8]}")
@@ -664,7 +681,10 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         print(f"preflight: {preflight.source_tensor_count} dense sources, "
               f"{g.layers} layers of {g.experts} NVFP4 experts, "
               f"n-gram table {g.ple_table_rows} rows, "
-              f"NextN head {'converted' if mtp else 'left out'}", flush=True)
+              f"NextN head {'converted' if mtp else 'left out'}, "
+              f"draft head {'of ' + str(g.draft_vocab) + ' rows' if draft is not None else 'left out'}"
+              + (f" (ranking {'matched' if draft.ranking is not None else 'not attested: token-id order'})"
+                 if draft is not None else ""), flush=True)
 
         # A text-only artifact must not offer pixels: the processor configs the release ships
         # stay out, and the engine then refuses `--vision` against it.
@@ -679,7 +699,7 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
             output,
             ArtifactIdentity(inv.MODEL_ID, WEIGHTS_ID, architecture="qwen4exp"),
             plan.specs,
-            geometry=geometry_block(g),
+            geometry=geometry_block(g, draft_vocab=draft_vocab),
             layer_types=g.layer_types,
         ) as writer:
             for index, spec in enumerate(specs, start=1):
@@ -696,6 +716,14 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
                     tensor = draft_experts.tensor(spec.name, target)
                     payload = encode(tensor, spec, target)
                     del tensor
+                elif spec.name == shortlist.DRAFT_HEAD_TOKEN_IDS_OBJECT:
+                    payload = encode(shortlist.materialize_draft_head_token_ids(draft), spec, target)
+                elif spec.name == shortlist.DRAFT_HEAD_OBJECT:
+                    head = materialize_recipe(recipes["text/output_head"], reader)
+                    tensor = shortlist.materialize_draft_head(head, draft)
+                    del head
+                    payload = family_conversion.encode_tensor_payload(tensor, spec, target)
+                    del tensor
                 else:
                     tensor = materialize_recipe(recipes[spec.name], reader)
                     if spec.name in unit_offset:
@@ -711,8 +739,12 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         "recipe_id": RECIPE_ID,
         "model_id": inv.MODEL_ID,
         "weights_id": WEIGHTS_ID,
-        "geometry": geometry_block(g),
+        "geometry": geometry_block(g, draft_vocab=draft_vocab),
         "layer_types": list(g.layer_types),
+        "draft_head": None if draft is None else {
+            "rows": g.draft_vocab,
+            "ranking": str(draft.ranking) if draft.ranking is not None else None,
+        },
         "source": str(model_dir),
         "device": str(target),
         "elapsed_seconds": time.perf_counter() - started,
@@ -733,8 +765,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The ingest path asks every converter the same way; this one never converts either.
     parser.add_argument("--no-vision", action="store_true", help="accepted; the tower is never converted")
     parser.add_argument("--no-mtp", action="store_true", help="leave the NextN draft head out")
+    parser.add_argument("--no-draft-head", action="store_true",
+                        help="leave the shortlist head for --lm-head-draft out")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device, mtp=not args.no_mtp)
+    convert(args.model, args.out, device=args.device, mtp=not args.no_mtp,
+            draft_head=not args.no_draft_head)
     return 0
 
 

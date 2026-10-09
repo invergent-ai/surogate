@@ -74,7 +74,7 @@ def _release(path, *, mtp=False):
     config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
                                      "quantized_layers": quantized}
     (path / "config.json").write_text(json.dumps(config))
-    (path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {"a": 0, "b": 1}},
+    (path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {f"t{i}": i for i in range(499)}},
                                                      "added_tokens": [{"id": 499}]}))
     (path / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages }}"}))
     (path / "generation_config.json").write_text(json.dumps({"eos_token_id": 1}))
@@ -134,10 +134,24 @@ def test_release_converts_nextn_head(tmp_path):
         assert artifact.find("mtp/layer/hc_ffn/up").format == inv.W8
         # The trunk keeps its NVFP4 experts beside the W8 draft ones.
         assert artifact.find("text/layers/0/mlp/routed_gate_up").format == checkpoint.NVFP4
+        # The shortlist head: the output head's rows for its token ids, at Q4.
+        assert artifact.geometry["draft_vocab"] == g.draft_vocab > 0
+        ids = _direct(artifact, "text/draft_head_token_ids")
+        assert ids.shape == (g.draft_vocab,) and len(set(ids.tolist())) == g.draft_vocab
+        assert int(ids.max()) < g.token_domain
+        shortlist = artifact.find("text/draft_head")
+        assert shortlist.format == "Q4G64_F16S" and tuple(shortlist.shape) == (g.draft_vocab, g.hidden)
+        head = stored["lm_head.weight"].float()[ids.long()]
+        cos = torch.nn.functional.cosine_similarity(_w8(artifact, "text/draft_head"), head, dim=1)
+        assert float(cos.min()) > 0.97
 
-    text_only = checkpoint.convert(tmp_path / "release", tmp_path / "text.sinfer", device="cpu", mtp=False)
-    with Artifact(text_only) as artifact:
-        assert not any(obj.name.startswith("mtp/") for obj in artifact.objects)
+    for name, options in (("text.sinfer", {"mtp": False}), ("no-draft.sinfer", {"draft_head": False})):
+        other = checkpoint.convert(tmp_path / "release", tmp_path / name, device="cpu", **options)
+        with Artifact(other) as artifact:
+            names = {obj.name for obj in artifact.objects}
+            assert not any(name.startswith("text/draft_head") for name in names)
+            assert artifact.geometry["draft_vocab"] == 0
+            assert any(name.startswith("mtp/") for name in names) == options.get("mtp", True)
 
 
 def test_nextn_head_refuses_what_the_engine_would_run_differently():

@@ -59,11 +59,16 @@ def _ranking_matches_tokenizer(ranking: Path, tokenizer: Path, vocab: int) -> bo
         return False
     if not isinstance(manifest, dict):
         return False
-    expected = manifest.get("tokenizer_sha256")
-    if not isinstance(expected, str) or len(expected) != 64 or manifest.get("vocab") != vocab:
+    # `tokenizer_sha256` names the tokenizer the ranking was measured with; a tokenizer listed in
+    # `compatible_tokenizer_sha256` was checked to give every token the same id (it may add
+    # tokens at ids the measured one leaves unassigned, which the ranking then counts as zero).
+    compatible = manifest.get("compatible_tokenizer_sha256")
+    expected = [manifest.get("tokenizer_sha256"), *(compatible if isinstance(compatible, list) else [])]
+    expected = {digest.lower() for digest in expected if isinstance(digest, str) and len(digest) == 64}
+    if not expected or manifest.get("vocab") != vocab:
         return False
     with (tokenizer / "tokenizer.json").open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest() == expected.lower()
+        return hashlib.file_digest(handle, "sha256").hexdigest() in expected
 
 
 def read_special_ids(tokenizer_dir: str | Path) -> tuple[int, ...]:

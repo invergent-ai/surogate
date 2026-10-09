@@ -444,7 +444,6 @@ struct TextGeometry {
             std::int64_t(g.max_context) + g.indexer_block - 1 > INT32_MAX) {
             throw std::invalid_argument("unsupported QSA indexer geometry");
         }
-        if (g.draft_vocab != 0) { throw std::invalid_argument("qwen4exp does not use a shortlist head"); }
         if (g.ple_ngram) {
             if (g.ple_ngram < 2 || g.ple_ngram > 3 || g.ple_heads_per_ngram <= 0 ||
                 std::int64_t(g.ple_ngram - 1) * g.ple_heads_per_ngram > 16 ||

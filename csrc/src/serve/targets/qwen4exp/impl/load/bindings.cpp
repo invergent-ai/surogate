@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sinfer::targets::qwen4exp::detail {
 namespace {
@@ -294,6 +295,22 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     return out;
 }
 
+// The shortlist's ids must be distinct tokens of the tokenizer: the proposal maps a row's
+// argmax back through them.
+void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle,
+                        const family::TextGeometry& g) {
+    const auto bytes = binder.payload(handle).data;
+    std::vector<bool> seen(static_cast<std::size_t>(g.token_domain), false);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(g.draft_vocab); ++i) {
+        std::uint32_t id = 0;
+        std::memcpy(&id, bytes.data() + i * sizeof(std::uint32_t), sizeof(id));
+        if (id >= seen.size() || seen[id]) {
+            throw artifact::ArtifactError("invalid draft-head token ids");
+        }
+        seen[id] = true;
+    }
+}
+
 } // namespace
 
 family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
@@ -385,6 +402,25 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
 
     out.output_mix  = bind_hc(g, binder, "text/output_hc/", false);
     out.output_head = linear(binder, "text/output_head", g.output_rows, g.hidden);
+
+    // The shortlist draft head: rows of the output head for the most frequent tokens, which
+    // `--lm-head-draft` proposes through instead of the full vocabulary. Bound whenever the
+    // artifact carries it, resident only when the run asked for it.
+    const bool has_draft_head = binder.has("text/draft_head");
+    if (features.optimized_proposal() && (!has_draft_head || g.draft_vocab <= 0)) {
+        throw std::runtime_error(
+            "--lm-head-draft needs an artifact converted with a draft head (text/draft_head)");
+    }
+    if (has_draft_head) {
+        const TensorPlacement placement =
+            features.optimized_proposal() ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
+        out.draft_head = artifact::bind_linear(binder, "text/draft_head", g.draft_vocab, g.hidden,
+                                               placement);
+        out.draft_head_token_ids = artifact::bind_tensor(
+            binder, "text/draft_head_token_ids", NumericFormat::I32,
+            {static_cast<std::uint64_t>(g.draft_vocab)}, placement);
+        validate_draft_ids(binder, out.draft_head_token_ids, g);
+    }
 
     // The NextN draft head. Bound whenever the artifact carries one, because every object an
     // artifact holds has to be consumed by the target that reads it -- but resident only when
@@ -654,6 +690,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.output_head = artifact::materialized_linear(backing, plan.output_head,
                                                         static_cast<std::int32_t>(g.output_rows),
                                                         static_cast<std::int32_t>(g.hidden));
+    if (plan.features.optimized_proposal()) {
+        auto& proposal     = runtime.optimized_proposal.emplace();
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, g.draft_vocab,
+                                                           static_cast<std::int32_t>(g.hidden));
+        proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
+                                                           NumericFormat::I32, {g.draft_vocab});
+    }
 
     if (g.ple_ngram) {
         PleWeights& ple = runtime.ple;
