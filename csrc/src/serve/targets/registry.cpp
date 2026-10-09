@@ -129,6 +129,31 @@ std::size_t explicit_capacity_headroom(int device, const KvCapacityPolicy& polic
                : 0;
 }
 
+// On a GPU that shares the host's memory, what this process's own host side grows by after the
+// KV cache is sized: the warm-ups load each round's kernels and the captures build its graphs.
+// On a DGX Spark that came to 2.4-2.6 GiB of resident set for Surogate3.7-35B-A3B and
+// Qwen3.8-Flash-Next alike (2026-10-09). It comes out of the same memory the device allocates
+// from, so an automatic cache sized without it took it from the host reserve: full, it left
+// the host about 7 of its 8 GiB. Charged to an automatic cache only, as an explicit size is the
+// operator's own; SUROGATE_UNIFIED_MEMORY_STARTUP_MIB replaces the 2.5 GiB.
+std::size_t startup_host_growth_bytes(int device, const KvCapacityPolicy& policy) {
+    if (policy.mode != KvCapacityMode::Automatic || !device_is_integrated(device)) { return 0; }
+    static const std::size_t bytes = [] {
+        if (const char* raw = std::getenv("SUROGATE_UNIFIED_MEMORY_STARTUP_MIB");
+            raw != nullptr && *raw != '\0') {
+            char* end                    = nullptr;
+            const unsigned long long mib = std::strtoull(raw, &end, 10);
+            if (end != raw && *end == '\0') { return static_cast<std::size_t>(mib) << 20; }
+            std::fprintf(stderr,
+                         "SUROGATE_UNIFIED_MEMORY_STARTUP_MIB=%s is not a whole number of MiB; "
+                         "keeping 2560\n",
+                         raw);
+        }
+        return std::size_t{2560} << 20;
+    }();
+    return bytes;
+}
+
 // resolve_kv_capacity, with the limit named in its refusal.
 runtime::KvCapacityResolution resolve_kv_capacity_within_limit(int device,
                                                                const KvCapacityPolicy& policy,
@@ -357,10 +382,17 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const std::size_t derived_residency_bytes =
         projected_derived_residency_bytes(binder, load_plan.materialization(),
                                           target_linear_policy<Target>());
+    const std::size_t startup_host_bytes = startup_host_growth_bytes(device.device, options.kv_capacity);
+    if (startup_host_bytes != 0) {
+        std::fprintf(stderr,
+                     "engine: KV sizing leaves %zu MiB for startup's own host memory (the GPU "
+                     "shares system memory)\n",
+                     startup_host_bytes >> 20);
+    }
     const std::size_t preflight_runtime_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(options.borrowed_weights.empty()
             ? load_plan.materialization().device_capacity_bytes : 0),
-        derived_residency_bytes);
+        derived_residency_bytes + startup_host_bytes);
     if (const std::size_t limit = device_memory_limit(device.device); limit != 0) {
         // The load also holds staging for the objects it rearranges; under a limit it must fit
         // beside the weights, or the limit is exceeded before serving even starts.
@@ -419,7 +451,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     runtime::KvCapacityResolution capacity_resolution = resolve_kv_capacity_within_limit(
         device.device, kv_policy, curve,
         subtract_saturating(
-            subtract_saturating(current_free_device_bytes(), derived_residency_bytes),
+            subtract_saturating(current_free_device_bytes(), derived_residency_bytes + startup_host_bytes),
             elastic_kv_unmapped_commitment(device.device)));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||

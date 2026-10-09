@@ -64,7 +64,9 @@ above. The Makefile finds the CUDA toolkit in `/usr/local/cuda`, where DGX OS ke
 
 The GPU shares the machine's memory with the system. Surogate counts as free what the system
 can still give it (`MemAvailable`, which includes reclaimable page cache) less 8 GiB left to
-the host. Set `SUROGATE_UNIFIED_MEMORY_RESERVE_MIB` to change that reserve.
+the host. Set `SUROGATE_UNIFIED_MEMORY_RESERVE_MIB` to change that reserve. The serving engine's
+automatic KV cache also leaves 2.5 GiB for the engine's own host memory
+(`SUROGATE_UNIFIED_MEMORY_STARTUP_MIB`), so a full cache does not eat into that reserve.
 
 ## Verify installation
 
