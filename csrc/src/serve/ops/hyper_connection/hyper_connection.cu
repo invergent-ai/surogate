@@ -20,6 +20,10 @@ namespace {
 
 constexpr int kThreads    = 256;
 constexpr int kMaxStreams = 8;
+// The stream norm: eight values per 16-byte load, and two loads per thread in flight per pass,
+// which covers a stream of up to 4,096 values in one pass.
+constexpr int kNormVec    = 8;
+constexpr int kNormChunks = 2;
 // W8 projections take the mixer's own kernels up to this many tokens (decode, speculative
 // verify); wider rounds dequantise the matrix to BF16 and keep cuBLASLt's tensor cores.
 constexpr int kW8DirectTokens = 64;
@@ -44,48 +48,129 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 // projections. A mixer also keeps the stream's inverse RMS for `finish_kernel` (`inv`, FP32
 // [T, streams]) and, when it combines, this stream's share of each inject row's dot with n in
 // FP32 (`inject_partial`, [T, streams (this one), streams (the row)]).
-template <bool kInject>
-__global__ void stream_norm_kernel(const __nv_bfloat16* __restrict__ residual,
-                                   const float* __restrict__ gamma,
-                                   const __nv_bfloat16* __restrict__ inject_weight, int hidden,
-                                   int streams, float eps, __nv_bfloat16* __restrict__ normalized,
-                                   float* __restrict__ inv_out, float* __restrict__ inject_partial) {
+// A decode round launches only streams x tokens blocks, so the block's latency is the kernel's:
+// each thread takes eight values per 16-byte load and issues every load of a pass (stream,
+// gamma, inject rows) before using any, and the inject shares are reduced together. kStreams
+// fixes the stream count at compile time (0: up to kMaxStreams at run time), which keeps the
+// inject rows in flight within two blocks' worth of registers per SM.
+template <bool kInject, int kStreams = 0>
+__global__ void __launch_bounds__(kThreads, 2)
+    stream_norm_kernel(const __nv_bfloat16* __restrict__ residual, const float* __restrict__ gamma,
+                       const __nv_bfloat16* __restrict__ inject_weight, int hidden, int streams,
+                       float eps, __nv_bfloat16* __restrict__ normalized,
+                       float* __restrict__ inv_out, float* __restrict__ inject_partial) {
     __shared__ float scratch[kThreads / 32];
+    constexpr int kRows = kStreams > 0 ? kStreams : kMaxStreams;
+    __shared__ float warp_shares[kRows][kThreads / 32];
     const int token  = static_cast<int>(blockIdx.x) / streams;
     const int stream = static_cast<int>(blockIdx.x) - token * streams;
     const int width  = hidden * streams;
+    const int chunks = hidden / kNormVec; // hidden % kNormVec == 0, checked by the launchers
+    const int tid    = static_cast<int>(threadIdx.x);
     const std::int64_t base =
         static_cast<std::int64_t>(token) * width + static_cast<std::int64_t>(stream) * hidden;
     const __nv_bfloat16* x = residual + base;
-    float sum_sq           = 0.0F;
-    for (int d = static_cast<int>(threadIdx.x); d < hidden; d += kThreads) {
-        const float v = __bfloat162float(x[d]);
-        sum_sq        = fmaf(v, v, sum_sq);
+
+    float sum_sq = 0.0F;
+    for (int first = 0; first < chunks; first += kThreads * kNormChunks) {
+        uint4 packed[kNormChunks];
+#pragma unroll
+        for (int c = 0; c < kNormChunks; ++c) {
+            const int chunk = first + c * kThreads + tid;
+            packed[c] = chunk < chunks ? *reinterpret_cast<const uint4*>(x + chunk * kNormVec)
+                                       : make_uint4(0U, 0U, 0U, 0U);
+        }
+#pragma unroll
+        for (int c = 0; c < kNormChunks; ++c) {
+            const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed[c]);
+#pragma unroll
+            for (int i = 0; i < kNormVec / 2; ++i) {
+                const float2 v = __bfloat1622float2(pairs[i]);
+                sum_sq         = fmaf(v.x, v.x, sum_sq);
+                sum_sq         = fmaf(v.y, v.y, sum_sq);
+            }
+        }
     }
     const float total = block_sum(sum_sq, scratch);
     const float inv   = rsqrtf(total / static_cast<float>(hidden) + eps);
-    if (inv_out != nullptr && threadIdx.x == 0) { inv_out[blockIdx.x] = inv; }
-    float dots[kMaxStreams] = {};
-    for (int d = static_cast<int>(threadIdx.x); d < hidden; d += kThreads) {
-        const float v = __bfloat162float(x[d]) * inv * gamma[stream * hidden + d];
-        normalized[base + d] = __float2bfloat16_rn(v);
-        if constexpr (kInject) {
-            const __nv_bfloat16* column = inject_weight + static_cast<std::int64_t>(stream) * hidden + d;
+    if (inv_out != nullptr && tid == 0) { inv_out[blockIdx.x] = inv; }
+
+    float dots[kRows] = {};
+    const float* stream_gamma = gamma + static_cast<std::int64_t>(stream) * hidden;
+    for (int first = 0; first < chunks; first += kThreads * kNormChunks) {
+        uint4 packed[kNormChunks];
+        float4 scale[kNormChunks][2];
+        uint4 rows[kInject ? kNormChunks : 1][kInject ? kRows : 1];
 #pragma unroll
-            for (int r = 0; r < kMaxStreams; ++r) {
-                if (r < streams) { dots[r] = fmaf(__bfloat162float(column[static_cast<std::int64_t>(r) * width]), v, dots[r]); }
+        for (int c = 0; c < kNormChunks; ++c) {
+            const int chunk = first + c * kThreads + tid;
+            if (chunk >= chunks) { continue; }
+            const int d = chunk * kNormVec;
+            packed[c]   = *reinterpret_cast<const uint4*>(x + d);
+            scale[c][0] = *reinterpret_cast<const float4*>(stream_gamma + d);
+            scale[c][1] = *reinterpret_cast<const float4*>(stream_gamma + d + 4);
+            if constexpr (kInject) {
+                const __nv_bfloat16* column =
+                    inject_weight + static_cast<std::int64_t>(stream) * hidden + d;
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    if (kStreams > 0 || r < streams) {
+                        rows[c][r] = *reinterpret_cast<const uint4*>(
+                            column + static_cast<std::int64_t>(r) * width);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < kNormChunks; ++c) {
+            const int chunk = first + c * kThreads + tid;
+            if (chunk >= chunks) { continue; }
+            const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed[c]);
+            const float g[kNormVec] = {scale[c][0].x, scale[c][0].y, scale[c][0].z, scale[c][0].w,
+                                       scale[c][1].x, scale[c][1].y, scale[c][1].z, scale[c][1].w};
+            float v[kNormVec];
+            uint4 out;
+            auto* out_pairs = reinterpret_cast<__nv_bfloat162*>(&out);
+#pragma unroll
+            for (int i = 0; i < kNormVec / 2; ++i) {
+                const float2 pair = __bfloat1622float2(pairs[i]);
+                v[2 * i]          = pair.x * inv * g[2 * i];
+                v[2 * i + 1]      = pair.y * inv * g[2 * i + 1];
+                out_pairs[i]      = __floats2bfloat162_rn(v[2 * i], v[2 * i + 1]);
+            }
+            *reinterpret_cast<uint4*>(normalized + base + chunk * kNormVec) = out;
+            if constexpr (kInject) {
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    if (kStreams > 0 || r < streams) {
+                        const auto* weight = reinterpret_cast<const __nv_bfloat162*>(&rows[c][r]);
+#pragma unroll
+                        for (int i = 0; i < kNormVec / 2; ++i) {
+                            const float2 w = __bfloat1622float2(weight[i]);
+                            dots[r]        = fmaf(w.x, v[2 * i], dots[r]);
+                            dots[r]        = fmaf(w.y, v[2 * i + 1], dots[r]);
+                        }
+                    }
+                }
             }
         }
     }
     if constexpr (kInject) {
+        const int lane = tid & 31;
+        const int warp = tid >> 5;
 #pragma unroll
-        for (int r = 0; r < kMaxStreams; ++r) {
-            if (r < streams) {
-                const float share = block_sum(dots[r], scratch);
-                if (threadIdx.x == 0) {
-                    inject_partial[static_cast<std::int64_t>(blockIdx.x) * streams + r] = share;
-                }
+        for (int r = 0; r < kRows; ++r) {
+            if (kStreams > 0 || r < streams) {
+                const float share = warp_reduce_sum(dots[r]);
+                if (lane == 0) { warp_shares[r][warp] = share; }
             }
+        }
+        __syncthreads();
+        if (tid < streams) {
+            float share = 0.0F;
+#pragma unroll
+            for (int w = 0; w < kThreads / 32; ++w) { share += warp_shares[tid][w]; }
+            inject_partial[static_cast<std::int64_t>(blockIdx.x) * streams + tid] = share;
         }
     }
 }
@@ -485,6 +570,9 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int3
         throw std::invalid_argument("hyper_connection: norm must be FP32 [streams*hidden]");
     }
     if (streams > kMaxStreams) { throw std::invalid_argument("hyper_connection: too many streams"); }
+    if (((width / streams) % kNormVec) != 0) {
+        throw std::invalid_argument("hyper_connection: stream width must be a multiple of 8");
+    }
     stream_norm_kernel<false><<<static_cast<unsigned>(tokens) * streams, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(norm.data),
         nullptr, width / streams, streams, eps, static_cast<__nv_bfloat16*>(normalized.data),
@@ -532,10 +620,19 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
     const auto* residual_data  = static_cast<const __nv_bfloat16*>(residual.data);
     const auto* gamma          = static_cast<const float*>(weights.norm.data);
     if (inject != nullptr) {
-        stream_norm_kernel<true><<<norm_blocks, kThreads, 0, stream>>>(
-            residual_data, gamma, static_cast<const __nv_bfloat16*>(weights.inject.qdata), hidden,
-            streams, eps, static_cast<__nv_bfloat16*>(normalized.data),
-            static_cast<float*>(inv.data), static_cast<float*>(shares.data));
+        const auto* inject_rows = static_cast<const __nv_bfloat16*>(weights.inject.qdata);
+        auto* norm_out          = static_cast<__nv_bfloat16*>(normalized.data);
+        auto* inv_out           = static_cast<float*>(inv.data);
+        auto* share_out         = static_cast<float*>(shares.data);
+        if (streams == 4) { // Qwen3.8-Flash-Next
+            stream_norm_kernel<true, 4><<<norm_blocks, kThreads, 0, stream>>>(
+                residual_data, gamma, inject_rows, hidden, streams, eps, norm_out, inv_out,
+                share_out);
+        } else {
+            stream_norm_kernel<true><<<norm_blocks, kThreads, 0, stream>>>(
+                residual_data, gamma, inject_rows, hidden, streams, eps, norm_out, inv_out,
+                share_out);
+        }
     } else {
         stream_norm_kernel<false><<<norm_blocks, kThreads, 0, stream>>>(
             residual_data, gamma, nullptr, hidden, streams, eps,
