@@ -122,8 +122,9 @@ struct ServeOptions {
     // on what else shares its rounds (api/ops/batch_invariant.h). Off by default: it trades
     // throughput for reproducibility.
     bool batch_invariant = false;
-    bool enable_thinking =
-        true; // default thinking mode for the generation prompt (--no-thinking opts out)
+    // Default thinking mode for the generation prompt: --thinking or --no-thinking, else what
+    // the chat template does when nothing asks (PromptCapabilities::thinking_by_default).
+    std::optional<bool> enable_thinking;
     bool preserve_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs

@@ -436,7 +436,9 @@ mass. These filters also apply during speculative decoding.
 
 ### Thinking
 
-`--no-thinking` requests answers without reasoning when the model supports disabling it.
+Without a flag, each model thinks or not as its chat template does by default (Qwen and
+Granite think, Gemma 4 answers directly). `--thinking` or `--no-thinking` sets that default
+for every request on a model whose template has the toggle.
 `--preserve-thinking` keeps earlier assistant reasoning in later prompts. These settings are
 independent and can be overridden per request. Supported reasoning-effort values depend on
 the model's chat template.

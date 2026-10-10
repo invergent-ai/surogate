@@ -587,6 +587,10 @@ struct PromptCapabilities {
     /// GLM-5.3-Flash always opens one and offers no switch, so a request that
     /// asks for thinking off is refused rather than answered with thinking on.
     bool reasoning_turn = false;
+    /// What the switch above is set to when nothing asks: a Jinja template's own render with
+    /// `enable_thinking` left undefined. Qwen's templates think unless told not to; Gemma 4's
+    /// answer directly unless asked to think. The hand-written templates think.
+    bool thinking_by_default = true;
     ReasoningEffortCapabilities reasoning_effort;
 };
 

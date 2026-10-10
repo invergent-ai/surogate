@@ -160,7 +160,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--gpu-memory-limit-mib N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
-           "[--lm-head-draft|--full-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
            "[--decision-attempts N]\n"
@@ -201,6 +201,9 @@ std::string serve_usage_text(const char* argv0) {
            "                           (weights and cache parked in host RAM), waking restores in "
            "~a second;\n"
            "                           not available on a GPU that shares system memory (DGX Spark)\n"
+           "       --thinking and --no-thinking set the default thinking mode where the template\n"
+           "         has a switch; without either, the template's own default holds (Qwen thinks,\n"
+           "         Gemma 4 answers directly). Requests override it.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -649,6 +652,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--full-head-draft") {
             options.speculative.proposal_head          = ProposalHead::Full;
             options.speculative.proposal_head_explicit = true;
+        } else if (arg == "--thinking") {
+            options.enable_thinking = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {

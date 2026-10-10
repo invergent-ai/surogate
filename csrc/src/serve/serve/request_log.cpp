@@ -539,7 +539,7 @@ std::string format_server_start_json(
                               {"media_preprocess_threads", options.media_preprocess_threads},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
-                              {"default_thinking", options.enable_thinking},
+                              {"default_thinking", options.enable_thinking ? Json(*options.enable_thinking) : Json("template")},
                               {"default_preserve_thinking", options.preserve_thinking},
                               {"decision_temperature", options.decision_temperature},
                               {"decision_attempts", options.decision_attempts}};

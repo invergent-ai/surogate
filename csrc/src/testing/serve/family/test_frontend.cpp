@@ -752,6 +752,15 @@ int test_jinja_capability_probe() {
     const sinfer::PromptCapabilities toggled = fi::probe_jinja_capabilities(toggle_source, toggle, {});
     failures += check(toggled.enable_thinking && toggled.reasoning_turn && !toggled.reasoning_effort.any(),
                       "a thinking switch was not read off the prompts it renders");
+    failures += check(toggled.thinking_by_default,
+                      "a switch that thinks when nothing asks was read as off by default");
+    // Gemma 4's way round: the switch exists and nothing set means no thinking.
+    const auto opt_in = [](const fi::ChatTemplateVariables& variables) {
+        return std::string("model: ") + (variables.enable_thinking.value_or(false) ? "<|think|>" : "");
+    };
+    const sinfer::PromptCapabilities opted = fi::probe_jinja_capabilities(toggle_source, opt_in, {});
+    failures += check(opted.enable_thinking && !opted.thinking_by_default,
+                      "a switch that stays off when nothing asks was read as on by default");
 
     // Nothing renders: nothing is claimed, rather than something assumed.
     const auto broken = [](const fi::ChatTemplateVariables&) -> std::string {

@@ -161,7 +161,8 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                                  const ServeOptions& server,
                                                  const sinfer::PromptCapabilities& capabilities) {
     ResolvedPromptSemantics result{
-        .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
+        .enable_thinking   = request.enable_thinking.value_or(
+            server.enable_thinking.value_or(capabilities.thinking_by_default)),
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };

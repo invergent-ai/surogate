@@ -625,6 +625,8 @@ PromptCapabilities probe_jinja_capabilities(std::string_view source,
         const std::optional<std::string> off = attempt({.enable_thinking = false});
         // Only a template whose prompt actually changes has a switch to drive.
         result.enable_thinking = on && off && *on != *off;
+        // Its default is whichever way the render with nothing set already went.
+        if (result.enable_thinking) { result.thinking_by_default = *base != *off; }
     }
 
     if (!mentions_variable(source, "reasoning_effort")) { return result; }

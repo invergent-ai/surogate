@@ -402,6 +402,25 @@ int main() {
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");
+    {
+        // No flag: the template's own default. A flag overrides it, a request overrides both.
+        failures += check(!defaults.enable_thinking, "the server should not fix a thinking default");
+        sinfer::PromptCapabilities opt_in = prompt_capabilities;
+        opt_in.thinking_by_default        = false;
+        GenerationRequest plain;
+        plain.max_tokens = 1;
+        failures += check(!resolve_prompt_semantics(plain, defaults, opt_in).enable_thinking &&
+                              resolve_prompt_semantics(plain, defaults, prompt_capabilities).enable_thinking,
+                          "the template's default thinking mode was not kept");
+        const auto on  = parse({"sinfer-serve", "model.sinfer", "--thinking"});
+        const auto off = parse({"sinfer-serve", "model.sinfer", "--no-thinking"});
+        failures += check(resolve_prompt_semantics(plain, on, opt_in).enable_thinking &&
+                              !resolve_prompt_semantics(plain, off, prompt_capabilities).enable_thinking,
+                          "--thinking / --no-thinking did not override the template's default");
+        plain.enable_thinking = true;
+        failures += check(resolve_prompt_semantics(plain, off, opt_in).enable_thinking,
+                          "a request's enable_thinking did not win over --no-thinking");
+    }
     request.preserve_thinking = false;
     failures +=
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,

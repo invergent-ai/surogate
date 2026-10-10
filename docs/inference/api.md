@@ -215,8 +215,10 @@ With a matching reasoning parser, non-streaming responses put reasoning in
 `message.reasoning_content` and the answer in `message.content`. Streaming responses use
 `reasoning_content` and `content` deltas respectively.
 
-`--no-thinking` sets the default thinking request to off where the template supports a toggle;
-per-request `enable_thinking` overrides that setting. Some models always reason and cannot
+Where the template has a thinking toggle, a request that does not set `enable_thinking` gets
+the template's own default, as vLLM does: Qwen and Granite think, Gemma 4 answers directly.
+`--thinking` or `--no-thinking` replaces that default; per-request `enable_thinking` overrides
+both. Some models always reason and cannot
 disable it. Unsupported per-request toggles or effort values are refused. `--preserve-thinking`
 keeps earlier assistant reasoning in later prompts; the request's `preserve_thinking` overrides
 that default. If you supply both a top-level setting and its `chat_template_kwargs` equivalent,
