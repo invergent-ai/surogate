@@ -606,6 +606,9 @@ sinfer_add_op_test(sinfer_w8_pipelined_test SOURCES ops/linear/test_w8_pipelined
 sinfer_add_op_test(sinfer_w8_route_bench
   SOURCES ops/linear/bench_w8_routes.cpp ops/linear/linear_test_common.cpp
   LIBRARIES sinfer_ops CUDA::cudart)
+sinfer_add_op_test(sinfer_nvfp4_route_bench
+  SOURCES ops/linear/bench_nvfp4_routes.cpp ops/linear/linear_test_common.cpp
+  LIBRARIES sinfer_ops CUDA::cudart CUDA::cublasLt)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 sinfer_add_op_test(sinfer_linear_nvfp4_cublaslt_test SOURCES ops/linear/test_nvfp4_cublaslt.cpp  LIBRARIES sinfer_ops CUDA::cublasLt)
