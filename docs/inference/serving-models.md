@@ -242,7 +242,13 @@ The converter keeps each module as the checkpoint stores it: NVFP4 where the exp
 quantised it, BF16 where it did not. To prepare the artifact yourself, for example to add a
 DFlash drafter, run the converter directly. `--text-format w8` stores the unquantised matrices
 as W8 instead of BF16. That saves about 2 GB but makes prefill about three times slower on this
-model.
+model. `--text-format fp8` stores the attention and dense feed-forward projections in FP8 for
+the FP8 tensor cores instead, with a scale per 128 by 128 block (per row where a matrix's rows
+are not whole 128s), and quantises each prompt token's activations per 128 values.
+
+The same option applies to the other Gemma converters. A per-channel FP8 export, such as Red
+Hat's Gemma 3 `FP8-dynamic` checkpoints, defaults to `fp8` and keeps the export's own codes and
+row scales; `--text-format w8` re-encodes it as before.
 
 ```bash
 python -m surogate.serve.convert.gemma_vl.convert --model my-gemma4-26b-nvfp4 \
