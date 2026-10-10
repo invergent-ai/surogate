@@ -127,9 +127,64 @@ def quantize_and_encode(
     return encode_row_split(quantized.codes, quantized.scales, spec, weight.shape)
 
 
+FP8_E4M3_MAX = 448.0
+FP8_BLOCK = 128
+
+
+def _fp8_codes(values: torch.Tensor, multipliers: torch.Tensor) -> torch.Tensor:
+    """E4M3FN code words of ``values / multipliers``, rounded to nearest. The quotient is
+    clamped to the finite range first: E4M3FN has no infinity, so an overflow would be NaN."""
+
+    scaled = torch.clamp(values / multipliers, -FP8_E4M3_MAX, FP8_E4M3_MAX)
+    return scaled.to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+def _fp8_multipliers(max_abs: torch.Tensor) -> torch.Tensor:
+    """One FP32 multiplier per group, mapping its largest magnitude to 448. An all-zero group
+    takes 1, which its zero codes ignore; the artifact refuses a multiplier that is not
+    positive."""
+
+    if not bool(torch.isfinite(max_abs).all()):
+        raise ValueError("FP8 quantization source contains NaN or infinity")
+    return torch.where(max_abs > 0, max_abs / FP8_E4M3_MAX, torch.ones_like(max_abs))
+
+
+def quantize_fp8_blocks(
+    weight: torch.Tensor, *, device: str | torch.device | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """E4M3FN codes [n, k] and FP32 multipliers [n/128, k/128] of a matrix of whole 128 x 128
+    blocks, each block against its own largest magnitude (DeepSeek's block-FP8 recipe)."""
+
+    if weight.dim() != 2 or weight.shape[0] % FP8_BLOCK or weight.shape[1] % FP8_BLOCK:
+        raise ValueError(f"block FP8 needs whole {FP8_BLOCK} x {FP8_BLOCK} blocks, got {tuple(weight.shape)}")
+    target = pick_device() if device is None else pick_device(device)
+    values = weight.detach().to(device=target, dtype=torch.float32)
+    n, k = values.shape
+    blocks = values.reshape(n // FP8_BLOCK, FP8_BLOCK, k // FP8_BLOCK, FP8_BLOCK)
+    multipliers = _fp8_multipliers(blocks.abs().amax(dim=(1, 3)))
+    codes = _fp8_codes(blocks, multipliers[:, None, :, None]).reshape(n, k)
+    return codes.cpu(), multipliers.cpu()
+
+
+def quantize_fp8_rows(
+    weight: torch.Tensor, *, device: str | torch.device | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """E4M3FN codes [n, k] and one FP32 multiplier per row, each row against its own largest
+    magnitude (the compressed-tensors per-channel recipe)."""
+
+    if weight.dim() != 2:
+        raise ValueError(f"row FP8 needs a matrix, got {tuple(weight.shape)}")
+    target = pick_device() if device is None else pick_device(device)
+    values = weight.detach().to(device=target, dtype=torch.float32)
+    multipliers = _fp8_multipliers(values.abs().amax(dim=1))
+    return _fp8_codes(values, multipliers[:, None]).cpu(), multipliers.cpu()
+
+
 __all__ = [
     "QuantizedMatrix",
     "pick_device",
     "quantize_and_encode",
+    "quantize_fp8_blocks",
+    "quantize_fp8_rows",
     "quantize_matrix",
 ]

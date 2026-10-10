@@ -12,6 +12,7 @@
 #include "core/layout.h"
 #include "family/impl/lora_hook.h"
 #include "family/impl/moe/moe_routing.h"
+#include "family/impl/storage_workspace.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -131,7 +132,7 @@ std::size_t attention_output_workspace_bytes(const family::TextGeometry& g, QTyp
 }
 
 std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType qtype,
-                                       std::int32_t first, std::int32_t last) {
+                                       QType down_qtype, std::int32_t first, std::int32_t last) {
     // The dense branch is the dense target's: gate, up, the gated activation and the down
     // projection, four planes because `gelu_mul` requires its output not to overlap its
     // inputs. The mixture adds four hidden-wide planes beside them -- the two normalised
@@ -155,8 +156,13 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType qtyp
         account_linear(layout, qtype, dense, g.hidden, first, last);
         account_linear(layout, qtype, dense, g.hidden, first, last);
     }
-    account_linear(layout, qtype, g.hidden, dense, first, last);
+    account_linear(layout, down_qtype, g.hidden, dense, first, last);
     return layout.peak_bytes(1);
+}
+
+std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType qtype,
+                                       std::int32_t first, std::int32_t last) {
+    return post_mixer_workspace_bytes(g, qtype, qtype, first, last);
 }
 
 } // namespace
@@ -275,6 +281,13 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
         // transient storage); the routed profile is planned for either.
         bytes = std::max(bytes, attention_projection_workspace_bytes(geometry, QType::NVFP4, first, last));
     }
+    // An artifact converted with `--text-format fp8` stores the projections for the FP8 tensor
+    // cores, which quantise their activation into transient storage.
+    bytes = std::max(bytes, family::stored_roles_format_workspace(
+        geometry, {"attention/query", "attention/key", "attention/value"},
+        QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return attention_projection_workspace_bytes(geometry, type, first, last);
+        }));
     return bytes;
 }
 
@@ -286,6 +299,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
     if (weights_profile == WeightsProfile::RoutedNvfp4) {
         bytes = std::max(bytes, attention_output_workspace_bytes(geometry, QType::NVFP4, first, last));
     }
+    bytes = std::max(bytes, family::stored_roles_format_workspace(
+        geometry, {"attention/output"}, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return attention_output_workspace_bytes(geometry, type, first, last);
+        }));
     return bytes;
 }
 
@@ -411,6 +428,12 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     if (weights_profile == WeightsProfile::RoutedNvfp4) {
         planes = std::max(planes, post_mixer_workspace_bytes(geometry, QType::NVFP4, first, last));
     }
+    // FP8 gate and up (`--text-format fp8`). The down projection contracts the 2,112-wide dense
+    // intermediate, which is not whole 128s, so it keeps the text format's fallback.
+    planes = std::max(planes, family::stored_roles_format_workspace(
+        geometry, {"mlp/gate", "mlp/up"}, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return post_mixer_workspace_bytes(geometry, type, qtype, first, last);
+        }));
     const ops::SparseMoeGeometry moe_geometry{
         .hidden = geometry.hidden,
         .experts = geometry.experts,

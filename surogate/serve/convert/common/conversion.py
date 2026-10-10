@@ -29,10 +29,27 @@ from surogate.serve.artifact.container import (
     plan_objects,
     tensor_payload_bytes as stored_tensor_bytes,
 )
-from surogate.serve.artifact.layouts import align_up, encode_direct, encoded_size
-from surogate.serve.convert.common.quantize import quantize_and_encode
+from surogate.serve.artifact.layouts import (
+    align_up,
+    encode_direct,
+    encode_fp8_block_scaled,
+    encode_fp8_row_f32,
+    encoded_size,
+)
+from surogate.serve.convert.common.quantize import (
+    quantize_and_encode,
+    quantize_fp8_blocks,
+    quantize_fp8_rows,
+)
 
-from .inventory import DIRECT_FORMATS, ResourceSpec, StoredObjectSpec, TensorSpec
+from .inventory import (
+    DIRECT_FORMATS,
+    FP8_BLOCK,
+    FP8_ROW_F32,
+    ResourceSpec,
+    StoredObjectSpec,
+    TensorSpec,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +234,13 @@ def encode_tensor_payload(
 ) -> bytes:
     if spec.format in DIRECT_FORMATS:
         return encode_direct(tensor, spec.format)
+    # FP8 from values: a BF16 matrix a converter stores for the FP8 tensor cores.
+    if spec.format == FP8_BLOCK:
+        codes, multipliers = quantize_fp8_blocks(tensor, device=device)
+        return encode_fp8_block_scaled(codes, multipliers, spec.shape)
+    if spec.format == FP8_ROW_F32:
+        codes, multipliers = quantize_fp8_rows(tensor, device=device)
+        return encode_fp8_row_f32(codes, multipliers, spec.shape)
     return quantize_and_encode(tensor, spec.format, device=device)
 
 

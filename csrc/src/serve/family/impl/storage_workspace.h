@@ -71,6 +71,16 @@ std::size_t stored_format_workspace(const TextGeometry& geometry, QType type, Ca
     return 0;
 }
 
+/// Whether a matrix stored as `stored` takes the workspace a planner sizes for `asked`. Block-
+/// and row-scaled FP8 are one route (fp8_block::linear) with one workspace, so asking for the
+/// block format covers both.
+inline bool stored_as_workspace_format(QType stored, QType asked) {
+    const auto fp8 = [](QType type) {
+        return type == QType::FP8_E4M3FN_BLK128_F32S || type == QType::FP8_E4M3FN_ROW_F32S;
+    };
+    return stored == asked || (fp8(stored) && fp8(asked));
+}
+
 /// `capacity(type)` when some text layer stores one of `roles` as `type`, else 0. The form above
 /// answers for the whole artifact, which is right only when one format covers every projection:
 /// an export that quantises some roles and not others -- NVIDIA's Gemma 4 31B keeps its
@@ -84,7 +94,8 @@ std::size_t stored_roles_format_workspace(const TextGeometry& geometry,
     for (const auto& [name, storage] : geometry.linear_storage) {
         const std::string_view key = name;
         if (!key.starts_with(kLayers) ||
-            std::find(storage.formats.begin(), storage.formats.end(), type) == storage.formats.end()) {
+            std::none_of(storage.formats.begin(), storage.formats.end(),
+                         [&](QType stored) { return stored_as_workspace_format(stored, type); })) {
             continue;
         }
         const auto slash = key.find('/', kLayers.size());

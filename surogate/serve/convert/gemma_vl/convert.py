@@ -18,14 +18,20 @@ from . import inventory
 
 #: What a checkpoint's non-routed text matrices are stored as. The engine binds whichever format
 #: the artifact states, so this is a storage choice, not a model variant: `w8` is the groupwise
-#: int8 every Gemma artifact has used, `bf16` keeps the checkpoint's own words.
+#: int8 every Gemma artifact has used, `bf16` keeps the checkpoint's own words, and `fp8` stores
+#: the attention and feed-forward projections for the FP8 tensor cores (E4M3 with a multiplier
+#: per 128 x 128 block, or per row where only K is whole 128s), which a prompt round runs two to
+#: four times faster than W8 on a DGX Spark at the same bytes a decode step reads.
 #:
 #: The default follows the checkpoint. A BF16 checkpoint keeps `w8`, the artifact it always
-#: produced. A quantised export keeps what it stored: the modules its declaration left alone stay
-#: BF16, as the exporter shipped them -- which on Gemma 4 is also the fast route, because the
+#: produced. A per-channel FP8 export (Red Hat's Gemma 3) keeps its codes and row multipliers,
+#: `fp8`: the weights the exporter shipped, and the W8A8 FP8 compute it was made for. Any other
+#: quantised export keeps what it stored: the modules its declaration left alone stay BF16 on the
+#: mixture, as the exporter shipped them -- which on Gemma 4 is also the fast route, because the
 #: 2,112-wide dense feed-forward is not a shape the W8 tensor-core kernels take and runs on their
-#: SIMT fallback (docs/inference/serving-models.md, "Gemma 4 mixture in NVFP4").
-TEXT_FORMATS = ("w8", "bf16")
+#: SIMT fallback (docs/inference/serving-models.md, "Gemma 4 mixture in NVFP4") -- and become W8
+#: on a dense model.
+TEXT_FORMATS = ("w8", "bf16", "fp8")
 
 
 def resources_for(model, g):
@@ -87,10 +93,11 @@ def resources_for(model, g):
     return resources
 
 
-def _text_storage(specs, text_format):
+def _text_storage(specs, text_format, *, mixture=False):
     """The text specs with every dense per-layer matrix in `text_format`. The embedding
     table (and the head tied to it) keeps W8 either way: it is the largest single object and
-    the decode step reads one of its rows per token."""
+    the decode step reads one of its rows per token. Under `fp8` a matrix the FP8 kernels do not
+    take keeps W8 on a dense model and BF16 on the mixture (its 2,112-wide down projection)."""
     if text_format not in TEXT_FORMATS:
         raise ValueError(f"text format must be one of {TEXT_FORMATS}, not {text_format!r}")
     if text_format == "w8":
@@ -98,6 +105,13 @@ def _text_storage(specs, text_format):
     from dataclasses import replace
 
     from surogate.serve.convert.common.inventory import BF16, CONTIGUOUS_LAYOUT, W8
+
+    if text_format == "fp8":
+        from surogate.serve.convert.common.fp8_block_source import fp8_projection_specs
+
+        specs = fp8_projection_specs(specs)
+        if not mixture:
+            return specs
 
     # The routed experts are not dense matrices: the MoE kernels take them W8 or quantised, never
     # BF16, and they keep whatever the checkpoint and the profile gave them.
@@ -185,15 +199,18 @@ def convert(model_dir, out_path, *, device="cpu", text_format=None, dflash_model
     if text_format is None:
         # What the export left unquantised. The mixture keeps it BF16 (its 2,112-wide dense
         # feed-forward has no W8 tensor-core kernel); a dense model's attention converts to W8
-        # like every BF16 Gemma artifact, half the bytes a decode step reads.
-        text_format = "bf16" if (convention is not None and mixture) else "w8"
-    text_specs = _text_storage(text_specs, text_format)
+        # like every BF16 Gemma artifact, half the bytes a decode step reads. A per-channel FP8
+        # export keeps its codes.
+        text_format = ("fp8" if fp8_export and fp8_block_source.is_fp8_channel_export(config) else
+                       "bf16" if (convention is not None and mixture) else "w8")
+    text_specs = _text_storage(text_specs, text_format, mixture=mixture)
     vision_specs, vision_recipes = inventory.vision_recipes(g)
     fp8_source = fp8_plan = None
     if fp8_export:
         planned_specs = (*text_specs, *vision_specs)
         fp8_source, fp8_plan = fp8_block_source.for_checkpoint(
-            model, config, planned_specs, {r.object_name: r for r in (*text_recipes, *vision_recipes)})
+            model, config, planned_specs, {r.object_name: r for r in (*text_recipes, *vision_recipes)},
+            row_codes=text_format == "fp8")
         text_specs = fp8_plan.specs[: len(text_specs)]
         vision_specs = fp8_plan.specs[len(text_specs):]
         weights_id = "groupwise-int"
@@ -284,7 +301,8 @@ def main(argv=None):
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--text-format", choices=TEXT_FORMATS, default=None,
                         help="storage of the non-quantised text matrices (attention, dense feed-forward); "
-                             "default bf16 (as stored) for the mixture's NVFP4 export, w8 otherwise")
+                             "default fp8 (codes kept) for a per-channel FP8 export, bf16 (as stored) for "
+                             "the mixture's NVFP4 export, w8 otherwise")
     parser.add_argument("--dflash-model", type=Path, default=None,
                         help="a DFlash drafter checkpoint trained for this target, stored beside it")
     args = parser.parse_args(argv)

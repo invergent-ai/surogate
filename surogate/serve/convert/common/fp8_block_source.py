@@ -20,9 +20,14 @@ dequantise-requantise round trip:
   ``[experts * 2 * intermediate, hidden]`` with each expert's rows ``[gate; up]`` and
   ``[experts * hidden, intermediate]``. Hopper's grouped GEMM serves them (ops/sparse_moe/fp8_sm90).
 
+A per-channel export's projections in ``NATIVE_SUFFIXES`` keep their codes and row multipliers
+too (``FP8_E4M3FN_ROW_F32S``, the same kernels) when the converter asks for it (``row_codes``):
+the targets that plan workspace for that format.
+
 Every other object that reads FP8 sources -- a projection outside the whole-block grid, a
-per-channel export, a draft head or a shared expert whose kernels read W8 only -- is dequantised
-through the stored words and encoded in the converter's own format. Everything the export keeps
+per-channel export whose converter did not ask, a draft head or a shared expert whose kernels
+read W8 only -- is dequantised through the stored words and encoded in the converter's own
+format. Everything the export keeps
 in BF16 (embedding, output head, norms, routers) takes the base recipes unchanged.
 """
 
@@ -36,9 +41,15 @@ import numpy as np
 import torch
 
 from surogate.core.model.quant_schemes import read_tensor_shapes
-from surogate.serve.artifact.layouts import encode_fp8_block_scaled
+from surogate.serve.artifact.layouts import encode_fp8_block_scaled, encode_fp8_row_f32
 from surogate.serve.convert.common.conversion import encode_tensor_payload
-from surogate.serve.convert.common.inventory import BLOCK128_LAYOUT, FP8_BLOCK, TensorSpec
+from surogate.serve.convert.common.inventory import (
+    BLOCK128_LAYOUT,
+    FP8_BLOCK,
+    FP8_ROW_F32,
+    ROW_SCALE_F32_LAYOUT,
+    TensorSpec,
+)
 from surogate.serve.convert.common.recipe import TensorRecipe, expression_sources
 from surogate.serve.convert.common.row_algebra import RowShapeMismatch, evaluate_rows
 from surogate.serve.convert.common.safetensors import ShardReader, name_spellings
@@ -47,6 +58,8 @@ from surogate.serve.convert.common.safetensors import ShardReader, name_spelling
 WEIGHTS_ID = "fp8-block"
 
 BLOCK = 128
+#: The FP8 kernels' rows per CTA: a row-scaled matrix's rows must be whole tiles of them.
+ROW_TILE = 64
 SCALE_SUFFIX = "_scale_inv"  # appended to a logical ``.weight`` name: a block grid
 ROW_SCALE_SUFFIX = "_scale"  # compressed-tensors: one multiplier per row, or one in all
 
@@ -171,9 +184,10 @@ def _whole_blocks(rows: np.ndarray) -> bool:
 class ObjectSource:
     """How one artifact object is produced from the export.
 
-    ``codes``: the stored codes and block scales of ``segments``, in order. ``requantize``: the
-    segments' values, encoded in ``spec.format`` as the base converter would. ``routed``: the
-    per-expert Linears under ``experts`` stacked into the inventory's parent.
+    ``codes``: the stored codes and block scales of ``segments``, in order. ``row_codes``: their
+    codes and row multipliers. ``requantize``: the segments' values, encoded in ``spec.format``
+    as the base converter would. ``routed``: the per-expert Linears under ``experts`` stacked
+    into the inventory's parent.
     """
 
     spec: TensorSpec
@@ -206,8 +220,11 @@ class Fp8BlockSource:
     def is_block(self, logical: str) -> bool:
         return logical + SCALE_SUFFIX in self.shapes
 
+    def is_row(self, logical: str) -> bool:
+        return not self.is_block(logical) and logical + ROW_SCALE_SUFFIX in self.shapes
+
     def is_quantized(self, logical: str) -> bool:
-        return self.is_block(logical) or logical + ROW_SCALE_SUFFIX in self.shapes
+        return self.is_block(logical) or self.is_row(logical)
 
     # -- planning --------------------------------------------------------------
 
@@ -216,10 +233,13 @@ class Fp8BlockSource:
         specs: Sequence[TensorSpec],
         recipes_by_name: Mapping[str, TensorRecipe],
         experts: int,
+        row_codes: bool = False,
     ) -> SourcePlan:
         out: list[TensorSpec] = []
         objects: dict[str, ObjectSource] = {}
         counts = {"codes": 0, "routed": 0, "requantize": 0}
+        if row_codes:
+            counts["row_codes"] = 0
         for spec in specs:
             recipe = recipes_by_name.get(spec.name)
             role = _role(spec.name)
@@ -231,7 +251,7 @@ class Fp8BlockSource:
                     raise ValueError(f"{spec.name}: this converter does not read FP8 routed experts")
                 item = self._routed(spec, recipe, experts)
             else:
-                item = self._rows(spec, recipe, role)
+                item = self._rows(spec, recipe, role, row_codes)
             if item is None:
                 out.append(spec)  # BF16 sources: the base recipes read them
                 continue
@@ -266,7 +286,8 @@ class Fp8BlockSource:
         return ObjectSource(TensorSpec(spec.name, spec.shape, FP8_BLOCK, BLOCK128_LAYOUT), "routed",
                             experts=module, expert_count=experts)
 
-    def _rows(self, spec: TensorSpec, recipe: TensorRecipe, role: str | None) -> ObjectSource | None:
+    def _rows(self, spec: TensorSpec, recipe: TensorRecipe, role: str | None,
+              row_codes: bool = False) -> ObjectSource | None:
         try:
             program = evaluate_rows(recipe.expression, self.shapes, None)
         except RowShapeMismatch:
@@ -290,6 +311,18 @@ class Fp8BlockSource:
         if native:
             return ObjectSource(TensorSpec(spec.name, spec.shape, FP8_BLOCK, BLOCK128_LAYOUT),
                                 "codes", segments)
+        # Row multipliers select rows freely, so any row program of per-channel sources keeps
+        # its codes; the kernels contract K in 128s.
+        if (
+            row_codes
+            and spec.name.startswith("text/layers/")
+            and role in NATIVE_SUFFIXES
+            and all(self.is_row(source) for source, _ in segments)
+            and program.k % BLOCK == 0
+            and spec.shape[0] % ROW_TILE == 0
+        ):
+            return ObjectSource(TensorSpec(spec.name, spec.shape, FP8_ROW_F32, ROW_SCALE_F32_LAYOUT),
+                                "row_codes", segments)
         return ObjectSource(spec, "requantize", segments)
 
     # -- payloads ----------------------------------------------------------------
@@ -322,6 +355,15 @@ class Fp8BlockSource:
                 codes.append(stored.index_select(0, index))
                 scales.append(block_scales.index_select(0, index[::BLOCK] // BLOCK))
             return encode_fp8_block_scaled(torch.cat(codes), torch.cat(scales), item.spec.shape)
+        if item.kind == "row_codes":
+            codes, scales = [], []
+            for source, rows in item.segments:
+                stored = _codes(reader, source)
+                index = torch.from_numpy(np.ascontiguousarray(rows))
+                row_codes, row_scales = _row_words(reader, source, stored)
+                codes.append(row_codes.index_select(0, index))
+                scales.append(row_scales.index_select(0, index))
+            return encode_fp8_row_f32(torch.cat(codes), torch.cat(scales), item.spec.shape)
         parts = []
         for source, rows in item.segments:
             index = torch.from_numpy(np.ascontiguousarray(rows))
@@ -332,6 +374,30 @@ class Fp8BlockSource:
         return encode_tensor_payload(torch.cat(parts).contiguous(), item.spec, device)
 
 
+def fp8_projection_specs(specs: Sequence[TensorSpec]) -> tuple[TensorSpec, ...]:
+    """``specs`` with each W8 text-layer projection in ``NATIVE_SUFFIXES`` stored for the FP8
+    tensor cores instead: block-scaled where both axes are whole 128s, row-scaled where K is and
+    the rows are whole 64-row tiles. Anything else -- another role, a shape the kernels do not
+    take -- keeps its format. The payload is the codes an FP8 export stores (``plan``) or the
+    values quantised (``conversion.encode_tensor_payload``)."""
+
+    from dataclasses import replace
+
+    from surogate.serve.convert.common.inventory import W8
+
+    def stored(spec: TensorSpec) -> TensorSpec:
+        if (getattr(spec, "format", None) != W8 or not spec.name.startswith("text/layers/")
+                or _role(spec.name) not in NATIVE_SUFFIXES or spec.shape[1] % BLOCK):
+            return spec
+        if spec.shape[0] % BLOCK == 0:
+            return replace(spec, format=FP8_BLOCK, layout=BLOCK128_LAYOUT)
+        if spec.shape[0] % ROW_TILE == 0:
+            return replace(spec, format=FP8_ROW_F32, layout=ROW_SCALE_F32_LAYOUT)
+        return spec
+
+    return tuple(stored(spec) for spec in specs)
+
+
 def for_checkpoint(
     model_dir: str | Path,
     config: Mapping[str, object],
@@ -340,19 +406,22 @@ def for_checkpoint(
     *,
     experts: int = 0,
     repack: object | None = None,
+    row_codes: bool = False,
 ) -> tuple[Fp8BlockSource | None, SourcePlan | None]:
     """The FP8 source and object plan a converter writes ``model_dir`` with, or ``(None, None)``
     when the checkpoint is not an FP8 export. ``specs`` are the objects the converter would
     write; the plan's ``specs`` replace them, and its ``covered`` objects leave the base
-    recipes' source preflight, since this module reads their sources instead."""
+    recipes' source preflight, since this module reads their sources instead. ``row_codes``
+    keeps a per-channel export's projection codes (``FP8_E4M3FN_ROW_F32S``) for a target that
+    plans that format."""
 
     if not is_fp8_export(config):
         return None, None
     if repack is not None:
         raise ValueError("--gguf-repack reads a GGUF; point --model at a BF16 checkpoint, not an FP8 export")
     source = Fp8BlockSource(model_dir)
-    plan = source.plan(specs, recipes_by_name, experts)
-    print(f"fp8 export: {plan.counts['codes']} objects keep their FP8 codes, "
+    plan = source.plan(specs, recipes_by_name, experts, row_codes)
+    print(f"fp8 export: {plan.counts['codes'] + plan.counts.get('row_codes', 0)} objects keep their FP8 codes, "
           f"{plan.counts['routed']} routed parents stack them, "
           f"{plan.counts['requantize']} are re-encoded from their values", flush=True)
     return source, plan
@@ -377,6 +446,36 @@ def _scales(reader: ShardReader, logical: str, shape: Sequence[int]) -> torch.Te
             "BF16 or FP32"
         )
     return scales.to(torch.float32)
+
+
+def _row_multipliers(reader: ShardReader, logical: str, n: int) -> torch.Tensor:
+    """A compressed-tensors Linear's multipliers, one per row, FP32 (a per-tensor one repeats)."""
+
+    scales = reader.get(logical + ROW_SCALE_SUFFIX).to(torch.float32)
+    if scales.numel() == 1:
+        scales = scales.reshape(1).expand(n)
+    elif scales.numel() == n:
+        scales = scales.reshape(n)
+    else:
+        raise ValueError(f"{logical}{ROW_SCALE_SUFFIX}: {tuple(scales.shape)}, expected one "
+                         f"multiplier per row ({n}) or one in all")
+    if not bool(torch.isfinite(scales).all()):
+        raise ValueError(f"{logical}{ROW_SCALE_SUFFIX}: non-finite multipliers")
+    return scales.contiguous()
+
+
+def _row_words(reader: ShardReader, logical: str,
+               codes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The stored codes and row multipliers as the artifact keeps them. A row whose multiplier is
+    zero or negative holds nothing but zeros (a negative one flips the codes' signs): its codes
+    are rewritten so the multiplier can be positive, the values unchanged."""
+
+    scales = _row_multipliers(reader, logical, codes.shape[0])
+    if bool((scales > 0).all()):
+        return codes, scales
+    fixed = torch.where((scales < 0)[:, None], codes ^ 0x80, codes)  # E4M3's sign bit
+    fixed[scales == 0] = 0
+    return fixed, torch.where(scales == 0, torch.ones_like(scales), scales.abs())
 
 
 def _dequantize(reader: ShardReader, logical: str) -> torch.Tensor:
@@ -406,6 +505,7 @@ def _dequantize(reader: ShardReader, logical: str) -> torch.Tensor:
 
 __all__ = [
     "WEIGHTS_ID",
+    "fp8_projection_specs",
     "Fp8BlockSource",
     "ObjectSource",
     "SourcePlan",

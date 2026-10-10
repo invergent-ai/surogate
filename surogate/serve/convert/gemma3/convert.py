@@ -607,12 +607,21 @@ def build_conversion_report(
     }
 
 
+#: How the attention and feed-forward projections are stored: `w8`, the groupwise int8 every
+#: Gemma 3 artifact has used, or `fp8` for the FP8 tensor cores (E4M3 with a multiplier per
+#: 128 x 128 block, or per row where only K is whole 128s), which a prompt round runs two to four
+#: times faster than W8 on a DGX Spark. A per-channel FP8 export (Red Hat's) defaults to `fp8`
+#: and keeps its own codes and row multipliers; a BF16 checkpoint defaults to `w8`.
+TEXT_FORMATS = ("w8", "fp8")
+
+
 def convert(
     model_dir: str | Path,
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
     gguf_repack: str | Path | None = None,
+    text_format: str | None = None,
 ) -> Path:
     """Run the complete conversion and return the conversion-report path."""
 
@@ -660,9 +669,20 @@ def convert(
             print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
                   flush=True)
 
+    if text_format is None:
+        text_format = ("fp8" if fp8_block_source.is_fp8_channel_export(config) and repack is None
+                       else "w8")
+    if text_format not in TEXT_FORMATS:
+        raise ValueError(f"text format must be one of {TEXT_FORMATS}, not {text_format!r}")
+    if text_format == "fp8":
+        if repack is not None:
+            raise ValueError("--text-format fp8 stores the projections from the checkpoint's "
+                             "values; a GGUF repack serves its own")
+        object_specs = fp8_block_source.fp8_projection_specs(object_specs)
     # An FP8 export keeps its codes where the kernels read them (common/fp8_block_source.py).
     fp8_source, fp8_plan = fp8_block_source.for_checkpoint(model, config, object_specs,
-                                                           recipes_by_name, repack=repack)
+                                                           recipes_by_name, repack=repack,
+                                                           row_codes=text_format == "fp8")
     if fp8_plan is not None:
         object_specs = fp8_plan.specs
     preflight = preflight_conversion(
@@ -737,6 +757,7 @@ def convert(
             "model": str(model_dir),
             "out": str(out_path),
             "device": requested_device,
+            "text_format": text_format,
         },
         config_summary=preflight.config_summary,
         source_preflight=preflight.source,
@@ -765,8 +786,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gguf-repack", type=Path, default=None,
                         help="repack map: objects this GGUF serves as it stores them")
+    parser.add_argument("--text-format", choices=TEXT_FORMATS, default=None,
+                        help="storage of the attention and feed-forward projections; default fp8 "
+                             "(codes kept) for a per-channel FP8 export, w8 otherwise")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack)
+    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
+            text_format=args.text_format)
 
 
 if __name__ == "__main__":
