@@ -1429,6 +1429,12 @@ int run_geometry(const Geometry& geometry) {
         // 64, 128 or 256 wide, 32 columns and up), whose 128- and 192-row query tiles and 80- to
         // 128-key tiles straddle the 64-slot pages; elsewhere they are more prompt-tile coverage.
         // The window cases below are FA3's local mask there.
+        // A 512-wide head takes the prompt kernel's output split from 64 columns; one case keeps
+        // its double-precision oracle short.
+        if (geometry.head_dim > 256) {
+            failures += run_a1_case(geometry, dtype, {130, 200, 400, 705u}, MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, dtype, {130, 200, 400, 706u}, MappingPattern::Fragmented);
+        }
         if (geometry.head_dim <= 256) {
             failures += run_a1_case(geometry, dtype, {130, 200, 400, 701u}, MappingPattern::Fragmented);
             failures += run_a3_case(geometry, dtype, {130, 200, 400, 702u}, MappingPattern::Fragmented);
@@ -2291,6 +2297,10 @@ int verify_fp8_wide_prompts() {
         {Geometry{"qwen3-8b", 32, 8, 128}, 1500, 3, 820u, 256},
         {Geometry{"fallback-12q4-d256", 12, 4, 256}, 1000, 1, 821u},
         {Geometry{"fallback-16q8-d64", 16, 8, 64}, 700, 2, 822u},
+        // Gemma 4's 512-wide global heads: the prompt kernel splits each query tile's output
+        // columns between two CTAs (kGqaPrefillOutSplit); FA3 serves no head that wide.
+        {Geometry{"gemma4-31b-global", 32, 4, 512}, 1000, 200, 823u},
+        {Geometry{"gemma4-12b-global", 16, 1, 512}, 200, 130, 824u},
     };
     constexpr int pages = 64;
     constexpr float scale = 1.0F / 16.0F;
@@ -2416,8 +2426,8 @@ int verify_fp8_wide_prompts() {
             cuda_synchronize();
             ops::set_batch_invariant(false);
             ops::set_prompt_attention_fp8_query(default_fp8_query);
-            const bool flash = !run.invariant && major == 9 && c.tokens >= 32;
-            const bool kernel = !run.invariant && major != 9 && c.tokens >= 64;
+            const bool flash = !run.invariant && major == 9 && c.tokens >= 32 && dim <= 256;
+            const bool kernel = !run.invariant && !flash && c.tokens >= 64;
             const bool q8 = kernel && run.fp8_query;
             const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
                                       " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +

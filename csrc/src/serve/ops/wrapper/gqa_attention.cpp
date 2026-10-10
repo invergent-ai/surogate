@@ -704,12 +704,25 @@ std::int32_t prompt_kernel_min_columns() {
 // they ran 1.5 s where vLLM's FlashAttention-2 ran 0.34 s), and the generic CUDA-core kernel for
 // a query group the registry does not carry (Qwen3-8B's 32 over 8: 60% of the GPU time in the
 // same load on the Spark). Its arithmetic is not the split-KV kernels', so --batch-invariant
-// keeps every width on those; a 512-wide head keeps them too, its 16-key variant being
-// unmeasured against them.
+// keeps every width on those.
+// A 512-wide head (the Gemma 4 global layers, GLM's absorbed latent) runs it as two CTAs a query
+// tile, each with the whole Q Kᵀ and half the output columns (kGqaPrefillOutSplit). On the tiles,
+// Gemma 4 31B's ten global layers took 172 ms of a 1.55 s prompt round of 2,017 tokens on a DGX
+// Spark. SUROGATE_SERVE_GQA_PROMPT_KERNEL_WIDE=0 keeps those heads on the tiles.
+bool prompt_kernel_wide_heads() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("SUROGATE_SERVE_GQA_PROMPT_KERNEL_WIDE");
+        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool prompt_kernel_takes(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
                          DType cache_dtype, std::int32_t width) {
     const std::int32_t min_columns = prompt_kernel_min_columns();
-    return min_columns > 0 && width >= min_columns && head_dim <= 256 && !batch_invariant() &&
+    return min_columns > 0 && width >= min_columns &&
+           (head_dim <= 256 || (head_dim <= 512 && prompt_kernel_wide_heads())) &&
+           !batch_invariant() &&
            (cache_dtype == DType::BF16 || cache_dtype == DType::FP8_E4M3FN) &&
            !fa3_takes_prompt(head_dim, q_heads, kv_heads, cache_dtype, width);
 }

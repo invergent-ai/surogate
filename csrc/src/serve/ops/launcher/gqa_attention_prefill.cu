@@ -208,7 +208,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<__nv_bfloat16*>(out.data), tokens, selection);
     } else if (cache.dtype == DType::FP8_E4M3FN) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(q.ne[1]), 1u);
+                                  static_cast<unsigned>(q.ne[1]),
+                                  static_cast<unsigned>(kGqaPrefillOutSplit<Geometry::HeadDim>));
         // A QSA selection takes the same e4m3 Q Kᵀ as the dense chunks: the mask is applied to
         // the scores either way, and the selection's chunks are the ones past the budget, where
         // the attention is longest.
@@ -257,7 +258,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(q.ne[1]), 1u);
+                                  static_cast<unsigned>(q.ne[1]),
+                                  static_cast<unsigned>(kGqaPrefillOutSplit<Geometry::HeadDim>));
         if (selection.words != nullptr) {
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>,
