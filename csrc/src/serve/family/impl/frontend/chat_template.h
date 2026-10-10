@@ -165,6 +165,11 @@ struct ReasoningSyntax {
     /// `<|channel>thought` itself. Only the second kind needs the decoder to watch for an
     /// opening marker mid-stream, and only a checkpoint that states its pair gets that.
     bool model_opens = false;
+    /// The special tokens either marker is spelled with. Gemma 4's are (`<|channel>`,
+    /// `<channel|>`), and an ordinary answer decodes with special tokens skipped -- which left
+    /// `thought\n` and the whole thought in the answer. These are decoded regardless, so the
+    /// stream sees the markers it splits on, and splitting removes them.
+    std::vector<int> marker_tokens;
 };
 
 /// Drop completed-turn reasoning before a Jinja renderer sees the messages.

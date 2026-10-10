@@ -340,12 +340,21 @@ def _plain_source(recipe) -> str | None:
     return None
 
 
+#: The per-layer projections a dense Gemma target serves from NVFP4 codes. Anything else an
+#: export quantises -- the E-series' per-layer input gate and projections, a few hundred
+#: kilobytes a layer -- is read through `DequantizingReader` into the text format instead.
+DENSE_SUFFIXES = ("/attention/query", "/attention/key", "/attention/value", "/attention/output",
+                  "/mlp/gate", "/mlp/up", "/mlp/down")
+
+
 def dense_plan(specs: Sequence[TensorSpec], recipes: Mapping[str, object], reader: ShardReader,
-               convention: Convention) -> tuple[tuple[TensorSpec, ...], dict[str, DenseSource]]:
+               convention: Convention, *, suffixes: Sequence[str] | None = None,
+               ) -> tuple[tuple[TensorSpec, ...], dict[str, DenseSource]]:
     """The text specs with every quantised dense module in NVFP4, and what builds each.
 
     A module is quantised when the checkpoint holds its global weight scale beside it; the
-    declaration's `ignore` list is a claim, the scale is the fact (`quant_scope`).
+    declaration's `ignore` list is a claim, the scale is the fact (`quant_scope`). `suffixes`
+    limits the objects that keep their codes; None keeps every plain copy's.
     """
     out: list[TensorSpec] = []
     sources: dict[str, DenseSource] = {}
@@ -355,6 +364,8 @@ def dense_plan(specs: Sequence[TensorSpec], recipes: Mapping[str, object], reade
         recipe = recipes.get(name)
         source = _plain_source(recipe) if recipe is not None else None
         if source is None or not name.startswith("text/layers/") or is_routed_object(name):
+            return None
+        if suffixes is not None and not name.endswith(tuple(suffixes)):
             return None
         module = source[: -len(".weight")]
         return module if reader.has(module + "." + convention.weight_global) else None
@@ -425,6 +436,57 @@ def dense_payload(name: str, sources: Mapping[str, DenseSource], reader: ShardRe
     return encode_nvfp4(codes, scales, struct.pack("<f", weight_divisor), (source.rows, source.columns))
 
 
+class DequantizingReader:
+    """The checkpoint as the BF16 recipes read it: an NVFP4 module's `.weight` is the values its
+    words represent rather than its packed codes.
+
+    For the recipes that read a quantised matrix without copying it -- the E-series' stacked
+    per-layer model projection, which the artifact cuts one slice per layer, and any module
+    `dense_plan` leaves to the text format. A ModelOpt export stores the codes under the very
+    name such a recipe asks for, so without this the recipe would read uint8 words as weights;
+    a compressed-tensors export has no `.weight` at all. Every other name passes through, and the
+    dense payloads read the plain reader, not this one.
+    """
+
+    def __init__(self, reader: ShardReader, convention: Convention) -> None:
+        self._reader = reader
+        self._convention = convention
+
+    def _module(self, name: str) -> str | None:
+        if not name.endswith(".weight"):
+            return None
+        module = name[: -len(".weight")]
+        return module if self._reader.has(module + "." + self._convention.weight_global) else None
+
+    def has(self, name: str) -> bool:
+        return self._module(name) is not None or self._reader.has(name)
+
+    def get(self, name: str) -> torch.Tensor:
+        module = self._module(name)
+        if module is None:
+            return self._reader.get(name)
+        part = _dense_module(self._reader, self._convention, module)
+        return nvfp4.dequantize(part.codes, part.scales, part.weight_divisor).to(torch.bfloat16)
+
+    def metadata(self, names):
+        from surogate.serve.convert.common.safetensors import TensorMetadata
+
+        names = list(names)
+        modules = {name: self._module(name) for name in names}
+        result = self._reader.metadata([name for name in names if modules[name] is None])
+        quantised = {name: module for name, module in modules.items() if module is not None}
+        codes = self._reader.metadata([module + "." + self._convention.codes
+                                       for module in quantised.values()])
+        for name, module in quantised.items():
+            found = codes[module + "." + self._convention.codes]
+            result[name] = TensorMetadata(name=name, shard=found.shard,
+                                          shape=(found.shape[0], 2 * found.shape[1]), dtype="BF16")
+        return result
+
+    def __getattr__(self, attribute):
+        return getattr(self._reader, attribute)
+
+
 class LayerCache:
     """Builds a layer's eight objects in one pass and hands them out in plan order."""
 
@@ -468,6 +530,8 @@ class LayerCache:
 __all__ = [
     "COMPRESSED_TENSORS",
     "DENSE_GATE_UP",
+    "DENSE_SUFFIXES",
+    "DequantizingReader",
     "DenseSource",
     "INPUT_DIVISOR_SUFFIX",
     "dense_payload",

@@ -26,6 +26,12 @@ class TensorMetadata:
 _SEGMENT_ALIASES: tuple[tuple[str, str], ...] = (
     ("block_sparse_moe.gate", "mlp.gate"),
     ("block_sparse_moe.experts", "mlp.experts"),
+    # Gemma 4's encoder-free vision embedder, as later transformers releases (and the exports
+    # made with them) spell it: the patch and position modules moved to `vision_embedder` and
+    # the projection lost its `multimodal_embedder` level.
+    ("embed_vision.patch_", "vision_embedder.patch_"),
+    ("embed_vision.pos_", "vision_embedder.pos_"),
+    ("embed_vision.multimodal_embedder.embedding_projection", "embed_vision.embedding_projection"),
 )
 
 

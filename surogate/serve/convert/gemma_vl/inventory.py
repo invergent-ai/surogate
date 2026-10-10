@@ -44,7 +44,12 @@ def geometry_from_config(config):
         raise ValueError("Gemma vision requires tanh GELU")
     hidden = positive_int(vc, "mm_embed_dim" if free else "hidden_size")
     if free:
-        if vc.get("model_patch_size") != 48 or vc.get("output_proj_dims") != hidden:
+        # Older configs state the 48-pixel patch the encoder-free embedder takes outright; newer
+        # ones (and the quantised exports made from them) state it as `patch_size` pooled by
+        # `pooling_kernel_size`, 16 x 3.
+        model_patch = vc.get("model_patch_size") or (
+            int(vc.get("patch_size") or 0) * int(vc.get("pooling_kernel_size") or 1))
+        if model_patch != 48 or vc.get("output_proj_dims") != hidden:
             raise ValueError("unsupported Gemma unified patch or projector geometry")
         merge, patch, positions = 1, 48, positive_int(vc, "mm_posemb_size")
     elif version == 3:

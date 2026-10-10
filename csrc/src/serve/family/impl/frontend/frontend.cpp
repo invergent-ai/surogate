@@ -325,6 +325,47 @@ std::optional<std::string> stated_chat_template(const Json& tokenizer_config) {
         "); the checkpoint does not say which template it serves");
 }
 
+/// Gemma 4's pair from the channel tokens its tokenizer config names, for a checkpoint that
+/// states no `response_template` -- every quantised Gemma 4 export so far drops it, keeping
+/// `soc_token` and `eoc_token` (start and end of channel). The thought is the channel named
+/// `thought`, which is how the published `response_template` spells the opener.
+bool channel_token_syntax(const Json& config, fi::ReasoningSyntax& syntax) {
+    const auto token = [&](const char* key) -> std::string {
+        if (!config.contains(key)) { return {}; }
+        const Json& value = config.at(key);
+        if (value.is_string()) { return value.get<std::string>(); }
+        if (value.is_object() && value.contains("content") && value.at("content").is_string()) {
+            return value.at("content").get<std::string>();
+        }
+        return {};
+    };
+    const std::string start = token("soc_token");
+    const std::string end   = token("eoc_token");
+    if (start.empty() || end.empty()) { return false; }
+    syntax.open        = start + "thought\n";
+    syntax.close       = end;
+    syntax.model_opens = true;
+    return true;
+}
+
+/// The special tokens a stated pair is spelled with; see `ReasoningSyntax::marker_tokens`.
+/// Only a pair the model opens itself is looked at: the `<think>` default and every family
+/// served before Gemma 4 spell theirs with ordinary added tokens, which decode as they always did.
+std::vector<int> special_marker_tokens(const fi::Tokenizer& tokenizer,
+                                       const fi::ReasoningSyntax& syntax) {
+    std::vector<int> out;
+    if (syntax.muse_glimmer || !syntax.model_opens) { return out; }
+    for (const std::string* marker : {&syntax.open, &syntax.close}) {
+        if (marker->empty()) { continue; }
+        for (const int id : tokenizer.encode(*marker, {.parse_added_tokens = true, .add_bos = false})) {
+            if (tokenizer.is_special_token(id) && std::find(out.begin(), out.end(), id) == out.end()) {
+                out.push_back(id);
+            }
+        }
+    }
+    return out;
+}
+
 /// The reasoning markers a checkpoint states, or the `<think>` pair when it states none.
 ///
 /// `response_template.fields.thinking` is how the published Gemma 4 files spell it, beside
@@ -342,7 +383,11 @@ fi::ReasoningSyntax reasoning_syntax(const FrontendResources& resources) {
         // wrong with the file; repeating a worse one from here would only obscure it.
         return syntax;
     }
-    if (!config.is_object() || !config.contains("response_template")) { return syntax; }
+    if (!config.is_object()) { return syntax; }
+    if (!config.contains("response_template")) {
+        (void)channel_token_syntax(config, syntax);
+        return syntax;
+    }
     const Json& response = config.at("response_template");
     if (response.is_object() && response.value("type", "") == "muse_glimmer") {
         syntax.muse_glimmer = true;
@@ -999,6 +1044,7 @@ public:
           vision_enabled(options.vision_enabled),
           has_chat_template(!resources.chat_template_jinja.empty() ||
                             !options.chat_template_override.empty()) {
+        reasoning.marker_tokens = special_marker_tokens(*tokenizer, reasoning);
         if (const char* probe = std::getenv("SUROGATE_SERVE_TRACE_REASONING"); probe != nullptr) {
             std::fprintf(stderr,
                          "[reasoning] config_bytes=%zu open=%s close=%s model_opens=%d\n",
@@ -1374,8 +1420,12 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         }
 
         StopMatch match;
+        // A marker's special tokens are decoded even where specials are skipped, so the stream
+        // can split on the marker (and drop it) rather than publish what is left of it.
+        const auto& markers = impl_->preview_state.reasoning.marker_tokens;
+        const bool marker = std::find(markers.begin(), markers.end(), token) != markers.end();
         const std::string bytes =
-            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special && !marker);
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match);
 

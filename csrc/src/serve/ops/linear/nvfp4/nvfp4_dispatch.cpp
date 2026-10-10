@@ -7,10 +7,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
 namespace {
+
+/// Read once: the route a shape takes at one token is part of the workspace plan, so the plan and
+/// every later dispatch must agree on it.
+bool generic_gemv_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_NVFP4_GENERIC_GEMV");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 enum class Nvfp4LinearRoute : std::uint8_t {
     A16,
@@ -32,6 +43,13 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     // and nothing wider (see Nvfp4GemvOnlyProblem). Every other width of a generic shape stays
     // on cuBLASLt, so the served wide rounds do not move.
     if (tokens == 1 && is_nvfp4_gemv_only_problem(output_rows, input_rows)) {
+        return Nvfp4LinearRoute::A16;
+    }
+    // Every other generic shape whose K the GEMV is built for decodes the same way
+    // (`Nvfp4GemvKGeometry`): the dense Gemma sizes and the E-series run all their NVFP4
+    // matrices through here at one token.
+    if (tokens == 1 && is_nvfp4_generic_problem(output_rows, input_rows) &&
+        nvfp4_generic_gemv_k(input_rows) && generic_gemv_enabled()) {
         return Nvfp4LinearRoute::A16;
     }
     if (is_nvfp4_generic_problem(output_rows, input_rows)) { return Nvfp4LinearRoute::W4A4; }

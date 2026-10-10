@@ -12,6 +12,7 @@
 #include "family/impl/storage_workspace.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -134,8 +135,14 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType qtyp
     (void)layout.alloc(DType::BF16, {g.intermediate, last});
     (void)layout.alloc(DType::BF16, {g.intermediate, last});
     (void)layout.alloc(DType::BF16, {g.hidden, last});
-    account_linear(layout, qtype, g.intermediate, g.hidden, first, last);
-    account_linear(layout, qtype, g.intermediate, g.hidden, first, last);
+    if (qtype == QType::NVFP4) {
+        // An NVFP4 export stores gate and up fused (`mlp/gate_up`): one matmul into the same
+        // bytes the two halves' planes take.
+        account_linear(layout, qtype, 2 * g.intermediate, g.hidden, first, last);
+    } else {
+        account_linear(layout, qtype, g.intermediate, g.hidden, first, last);
+        account_linear(layout, qtype, g.intermediate, g.hidden, first, last);
+    }
     account_linear(layout, qtype, g.hidden, g.intermediate, first, last);
     return layout.peak_bytes(1);
 }
@@ -252,6 +259,9 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
         attention_projection_workspace_bytes(geometry, QType::Q4_K, first, last),
         family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
             return attention_projection_workspace_bytes(geometry, type, first, last);
+        }),
+        family::stored_format_workspace(geometry, QType::NVFP4, [&](QType type) {
+            return attention_projection_workspace_bytes(geometry, type, first, last);
         })});
 }
 
@@ -262,6 +272,9 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
         attention_output_workspace_bytes(geometry, QType::Q4_K, first, last),
         family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
             return attention_output_workspace_bytes(geometry, type, first, last);
+        }),
+        family::stored_format_workspace(geometry, QType::NVFP4, [&](QType type) {
+            return attention_output_workspace_bytes(geometry, type, first, last);
         })});
 }
 
@@ -271,21 +284,34 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                 = workspace.scope();
     const std::int32_t columns = hidden.ne[1];
-    const std::int32_t intermediate = weights.gate.n;
-    Tensor gate       = workspace.alloc(DType::BF16, {intermediate, columns});
-    Tensor up         = workspace.alloc(DType::BF16, {intermediate, columns});
+    const bool fused           = weights.fused_gate_up.qdata != nullptr;
+    const std::int32_t intermediate = fused ? weights.fused_gate_up.n / 2 : weights.gate.n;
+    // The gate and up planes are adjacent, so a fused projection writes them as its one
+    // `[gate; up]` output and the halves are the same bytes either way.
+    Tensor gate_up    = workspace.alloc(DType::BF16, {2 * intermediate, columns});
     Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
     Tensor projected  = workspace.alloc(DType::BF16, {residual.ne[0], columns});
-    
-    // Gate and up are separate matrices here, where Llama and the Qwen families
-    // fuse them and feed one `linear_swiglu`. That costs a launch and buys two
-    // adaptable modules: `gate_proj` and `up_proj` have their own weights, so the
-    // hook can add a delta to each instead of the fused targets' refusal.
-    ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
-                                     {weights.up, up, kTextPolicy}}, &workspace, stream);
-    apply_lora(weights.gate, kGatePort, hidden, gate, stream);
-    apply_lora(weights.up, kUpPort, hidden, up, stream);
-    ops::gelu_mul(gate, up, kMlpActivation, activation, stream);
+
+    if (fused) {
+        // An NVFP4 export's pair, one matmul into one plane whose two halves `gelu_mul_fused`
+        // reads in place. Adapters are refused on such an artifact (`bind_lora`).
+        ops::linear(hidden, weights.fused_gate_up, gate_up, kTextPolicy, workspace, stream);
+        ops::gelu_mul_fused(gate_up, kMlpActivation, activation, stream);
+    } else {
+        // Gate and up are separate matrices here, where Llama and the Qwen families
+        // fuse them and feed one `linear_swiglu`. That costs a launch and buys two
+        // adaptable modules: `gate_proj` and `up_proj` have their own weights, so the
+        // hook can add a delta to each instead of the fused targets' refusal.
+        Tensor gate(gate_up.data, DType::BF16, {intermediate, columns});
+        Tensor up(static_cast<std::byte*>(gate_up.data) +
+                      static_cast<std::size_t>(intermediate) * columns * sizeof(std::uint16_t),
+                  DType::BF16, {intermediate, columns});
+        ops::linear_projections(hidden, {{weights.gate, gate, kTextPolicy},
+                                         {weights.up, up, kTextPolicy}}, &workspace, stream);
+        apply_lora(weights.gate, kGatePort, hidden, gate, stream);
+        apply_lora(weights.up, kUpPort, hidden, up, stream);
+        ops::gelu_mul(gate, up, kMlpActivation, activation, stream);
+    }
     ops::linear(activation, weights.down, projected, kTextPolicy, workspace, stream);
     // down reads the gated activation, which is exactly the input its adapter was
     // trained against.
@@ -313,6 +339,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         post_mixer_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
         post_mixer_workspace_bytes(geometry, QType::Q4_K, first, last),
         family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+            return post_mixer_workspace_bytes(geometry, type, first, last);
+        }),
+        family::stored_format_workspace(geometry, QType::NVFP4, [&](QType type) {
             return post_mixer_workspace_bytes(geometry, type, first, last);
         })});
 }

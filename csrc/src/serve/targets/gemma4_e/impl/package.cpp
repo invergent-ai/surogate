@@ -102,6 +102,13 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         store.register_module(
             index, "o_proj",
             Binding{attention.output.qdata, 3, query_rows, g.hidden});
+        if (attention.post_mixer.fused_gate_up.qdata != nullptr) {
+            // An NVFP4 export's gate and up are one fused matrix; an adapter's gate_proj and
+            // up_proj deltas would each land on the wrong half of it.
+            throw std::invalid_argument(
+                "gemma4_e: LoRA adapters are not served on an artifact whose feed-forward is "
+                "NVFP4 (fused gate/up); merge the adapter before quantising");
+        }
         family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden,
                                   g.intermediate_for(attention.projection.owns_kv));
         const auto& input = attention.post_mixer.per_layer_input;
@@ -185,8 +192,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::resolved_gemma4(
-        reader.geometry(), reader.layer_types(), true, false);
+    return detail::resolved_geometry(reader);
 }
 
 std::unique_ptr<Package::Program>

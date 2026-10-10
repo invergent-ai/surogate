@@ -170,12 +170,15 @@ inline constexpr bool is_nvfp4_gemv_only_problem(std::int32_t output_rows, std::
 // shape-generic, so only the activation quantizer needs an instantiation per K. The one list
 // below is every K the quantizer is built for -- the family's hidden, query, value and
 // intermediate widths at every published size (0.8B 1024/2048/3584, 2B 2048/6144, 4B
-// 2560/4096/9216, 27B 5120/6144/17408), and Gemma 4 26B-A4B's (hidden 2816, windowed and
-// global attention 4096/8192, dense feed-forward 2112) -- and both the admission predicate and
-// the launch switch expand it, so a new width is one entry here.
+// 2560/4096/9216, 27B 5120/6144/17408), Gemma 4 26B-A4B's (hidden 2816, windowed and
+// global attention 4096/8192, dense feed-forward 2112), the dense Gemma 4 and Gemma 3 sizes'
+// (12B hidden 3840 and feed-forward 15360, 27B/31B hidden 5376 and feed-forward 21504) and the
+// E-series' (E2B hidden 1536 and double-wide feed-forward 12288, E4B feed-forward 10240, and the
+// 256-wide per-layer input both project from) -- and both the admission predicate and the
+// launch switch expand it, so a new width is one entry here.
 #define SINFER_NVFP4_FOR_EACH_ACTIVATION_K(X) \
-    X(512) X(1024) X(2048) X(2112) X(2560) X(2816) X(3584) X(4096) X(5120) X(6144) X(8192) \
-    X(9216) X(17408)
+    X(256) X(512) X(1024) X(1536) X(2048) X(2112) X(2560) X(2816) X(3584) X(3840) X(4096) \
+    X(5120) X(5376) X(6144) X(8192) X(9216) X(10240) X(12288) X(15360) X(17408) X(21504)
 using Nvfp4Activation512Geometry   = Nvfp4ActivationGeometry<512>;
 using Nvfp4Activation1024Geometry  = Nvfp4ActivationGeometry<1024>;
 using Nvfp4Activation2048Geometry  = Nvfp4ActivationGeometry<2048>;
@@ -195,6 +198,20 @@ inline constexpr bool nvfp4_activation_k_instantiated(std::int32_t input_rows) {
     SINFER_NVFP4_FOR_EACH_ACTIVATION_K(SINFER_NVFP4_K_CASE)
 #undef SINFER_NVFP4_K_CASE
     return false;
+}
+
+// The decode GEMV for a shape outside both lists above. The kernel reads its output rows only to
+// size the grid, so the launch passes them at run time and one instantiation per K serves every
+// row count: `kOutputRows` is a placeholder that satisfies the template's tile assertion and
+// nothing reads. Same reason as the 2560 family's GEMV-only geometries -- at one token a GEMV
+// streams the weight once where cuBLASLt runs a 128-row MMA tile on a single row -- for every
+// generic shape whose K is a whole number of 256-value phases (2112 is not, and stays on
+// cuBLASLt). `SUROGATE_NVFP4_GENERIC_GEMV=0` keeps one-token rounds on cuBLASLt.
+template <std::int32_t InputRows>
+using Nvfp4GemvKGeometry = Nvfp4GemvGeometry<128, InputRows>;
+
+inline constexpr bool nvfp4_generic_gemv_k(std::int32_t input_rows) {
+    return (input_rows % 256) == 0 && nvfp4_activation_k_instantiated(input_rows);
 }
 
 // Byte offset of the UE4M3 scale for (row, 16-wide group) in the 128x4 tiled layout shared by
@@ -291,6 +308,15 @@ template <>
 struct Nvfp4LinearDecodeProductionSchedule<Nvfp4Residual9216Geometry> {
     using Type =
         Nvfp4GemvSchedule<4, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+};
+
+// The generic-K GEMV keeps the production schedule's 16 rows per CTA. Sixteen values per lane
+// needs K to be a whole number of 512-value phases; 3840 and 5376 are not, and take eight.
+template <std::int32_t InputRows>
+struct Nvfp4GenericDecodeSchedule {
+    static constexpr int kValuesPerLane = (InputRows % 512) == 0 ? 16 : 8;
+    using Type = Nvfp4GemvSchedule<8, 2, kValuesPerLane, 4, Nvfp4ScaleAccess::StagedRaw,
+                                   Nvfp4CodeCache::Default, 2>;
 };
 
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;

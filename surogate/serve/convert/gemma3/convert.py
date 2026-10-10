@@ -346,6 +346,8 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
             data = (path.read_bytes() if template is None
                     else official_resources.tokenizer_config_with_template(
                         path.read_bytes(), template))
+        elif filename == "tokenizer.json" and path.exists():
+            data = text_model_tokenizer(path.read_bytes(), _vocab_size(root))
         elif path.exists():
             data = path.read_bytes()
         elif filename == "generation_config.json":
@@ -364,6 +366,42 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return tuple(payloads)
 
 
+
+
+def _vocab_size(root: Path) -> int | None:
+    config_path = Path(root) / "config.json"
+    if not config_path.exists():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    value = text.get("vocab_size", config.get("vocab_size"))
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def text_model_tokenizer(data: bytes, vocab_size: int | None) -> bytes:
+    """The checkpoint's `tokenizer.json` without the added tokens past the embedding table.
+
+    Every Gemma 3 release ships the multimodal tokenizer, which adds `<image_soft_token>` at id
+    262,144 -- one past the last row of the text-only sizes' 262,144-row table (the 270M and the
+    1B; the vision sizes pad theirs to 262,208). The text model has no row for it, so the artifact
+    could not state a token domain its head covers and was refused at load ("token_domain exceeds
+    output_rows"), and a prompt that spelled the marker would have indexed past the table. The
+    marker means nothing without an image tower, so it is dropped from the stored tokenizer, which
+    then splits that text into ordinary pieces as the GGUF releases do. A vocabulary entry past
+    the table is a different checkpoint problem and is left for the domain check to refuse.
+    """
+    if vocab_size is None:
+        return data
+    tokenizer = json.loads(data)
+    added = tokenizer.get("added_tokens") or []
+    kept = [token for token in added if token.get("id", 0) < vocab_size]
+    if len(kept) == len(added):
+        return data
+    dropped = [token.get("content") for token in added if token.get("id", 0) >= vocab_size]
+    print(f"tokenizer: dropping added tokens past the {vocab_size}-row embedding: {dropped}",
+          flush=True)
+    tokenizer["added_tokens"] = kept
+    return json.dumps(tokenizer, ensure_ascii=False).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +443,17 @@ def build_object_plan(
         object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
 
+
+
+def stored_tokenizer_domain(preflight: "ConversionPreflight") -> int:
+    """The domain of the tokenizer the artifact stores, which `text_model_tokenizer` may have
+    trimmed; the checkpoint's own file when no tokenizer resource is carried."""
+    from surogate.serve.convert.common.checkpoint import tokenizer_json_ids
+
+    for item in preflight.resources:
+        if item.name == "frontend/tokenizer.json":
+            return tokenizer_json_ids(json.loads(item.data))[-1] + 1
+    return tokenizer_domain(preflight.model_dir)
 
 
 def geometry_block(preflight: "ConversionPreflight", *, token_domain: int) -> dict[str, float]:
@@ -636,7 +685,7 @@ def convert(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="gemma3"),
             preflight.object_plan.specs,
-            geometry=geometry_block(preflight, token_domain=tokenizer_domain(model)),
+            geometry=geometry_block(preflight, token_domain=stored_tokenizer_domain(preflight)),
             layer_types=geometry.layer_types,
             external=external,
         ) as writer:

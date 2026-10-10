@@ -1756,6 +1756,42 @@ int test_terminal_reasoning_preserves_content_stop_prefix() {
     return failures;
 }
 
+/// A quantised Gemma 4 export states no `response_template`, only its channel tokens -- and
+/// those are special, so an answer decoded with specials skipped used to publish `thought\n`
+/// and the whole thought as content.
+int test_channel_tokens_split_reasoning() {
+    auto owned = resources();
+    auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
+    auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+    config.erase("response_template");
+    config["soc_token"] = "<|channel>";
+    config["eoc_token"] = "<channel|>";
+    const std::vector<std::pair<std::string, bool>> pieces{
+        {"<|channel>", true}, {"<channel|>", true}, {"thought\n", false}, {"reason", false},
+        {"answer", false}, {"<|other|>", true}};
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        const int id = 100 + static_cast<int>(i);
+        tokenizer["added_tokens"].push_back(added(id, pieces[i].first, pieces[i].second));
+        config["added_tokens_decoder"][std::to_string(id)] =
+            decoder_added(pieces[i].first, pieces[i].second);
+    }
+    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_config_json = config.dump();
+    const auto frontend = FrontendFactory::create_component(owned, false);
+    const auto prompt = frontend.prepare_tokens({0});
+    auto session = frontend.make_output_session(prompt, {});
+    const std::array<sinfer::TokenId, 6> stream{100, 102, 103, 101, 105, 104};
+    const auto decision = session.preview(stream, 16, sinfer::FinishReason::OutputLimit);
+    const auto output = session.commit_preview();
+    int failures = check(decision.accepted_tokens == stream.size(), "channel stream was cut short");
+    failures += check(channel_text(output, sinfer::OutputChannel::Reasoning) == "reason",
+                      "the thought between Gemma 4's channel tokens did not reach reasoning");
+    // `<|other|>` is special and no marker's: still skipped, as every special was before.
+    failures += check(channel_text(output, sinfer::OutputChannel::Content) == "answer",
+                      "channel markers or a skipped special reached the answer");
+    return failures;
+}
+
 int test_byte_level_bos() {
     int failures = 0;
     for (bool renderer : {false, true}) {
@@ -2157,6 +2193,7 @@ int main() {
     failures += test_interleaved_reasoning_round();
     failures += test_muse_output_headers();
     failures += test_terminal_reasoning_preserves_content_stop_prefix();
+    failures += test_channel_tokens_split_reasoning();
     failures += test_byte_level_bos();
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();

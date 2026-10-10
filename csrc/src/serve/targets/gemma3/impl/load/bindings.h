@@ -14,12 +14,15 @@
 #include "targets/gemma3/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
+#include "artifact/reader.h"
+#include "artifact/typed_binding.h"
 #include "core/tensor.h"
 
 #include <array>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 
 namespace sinfer::targets::gemma3_270m::detail {
@@ -37,6 +40,8 @@ inline constexpr std::size_t kGdnLayers = 0;
 struct WeightPlan {
     artifact::ObjectHandle object;
     artifact::NumericFormat format = artifact::NumericFormat::BF16;
+    /// The whole binding, which for an NVFP4 matrix carries its two global divisors.
+    artifact::LinearBinding linear{};
 };
 
 /// Gemma 3's MLP keeps gate and up separate, where the Qwen families and Llama
@@ -53,6 +58,10 @@ struct WeightPlan {
 struct MlpPlan {
     WeightPlan gate;
     WeightPlan up;
+    /// Gate and up as one `[gate; up]` matrix, where the artifact stores them so -- an NVFP4
+    /// export's, whose pair shares one weight divisor (`mlp/gate_up`, written by
+    /// `routed_nvfp4.dense_plan`). Empty otherwise, and then `gate` and `up` are bound.
+    std::optional<WeightPlan> gate_up;
     WeightPlan down;
     artifact::ObjectHandle post_feedforward_norm;
 };
@@ -133,12 +142,18 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
+/// The artifact's declared geometry with each matrix's stored format resolved.
+family::TextGeometry resolved_geometry(const artifact::Reader& reader);
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features);
 
 struct DensePostMixerPayload {
     Weight gate;
     Weight up;
+    /// The fused `[gate; up]` projection of an NVFP4 feed-forward, or empty (null qdata), in
+    /// which case `gate` and `up` hold the two halves.
+    Weight fused_gate_up;
     Weight down;
     Tensor post_feedforward_norm;
     float rms_epsilon = 0.0F;

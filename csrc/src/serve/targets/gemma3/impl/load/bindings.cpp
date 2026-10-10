@@ -2,6 +2,7 @@
 
 #include "targets/gemma3/impl/config.h"
 
+#include "artifact/linear_storage.h"
 #include "artifact/typed_binding.h"
 
 #include <cstddef>
@@ -45,8 +46,8 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
 }
 
 /// A matrix at whatever format the artifact declares. The profile's format is what a
-/// converted checkpoint stores, but a GGUF served natively keeps its own K-quants, and the
-/// kernels dispatch on the weight's qtype either way.
+/// converted checkpoint stores, but a GGUF served natively keeps its own K-quants, an NVFP4
+/// export keeps its codes, and the kernels dispatch on the weight's qtype either way.
 WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericFormat,
                        std::initializer_list<std::uint64_t> shape) {
     if (shape.size() != 2) { throw std::logic_error("bind_weight: rank-two shape"); }
@@ -54,12 +55,15 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
     const artifact::LinearBinding binding =
         artifact::bind_linear(binder, name, static_cast<std::int32_t>(dims[0]),
                               static_cast<std::int32_t>(dims[1]));
-    return WeightPlan{.object = binding.object, .format = binding.format};
+    return WeightPlan{.object = binding.object, .format = binding.format, .linear = binding};
 }
 
+/// `materialized_linear` is `materialized_weight` for every format but NVFP4, which it pairs
+/// with the divisors `bind_linear` read -- so a W8 or BF16 artifact binds exactly the Weight it
+/// always did.
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns) {
-    return artifact::materialized_weight(materialized, plan.object, plan.format, rows, columns);
+    return artifact::materialized_linear(materialized, plan.linear, rows, columns);
 }
 
 Tensor materialized_norm(const artifact::MaterializedArtifact& materialized,
@@ -71,10 +75,13 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized,
                                const family::TextGeometry& g) {
     DensePostMixerPayload out;
-    out.gate = materialized_weight(materialized, plan.gate, g.intermediate,
-                                   g.hidden);
-    out.up   = materialized_weight(materialized, plan.up, g.intermediate,
-                                   g.hidden);
+    if (plan.gate_up.has_value()) {
+        out.fused_gate_up =
+            materialized_weight(materialized, *plan.gate_up, 2 * g.intermediate, g.hidden);
+    } else {
+        out.gate = materialized_weight(materialized, plan.gate, g.intermediate, g.hidden);
+        out.up   = materialized_weight(materialized, plan.up, g.intermediate, g.hidden);
+    }
     out.down = materialized_weight(materialized, plan.down, g.hidden,
                                    g.intermediate);
     out.rms_epsilon = g.post_norm_epsilon > 0 ? g.post_norm_epsilon : g.rms_epsilon;
@@ -126,16 +133,31 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
             binder, prefix + "attention/key_norm", NumericFormat::BF16, {g.head_dim});
         target.attention.output = bind_weight(binder, prefix + "attention/output", weights,
                                               {g.hidden, g.query_size()});
-        target.mlp.gate = bind_weight(binder, prefix + "mlp/gate", weights,
-                                      {g.intermediate, g.hidden});
-        target.mlp.up   = bind_weight(binder, prefix + "mlp/up", weights,
-                                      {g.intermediate, g.hidden});
+        if (binder.has(prefix + "mlp/gate_up")) {
+            // An NVFP4 export's pair, stored as the one matrix its shared divisor makes it.
+            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
+                                             {2 * g.intermediate, g.hidden});
+        } else {
+            target.mlp.gate = bind_weight(binder, prefix + "mlp/gate", weights,
+                                          {g.intermediate, g.hidden});
+            target.mlp.up   = bind_weight(binder, prefix + "mlp/up", weights,
+                                          {g.intermediate, g.hidden});
+        }
         target.mlp.down = bind_weight(binder, prefix + "mlp/down", weights,
                                       {g.hidden, g.intermediate});
     }
 }
 
 } // namespace
+
+family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
+    auto g = family::TextGeometry::resolved_gemma3(reader.geometry(), reader.layer_types());
+    // Which format each matrix is stored in, for the workspace planner: an NVFP4 export's codes
+    // take transient activation storage (W4A4) that the profile's W8 does not, and an FP8
+    // export's blocks theirs.
+    artifact::resolve_linear_storage(reader, g);
+    return g;
+}
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features) {
@@ -144,7 +166,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The checkpoint's own dimensions, where it states them: absent members keep the
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
-    out.geometry = family::TextGeometry::resolved_gemma3(binder.reader().geometry(), binder.reader().layer_types());
+    out.geometry = resolved_geometry(binder.reader());
     const family::TextGeometry& g = out.geometry;
     out.frontend     = (binder.has("vision/patch_embedding") ? family::bind_frontend_resources(binder) : family::bind_text_only_frontend_resources(binder));
     out.features     = features;

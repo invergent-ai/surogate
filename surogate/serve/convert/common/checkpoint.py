@@ -15,7 +15,12 @@ def tokenizer_ids(root) -> tuple[int, ...]:
     import json
     from pathlib import Path
 
-    tokenizer = json.loads((Path(root) / "tokenizer.json").read_text(encoding="utf-8"))
+    return tokenizer_json_ids(json.loads((Path(root) / "tokenizer.json").read_text(encoding="utf-8")))
+
+
+def tokenizer_json_ids(tokenizer: Mapping[str, Any]) -> tuple[int, ...]:
+    """`tokenizer_ids` of an already-parsed `tokenizer.json`: what a converter that rewrites the
+    file it stores reads its domain from."""
     vocab = tokenizer["model"]["vocab"]
     ids = list(vocab.values()) if isinstance(vocab, dict) else list(range(len(vocab)))
     ids.extend(token["id"] for token in tokenizer.get("added_tokens", ()))
