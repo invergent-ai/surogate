@@ -24,6 +24,9 @@ def chat_template_bytes(root: Path) -> bytes | None:
         return path.read_bytes()
     config = json.loads((root / "tokenizer_config.json").read_text(encoding="utf-8"))
     template = config.get("chat_template")
+    if (not isinstance(template, str) or not template) and (root / "chat_template.json").is_file():
+        # The processor's copy, where newer Transformers exports keep it instead.
+        template = json.loads((root / "chat_template.json").read_text(encoding="utf-8")).get("chat_template")
     if not isinstance(template, str) or not template:
         return None
     return template.encode("utf-8")

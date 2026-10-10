@@ -357,7 +357,15 @@ std::vector<int> special_marker_tokens(const fi::Tokenizer& tokenizer,
     if (syntax.muse_glimmer || !syntax.model_opens) { return out; }
     for (const std::string* marker : {&syntax.open, &syntax.close}) {
         if (marker->empty()) { continue; }
-        for (const int id : tokenizer.encode(*marker, {.parse_added_tokens = true, .add_bos = false})) {
+        std::vector<int> ids;
+        try {
+            ids = tokenizer.encode(*marker, {.parse_added_tokens = true, .add_bos = false});
+        } catch (const std::invalid_argument&) {
+            // A vocabulary that cannot spell the marker has no special token in it to keep;
+            // the marker then decodes as it did before, and serving does not stop over it.
+            continue;
+        }
+        for (const int id : ids) {
             if (tokenizer.is_special_token(id) && std::find(out.begin(), out.end(), id) == out.end()) {
                 out.push_back(id);
             }

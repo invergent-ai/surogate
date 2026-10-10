@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
-from surogate.serve.convert.common import conversion
+from surogate.serve.convert.common import conversion, official_resources
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
 from surogate.serve.convert.common.inventory import RESOURCE_SPECS
 from surogate.serve.convert.common.quantize import pick_device
@@ -30,6 +30,16 @@ TEXT_FORMATS = ("w8", "bf16")
 
 def resources_for(model, g):
     resources = {r.name: r.data for r in conversion.load_resources(model, RESOURCE_SPECS)}
+    if "frontend/chat_template.jinja" not in resources:
+        # Releases that state the template only in tokenizer_config.json or chat_template.json
+        # (Red Hat's Gemma 3 FP8 exports) would otherwise convert as a base model, and the chat
+        # endpoints refuse a base model by name.
+        template = official_resources.chat_template_bytes(Path(model))
+        if template is not None:
+            resources["frontend/chat_template.jinja"] = template
+            resources["frontend/tokenizer_config.json"] = official_resources.tokenizer_config_with_template(
+                resources["frontend/tokenizer_config.json"], template)
+            resources = {spec.name: resources[spec.name] for spec in RESOURCE_SPECS if spec.name in resources}
     config, v = g.config, g.vision
     image = json.loads(resources["frontend/preprocessor_config.json"])
     token_config = json.loads(resources["frontend/tokenizer_config.json"])
