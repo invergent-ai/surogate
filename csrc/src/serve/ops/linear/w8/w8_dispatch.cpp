@@ -1,5 +1,8 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
+#include "ops/linear/w8/w8_rowsplit_wgmma_sm90.h"
+
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -7,9 +10,10 @@ namespace sinfer::ops::detail {
 
 void launch_w8_consistent(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
+namespace {
 
+/// The route a benchmarked shape's T bands give, or null for a shape nobody has measured.
+W8Launch measured_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 10240:
         if (n == 5120) {
@@ -330,29 +334,73 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     default:
         break;
     }
-
-    // Everything above is a *measured* route: a shape someone benchmarked, with the T bands
-    // the measurements produced. What follows is the same family of launchers at their
-    // default bands, for a shape nobody has measured yet.
-    //
-    // The launchers are shape-generic -- they take n, k and T from the tensors and handle a
-    // partial tile -- so refusing here would be a policy, not a limit, and the policy was
-    // wrong: it made every size of every family a code change. The one real constraint is
-    // the MMA route's 16-byte-aligned scale rows, and a shape that misses it takes the SIMT
-    // route at any width.
-    //
-    // A shape that lands here works but is not tuned. Measure it and give it an entry above.
-    if ((k % kW8MmaScaleRowAlignmentK) != 0) { return launch_w8_simt_r8_c4; }
-    if ((n % kW8MmaRowAlignmentN) != 0) { return launch_w8_simt_r8_c4; }
-    return launch_w8_consistent;
+    return nullptr;
 }
 
-bool w8_uses_stable_accumulation(std::int32_t n, std::int32_t k) {
-    // Generic shapes use the same K reduction at every width. Small changes
-    // at a BF16 boundary can otherwise flip FP8 cache codes and accumulate
-    // across layers. Shapes that require SIMT keep that route at every width.
-    return k % kW8MmaScaleRowAlignmentK != 0 || n % kW8MmaRowAlignmentN != 0 ||
-           select_w8_a16_launch(n, k, 1) == launch_w8_consistent;
+/// SUROGATE_SERVE_W8_GENERIC_MMA=0 restores the earlier generic routes: the batch-consistent
+/// kernel at every width, and SIMT for any shape that is not whole 128-row tiles over whole
+/// 256s of K.
+bool generic_mma_enabled() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_W8_GENERIC_MMA");
+        return raw == nullptr || raw[0] != '0';
+    }();
+    return enabled;
+}
+
+/// The same family of launchers at default bands, for a shape nobody has measured.
+///
+/// The launchers are shape-generic -- they take n, k and T from the tensors and handle a
+/// partial tile -- so refusing here would be a policy, not a limit. The real constraints are
+/// the scale rows' alignment (16 bytes, k % 256, for every MMA family but the row-split one,
+/// which stages 8-byte halves and needs k % 128) and the batch-consistent kernel's 16-row
+/// tiles.
+///
+/// Through 64 columns (every decode round up to 64 lanes) a shape keeps one K reduction at
+/// every width: the batch-consistent kernel, or SIMT where that kernel cannot tile it. Small
+/// changes at a BF16 boundary can otherwise flip FP8 cache codes between a lane served alone
+/// and in a batch. Wider rounds are prompt chunks, where that kernel cost what the bands
+/// below save: on a DGX Spark (sinfer_w8_route_bench, 21 Gemma shapes), 1.4-2.7x at 96 to
+/// 2,048 columns over whole 256s of K, 12-18x on Gemma 3 1B's k = 1,152, and 26x on Gemma 3's
+/// 262,208-row head, which SIMT had served at every width. Every route there matched SIMT.
+/// Hopper's batch-consistent kernel runs on wgmma from 33 columns and keeps every width.
+///
+/// A shape that lands here works but is not tuned. Measure it and give it an entry above.
+W8Launch generic_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool k_aligned   = k % kW8MmaScaleRowAlignmentK == 0;
+    const bool row_split_k = k % kW8RowSplitMmaScaleRowAlignmentK == 0;
+    if (!generic_mma_enabled()) {
+        if (!k_aligned || n % kW8MmaRowAlignmentN != 0) { return launch_w8_simt_r8_c4; }
+        return launch_w8_consistent;
+    }
+    // Rows in whole 64s: the MMA tiles' measured reach (262,208 = 4,097 x 64 matched SIMT on
+    // every route); anything else, or a k no MMA family stages, keeps SIMT at every width.
+    if (n % 64 != 0 || !row_split_k) { return launch_w8_simt_r8_c4; }
+    if (k_aligned) {
+        if (t <= 64 || w8_wgmma_available()) { return launch_w8_consistent; }
+    } else {
+        // Only the row-split MMA routes take these; SIMT is the consistent route, and from
+        // eight columns it was 1.2-10x slower than them on Gemma 3 1B's projections.
+        if (t <= 4) { return launch_w8_simt_r8_c4; }
+        if (t <= 64) { return launch_w8_mma_r32_c64; }
+    }
+    if (t <= 128) { return launch_w8_mma_r32_c128; }
+    return launch_w8_mma_r64_c128;
+}
+
+} // namespace
+
+W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
+    if (const W8Launch measured = measured_w8_a16_launch(n, k, t)) { return measured; }
+    return generic_w8_a16_launch(n, k, t);
+}
+
+bool w8_marlin_eligible(std::int32_t n, std::int32_t k) {
+    // The Marlin band serves measured shapes only, whole 128s both ways: a generic shape keeps
+    // the routes above, whose numerics through decode widths do not depend on the batch.
+    return k % kW8MmaScaleRowAlignmentK == 0 && n % kW8MmaRowAlignmentN == 0 &&
+           measured_w8_a16_launch(n, k, 1) != nullptr;
 }
 
 W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
@@ -369,7 +417,8 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
     W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
-    if (launch == launch_w8_consistent && w.padded_shape[1] != w.k) {
+    // A padded weight keeps SIMT wherever the generic routes would have taken it elsewhere.
+    if (w.padded_shape[1] != w.k && measured_w8_a16_launch(w.n, w.k, 1) == nullptr) {
         launch = launch_w8_simt_r8_c4;
     }
     launch(x, w, out, stream);
