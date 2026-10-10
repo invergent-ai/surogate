@@ -113,7 +113,7 @@ Each comparison ran both engines on the same kind of GPU with the same requests.
 | DGX Spark | Qwen3.8-27B · NVFP4 | 1 user, decode | **13.0 tok/s** | vLLM: 11.4 | **1.14×** |
 | DGX Spark | Qwen3.8-27B · NVFP4 | 32 users, decode per user | **7.6 tok/s** | vLLM: 6.5 | **1.17×** |
 | DGX Spark | Qwen3.8-27B · NVFP4 | 32 users, 512-token prompts, time to first token (p50) | **839 ms** | vLLM: 1,785 ms | **2.13×** |
-| DGX Spark | Qwen3.8-27B · NVFP4 | 1 user, real text, MTP | **31.0 tok/s** | vLLM (MTP): 18.6 | **1.67×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 1 user, real text, MTP | **29.1 tok/s** | vLLM (MTP): 18.6 | **1.56×** |
 | DGX Spark | Qwen3.8-27B · NVFP4 | 8 users, real text, MTP | **199.4 tok/s** | vLLM (MTP): 129.4 | **1.54×** |
 | DGX Spark | Qwen3.8-27B · NVFP4 | 16 users, real text, MTP | **279.9 tok/s** | vLLM (MTP): 188.3 | **1.49×** |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 1 user, decode | **31.4 tok/s** (with MTP: 45.9 on real text, 67.2 on benchmark prose) | vLLM: does not fit in 121.7 GiB | — |
@@ -121,8 +121,6 @@ Each comparison ran both engines on the same kind of GPU with the same requests.
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | cold 32k-token prompt, prefill | **2,008 tok/s** | llama.cpp (UD-IQ4_XS GGUF): 629 | **3.2×** |
 | DGX Spark | EmbeddingGemma-300M · W8 | 16 clients, one text per request | **2,442 texts/s** | vLLM (BF16): 510-562 | **4.3×** |
 | DGX Spark | EmbeddingGemma-300M · W8 | 4 clients, 32 texts per request | **814 texts/s** | vLLM (BF16): 745 | **1.09×** |
-
-On the DGX Spark, Qwen3.8-27B runs with an FP8 KV cache on Surogate and a BF16 one on vLLM, whose FP8 cache does not start on GB10.
 
 Also measured, without another engine alongside: single-user decode of Qwen3-0.6B at 685 tok/s and Qwen3.5-0.8B at 563 tok/s on an H100; Qwen3-0.6B at 220 tok/s, Qwen3.5-4B NVFP4 at 73 tok/s, Gemma 3 1B Q8_0 at 138 tok/s and Qwen3.6-27B NVFP4 at 12.0 tok/s on a DGX Spark, the last at the Spark's memory-bandwidth limit.
 
@@ -141,7 +139,7 @@ Also measured, without another engine alongside: single-user decode of Qwen3-0.6
 | DGX Spark | Qwen3-8B | 1,433 · FP8 | — | — |
 | DGX Spark | Qwen3.6-35B-A3B | 674 · FP8 | — | — |
 
-<sub>RTX 5090 serving rows: 2026-08-30 to 2026-09-07, cards at a 400 W limit, vLLM 0.27.1 and llama.cpp CUDA builds. H100 and DGX Spark rows: 2026-10-05 to 2026-10-09, vLLM 0.31. On the DGX Spark, vLLM's FP8 KV cache fails to start, so vLLM ran a BF16 cache; Surogate ran a BF16 cache for the 35B's short-prompt rows and an FP8 cache for its long-context and MTP rows and for Flash-Next. Qwen3.8-Flash-Next's NVFP4 release needs 123.5 GiB in vLLM on a 121.7 GiB Spark; a public vLLM preview with MTP is reported at 31-41 tok/s for one user there (not measured here). Surogate's Flash-Next rows run the 105 GB artifact converted from that release, and its prefill row is against llama.cpp on Unsloth's UD-IQ4_XS GGUF. Benchmark prose is the repeated 512-token text the throughput rows use, where up to 95% of MTP drafts are accepted; "real text" means distinct Wikipedia passages, where 52-54% are. Full methods: <a href="surogate/serve/BENCHMARKS.md">serving benchmarks</a>, <a href="docs/reference/benchmarks.md">training benchmarks</a>, and the pull requests behind each result (#296-#308).</sub>
+<sub>RTX 5090 serving rows: 2026-08-30 to 2026-09-07, cards at a 400 W limit, vLLM 0.27.1 and llama.cpp CUDA builds. H100 and DGX Spark rows: 2026-10-05 to 2026-10-09, vLLM 0.31. On the DGX Spark, vLLM's FP8 KV cache fails to start, so vLLM ran a BF16 cache; Surogate ran a BF16 cache for the 35B's short-prompt rows and an FP8 cache for its long-context and MTP rows, for Flash-Next and for Qwen3.8-27B. Qwen3.8-Flash-Next's NVFP4 release needs 123.5 GiB in vLLM on a 121.7 GiB Spark; a public vLLM preview with MTP is reported at 31-41 tok/s for one user there (not measured here). Surogate's Flash-Next rows run the 105 GB artifact converted from that release, and its prefill row is against llama.cpp on Unsloth's UD-IQ4_XS GGUF. Benchmark prose is the repeated 512-token text the throughput rows use, where up to 95% of MTP drafts are accepted; "real text" means distinct Wikipedia passages, where 52-54% are. Full methods: <a href="surogate/serve/BENCHMARKS.md">serving benchmarks</a>, <a href="docs/reference/benchmarks.md">training benchmarks</a>, and the pull requests behind each result (#296-#309).</sub>
 
 ## Two engines. One workflow.
 
