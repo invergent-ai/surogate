@@ -601,6 +601,11 @@ sinfer_add_test(sinfer_w8_moe_precision_test SOURCES ops/linear/test_w8_moe_prec
 sinfer_add_op_test(sinfer_w8_tail_test SOURCES ops/linear/test_w8_tail.cu LIBRARIES sinfer_ops CUDA::cudart)
 # The pipelined and wgmma W8 kernels against the medium-T one, bit for bit; `bench` times them.
 sinfer_add_op_test(sinfer_w8_pipelined_test SOURCES ops/linear/test_w8_pipelined.cu LIBRARIES sinfer_ops CUDA::cudart)
+# Every W8 launcher against SIMT on two Gemma shapes; `bench n k ...` times them all beside the
+# dispatcher's own pick, which is how an unmeasured shape gets its w8_dispatch.cpp entry.
+sinfer_add_op_test(sinfer_w8_route_bench
+  SOURCES ops/linear/bench_w8_routes.cpp ops/linear/linear_test_common.cpp
+  LIBRARIES sinfer_ops CUDA::cudart)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 sinfer_add_op_test(sinfer_linear_nvfp4_cublaslt_test SOURCES ops/linear/test_nvfp4_cublaslt.cpp  LIBRARIES sinfer_ops CUDA::cublasLt)
