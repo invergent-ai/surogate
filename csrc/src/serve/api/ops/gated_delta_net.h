@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/gdn_replay_records.h"
+
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -102,6 +104,23 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                   cudaStream_t stream);
+
+/**
+ * The same, with one layer's deferred folds (gdn_replay_stash). A row whose initial slot S is
+ * below pending.columns.ne[0] with pending.columns[S] = P > 0 first applies the P transitions
+ * stashed for S, stores that state to the slot (the one write this form makes), and verifies
+ * from it, rounded to the stored BF16 as a later read would see it. Outputs and records equal
+ * those of gdn_replay_fold followed by the plain form, bit for bit. The counts are read, never
+ * written: whoever resolves the round sets them again for every row it held. An empty
+ * `pending` is the plain form.
+ */
+void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots, Tensor& key_record,
+                                   Tensor& value_record, Tensor& gate_record,
+                                   const GdnPendingFoldLayer& pending, Tensor& out,
                                    cudaStream_t stream);
 
 } // namespace sinfer::ops

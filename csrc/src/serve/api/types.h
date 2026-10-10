@@ -125,6 +125,9 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    /// Whether the run chose `proposal_head` (--lm-head-draft or --full-head-draft). An MTP run
+    /// that did not drafts with the artifact's shortlist head when it carries one.
+    bool proposal_head_explicit = false;
     /// Widest round (decode lanes in flight) that still verifies drafts; wider rounds run the
     /// head's narrow round -- one column per lane through the trunk, the head aligned and
     /// proposing as usual -- so a draft head never costs a throughput-bound batch. 0 takes

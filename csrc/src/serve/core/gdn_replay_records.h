@@ -5,8 +5,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
 
 namespace sinfer {
+
+/// Whether a speculative round's GDN fold may wait for the lane's next verify
+/// (GdnReplayRecordSpec::pending_slots). SUROGATE_SERVE_DEFER_GDN_FOLD=0 folds every round.
+[[nodiscard]] inline bool deferred_gdn_fold_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_DEFER_GDN_FOLD");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
 
 struct GdnReplayRecordSpec {
     std::int32_t layers          = 0;
@@ -22,6 +34,12 @@ struct GdnReplayRecordSpec {
     /// width, outer]` -- laid out like the value, so a replay reads the channels it owns -- and
     /// beta, which stays one per head, has a plane of its own beside it.
     bool diagonal_gate           = false;
+    /// Lanes (current-state slots [0, pending_slots)) that can carry a deferred fold; zero plans
+    /// none. A deferred fold keeps a round's accepted transitions per lane until that lane's next
+    /// verify reads its state anyway, which then applies them before verifying -- so a round
+    /// reads the recurrent state once instead of twice (the verify, then the fold). Scalar gate
+    /// only.
+    std::int32_t pending_slots   = 0;
 
     /// Rows of the gate plane: {g, beta} pairs for a scalar gate, the key channels of g for a
     /// diagonal one.
@@ -38,6 +56,12 @@ struct GdnReplayRecordLayout {
     TensorRegion gate;
     /// Present only for a diagonal gate; a scalar gate's beta rides in `gate`.
     TensorRegion beta;
+    /// Present only with `spec.pending_slots`: the deferred folds' transitions, laid out like
+    /// the records with the lane's slot in place of the round's row, and their column counts.
+    TensorRegion pending_key;
+    TensorRegion pending_value;
+    TensorRegion pending_gate;
+    TensorRegion pending_columns;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
@@ -45,12 +69,23 @@ struct GdnReplayRecordLayout {
 [[nodiscard]] GdnReplayRecordLayout plan_gdn_replay_records(LayoutBuilder& builder,
                                                             const GdnReplayRecordSpec& spec);
 
+/// One layer's deferred folds, read by that layer's verify. Empty when none are planned.
+struct GdnPendingFoldLayer {
+    Tensor key;     // BF16 [key_dim, qk_heads, width, pending_slots]
+    Tensor value;   // BF16 [value_dim, value_heads, width, pending_slots]
+    Tensor gate;    // FP32 [2, value_heads, width, pending_slots]: {g, beta}
+    Tensor columns; // I32 [pending_slots]: transitions pending per lane, for every layer
+
+    [[nodiscard]] bool present() const noexcept { return columns.data != nullptr; }
+};
+
 struct GdnReplayRecordLayer {
     Tensor conv;  // BF16 [conv_channels, width, rows]
     Tensor key;   // BF16 [key_dim, qk_heads, width, rows]
     Tensor value; // BF16 [value_dim, value_heads, width, rows]
     Tensor gate;  // FP32 [gate_rows, value_heads, width, rows]: {g, beta}, or g per channel
     Tensor beta;  // FP32 [value_heads, width, rows] for a diagonal gate; empty otherwise
+    GdnPendingFoldLayer pending;
 };
 
 /**
@@ -65,7 +100,15 @@ struct GdnReplayRecords {
     Tensor value;
     Tensor gate;
     Tensor beta;
+    /// Deferred folds (spec.pending_slots > 0): key/value/gate planes with outer index
+    /// `layer * pending_slots + slot` at the planned width, and I32 [pending_slots] counts.
+    Tensor pending_key;
+    Tensor pending_value;
+    Tensor pending_gate;
+    Tensor pending_columns;
     GdnReplayRecordSpec spec;
+
+    [[nodiscard]] bool defers_fold() const noexcept { return pending_columns.data != nullptr; }
 
     GdnReplayRecords() = default;
     GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout);

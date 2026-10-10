@@ -96,11 +96,13 @@ void require_scale(float scale, const char* op) {
     }
 }
 
-void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                            const Tensor& beta, float scale, const Tensor& states,
-                            const Tensor& valid_columns, const Tensor& initial_slots,
-                            const Tensor& key_record, const Tensor& value_record,
-                            const Tensor& gate_record, const Tensor& out) {
+std::vector<MemoryRange> validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                                const Tensor& g, const Tensor& beta, float scale,
+                                                const Tensor& states, const Tensor& valid_columns,
+                                                const Tensor& initial_slots,
+                                                const Tensor& key_record,
+                                                const Tensor& value_record,
+                                                const Tensor& gate_record, const Tensor& out) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
     const std::int32_t value_heads = v.ne[1];
@@ -152,6 +154,40 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
         if (tensor->data != nullptr) { ranges.push_back(tensor_range(*tensor, kOp)); }
     }
     require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
+    return ranges;
+}
+
+void validate_pending_layer(const GdnPendingFoldLayer& pending, const Tensor& v,
+                            const Tensor& q, const Tensor& states,
+                            const std::vector<MemoryRange>& others) {
+    constexpr const char* kOp = "gated_delta_net_replay_record";
+    if (!pending.present()) { return; }
+    const std::int32_t qk_heads    = q.ne[1];
+    const std::int32_t value_heads = v.ne[1];
+    const std::int32_t slots       = pending.columns.ne[0];
+    const std::int32_t width       = pending.key.ne[2];
+    if (slots <= 0 || slots > states.ne[3] || width < q.ne[2]) {
+        throw std::invalid_argument(std::string(kOp) + ": invalid deferred fold geometry");
+    }
+    require_tensor(pending.columns, DType::I32, {slots}, 4, kOp, "pending columns");
+    require_tensor(pending.key, DType::BF16, {kStateDim, qk_heads, width, slots}, 8, kOp,
+                   "pending keys");
+    require_tensor(pending.value, DType::BF16, {kStateDim, value_heads, width, slots}, 2, kOp,
+                   "pending values");
+    require_tensor(pending.gate, DType::FP32, {2, value_heads, width, slots}, 8, kOp,
+                   "pending gates");
+    const std::array<MemoryRange, 4> planes{
+        tensor_range(pending.key, kOp), tensor_range(pending.value, kOp),
+        tensor_range(pending.gate, kOp), tensor_range(pending.columns, kOp)};
+    for (const MemoryRange plane : planes) {
+        for (const MemoryRange other : others) {
+            if (overlaps(plane, other)) {
+                throw std::invalid_argument(std::string(kOp) +
+                                            ": deferred folds overlap another tensor");
+            }
+        }
+    }
+    require_pairwise_disjoint(planes, "gated_delta_net_replay_record: deferred fold planes overlap");
 }
 
 bool is_supported_fold_geometry(const GdnReplayRecordSpec& spec) {
@@ -298,6 +334,36 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     return packed;
 }
 
+void require_pending_records(const GdnReplayRecords& records, const char* op) {
+    const GdnReplayRecordSpec& spec = records.spec;
+    if (!records.defers_fold() || spec.diagonal_gate || spec.pending_slots <= 0) {
+        throw std::invalid_argument(std::string(op) + ": records plan no deferred folds");
+    }
+    const std::int32_t outer = spec.layers * spec.pending_slots;
+    const std::int32_t width = records.pending_key.ne[2];
+    if (width < spec.width) {
+        throw std::invalid_argument(std::string(op) + ": deferred fold planes are too narrow");
+    }
+    require_tensor(records.pending_key, DType::BF16, {kStateDim, spec.qk_heads, width, outer}, 256,
+                   op, "pending keys");
+    require_tensor(records.pending_value, DType::BF16, {kStateDim, spec.value_heads, width, outer},
+                   256, op, "pending values");
+    require_tensor(records.pending_gate, DType::FP32, {2, spec.value_heads, width, outer}, 256, op,
+                   "pending gates");
+    require_tensor(records.pending_columns, DType::I32, {spec.pending_slots}, 256, op,
+                   "pending columns");
+}
+
+void require_pending_slots(std::span<const GdnReplayFoldRow> rows,
+                           const GdnReplayRecordSpec& spec, const char* op) {
+    for (const GdnReplayFoldRow& row : rows) {
+        if (row.commit_columns > 0 &&
+            (row.linear_state_slot < 0 || row.linear_state_slot >= spec.pending_slots)) {
+            throw std::invalid_argument(std::string(op) + ": slot has no deferred fold planes");
+        }
+    }
+}
+
 } // namespace
 
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -306,11 +372,26 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream) {
-    validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                           key_record, value_record, gate_record, out);
+    gated_delta_net_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                                  initial_state_slots, key_record, value_record, gate_record,
+                                  GdnPendingFoldLayer{}, out, stream);
+}
+
+void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots, Tensor& key_record,
+                                   Tensor& value_record, Tensor& gate_record,
+                                   const GdnPendingFoldLayer& pending, Tensor& out,
+                                   cudaStream_t stream) {
+    const std::vector<MemoryRange> ranges =
+        validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                               initial_state_slots, key_record, value_record, gate_record, out);
+    validate_pending_layer(pending, v, q, ssm_states, ranges);
     detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
                                                      valid_columns, initial_state_slots, key_record,
-                                                     value_record, gate_record, out, stream);
+                                                     value_record, gate_record, pending, out,
+                                                     stream);
 }
 
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
@@ -330,6 +411,50 @@ void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLay
     }
     detail::gated_delta_net::launch_replay_fold(records, states, packed,
                                                 static_cast<std::int32_t>(rows.size()), stream);
+}
+
+void gdn_replay_stash(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
+    validate_fold_records(records);
+    validate_fold_states(records, states);
+    require_records_disjoint_from_states(records, states);
+    require_pending_records(records, "gdn_replay_stash");
+    const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
+        validate_fold_rows(records, states, rows);
+    require_pending_slots(rows, records.spec, "gdn_replay_stash");
+    detail::gated_delta_net::launch_replay_stash(records, states, packed,
+                                                 static_cast<std::int32_t>(rows.size()), stream);
+}
+
+void gdn_replay_fold_pending(const GdnReplayRecords& records,
+                             LinearAttentionStateAllLayersView states,
+                             std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
+    validate_fold_records(records);
+    validate_fold_states(records, states);
+    require_pending_records(records, "gdn_replay_fold_pending");
+    if (rows.empty() || rows.size() > static_cast<std::size_t>(kMaximumRows)) {
+        throw std::invalid_argument("gdn_replay_fold_pending: row count is out of range");
+    }
+    // The fold's row checks, against the pending planes' own width.
+    detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        if (rows[row].linear_state_slot < 0 ||
+            rows[row].linear_state_slot >= records.spec.pending_slots ||
+            rows[row].linear_state_slot >= states.spec.slot_count) {
+            throw std::invalid_argument("gdn_replay_fold_pending: slot is out of range");
+        }
+        if (rows[row].commit_columns < 0 || rows[row].commit_columns > records.pending_key.ne[2]) {
+            throw std::invalid_argument("gdn_replay_fold_pending: pending extent is out of range");
+        }
+        for (std::size_t previous = 0; previous < row; ++previous) {
+            if (rows[previous].linear_state_slot == rows[row].linear_state_slot) {
+                throw std::invalid_argument("gdn_replay_fold_pending: slots must be distinct");
+            }
+        }
+        packed.row[row] = {rows[row].linear_state_slot, rows[row].commit_columns};
+    }
+    detail::gated_delta_net::launch_replay_fold_pending(
+        records, states, packed, static_cast<std::int32_t>(rows.size()), stream);
 }
 
 } // namespace sinfer::ops

@@ -196,8 +196,25 @@ def _split_gdn(entry):
     ) for role, part in zip(("query_key_value", "z"), entry.parts))
 
 
-def build(geometry, profile, sources):
-    """Build an artifact plan from config dimensions and actual per-object source formats."""
+#: Formats the converter may quantize an unquantized MTP block's matrices to (--mtp-format).
+#: W8 only: the runtime's W8 linear serves any shape, while its Q6/Q5/Q4 linears pick kernels
+#: from tables of the shapes those formats ship at (output heads, vision), and an MTP block's
+#: matrices are not among them, so such an artifact would fail at startup.
+MTP_FORMATS = {"bf16": inv.BF16, "w8": inv.W8}
+
+#: The all-quantized exports store a BF16 MTP block in W8 unless told otherwise. The block only
+#: drafts -- verification decides every token -- so its precision can cost acceptance but never
+#: output, and on the 27B at 8 bits it cost neither: the same tokens per round as BF16, and a
+#: decode round ~5 ms shorter on a DGX Spark. The other exports keep the source's BF16.
+DEFAULT_MTP_FORMAT = {inv.NVFP4_ALL: inv.W8, inv.NVFP4_UNIFORM: inv.W8}
+
+
+def build(geometry, profile, sources, *, mtp_format=inv.BF16):
+    """Build an artifact plan from config dimensions and actual per-object source formats.
+
+    ``mtp_format`` quantizes the MTP block's BF16 matrices (its norms stay BF16): the block runs
+    once to align and once per further draft every round, so on a bandwidth-bound decode its
+    weights are read several times a round."""
     g = geometry
     policy = inv.export_for(profile, g)
     template = inv.build_tensor_specs(g, mtp=bool(g.mtp_layers), vision=bool(inv.vision_tower(g)))
@@ -253,7 +270,7 @@ def build(geometry, profile, sources):
                             f"{name}: this export supports unquantized {component} matrices; "
                             f"found {sorted(source_formats)}. Use --no-{component} to omit this component."
                         )
-                    numeric_format = inv.BF16
+                    numeric_format = mtp_format if name.startswith("mtp/") else inv.BF16
                 spec_out = inv.tensor_spec(name, spec.shape, numeric_format)
             tensors.append(spec_out)
             if spec_out.format == inv.NVFP4:
@@ -364,12 +381,15 @@ def _validate_quantization(config):
             raise ValueError(f"quantization group {name}: compressed FP8 requires per-channel scales")
         activation = group.get("input_activations")
         if activation is not None:
+            # Newer compressed-tensors writes dynamic "local" for NVFP4 activations: per-group scales are
+            # computed at run time against the stored static input_global_scale, which is what we read.
+            dynamic = activation.get("dynamic", False) if isinstance(activation, dict) else None
             if not isinstance(activation, dict) or (
                 activation.get("type") != "float" or activation.get("num_bits") != bits
                 or activation.get("symmetric") is not True
                 or activation.get("strategy") not in (("tensor_group",) if bits == 4 else ("tensor", "token"))
                 or (bits == 4 and activation.get("group_size") != 16)
-                or not isinstance(activation.get("dynamic", False), bool)
+                or not (isinstance(dynamic, bool) or (bits == 4 and dynamic == "local"))
             ):
                 raise ValueError(f"quantization group {name}: unsupported input activation quantization")
         if group.get("output_activations") is not None:
@@ -409,7 +429,7 @@ def _frontend(root, resources_from, stack):
 
 
 def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="cuda", resources_from=None,
-            mtp=True, vision=True):
+            mtp=True, vision=True, mtp_format=inv.BF16):
     from surogate.serve.convert.common.quantize import pick_device
     from ..convert import _tools_root
     started = time.perf_counter()
@@ -431,7 +451,7 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
         scope = conversion.honour_declared_scope(primary_config, g, primary, what=conversion.checkpoint_label(primary))
         if scope:
             print(scope, flush=True)
-        plan = build(g, profile, sources)
+        plan = build(g, profile, sources, mtp_format=mtp_format)
         object_plan = conversion.build_object_plan(plan.objects, {r.name: r.data for r in resources})
         draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, frontend_root, geometry=g)
         derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_head.materialize_draft_head_token_ids(draft)}
@@ -462,7 +482,7 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
             target_key=inv.TARGET_KEY, recipe_id="qwen3_5-checkpoint-quantized-v3", repo_root=_tools_root(),
             model_dir=primary, out_path=output,
             arguments={"model": str(root), "quantized_model": str(primary), "device": device,
-                       "mtp": mtp, "vision": vision},
+                       "mtp": mtp, "vision": vision, "mtp_format": mtp_format},
             config_summary=checkpoint.geometry_block(g), source_preflight=plan.source_preflight,
             objects=object_plan.objects, elapsed_seconds=time.perf_counter() - started,
             final_bytes=output.stat().st_size, device=resolved_device, ranking_path=draft.ranking,
@@ -481,9 +501,15 @@ def main(argv=None, *, profile=None):
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-mtp", action="store_true")
+    parser.add_argument("--mtp-format", choices=sorted(MTP_FORMATS),
+                        help="store an unquantized MTP block's matrices in this format "
+                             "(default: w8 for nvfp4-all and nvfp4-uniform, bf16 otherwise)")
     parser.add_argument("--no-vision", action="store_true")
     args = parser.parse_args(argv)
     source = args.quantized_model or args.model
     profile = profile or profile_for_checkpoint(conversion.load_json(source / "config.json"))
+    mtp_format = (MTP_FORMATS[args.mtp_format] if args.mtp_format is not None
+                  else DEFAULT_MTP_FORMAT.get(profile, inv.BF16))
     return convert(args.model, args.out, profile=profile, quantized_model_dir=args.quantized_model,
-                   device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
+                   device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
+                   mtp_format=mtp_format)

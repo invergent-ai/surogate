@@ -30,9 +30,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full ||
-            options.max_lanes != 0 || options.adaptive) {
-            throw std::invalid_argument("--draft-tokens, --lm-head-draft, --spec-adaptive and "
-                                        "--spec-max-lanes require --spec mtp|dflash");
+            options.proposal_head_explicit || options.max_lanes != 0 || options.adaptive) {
+            throw std::invalid_argument("--draft-tokens, --lm-head-draft, --full-head-draft, "
+                                        "--spec-adaptive and --spec-max-lanes require --spec mtp|dflash");
         }
         return;
     case SpeculativeBackend::Mtp:

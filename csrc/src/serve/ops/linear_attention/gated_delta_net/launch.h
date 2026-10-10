@@ -58,11 +58,24 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream);
+                             const GdnPendingFoldLayer& pending, Tensor& out, cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
+
+/// `rows` as for the fold, one per record row: publishes each row's convolution history and
+/// copies its committed transitions to the pending planes at its slot.
+void launch_replay_stash(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                         cudaStream_t stream);
+
+/// `rows` name slots and their pending transition counts, in any order: folds the pending
+/// transitions into the recurrent state and leaves the convolution history alone.
+void launch_replay_fold_pending(const GdnReplayRecords& records,
+                                LinearAttentionStateAllLayersView states,
+                                const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                                cudaStream_t stream);
 
 std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens);
 

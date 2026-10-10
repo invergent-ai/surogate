@@ -112,9 +112,10 @@ MODEL=./models/checkpoint-with-mtp bash examples/serve/launch.sh mtp
 MODEL=./models/checkpoint-with-mtp bash examples/serve/launch.sh mtp --devices 0,1
 ```
 
-MTP needs actual draft weights; community exports may omit them. Add `--lm-head-draft`
-only when the checkpoint also includes a reduced draft vocabulary. Compare with and
-without speculation at the concurrency you expect to serve.
+MTP needs actual draft weights; community exports may omit them. When the prepared model
+also carries a reduced draft vocabulary, MTP drafts with it by default; `--full-head-draft`
+drafts with the full output head instead. Compare with and without speculation at the
+concurrency you expect to serve.
 
 DFlash preparation is an advanced source-checkout workflow. Supply a compatible
 Qwen3.5/3.6 MoE target and DFlash drafter checkpoint; both must already be downloaded:

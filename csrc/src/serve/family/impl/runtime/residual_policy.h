@@ -351,7 +351,7 @@ inline void linear_recurrence_record(const Tensor& q, const Tensor& k, const Ten
     } else if constexpr (linear_mixer<Variant>() == family::LinearMixer::GatedDelta) {
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale, states, valid_columns,
                                            initial_state_slots, records.key, records.value,
-                                           records.gate, out, stream);
+                                           records.gate, records.pending, out, stream);
     } else {
         throw std::logic_error(
             "this target's linear mixer has no replay-record form, so it cannot verify a "

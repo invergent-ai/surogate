@@ -397,40 +397,61 @@ void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_
     }
 }
 
-PagedKVHostImage PagedKVPool::download_pages(std::span<const std::int32_t> ids,
-                                             cudaStream_t stream) const {
+std::size_t PagedKVPool::image_plane_bytes(std::size_t plane, std::size_t pages) const {
+    const auto& tensor   = planes_.at(plane);
+    const int page_axis  = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
+    const auto heads     = page_axis == 3 ? 1 : static_cast<std::size_t>(tensor.ne[3]);
+    return pages * static_cast<std::size_t>(tensor.nb[page_axis]) * heads;
+}
+
+void PagedKVPool::download_pages_to(std::span<const std::int32_t> ids,
+                                    std::span<std::byte* const> destinations,
+                                    cudaStream_t stream) const {
+    if (destinations.size() != planes_.size()) {
+        throw std::invalid_argument("prefix image does not name every KV plane");
+    }
     for (const auto id : ids) {
         if (id < 0 || static_cast<std::uint32_t>(id) >= page_group_count()) {
             throw std::out_of_range("prefix image page is outside the KV pool");
         }
     }
-    PagedKVHostImage image;
-    image.pages = static_cast<std::uint32_t>(ids.size());
-    image.planes.resize(planes_.size());
     for (std::size_t i = 0; i < planes_.size(); ++i) {
         const auto& plane = planes_[i];
         const int page_axis = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
         const auto stride = static_cast<std::size_t>(plane.nb[page_axis]);
         const auto heads = page_axis == 3 ? 1 : plane.ne[3];
-        auto& host = image.planes[i];
-        host.resize(ids.size() * stride * heads);
+        std::byte* host = destinations[i];
         for (std::size_t first = 0; first < ids.size();) {
             std::size_t last = first + 1;
             while (last < ids.size() && ids[last] == ids[last - 1] + 1) { ++last; }
-            CUDA_CHECK(cudaMemcpy2DAsync(host.data() + first * stride, ids.size() * stride,
+            CUDA_CHECK(cudaMemcpy2DAsync(host + first * stride, ids.size() * stride,
                 static_cast<const std::byte*>(plane.data) + ids[first] * stride,
                 page_axis == 3 ? (last - first) * stride : plane.nb[3],
                 (last - first) * stride, heads, cudaMemcpyDeviceToHost, stream));
             first = last;
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+}
+
+PagedKVHostImage PagedKVPool::download_pages(std::span<const std::int32_t> ids,
+                                             cudaStream_t stream) const {
+    PagedKVHostImage image;
+    image.pages = static_cast<std::uint32_t>(ids.size());
+    image.planes.resize(planes_.size());
+    std::vector<std::byte*> destinations(planes_.size());
+    for (std::size_t i = 0; i < planes_.size(); ++i) {
+        image.planes[i].resize(image_plane_bytes(i, ids.size()));
+        destinations[i] = image.planes[i].data();
+    }
+    download_pages_to(ids, destinations, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     return image;
 }
 
-void PagedKVPool::upload_pages(const PagedKVHostImage& image,
-                               std::span<const std::int32_t> ids, cudaStream_t stream) const {
-    if (ids.size() > image.pages || image.planes.size() != planes_.size()) {
+void PagedKVPool::upload_pages_from(std::span<const std::byte* const> sources,
+                                    std::uint32_t image_pages, std::span<const std::int32_t> ids,
+                                    cudaStream_t stream) const {
+    if (ids.size() > image_pages || sources.size() != planes_.size()) {
         throw std::invalid_argument("prefix image does not cover the KV allocation");
     }
     for (const auto id : ids) {
@@ -438,31 +459,38 @@ void PagedKVPool::upload_pages(const PagedKVHostImage& image,
             throw std::out_of_range("prefix image page is outside the KV pool");
         }
     }
-    // Validate every plane before enqueueing a copy, including malformed images.
-    for (std::size_t i = 0; i < planes_.size(); ++i) {
-        const auto& plane = planes_[i];
-        const int axis = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
-        const auto heads = axis == 3 ? 1 : plane.ne[3];
-        if (image.planes[i].size() != std::size_t(image.pages) * plane.nb[axis] * heads) {
-            throw std::invalid_argument("prefix image KV plane geometry differs");
-        }
-    }
     for (std::size_t i = 0; i < planes_.size(); ++i) {
         const auto& plane = planes_[i];
         const int page_axis = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
         const auto stride = static_cast<std::size_t>(plane.nb[page_axis]);
         const auto heads = page_axis == 3 ? 1 : plane.ne[3];
-        const auto& host = image.planes[i];
+        const std::byte* host = sources[i];
         for (std::size_t first = 0; first < ids.size();) {
             std::size_t last = first + 1;
             while (last < ids.size() && ids[last] == ids[last - 1] + 1) { ++last; }
             CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(plane.data) + ids[first] * stride,
                 page_axis == 3 ? (last - first) * stride : plane.nb[3],
-                host.data() + first * stride, std::size_t(image.pages) * stride,
+                host + first * stride, std::size_t(image_pages) * stride,
                 (last - first) * stride, heads, cudaMemcpyHostToDevice, stream));
             first = last;
         }
     }
+}
+
+void PagedKVPool::upload_pages(const PagedKVHostImage& image,
+                               std::span<const std::int32_t> ids, cudaStream_t stream) const {
+    if (ids.size() > image.pages || image.planes.size() != planes_.size()) {
+        throw std::invalid_argument("prefix image does not cover the KV allocation");
+    }
+    // Validate every plane before enqueueing a copy, including malformed images.
+    std::vector<const std::byte*> sources(planes_.size());
+    for (std::size_t i = 0; i < planes_.size(); ++i) {
+        if (image.planes[i].size() != image_plane_bytes(i, image.pages)) {
+            throw std::invalid_argument("prefix image KV plane geometry differs");
+        }
+        sources[i] = image.planes[i].data();
+    }
+    upload_pages_from(sources, image.pages, ids, stream);
 }
 
 std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,

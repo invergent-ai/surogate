@@ -26,7 +26,12 @@ def verify_artifact(artifact, base_dir, nvfp4_dir=None, *, device="cpu"):
         sources = quantized.Sources(reader, fallback)
         g = quantized._geometry(conversion.load_json(root / "config.json"), root, sources,
                                 mtp=bool(artifact.geometry["mtp_layers"]), vision=bool(artifact.vision_geometry))
-        plan = quantized.build(g, profile, sources)
+        # The MTP block's storage format is a conversion option (--mtp-format); take it from the
+        # artifact, then re-encode every byte in it like any other object.
+        mtp_format = next((obj.format for obj in artifact.objects if obj.name == "mtp/input_projection"), inv.BF16)
+        if mtp_format not in quantized.MTP_FORMATS.values():
+            raise ValueError(f"mtp/input_projection: unexpected MTP storage format {mtp_format}")
+        plan = quantized.build(g, profile, sources, mtp_format=mtp_format)
         if artifact.geometry != checkpoint.geometry_block(g) or tuple(artifact.layer_types) != g.layer_types:
             raise ValueError("artifact geometry does not match the source checkpoint")
         resources = {r.name: r.data for r in conversion.load_resources(root, inv.RESOURCE_SPECS)}

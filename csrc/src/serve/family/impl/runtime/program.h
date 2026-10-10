@@ -19,6 +19,7 @@
 #include "family/impl/runtime/dflash_context.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/prefix_identity.h"
+#include "family/impl/archive_storage.h"
 #include "family/impl/radix_prefix_cache.h"
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/vision_context.h"
@@ -324,10 +325,14 @@ struct SharedPrefix {
     ~SharedPrefix() { if (storage) storage->free.push_back(slot); }
 };
 
+/// A finished lane's prefix kept in host memory after its lane went to another request. Every
+/// byte lives in `storage`; the views below are its tensors and KV planes.
 struct ArchivedSequence {
     SequenceState state;
-    PagedKVHostImage text, backend;
-    std::vector<std::vector<std::byte>> current, checkpoint;
+    family::detail::ArchiveBlock storage;
+    std::uint32_t text_pages = 0, backend_pages = 0;
+    std::vector<std::byte*> text, backend;
+    std::vector<std::span<std::byte>> current, checkpoint;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -459,6 +464,11 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    /// Applies the lanes' deferred folds now, for a round that reads their state without the
+    /// replay-record verify that would apply them (an ordinary, narrow or one-column round).
+    void settle_deferred_folds(std::span<const std::uint32_t> lanes);
+    /// Brings the device's deferred fold counts up to date before a round can read them.
+    void flush_deferred_fold_counts();
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     void evict_archived_prefixes() noexcept;
@@ -616,6 +626,11 @@ public:
     WorkspaceArena work;
     std::unique_ptr<family::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
+    /// Each lane's deferred GDN fold (replay_records->defers_fold()): the transitions its last
+    /// round accepted and its next verify applies, as the device's pending_columns holds them
+    /// once `deferred_fold_counts_dirty` is flushed. Zero for a lane with nothing pending.
+    std::vector<std::int32_t> deferred_fold_columns;
+    bool deferred_fold_counts_dirty = false;
     std::optional<DFlashPersistentState> dflash;
     family::RoundState io;
     Tensor prefill_hidden;
@@ -634,7 +649,12 @@ public:
     std::vector<RequestControl> requests;
     // Host snapshots retain complete continuation state without reserving another active
     // lane or increasing the GPU KV pool. Each pipeline stage has a bounded local cache.
-    family::detail::RadixPrefixCache<ArchivedSequence> archived_prefixes{512ULL << 20};
+    static constexpr std::size_t kArchivedPrefixBytes = 512ULL << 20;
+    family::detail::RadixPrefixCache<ArchivedSequence> archived_prefixes{kArchivedPrefixBytes};
+    /// Page-locked storage for `archived_prefixes`, made at the first archive; null if the host
+    /// refused it (`archive_arena_refused`), and images then use the heap.
+    std::shared_ptr<family::detail::PinnedArchiveArena> archive_arena;
+    bool archive_arena_refused = false;
     std::unordered_map<const GpuPrefixKey*, std::shared_ptr<GpuPrefix>> gpu_prefixes;
     void prune_gpu_prefixes();
     void capture_gpu_prefix(SequenceState& sequence, const std::shared_ptr<const GpuPrefixKey>& key,
@@ -722,6 +742,11 @@ public:
         bool graph_hit           = false;
         schedule::PrefillChunkResult chunk{};
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+        /// Per prompt, its first segment's length when it brought two (0: one segment).
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> splits{};
+        /// The decode lanes verified their drafts in this round (an MTP round carrying the
+        /// prompts): consume reads them through consume_mtp_round.
+        bool mtp_verify = false;
     };
     MixedInFlight mixed_in_flight_{};
     std::uint64_t mixed_in_flight_counter_ = 0;
@@ -796,8 +821,11 @@ private:
     void copy_round_token();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
+    /// One step of a staged prompt: its next chunk, or with `bridge_only` just a reused
+    /// prefix's MTP bridge (the chunk is left to a later step).
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
-                                                             RequestControl& request);
+                                                             RequestControl& request,
+                                                             bool bridge_only = false);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -822,9 +850,12 @@ private:
     /// the egress into each lane's `SpeculativeOutcome` and records the pending candidate.
     /// A stage without the head runs the verify forward only and leaves the lanes pending
     /// with nothing produced, for `adopt_speculative_outcome`.
+    /// With `prefill_lanes`, the staged prompts' chunks ride the verify forward as a mixed
+    /// round does (launch_mixed_round routes there), so the lanes keep verifying drafts.
     [[nodiscard]] runtime::RoundHandle
     launch_mtp_round(std::span<const std::uint32_t> lanes,
-                     std::span<const runtime::RoundBudget> budgets);
+                     std::span<const runtime::RoundBudget> budgets,
+                     std::span<const std::uint32_t> prefill_lanes = {});
     [[nodiscard]] runtime::BatchedGeneratedRound consume_mtp_round(runtime::RoundHandle handle);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,

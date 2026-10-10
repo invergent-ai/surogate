@@ -41,4 +41,32 @@ struct GdnReplayFoldRow {
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);
 
+/**
+ * Op: gdn_replay_stash
+ *
+ * The deferred form of gdn_replay_fold, for records that plan pending folds
+ * (`records.defers_fold()`, scalar gate). Rows are as for the fold, and each linear_state_slot is
+ * a lane slot in [0,spec.pending_slots). For a positive extent the Op sets the convolution
+ * history exactly as the fold does and copies the row's [0,commit_columns) key/value/{g,beta}
+ * records, bit for bit, to the pending planes at the slot; it writes no recurrent state and no
+ * pending column count. The caller then sets pending_columns[slot] to the extent, and the slot's
+ * next gated_delta_net_replay_record applies those transitions before verifying -- or
+ * gdn_replay_fold_pending applies them when no verify comes first.
+ */
+void gdn_replay_stash(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);
+
+/**
+ * Op: gdn_replay_fold_pending
+ *
+ * Applies stashed transitions without a verify: each row names a distinct lane slot in
+ * [0,spec.pending_slots) and the count stashed for it (in [0,spec.width]; the caller's copy of
+ * pending_columns). The Op folds that many pending transitions into the slot's recurrent state
+ * in every layer, exactly as gdn_replay_fold would have from the records, and leaves the
+ * convolution history alone; the caller then clears pending_columns for the slot.
+ */
+void gdn_replay_fold_pending(const GdnReplayRecords& records,
+                             LinearAttentionStateAllLayersView states,
+                             std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);
+
 } // namespace sinfer::ops

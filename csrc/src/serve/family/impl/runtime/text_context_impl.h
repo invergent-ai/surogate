@@ -28,6 +28,7 @@
 #include "api/ops/gdn_gating.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "api/ops/gqa_attention.h"
 #include "api/ops/linear.h"
 #include "api/ops/lora_store.h"
@@ -1696,6 +1697,11 @@ void TextContext::short_conv_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx,
         Tensor part_out   = convolved.slice(1, segment.offset, segment.columns);
         Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), segment.state_slot);
         ops::short_conv(part_in, *w.conv1d, conv_state, part_out, cfg_.hidden, valid, s);
+        if (segment.capture_slot >= 0) {
+            const Tensor target = state_.conv_slot(static_cast<std::uint32_t>(gidx), segment.capture_slot);
+            CUDA_CHECK(cudaMemcpyAsync(target.data, conv_state.data, conv_state.bytes(),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
     }
     if (batch > 0) {
         Tensor rows_in  = bcx.slice(1, prefill_columns, batch)
@@ -2364,6 +2370,28 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     if (finalizers > 0 && (finalize.tokens.data == nullptr || finalize.sampling == nullptr)) {
         throw std::invalid_argument("mixed chunk finalizers need sampler staging");
     }
+    // Two segments on one slot are one prompt cut at a boundary: adjacent, the second starting
+    // where the first ends, and only where every per-segment pass runs them in order.
+    std::array<bool, kMaximumBatchColumns> split_prompt{};
+    if (segments.size() > static_cast<std::size_t>(kMaximumBatchColumns)) {
+        throw std::invalid_argument("mixed chunk carries too many segments");
+    }
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        for (std::size_t j = i + 1; j < segments.size(); ++j) {
+            if (segments[j].state_slot != segments[i].state_slot) { continue; }
+            if (!mixed_split_segments_supported() || j != i + 1 || segments[i].finalize ||
+                segments[j].kv_base != segments[i].kv_base + static_cast<std::int32_t>(segments[i].ids.size()) ||
+                segments[j].kv_table_row != segments[i].kv_table_row || segments[i].vision ||
+                segments[j].vision) {
+                throw std::logic_error("mixed chunk carries one prompt's segments out of order");
+            }
+            split_prompt[i] = split_prompt[j] = true;
+        }
+        if (segments[i].capture_slot >= 0 &&
+            (i + 1 == segments.size() || segments[i + 1].state_slot != segments[i].state_slot)) {
+            throw std::logic_error("mixed chunk captures a state no later segment advances");
+        }
+    }
     const int total  = prefill_cols + decode_columns;
     const int base_i = segments.front().kv_base;
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
@@ -2650,7 +2678,10 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         selection.image_begin = scatter.front();
                         selection.image_end = scatter.back() + 1;
                     }
-                    if (may_pack && segment.kv_table_row >= 0 && selection.words == nullptr &&
+                    // A prompt's two segments (mixed_split_segments_supported) attend one after
+                    // the other, on their own launches: the second reads the keys the first writes.
+                    if (may_pack && !split_prompt[sg] && segment.kv_table_row >= 0 &&
+                        selection.words == nullptr &&
                         selection.image_end == 0 &&
                         ops::gqa_attention_packs_prompt(layer_head_dim, cfg_.n_q, kv_view.num_kv_heads,
                                                         kv_view.dtype, len, envelope)) {
@@ -2725,7 +2756,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 for (std::size_t sg = 0; sg < segments.size(); ++sg) {
                     parts.push_back({segment_begin[sg],
                                      static_cast<std::int32_t>(segments[sg].ids.size()),
-                                     static_cast<std::int32_t>(segments[sg].state_slot)});
+                                     static_cast<std::int32_t>(segments[sg].state_slot),
+                                     segments[sg].capture_slot});
                 }
                 short_conv_mix_mixed(gdn, x, gidx, parts, prefill_cols, decode_columns, Tensor{},
                                      decode.linear_state_slots);
@@ -2764,6 +2796,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                             static_cast<std::uint32_t>(segments[sg].state_slot));
                         ops::causal_conv1d_silu_split(qkv_a, *gdn.conv1d, conv_state, conv_state,
                                                       qa, ka, va, Tensor{}, s);
+                        if (segments[sg].capture_slot >= 0) {
+                            const Tensor target = state_.conv_slot(static_cast<std::uint32_t>(gidx),
+                                                                   segments[sg].capture_slot);
+                            CUDA_CHECK(cudaMemcpyAsync(target.data, conv_state.data, conv_state.bytes(),
+                                                       cudaMemcpyDeviceToDevice, s));
+                        }
                     }
                     if (batch > 0) {
                         Tensor qkv_b = qkv.slice(1, prefill_cols, decode_columns).view({cfg_.conv_dim, width, batch});
@@ -2775,9 +2813,22 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                 state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
                                 decode.linear_state_slots, decode.linear_state_slots, qb, kb, vb, s);
                         } else {
-                            for (const auto* part : {&qb, &kb, &vb}) {
-                                CUDA_CHECK(cudaMemsetAsync(part->data, 0, part->bytes(), s));
+                            // The verify columns rode the projection above, and a projected
+                            // plane is what the conv record holds: copy it there and convolve
+                            // from it, instead of streaming the input projection's weights a
+                            // second time for these columns (the record form projects them
+                            // again, then runs this same convolution).
+                            if (!decode.replay_records) { throw std::logic_error("mixed verification has no replay records"); }
+                            auto records = decode.replay_records->layer(gidx, batch);
+                            if (records.conv.ne[0] != qkv_b.ne[0] || records.conv.ne[1] != width ||
+                                records.conv.ne[2] != batch) {
+                                throw std::logic_error("mixed verification conv record does not match the projection");
                             }
+                            CUDA_CHECK(cudaMemcpyAsync(records.conv.data, qkv_b.data, qkv_b.bytes(),
+                                                       cudaMemcpyDeviceToDevice, s));
+                            ops::detail::gdn_projected_conv_record_launch(records.conv, *gdn.conv1d,
+                                state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                                decode.linear_state_slots, qb, kb, vb, s);
                         }
                     }
                     if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
@@ -2786,20 +2837,6 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 debug_probe<Variant>("mixed_gdn_conv_key", kc, cfg_.n_layers, s);
                 debug_probe<Variant>("mixed_gdn_conv_value", vc, cfg_.n_layers, s);
 
-                if (batch > 0 && width > 1) {
-                    if (!decode.replay_records) { throw std::logic_error("mixed verification has no replay records"); }
-                    auto records = decode.replay_records->layer(gidx, batch);
-                    Tensor input = h.slice(1, prefill_cols, decode_columns).view({cfg_.hidden, width, batch});
-                    Tensor query = qc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
-                    Tensor key = kc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
-                    Tensor value = vc.slice(1, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
-                    Tensor gate = z.slice(2, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
-                    ops::ScopedLoraColumns verify_lora(roots.lora_slots.slice(0, prefill_cols, decode_columns));
-                    Variant::gdn_input_projection_record(input, *gdn.projection, *gdn.conv1d,
-                        state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
-                        decode.linear_state_slots, records.conv, query, key, value, gate,
-                        Phase::Verify, work_, s);
-                }
                 Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor vv          = vc.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
@@ -2821,6 +2858,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         static_cast<std::uint32_t>(segments[sg].state_slot));
                     family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, cfg_.gdn_scale,
                                                               work_, recurrent_state, oa, s);
+                    if (segments[sg].capture_slot >= 0) {
+                        const Tensor target = state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
+                                                                    segments[sg].capture_slot);
+                        CUDA_CHECK(cudaMemcpyAsync(target.data, recurrent_state.data,
+                                                   recurrent_state.bytes(), cudaMemcpyDeviceToDevice, s));
+                    }
                     }
                 }
                 if (batch > 0) {

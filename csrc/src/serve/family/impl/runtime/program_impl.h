@@ -37,6 +37,19 @@ inline bool round_trace_enabled() {
     static const bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
     return enabled;
 }
+/// SUROGATE_SERVE_ADMIT_TRACE=1: where a slow admission spends its time (archive, restore,
+/// eviction), one line per step that takes 5 ms or more.
+inline bool admit_trace_enabled() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_ADMIT_TRACE") != nullptr;
+    return enabled;
+}
+inline void admit_trace_step(const char* step, std::uint32_t lane,
+                             std::chrono::steady_clock::time_point since) {
+    if (!admit_trace_enabled()) { return; }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
+    if (ms >= 5.0) { std::fprintf(stderr, "admit-trace: lane %u %s %.1f ms\n", lane, step, ms); }
+}
 /// Whether a decision's first token projects only its candidates' head rows (sample_from_hidden).
 /// SUROGATE_SERVE_CANDIDATE_HEAD=0 projects the whole head and samples, as before, for comparison;
 /// the candidate logits are the same bits either way.
@@ -382,6 +395,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         if (speculative_backend == SpeculativeBackend::DFlash) {
             dflash_record_storage = replay_records;
         }
+        if (replay_records->defers_fold()) {
+            deferred_fold_columns.assign(static_cast<std::size_t>(replay_records->spec.pending_slots), 0);
+            CUDA_CHECK(cudaMemsetAsync(replay_records->pending_columns.data, 0,
+                                       replay_records->pending_columns.bytes(), device.stream));
+            std::fprintf(stderr, "engine: MTP folds each round's accepted linear-attention "
+                                 "transitions into the next verify (SUROGATE_SERVE_DEFER_GDN_FOLD=0 "
+                                 "folds every round)\n");
+        }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None && !model.gdn_layers.empty())) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
@@ -672,11 +693,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request_plan.reuse == ReusePath::FullReset ||
         request_plan.reuse_base < sequence.execution_frontier ||
         is_rewrite_checkpoint_restore(request_plan.reuse)) {
+        const auto archive_started = std::chrono::steady_clock::now();
         archive_sequence(sequence);
+        admit_trace_step("archive previous", lane, archive_started);
     }
+    const auto restore_started = std::chrono::steady_clock::now();
     if (request_plan.device_prefix) { restore_gpu_prefix(sequence, request_plan); }
     else if (request_plan.shared_prefix) { restore_shared_prefix(sequence, request_plan); }
     else if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
+    admit_trace_step("restore prefix", lane, restore_started);
     sequence.target_only = request_plan.target_only;
     request.target_only = request_plan.target_only;
     request.gpu_prefix = request_plan.gpu_prefix;
@@ -966,13 +991,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                          staged.elapsed_seconds * 1e3);
         }
         request.lifecycle      = Lifecycle::Prefilling;
+        // A reused prefix's MTP bridge is one head column: it runs here, and the suffix after
+        // it then rides the decode rounds as a fresh prompt does, instead of prefilling alone
+        // at admission while every running lane waits for it (a multi-second stall for a long
+        // suffix). SUROGATE_SERVE_MTP_REUSE_MIXED=0 keeps the classic order below.
+        static const bool reuse_mixed = [] {
+            const char* value = std::getenv("SUROGATE_SERVE_MTP_REUSE_MIXED");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        if (reuse_mixed && defer_first_chunk && staged.mtp_bridge == MtpBridgeMode::BeforeSuffix &&
+            !pipeline_stage() && !staged.vision && request.prompt_logprobs < 0) {
+            (void)advance_prefill(sequence, request, true);
+        }
         // Deferred first chunk (PATCHES.md #30): leave the staged prefill to
         // the executor loop so it can ride a mixed round with the active
         // decode lanes -- or, for a shape no mixed round takes, a lone prefill
         // step. A draft-head prompt defers too: on a pipeline the deferred path
         // is the one that respects stage ownership, and a first chunk run at
         // admission shares a stage's boundary buffers with whatever round is in
-        // flight there. Bridged MTP reuse keeps the classic order.
+        // flight there. A bridge the block above did not run (a pipeline stage, an image
+        // prompt, prompt logprobs, or SUROGATE_SERVE_MTP_REUSE_MIXED=0) keeps the classic order.
         if (defer_first_chunk &&
             ((pipeline_stage() && !request_plan.target_only && speculative_backend == SpeculativeBackend::DFlash) ||
              (staged.mtp_bridge == MtpBridgeMode::None && staged.cursor < staged.prompt_tokens))) {
@@ -1100,13 +1138,41 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         anything_to_fold = anything_to_fold || fold_rows[row].commit_columns > 0;
     }
+    // A lane that goes on decoding keeps its accepted transitions for its next verify, which
+    // reads its state anyway and applies them first: the round then reads the recurrent state
+    // once rather than twice. A finishing or cancelled lane folds now; its state is what a
+    // later turn reuses. Every row's count is set here, so a verify never sees a stale one.
+    const bool defer = replay_records && replay_records->defers_fold();
+    std::array<ops::GdnReplayFoldRow, kMaximumBatchColumns> fold_now{};
+    std::array<ops::GdnReplayFoldRow, kMaximumBatchColumns> fold_later{};
+    bool anything_now = false, anything_later = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        fold_now[row]   = fold_rows[row];
+        fold_later[row] = {fold_rows[row].linear_state_slot, 0};
+        if (defer && fold_rows[row].commit_columns > 0 && !cancelled[row] && !terminal[row]) {
+            fold_later[row]             = fold_rows[row];
+            fold_now[row].commit_columns = 0;
+        }
+        anything_now   = anything_now || fold_now[row].commit_columns > 0;
+        anything_later = anything_later || fold_later[row].commit_columns > 0;
+        if (defer) {
+            deferred_fold_columns.at(lanes[row]) = fold_later[row].commit_columns;
+            deferred_fold_counts_dirty           = true;
+        }
+    }
     const auto tail_started = Clock::now();
     try {
-        if (anything_to_fold && replay_records) {
+        if (anything_now && replay_records) {
             ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
-                                 std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                                 std::span<const ops::GdnReplayFoldRow>(fold_now.data(), lanes.size()),
                                  device.stream);
         }
+        if (anything_later) {
+            ops::gdn_replay_stash(*replay_records, decoder->linear_attention.all_layers_view(),
+                                  std::span<const ops::GdnReplayFoldRow>(fold_later.data(), lanes.size()),
+                                  device.stream);
+        }
+        if (defer) { flush_deferred_fold_counts(); }
         // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
         // included; its snapshots hold the state after each column, and the committed prefix's
         // last one is what the next round must start from.
@@ -1280,11 +1346,15 @@ void ProgramImplCore::evict_archived_prefixes() noexcept {
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
+    const auto started = std::chrono::steady_clock::now();
     archived_prefixes.clear();
     // Retained lanes go only when the pool is short; so do the shared prefixes' pages.
     drop_shared_prefixes();
+    admit_trace_step("evict: drop archived and shared prefixes", lane, started);
     if (!has_retained_lane(lane)) { return; }
+    const auto cleared = std::chrono::steady_clock::now();
     clear_lane(sequences[lane], requests[lane]);
+    admit_trace_step("evict: clear retained lane", lane, cleared);
 }
 
 TokenScoreDelta ProgramImplCore::logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
@@ -1484,6 +1554,11 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    // A deferred fold belongs to the request: the lane's next one starts from its own state.
+    if (sequence.lane < deferred_fold_columns.size() && deferred_fold_columns[sequence.lane] != 0) {
+        deferred_fold_columns[sequence.lane] = 0;
+        deferred_fold_counts_dirty           = true;
+    }
     request.prefill.reset();
     request.gpu_prefix.reset();
     request.save_gpu_prefix.reset();
@@ -1504,6 +1579,36 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
+}
+
+void ProgramImplCore::flush_deferred_fold_counts() {
+    if (!deferred_fold_counts_dirty || !replay_records || !replay_records->defers_fold()) { return; }
+    // Pageable source: the copy is staged before this returns, so the counts can change after.
+    CUDA_CHECK(cudaMemcpyAsync(replay_records->pending_columns.data, deferred_fold_columns.data(),
+                               deferred_fold_columns.size() * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, device.stream));
+    deferred_fold_counts_dirty = false;
+}
+
+void ProgramImplCore::settle_deferred_folds(std::span<const std::uint32_t> lanes) {
+    if (!replay_records || !replay_records->defers_fold()) { return; }
+    std::vector<ops::GdnReplayFoldRow> rows;
+    for (const std::uint32_t lane : lanes) {
+        if (lane < deferred_fold_columns.size() && deferred_fold_columns[lane] > 0) {
+            rows.push_back({LinearStateSlots::current_state_slot(lane, max_concurrency),
+                            deferred_fold_columns[lane]});
+            deferred_fold_columns[lane] = 0;
+        }
+    }
+    if (rows.empty()) { return; }
+    for (std::size_t first = 0; first < rows.size(); first += kMaximumBatchColumns) {
+        const std::size_t count = std::min<std::size_t>(kMaximumBatchColumns, rows.size() - first);
+        ops::gdn_replay_fold_pending(*replay_records, decoder->linear_attention.all_layers_view(),
+                                     std::span<const ops::GdnReplayFoldRow>(rows.data() + first, count),
+                                     device.stream);
+    }
+    deferred_fold_counts_dirty = true;
+    flush_deferred_fold_counts();
 }
 
 family::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -2583,7 +2688,8 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 }
 
 runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
-                                                            RequestControl& request) {
+                                                            RequestControl& request,
+                                                            bool bridge_only) {
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -2698,6 +2804,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.mtp_kv_valid = staged.base;
             staged.mtp_bridge     = MtpBridgeMode::None;
+        }
+        if (bridge_only) {
+            staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+            return runtime::PrefillStepResult{.summary = summary, .processed_prompt_tokens = 0};
         }
 
         if (staged.cursor < staged.prompt_tokens) {
@@ -3298,11 +3408,33 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         mixed_in_flight_.id = handle.id;
         return handle;
     }
+    // Under the draft head the decode lanes verify their drafts in the round that carries the
+    // prompts: launch_mtp_round runs its verify forward as this mixed round (it comes back
+    // here with the verify frame), so a prompt arriving costs the running lanes no drafts.
+    // SUROGATE_SERVE_MTP_MIXED_VERIFY=0 keeps the older shape: decode lanes one column each,
+    // nothing proposed, and the round after it verifying nothing. Pipeline stages and narrow
+    // rounds keep it too.
+    static const bool mtp_mixed_verify = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_MTP_MIXED_VERIFY");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    if (speculative_backend == SpeculativeBackend::Mtp && mtp_mixed_verify && !verify &&
+        !lanes.empty() && !prefill_lanes.empty() && !pipeline_stage() &&
+        !narrow_round_for(lanes.size()) && !requests.at(prefill_lanes.front()).target_only &&
+        prefill_chunk > static_cast<std::uint32_t>(lanes.size()) * (draft_window + 1U)) {
+        auto handle = launch_mtp_round(lanes, budgets, prefill_lanes);
+        mixed_in_flight_.id = handle.id;
+        return handle;
+    }
     const bool target_only = !prefill_lanes.empty() && requests.at(prefill_lanes.front()).target_only;
     const bool flash = speculative_backend == SpeculativeBackend::DFlash && !target_only;
     const auto verify_width = verify ? static_cast<std::uint32_t>(verify->ids.ne[0]) : 1U;
     const auto decode_columns = static_cast<std::uint32_t>(lanes.size()) * verify_width;
     const bool head = speculative_backend == SpeculativeBackend::Mtp && !target_only;
+    // The decode lanes belong to the speculative round that launched this one: it staged
+    // their columns, and it samples, accepts and aligns them.
+    const bool mtp_verify = head && verify != nullptr;
+    const bool speculative_decode = flash || mtp_verify;
     if (lanes.size() > batch_capacity ||
         budgets.size() != lanes.size() ||
         prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills ||
@@ -3330,6 +3462,10 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             throw std::logic_error("mixed round does not support this staged prefill");
         }
     }
+    // Decode lanes that ride here without verifying run one column in place, so their
+    // deferred folds land first; verifying ones apply them in the record (launch_mtp_round
+    // brought the counts up to date).
+    if (!mtp_verify) { settle_deferred_folds(lanes); }
     // The first staged prompt owns the card (its KV view and cursor); every prompt's KV is
     // addressed per segment through the batch view and its own table row.
     const std::uint32_t prefill_lane = prefill_lanes.front();
@@ -3384,7 +3520,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             }
         }
 
-        for (std::size_t row = 0; !flash && row < lanes.size(); ++row) {
+        for (std::size_t row = 0; !speculative_decode && row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
             RequestControl& request            = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
@@ -3415,7 +3551,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         if (batch_bucket < rows) {
             throw std::logic_error("mixed round bucket is smaller than the decode row count");
         }
-        for (std::int32_t row = rows; !flash && row < batch_bucket; ++row) {
+        for (std::int32_t row = rows; !speculative_decode && row < batch_bucket; ++row) {
             const std::size_t pad                          = static_cast<std::size_t>(row);
             ordinary_host_ingress->tokens[pad]             = ordinary_host_ingress->tokens[0];
             ordinary_host_ingress->cache_positions[pad]    = ordinary_host_ingress->cache_positions[0];
@@ -3426,8 +3562,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             ordinary_host_ingress->lora_slots[pad]         = ordinary_host_ingress->lora_slots[0];
         }
         family::OrdinaryDecodeState ordinary;
-        if (!flash && !target_only) { ordinary = *io.ordinary; }
-        if (!flash && !target_only) { CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
+        if (!speculative_decode && !target_only) { ordinary = *io.ordinary; }
+        if (!speculative_decode && !target_only) { CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
                                    sizeof(family::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    device.stream)); }
 
@@ -3441,10 +3577,26 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         // tokens in turn until the window is spent, so a round packs as many short prompts
         // as fit and still chunks a long one exactly as before (#80).
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+        // A prompt cut at its recurrent boundary brings the rest after it as a second segment
+        // when the window has room: splits[i] is then its first segment's length. A chat
+        // prompt's boundary (where the next turn's template would rewrite it) sits a few tokens
+        // before its end, and a round of its own for those few tokens cost a whole round, the
+        // decode lanes' verify included. The second segment starts from exactly the state and
+        // keys the first leaves, as a chunk of the next round would, so the boundary still cuts
+        // the recurrent scan where it did; a rewrite checkpoint there is copied layer by layer
+        // between the two. SUROGATE_SERVE_MIXED_SPLIT=0 keeps a round per segment.
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> splits{};
+        static const bool kSplitPrompts = [] {
+            const char* value = std::getenv("SUROGATE_SERVE_MIXED_SPLIT");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
         std::array<schedule::VisionChunk, runtime::kMaximumMixedPrefills> vision_chunks{};
         std::uint32_t window_left = mixed_chunk_cap;
         std::size_t staged_count  = 0;
         const bool invariant_cuts = ops::batch_invariant();
+        const bool split_prompts  = kSplitPrompts && !invariant_cuts && !flash && !target_only &&
+                                   !pipeline_stage() && decoder->ple.empty() &&
+                                   schedule::TextContext::mixed_split_segments_supported();
         for (std::size_t i = 0; i < prefill_lanes.size() && window_left > 0; ++i) {
             const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
             const std::uint32_t want = entry.prompt_tokens - entry.cursor;
@@ -3459,6 +3611,14 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             }
             if (const auto boundary = entry.chunk_boundary(); boundary && entry.cursor < *boundary) {
                 nominals[i] = std::min(nominals[i], *boundary - entry.cursor);
+                if (split_prompts && !entry.vision && nominals[i] == *boundary - entry.cursor &&
+                    *boundary < entry.prompt_tokens && window_left > nominals[i] &&
+                    (!entry.shared_capture || *entry.shared_capture <= entry.cursor) &&
+                    (!entry.rewrite_checkpoint_capture ||
+                     entry.rewrite_checkpoint_capture->frontier == *boundary)) {
+                    splits[i] = nominals[i];
+                    nominals[i] += std::min(window_left - nominals[i], entry.prompt_tokens - *boundary);
+                }
             }
             if (entry.vision) {
                 nominals[i] = entry.vision->chunk_length(entry.cursor, nominals[i]);
@@ -3493,7 +3653,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         // Target-only packs have no ordinary decode frame. Their lone-prompt graph
         // route is advance_prefill; a packed chunk stays eager even if it fills the window.
         const bool graph_planned = !kNoMixedGraph && !head && !flash && !target_only && staged_count == 1 &&
-                                   staged.use_graph && prefill_graphs.has_value() &&
+                                   splits[0] == 0 && staged.use_graph && prefill_graphs.has_value() &&
                                    batch_bucket == rows && graph_nominal > 0 &&
                                    (!boundary || staged.cursor >= *boundary ||
                                     staged.cursor + graph_nominal <= *boundary);
@@ -3555,7 +3715,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         }
 
         schedule::TextContext::MixedDecodeSlice slice;
-        if (!flash && !target_only) {
+        if (!speculative_decode && !target_only) {
             slice.ids                = ordinary.tokens.slice(0, 0, rows);
             slice.lora_slots         = ordinary.lora_slots.slice(0, 0, rows);
             slice.cache_positions    = ordinary.cache_positions.slice(0, 0, rows);
@@ -3570,7 +3730,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         if (verify) {
             const auto columns = static_cast<std::int32_t>(decode_columns);
             slice.ids = verify->ids.view({columns});
-            slice.lora_slots = io.dflash_decode->lora_slots.slice(0, 0, rows);
+            slice.lora_slots = (flash ? io.dflash_decode->lora_slots : io.mtp_decode->lora_slots)
+                                   .slice(0, 0, rows);
             slice.cache_positions = verify->cache_positions.view({columns});
             slice.rope_positions = verify->rope_positions.view({columns});
             slice.kv_table_rows = verify->kv_table_rows;
@@ -3671,8 +3832,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             }
         }
         if (!graph_hit) {
-            std::array<schedule::TextContext::MixedPrefillSegment, runtime::kMaximumMixedPrefills>
+            std::array<schedule::TextContext::MixedPrefillSegment, 2 * runtime::kMaximumMixedPrefills>
                 segments{};
+            std::size_t segment_count = 0;
             for (std::size_t i = 0; i < staged_count; ++i) {
                 SequenceState& sequence              = sequences[prefill_lanes[i]];
                 const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
@@ -3689,35 +3851,48 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     }
                 }
-                segments[i] = schedule::TextContext::MixedPrefillSegment{
-                    .ids = std::span<const TokenId>(entry.prompt.token_ids)
-                               .subspan(entry.cursor, nominals[i]),
-                    .kv_base      = static_cast<std::int32_t>(entry.cursor),
-                    .kv_table_row = sequence.kv->text.bound_row(),
-                    .state_slot   = static_cast<std::int32_t>(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency)),
-                    .finalize         = false,
-                    .mtp_kv_table_row = head && stage_holds_head()
-                                            ? sequence.kv->backend->bound_row()
-                                            : -1,
-                    .mtp_kv = head && stage_holds_head() ? mtp_kv_view(sequence)
-                                                          : family::PagedKVCacheView{},
-                    // Every column but the prompt's last pairs with the prompt's next token;
-                    // the last pairs with the token the zero-suffix step samples (the bridge).
-                    .mtp_shifted_ids =
-                        head ? std::span<const TokenId>(entry.prompt.token_ids)
-                                   .subspan(entry.cursor + 1,
-                                            std::min(nominals[i],
-                                                     entry.prompt_tokens - entry.cursor - 1))
-                             : std::span<const TokenId>{},
-                    .lora_slot = requests[prefill_lanes[i]].lora_slot,
-                    .prompt = &entry.prompt,
-                    .vision = entry.vision ? &vision_chunks[i] : nullptr,
+                const auto segment = [&](std::uint32_t begin, std::uint32_t length, std::int32_t capture) {
+                    return schedule::TextContext::MixedPrefillSegment{
+                        .ids = std::span<const TokenId>(entry.prompt.token_ids).subspan(begin, length),
+                        .kv_base      = static_cast<std::int32_t>(begin),
+                        .kv_table_row = sequence.kv->text.bound_row(),
+                        .state_slot   = static_cast<std::int32_t>(
+                            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency)),
+                        .finalize         = false,
+                        .mtp_kv_table_row = head && stage_holds_head()
+                                                ? sequence.kv->backend->bound_row()
+                                                : -1,
+                        .mtp_kv = head && stage_holds_head() ? mtp_kv_view(sequence)
+                                                              : family::PagedKVCacheView{},
+                        // Every column but the prompt's last pairs with the prompt's next token;
+                        // the last pairs with the token the zero-suffix step samples (the bridge).
+                        .mtp_shifted_ids =
+                            head ? std::span<const TokenId>(entry.prompt.token_ids)
+                                       .subspan(begin + 1, std::min(length, entry.prompt_tokens - begin - 1))
+                                 : std::span<const TokenId>{},
+                        .lora_slot = requests[prefill_lanes[i]].lora_slot,
+                        .prompt = &entry.prompt,
+                        .vision = entry.vision ? &vision_chunks[i] : nullptr,
+                        .capture_slot = capture,
+                    };
                 };
+                if (splits[i] == 0) {
+                    segments[segment_count++] = segment(entry.cursor, nominals[i], -1);
+                    continue;
+                }
+                // The prompt's two segments; a rewrite checkpoint at the boundary between them is
+                // taken in the round, layer by layer (consume copies the boundary's hidden).
+                const bool capture = entry.rewrite_checkpoint_capture &&
+                                     entry.rewrite_checkpoint_capture->frontier == entry.cursor + splits[i];
+                segments[segment_count++] = segment(
+                    entry.cursor, splits[i],
+                    capture ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
+                            : -1);
+                segments[segment_count++] = segment(entry.cursor + splits[i], nominals[i] - splits[i], -1);
             }
             chunk = card.mixed_chunk_multi(
                 std::span<const schedule::TextContext::MixedPrefillSegment>(segments.data(),
-                                                                            staged_count),
+                                                                            segment_count),
                 slice, schedule::TextContext::MixedPrefillFinalize{}, flash ? &mixed_sink : nullptr);
         }
 
@@ -3728,14 +3903,15 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 .view({model.geometry.dflash.feature_rows, static_cast<int>(verify_width), rows});
             ops::scatter_bf16_batch(features, verify->lanes, verify->valid_columns,
                                     dflash->pending_features, device.stream);
-            if (stage_holds_head()) {
-                Tensor logits = verify->target_logits.view({verify->target_logits.ne[0], static_cast<int>(decode_columns)});
-                Tensor tokens = verify->target_tokens.view({static_cast<int>(decode_columns)});
-                ops::argmax(logits, tokens, cfg.token_domain, device.stream);
-            }
+        }
+        if (speculative_decode && verify && stage_holds_head()) {
+            // The verify forward's own argmax, which the accept reads as the target tokens.
+            Tensor logits = verify->target_logits.view({verify->target_logits.ne[0], static_cast<int>(decode_columns)});
+            Tensor tokens = verify->target_tokens.view({static_cast<int>(decode_columns)});
+            ops::argmax(logits, tokens, cfg.token_domain, device.stream);
         }
         if (round_trace_enabled()) { std::fprintf(stderr, "round-trace: mixed graph_hit=%d verify_width=%u\n", int(graph_hit), verify_width); }
-        if (rows > 0 && !flash) {
+        if (rows > 0 && !speculative_decode) {
             Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
             Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
             Tensor lanes_tensor    = ordinary.lanes.slice(0, 0, rows);
@@ -3797,6 +3973,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         mixed_in_flight_.graph_hit    = graph_hit;
         mixed_in_flight_.chunk        = chunk;
         mixed_in_flight_.nominals     = nominals;
+        mixed_in_flight_.splits       = splits;
+        mixed_in_flight_.mtp_verify   = mtp_verify;
         return runtime::RoundHandle{.id = mixed_in_flight_.id, .rows = mixed_in_flight_.rows};
     } catch (...) {
         try {
@@ -3823,22 +4001,27 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
     const bool graph_hit                              = flight.graph_hit;
     const schedule::PrefillChunkResult chunk          = flight.chunk;
     const std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals = flight.nominals;
+    const std::array<std::uint32_t, runtime::kMaximumMixedPrefills> splits   = flight.splits;
     const std::uint32_t prefill_lane = prefill_lanes.front();
     SequenceState& prefill_sequence  = sequences[prefill_lane];
     RequestControl& prefill_request  = requests[prefill_lane];
     try {
         const bool flash = speculative_backend == SpeculativeBackend::DFlash && !prefill_request.target_only;
-        runtime::BatchedGeneratedRound flash_round;
-        if (flash && !lanes.empty()) { flash_round = consume_dflash_round(handle); }
+        // The decode lanes verified drafts in an MTP round that carried the prompts: that
+        // round's consume reads and records them, as for a round without prompts.
+        const bool mtp_verify = flight.mtp_verify;
+        runtime::BatchedGeneratedRound speculative_round;
+        if (flash && !lanes.empty()) { speculative_round = consume_dflash_round(handle); }
+        else if (mtp_verify) { speculative_round = consume_mtp_round(handle); }
         else { device.synchronize(); }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         round_trace_state(decoder->linear_attention, device.stream, "post-round");
         const bool head = speculative_backend == SpeculativeBackend::Mtp && !prefill_request.target_only;
-        for (std::size_t row = 0; !flash && row < lanes.size(); ++row) {
+        for (std::size_t row = 0; !flash && !mtp_verify && row < lanes.size(); ++row) {
             append_completion_score(lanes[row], ordinary_host_egress->scores[row]);
         }
-        if (head) {
+        if (head && !mtp_verify) {
             // Under the draft head the decode rows resolve as a narrow round's do: one token
             // licensed per lane, nothing proposed, the recurrent state updated in place with
             // nothing to fold. The stage with the head decides and exports the decision; the
@@ -3904,12 +4087,12 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
         }
 
         runtime::MixedRoundResult result;
-        if (!flash && !lanes.empty()) { result.round = runtime::BatchedGeneratedRound{
+        if (!flash && !mtp_verify && !lanes.empty()) { result.round = runtime::BatchedGeneratedRound{
             .tokens   = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
                                                lanes.size()),
             .logprobs = std::span<const float>(ordinary_host_egress->sampled_logprobs.data(),
                                                lanes.size())}; }
-        if (flash) { result.round = flash_round; }
+        if (flash || mtp_verify) { result.round = speculative_round; }
         // Each staged prompt advances by its own chunk; the graph path processes exactly the
         // first one, so its count matches what the forward consumed.
         // The plan (which prompts, how many tokens each) was fixed before the forward, so a
@@ -3944,6 +4127,14 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                     schedule::dflash_append_context(context, features, positions, count, lane, row, {processed, processed});
                 }
                 sequence.dflash_context_frontier = entry.cursor + processed;
+            }
+            if (splits[i] > 0 && entry.rewrite_checkpoint_capture &&
+                entry.cursor + splits[i] == entry.rewrite_checkpoint_capture->frontier) {
+                // The prompt's two segments took the checkpoint's state between them, layer by
+                // layer; its hidden is the first segment's last column.
+                Tensor hidden = prefill_hidden.slice(1, column + splits[i] - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data, hidden.data,
+                    hidden.bytes(), cudaMemcpyDeviceToDevice, device.stream));
             }
             entry.cursor += processed;
             if (entry.vision) { entry.vision->release_encoded_media_payloads(); }
@@ -4018,7 +4209,8 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
 
 runtime::RoundHandle
 ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
-                                  std::span<const runtime::RoundBudget> budgets) {
+                                  std::span<const runtime::RoundBudget> budgets,
+                                  std::span<const std::uint32_t> prefill_lanes) {
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
@@ -4058,16 +4250,25 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
 
     // Too many lanes in flight to pay for a verify: the narrow round, one column per lane.
     const bool narrow  = narrow_round_for(lanes.size());
-    // No row selects an adapter: the base routes, as in launch_ordinary_round.
-    const bool base_round = base_round_for(lanes);
+    if (narrow && !prefill_lanes.empty()) {
+        throw std::logic_error("a narrow MTP round cannot carry staged prompts");
+    }
+    // No row selects an adapter, staged prompts included: the base routes, as in
+    // launch_ordinary_round.
+    const bool base_round = base_round_for(lanes, prefill_lanes);
     ops::ScopedLoraBaseRound base_scope(base_round);
     const auto started = Clock::now();
     try {
+        // A verify applies its lanes' deferred folds itself; a narrow round updates the state
+        // in place, so they land first.
+        if (narrow) { settle_deferred_folds(lanes); }
+        flush_deferred_fold_counts();
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
         DecodeGraphFamily& family = (narrow ? mtp_narrow_graphs : mtp_graphs).of(base_round);
-        if (use_cuda_graph && !family.profiles.empty()) {
+        // A round carrying prompts runs eagerly: the prompts' chunks are not in any graph.
+        if (use_cuda_graph && !family.profiles.empty() && prefill_lanes.empty()) {
             DecodeGraphProfile& profile =
                 select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, narrow ? "MTP narrow batch" : "MTP batch");
@@ -4133,6 +4334,15 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                                  tail_hidden_store,
                                                  chain_one};
         schedule_state.execution.constraints = speculative_constraints.get();
+        if (!prefill_lanes.empty()) {
+            // The verify forward is the mixed round: each staged prompt's chunk beside the
+            // lanes' draft columns, the head aligned over the prompts' segments there and
+            // over the lanes' accepted columns after the accept, as in any wide round.
+            schedule_state.mixed_target = [&](schedule::TextContext&, schedule::TargetVerifyFrameView frame,
+                                              ops::GqaExecutionEnvelope) {
+                (void)launch_mixed_round(prefill_lanes, lanes, budgets, &frame);
+            };
+        }
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -4150,6 +4360,9 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
         try {
             device.synchronize();
         } catch (...) {}
+        for (const auto lane : prefill_lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }

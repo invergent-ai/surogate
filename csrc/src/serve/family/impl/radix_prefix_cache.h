@@ -28,19 +28,26 @@ public:
     bool reserve(std::size_t bytes) {
         if (!bytes || bytes > capacity_) { return false; }
         while (used_ > capacity_ - bytes || values_.size() >= max_entries_) {
-            auto oldest = values_.end();
-            for (auto it = values_.begin(); it != values_.end(); ++it) {
-                if (it->second.value.use_count() == 1 &&
-                    (oldest == values_.end() || it->second.access < oldest->second.access)) {
-                    oldest = it;
-                }
-            }
-            if (oldest == values_.end()) { return false; }
-            used_ -= oldest->second.bytes;
-            values_.erase(oldest);
-            ++revision_;
-            prune(root_);
+            if (!evict_oldest()) { return false; }
         }
+        return true;
+    }
+
+    /// Drops the least recently used value no request plan holds; false when every value is
+    /// held (or there is none). Its storage goes back when the last reference does.
+    bool evict_oldest() {
+        auto oldest = values_.end();
+        for (auto it = values_.begin(); it != values_.end(); ++it) {
+            if (it->second.value.use_count() == 1 &&
+                (oldest == values_.end() || it->second.access < oldest->second.access)) {
+                oldest = it;
+            }
+        }
+        if (oldest == values_.end()) { return false; }
+        used_ -= oldest->second.bytes;
+        values_.erase(oldest);
+        ++revision_;
+        prune(root_);
         return true;
     }
 

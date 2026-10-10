@@ -1127,6 +1127,18 @@ private:
         request->lane_plan_versions[lane] = version;
     }
 
+    /// SUROGATE_SERVE_ADMIT_TRACE=1: one line for each admission step that takes 5 ms or more.
+    static void admit_trace_step(const char* step, std::uint64_t request_id,
+                                 Clock::time_point since) {
+        static const bool enabled = std::getenv("SUROGATE_SERVE_ADMIT_TRACE") != nullptr;
+        if (!enabled) { return; }
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - since).count();
+        if (ms >= 5.0) {
+            std::fprintf(stderr, "admit-trace: request %llu %s %.1f ms\n",
+                         static_cast<unsigned long long>(request_id), step, ms);
+        }
+    }
+
     /// Among free lanes that reuse equally much of a request, the one whose loss costs least:
     /// a lane holding no retained prefix first, then the retained prefix released longest
     /// ago. Picking the lowest index instead handed a new conversation the lane another
@@ -1212,6 +1224,7 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
+            const auto evict_started = Clock::now();
             bool evicted = false;
             // Oldest-released retained prefixes go first.
             std::vector<std::uint32_t> eviction_order(max_concurrency_);
@@ -1232,6 +1245,7 @@ private:
                     evicted = true;
                 }
             }
+            admit_trace_step("evict retained lanes", request->id, evict_started);
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 // `can_admit_lane_after_retained_eviction` chose this lane by summing every
                 // `sequences[other].retained && sequences[other].kv`, with no test on the
@@ -1308,9 +1322,11 @@ private:
             }
             publish_runtime_stats();
             target_started                = true;
+            const auto start_started      = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 /*defer_first_chunk=*/true);
+            admit_trace_step("start prefill", request->id, start_started);
             if (!first.complete && !prefill_lanes_.contains(lane)) {
                 // A fully cached prompt can still defer its first-token step (DFlash
                 // pipeline stages do this to preserve execution order). Register it
@@ -1320,14 +1336,29 @@ private:
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             const bool ran = first.processed_prompt_tokens != 0 || first.complete;
             if (ran || cancel_at_boundary) {
+                const auto resolve_started = Clock::now();
                 resolve_prefill_step(request, first, cancel_at_boundary);
+                admit_trace_step("resolve prefill step", request->id, resolve_started);
             }
             // New candidate readouts can be staged together in a DFlash engine.
             // Keep GPU-prefix admissions on their old route: changing their batch
             // width also changes the arithmetic of their batched full-vocabulary head.
+            // An MTP engine stages its prompts together too: its verify round carries every
+            // staged prompt's chunk (launch_mixed_round -> launch_mtp_round), so a burst of
+            // arrivals shares one mixed round instead of taking a round each, which at 16
+            // lanes on a DGX Spark held the last of a burst 1-3 s for its first token.
+            // SUROGATE_SERVE_MTP_STAGE_TOGETHER=0 restores one prompt per pass.
+            static const bool kMtpStagesTogether = [] {
+                const char* value = std::getenv("SUROGATE_SERVE_MTP_STAGE_TOGETHER");
+                return value == nullptr || std::string(value) != "0";
+            }();
+            const auto& execution = request->options.execution;
+            const bool staged_together =
+                speculative_backend_ == SpeculativeBackend::Mtp
+                    ? kMtpStagesTogether && !execution.gpu_prefix && !execution.save_gpu_prefix
+                    : dflash_candidate_readout(speculative_backend_, execution);
             ran_gpu_unit = ran || kPipelined ||
-                           (speculative_backend_ != SpeculativeBackend::None &&
-                            !dflash_candidate_readout(speculative_backend_, request->options.execution));
+                           (speculative_backend_ != SpeculativeBackend::None && !staged_together);
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -1385,7 +1416,9 @@ private:
             }
 
             try {
+                const auto plan_started = Clock::now();
                 ensure_base_plan(head);
+                admit_trace_step("base plan", head->id, plan_started);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1403,7 +1436,9 @@ private:
 
             std::optional<LaneChoice> head_lane;
             try {
+                const auto find_started = Clock::now();
                 head_lane = find_admission_lane(head);
+                admit_trace_step("find lane", head->id, find_started);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1589,6 +1624,7 @@ private:
             const auto t_admit = Clock::now();
             top_up_prefill_lanes();
             seg_timer_.admit += std::chrono::duration<double>(Clock::now() - t_admit).count();
+            admit_trace_step("top-up admission pass (all steps)", 0, t_admit);
         }
         // The round's width, for a draft head deciding whether a verify pays: every lane that
         // is decode-ready, whichever group it rides in.
@@ -1817,6 +1853,16 @@ private:
         const MixedRoundResult mixed = instance_.program->advance_prefill_mixed(
             std::span<const std::uint32_t>(staged.data(), staged_count), lanes,
             membership.budget_span());
+        // What each decode lane got out of the round, for the decode share: a verify round
+        // licenses several tokens per lane, an ordinary one exactly one.
+        last_mixed_tokens_per_lane_ = 1.0;
+        if (!lanes.empty() && mixed.round.row_counts.size() >= lanes.size()) {
+            std::uint64_t licensed = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                licensed += static_cast<std::uint64_t>(std::max(mixed.round.row_counts[row], 1));
+            }
+            last_mixed_tokens_per_lane_ = static_cast<double>(licensed) / static_cast<double>(lanes.size());
+        }
         process_decode_round(membership, mixed.round);
         if (!membership.empty()) ++cumulative_stats_.decode_rounds;
         // Resolve each staged prompt against its own result. resolve_prefill_step can retire a
@@ -2341,7 +2387,7 @@ private:
                         seg_timer_.mixed += mixed_seconds;
                         seg_timer_.mixed_rounds += 1;
                         if (!membership.empty() && decode_share() > 0.0 &&
-                            mixed_seconds > kDecodeShareMinMixedRound) {
+                            mixed_seconds > kDecodeShareMinMixedRound * last_mixed_tokens_per_lane_) {
                             decode_share_credit_s_ = std::min(
                                 kDecodeShareCreditCap,
                                 decode_share_credit_s_ +
@@ -2393,6 +2439,7 @@ private:
                     }
                     seg_timer_.admit +=
                         std::chrono::duration<double>(Clock::now() - t_admit).count();
+                    admit_trace_step("admission pass (all steps)", 0, t_admit);
                     if (progress == AdmissionProgress::RanGpuUnit) {
                         previous_unit_was_decode = false;
                         continue;
@@ -2497,13 +2544,16 @@ private:
     }
 
     /// Fraction of the time decoding sequences get to themselves while long prompts prefill. A
-    /// mixed round gives each decoding sequence one token, and with a long prompt at a long
-    /// context a mixed round takes most of a second (0.75 s with a 100k-token prompt on the 35B
-    /// on a DGX Spark), so an agent's reply crawled at about 1.4 tok/s until every staged prompt
-    /// was done. After each mixed round that carried decode rows and took longer than
-    /// `kDecodeShareMinMixedRound`, decode-only rounds run for share / (1 - share) of its time;
-    /// prompts keep the rest. Shorter mixed rounds already decode at 4 tok/s or more and earn
-    /// nothing. SUROGATE_SERVE_DECODE_SHARE, in [0, 0.9]; 0 leaves every round mixed.
+    /// mixed round gives each decoding sequence one token (an MTP verify round a few), and with
+    /// a long prompt at a long context a mixed round takes most of a second (0.75 s with a
+    /// 100k-token prompt on the 35B on a DGX Spark), so an agent's reply crawled at about
+    /// 1.4 tok/s until every staged prompt was done. After each mixed round that carried decode
+    /// rows and took longer than `kDecodeShareMinMixedRound` per token it gave each lane,
+    /// decode-only rounds run for share / (1 - share) of its time; prompts keep the rest. A
+    /// round whose lanes already decoded at 4 tok/s or more earns nothing: an ordinary mixed
+    /// round under 0.25 s, or an MTP round that verified drafts beside the prompt and licensed
+    /// ~2.7 tokens a lane, under ~0.7 s.
+    /// SUROGATE_SERVE_DECODE_SHARE, in [0, 0.9]; 0 leaves every round mixed.
     static double decode_share() {
         static const double share = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_DECODE_SHARE");
@@ -2527,6 +2577,8 @@ private:
     /// Seconds of decode-only rounds still owed to the decoding sequences while prompts prefill
     /// (`decode_share`). Negative once a decode round overran it; cleared when nothing prefills.
     double decode_share_credit_s_ = 0.0;
+    /// Mean tokens the last mixed round licensed per decode lane (1 for an ordinary round).
+    double last_mixed_tokens_per_lane_ = 1.0;
     static constexpr double kDecodeShareCreditCap     = 2.0;
     static constexpr double kDecodeShareMinMixedRound = 0.25;
 

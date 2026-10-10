@@ -1,7 +1,10 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "family/impl/archive_storage.h"
 #include <array>
 #include <cassert>
+#include <cstring>
+#include <vector>
 
 using namespace sinfer;
 
@@ -25,6 +28,24 @@ int main() {
             pool.zero_pages(std::span(&scrambled[i], 1), device.stream, 17 + i);
         }
         const auto image = pool.download_pages(scrambled, device.stream);
+        // The same image into page-locked memory, without a wait per plane.
+        {
+            auto arena = sinfer::family::detail::PinnedArchiveArena::create(1U << 20);
+            assert(arena);
+            std::vector<std::optional<sinfer::family::detail::ArchiveBlock>> blocks;
+            std::vector<std::byte*> planes;
+            for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+                blocks.push_back(arena->allocate(pool.image_plane_bytes(p, scrambled.size())));
+                assert(blocks.back() && blocks.back()->pinned);
+                planes.push_back(blocks.back()->data);
+            }
+            pool.download_pages_to(scrambled, planes, device.stream);
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+                assert(image.planes[p].size() == pool.image_plane_bytes(p, scrambled.size()));
+                assert(std::memcmp(planes[p], image.planes[p].data(), image.planes[p].size()) == 0);
+            }
+        }
         // Reject invalid input before touching any destination plane.
         auto invalid = image;
         invalid.planes.back().pop_back();
@@ -60,5 +81,25 @@ int main() {
                                   image.planes[p].begin() + head * image.planes[p].size() / heads));
             }
         }
+    }
+    // The archive arena hands out first fit and coalesces what comes back.
+    {
+        auto arena = sinfer::family::detail::PinnedArchiveArena::create(4096);
+        assert(arena);
+        auto a = arena->allocate(1000);
+        auto b = arena->allocate(1000);
+        auto c = arena->allocate(2000);
+        assert(a && b && c && a->pinned && a->size == 1000);
+        assert(b->data == a->data + 1024 && c->data == b->data + 1024);
+        assert(!arena->allocate(1));
+        std::byte* const base = a->data;
+        a.reset();
+        b.reset();
+        auto d = arena->allocate(2048);
+        assert(d && d->data == base);
+        c.reset();
+        d.reset();
+        auto whole = arena->allocate(4096);
+        assert(whole && whole->data == base);
     }
 }

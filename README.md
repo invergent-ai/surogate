@@ -110,6 +110,12 @@ Each comparison ran both engines on the same kind of GPU with the same requests.
 | DGX Spark | Qwen3-8B · FP8 | 8 users, decode | **182.4 tok/s** | vLLM: 153.6 | **1.19×** |
 | DGX Spark | Qwen3-8B · FP8 | 32 users, decode | 470.4 tok/s | vLLM: 496.0 | 0.95× |
 | DGX Spark | Qwen3-8B · FP8 | 8 users, 2,048-token prompts, prefill | **5,939 tok/s** | vLLM: 5,632 | **1.05×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 1 user, decode | **13.0 tok/s** | vLLM: 11.4 | **1.14×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 32 users, decode per user | **7.6 tok/s** | vLLM: 6.5 | **1.17×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 32 users, 512-token prompts, time to first token (p50) | **839 ms** | vLLM: 1,785 ms | **2.13×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 1 user, real text, MTP | **29.1 tok/s** | vLLM (MTP): 18.6 | **1.56×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 8 users, real text, MTP | **199.4 tok/s** | vLLM (MTP): 129.4 | **1.54×** |
+| DGX Spark | Qwen3.8-27B · NVFP4 | 16 users, real text, MTP | **279.9 tok/s** | vLLM (MTP): 188.3 | **1.49×** |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 1 user, decode | **31.4 tok/s** (with MTP: 45.9 on real text, 67.2 on benchmark prose) | vLLM: does not fit in 121.7 GiB | — |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 16 users, real text, MTP | **115.7 tok/s** (97.2 without MTP) | vLLM: does not fit | — |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | cold 32k-token prompt, prefill | **2,008 tok/s** | llama.cpp (UD-IQ4_XS GGUF): 629 | **3.2×** |
@@ -133,7 +139,7 @@ Also measured, without another engine alongside: single-user decode of Qwen3-0.6
 | DGX Spark | Qwen3-8B | 1,433 · FP8 | — | — |
 | DGX Spark | Qwen3.6-35B-A3B | 674 · FP8 | — | — |
 
-<sub>RTX 5090 serving rows: 2026-08-30 to 2026-09-07, cards at a 400 W limit, vLLM 0.27.1 and llama.cpp CUDA builds. H100 and DGX Spark rows: 2026-10-05 to 2026-10-09, vLLM 0.31. On the DGX Spark, vLLM's FP8 KV cache fails to start, so vLLM ran a BF16 cache; Surogate ran a BF16 cache for the 35B's short-prompt rows and an FP8 cache for its long-context and MTP rows and for Flash-Next. Qwen3.8-Flash-Next's NVFP4 release needs 123.5 GiB in vLLM on a 121.7 GiB Spark; a public vLLM preview with MTP is reported at 31-41 tok/s for one user there (not measured here). Surogate's Flash-Next rows run the 105 GB artifact converted from that release, and its prefill row is against llama.cpp on Unsloth's UD-IQ4_XS GGUF. Benchmark prose is the repeated 512-token text the throughput rows use, where up to 95% of MTP drafts are accepted; "real text" means distinct Wikipedia passages, where 52-54% are. Full methods: <a href="surogate/serve/BENCHMARKS.md">serving benchmarks</a>, <a href="docs/reference/benchmarks.md">training benchmarks</a>, and the pull requests behind each result (#296-#308).</sub>
+<sub>RTX 5090 serving rows: 2026-08-30 to 2026-09-07, cards at a 400 W limit, vLLM 0.27.1 and llama.cpp CUDA builds. H100 and DGX Spark rows: 2026-10-05 to 2026-10-09, vLLM 0.31. On the DGX Spark, vLLM's FP8 KV cache fails to start, so vLLM ran a BF16 cache; Surogate ran a BF16 cache for the 35B's short-prompt rows and an FP8 cache for its long-context and MTP rows, for Flash-Next and for Qwen3.8-27B. Qwen3.8-Flash-Next's NVFP4 release needs 123.5 GiB in vLLM on a 121.7 GiB Spark; a public vLLM preview with MTP is reported at 31-41 tok/s for one user there (not measured here). Surogate's Flash-Next rows run the 105 GB artifact converted from that release, and its prefill row is against llama.cpp on Unsloth's UD-IQ4_XS GGUF. Benchmark prose is the repeated 512-token text the throughput rows use, where up to 95% of MTP drafts are accepted; "real text" means distinct Wikipedia passages, where 52-54% are. Full methods: <a href="surogate/serve/BENCHMARKS.md">serving benchmarks</a>, <a href="docs/reference/benchmarks.md">training benchmarks</a>, and the pull requests behind each result (#296-#309).</sub>
 
 ## Two engines. One workflow.
 

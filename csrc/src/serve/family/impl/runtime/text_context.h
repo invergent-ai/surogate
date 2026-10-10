@@ -310,6 +310,7 @@ struct ShortConvSegment {
     std::int32_t offset     = 0;
     std::int32_t columns    = 0;
     std::int32_t state_slot = 0;
+    std::int32_t capture_slot = -1; // see MixedPrefillSegment::capture_slot
 };
 
 struct FullLayerW {
@@ -551,7 +552,22 @@ public:
         std::int32_t lora_slot = -1;
         const family::PreparedPromptData* prompt = nullptr;
         const VisionChunk* vision = nullptr;
+        // A prompt cut at a recurrent boundary may bring the rest after it as the next segment,
+        // on the same slot (mixed_split_segments_supported). When the boundary is a rewrite
+        // checkpoint, each linear layer copies this segment's end state to this slot before the
+        // next segment advances it; -1 copies nothing.
+        std::int32_t capture_slot = -1;
     };
+    // Whether one prompt may bring two consecutive segments to a mixed round: every per-segment
+    // pass below runs them in order on the same slot and the same KV row, so the second starts
+    // from exactly the state and keys the first left, as a chunk of a later round would. Not
+    // for a layer prologue or an attention indexer, whose per-segment passes have not been
+    // checked for that.
+    template <class V = Variant>
+    [[nodiscard]] static constexpr bool mixed_split_segments_supported() noexcept {
+        return !Hooks::prologue && !requires { V::has_glm_indexer; } &&
+               !requires { V::has_qsa_indexer; };
+    }
     // Staging for the segments that finish in this round: their last hidden columns are
     // gathered into `hidden`, one lm_head produces `logits`, and the batched sampler writes
     // `tokens`. Sized for the number of finalizing segments the caller allows.
