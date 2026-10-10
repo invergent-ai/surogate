@@ -2,6 +2,7 @@
 #include "ops/nvfp4_device.h"
 
 #include <array>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 
@@ -106,6 +107,10 @@ int main() {
         return 77;
     }
     if (!sinfer::test::nvfp4_device("NVFP4_A4 Linear")) { return 77; }
+    // A generic shape decodes one token through the K-templated GEMV by default, with BF16
+    // activations (sinfer_linear_nvfp4_a16_test covers it). This test is the W4A4 route's, one
+    // token included, so it keeps every width on cuBLASLt. Read once, before the first dispatch.
+    ::setenv("SUROGATE_NVFP4_GENERIC_GEMV", "0", 1);
     try {
         const int failures = run_nvfp4_a4();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";
