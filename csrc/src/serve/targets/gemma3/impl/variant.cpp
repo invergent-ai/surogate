@@ -215,10 +215,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
     return std::max({
         attention_projection_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
         attention_projection_workspace_bytes(geometry, QType::Q4_K, first, last),
-        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+        family::stored_roles_format_workspace(geometry, {"attention/query", "attention/key", "attention/value"}, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
             return attention_projection_workspace_bytes(geometry, type, first, last);
         }),
-        family::stored_format_workspace(geometry, QType::NVFP4, [&](QType type) {
+        family::stored_roles_format_workspace(geometry, {"attention/query", "attention/key", "attention/value"}, QType::NVFP4, [&](QType type) {
             return attention_projection_workspace_bytes(geometry, type, first, last);
         })});
 }
@@ -228,10 +228,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
     return std::max({
         attention_output_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
         attention_output_workspace_bytes(geometry, QType::Q4_K, first, last),
-        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+        family::stored_roles_format_workspace(geometry, {"attention/output"}, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
             return attention_output_workspace_bytes(geometry, type, first, last);
         }),
-        family::stored_format_workspace(geometry, QType::NVFP4, [&](QType type) {
+        family::stored_roles_format_workspace(geometry, {"attention/output"}, QType::NVFP4, [&](QType type) {
             return attention_output_workspace_bytes(geometry, type, first, last);
         })});
 }
@@ -287,10 +287,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     return std::max({
         post_mixer_workspace_bytes(geometry, profile_qtype(weights_profile), first, last),
         post_mixer_workspace_bytes(geometry, QType::Q4_K, first, last),
-        family::stored_format_workspace(geometry, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
+        family::stored_roles_format_workspace(geometry, {"mlp/gate_up", "mlp/gate", "mlp/up", "mlp/down"}, QType::FP8_E4M3FN_BLK128_F32S, [&](QType type) {
             return post_mixer_workspace_bytes(geometry, type, first, last);
         }),
-        family::stored_format_workspace(geometry, QType::NVFP4, [&](QType type) {
+        family::stored_roles_format_workspace(geometry, {"mlp/gate_up", "mlp/gate", "mlp/up", "mlp/down"}, QType::NVFP4, [&](QType type) {
             return post_mixer_workspace_bytes(geometry, type, first, last);
         })});
 }

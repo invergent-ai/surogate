@@ -3,7 +3,9 @@
 #include "api/family/text_geometry.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <string>
+#include <string_view>
 
 namespace sinfer::family {
 inline const LinearStorage& require_linear_storage(const TextGeometry& geometry, std::string_view name) {
@@ -63,6 +65,34 @@ template<class Capacity>
 std::size_t stored_format_workspace(const TextGeometry& geometry, QType type, Capacity capacity) {
     for (const auto& [name, storage] : geometry.linear_storage) {
         if (std::find(storage.formats.begin(), storage.formats.end(), type) != storage.formats.end()) {
+            return capacity(type);
+        }
+    }
+    return 0;
+}
+
+/// `capacity(type)` when some text layer stores one of `roles` as `type`, else 0. The form above
+/// answers for the whole artifact, which is right only when one format covers every projection:
+/// an export that quantises some roles and not others -- NVIDIA's Gemma 4 31B keeps its
+/// attention BF16 (stored W8) and its feed-forward NVFP4 -- would otherwise have its attention
+/// shapes planned for a format they never take, and NVFP4 refuses the 31B's global widths.
+template<class Capacity>
+std::size_t stored_roles_format_workspace(const TextGeometry& geometry,
+                                          std::initializer_list<std::string_view> roles,
+                                          QType type, Capacity capacity) {
+    constexpr std::string_view kLayers = "text/layers/";
+    for (const auto& [name, storage] : geometry.linear_storage) {
+        const std::string_view key = name;
+        if (!key.starts_with(kLayers) ||
+            std::find(storage.formats.begin(), storage.formats.end(), type) == storage.formats.end()) {
+            continue;
+        }
+        const auto slash = key.find('/', kLayers.size());
+        if (slash == std::string_view::npos) {
+            continue;
+        }
+        const std::string_view role = key.substr(slash + 1);
+        if (std::find(roles.begin(), roles.end(), role) != roles.end()) {
             return capacity(type);
         }
     }

@@ -121,6 +121,10 @@ using Gqa512_32q4  = GqaGeometry<512, 32, 4, 2>;  // gemma-4-31b, global
 using Gqa256_8q1   = GqaGeometry<256, 8, 1, 4>;  // gemma-4-e2b, windowed
 using Gqa512_8q1   = GqaGeometry<512, 8, 1, 4>;  // gemma-4-e2b, global
 using Gqa512_8q2   = GqaGeometry<512, 8, 2, 2>;  // gemma-4-e4b, global
+// Gemma 3 27B is the one Gemma 3 size whose head is 128 wide: thirty-two query heads over sixteen
+// key/value heads, the 31B's counts at half its windowed width. Split 1: sixteen KV heads give the
+// grid its parallelism.
+using Gqa128_32q16 = GqaGeometry<128, 32, 16, 1>; // gemma-3-27b
 
 // The registry. Every dispatcher below and in the launchers is generated from
 // this list, so a registration line is the whole of adding a shape — with the
@@ -150,7 +154,8 @@ using Gqa512_8q2   = GqaGeometry<512, 8, 2, 2>;  // gemma-4-e4b, global
     X(Gqa512_32q4)                                                                                 \
     X(Gqa256_8q1)                                                                                  \
     X(Gqa512_8q1)                                                                                  \
-    X(Gqa512_8q2)
+    X(Gqa512_8q2)                                                                                  \
+    X(Gqa128_32q16)
 
 namespace detail {
 
