@@ -2,6 +2,7 @@
 #include "ops/nvfp4_device.h"
 
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 
@@ -51,6 +52,18 @@ int run_nvfp4_a16() {
                           {2560, 4096, 714U, Comparison::Sampled, true, decode_only_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {2560, 9216, 715U, Comparison::Sampled, true, decode_only_invocations});
+    // Generic shapes decode through the K-templated GEMV (`Nvfp4GemvKGeometry`): the dense
+    // Gemma and E-series widths, both value-per-lane schedules (K a multiple of 512 or not),
+    // and the E2B's one-head key projection.
+    constexpr std::array<std::array<std::int32_t, 2>, 10> generic{{
+        {4096, 3840}, {30720, 3840}, {3840, 15360}, {43008, 5376}, {5376, 21504},
+        {12288, 1536}, {256, 1536}, {1536, 6144}, {2048, 2560}, {3840, 8192}}};
+    unsigned seed = 720U;
+    for (const auto& [rows, columns] : generic) {
+        failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                              {rows, columns, seed++, Comparison::Sampled, true,
+                               decode_only_invocations});
+    }
     return failures;
 }
 
