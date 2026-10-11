@@ -399,9 +399,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             deferred_fold_columns.assign(static_cast<std::size_t>(replay_records->spec.pending_slots), 0);
             CUDA_CHECK(cudaMemsetAsync(replay_records->pending_columns.data, 0,
                                        replay_records->pending_columns.bytes(), device.stream));
-            std::fprintf(stderr, "engine: MTP folds each round's accepted linear-attention "
+            std::fprintf(stderr, "engine: %s folds each round's accepted linear-attention "
                                  "transitions into the next verify (SUROGATE_SERVE_DEFER_GDN_FOLD=0 "
-                                 "folds every round)\n");
+                                 "folds every round)\n",
+                         speculative_backend == SpeculativeBackend::DFlash ? "DFlash" : "MTP");
         }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None && !model.gdn_layers.empty())) {
@@ -3464,8 +3465,11 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
     }
     // Decode lanes that ride here without verifying run one column in place, so their
     // deferred folds land first; verifying ones apply them in the record (launch_mtp_round
-    // brought the counts up to date).
-    if (!mtp_verify) { settle_deferred_folds(lanes); }
+    // and launch_dflash_round brought the counts up to date). A DFlash round drafting nothing
+    // verifies one column, which updates the state in place too.
+    if (!(speculative_decode && verify != nullptr && verify_width > 1)) {
+        settle_deferred_folds(lanes);
+    }
     // The first staged prompt owns the card (its KV view and cursor); every prompt's KV is
     // addressed per segment through the batch view and its own table row.
     const std::uint32_t prefill_lane = prefill_lanes.front();
@@ -4716,6 +4720,10 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
     ops::ScopedLoraBaseRound base_scope(base_round);
     const auto started = Clock::now();
     try {
+        // A verify applies its lanes' deferred folds itself; a round drafting nothing updates
+        // the state in place, so they land first.
+        if (active_dflash_window == 0) { settle_deferred_folds(lanes); }
+        flush_deferred_fold_counts();
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes =
             dflash_envelopes(0, maximum_frontier, active_dflash_window);

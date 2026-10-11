@@ -334,10 +334,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          // records a pair; the spec says which, and the fold reads it back.
                          .diagonal_gate =
                              family::linear_mixer_gate_is_per_channel(schedule::kLinearMixer),
-                         // MTP defers each round's fold into the lane's next verify (gated delta
-                         // net only): SUROGATE_SERVE_DEFER_GDN_FOLD=0 folds every round instead.
+                         // MTP and DFlash defer each round's fold into the lane's next verify
+                         // (gated delta net only; DFlash on one device, not across pipeline
+                         // stages): SUROGATE_SERVE_DEFER_GDN_FOLD=0 folds every round instead.
                          .pending_slots =
-                             plan.speculative_backend == SpeculativeBackend::Mtp &&
+                             (plan.speculative_backend == SpeculativeBackend::Mtp ||
+                              (plan.speculative_backend == SpeculativeBackend::DFlash &&
+                               plan.pipeline_stage_first == 0 && plan.pipeline_stage_last == 0)) &&
                                      !family::linear_mixer_gate_is_per_channel(schedule::kLinearMixer) &&
                                      deferred_gdn_fold_enabled()
                                  ? static_cast<std::int32_t>(plan.max_concurrency)
