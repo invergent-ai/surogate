@@ -122,6 +122,15 @@ struct TextGeometry {
     float rms_epsilon               = 0.0F;
     float rope_theta                = 0.0F;
     float rope_frequency_scale      = 1.0F;
+    /// YaRN context extension (Hugging Face rope_type "yarn"), laid over the checkpoint at load
+    /// from EngineOptions::rope_scaling (family::apply_rope_scaling) and never stored in an
+    /// artifact. Factor 0 is the checkpoint's own rotation; `max_context` is then already the
+    /// extended one, and the original context the one the correction dims are taken over.
+    float rope_yarn_factor            = 0.0F;
+    std::int32_t rope_yarn_original   = 0;
+    float rope_yarn_beta_fast         = 32.0F;
+    float rope_yarn_beta_slow         = 1.0F;
+    float rope_yarn_attention_factor  = 0.0F;
     /// What the embedding lookup is multiplied by before the first block, where a family
     /// scales it. Gemma's is `sqrt(hidden)` rounded to bf16 as the reference rounds it, which
     /// is 62.0 at hidden 3840 and 73.5 at 5376 -- so a target serving two sizes cannot compile

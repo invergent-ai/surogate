@@ -1,3 +1,4 @@
+#include "api/family/rope_scaling.h"
 #include "runtime/engine/pipeline_partition.h"
 #include <algorithm>
 #include <optional>
@@ -289,6 +290,23 @@ family::VisionGeometry declared_vision_geometry(const artifact::Reader& reader) 
                                             : family::VisionGeometry::resolved(reader.vision_geometry());
 }
 
+/// The dimensions to plan against: the target's declared geometry with --rope-scaling laid over
+/// it. YaRN reaches the rotation through the target's own bindings (plan_load), so only a target
+/// that lays it there takes the flag; any other refuses it rather than plan a context its
+/// rotation was never extended to.
+template <class Target>
+family::TextGeometry served_geometry(const artifact::Reader& reader, const EngineOptions& options) {
+    family::TextGeometry geometry = Target::declared_geometry(reader);
+    if (options.rope_scaling.factor != 0.0F) {
+        if (std::string_view(Target::target_key) != "qwen3_5_moe") {
+            throw std::invalid_argument("--rope-scaling: YaRN is served by the qwen3_5_moe target only, not " +
+                                        std::string(Target::target_key));
+        }
+        family::apply_rope_scaling(geometry, options);
+    }
+    return geometry;
+}
+
 template <class Target>
 std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptions& options,
                                         typename Target::WeightsProfile weights_profile,
@@ -356,7 +374,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const auto weights_profile                    = Target::resolve_weights(identity);
     // The dimensions to plan and bind against: this target's compiled config with whatever
     // the artifact declares laid over it.
-    const family::TextGeometry geometry            = Target::declared_geometry(reader);
+    const family::TextGeometry geometry            = served_geometry<Target>(reader, options);
     const auto generation = reader.payload("frontend/generation_config.json").data;
     const ModelSamplingDefaults sampling_defaults = runtime::load_sampling_defaults(
         Target::sampling_defaults(Target::model_id),
@@ -718,7 +736,7 @@ StagePreflight<Target>
 preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
                    const std::vector<EngineOptions>& stage_options) {
     const auto weights_profile          = Target::resolve_weights(reader.identity());
-    const family::TextGeometry geometry = Target::declared_geometry(reader);
+    const family::TextGeometry geometry = served_geometry<Target>(reader, options);
     const auto count                    = stage_options.size();
 
     StagePreflight<Target> out{};

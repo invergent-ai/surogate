@@ -2545,7 +2545,7 @@ int verify_fp8_wide_prompts() {
         // The prompt kernel's FP8 query-key product (ops::prompt_attention_fp8_query) rounds each
         // query row to e4m3 against its own absolute maximum; its oracle rounds the queries the
         // same way, so the bf16 bound still holds.
-        const bool fp8_query = major != 9 && c.tokens >= 64 && (dim == 128 || dim == 256);
+        const bool fp8_query = major != 9 && c.tokens >= 64 && (dim == 128 || dim == 256 || dim == 512);
         std::vector<double> reference_q8;
         if (fp8_query) {
             std::vector<float> q8_values(q_values.size());

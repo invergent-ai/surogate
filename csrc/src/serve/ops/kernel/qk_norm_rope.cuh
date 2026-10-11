@@ -27,7 +27,8 @@ enum class QkNormForm { D128, Warp };
 /// Which rope kernel's coefficients the rotation reproduces: rope_generic_kernel's,
 /// rope_fixed_kernel's Text1D / TextMrope tables, or rope_table_apply_kernel's (read from a
 /// rope_table, position-major).
-enum class QkRopeAngles { Generic, Text1D, TextMrope, Table };
+/// The Yarn forms are rope_fixed_kernel's YaRN coefficients for the same two tables.
+enum class QkRopeAngles { Generic, Text1D, TextMrope, Table, Text1DYarn, TextMropeYarn };
 
 inline constexpr int kQkNormRopeWarps = 8;
 
@@ -38,7 +39,7 @@ static __global__ __launch_bounds__(kQkNormRopeWarps * 32) void qk_norm_rope_ker
         const std::int32_t* positions, std::int32_t axes, std::int32_t head_dim,
         std::int32_t rotary_dim, std::int32_t active_pairs, float theta, std::int32_t height_pairs,
         std::int32_t width_pairs, std::int32_t q_heads, std::int32_t k_heads, std::int32_t tokens,
-        float eps, const float2* table) {
+        float eps, const float2* table, RopeYarn yarn) {
     constexpr int kMaxSlots = 4; // BF16x2 slots a lane holds: head dims up to 256
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
@@ -81,6 +82,9 @@ static __global__ __launch_bounds__(kQkNormRopeWarps * 32) void qk_norm_rope_ker
             const float2 cs = table[static_cast<std::int64_t>(positions[token]) * half + pair];
             cos_cache[pair] = cs.x;
             sin_cache[pair] = cs.y;
+        } else if constexpr (Angles == QkRopeAngles::Text1DYarn || Angles == QkRopeAngles::TextMropeYarn) {
+            fixed_sincos<Angles == QkRopeAngles::Text1DYarn ? RopeKernelMode::Text1D : RopeKernelMode::TextMrope,
+                         true>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair], &yarn);
         } else {
             fixed_sincos<Angles == QkRopeAngles::Text1D ? RopeKernelMode::Text1D : RopeKernelMode::TextMrope>(
                 positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);

@@ -28,7 +28,8 @@ void launch(const QkNormRope& a, int k_heads, cudaStream_t stream) {
         static_cast<const std::int32_t*>(a.positions->data), a.positions->ne[1], q.ne[0],
         a.rotary_dim, a.active_pairs, a.theta, interleaved ? a.sections[1] : -1,
         interleaved ? a.sections[2] : -1, q.ne[1], k_heads, tokens, a.eps,
-        a.table == nullptr ? nullptr : static_cast<const float2*>(a.table->data));
+        a.table == nullptr ? nullptr : static_cast<const float2*>(a.table->data),
+        a.yarn == nullptr ? RopeYarn{} : *a.yarn);
 }
 
 template <RmsEpilogue Epilogue, QkNormForm Form>
@@ -37,6 +38,8 @@ void launch_angles(const QkNormRope& a, int k_heads, QkRopeAngles angles, cudaSt
     case QkRopeAngles::Text1D: launch<Epilogue, Form, QkRopeAngles::Text1D>(a, k_heads, stream); break;
     case QkRopeAngles::TextMrope: launch<Epilogue, Form, QkRopeAngles::TextMrope>(a, k_heads, stream); break;
     case QkRopeAngles::Table: launch<Epilogue, Form, QkRopeAngles::Table>(a, k_heads, stream); break;
+    case QkRopeAngles::Text1DYarn: launch<Epilogue, Form, QkRopeAngles::Text1DYarn>(a, k_heads, stream); break;
+    case QkRopeAngles::TextMropeYarn: launch<Epilogue, Form, QkRopeAngles::TextMropeYarn>(a, k_heads, stream); break;
     default: launch<Epilogue, Form, QkRopeAngles::Generic>(a, k_heads, stream); break;
     }
 }
@@ -71,7 +74,14 @@ bool qk_norm_rope_launch(const QkNormRope& a, cudaStream_t stream) {
     // rope_interleaved always runs the generic kernel. A table is what rope_from_table reads.
     QkRopeAngles angles = QkRopeAngles::Generic;
     const bool whole    = a.active_pairs == a.rotary_dim / 2;
-    if (a.table != nullptr) {
+    if (a.yarn != nullptr) {
+        // Only the fixed tables' geometries take YaRN; the caller runs ops::rope's YaRN form else.
+        if (a.table != nullptr || a.sections[0] != 0 || !whole || a.rotary_dim != 64 || head_dim != 256 ||
+            !((q.ne[1] == 24 && a.k_heads == 4) || (q.ne[1] == 16 && a.k_heads == 2))) {
+            return false;
+        }
+        angles = axes == 1 ? QkRopeAngles::Text1DYarn : QkRopeAngles::TextMropeYarn;
+    } else if (a.table != nullptr) {
         angles = QkRopeAngles::Table;
     } else if (a.sections[0] == 0 && whole && a.rotary_dim == 64 && a.theta == 1.0e7F &&
                head_dim == 256 &&

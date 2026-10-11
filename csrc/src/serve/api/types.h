@@ -171,6 +171,18 @@ struct EngineOptions {
     // Placement probes size a candidate without allocating its expert cache.
     bool offload_planning_only         = false;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    // --rope-scaling: YaRN laid over the checkpoint's rotation (Hugging Face rope_type "yarn").
+    // `factor` 0 keeps the checkpoint's own; `original_context` 0 means the checkpoint's
+    // max_context, and the served context may then reach original_context * factor;
+    // `attention_factor` 0 means 0.1 * ln(factor) + 1.
+    struct RopeScaling {
+        float factor                  = 0.0F;
+        std::uint32_t original_context = 0;
+        float beta_fast               = 32.0F;
+        float beta_slow               = 1.0F;
+        float attention_factor        = 0.0F;
+    };
+    RopeScaling rope_scaling;
     // --chat-template: a Jinja template that replaces the artifact's. Empty keeps the
     // artifact's, which is the only one whose agreement with tokenizer_config.json the
     // loader can check -- an override is the operator taking that responsibility.

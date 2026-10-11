@@ -4654,3 +4654,41 @@ artifact, FP8 KV, DGX Spark:
 | 4 agents, warm turn TTFT p50 / p90 | 6.97 / 10.81 s | 3.47 / 5.07 s | 8.35 / 12.81 s |
 | 4 agents, decode per agent | 8.2 tok/s | 11.6 tok/s | 5.4 tok/s |
 | 4 agents, turns a minute | 6.1 | 9.5 | 4.3 |
+
+## 123
+
+**YaRN for the Qwen3.5/3.6 MoE target: a million-token context (2026-10-11).** Surogate3.7
+35B-A3B is trained to 262,144 positions and the engine refused any longer context; Qwen's own
+recipe for this family extends it with YaRN (rope_type "yarn", factor 4), which no serving target
+implemented.
+
+- **`--rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'`**
+  (Hugging Face's rope_scaling object, as vLLM takes it; the family's own rope keys may ride along)
+  lays YaRN over the checkpoint's rotation at load and extends the served context to original *
+  factor (`api/family/rope_scaling.h`, applied to the registry's planning geometry and to the
+  target's bound geometry). Only `qwen3_5_moe` takes it; any other target refuses the flag rather
+  than run past its native context unscaled. Off by default: no artifact changes.
+- **`ops::rope_yarn`** derives the coefficients the way transformers' `_compute_yarn_parameters`
+  and vLLM's YaRN embedding do (correction dims floor/ceil of beta_fast 32 / beta_slow 1 over the
+  original context: pairs 0-13 kept, 22-31 divided by the factor, a ramp between;
+  attention_factor 0.1 ln(factor) + 1 on cos and sin of the rotated channels). The fixed text
+  rope kernels (head dim 256, rotary dim 64) take the 32 frequencies and the factor as a kernel
+  parameter, the angle in double reduced before sincosf; the fused QK-norm + rope kernel takes the
+  same (`QkRopeAngles::Text1DYarn` / `TextMropeYarn`), bit for bit the separate ops. Every rotation
+  of the model takes it: the layers' (eager, graph, mixed rounds) and the MTP head's.
+- Tests: the coefficient table against the formula; the YaRN rotation against the FP64 oracle at
+  positions to 1,048,000 (1-D and MRoPE, the 35B's and 27B's heads, single-tensor form); the fused
+  kernel bit-identical to the ops to position 1,000,000.
+
+DGX Spark, the 35B NVFP4, FP8 KV, no speculation; three passphrases at 10/50/90% of a haystack of
+this repository's sources (`gemma/needle.py`):
+
+| | 200k | 400k | 1M |
+|---|---|---|---|
+| Without YaRN | 3/3, 59 s | refused | refused |
+| YaRN, factor 4 | 3/3, 59 s | 3/3, 183 s | 3/3, 946 s |
+| Decode after the prompt | 42.3 tok/s | 30.6 tok/s | 15.6 tok/s |
+
+Below the native context YaRN costs a little, as Qwen documents for static YaRN: the tokens of a
+900-token answer scored given its 94,631-token document, +0.021 ± 0.008 nats against the native
+rotation (top-1 97.0% -> 96.6%). Serve it where contexts past 262,144 are wanted.

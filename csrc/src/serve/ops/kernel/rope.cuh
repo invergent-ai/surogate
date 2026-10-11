@@ -5,6 +5,8 @@
 // D/R=128/128, plus packed Vision 16Q/16K at D/R=72/72. One CTA owns one token and shares its
 // rotary coefficients across heads.
 
+#include "api/ops/rope.h"
+
 #include <cuda_bf16.h>
 
 #include <cmath>
@@ -94,10 +96,26 @@ __device__ __forceinline__ void fixed_axis_frequency(int pair, int* axis, float*
     }
 }
 
-template <RopeKernelMode Mode>
+// `Yarn` (Text1D and TextMrope only): pair `pair` turns at yarn->inv_frequency[pair], the angle
+// taken in double and reduced before sincosf, and both coefficients carry yarn->attention_factor.
+template <RopeKernelMode Mode, bool Yarn = false>
 __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int tokens, int token,
-                                             int pair, float* sine, float* cosine) {
-    if constexpr (Mode == RopeKernelMode::DflashText1D) {
+                                             int pair, float* sine, float* cosine,
+                                             const RopeYarn* yarn = nullptr) {
+    static_assert(!Yarn || Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope);
+    if constexpr (Yarn) {
+        constexpr double kInvTwoPi = 1.59154943091895336e-01;
+        constexpr double kTwoPi    = 6.28318530717958648e+00;
+        const int axis             = Mode == RopeKernelMode::TextMrope ? pair % 3 : 0;
+        const double angle =
+            static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+            static_cast<double>(yarn->inv_frequency[pair]);
+        const float reduced = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
+        float s, c;
+        sincosf(reduced, &s, &c);
+        *sine   = s * yarn->attention_factor;
+        *cosine = c * yarn->attention_factor;
+    } else if constexpr (Mode == RopeKernelMode::DflashText1D) {
         constexpr double kInvTwoPi = 1.59154943091895336e-01;
         constexpr double kTwoPi    = 6.28318530717958648e+00;
         const double angle  = static_cast<double>(positions[token]) * kDflashRopeInvFrequency[pair];
@@ -164,10 +182,10 @@ __host__ __device__ constexpr int rope_fixed_half(RopeKernelMode mode) {
                                                   : 32;
 }
 
-template <RopeKernelMode Mode, int QHeads, int KHeads>
+template <RopeKernelMode Mode, int QHeads, int KHeads, bool Yarn = false>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
-                                  std::int64_t k_token_stride) {
+                                  std::int64_t k_token_stride, RopeYarn yarn) {
     constexpr int kHeadDim = rope_fixed_head_dim(Mode);
     constexpr int kHalf    = rope_fixed_half(Mode);
     const int token        = static_cast<int>(blockIdx.x);
@@ -177,7 +195,8 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     __shared__ float sin_cache[kHalf];
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
-        fixed_sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        fixed_sincos<Mode, Yarn>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair],
+                                 &yarn);
     }
     __syncthreads();
 

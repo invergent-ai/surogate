@@ -90,4 +90,37 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
 void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta, Tensor& x,
           cudaStream_t stream);
 
+/**
+ * YaRN context extension (Hugging Face `rope_type: "yarn"`), for the text rotation the fixed
+ * kernels serve: head dim 256, rotary dim 64, [T] or [T,3] positions (pair i on axis i % 3).
+ * Pair i turns at `inv_frequency[i]` instead of theta^(-2i/64), and both cos and sin are
+ * multiplied by `attention_factor` -- on the rotated channels only, as transformers' and vLLM's
+ * rotary embeddings scale them. The angle is taken in double and reduced before sincosf, so it
+ * stays exact to the float's precision out to a million positions.
+ */
+struct RopeYarn {
+    static constexpr int kPairs = 32;
+    float inv_frequency[kPairs]{};
+    float attention_factor = 1.0F;
+};
+
+/**
+ * YaRN's coefficients the way transformers' _compute_yarn_parameters and vLLM's
+ * YaRNScalingRotaryEmbedding derive them: theta^(-2i/rotary_dim) kept (extrapolated) for the
+ * pairs that turn more than `beta_fast` times over `original_context` positions, divided by
+ * `factor` (interpolated) for those that turn fewer than `beta_slow` times, and blended linearly
+ * between the two correction dims (floor and ceil); attention_factor 0.1 * ln(factor) + 1 unless
+ * one is given (> 0). rotary_dim must be 64; factor > 1.
+ */
+[[nodiscard]] RopeYarn rope_yarn(int rotary_dim, float theta, float factor, int original_context,
+                                 float beta_fast = 32.0F, float beta_slow = 1.0F,
+                                 float attention_factor = 0.0F);
+
+/// ops::rope with YaRN's coefficients, Q and K or a single tensor. Only the fixed text
+/// geometries (Q/K heads 24/4 or 16/2; single tensors of 24, 16, 4 or 2 heads) are served.
+void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& q,
+          Tensor& k, cudaStream_t stream);
+void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& x,
+          cudaStream_t stream);
+
 } // namespace sinfer::ops

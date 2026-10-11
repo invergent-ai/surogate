@@ -61,6 +61,8 @@ struct ServeOptions {
     ModelPriority model_priority = ModelPriority::Normal;
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;
+    /// --rope-scaling: YaRN over the checkpoint's rotation (EngineOptions::RopeScaling).
+    EngineOptions::RopeScaling rope_scaling;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     // --host-moe-layers N|all: experts of this many mixture layers live in pinned host memory,
     // read over PCIe, instead of on the card. What lets a model larger than the cards load.

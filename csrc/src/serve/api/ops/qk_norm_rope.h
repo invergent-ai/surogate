@@ -1,5 +1,6 @@
 #pragma once
 
+#include "api/ops/rope.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -36,6 +37,10 @@ struct QkNormRope {
     /// ops::rope_from_table leaves after the two norms. [T] positions within the table, no
     /// sections; `theta` and `active_pairs` are still validated, and are the table's.
     const Tensor* table = nullptr;
+    /// Optional YaRN coefficients (ops::rope_yarn): the rotation is ops::rope's YaRN form, for the
+    /// fixed text geometries it serves; no table, no sections. Anything else returns false and the
+    /// caller runs the two ops.
+    const RopeYarn* yarn = nullptr;
 };
 
 /**

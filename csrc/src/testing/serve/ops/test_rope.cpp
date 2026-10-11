@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,9 @@ struct Geometry {
     int active_pairs = 0;
     std::array<int, 3> sections{};
     float frequency_scale = 1.0F;
+    /// YaRN coefficients: pair i turns at yarn->inv_frequency[i] and its cos and sin carry
+    /// yarn->attention_factor.
+    const ops::RopeYarn* yarn = nullptr;
 };
 
 /// The pairs a geometry actually rotates.
@@ -110,13 +114,17 @@ std::vector<double> rope_oracle(const std::vector<float>& input, const std::vect
                     }
                     exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
                 }
-                const double frequency = std::pow(static_cast<double>(geometry.theta), exponent);
+                const double frequency =
+                    geometry.yarn != nullptr
+                        ? static_cast<double>(geometry.yarn->inv_frequency[pair])
+                        : std::pow(static_cast<double>(geometry.theta), exponent);
                 const double phase =
                     static_cast<double>(
                         positions[static_cast<std::size_t>(axis) * geometry.tokens + token]) *
                     frequency * geometry.frequency_scale;
-                const double cosine  = std::cos(phase);
-                const double sine    = std::sin(phase);
+                const double scale   = geometry.yarn != nullptr ? geometry.yarn->attention_factor : 1.0;
+                const double cosine  = std::cos(phase) * scale;
+                const double sine    = std::sin(phase) * scale;
                 const std::size_t lo = dense_index(geometry.head_dim, heads, token, head, pair);
                 const std::size_t hi =
                     dense_index(geometry.head_dim, heads, token, head, pair + half);
@@ -281,7 +289,10 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
-    if (geometry.sections[0]) {
+    if (geometry.yarn != nullptr) {
+        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, *geometry.yarn, q_tensor,
+                  k_tensor, nullptr);
+    } else if (geometry.sections[0]) {
         ops::rope_interleaved(position_tensor, geometry.rotary_dim, geometry.theta,
                               geometry.sections, q_tensor, k_tensor, nullptr);
     } else {
@@ -336,7 +347,9 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
     Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
-    if (geometry.sections[0]) {
+    if (geometry.yarn != nullptr) {
+        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, *geometry.yarn, tensor, nullptr);
+    } else if (geometry.sections[0]) {
         ops::rope_interleaved(position_tensor, geometry.rotary_dim, geometry.theta, geometry.sections, tensor, nullptr);
     } else {
         ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta, tensor, nullptr);
@@ -482,6 +495,37 @@ int run_table_case(const char* label, int head_dim, float theta, float frequency
     return failures;
 }
 
+// ops::rope_yarn against transformers' formula, written out in double (factor 4 over the 35B's
+// 262,144 positions: correction dims floor(14.24) = 14 and ceil(21.12) = 22).
+int run_yarn_table_case() {
+    const ops::RopeYarn yarn = ops::rope_yarn(64, kTextTheta, 4.0F, 262'144);
+    const double low = 14.0, high = 22.0;
+    int failures = 0;
+    for (int pair = 0; pair < ops::RopeYarn::kPairs; ++pair) {
+        const double native = std::pow(1.0e7, -2.0 * pair / 64.0);
+        const double ramp   = std::clamp((pair - low) / (high - low), 0.0, 1.0);
+        const double want   = native / 4.0 * ramp + native * (1.0 - ramp);
+        if (std::abs(yarn.inv_frequency[pair] - want) > 1e-6 * want) {
+            std::cerr << "yarn table: pair " << pair << " " << yarn.inv_frequency[pair] << " != " << want << '\n';
+            ++failures;
+        }
+    }
+    if (std::abs(yarn.attention_factor - (0.1 * std::log(4.0) + 1.0)) > 1e-6) {
+        std::cerr << "yarn table: attention factor " << yarn.attention_factor << '\n';
+        ++failures;
+    }
+    const ops::RopeYarn stated = ops::rope_yarn(64, kTextTheta, 4.0F, 262'144, 32.0F, 1.0F, 1.25F);
+    if (stated.attention_factor != 1.25F) {
+        std::cerr << "yarn table: a stated attention factor was not kept\n";
+        ++failures;
+    }
+    bool refused = false;
+    try { (void)ops::rope_yarn(128, kTextTheta, 4.0F, 262'144); } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) { std::cerr << "yarn table: rotary dim 128 was not refused\n"; ++failures; }
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " yarn table\n";
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -552,6 +596,30 @@ int main() {
         run_pair_case({"gemma4-31b global", 512, 512, 1, 33, kTextTheta, 64}, 32, 4, 1024);
     // And the windowed half, which rotates in full at the local base.
     failures += run_pair_case({"gemma4 windowed", 256, 256, 1, 64, 1.0e4F}, 16, 8, 512);
+
+    // YaRN (factor 4 over 262,144): the 35B's and the 27B's text heads at a million positions,
+    // 1-D and MRoPE, decode and prefill, pair and single-tensor (the MTP head's K) forms.
+    failures += run_yarn_table_case();
+    const ops::RopeYarn yarn = ops::rope_yarn(64, kTextTheta, 4.0F, 262'144);
+    Geometry yarn_decode{"35b yarn decode", 256, 64, 1, 1, kTextTheta};
+    yarn_decode.yarn = &yarn;
+    failures += run_pair_case(yarn_decode, 16, 2, 1'048'000);
+    Geometry yarn_prefill{"35b yarn prefill", 256, 64, 1, 300, kTextTheta};
+    yarn_prefill.yarn = &yarn;
+    failures += run_pair_case(yarn_prefill, 16, 2, 1'047'000, 16, 8);
+    Geometry yarn_native{"35b yarn short context", 256, 64, 1, 7, kTextTheta};
+    yarn_native.yarn = &yarn;
+    failures += run_pair_case(yarn_native, 16, 2, 31);
+    Geometry yarn_mrope{"35b yarn mrope", 256, 64, 3, 129, kTextTheta};
+    yarn_mrope.yarn = &yarn;
+    failures += run_pair_case(yarn_mrope, 16, 2, 700'000);
+    Geometry yarn_27b{"27b yarn prefill", 256, 64, 1, 64, kTextTheta};
+    yarn_27b.yarn = &yarn;
+    failures += run_pair_case(yarn_27b, 24, 4, 900'000);
+    Geometry yarn_k{"35b yarn mtp k", 256, 64, 1, 5, kTextTheta};
+    yarn_k.yarn = &yarn;
+    failures += run_single_case(yarn_k, 2, 1'040'000, 8);
+    failures += run_single_case(yarn_k, 16, 1'040'000);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

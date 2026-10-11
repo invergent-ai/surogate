@@ -48,19 +48,27 @@ void require_fixed_head_dim(const Tensor* tensor, const char* label) {
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
 void launch_fixed_block(const Tensor& positions, Tensor* q, Tensor* k, int block,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, const RopeYarn* yarn = nullptr) {
     require_fixed_head_dim<Mode>(q, "query");
     require_fixed_head_dim<Mode>(k, "key");
     const int tokens = positions.ne[0];
+    const auto* pos  = static_cast<const std::int32_t*>(positions.data);
+    auto* qd         = q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data);
+    auto* kd         = k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data);
+    if constexpr (Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope) {
+        if (yarn != nullptr) {
+            rope_fixed_kernel<Mode, QHeads, KHeads, true><<<tokens, block, 0, stream>>>(
+                pos, qd, kd, tokens, token_stride(q), token_stride(k), *yarn);
+            return;
+        }
+    }
     rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data),
-        q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-        token_stride(k));
+        pos, qd, kd, tokens, token_stride(q), token_stride(k), RopeYarn{});
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
-void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t stream) {
+void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t stream,
+                  const RopeYarn* yarn = nullptr) {
     const int tokens = positions.ne[0];
     int block        = kSmallBlock;
     if constexpr (kTextMode<Mode>) {
@@ -75,7 +83,7 @@ void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t st
         if (block > head_warps) { block = head_warps; }
         if (block > 1024) { block = 1024; }
     }
-    launch_fixed_block<Mode, QHeads, KHeads>(positions, q, k, block, stream);
+    launch_fixed_block<Mode, QHeads, KHeads>(positions, q, k, block, stream, yarn);
 }
 
 template <int HeadsPerBlock, int QHeads, int KHeads>
@@ -92,10 +100,11 @@ void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, cudaStre
 }
 
 bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, const RopeYarn* yarn = nullptr) {
     if (!bf16x2_aligned(q) || !bf16x2_aligned(k)) { return false; }
     const int axes = positions.ne[1];
-    if (axes == 1 && q.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F && q.ne[1] == 32 &&
+    if (yarn != nullptr && (rotary_dim != 64 || (axes != 1 && axes != 3))) { return false; }
+    if (yarn == nullptr && axes == 1 && q.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F && q.ne[1] == 32 &&
         k.ne[1] == 8) {
         const int tokens = positions.ne[0];
         if (tokens <= 16) {
@@ -109,28 +118,30 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
     }
     const bool text_head_dim = q.ne[0] == rope_fixed_head_dim(RopeKernelMode::Text1D) &&
                                k.ne[0] == rope_fixed_head_dim(RopeKernelMode::Text1D);
-    if (rotary_dim == 64 && theta == 1.0e7F && text_head_dim) {
+    // Under YaRN the table is the caller's, so theta is only the native table's test.
+    if (rotary_dim == 64 && (theta == 1.0e7F || yarn != nullptr) && text_head_dim) {
         if (q.ne[1] == 24 && k.ne[1] == 4) {
             if (axes == 1) {
-                launch_fixed<RopeKernelMode::Text1D, 24, 4>(positions, &q, &k, stream);
+                launch_fixed<RopeKernelMode::Text1D, 24, 4>(positions, &q, &k, stream, yarn);
                 return true;
             }
             if (axes == 3) {
-                launch_fixed<RopeKernelMode::TextMrope, 24, 4>(positions, &q, &k, stream);
+                launch_fixed<RopeKernelMode::TextMrope, 24, 4>(positions, &q, &k, stream, yarn);
                 return true;
             }
         }
         if (q.ne[1] == 16 && k.ne[1] == 2) {
             if (axes == 1) {
-                launch_fixed<RopeKernelMode::Text1D, 16, 2>(positions, &q, &k, stream);
+                launch_fixed<RopeKernelMode::Text1D, 16, 2>(positions, &q, &k, stream, yarn);
                 return true;
             }
             if (axes == 3) {
-                launch_fixed<RopeKernelMode::TextMrope, 16, 2>(positions, &q, &k, stream);
+                launch_fixed<RopeKernelMode::TextMrope, 16, 2>(positions, &q, &k, stream, yarn);
                 return true;
             }
         }
     }
+    if (yarn != nullptr) { return false; }
     if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 &&
         k.ne[1] == 16 && q.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D) &&
         k.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D)) {
@@ -147,12 +158,14 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
 }
 
 template <RopeKernelMode Mode, int Heads>
-void launch_fixed_single(const Tensor& positions, Tensor& x, cudaStream_t stream) {
-    launch_fixed<Mode, Heads, 0>(positions, &x, nullptr, stream);
+void launch_fixed_single(const Tensor& positions, Tensor& x, cudaStream_t stream,
+                         const RopeYarn* yarn = nullptr) {
+    launch_fixed<Mode, Heads, 0>(positions, &x, nullptr, stream, yarn);
 }
 
 template <int Heads>
-bool launch_text_single(const Tensor& positions, int axes, Tensor& x, cudaStream_t stream) {
+bool launch_text_single(const Tensor& positions, int axes, Tensor& x, cudaStream_t stream,
+                        const RopeYarn* yarn = nullptr) {
     // Head count alone does not identify the kernel: Text1D and TextMrope are
     // compiled for head dim 256, and the QSA indexer arrives here with four
     // 128-wide heads at the same rotary_dim and theta.
@@ -160,11 +173,11 @@ bool launch_text_single(const Tensor& positions, int axes, Tensor& x, cudaStream
         return false;
     }
     if (axes == 1) {
-        launch_fixed_single<RopeKernelMode::Text1D, Heads>(positions, x, stream);
+        launch_fixed_single<RopeKernelMode::Text1D, Heads>(positions, x, stream, yarn);
         return true;
     }
     if (axes == 3) {
-        launch_fixed_single<RopeKernelMode::TextMrope, Heads>(positions, x, stream);
+        launch_fixed_single<RopeKernelMode::TextMrope, Heads>(positions, x, stream, yarn);
         return true;
     }
     return false;
@@ -262,6 +275,29 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pair
     const bool whole = active_pairs == rotary_dim / 2;
     if (!whole || !launch_fixed_single_dispatch(positions, rotary_dim, theta, x, stream)) {
         launch_generic(positions, rotary_dim, active_pairs, theta, &x, nullptr, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_yarn_launch(const Tensor& positions, int rotary_dim, const RopeYarn& yarn, Tensor& q,
+                      Tensor& k, cudaStream_t stream) {
+    if (!launch_fixed_pair(positions, rotary_dim, 0.0F, q, k, stream, &yarn)) {
+        throw std::invalid_argument(
+            "rope: YaRN is served for head dim 256, rotary dim 64 and Q/K heads 24/4 or 16/2 only");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_yarn_single_launch(const Tensor& positions, int rotary_dim, const RopeYarn& yarn,
+                             Tensor& x, cudaStream_t stream) {
+    const int axes = positions.ne[1];
+    if (!bf16x2_aligned(x) || rotary_dim != 64 ||
+        !(launch_text_single<24>(positions, axes, x, stream, &yarn) ||
+          launch_text_single<4>(positions, axes, x, stream, &yarn) ||
+          launch_text_single<16>(positions, axes, x, stream, &yarn) ||
+          launch_text_single<2>(positions, axes, x, stream, &yarn))) {
+        throw std::invalid_argument(
+            "rope: YaRN is served for head dim 256, rotary dim 64 and 24, 16, 4 or 2 heads only");
     }
     CUDA_CHECK(cudaGetLastError());
 }

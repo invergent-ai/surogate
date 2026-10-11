@@ -508,7 +508,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     Tensor rope_for_op = text_rope_positions<Variant>(
         active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions);
     if constexpr (applies_rotary<Variant>()) {
-        ops::rope(rope_for_op, cfg_.rotary_dim, cfg_.rope_theta, qn, kn, s);
+        rope_text(cfg_, rope_for_op, cfg_.rotary_dim, cfg_.rope_theta, qn, kn, s);
     }
 
     Tensor a = results.attention.view({cfg_.head_dim, cfg_.n_q, T});
@@ -688,7 +688,7 @@ void TextContext::mtp_prefill_trunk_block(const Tensor& ids, const Tensor& hidde
             Tensor kn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_kv, tokens});
             ops::rmsnorm(keys, block.key_norm, cfg_.rms_eps, norm_unit_offset<V>(), kn, s);
             Tensor rope = text_rope_positions<V>(rope_positions);
-            ops::rope(rope, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
+            rope_text(cfg_, rope, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
             ops::gqa_kv_append(kn, v.view({cfg_.head_dim, cfg_.n_kv, tokens}), positions,
                                mtp_kv_.layer_view(0), s);
             if (!final_hidden) { return; }
@@ -697,7 +697,7 @@ void TextContext::mtp_prefill_trunk_block(const Tensor& ids, const Tensor& hidde
             Tensor qn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
             ops::rmsnorm(query, block.query_norm, cfg_.rms_eps, norm_unit_offset<V>(), qn, s);
             Tensor last_rope = rope.slice(0, tokens - 1, 1);
-            ops::rope(last_rope, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
+            rope_text(cfg_, last_rope, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
             Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
             ops::gqa_attention_cached(qn, positions.slice(0, tokens - 1, 1), cfg_.attention_scale,
                                       mtp_kv_.layer_view(0), envelope, work_, a, s);
@@ -784,7 +784,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
         }
         if constexpr (applies_rotary<Variant>()) {
-            ops::rope(rope_positions, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
+            rope_text(cfg_, rope_positions, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
         }
         ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
         (void)mtp_indexer_selection(ah, positions, envelope.max_visible_keys, true);
@@ -830,7 +830,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             }
         }
         if constexpr (applies_rotary<Variant>()) {
-            ops::rope(last_rope_position, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
+            rope_text(cfg_, last_rope_position, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
         }
 
         Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
@@ -1333,9 +1333,11 @@ bool TextContext::fused_qk_norm_rope(const Tensor* q_norm, const Tensor* k_norm,
         args.rotary_dim   = cfg_.layer_rotary_dim(layer);
         args.active_pairs = cfg_.layer_rotary_pairs(layer);
         args.theta        = layer_rope_theta(layer, g);
-        // The same choice the separate rope makes below: interleaved MRoPE for [T,3] positions
-        // of a model that declares its sections.
-        if (rope_positions.ne[1] == 3 && g.mrope_temporal) {
+        // The same choice the separate rope makes below: YaRN's form when the model is served
+        // with it, else interleaved MRoPE for [T,3] positions of a model that declares sections.
+        if (cfg_.rope_yarn) {
+            args.yarn = &*cfg_.rope_yarn;
+        } else if (rope_positions.ne[1] == 3 && g.mrope_temporal) {
             args.sections = {g.mrope_temporal, g.mrope_height, g.mrope_width};
         }
         return ops::qk_norm_rope(args, s);
@@ -1424,7 +1426,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     if constexpr (applies_rotary<Variant>()) {
         if (!fused_norm_rope && cfg_.layer_rotary_dim(layer) > 0) {
             const auto& g = weights_.geometry;
-            if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
+            if (cfg_.rope_yarn) {
+                ops::rope(rope_for_op, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
+                          *cfg_.rope_yarn, qn, kn, s);
+            } else if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
                 ops::rope_interleaved(rope_for_op, cfg_.layer_rotary_dim(layer),
                                       layer_rope_theta(layer, g),
                                       {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
@@ -2628,7 +2633,10 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 if constexpr (applies_rotary<Variant>()) {
                     if (!fused_norm_rope && cfg_.layer_rotary_dim(layer) > 0) {
                         const auto& g = weights_.geometry;
-                        if (rope_all.ne[1] == 3 && g.mrope_temporal) {
+                        if (cfg_.rope_yarn) {
+                            ops::rope(rope_all, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
+                                      *cfg_.rope_yarn, qn, kn, s);
+                        } else if (rope_all.ne[1] == 3 && g.mrope_temporal) {
                             ops::rope_interleaved(
                                 rope_all, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
                                 {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
@@ -3346,9 +3354,15 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 }
                 if constexpr (applies_rotary<Variant>()) {
                     if (!fused_norm_rope && cfg_.layer_rotary_dim(layer) > 0) {
-                        ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
-                                  cfg_.layer_rotary_pairs(layer),
-                                  layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+                        if (cfg_.rope_yarn) {
+                            ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
+                                      layer_rope_theta(layer, weights_.geometry), *cfg_.rope_yarn,
+                                      qn, kn, s);
+                        } else {
+                            ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
+                                      cfg_.layer_rotary_pairs(layer),
+                                      layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+                        }
                     }
                 }
                 // A windowed layer looks at fewer keys than the round is sized for;

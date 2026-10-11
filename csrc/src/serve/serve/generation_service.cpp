@@ -374,6 +374,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.device                   = options_.device;
     engine_options.devices                  = options_.devices;
     engine_options.max_context              = options_.max_context;
+    engine_options.rope_scaling             = options_.rope_scaling;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.host_moe_layers          = options_.host_moe_layers;
     engine_options.gpu_layers               = options_.gpu_layers;

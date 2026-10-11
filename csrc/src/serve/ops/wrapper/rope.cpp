@@ -2,9 +2,11 @@
 
 #include "ops/launcher/rope.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 
@@ -281,6 +283,88 @@ void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
     detail::rope_single_launch(positions, rotary_dim, active_pairs, theta, x, stream);
+}
+
+RopeYarn rope_yarn(int rotary_dim, float theta, float factor, int original_context, float beta_fast,
+                   float beta_slow, float attention_factor) {
+    if (rotary_dim != 2 * RopeYarn::kPairs) {
+        throw std::invalid_argument("rope_yarn: rotary_dim must be 64");
+    }
+    if (!std::isfinite(theta) || theta <= 1.0F || !std::isfinite(factor) || factor <= 1.0F ||
+        original_context <= 0 || !std::isfinite(beta_fast) || !std::isfinite(beta_slow) ||
+        beta_fast <= 0.0F || beta_slow <= 0.0F || !std::isfinite(attention_factor) ||
+        attention_factor < 0.0F) {
+        throw std::invalid_argument(
+            "rope_yarn: theta and factor must exceed 1, the original context and betas be positive");
+    }
+    // transformers' _compute_yarn_parameters (truncate=True) and vLLM's _yarn_find_correction_range,
+    // in double; the frequencies are float there, as here.
+    const double dim        = rotary_dim;
+    const double base       = theta;
+    const auto correction_dim = [&](double rotations) {
+        return dim * std::log(static_cast<double>(original_context) / (rotations * 2.0 * std::numbers::pi)) /
+               (2.0 * std::log(base));
+    };
+    const double low  = std::max(std::floor(correction_dim(beta_fast)), 0.0);
+    double high       = std::min(std::ceil(correction_dim(beta_slow)), dim - 1.0);
+    if (low == high) { high += 0.001; }
+    RopeYarn out;
+    for (int pair = 0; pair < RopeYarn::kPairs; ++pair) {
+        const float pos_freq      = static_cast<float>(std::pow(base, 2.0 * pair / dim));
+        const float extrapolation = 1.0F / pos_freq;
+        const float interpolation = 1.0F / (factor * pos_freq);
+        const float ramp = static_cast<float>(std::clamp((pair - low) / (high - low), 0.0, 1.0));
+        const float keep = 1.0F - ramp; // the extrapolation factor
+        out.inv_frequency[pair] = interpolation * (1.0F - keep) + extrapolation * keep;
+    }
+    out.attention_factor = attention_factor > 0.0F
+                               ? attention_factor
+                               : static_cast<float>(0.1 * std::log(static_cast<double>(factor)) + 1.0);
+    return out;
+}
+
+void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& q,
+          Tensor& k, cudaStream_t stream) {
+    require_common(positions, rotary_dim, theta);
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
+        throw std::invalid_argument("rope: q/k must be BF16");
+    }
+    (void)numel_allow_zero(positions, "positions");
+    const std::int64_t q_numel = numel_allow_zero(q, "q");
+    (void)numel_allow_zero(k, "k");
+    const std::int32_t tokens   = q.ne[2];
+    const int axes              = position_axes(positions, tokens);
+    const std::int32_t head_dim = q.ne[0];
+    if (head_dim != kTextHeadDim || rotary_dim != 2 * RopeYarn::kPairs || (axes != 1 && axes != 3)) {
+        throw std::invalid_argument("rope: YaRN requires head dim 256, rotary dim 64 and [T] or [T,3] positions");
+    }
+    require_tensor_layout(q, "q", head_dim, q.ne[1], tokens);
+    require_tensor_layout(k, "k", head_dim, k.ne[1], tokens);
+    if (q_numel == 0) { return; }
+    require_positions_storage(positions);
+    if (q.data == nullptr || k.data == nullptr) {
+        throw std::invalid_argument("rope: q/k data must be non-null");
+    }
+    detail::rope_yarn_launch(positions, rotary_dim, yarn, q, k, stream);
+}
+
+void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& x,
+          cudaStream_t stream) {
+    require_common(positions, rotary_dim, theta);
+    if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
+    (void)numel_allow_zero(positions, "positions");
+    const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
+    const std::int32_t tokens   = x.ne[2];
+    const int axes              = position_axes(positions, tokens);
+    const std::int32_t head_dim = x.ne[0];
+    if (head_dim != kTextHeadDim || rotary_dim != 2 * RopeYarn::kPairs || (axes != 1 && axes != 3)) {
+        throw std::invalid_argument("rope: YaRN requires head dim 256, rotary dim 64 and [T] or [T,3] positions");
+    }
+    require_tensor_layout(x, "tensor", head_dim, x.ne[1], tokens);
+    if (x_numel == 0) { return; }
+    require_positions_storage(positions);
+    if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
+    detail::rope_yarn_single_launch(positions, rotary_dim, yarn, x, stream);
 }
 
 } // namespace sinfer::ops

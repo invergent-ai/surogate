@@ -33,6 +33,7 @@ struct Case {
     bool keys = true;
     bool expect_fused = true;
     float table_scale = 0.0F;      ///< nonzero: the angles come from a rope_table with this scale
+    float yarn_factor = 0.0F;      ///< nonzero: YaRN over 262,144 positions (ops::rope_yarn)
 };
 
 std::vector<std::uint16_t> random_bf16(std::size_t n, std::mt19937& rng, float lo, float hi) {
@@ -104,7 +105,11 @@ int run(const Case& c, int tokens, int first_position, std::uint32_t seed) {
     ops::rmsnorm(q, qw, eps, c.unit_offset, qr, nullptr);
     ops::rmsnorm(k, kw, eps, c.unit_offset, kr, nullptr);
     Tensor table(table_dev.p, DType::FP32, {2, c.rotary_dim / 2, table_positions});
-    if (c.table_scale != 0.0F) {
+    ops::RopeYarn yarn;
+    if (c.yarn_factor != 0.0F) { yarn = ops::rope_yarn(c.rotary_dim, c.theta, c.yarn_factor, 262'144); }
+    if (c.yarn_factor != 0.0F) {
+        ops::rope(positions, c.rotary_dim, c.theta, yarn, qr, kr, nullptr);
+    } else if (c.table_scale != 0.0F) {
         ops::rope_table(c.head_dim, c.rotary_dim, active_pairs, c.theta, c.table_scale, table, nullptr);
         ops::rope_from_table(positions, table, qr, kr, nullptr);
     } else if (c.sections[0] != 0) {
@@ -120,6 +125,7 @@ int run(const Case& c, int tokens, int first_position, std::uint32_t seed) {
     args.positions = &positions, args.rotary_dim = c.rotary_dim, args.active_pairs = active_pairs;
     args.theta = c.theta, args.sections = c.sections;
     if (c.table_scale != 0.0F) { args.table = &table; }
+    if (c.yarn_factor != 0.0F) { args.yarn = &yarn; }
     const bool fused = ops::qk_norm_rope(args, nullptr);
     cuda_synchronize();
 
@@ -186,6 +192,12 @@ int main() {
         {"d128/r128 32q8k scaled table", 128, 128, 32, 8, 1, 1.0e6F, false, 0, {}, true, true, 0.125F},
         {"d256/r64 16q2k table", 256, 64, 16, 2, 1, 1.0e7F, true, 0, {}, true, true, 1.0F},
         {"queries only d256/r256 table", 256, 256, 8, 4, 1, 1.0e4F, true, 0, {}, false, true, 1.0F},
+        // YaRN (factor 4) on the 35B's and the 27B's text heads, 1-D and MRoPE, keys and queries
+        // alone.
+        {"35b d256/r64 16q2k yarn", 256, 64, 16, 2, 1, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
+        {"35b d256/r64 16q2k mrope yarn", 256, 64, 16, 2, 3, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
+        {"27b d256/r64 24q4k yarn", 256, 64, 24, 4, 1, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
+        {"queries only d256/r64 yarn", 256, 64, 16, 2, 1, 1.0e7F, true, 0, {}, false, true, 0.0F, 4.0F},
         // Outside the domain: declined.
         {"d128/r96 declined", 128, 96, 8, 2, 1, 1.0e4F, false, 0, {}, true, false},
         {"d512/r512 declined", 512, 512, 4, 1, 1, 1.0e6F, true, 64, {}, true, false},
@@ -194,7 +206,9 @@ int main() {
     std::uint32_t seed = 11;
     for (const Case& c : cases) {
         for (const int tokens : {1, 3, 64, 333}) {
-            for (const int first : {0, 9000, 250000}) {
+            for (const int first : {0, 9000, 250000, 1000000}) {
+                // A million positions: YaRN's range; the native tables stop at their own.
+                if (first > 250000 && c.yarn_factor == 0.0F) { continue; }
                 // A table of 250,000 positions is 128 MB a run; the table cases stop at 9,000.
                 if (c.table_scale != 0.0F && first > 9000) { continue; }
                 failures += run(c, tokens, first, seed++);

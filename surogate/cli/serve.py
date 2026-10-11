@@ -114,7 +114,7 @@ _VALUE_OPTIONS = {
         --max-num-batched-tokens
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
-        --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
+        --default-max-tokens --reasoning-parser --tool-call-parser --chat-template --rope-scaling
         --model-priority --model --lora-modules --max-loras --max-lora-rank
         --decision-temperature --decision-attempts --gpu-memory-limit-mib --openrouter-models-file
     """.split()),

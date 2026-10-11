@@ -1,4 +1,5 @@
 #include <api/targets/qwen3_5_moe/package.h>
+#include "api/family/rope_scaling.h"
 #include "family/impl/lora_bind.h"
 #include <api/family/frontend_resources.h>
 #include <api/family/prepared_prompt.h>
@@ -79,6 +80,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     auto plan = detail::bind_artifact(binder, family::startup_features(options), weights_profile,
                               options.host_moe_layers, options.gpu_layers,
                               options.load_progress);
+    // --rope-scaling reaches every rotation of the model through the bound geometry
+    // (ModelConfig::rope_yarn), as it reaches the planner through the registry's.
+    family::apply_rope_scaling(plan.bindings.geometry, options);
     const auto& g = plan.bindings.geometry;
     family::plan_banked_experts(binder, plan.bindings.host_bank, plan.materialization,
                                 options, offload_geometry(g), g.layers + g.mtp_layers,

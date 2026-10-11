@@ -4,6 +4,8 @@
 #include "product/speculative_options.h"
 #include "serve/decisions_schema.h"
 
+#include <nlohmann/json.hpp>
+
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -29,6 +31,54 @@ int parse_nonnegative_int(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<int>(value);
+}
+
+/// --rope-scaling: Hugging Face's rope_scaling / rope_parameters object, as vLLM takes it, e.g.
+/// {"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}. Only YaRN is
+/// served. The checkpoint's own rope keys may ride along (a pasted rope_parameters) and are
+/// ignored; anything else is refused, so a misspelt key cannot silently mean the default.
+EngineOptions::RopeScaling parse_rope_scaling(const std::string& text) {
+    const auto json = nlohmann::json::parse(text, nullptr, false);
+    if (!json.is_object()) { throw std::invalid_argument("--rope-scaling must be a JSON object"); }
+    const std::string type = json.value("rope_type", json.value("type", std::string()));
+    if (type != "yarn") {
+        throw std::invalid_argument("--rope-scaling: only rope_type \"yarn\" is supported, got \"" + type + "\"");
+    }
+    const auto number = [&](const char* key, double fallback) {
+        if (!json.contains(key)) { return fallback; }
+        if (!json.at(key).is_number()) {
+            throw std::invalid_argument(std::string("--rope-scaling: ") + key + " must be a number");
+        }
+        return json.at(key).get<double>();
+    };
+    EngineOptions::RopeScaling out;
+    if (!json.contains("factor")) { throw std::invalid_argument("--rope-scaling: factor is required"); }
+    out.factor = static_cast<float>(number("factor", 0.0));
+    const double original = number("original_max_position_embeddings", 0.0);
+    out.beta_fast        = static_cast<float>(number("beta_fast", 32.0));
+    out.beta_slow        = static_cast<float>(number("beta_slow", 1.0));
+    out.attention_factor = static_cast<float>(number("attention_factor", 0.0));
+    if (!std::isfinite(out.factor) || out.factor <= 1.0F || original < 0.0 ||
+        original > static_cast<double>(std::numeric_limits<std::int32_t>::max()) ||
+        original != std::floor(original) || !(out.beta_fast > 0.0F) || !(out.beta_slow > 0.0F) ||
+        out.attention_factor < 0.0F) {
+        throw std::invalid_argument("--rope-scaling: factor must exceed 1; original_max_position_embeddings, "
+                                    "beta_fast, beta_slow and attention_factor must be positive");
+    }
+    out.original_context = static_cast<std::uint32_t>(original);
+    if (json.contains("truncate") && json.at("truncate") != true) {
+        throw std::invalid_argument("--rope-scaling: only truncated correction dims (truncate=true) are served");
+    }
+    for (const auto& item : json.items()) {
+        static constexpr std::string_view kKnown[] = {
+            "rope_type", "type", "factor", "original_max_position_embeddings", "beta_fast",
+            "beta_slow", "attention_factor", "truncate", "rope_theta", "partial_rotary_factor",
+            "mrope_section", "mrope_interleaved"};
+        if (std::find(std::begin(kKnown), std::end(kKnown), item.key()) == std::end(kKnown)) {
+            throw std::invalid_argument("--rope-scaling: unsupported key \"" + item.key() + "\"");
+        }
+    }
+    return out;
 }
 
 float parse_float_in(const char* text, const char* label, float lo, float hi) {
@@ -135,7 +185,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> [--host H] [--port N] [--api-key KEY|--api-key-file PATH] "
-           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers "
+           "[--served-model-name ID] [--max-model-len N|auto] [--rope-scaling JSON] [--kv-capacity N|auto] [--gpu-layers "
            "N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank "
            "auto|w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens "
            "N] "
@@ -179,6 +229,10 @@ std::string serve_usage_text(const char* argv0) {
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
+           "       --rope-scaling takes Hugging Face's rope_scaling object, e.g.\n"
+           "         '{\"rope_type\":\"yarn\",\"factor\":4,\"original_max_position_embeddings\":262144}':\n"
+           "         YaRN over the Qwen3.5/3.6 MoE rotation, extending the context to\n"
+           "         original * factor\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -297,6 +351,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                : static_cast<std::uint32_t>(
                                      parse_nonnegative_int(text.c_str(), "max-model-len"));
             max_context_explicit = true;
+        } else if (arg == "--rope-scaling") {
+            options.rope_scaling = parse_rope_scaling(require_value("--rope-scaling"));
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;

@@ -12,6 +12,7 @@
 #include "api/ops/sampling.h"
 #include "api/ops/gqa_attention.h"
 #include "api/ops/qsa_indexer.h"
+#include "api/ops/rope.h"
 #include "api/ops/short_conv.h"
 #include <api/family/text_geometry.h>
 #include <api/family/decoder_state.h>
@@ -22,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -288,8 +290,35 @@ struct ModelConfig {
             kv_owner_mask       = geometry.kv_owner_mask;
             kv_sharing_declared = true;
         }
+        if (geometry.rope_yarn_factor > 0.0F) {
+            rope_yarn = ops::rope_yarn(geometry.rotary_dim, geometry.rope_theta,
+                                       geometry.rope_yarn_factor, geometry.rope_yarn_original,
+                                       geometry.rope_yarn_beta_fast, geometry.rope_yarn_beta_slow,
+                                       geometry.rope_yarn_attention_factor);
+        }
     }
+    /// YaRN's coefficients when the model is served with --rope-scaling; every text rotation of
+    /// the model (its layers' and its MTP head's) then takes ops::rope's YaRN form.
+    std::optional<ops::RopeYarn> rope_yarn;
 };
+
+/// ops::rope, or its YaRN form when the model is served with one.
+inline void rope_text(const ModelConfig& cfg, const Tensor& positions, int rotary_dim, float theta,
+                      Tensor& q, Tensor& k, cudaStream_t s) {
+    if (cfg.rope_yarn) {
+        ops::rope(positions, rotary_dim, theta, *cfg.rope_yarn, q, k, s);
+    } else {
+        ops::rope(positions, rotary_dim, theta, q, k, s);
+    }
+}
+inline void rope_text(const ModelConfig& cfg, const Tensor& positions, int rotary_dim, float theta,
+                      Tensor& x, cudaStream_t s) {
+    if (cfg.rope_yarn) {
+        ops::rope(positions, rotary_dim, theta, *cfg.rope_yarn, x, s);
+    } else {
+        ops::rope(positions, rotary_dim, theta, x, s);
+    }
+}
 
 using Hooks = ResidualHooks<Variant>;
 // False only for a target whose attention has no output gate (a dense GQA
