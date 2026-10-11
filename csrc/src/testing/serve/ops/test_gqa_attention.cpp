@@ -1958,7 +1958,7 @@ int verify_fp8_current_tokens_match_cached(int dim, int heads, int kv_heads) {
 }
 
 // 256- and 512-wide heads take the resident-query small-T kernel (query tile in shared memory,
-// 128 output dimensions a warp, P in registers, e4m3 codes loaded four chunks at a time). It must
+// 128 output dimensions a warp, P in registers, e4m3 codes loaded one key tile ahead). It must
 // write every output and cache bit the route it replaced writes: appended and cached, BF16 and
 // E4M3 caches, decode and verification widths (chunked past the lane step), masked lanes,
 // sliding windows, histories crossing tile, page and partition boundaries, and query groups from

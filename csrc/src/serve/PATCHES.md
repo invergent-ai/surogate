@@ -4987,3 +4987,50 @@ against `SUROGATE_SERVE_NVFP4_CUTLASS=rows`: Gemma 4 12B 172.8 against 131.2 tok
 users, 483.2 against 409.6 at 32, 4,659 against 3,994 tok/s on 2,048-token prompts; Gemma 3 12B
 480.0 against 409.6 at 32 users; Gemma 4 E4B 972.8 against 905.6 at 32 users. Greedy replies on the
 12B are identical to the old rule's (4 of 4, 64 tokens).
+
+## 135
+
+**Decode attention over an e4m3 cache loads each key tile one tile ahead (2026-10-11).** The
+resident-query small-T kernel (#132) loaded a cached e4m3 tile only when its turn came, four chunks
+at a time, and widened it before any arithmetic on it: nothing overlapped a tile's loads with the
+scoring and accumulation of the tile before. On a DGX Spark a decode call at head dim 256
+(Surogate3.7-35B-A3B: 16 query heads, 2 KV heads) read the cache at about 251 GB/s at the margin,
+but spent a fixed ~220 us a call besides. That was a long context's last wave of 2048-key
+partitions (1 MB of codes a CTA): a few CTAs streaming alone at a few GB/s each. Ten full-attention
+layers made it ~2 ms of every decode step.
+
+- **One tile ahead** (`gqa_small_t_load_fp8_tile`, `gqa_small_t_widen_fp8_tile`,
+  `ops/kernel/gqa_attention_decode_bf16.cuh`): each thread holds its share of the next tile's codes
+  in registers (16 pairs of 8 codes at two warps) while the current tile is scored, and widens them
+  into shared memory at the next tile's turn.
+- **Widest partitions first**: a CTA takes partition `active - 1 - blockIdx.y`, so the 2048-key
+  partitions start in the first wave and the 128- and 512-key ones fill the end. Each partition
+  still writes its own split's partials, so the reduction is unchanged.
+- **No QSA block list in the resident layout** (`GqaSmallTTcResidentSmem`). The resident kernel is
+  never sparse, and with the 1 KB list a four-token tile of two row warps (an MTP 3 verify of a
+  group of eight) took 50,432 bytes. Two of those plus the 1 KB a block reserves overran a GB10
+  SM's 100 KB, so verify ran one CTA an SM; it now runs two.
+- The widened values and every operation on them are unchanged: `sinfer_gqa_attention_test`'s
+  resident-against-legacy check passes bit for bit, and MTP draft acceptance in the engine is
+  identical before and after.
+- The causal attention bench takes contexts up to the op's 1,048,576 visible keys.
+
+Measured on a DGX Spark against 5110824. Kernel (`sinfer_causal_softmax_attention_bench`,
+`d256-h16-kv2`, e4m3, graph, cold cache):
+
+| B | W | 32K | 131K | 262K |
+|---|---|---|---|---|
+| 1 | 1 | 367 -> 306 us | 756 -> 658 us | 1289 -> 1161 us |
+| 1 | 4 | 323 -> 268 us | 837 -> 693 us | 1418 -> 1244 us |
+| 4 | 1 | 783 -> 673 us | 2497 -> 2329 us | 4816 -> 4538 us |
+| 4 | 4 | 902 -> 784 us | 2893 -> 2549 us | 5524 -> 4902 us |
+
+Most of it is the one-tile-ahead load and the layout; widest-first adds 1-5%. At 1,040,000 keys a
+batch-1 call takes 4.9 ms (217 GB/s).
+
+Engine: Surogate3.7-35B-A3B NVFP4 with FP8 KV, 1,024 tokens after a cached prompt, the same build
+with 5110824's kernel file for the "before" runs. No speculation: 46.1-47.3 -> 49.1-49.3 tok/s at
+123K prompt tokens, 42.7-43.5 -> 43.8-43.9 at 197K. MTP 3: 89.2-89.4 -> 93.9-94.2 and 79.2-79.4 ->
+84.1-84.2, acceptance 67.6% and 67.2% both times. Agent turns with real tool calls
+(`agentic_long_bench.py --tools`, 1 agent, 100K-200K): decode p50 96.2 -> 99.2 tok/s with MTP 3,
+46.7 -> 47.5 without; first token unchanged (1.11-1.12 s).

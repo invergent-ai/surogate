@@ -30,6 +30,46 @@ namespace sinfer::ops {
 // QSA sparse selection (design/INFERENCE.md, phase 4): `block_mask` holds one bit per block of
 // `SparseBlock` cells for every query column, and a key whose block bit is clear scores -inf.
 // `Sparse == false` compiles to exactly the dense kernel.
+// The resident e4m3 path's one-tile-ahead stage: chunk `tid + i * Threads` (8 codes of one key)
+// of a Bc-key tile wholly inside one cache page, loaded into registers and widened later. A
+// thread count that does not divide the tile (six warps) leaves its last chunks past the end:
+// they load and widen nothing.
+template <typename Geometry, int Bc, int Threads, int N, typename CacheT>
+__device__ __forceinline__ void gqa_small_t_load_fp8_tile(int2 (&k_raw)[N], int2 (&v_raw)[N],
+                                                          const CacheT* cache_k,
+                                                          const CacheT* cache_v, int physical_page,
+                                                          int kv_head, int k0, int tid) {
+    constexpr int D       = Geometry::HeadDim;
+    constexpr int kChunks = Bc * (D / 8);
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int chunk = tid + i * Threads;
+        if (kChunks % Threads != 0 && chunk >= kChunks) { continue; }
+        const int key_l = chunk / (D / 8);
+        const int d     = (chunk - key_l * (D / 8)) * 8;
+        const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head, d,
+                                                           (k0 + key_l) & kPagedKVPageMask);
+        k_raw[i] = load_vec<int2>(&cache_k[off]);
+        v_raw[i] = load_vec<int2>(&cache_v[off]);
+    }
+}
+
+template <int D, int Bc, int Threads, int N>
+__device__ __forceinline__ void gqa_small_t_widen_fp8_tile(__nv_bfloat16* k_s, __nv_bfloat16* v_s,
+                                                           const int2 (&k_raw)[N],
+                                                           const int2 (&v_raw)[N], int tid) {
+    constexpr int kChunks = Bc * (D / 8);
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int chunk = tid + i * Threads;
+        if (kChunks % Threads != 0 && chunk >= kChunks) { continue; }
+        const int key_l = chunk / (D / 8);
+        const int d     = (chunk - key_l * (D / 8)) * 8;
+        store_vec(&k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)], gqa_kv_dequant_fp8x8_raw(k_raw[i]));
+        store_vec(&v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)], gqa_kv_dequant_fp8x8_raw(v_raw[i]));
+    }
+}
+
 template <bool Sparse, int SparseBlock>
 __device__ __forceinline__ bool gqa_block_visible(const std::uint32_t* row_words, int key) {
     if constexpr (!Sparse) {
@@ -66,14 +106,16 @@ struct GqaSmallTTcSmem {
 /// registers. A 512-wide head held its query fragments (128 registers) and a 512-wide output
 /// accumulator (256) at once and spilled about 1.4 KB a thread on every key tile; reading the
 /// query fragments from shared memory per k-step leaves only the accumulator in registers.
+/// It has no QSA block list (the resident kernel is never sparse). With one, a 256-wide head's
+/// two-row-warp tile (a four-token MTP verify of a group of eight) took 50,432 bytes, and two
+/// of those plus the 1 KB a block reserves overran a GB10 SM's 100 KB: one CTA an SM.
 template <typename Geometry, int RowWarps>
 struct GqaSmallTTcResidentSmem {
     static constexpr int kBc        = GqaSmallTTcSmem<Geometry, 1>::kBc;
     static constexpr int kQBytes    = RowWarps * 16 * Geometry::HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
     static constexpr int kKvBytes   = 2 * kBc * Geometry::HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
     static constexpr int kPageBytes = GqaSmallTTcSmem<Geometry, 1>::kPageBytes;
-    static constexpr int kBlockBytes = GqaSmallTTcSmem<Geometry, 1>::kBlockBytes;
-    static constexpr int kBytes     = kQBytes + kKvBytes + kPageBytes + kBlockBytes;
+    static constexpr int kBytes     = kQBytes + kKvBytes + kPageBytes;
 };
 
 // LaneColumns: each lane's first column is lane_columns[lane] rather than column_begin + lane *
@@ -159,7 +201,8 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     static_assert(ResidentSmem::kBc == Bc);
     extern __shared__ __align__(16) unsigned char gqa_small_t_smem[];
     // Shared layout: [Q/K | V | P | page ids | block ids], Q overwritten by K once its
-    // fragments are in registers; resident: [Q | K | V | page ids | block ids], P in registers.
+    // fragments are in registers; resident: [Q | K | V | page ids], P in registers (no block
+    // ids: the resident kernel is dense, and block_ids_s is never read).
     constexpr int kQBytes     = QResident ? ResidentSmem::kQBytes : 0;
     constexpr int kPagesAt    = QResident ? ResidentSmem::kQBytes + ResidentSmem::kKvBytes
                                           : Smem::kQkvBytes + Smem::kPBytes;
@@ -175,7 +218,7 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const int row_parts   = QResident ? static_cast<int>(gridDim.x) / Geometry::KVHeads : 1;
     const int kv_head     = static_cast<int>(blockIdx.x) / row_parts;
     const int row_base    = (static_cast<int>(blockIdx.x) - kv_head * row_parts) * Br;
-    const int split       = static_cast<int>(blockIdx.y);
+    int split             = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
     const int tid         = static_cast<int>(threadIdx.x);
@@ -268,6 +311,11 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const int active_split_count =
         min(split_count, gqa_key_partition(last_pos) + 1 - first_partition);
     if (split >= active_split_count) { return; }
+    // Widest partitions first. CTAs start roughly in block order, and past 16K keys the last
+    // partitions are the 2048-key ones: started last, they ran on after everything else had
+    // finished, a few CTAs streaming alone. Taken first, the short ones fill the end instead.
+    // Each partition still writes its own split's partials, so the reduction is unchanged.
+    split = active_split_count - 1 - split;
 
     const int split_start = gqa_key_partition_begin(first_partition + split);
     const int split_end = min(gqa_key_partition_begin(first_partition + split + 1), key_hi);
@@ -422,57 +470,54 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
+    // Resident, e4m3 cache: a tile wholly inside the split and already in the cache (every tile
+    // but the last of a decode call) is loaded one tile ahead. Its codes travel into registers
+    // while the tile before it is scored and accumulated, and are widened into shared memory
+    // when its turn comes. Loaded only at its turn, in groups of four chunks, a tile kept the
+    // memory idle through every tile's arithmetic: a lone CTA streamed a few GB/s, and a long
+    // context's last wave (2048-key partitions, 1 MB of e4m3 K/V a CTA) added ~220 us to each
+    // decode call on a GB10. The widened values and every operation on them are unchanged.
+    constexpr bool kPrefetch  = QResident && kFp8Cache;
+    constexpr int kPerThread  = (Bc * (D / 8) + Threads - 1) / Threads;
+    static_assert(kPagedKVPageSize % Bc == 0, "a key tile must lie inside one cache page");
+    int2 next_k[kPrefetch ? kPerThread : 1];
+    int2 next_v[kPrefetch ? kPerThread : 1];
+    const auto cached_tile = [&](int tile_k0) {
+        bool cached = tile_k0 >= split_start && tile_k0 + Bc <= split_end;
+        if constexpr (CacheInput::writes_cache) { cached = cached && tile_k0 + Bc <= first_pos; }
+        return cached;
+    };
+    bool next_loaded = false;
+    if constexpr (kPrefetch) {
+        if (key_blocks > 0 && cached_tile(first_tile)) {
+            gqa_small_t_load_fp8_tile<Geometry, Bc, Threads>(next_k, next_v, cache_k, cache_v,
+                                                             physical_page, kv_head, first_tile, tid);
+            next_loaded = true;
+        }
+    }
+
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
         if (!Sparse && kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
-        // Resident, e4m3 cache: a tile wholly inside the split and already in the cache (every
-        // tile but the last of a decode call) loads kStageGroup chunks' codes before widening
-        // any. The loop below widens each chunk as it lands, one DRAM round trip after
-        // another, sixteen per thread and tile on a 512-wide head.
         bool staged = false;
-        if constexpr (QResident && kFp8Cache) {
-            // Six warps (a group-6 head's three row warps) do not divide a tile: the last
-            // group then holds chunks past its end, which load and store nothing.
-            constexpr int kChunks     = Bc * (D / 8);
-            constexpr bool kRagged    = kChunks % Threads != 0;
-            constexpr int kPerThread  = (kChunks + Threads - 1) / Threads;
-            constexpr int kStageGroup = kPerThread < 4 ? kPerThread : 4;
-            static_assert(kRagged || kPerThread % kStageGroup == 0);
-            bool cached_tile = k0 >= split_start && k0 + Bc <= split_end;
-            if constexpr (CacheInput::writes_cache) {
-                cached_tile = cached_tile && k0 + Bc <= first_pos;
-            }
-            if (cached_tile) {
-#pragma unroll 1
-                for (int group = 0; group < kPerThread; group += kStageGroup) {
-                    int2 k_raw[kStageGroup];
-                    int2 v_raw[kStageGroup];
-#pragma unroll
-                    for (int i = 0; i < kStageGroup; ++i) {
-                        const int chunk = tid + (group + i) * Threads;
-                        if (kRagged && chunk >= kChunks) { continue; }
-                        const int key_l = chunk / (D / 8);
-                        const int d     = (chunk - key_l * (D / 8)) * 8;
-                        const std::int64_t off = gqa_cache_index<Geometry>(
-                            physical_page, kv_head, d, (k0 + key_l) & kPagedKVPageMask);
-                        k_raw[i] = load_vec<int2>(&cache_k[off]);
-                        v_raw[i] = load_vec<int2>(&cache_v[off]);
-                    }
-#pragma unroll
-                    for (int i = 0; i < kStageGroup; ++i) {
-                        const int chunk = tid + (group + i) * Threads;
-                        if (kRagged && chunk >= kChunks) { continue; }
-                        const int key_l = chunk / (D / 8);
-                        const int d     = (chunk - key_l * (D / 8)) * 8;
-                        store_vec(&k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)],
-                                  gqa_kv_dequant_fp8x8_raw(k_raw[i]));
-                        store_vec(&v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)],
-                                  gqa_kv_dequant_fp8x8_raw(v_raw[i]));
-                    }
-                }
+        if constexpr (kPrefetch) {
+            if (next_loaded) {
+                gqa_small_t_widen_fp8_tile<D, Bc, Threads>(k_s, v_s, next_k, next_v, tid);
                 staged = true;
+            }
+            // A tile lies inside one page (Bc divides the page), so the next one opens a new
+            // page exactly when its first key does.
+            const int next_k0 = k0 + Bc;
+            next_loaded = kb + 1 < key_blocks && cached_tile(next_k0);
+            if (next_loaded) {
+                const int next_page =
+                    (next_k0 & kPagedKVPageMask) == 0
+                        ? physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page]
+                        : physical_page;
+                gqa_small_t_load_fp8_tile<Geometry, Bc, Threads>(next_k, next_v, cache_k, cache_v,
+                                                                 next_page, kv_head, next_k0, tid);
             }
         }
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).

@@ -59,6 +59,10 @@ constexpr Geometry kD128H32Kv8{"d128-h32-kv8", 32, 8, 128};
 // "all": int8 KV has no 512-wide kernel.
 constexpr Geometry kD512H16Kv2{"d512-h16-kv2", 16, 2, 512};
 
+// Contexts reach the op's visible-key limit, a million keys: a YaRN-extended Qwen3.5/3.6 serves
+// 1,048,576 (--rope-scaling). A context plus its W new keys must stay within it.
+constexpr auto kMaxContext = static_cast<std::int32_t>(ops::kGqaAttentionMaximumVisibleKeys);
+
 struct Options {
     Entry entry             = Entry::Both;
     GeometryChoice geometry = GeometryChoice::All;
@@ -191,10 +195,10 @@ Options parse_options(int argc, char** argv) {
             options.batches = parse_list(next("--batch requires a value"), 1, 32, "--batch");
         } else if (argument == "--context") {
             options.contexts =
-                parse_list(next("--context requires a value"), 0, 262144, "--context");
+                parse_list(next("--context requires a value"), 0, kMaxContext, "--context");
         } else if (argument == "--row-contexts") {
             options.row_contexts =
-                parse_list(next("--row-contexts requires a value"), 0, 262144, "--row-contexts");
+                parse_list(next("--row-contexts requires a value"), 0, kMaxContext, "--row-contexts");
         } else if (argument == "--valid-columns") {
             options.valid_columns =
                 parse_list(next("--valid-columns requires a value"), 0, 16, "--valid-columns");
