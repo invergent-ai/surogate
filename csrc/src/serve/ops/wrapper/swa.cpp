@@ -80,7 +80,7 @@ std::size_t swa_workspace_capacity_bytes(SwaContextExecutionEnvelope envelope,
                                          std::int32_t min_tokens, std::int32_t max_tokens,
                                          std::int32_t batch_size) {
     if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        batch_size > 8 || envelope.min_context > envelope.max_context ||
+        batch_size > kMaximumBatchColumns || envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("swa workspace: invalid envelope or token interval");

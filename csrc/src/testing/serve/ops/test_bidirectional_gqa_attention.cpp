@@ -457,12 +457,12 @@ int graph_mapping_replay_case() {
     return failures;
 }
 
-int batch_table_case() {
-    constexpr int tokens            = 2;
-    constexpr int batch             = 2;
+// B lanes in one launch against each lane alone: mixed context lengths, live widths and table
+// rows. DFlash rounds reach far past eight lanes.
+int batch_table_case(int batch, int tokens) {
     constexpr int logical_pages     = 2;
     constexpr int logical_capacity  = logical_pages * kPage;
-    constexpr int physical_pages    = 6;
+    const int physical_pages        = batch * logical_pages + 2;
     const std::size_t row_q_count   = static_cast<std::size_t>(kD) * kQHeads * tokens;
     const std::size_t row_kv_count  = static_cast<std::size_t>(kD) * kKVHeads * tokens;
     const std::size_t logical_count = static_cast<std::size_t>(kD) * logical_capacity * kKVHeads;
@@ -491,7 +491,11 @@ int batch_table_case() {
     round_to_bf16(physical_k);
     round_to_bf16(physical_v);
 
-    const std::vector<std::int32_t> block_tables{0, 2, 5, 3};
+    // Every table row maps its pages to distinct physical pages (11 is prime to their count).
+    std::vector<std::int32_t> block_tables(static_cast<std::size_t>(batch) * logical_pages);
+    for (std::size_t i = 0; i < block_tables.size(); ++i) {
+        block_tables[i] = static_cast<std::int32_t>((i * 11 + 5) % physical_pages);
+    }
     for (int row = 0; row < batch; ++row) {
         const std::vector<float> row_k(
             logical_k.begin() + static_cast<std::ptrdiff_t>(row * logical_count),
@@ -508,9 +512,14 @@ int batch_table_case() {
                                 physical_pages);
     }
 
-    const std::vector<std::int32_t> lengths{65, 1};
-    const std::vector<std::int32_t> valid{2, 1};
-    const std::vector<std::int32_t> table_rows{1, 0};
+    std::vector<std::int32_t> lengths(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> valid(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> table_rows(static_cast<std::size_t>(batch));
+    for (int b = 0; b < batch; ++b) {
+        lengths[static_cast<std::size_t>(b)]    = b == 0 ? 65 : (b * 37 + 1) % (logical_capacity + 1);
+        valid[static_cast<std::size_t>(b)]      = tokens - (b * 5) % tokens;
+        table_rows[static_cast<std::size_t>(b)] = (b * 7 + 1) % batch;
+    }
     DeviceBuffer d_q          = to_device(bf16_bits(q));
     DeviceBuffer d_query_k    = to_device(bf16_bits(query_k));
     DeviceBuffer d_query_v    = to_device(bf16_bits(query_v));
@@ -532,7 +541,7 @@ int batch_table_case() {
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, batch});
     auto context =
         make_context_view(d_context_k, d_context_v, d_tables, logical_pages, physical_pages, batch);
-    constexpr ops::GqaContextExecutionEnvelope envelope{0, 65};
+    constexpr ops::GqaContextExecutionEnvelope envelope{0, logical_capacity};
 
     std::vector<std::uint16_t> expected(row_q_count * batch);
     DeviceArena single_workspace(
@@ -562,10 +571,12 @@ int batch_table_case() {
                                      workspace, out_tensor, nullptr);
     cuda_synchronize();
 
-    int failures =
-        verify_exact("bidirectional_gqa_attention B=2 mixed lengths and table rows",
-                     from_device<std::uint16_t>(d_out.data(), row_q_count * batch), expected);
-    failures += d_out.verify_guards("bidirectional GQA B=2 output guards");
+    const std::string label = "bidirectional_gqa_attention B=" + std::to_string(batch) +
+                              " T=" + std::to_string(tokens);
+    int failures = verify_exact((label + " mixed lengths and table rows").c_str(),
+                                from_device<std::uint16_t>(d_out.data(), row_q_count * batch),
+                                expected);
+    failures += d_out.verify_guards((label + " output guards").c_str());
     return failures;
 }
 
@@ -608,7 +619,8 @@ int main() {
     failures += run_case<std::uint8_t>(16, 0, InputProfile::QueryVisibility);
     failures += run_case<std::uint8_t>(16, 257, InputProfile::Random, 65537, MappingPattern::Fragmented);
     failures += graph_mapping_replay_case();
-    failures += batch_table_case();
+    failures += batch_table_case(2, 2);
+    failures += batch_table_case(32, 8);
 
     if (failures != 0) {
         std::cerr << "bidirectional_gqa_attention failures=" << failures << '\n';

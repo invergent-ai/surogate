@@ -46,7 +46,7 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
         throw std::invalid_argument("prepare_masked_block: W must be 1..16");
     }
     if (batch_size < 1 || batch_size > kMaximumBatchColumns) {
-        throw std::invalid_argument("prepare_masked_block: B must be 1..8");
+        throw std::invalid_argument("prepare_masked_block: B is out of range");
     }
     if (mask_id < 0) {
         throw std::invalid_argument("prepare_masked_block: mask_id must be nonnegative");

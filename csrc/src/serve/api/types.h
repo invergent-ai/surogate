@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -93,12 +94,20 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
-// Draft attention supports eight rows per GPU round. Extra active requests use
-// subsequent rounds; the configured number of request lanes stays independent.
-[[nodiscard]] constexpr std::uint32_t decode_batch_capacity(
+// A GPU round's lanes. DFlash rounds used to stop at eight, leaving the rest of the active
+// requests for later rounds; on the Spark that held a 32-user Gemma 4 26B-A4B to 8 verifying
+// lanes a round, 18.4 tokens/s a user against vLLM's 34.0 with the same drafter (2026-10-11).
+// `SUROGATE_SERVE_DFLASH_MAX_LANES` restores a cap.
+[[nodiscard]] inline std::uint32_t decode_batch_capacity(
     std::uint32_t active_sequences, SpeculativeBackend backend) noexcept {
     const auto capacity = decode_batch_capacity(active_sequences);
-    return backend == SpeculativeBackend::DFlash && capacity > 8 ? 8 : capacity;
+    if (backend != SpeculativeBackend::DFlash) { return capacity; }
+    static const std::uint32_t cap = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DFLASH_MAX_LANES");
+        const long value = raw == nullptr ? 0 : std::strtol(raw, nullptr, 10);
+        return value > 0 ? static_cast<std::uint32_t>(value) : 0U;
+    }();
+    return cap > 0 && capacity > cap ? cap : capacity;
 }
 
 /// `SpeculativeOptions::max_lanes` meaning "verify at any width".

@@ -290,9 +290,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     return failures;
 }
 
-int run_batch_case() {
-    constexpr int tokens                 = 2;
-    constexpr int batch                  = 2;
+// B lanes in one launch against each lane alone. DFlash rounds reach far past eight lanes.
+int run_batch_case(int batch, int tokens) {
     const std::size_t row_q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
     const std::size_t row_kv_count       = static_cast<std::size_t>(kD) * kKVHeads * tokens;
     const std::size_t lane_context_count = static_cast<std::size_t>(kD) * kWindow * kKVHeads;
@@ -312,9 +311,20 @@ int run_batch_case() {
     round_to_bf16(context_k);
     round_to_bf16(context_v);
 
-    const std::vector<int> positions{4096, 4097, 65, 65};
-    const std::vector<std::int32_t> valid{2, 1};
-    const std::vector<std::int32_t> lanes{1, 0};
+    // Lanes alternate between a context near the window's size and a short one; columns past a
+    // lane's live width repeat its last position.
+    std::vector<int> positions(static_cast<std::size_t>(tokens) * batch);
+    std::vector<std::int32_t> valid(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> lanes(static_cast<std::size_t>(batch));
+    for (int b = 0; b < batch; ++b) {
+        const int live = b == 0 ? tokens : 1 + (b * 5) % tokens;
+        const int base = b % 2 == 0 ? 4096 - 3 * b : 65 + 13 * b;
+        for (int t = 0; t < tokens; ++t) {
+            positions[static_cast<std::size_t>(b) * tokens + t] = base + std::min(t, live - 1);
+        }
+        valid[static_cast<std::size_t>(b)] = live;
+        lanes[static_cast<std::size_t>(b)] = (b * 7 + 1) % batch;
+    }
 
     DeviceBuffer d_q         = to_device(bf16_bits(q));
     DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
@@ -361,10 +371,11 @@ int run_batch_case() {
              kScale, context, envelope, workspace, out_tensor, nullptr);
     cuda_synchronize();
 
-    int failures =
-        verify_exact("swa B=2 mixed lengths and lanes",
-                     from_device<std::uint16_t>(d_out.data(), row_q_count * batch), expected);
-    failures += d_out.verify_guards("swa B=2 output guards");
+    const std::string label = "swa B=" + std::to_string(batch) + " T=" + std::to_string(tokens);
+    int failures = verify_exact((label + " mixed lengths and lanes").c_str(),
+                                from_device<std::uint16_t>(d_out.data(), row_q_count * batch),
+                                expected);
+    failures += d_out.verify_guards((label + " output guards").c_str());
     return failures;
 }
 
@@ -401,14 +412,16 @@ int main() {
     failures += run_case<std::uint8_t>(16, 0);
     failures += run_case<std::uint8_t>(16, 4096, InputProfile::WindowBoundary);
     failures += run_case<std::uint8_t>(16, 8194);
-    failures += run_batch_case();
+    failures += run_batch_case(2, 2);
+    failures += run_batch_case(12, 8);
 
     kWindow = 2048;
     failures += run_case(1, 0);
     failures += run_case(16, 2048, InputProfile::WindowBoundary);
     failures += run_case(3, 4098);
     failures += run_case<std::uint8_t>(16, 4098);
-    failures += run_batch_case();
+    failures += run_batch_case(2, 2);
+    failures += run_batch_case(12, 8);
 
     // Causal inside the block, as z-lab's Gemma 4 drafters attend in their sliding layers.
     kCausal = true;
