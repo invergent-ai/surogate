@@ -36,7 +36,8 @@ def verify_artifact(artifact, base_dir, nvfp4_dir=None, *, device="cpu"):
             raise ValueError("artifact geometry does not match the source checkpoint")
         resources = {r.name: r.data for r in conversion.load_resources(root, inv.RESOURCE_SPECS)}
         expected = [s for s in plan.objects if isinstance(s, inv.TensorSpec) or s.name in resources]
-        if [obj.name for obj in artifact.objects] != [s.name for s in expected]:
+        # A DFlash drafter's dflash/* objects come from its own checkpoint, not this one.
+        if [obj.name for obj in artifact.objects if not obj.name.startswith("dflash/")] != [s.name for s in expected]:
             raise ValueError("artifact inventory does not match the source checkpoint")
         draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, root, geometry=g)
         derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_head.materialize_draft_head_token_ids(draft)}

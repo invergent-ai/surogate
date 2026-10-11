@@ -21,7 +21,7 @@ from surogate.serve.convert.common import conversion, qwen3_5 as checkpoint
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
 from surogate.serve.convert.common.quant_scope import observed_scope
 from surogate.serve.convert.common.recipe import (
-    Concat, TensorRecipe, expression_sources, preflight_source_reader,
+    Concat, TensorRecipe, expression_sources, materialize_recipe, preflight_source_reader,
 )
 from surogate.serve.convert.common.safetensors import ShardReader
 from .. import draft_head, inventory as inv, recipe as base_recipe
@@ -429,7 +429,10 @@ def _frontend(root, resources_from, stack):
 
 
 def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="cuda", resources_from=None,
-            mtp=True, vision=True, mtp_format=inv.BF16):
+            mtp=True, vision=True, mtp_format=inv.BF16, dflash_model_dir=None):
+    """``dflash_model_dir`` adds a DFlash drafter's dflash/* objects, which the drafter's own BF16
+    checkpoint supplies and which are stored as the groupwise conversion stores them."""
+    from surogate.serve.convert.common import dflash as dflash_checkpoint
     from surogate.serve.convert.common.quantize import pick_device
     from ..convert import _tools_root
     started = time.perf_counter()
@@ -452,7 +455,17 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
         if scope:
             print(scope, flush=True)
         plan = build(g, profile, sources, mtp_format=mtp_format)
-        object_plan = conversion.build_object_plan(plan.objects, {r.name: r.data for r in resources})
+        dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
+        dflash_geometry, dflash_specs, dflash_recipes, dflash_reader = None, (), {}, None
+        if dflash_model is not None:
+            dflash_geometry = dflash_checkpoint.geometry_from_config(
+                conversion.load_json(dflash_model / "config.json"), g)
+            dflash_specs, recipes = dflash_checkpoint.conversion_plan(dflash_geometry, g)
+            base_recipe.preflight_sources(dflash_model, recipes)
+            dflash_recipes = {r.object_name: r for r in recipes}
+            dflash_reader = stack.enter_context(ShardReader.for_directory(dflash_model))
+        objects = plan.objects + tuple(dflash_specs)
+        object_plan = conversion.build_object_plan(objects, {r.name: r.data for r in resources})
         draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, frontend_root, geometry=g)
         derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_head.materialize_draft_head_token_ids(draft)}
         resource_map = {r.name: r.data for r in resources}
@@ -464,9 +477,16 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
             output, ArtifactIdentity(inv.MODEL_ID, inv.weights_id_for(profile), architecture=inv.TARGET_KEY),
             object_plan.specs, geometry=checkpoint.geometry_block(g), layer_types=g.layer_types,
             vision_geometry=checkpoint.vision_geometry_block(g.declared.hf_config),
+            dflash_geometry=dflash_checkpoint.geometry_block(dflash_geometry) if dflash_geometry else None,
+            dflash_target_layers=dflash_geometry.target_feature_layers if dflash_geometry else None,
         ) as writer:
-            for spec in plan.objects:
-                if isinstance(spec, inv.ResourceSpec):
+            for spec in objects:
+                if spec.name in dflash_recipes:
+                    tensor = materialize_recipe(dflash_recipes[spec.name], dflash_reader)
+                    if spec.format == inv.BF16 and tensor.dtype == torch.float32:
+                        tensor = tensor.to(torch.bfloat16)
+                    payload = conversion.encode_tensor_payload(tensor, spec, resolved_device)
+                elif isinstance(spec, inv.ResourceSpec):
                     if spec.name not in resource_map:
                         continue
                     payload = resource_map[spec.name]
@@ -482,7 +502,8 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
             target_key=inv.TARGET_KEY, recipe_id="qwen3_5-checkpoint-quantized-v3", repo_root=_tools_root(),
             model_dir=primary, out_path=output,
             arguments={"model": str(root), "quantized_model": str(primary), "device": device,
-                       "mtp": mtp, "vision": vision, "mtp_format": mtp_format},
+                       "mtp": mtp, "vision": vision, "mtp_format": mtp_format,
+                       "dflash_model": str(dflash_model) if dflash_model else None},
             config_summary=checkpoint.geometry_block(g), source_preflight=plan.source_preflight,
             objects=object_plan.objects, elapsed_seconds=time.perf_counter() - started,
             final_bytes=output.stat().st_size, device=resolved_device, ranking_path=draft.ranking,
@@ -505,6 +526,7 @@ def main(argv=None, *, profile=None):
                         help="store an unquantized MTP block's matrices in this format "
                              "(default: w8 for nvfp4-all and nvfp4-uniform, bf16 otherwise)")
     parser.add_argument("--no-vision", action="store_true")
+    parser.add_argument("--dflash-model", type=Path, help="matching DFlash drafter checkpoint")
     args = parser.parse_args(argv)
     source = args.quantized_model or args.model
     profile = profile or profile_for_checkpoint(conversion.load_json(source / "config.json"))
@@ -512,4 +534,4 @@ def main(argv=None, *, profile=None):
                   else DEFAULT_MTP_FORMAT.get(profile, inv.BF16))
     return convert(args.model, args.out, profile=profile, quantized_model_dir=args.quantized_model,
                    device=args.device, mtp=not args.no_mtp, vision=not args.no_vision,
-                   mtp_format=mtp_format)
+                   mtp_format=mtp_format, dflash_model_dir=args.dflash_model)

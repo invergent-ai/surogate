@@ -172,10 +172,11 @@ def test_fp8_block_scales_widen_to_fp32(tmp_path, scale_dtype):
     assert torch.equal(stored, scales.float().reshape(-1))
 
 
-@pytest.mark.parametrize("mtp,vision,tied,mtp_format", [(True, True, False, inv.BF16), (False, False, True, inv.BF16),
-                                                     (True, False, False, inv.W8)])
+@pytest.mark.parametrize("mtp,vision,tied,mtp_format,drafter", [
+    (True, True, False, inv.BF16, False), (False, False, True, inv.BF16, False),
+    (True, False, False, inv.W8, False), (True, False, False, inv.W8, True)])
 def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monkeypatch, mtp, vision, tied,
-                                                                  mtp_format):
+                                                                  mtp_format, drafter):
     from safetensors.torch import save_file
     import numpy as np
     from surogate.serve.artifact.container import Artifact
@@ -204,8 +205,18 @@ def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monk
     ranking.parent.mkdir(parents=True)
     np.arange(g.vocab, dtype="<i8").tofile(ranking)
     monkeypatch.setattr(base_convert, "_tools_root", lambda: tmp_path)
+    drafter_dir, drafter_geometry = None, None
+    if drafter:
+        # The all-NVFP4 export takes a DFlash drafter as the groupwise conversion does.
+        from surogate.serve.convert.common import dflash
+        from tests.serve.test_qwen3_5_moe_checkpoint_config import _save, draft_config
+        drafter_config = draft_config(g, targets=(0, 2))
+        drafter_geometry = dflash.geometry_from_config(drafter_config, g)
+        drafter_dir = tmp_path / "drafter"
+        _save(drafter_dir, drafter_config, dflash.conversion_plan(drafter_geometry, g)[1])
     output = quantized.convert(tmp_path, tmp_path / "artifact.sinfer", profile=inv.NVFP4_ALL,
-                               device="cpu", mtp=mtp, vision=vision, mtp_format=mtp_format)
+                               device="cpu", mtp=mtp, vision=vision, mtp_format=mtp_format,
+                               dflash_model_dir=drafter_dir)
     report = json.loads((tmp_path / "artifact.sinfer.conversion.json").read_text())
     assert report["config_summary"]["mtp_layers"] == int(mtp)
     with Artifact.open(output) as artifact:
@@ -224,6 +235,12 @@ def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monk
         if vision:
             assert artifact.find("vision/layers/0/mlp/fc1").format == inv.BF16
         assert tuple(artifact.layer_types) == g.layer_types
+        assert any(obj.name.startswith("dflash/") for obj in artifact.objects) == drafter
+        if drafter:
+            from surogate.serve.convert.common import dflash
+            assert artifact.dflash_geometry == dflash.geometry_block(drafter_geometry)
+            assert artifact.dflash_target_layers == [0, 2]
+            assert artifact.find("dflash/layers/0/mlp/gate_up").format == inv.W8
         assert artifact.find("text/token_embedding").format == inv.FP8
         assert artifact.find("text/layers/2/mlp/down").format == inv.NVFP4
         assert artifact.find("text/layers/0/mlp/down").format == inv.BF16

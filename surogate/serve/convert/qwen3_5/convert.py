@@ -648,10 +648,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 vision_storage=args.vision_storage, dflash_model_dir=args.dflash_model,
                 profile=profile)
         return
-    if args.dflash_model is not None:
-        raise ValueError("--dflash-model currently requires the groupwise-int or bf16 conversion profile")
     writer = _export_writer(profile)
     options = {}
+    if args.dflash_model is not None:
+        options["dflash_model_dir"] = args.dflash_model
     if args.mtp_format is not None:
         if profile not in (inventory.NVFP4_ALL, inventory.NVFP4_UNIFORM):
             raise ValueError("--mtp-format applies to the nvfp4-all and nvfp4-uniform exports")

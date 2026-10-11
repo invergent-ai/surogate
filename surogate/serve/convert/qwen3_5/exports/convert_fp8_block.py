@@ -5,9 +5,10 @@ from pathlib import Path
 from . import quantized
 
 
-def convert(model_dir, out_path, *, device="cuda", mtp=True, vision=True):
+def convert(model_dir, out_path, *, device="cuda", mtp=True, vision=True, dflash_model_dir=None):
     return quantized.convert(model_dir, out_path,
-                             profile=profile_for_checkpoint(_load_config(Path(model_dir))), device=device, mtp=mtp, vision=vision)
+                             profile=profile_for_checkpoint(_load_config(Path(model_dir))), device=device, mtp=mtp, vision=vision,
+                             dflash_model_dir=dflash_model_dir)
 
 
 def main(argv=None):
