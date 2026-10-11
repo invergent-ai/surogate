@@ -70,15 +70,22 @@ static_assert(!kGqaPrefillFp8Raw<512>);
 // the e4m3 tensor cores at twice the bf16 rate; only V is widened. The arena holds the e4m3 Q
 // tile and its row scales, one raw block each of K and V codes, and the widened V tile: under
 // half of an SM's 100 KiB at head dim 256, so two CTAs share an SM. The 16-byte swizzle needs
-// eight chunks a row.
+// eight chunks a row. A 512-wide head's two output-split CTAs each hold the whole e4m3 Q and K
+// but only their own half of V, codes and widened: 52 KiB, one CTA to an SM.
+// MEASURED (DGX Spark, FP8 cache, 2,048 new tokens over 131,072 cached ones, d512-h16-kv2): the
+// bf16 product with V and K widened straight from global memory took 499 ms (17.8 TFLOP/s) where
+// a 256-wide head took 41 ms (109 TFLOP/s); at Gemma 4's five to ten global layers that was most
+// of a long-context agent turn.
 template <int HeadDim>
-inline constexpr bool kGqaPrefillFp8QkRegistered = HeadDim == 128 || HeadDim == 256;
+inline constexpr bool kGqaPrefillFp8QkRegistered = HeadDim == 128 || HeadDim == 256 || HeadDim == 512;
 template <int HeadDim>
 inline constexpr int kGqaPrefillFp8QkSmemBytes =
     kGqaPrefillBr * HeadDim + kGqaPrefillBr * static_cast<int>(sizeof(float)) +
-    2 * kGqaPrefillBcFor<HeadDim> * HeadDim +
-    kGqaPrefillBcFor<HeadDim> * HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+    kGqaPrefillBcFor<HeadDim> * HeadDim +
+    kGqaPrefillBcFor<HeadDim> * (HeadDim / kGqaPrefillOutSplit<HeadDim>) *
+        (1 + static_cast<int>(sizeof(__nv_bfloat16)));
 static_assert(kGqaPrefillFp8QkSmemBytes<256> == 49408);
+static_assert(kGqaPrefillFp8QkSmemBytes<512> == 53504);
 
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;

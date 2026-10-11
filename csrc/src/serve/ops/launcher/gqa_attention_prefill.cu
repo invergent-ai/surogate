@@ -248,7 +248,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
             }
         };
         if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
-            if (::sinfer::ops::prompt_attention_fp8_query()) {
+            if (::sinfer::ops::prompt_attention_fp8_query() &&
+                (Geometry::HeadDim <= 256 || ::sinfer::ops::prompt_attention_fp8_query_wide())) {
                 launch_sparse.template operator()<true>();
             } else {
                 launch_sparse.template operator()<false>();
@@ -546,6 +547,14 @@ void set_prompt_attention_fp8_query(bool enabled) noexcept {
 
 bool prompt_attention_fp8_query() noexcept {
     return prompt_attention_fp8_query_switch().load(std::memory_order_relaxed);
+}
+
+bool prompt_attention_fp8_query_wide() noexcept {
+    static const bool enabled = [] {
+        const char* text = std::getenv("SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK_WIDE");
+        return text == nullptr || std::string_view(text) != "0";
+    }();
+    return enabled;
 }
 
 } // namespace sinfer::ops
