@@ -260,15 +260,17 @@ std::uint32_t context_prefill(std::uint32_t requested, std::uint32_t context) {
 }
 
 
-/// An MTP run that chose no proposal head drafts with the artifact's shortlist head when it
-/// carries one. Each draft then reads that head (131,072 rows at 4 bits on Qwen3.5-family
-/// NVFP4 exports) instead of the whole output head (248,320 rows at 8 bits), three times a
-/// round at three drafts. The target verifies every draft either way, so greedy output is
-/// unchanged and sampled output keeps the target's distribution: on a DGX Spark it took
-/// ~11 ms from every round of Qwen3.8-27B at the same acceptance, +10% decode at 1 and 8
-/// users and +6% at 16. --full-head-draft opts out.
+/// An MTP or DFlash run that chose no proposal head drafts with the artifact's shortlist head
+/// when it carries one. Each draft then reads that head (131,072 rows at 4 bits on
+/// Qwen3.5-family NVFP4 exports) instead of the whole output head (248,320 rows at 8 bits).
+/// The target verifies every draft either way, so greedy output is unchanged and sampled
+/// output keeps the target's distribution. On a DGX Spark it took ~11 ms from every MTP round
+/// of Qwen3.8-27B at the same acceptance, +10% decode at 1 and 8 users and +6% at 16; a DFlash
+/// round scores all its drafts at once, 56 rows at eight lanes, which the full head served in
+/// two passes of 5.5 ms. --full-head-draft opts out.
 EngineOptions with_resolved_proposal_head(const EngineOptions& options, const artifact::Reader& reader) {
-    if (options.speculative.backend != SpeculativeBackend::Mtp ||
+    if ((options.speculative.backend != SpeculativeBackend::Mtp &&
+         options.speculative.backend != SpeculativeBackend::DFlash) ||
         options.speculative.proposal_head_explicit ||
         options.speculative.proposal_head != ProposalHead::Full ||
         reader.find("text/draft_head") == nullptr) {
@@ -276,8 +278,9 @@ EngineOptions with_resolved_proposal_head(const EngineOptions& options, const ar
     }
     EngineOptions resolved              = options;
     resolved.speculative.proposal_head = ProposalHead::Optimized;
-    std::fprintf(stderr, "engine: MTP drafts with the artifact's shortlist head "
-                         "(--full-head-draft drafts with the full output head)\n");
+    std::fprintf(stderr, "engine: %s drafts with the artifact's shortlist head "
+                         "(--full-head-draft drafts with the full output head)\n",
+                 options.speculative.backend == SpeculativeBackend::DFlash ? "DFlash" : "MTP");
     return resolved;
 }
 
