@@ -294,8 +294,10 @@ void populate_score_texts(Engine& engine, GenerationOutcome& outcome) {
 
 class ServiceOutputSink final : public sinfer::OutputSink {
 public:
-    ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools, bool muse_tools)
-        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), muse_tools_(muse_tools), tool_filter_(json_tools,muse_tools) {}
+    ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools, bool muse_tools,
+                      bool gemma_tools)
+        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), muse_tools_(muse_tools),
+          tool_filter_(json_tools, muse_tools, gemma_tools) {}
 
     void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
@@ -469,6 +471,12 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         }
     }
     prompt_capabilities_ = engine_->prompt_capabilities();
+    // Gemma 4 writes its calls in its own notation, which the default Qwen parser never finds: an
+    // agent got every call back as prose. A vocabulary that spells Gemma 4's markers takes the
+    // gemma4 parser unless --tool-call-parser named one.
+    if (prompt_capabilities_.gemma4_tool_calls && !options_.tool_call_format_explicit) {
+        options_.tool_call_format = ToolCallFormat::Gemma4;
+    }
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
@@ -760,7 +768,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (sink != nullptr) {
         output_sink = std::make_unique<ServiceOutputSink>(*engine_, *sink, prepared.tool_capable,
             options_.tool_call_format == ToolCallFormat::Llama3Json,
-            options_.tool_call_format == ToolCallFormat::MuseAtem);
+            options_.tool_call_format == ToolCallFormat::MuseAtem,
+            options_.tool_call_format == ToolCallFormat::Gemma4);
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;

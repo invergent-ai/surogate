@@ -26,12 +26,17 @@ ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text,
 ParsedToolCallOutput parse_muse_tool_call_output(const std::string& text,
     std::size_t max_tool_name_length, const std::vector<ToolDefinition>& tools = {});
 
+// Gemma 4: `<|tool_call>call:NAME{key:<|"|>text<|"|>,count:2}<tool_call|>`, its chat template's own
+// argument notation, read back into JSON arguments.
+ParsedToolCallOutput parse_gemma4_tool_call_output(const std::string& text,
+    std::size_t max_tool_name_length, const std::vector<ToolDefinition>& tools = {});
+
 // Incrementally publishes text outside a possible tool-call suffix. At terminal time, a valid tool response discards the
 // buffered tool region; malformed/non-tool output flushes it verbatim.
 class ToolCallStreamFilter {
 public:
-    explicit ToolCallStreamFilter(bool json_tools = false, bool muse_tools = false)
-        : json_tools_(json_tools), muse_tools_(muse_tools) {}
+    explicit ToolCallStreamFilter(bool json_tools = false, bool muse_tools = false, bool gemma_tools = false)
+        : json_tools_(json_tools), muse_tools_(muse_tools), gemma_tools_(gemma_tools) {}
     std::string feed(std::string_view text);
     std::string finish(bool is_tool_call_response);
 
@@ -40,6 +45,7 @@ public:
 private:
     bool json_tools_ = false;
     bool muse_tools_ = false;
+    bool gemma_tools_ = false;
     std::string pending_;
     std::string tool_region_;
     std::size_t emitted_bytes_ = 0;

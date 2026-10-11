@@ -145,6 +145,14 @@ std::string make_tool_constraint(const GenerationRequest& request, ToolCallForma
     if (format == ToolCallFormat::None) {
         throw ApiException({.message="constrained tool calls require an enabled tool parser", .param="tools"});
     }
+    // Gemma 4's argument notation has no grammar here: a strict tool is called unconstrained, as
+    // under tool_choice 'auto', and a call the request demands is refused rather than left to the
+    // model. Agent SDKs mark their tools strict by default, so refusing those would refuse them all.
+    if (format == ToolCallFormat::Gemma4) {
+        if (!required) { return {}; }
+        throw ApiException({.message="tool_choice 'required' or a named function is not supported with the gemma4 tool-call parser",
+                            .param="tool_choice", .code="tool_choice_not_supported"});
+    }
     if (request.ignore_eos || request.min_tokens != 0 || !request.stop_strings.empty()) {
         throw ApiException({.message="constrained tools require ignore_eos=false, min_tokens=0, and no custom stops", .param="tools"});
     }

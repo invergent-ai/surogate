@@ -233,6 +233,158 @@ bool parse_spark_call(std::string_view block, std::size_t max_name_length, ToolC
     return true;
 }
 
+// Gemma 4 writes a call in its chat template's own notation rather than JSON (format_argument):
+// a string between `<|"|>` marks, true or false, an object in braces with bare keys, a list in
+// brackets, and anything else as Jinja prints it -- numbers, and Python's None for null.
+constexpr std::string_view kGemmaQuote = "<|\"|>";
+constexpr unsigned kGemmaMaxDepth      = 32;
+
+bool parse_gemma_value(std::string_view text, std::size_t& pos, Json& out, std::string* bare,
+                       unsigned depth);
+
+// A key is bare (`city:`) as the template writes call arguments, or quoted (`<|"|>city<|"|>:`) as
+// it writes them inside a tool's declaration; the model may copy either.
+bool parse_gemma_key(std::string_view text, std::size_t& pos, std::string& key) {
+    skip_ws(text, pos);
+    if (starts_with_at(text, pos, kGemmaQuote)) {
+        const std::size_t begin = pos + kGemmaQuote.size();
+        const std::size_t end   = text.find(kGemmaQuote, begin);
+        if (end == std::string_view::npos) { return false; }
+        key = std::string(text.substr(begin, end - begin));
+        pos = end + kGemmaQuote.size();
+    } else {
+        const std::size_t begin = pos;
+        while (pos < text.size() && std::string_view(":,{}[]<").find(text[pos]) == std::string_view::npos) {
+            ++pos;
+        }
+        key = trim_ascii(text.substr(begin, pos - begin));
+    }
+    skip_ws(text, pos);
+    if (key.empty() || pos >= text.size() || text[pos] != ':') { return false; }
+    ++pos;
+    return true;
+}
+
+// `{key:value,...}` from its opening brace. At the top level (`schema` set) a bare value is typed
+// by the tool's schema as the XML parsers type theirs: `code:123` stays text for a string field.
+bool parse_gemma_object(std::string_view text, std::size_t& pos, Json& out, unsigned depth,
+                        const Json* schema = nullptr) {
+    if (depth > kGemmaMaxDepth || pos >= text.size() || text[pos] != '{') { return false; }
+    ++pos;
+    out = Json::object();
+    skip_ws(text, pos);
+    if (pos < text.size() && text[pos] == '}') {
+        ++pos;
+        return true;
+    }
+    for (;;) {
+        std::string key;
+        if (!parse_gemma_key(text, pos, key) || out.contains(key)) { return false; }
+        Json value;
+        std::string bare;
+        if (!parse_gemma_value(text, pos, value, &bare, depth + 1)) { return false; }
+        out[key] = schema != nullptr && !bare.empty() ? argument_value(bare, *schema, key)
+                                                     : std::move(value);
+        skip_ws(text, pos);
+        if (pos >= text.size()) { return false; }
+        if (text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (text[pos] != '}') { return false; }
+        ++pos;
+        return true;
+    }
+}
+
+bool parse_gemma_value(std::string_view text, std::size_t& pos, Json& out, std::string* bare,
+                       unsigned depth) {
+    skip_ws(text, pos);
+    if (pos >= text.size() || depth > kGemmaMaxDepth) { return false; }
+    if (starts_with_at(text, pos, kGemmaQuote)) {
+        const std::size_t begin = pos + kGemmaQuote.size();
+        const std::size_t end   = text.find(kGemmaQuote, begin);
+        if (end == std::string_view::npos) { return false; }
+        out = std::string(text.substr(begin, end - begin));
+        pos = end + kGemmaQuote.size();
+        return true;
+    }
+    if (text[pos] == '{') { return parse_gemma_object(text, pos, out, depth); }
+    if (text[pos] == '[') {
+        ++pos;
+        out = Json::array();
+        skip_ws(text, pos);
+        if (pos < text.size() && text[pos] == ']') {
+            ++pos;
+            return true;
+        }
+        for (;;) {
+            Json item;
+            if (!parse_gemma_value(text, pos, item, nullptr, depth + 1)) { return false; }
+            out.push_back(std::move(item));
+            skip_ws(text, pos);
+            if (pos >= text.size()) { return false; }
+            if (text[pos] == ',') {
+                ++pos;
+                continue;
+            }
+            if (text[pos] != ']') { return false; }
+            ++pos;
+            return true;
+        }
+    }
+    if (text[pos] == '"') {
+        // A JSON string the model wrote instead of the template's quote marks: read it whole, so a
+        // comma or brace inside it does not end the value.
+        std::size_t end = pos + 1;
+        while (end < text.size() && text[end] != '"') { end += text[end] == '\\' ? 2 : 1; }
+        if (end >= text.size()) { return false; }
+        out = Json::parse(text.substr(pos, end + 1 - pos), nullptr, false);
+        if (!out.is_string()) { return false; }
+        pos = end + 1;
+        return true;
+    }
+    // A bare scalar runs to the next delimiter.
+    const std::size_t begin = pos;
+    while (pos < text.size() && std::string_view(",}]<").find(text[pos]) == std::string_view::npos) {
+        ++pos;
+    }
+    const std::string raw = trim_ascii(text.substr(begin, pos - begin));
+    if (raw.empty()) { return false; }
+    if (raw == "None" || raw == "True" || raw == "False") {
+        out = raw == "None" ? Json(nullptr) : Json(raw == "True");
+    } else {
+        out = Json::parse(raw, nullptr, false);
+        if (out.is_discarded() || out.is_structured()) { out = raw; }
+    }
+    if (bare != nullptr) { *bare = raw == "None" ? "null" : raw; }
+    return true;
+}
+
+// The body between `<|tool_call>` and `<tool_call|>`: `call:NAME{arguments}`.
+bool parse_gemma_call(std::string_view block, std::size_t max_name_length, ToolCall& out,
+                      const std::vector<ToolDefinition>& tools) {
+    constexpr std::string_view kCall = "call:";
+    std::size_t pos = 0;
+    skip_ws(block, pos);
+    if (!starts_with_at(block, pos, kCall)) { return false; }
+    pos += kCall.size();
+    const std::size_t brace = block.find('{', pos);
+    if (brace == std::string_view::npos) { return false; }
+    const std::string name = trim_ascii(block.substr(pos, brace - pos));
+    if (!valid_function_name(name, max_name_length)) { return false; }
+    pos               = brace;
+    const Json schema = function_schema(name, tools);
+    Json args;
+    if (!parse_gemma_object(block, pos, args, 0, &schema)) { return false; }
+    skip_ws(block, pos);
+    if (pos != block.size()) { return false; }
+    out.id             = new_tool_call_id();
+    out.name           = name;
+    out.arguments_json = args.dump();
+    return true;
+}
+
 ParsedToolCallOutput fallback(const std::string& text) {
     ParsedToolCallOutput out;
     out.content = text;
@@ -363,6 +515,46 @@ ParsedToolCallOutput parse_muse_tool_call_output(const std::string& text,
     return out;
 }
 
+ParsedToolCallOutput parse_gemma4_tool_call_output(const std::string& text, std::size_t max_name,
+                                                   const std::vector<ToolDefinition>& tools) {
+    constexpr std::string_view kToolOpen  = "<|tool_call>";
+    constexpr std::string_view kToolClose = "<tool_call|>";
+    const std::size_t first = text.find(kToolOpen);
+    if (first == std::string::npos) { return fallback(text); }
+
+    ParsedToolCallOutput out;
+    out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+    std::size_t pos = first;
+    while (pos < text.size()) {
+        const auto next = text.find(kToolOpen, pos);
+        if (next == std::string::npos) {
+            out.content += rtrim_ascii(std::string_view(text).substr(pos));
+            break;
+        }
+        if (next != pos) {
+            const auto between = std::string_view(text).substr(pos, next - pos);
+            if (!trim_ascii(between).empty()) { out.content += between; }
+        }
+        const std::size_t inner_begin = next + kToolOpen.size();
+        // A string argument may itself spell the closing marker: take the first close after which
+        // the call parses.
+        ToolCall call;
+        std::size_t close = text.find(kToolClose, inner_begin);
+        while (close != std::string::npos &&
+               !parse_gemma_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                 max_name, call, tools)) {
+            close = text.find(kToolClose, close + kToolClose.size());
+        }
+        if (close == std::string::npos) { return fallback(text); }
+        out.tool_calls.push_back(std::move(call));
+        pos = close + kToolClose.size();
+    }
+
+    if (out.tool_calls.empty()) { return fallback(text); }
+    out.is_tool_call_response = true;
+    return out;
+}
+
 std::string ToolCallStreamFilter::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     if (text.empty()) { return {}; }
@@ -371,7 +563,9 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
         return {};
     }
 
-    const std::string_view kToolOpen = muse_tools_ ? "<atem:function_calls>" : "<tool_call>";
+    const std::string_view kToolOpen = muse_tools_    ? "<atem:function_calls>"
+                                       : gemma_tools_ ? "<|tool_call>"
+                                                      : "<tool_call>";
     pending_.append(text);
     std::size_t marker = pending_.find(kToolOpen);
     if (json_tools_) {

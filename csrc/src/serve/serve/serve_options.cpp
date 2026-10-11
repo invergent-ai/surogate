@@ -208,8 +208,9 @@ std::string serve_usage_text(const char* argv0) {
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --reasoning-parser selects how a reasoning span is recognised (default qwen3);\n"
-           "         --tool-call-parser how a tool call is (default qwen3_xml). Both accept the\n"
-           "         vLLM names, and an unknown one is refused with the supported list.\n"
+           "         --tool-call-parser how a tool call is (default qwen3_xml, gemma4 for a\n"
+           "         Gemma 4 vocabulary). Both accept the vLLM names, and an unknown one is\n"
+           "         refused with the supported list.\n"
            "       --enable-auto-tool-choice permits tool_choice 'auto'; it needs a tool-call "
            "parser.\n"
            "       --chat-template replaces the artifact's Jinja template with one read from "
@@ -495,6 +496,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.reasoning_format = parse_reasoning_format(require_value("--reasoning-parser"));
         } else if (arg == "--tool-call-parser") {
             options.tool_call_format = parse_tool_call_format(require_value("--tool-call-parser"));
+            options.tool_call_format_explicit = true;
         } else if (arg == "--enable-auto-tool-choice") {
             options.enable_auto_tool_choice = true;
         } else if (arg == "--chat-template") {

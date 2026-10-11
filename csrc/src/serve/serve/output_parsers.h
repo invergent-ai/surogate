@@ -35,6 +35,7 @@ enum class ToolCallFormat {
     MuseAtem,    ///< Muse-Glimmer ATEM function and parameter tags
     Spark25,     ///< `<tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>`
     Llama3Json,  ///< bare `{"name":..,"parameters":{..}}`, optionally after `<|python_tag|>`
+    Gemma4,      ///< `<|tool_call>call:name{key:<|"|>text<|"|>,count:2}<tool_call|>`
 };
 
 /// Parses `--reasoning-parser`. Throws std::invalid_argument naming the

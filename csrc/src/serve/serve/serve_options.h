@@ -134,6 +134,9 @@ struct ServeOptions {
     // tool calls in the Qwen block.
     ReasoningFormat reasoning_format = ReasoningFormat::ThinkTags;
     ToolCallFormat tool_call_format  = ToolCallFormat::QwenXml;
+    /// --tool-call-parser was given. Without it a checkpoint whose vocabulary spells Gemma 4's
+    /// tool-call markers is served with the gemma4 parser (GenerationService).
+    bool tool_call_format_explicit = false;
     /// --enable-auto-tool-choice: vLLM gates automatic tool selection behind this
     /// flag and requires a tool-call parser with it. Off, a request asking for
     /// `tool_choice: "auto"` with tools attached is refused rather than answered

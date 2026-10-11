@@ -601,6 +601,10 @@ struct PromptCapabilities {
     /// answer directly unless asked to think. The hand-written templates think.
     bool thinking_by_default = true;
     ReasoningEffortCapabilities reasoning_effort;
+    /// The vocabulary spells Gemma 4's tool-call markers (`<|tool_call>`, `<tool_call|>` and the
+    /// `<|"|>` string quote) as special tokens: the server reads calls with the gemma4 parser
+    /// unless told otherwise.
+    bool gemma4_tool_calls = false;
 };
 
 struct PromptOptions {

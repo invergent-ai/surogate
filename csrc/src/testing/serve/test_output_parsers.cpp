@@ -80,6 +80,12 @@ void test_tool_call_names() {
     check(parse_tool_call_format("hermes") == ToolCallFormat::QwenXml, "hermes shares the Qwen block");
     check(parse_tool_call_format("llama3_json") == ToolCallFormat::Llama3Json, "llama3_json");
     check(parse_tool_call_format("none") == ToolCallFormat::None, "none disables");
+    check(parse_tool_call_format("gemma4") == ToolCallFormat::Gemma4, "gemma4");
+    const auto gemma = parse_tool_calls(ToolCallFormat::Gemma4,
+                                        "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>", 64);
+    check(gemma.is_tool_call_response && gemma.tool_calls.size() == 1 &&
+              Json::parse(gemma.tool_calls[0].arguments_json) == Json{{"city", "Paris"}},
+          "gemma4 dispatches to the Gemma 4 notation");
 
     bool threw = false;
     try {

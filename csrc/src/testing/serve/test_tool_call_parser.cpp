@@ -225,8 +225,64 @@ int test_literal_schema_types() {
     return failures;
 }
 
+// Gemma 4's own notation, as its chat template writes a call back (format_argument): strings in
+// `<|"|>` marks, bare keys, nested objects and lists, Jinja's spelling of other scalars.
+int test_gemma4_calls() {
+    using namespace sinfer::serve;
+    int failures = 0;
+    ToolDefinition tool;
+    tool.name = "files.write";
+    tool.parameters_json = R"({"type":"object","properties":{"path":{"type":"string"},"code":{"type":"string"},"count":{"type":"integer"}}})";
+    const auto parsed = parse_gemma4_tool_call_output(
+        "Writing it.\n<|tool_call>call:files.write{code:007,count:3,flags:[true,None,1.5],"
+        "meta:{note:<|\"|>a, {b}: c<tool_call|><|\"|>,tags:[<|\"|>x<|\"|>]},"
+        "path:<|\"|>/tmp/a b.txt<|\"|>}<tool_call|><|tool_call>call:clock{}<tool_call|>",
+        64, {tool});
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2, "two Gemma 4 calls");
+    failures += check(parsed.content == "Writing it.", "Gemma 4 content before the call kept");
+    if (parsed.tool_calls.size() != 2) { return failures + 1; }
+    failures += check(parsed.tool_calls[0].name == "files.write" && parsed.tool_calls[1].name == "clock",
+                      "Gemma 4 call names");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args["path"] == "/tmp/a b.txt", "quoted string argument");
+    failures += check(args["code"] == "007" && args["count"] == 3, "bare scalars typed by the schema");
+    failures += check(args["flags"] == Json::array({true, nullptr, 1.5}), "list of booleans, None and a number");
+    failures += check(args["meta"] == Json{{"note", "a, {b}: c<tool_call|>"}, {"tags", Json::array({"x"})}},
+                      "nested object whose string spells delimiters and the closing marker");
+    failures += check(Json::parse(parsed.tool_calls[1].arguments_json) == Json::object(), "empty arguments");
+
+    const auto quoted_keys = parse_gemma4_tool_call_output(
+        "<|tool_call>call:files.write{<|\"|>path<|\"|>:<|\"|>a<|\"|>,count:\"2, not 3\"}<tool_call|>", 64);
+    failures += check(quoted_keys.tool_calls.size() == 1 &&
+                          Json::parse(quoted_keys.tool_calls[0].arguments_json) ==
+                              Json{{"path", "a"}, {"count", "2, not 3"}},
+                      "quoted keys and a JSON string the model wrote instead");
+
+    for (const std::string malformed :
+         {"<|tool_call>call:f{a:<|\"|>open}<tool_call|>", "<|tool_call>call:f{a:1",
+          "<|tool_call>call:f{a:1,a:2}<tool_call|>", "<|tool_call>call:bad name{}<tool_call|>",
+          "<|tool_call>f{a:1}<tool_call|>"}) {
+        const auto fallback = parse_gemma4_tool_call_output(malformed, 64);
+        failures += check(!fallback.is_tool_call_response && fallback.content == malformed,
+                          "malformed Gemma 4 call stays visible: " + malformed);
+    }
+    failures += check(parse_gemma4_tool_call_output("call:f{a:1}", 64).tool_calls.empty(),
+                      "a call without its markers is prose");
+
+    const std::string streamed = "Sure.  \n<|tool_call>call:clock{}<tool_call|>";
+    for (std::size_t split = 0; split <= streamed.size(); ++split) {
+        ToolCallStreamFilter filter(false, false, true);
+        std::string visible = filter.feed(std::string_view(streamed).substr(0, split));
+        visible += filter.feed(std::string_view(streamed).substr(split));
+        visible += filter.finish(true);
+        failures += check(visible == "Sure.", "Gemma 4 call leaked through split streaming");
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_gemma4_calls();
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();

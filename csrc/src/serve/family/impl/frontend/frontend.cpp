@@ -374,6 +374,20 @@ std::vector<int> special_marker_tokens(const fi::Tokenizer& tokenizer,
     return out;
 }
 
+/// Whether the vocabulary spells Gemma 4's tool-call markers, each as one special token: a call is
+/// `<|tool_call>call:NAME{key:<|"|>text<|"|>}<tool_call|>`, which the default Qwen parser never
+/// finds. (A request with tools decodes special tokens, so the markers reach the parser.)
+bool spells_gemma4_tool_calls(const fi::Tokenizer& tokenizer) {
+    for (const std::string marker : {"<|tool_call>", "<tool_call|>", "<|\"|>"}) {
+        std::vector<int> ids;
+        try {
+            ids = tokenizer.encode(marker, {.parse_added_tokens = true, .add_bos = false});
+        } catch (const std::invalid_argument&) { return false; }
+        if (ids.size() != 1 || !tokenizer.is_special_token(ids.front())) { return false; }
+    }
+    return true;
+}
+
 /// The reasoning markers a checkpoint states, or the `<think>` pair when it states none.
 ///
 /// `response_template.fields.thinking` is how the published Gemma 4 files spell it, beside
@@ -1091,6 +1105,7 @@ public:
                                                },
                                                reasoning)
                 : chat_template.capabilities();
+        capabilities.gemma4_tool_calls = spells_gemma4_tool_calls(*tokenizer);
         if (tokenizer->renders_chat_template()) {
             // Probe a completed turn: a one-user generation prompt cannot reveal
             // whether the template drops historical assistant reasoning.
