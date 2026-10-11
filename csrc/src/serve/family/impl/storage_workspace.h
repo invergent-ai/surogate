@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api/family/text_geometry.h"
+#include "core/tensor.h"
 
 #include <algorithm>
 #include <initializer_list>
