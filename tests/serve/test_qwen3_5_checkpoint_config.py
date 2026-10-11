@@ -219,6 +219,9 @@ def test_quantized_conversion_writes_complete_checkpoint_metadata(tmp_path, monk
                                dflash_model_dir=drafter_dir)
     report = json.loads((tmp_path / "artifact.sinfer.conversion.json").read_text())
     assert report["config_summary"]["mtp_layers"] == int(mtp)
+    assert ("dflash" in report) == drafter
+    if drafter:
+        assert report["dflash"]["target_layers"] == [0, 2]
     with Artifact.open(output) as artifact:
         assert artifact.geometry["hidden"] == 128
         assert artifact.geometry["token_domain"] == 500

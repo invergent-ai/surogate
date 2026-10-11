@@ -509,6 +509,10 @@ def convert(model_dir, out_path, *, profile, quantized_model_dir=None, device="c
             final_bytes=output.stat().st_size, device=resolved_device, ranking_path=draft.ranking,
         )
         report["source"]["matrix_formats"] = plan.formats
+        if dflash_geometry is not None:
+            report["dflash"] = {"model": str(dflash_model),
+                                "geometry": dflash_checkpoint.geometry_block(dflash_geometry),
+                                "target_layers": list(dflash_geometry.target_feature_layers)}
         Path(str(output) + ".conversion.json").write_text(json.dumps(report, indent=2) + "\n")
         return output
 
