@@ -51,6 +51,16 @@ bool dflash_causal_local() {
     return value;
 }
 
+/// A DFlash 2 drafter's candidate selector. `SUROGATE_SERVE_DFLASH_SELECTOR=0` takes each
+/// position's argmax instead, so the selector's share of acceptance can be measured.
+bool dflash_selector_enabled() {
+    static const bool value = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DFLASH_SELECTOR");
+        return !(raw != nullptr && raw[0] == '0' && raw[1] == '\0');
+    }();
+    return value;
+}
+
 void require_dflash_state(const PrefillContext& state) {
     if (state.dflash == nullptr || !state.execution.model.dflash.has_value()) {
         throw std::logic_error("DFlash schedule requires DFlash weights and state");
@@ -356,7 +366,7 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         ops::rmsnorm(packed, state.execution.model.dflash->final_norm, config.rms_epsilon, false,
                      proposal_hidden, state.execution.device.stream);
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
-        if (config.has_selector()) {
+        if (config.has_selector() && dflash_selector_enabled()) {
             // DFlash 2: each position's best `selector_top_k` draft logits, walked left to right
             // with a pair score through the selector's codebooks.
             const auto proposals = static_cast<std::int32_t>(k) * batch_size;
