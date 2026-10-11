@@ -183,6 +183,7 @@ bool nvfp4_cublaslt_route(std::int32_t tokens) {
 namespace {
 
 constexpr int kCutlassPolicy = -2;
+constexpr int kRowsPolicy    = -3; // the rows >= 4096 rule on every device, GB10 included
 
 int cutlass_tile_setting() {
     static const int tile = [] {
@@ -196,17 +197,55 @@ int cutlass_tile_setting() {
         if (value == "128sk") { return 3; }
         if (value == "256swap") { return 4; }
         if (value == "128swap") { return 5; }
+        if (value == "rows") { return kRowsPolicy; }
         return kCutlassPolicy;
     }();
     return tile;
 }
 
+bool device_is_gb10() noexcept {
+    static const bool gb10 = [] {
+        int device = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return major == 12 && minor == 1;
+    }();
+    return gb10;
+}
+
+// GB10 (sm_121). MEASURED (sinfer_nvfp4_route_bench, DGX Spark, the 13 NVFP4 projection shapes of
+// Gemma 4 E2B, E4B, 12B and 31B, widths 2 to 2048): below 64 tokens the 256 tile the other
+// policy takes averaged 1.9x cuBLASLt's time on rows >= 4096 (up to 2.3x, and 3.5x the best
+// tile's), and the generic shapes run this route from two tokens up (one token takes the
+// GEMV). cuBLASLt leads the small problems but collapses on the large ones (1.75 to 3.7 times
+// the best tile on the MLP projections from about 4e10 multiply-adds). Summed over all 208
+// cells this rule came within 3.5% of the best tile per cell, the other policy 28%:
+//   - n*k*T >= 1e11: the 256 tile, never more than 1.15x the best tile there;
+//   - n*k*T >= 3e10: the 128 swap tile, ahead of cuBLASLt's cliff (the earliest seen, at
+//     4.4e10 on 43008 x 5376);
+//   - below 64 tokens, mid-size weights (n >= 3840, n*k < 5.5e7): the 256 swap tile, up to
+//     1.7x faster than cuBLASLt on the query/key/value and output projections, at worst 6%
+//     slower;
+//   - otherwise cuBLASLt.
+int gb10_tile(std::int64_t rows, std::int64_t k, std::int64_t tokens) noexcept {
+    const std::int64_t weight = rows * k;
+    const std::int64_t work   = weight * tokens;
+    if (work >= 100'000'000'000LL) { return 1; }
+    if (work >= 30'000'000'000LL) { return 5; }
+    if (tokens < 64 && rows >= 3840 && weight < 55'000'000LL) { return 4; }
+    return -1;
+}
+
 } // namespace
 
-int nvfp4_cutlass_tile_for(std::int32_t rows, std::int32_t tokens) {
+int nvfp4_cutlass_tile_for(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
     const int setting = cutlass_tile_setting();
-    if (setting != kCutlassPolicy) { return setting; }
-    (void)tokens;
+    if (setting != kCutlassPolicy && setting != kRowsPolicy) { return setting; }
+    if (setting == kCutlassPolicy && device_is_gb10()) { return gb10_tile(rows, k, tokens); }
     return rows >= 4096 ? 1 : -1;
 }
 
@@ -229,7 +268,7 @@ void nvfp4_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int3
     // The CUTLASS route first, where the policy takes it: the same operands and layouts, a
     // packed [rows, tokens] output (so only when the leading dimension is the slice's rows),
     // beta 1 as the residual variant. A launch it cannot configure falls through to cuBLASLt.
-    if (const int tile = nvfp4_cutlass_tile_for(rows, tokens); tile >= 0 && out_ld == rows &&
+    if (const int tile = nvfp4_cutlass_tile_for(rows, weight.k, tokens); tile >= 0 && out_ld == rows &&
         (beta == 0.0F || beta == 1.0F)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         if (nvfp4_cutlass_gemm(activation_codes, activation_tiled_scales, weight_codes,
