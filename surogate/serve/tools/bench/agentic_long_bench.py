@@ -42,6 +42,15 @@ parser.add_argument("--tool-min", type=int, default=1_000)
 parser.add_argument("--tool-max", type=int, default=4_000)
 parser.add_argument("--stagger", type=float, default=5.0)
 parser.add_argument("--jsonl", required=True)
+parser.add_argument(
+    "--tools",
+    action="store_true",
+    help="Real tool calls: the history is read_file calls and their results, the model gets "
+    "read_file/search/run_shell, writes its own calls and stops on its own (no ignore_eos), and "
+    "every call it makes is answered with a corpus piece. Requests are not streamed, so a turn "
+    "records its latency, not its first token: take TTFT, decode speed and draft acceptance from "
+    "the server's request log.",
+)
 args = parser.parse_args()
 
 tok = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -61,6 +70,72 @@ def piece(rng, tokens):
 
 def tool_result(rng):
     return "<tool_result>\n" + piece(rng, rng.randint(args.tool_min, args.tool_max)) + "\n</tool_result>"
+
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read a file of the repository.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "search", "description": "Search the repository for a string; returns matching lines with context.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "run_shell", "description": "Run a shell command in the repository and return its output.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+]
+
+
+def opening_tools(rng, agent):
+    """--tools: the task, then read_file calls and their results up to about --start tokens."""
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Task {agent}-{rng.randrange(10**9)}: find where the behaviour described "
+         "below is implemented and explain it, reading and searching files as needed.\n\n" + piece(rng, 300)},
+    ]
+    approx = args.system + 300
+    step = 0
+    while approx < args.start:
+        call_id = f"call_{agent}_{step}"
+        messages += [
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": f"src/module_{agent}_{step}.py"})}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": piece(rng, rng.randint(args.tool_min, args.tool_max))},
+        ]
+        approx += 40 + (args.tool_min + args.tool_max) // 2 + 12
+        step += 1
+    return messages
+
+
+async def request_tools(session, messages):
+    body = {
+        "model": "bench",
+        "messages": messages,
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "max_tokens": args.out,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    started = time.perf_counter()
+    async with session.post(args.url + "/v1/chat/completions", json=body) as response:
+        if response.status != 200:
+            raise RuntimeError(f"HTTP {response.status}: {(await response.text())[:300]}")
+        reply = await response.json()
+    ended = time.perf_counter()
+    choice = reply["choices"][0]
+    usage = reply["usage"]
+    details = usage.get("prompt_tokens_details") or {}
+    return {
+        "prompt": usage["prompt_tokens"],
+        "cached": details.get("cached_tokens"),
+        "completion": usage["completion_tokens"],
+        "latency_s": round(ended - started, 4),
+        "finish": choice.get("finish_reason"),
+        "tool_calls": len(choice["message"].get("tool_calls") or []),
+        "message": choice["message"],
+    }
 
 
 def opening(rng, agent):
@@ -141,6 +216,8 @@ def pct(values, q):
 
 
 def summarize(agents, records, errors, wall):
+    if args.tools:
+        return summarize_tools(agents, records, errors, wall)
     cold = [r for r in records if r["turn"] == 0]
     warm = [r for r in records if r["turn"] > 0]
     known = [r for r in warm if r["cached"] is not None]
@@ -187,31 +264,70 @@ def summarize(agents, records, errors, wall):
     return out
 
 
+def summarize_tools(agents, records, errors, wall):
+    warm = [r for r in records if r["turn"] > 0]
+    known = [r for r in warm if r["cached"] is not None]
+    return {
+        "label": args.label,
+        "mode": "tools",
+        "agents": agents,
+        "wall_s": round(wall, 1),
+        "turns": len(records),
+        "errors": len(errors),
+        "first_error": errors[:1],
+        "turns_per_min": round(len(records) * 60 / wall, 1),
+        "gen_tok_s": round(sum(r["completion"] for r in records) / wall, 1),
+        "completion_mean": round(statistics.mean(r["completion"] for r in records), 1) if records else None,
+        "turns_with_tool_calls": sum(1 for r in records if r["tool_calls"]),
+        "finish": {k: sum(1 for r in records if r["finish"] == k) for k in sorted({r["finish"] for r in records})},
+        "cold_latency_max_s": max((r["latency_s"] for r in records if r["turn"] == 0), default=None),
+        "warm_latency_p50_s": pct([r["latency_s"] for r in warm], 0.5),
+        "warm_latency_p90_s": pct([r["latency_s"] for r in warm], 0.9),
+        "warm_new_tokens_p50": pct([r["prompt"] - r["cached"] for r in known], 0.5),
+        "warm_cache_misses": sum(1 for r in known if r["prompt"] - r["cached"] > 2 * args.out + 3 * args.tool_max + 512),
+    }
+
+
 async def run(agents, sink):
     records, errors = [], []
 
     async def agent(session, i):
         rng = random.Random(1000 * agents + i)
         await asyncio.sleep(i * args.stagger)
-        messages = opening(rng, i)
+        messages = (opening_tools if args.tools else opening)(rng, i)
         turn = 0
         while True:
             try:
-                r = await request(session, messages)
+                r = await (request_tools if args.tools else request)(session, messages)
             except Exception as error:  # noqa: BLE001
                 errors.append(f"agent {i} turn {turn}: {error}")
                 return
-            text = r.pop("text")
+            message = r.pop("message", None)
+            text = r.pop("text", None)
             r.update(label=args.label, agents=agents, agent=i, turn=turn, at_s=round(time.perf_counter() - begin, 2))
             records.append(r)
             sink.write(json.dumps(r) + "\n")
             sink.flush()
-            if r["prompt"] + args.out + args.tool_max >= args.max:
+            if r["prompt"] + args.out + args.tool_max * max(1, r.get("tool_calls", 1)) >= args.max:
                 return
-            messages = messages + [
-                {"role": "assistant", "content": text},
-                {"role": "user", "content": tool_result(rng)},
-            ]
+            if args.tools and message.get("tool_calls"):
+                messages = messages + [
+                    {"role": "assistant", "content": message.get("content") or "", "tool_calls": message["tool_calls"]}
+                ] + [
+                    {"role": "tool", "tool_call_id": call["id"],
+                     "content": piece(rng, rng.randint(args.tool_min, args.tool_max))}
+                    for call in message["tool_calls"]
+                ]
+            elif args.tools:
+                messages = messages + [
+                    {"role": "assistant", "content": message.get("content") or ""},
+                    {"role": "user", "content": "Keep going: check the next relevant file before you conclude."},
+                ]
+            else:
+                messages = messages + [
+                    {"role": "assistant", "content": text},
+                    {"role": "user", "content": tool_result(rng)},
+                ]
             turn += 1
 
     timeout = aiohttp.ClientTimeout(total=7200)
