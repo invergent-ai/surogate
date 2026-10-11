@@ -598,13 +598,15 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 }
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
+    // A conversation's turns share their opening, so both encodes reuse the ids of earlier
+    // prompts and encode only the bytes after the shared part (Tokenizer::encode_reusing_prefix).
     EncodedChat encoded;
-    encoded.input_ids = tokenizer.encode(rendered.text);
+    encoded.input_ids = tokenizer.encode_reusing_prefix(rendered.text);
     if (!rendered.rewrite_checkpoint) { return encoded; }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
     }
-    const std::vector<int> prefix = tokenizer.encode(
+    const std::vector<int> prefix = tokenizer.encode_reusing_prefix(
         std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
     const auto shared = static_cast<std::size_t>(std::mismatch(
         prefix.begin(), prefix.end(), encoded.input_ids.begin(), encoded.input_ids.end()).first - prefix.begin());

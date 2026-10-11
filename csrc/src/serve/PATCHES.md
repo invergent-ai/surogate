@@ -5034,3 +5034,32 @@ with 5110824's kernel file for the "before" runs. No speculation: 46.1-47.3 -> 4
 84.1-84.2, acceptance 67.6% and 67.2% both times. Agent turns with real tool calls
 (`agentic_long_bench.py --tools`, 1 agent, 100K-200K): decode p50 96.2 -> 99.2 tok/s with MTP 3,
 46.7 -> 47.5 without; first token unchanged (1.11-1.12 s).
+
+## 136
+
+**A prompt reuses the token ids of a recent prompt it opens with (2026-10-11).** An agent sends its
+whole conversation every turn, and the server rendered and tokenized all of it each time: on a
+DGX Spark a Surogate3.7-35B-A3B turn at ~147K prompt tokens, of which ~2,200 new, spent 0.26 s
+before its prefill began (18% of the turn with MTP 3), almost all of it in the BPE encode.
+
+- **`Tokenizer::encode_reusing_prefix`** (`family/impl/frontend/tokenizer.cpp`, used by
+  `encode_rendered_chat` for the rendered chat and its rewrite-checkpoint prefix): the tokenizer
+  keeps the ids of its 32 most recent prompts of 16 KB or more (256 MB of text at most) with the
+  byte offset and id index of each added token. A new prompt takes the ids of the one sharing the
+  most opening bytes, up to the last added token that starts at least the longest added token's
+  length inside the shared bytes, and encodes the rest. A prompt holding nearly all of the one it
+  reused (the same conversation's previous turn) replaces it.
+- The ids are exactly `encode()`'s: an ordinary span between added tokens is encoded on its own,
+  and the added-token scan reads no further ahead than the longest added token, so up to that
+  token both encodes make the same decisions on the same bytes. SentencePiece checkpoints (encoded
+  by the project tokenizer) and shorter texts take `encode()`.
+- `SUROGATE_SERVE_PROMPT_TOKEN_REUSE=0` encodes every prompt whole; `verify` also encodes it whole
+  and fails the request if the ids differ. `sinfer_added_token_matching_test` checks reuse against
+  `encode()` on growing, cut and branching prompts over overlapping added tokens, six
+  conversations at once.
+
+Measured on a DGX Spark (`agentic_long_bench.py --tools`, MTP 3, 100K-200K, same build otherwise):
+at 1 agent prepare p50 0.262 -> 0.026 s, first token p50 1.117 -> 0.874 s, turn p50 1.421 -> 1.186 s,
+35.7 against 31.3 turns a minute, draft acceptance identical (81.5%); at 4 agents prepare 0.305 ->
+0.025 s, first token p50 2.00 -> 1.79 s, turn p50 4.82 -> 4.34 s. A session run with `verify`
+(42 turns of real tool calls) found no difference.

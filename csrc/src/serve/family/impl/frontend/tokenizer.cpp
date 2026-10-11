@@ -14,6 +14,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <memory>
+#include <cstdlib>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -747,6 +750,22 @@ bool describes_sentencepiece(const Json& root) {
 
 } // namespace
 
+struct Tokenizer::PrefixCache {
+    struct Entry {
+        std::string text;
+        std::vector<int> ids;                    // without the automatic BOS
+        std::vector<std::uint32_t> added_bytes;  // where each added token starts in `text`
+        std::vector<std::uint32_t> added_ids;    // that token's index in `ids`
+    };
+    // Shorter prompts encode quickly; an agent's turn re-sends far more than this.
+    static constexpr std::size_t kMinimumBytes = 16 * 1024;
+    // A turn is kept in place of the turn it extends, so this is about one entry an agent.
+    static constexpr std::size_t kEntries    = 32;
+    static constexpr std::size_t kTextBudget = std::size_t{256} << 20;
+    std::mutex mutex;
+    std::vector<std::shared_ptr<const Entry>> entries; // most recent first
+};
+
 Tokenizer::~Tokenizer()                            = default;
 namespace {
 
@@ -870,6 +889,10 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         }
         added_token_trie_[node].token_index = index;
     }
+    for (const AddedToken& token : added_tokens_) {
+        longest_added_token_ = std::max(longest_added_token_, token.content.size());
+    }
+    prefix_cache_ = std::make_shared<PrefixCache>();
     if (valid_token_ids_.size() < id_to_token_.size()) {
         valid_token_ids_.resize(id_to_token_.size());
     }
@@ -971,6 +994,16 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     }
 
     std::vector<int> ids;
+    append_ids_with_added_tokens(text, ids, nullptr, nullptr, 0);
+    return with_bos(std::move(ids));
+}
+
+// encode()'s scan with added tokens parsed, appending to `ids`. With `added_bytes` it also records
+// where each added token starts (`byte_base` plus its offset in `text`) and its index in `ids`.
+void Tokenizer::append_ids_with_added_tokens(std::string_view text, std::vector<int>& ids,
+                                             std::vector<std::uint32_t>* added_bytes,
+                                             std::vector<std::uint32_t>* added_ids,
+                                             std::size_t byte_base) const {
     std::size_t ordinary_begin = 0;
     std::size_t pos            = 0;
     while (pos < text.size()) {
@@ -999,6 +1032,10 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
                            bpe_merge_ranks_, vocab_token_to_id_);
         }
 
+        if (added_bytes != nullptr) {
+            added_bytes->push_back(static_cast<std::uint32_t>(byte_base + pos));
+            added_ids->push_back(static_cast<std::uint32_t>(ids.size()));
+        }
         ids.push_back(match_token->id);
         pos += match_token->content.size();
         ordinary_begin = pos;
@@ -1009,7 +1046,87 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
                        bpe_merge_ranks_,
                        vocab_token_to_id_);
     }
-    return with_bos(std::move(ids));
+}
+
+std::vector<int> Tokenizer::encode_reusing_prefix(std::string_view text) const {
+    // SUROGATE_SERVE_PROMPT_TOKEN_REUSE=0 encodes every prompt whole; "verify" also does, and
+    // throws if the reused ids differ.
+    static const int mode = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_PROMPT_TOKEN_REUSE");
+        const std::string_view setting = value == nullptr ? "" : value;
+        return setting == "0" ? 0 : setting == "verify" ? 2 : 1;
+    }();
+    if (mode == 0 || delegate_encodes_ || !prefix_cache_ || longest_added_token_ == 0 ||
+        text.size() < PrefixCache::kMinimumBytes ||
+        text.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return encode(text);
+    }
+    std::vector<std::shared_ptr<const PrefixCache::Entry>> entries;
+    {
+        const std::lock_guard<std::mutex> lock(prefix_cache_->mutex);
+        entries = prefix_cache_->entries;
+    }
+    // The longest reusable prefix: the last added token starting at or before `safe`, where
+    // `safe` leaves the scan's whole lookahead inside the shared bytes.
+    std::shared_ptr<const PrefixCache::Entry> source;
+    std::size_t reuse_bytes = 0;
+    std::size_t reuse_ids   = 0;
+    std::size_t source_shared = 0;
+    for (const auto& entry : entries) {
+        const std::size_t limit = std::min(text.size(), entry->text.size());
+        const std::size_t shared = static_cast<std::size_t>(
+            std::mismatch(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(limit),
+                          entry->text.begin()).first - text.begin());
+        if (shared < longest_added_token_) { continue; }
+        const std::size_t safe = shared - longest_added_token_;
+        const auto after = std::upper_bound(entry->added_bytes.begin(), entry->added_bytes.end(), safe);
+        if (after == entry->added_bytes.begin()) { continue; }
+        const auto k = static_cast<std::size_t>(after - entry->added_bytes.begin()) - 1;
+        if (entry->added_bytes[k] > reuse_bytes) {
+            reuse_bytes   = entry->added_bytes[k];
+            reuse_ids     = entry->added_ids[k];
+            source        = entry;
+            source_shared = shared;
+        }
+    }
+    auto fresh = std::make_shared<PrefixCache::Entry>();
+    fresh->text.assign(text);
+    if (source) {
+        const auto kept = std::lower_bound(source->added_bytes.begin(), source->added_bytes.end(),
+                                           static_cast<std::uint32_t>(reuse_bytes)) -
+                          source->added_bytes.begin();
+        fresh->ids.assign(source->ids.begin(), source->ids.begin() + static_cast<std::ptrdiff_t>(reuse_ids));
+        fresh->added_bytes.assign(source->added_bytes.begin(), source->added_bytes.begin() + kept);
+        fresh->added_ids.assign(source->added_ids.begin(), source->added_ids.begin() + kept);
+    }
+    append_ids_with_added_tokens(text.substr(reuse_bytes), fresh->ids, &fresh->added_bytes,
+                                 &fresh->added_ids, reuse_bytes);
+    std::vector<int> ids = fresh->ids;
+    if (automatic_bos_id_ >= 0 && (ids.empty() || ids.front() != automatic_bos_id_)) {
+        ids.insert(ids.begin(), automatic_bos_id_);
+    }
+    if (mode == 2 && ids != encode(text)) {
+        throw std::logic_error("prompt token reuse differs from a whole encode");
+    }
+    {
+        const std::lock_guard<std::mutex> lock(prefix_cache_->mutex);
+        auto& list = prefix_cache_->entries;
+        // A prompt holding nearly all of the one it reused (the same conversation's previous
+        // turn) takes its place; one that shares only an opening keeps both.
+        if (source && source_shared + 4096 >= source->text.size()) {
+            list.erase(std::remove(list.begin(), list.end(), source), list.end());
+        }
+        list.insert(list.begin(), std::move(fresh));
+        std::size_t bytes = 0;
+        std::size_t keep  = 0;
+        while (keep < list.size() && keep < PrefixCache::kEntries &&
+               bytes + list[keep]->text.size() <= PrefixCache::kTextBudget) {
+            bytes += list[keep]->text.size();
+            ++keep;
+        }
+        list.resize(std::max<std::size_t>(keep, 1));
+    }
+    return ids;
 }
 
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {

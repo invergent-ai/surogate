@@ -3,6 +3,7 @@
 #include "family/impl/frontend/chat_template.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -67,6 +68,14 @@ public:
     Tokenizer& operator=(Tokenizer&&) noexcept;
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
+    /// encode() of a whole rendered prompt, reusing the ids of a recent one that opens with the
+    /// same bytes. Everything before the last added token that starts at least the longest added
+    /// token's length inside the shared bytes is taken from that prompt; only the rest is encoded.
+    /// An ordinary span between added tokens encodes on its own, and the added-token scan reads no
+    /// further ahead than its longest token, so the ids are exactly encode()'s. An agent re-sends
+    /// its whole conversation every turn; this encodes what the turn appended. A SentencePiece
+    /// checkpoint (encoded by the project tokenizer) and short texts take encode().
+    std::vector<int> encode_reusing_prefix(std::string_view text) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
     std::string decode_token_bytes(int id, bool skip_special_tokens = false) const;
 
@@ -130,6 +139,14 @@ private:
     /// The delegate always renders when present; it encodes only for SentencePiece,
     /// so a BPE checkpoint keeps the encoder above and gains nothing but the renderer.
     bool delegate_encodes_ = false;
+    // encode_reusing_prefix(): recent prompts' ids and where their added tokens start.
+    struct PrefixCache;
+    std::size_t longest_added_token_ = 0;
+    std::shared_ptr<PrefixCache> prefix_cache_;
+    void append_ids_with_added_tokens(std::string_view text, std::vector<int>& ids,
+                                      std::vector<std::uint32_t>* added_bytes,
+                                      std::vector<std::uint32_t>* added_ids,
+                                      std::size_t byte_base) const;
 };
 
 } // namespace sinfer::family::frontend_internal

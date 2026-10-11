@@ -69,5 +69,59 @@ int main() {
     try { (void)tokenizer::Tokenizer::from_sources({.tokenizer_json = fixture.dump()}); }
     catch (const std::runtime_error&) { rejected = true; }
     assert(rejected);
-    std::cout << "Added-token matching and concurrent image tokenization passed\n";
+    // encode_reusing_prefix() must return encode()'s ids exactly: agent-like prompts that drop a
+    // short tail and grow every turn, prompts sharing only an opening, and several conversations
+    // at once. The added tokens here overlap each other and ordinary text, the hard case for
+    // reusing ids up to an added-token boundary.
+    {
+        // Ordinary pieces use the vocabulary's letters only (this tokenizer has no byte
+        // fallback); added tokens meet across piece boundaries ("ab" + "a" is "aba").
+        const std::vector<std::string> pieces = {"a", "b", "c", "z", "x", "<", "é", "<image>",
+                                                 "<image>tail", "<image>tailmore", "ab", "aba",
+                                                 "<unused42>", "bc"};
+        // Prompts are joined pieces and are cut on piece boundaries, so every text stays
+        // encodable (a cut inside "<image>tailmore" would leave letters outside the vocabulary).
+        const auto conversation_run = [&](unsigned seed, int turns) {
+            const auto next = [&seed] {
+                seed = seed * 1664525U + 1013904223U;
+                return seed >> 8;
+            };
+            std::vector<std::string> parts;
+            std::size_t bytes = 0;
+            const auto grow = [&](std::size_t more) {
+                for (const std::size_t target = bytes + more; bytes < target;) {
+                    parts.push_back(pieces[next() % pieces.size()]);
+                    bytes += parts.back().size();
+                }
+            };
+            const auto join = [&](std::size_t count) {
+                std::string text;
+                for (std::size_t i = 0; i < count; ++i) { text += parts[i]; }
+                return text;
+            };
+            grow(20000);
+            for (int turn = 0; turn < turns; ++turn) {
+                const std::string conversation = join(parts.size());
+                assert(byte_tokenizer.encode_reusing_prefix(conversation) ==
+                       byte_tokenizer.encode(conversation));
+                for (unsigned cut = next() % 6; cut != 0 && !parts.empty(); --cut) {
+                    bytes -= parts.back().size();
+                    parts.pop_back();
+                }
+                grow(64 + next() % 2048);
+                if (turn % 7 == 3) {
+                    std::string other = join(parts.size() * 3 / 4);
+                    for (int i = 0; i < 400; ++i) { other += pieces[next() % pieces.size()]; }
+                    assert(byte_tokenizer.encode_reusing_prefix(other) == byte_tokenizer.encode(other));
+                }
+            }
+        };
+        conversation_run(7U, 40);
+        std::vector<std::future<void>> agents;
+        for (unsigned agent = 0; agent < 6; ++agent) {
+            agents.push_back(std::async(std::launch::async, [&, agent] { conversation_run(100U + agent, 20); }));
+        }
+        for (auto& agent : agents) { agent.get(); }
+    }
+    std::cout << "Added-token matching, concurrent image tokenization and prefix reuse passed\n";
 }
