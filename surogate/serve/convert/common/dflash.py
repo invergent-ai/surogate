@@ -23,6 +23,14 @@ class Geometry:
     rope_theta: float
     layer_types: tuple[str, ...]
     target_feature_layers: tuple[int, ...]
+    # DFlash 2 (zero on a first-generation drafter): a two-tap dynamic convolution over the
+    # block's rows before and after every attention and feed-forward sublayer, its dynamic
+    # weights one per `conv_group` channels; and a candidate selector that walks the draft
+    # logits' `selector_top_k` best tokens per position through rank-`selector_rank` codebooks.
+    conv_kernel: int = 0
+    conv_group: int = 0
+    selector_rank: int = 0
+    selector_top_k: int = 0
 
     @property
     def query_size(self):
@@ -40,6 +48,12 @@ class Geometry:
     def local_layers(self):
         return self.layer_types.count("sliding_attention")
 
+    @property
+    def conv_rows(self):
+        """Rows of a sublayer's kernel projection: per stage (before, after) and tap (this row,
+        the row before), one dynamic weight per channel group."""
+        return 2 * self.conv_kernel * (self.hidden // self.conv_group) if self.conv_kernel else 0
+
     def declaration(self, target):
         return replace(target.declared, section_config={
             "dflash_layers": self.layers, "dflash_head_dim": self.head_dim,
@@ -47,6 +61,8 @@ class Geometry:
             "dflash_attn_cols": self.query_size, "dflash_kv_rows": self.kv_size,
             "dflash_gate_up_rows": 2 * self.intermediate, "dflash_ffn": self.intermediate,
             "dflash_feature_rows": self.feature_rows,
+            "dflash_conv_taps": self.conv_kernel, "dflash_conv_rows": self.conv_rows,
+            "dflash_selector_rank": self.selector_rank,
         })
 
 
@@ -93,6 +109,20 @@ def geometry_from_config(config: Mapping, target) -> Geometry:
     block = positive_int(draft, "block_size")
     if block < 2 or block > 16:
         raise ValueError("DFlash currently supports block_size in 2..16")
+    conv_kernel, conv_group, selector_rank, selector_top_k = (
+        _optional_int(draft, name) for name in
+        ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"))
+    if "DFlash2DraftModel" in (config.get("architectures") or ()) and not (conv_kernel and selector_rank):
+        raise ValueError("a DFlash2DraftModel states its convolution and candidate selector in dflash_config")
+    if bool(conv_kernel) != bool(conv_group):
+        raise ValueError("DFlash conv_kernel_size and conv_group_size come together")
+    if conv_kernel and (conv_kernel != 2 or config["hidden_size"] % conv_group):
+        raise ValueError("DFlash 2 convolutions are served with two taps over whole channel groups")
+    if bool(selector_rank) != bool(selector_top_k):
+        raise ValueError("DFlash selector_rank and selector_top_k come together")
+    if selector_rank and (selector_rank % 32 or selector_rank > 1024 or selector_top_k > 32):
+        raise ValueError("DFlash 2 selectors are served with rank a multiple of 32 up to 1024 "
+                         "and at most 32 candidates")
     mask = draft.get("mask_token_id")
     if isinstance(mask, bool) or not isinstance(mask, int) or not 0 <= mask < target.vocab:
         raise ValueError("DFlash mask_token_id must index the target embedding")
@@ -104,19 +134,32 @@ def geometry_from_config(config: Mapping, target) -> Geometry:
     g = Geometry(target.hidden, layers, config["intermediate_size"], config["num_attention_heads"],
                  config["num_key_value_heads"], config["head_dim"], config["sliding_window"], mask,
                  block, config["max_position_embeddings"], config["rms_norm_eps"], rope["rope_theta"],
-                 tuple(schedule), tuple(targets))
+                 tuple(schedule), tuple(targets), conv_kernel, conv_group, selector_rank, selector_top_k)
     if max(g.query_size + 2 * g.kv_size, g.feature_rows, 2 * g.intermediate) > 2147483647:
         raise ValueError("DFlash projection dimensions exceed int32")
     return g
 
 
 def geometry_block(g: Geometry):
-    return dict(hidden=g.hidden, layers=g.layers, local_layers=g.local_layers,
-                intermediate=g.intermediate, query_heads=g.query_heads, kv_heads=g.kv_heads,
-                head_dim=g.head_dim, local_capacity=g.local_capacity, mask_token=g.mask_token,
-                block_size=g.block_size, max_context=g.max_context, rms_epsilon=g.rms_epsilon,
-                rope_theta=g.rope_theta, attention_scale=g.head_dim ** -.5,
-                feature_layers=len(g.target_feature_layers), feature_rows=g.feature_rows)
+    block = dict(hidden=g.hidden, layers=g.layers, local_layers=g.local_layers,
+                 intermediate=g.intermediate, query_heads=g.query_heads, kv_heads=g.kv_heads,
+                 head_dim=g.head_dim, local_capacity=g.local_capacity, mask_token=g.mask_token,
+                 block_size=g.block_size, max_context=g.max_context, rms_epsilon=g.rms_epsilon,
+                 rope_theta=g.rope_theta, attention_scale=g.head_dim ** -.5,
+                 feature_layers=len(g.target_feature_layers), feature_rows=g.feature_rows)
+    # Stated only by a DFlash 2 drafter, so a first-generation artifact's metadata is unchanged.
+    if g.conv_kernel:
+        block.update(conv_kernel=g.conv_kernel, conv_group=g.conv_group)
+    if g.selector_rank:
+        block.update(selector_rank=g.selector_rank, selector_top_k=g.selector_top_k)
+    return block
+
+
+def _optional_int(config: Mapping, name: str) -> int:
+    value = config.get(name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"DFlash {name} must be a nonnegative integer")
+    return value
 
 
 def conversion_plan(g: Geometry, target):

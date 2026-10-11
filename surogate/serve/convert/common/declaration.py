@@ -263,6 +263,11 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "DflashGateUpRows": config.get("dflash_gate_up_rows", 0),
         "DflashFfn": config.get("dflash_ffn", 0),
         "DflashFeatureRows": config.get("dflash_feature_rows", 0),
+        # DFlash 2's per-sublayer convolutions and candidate selector; zero on a first-
+        # generation drafter, which drops their objects.
+        "DflashConvTaps": config.get("dflash_conv_taps", 0),
+        "DflashConvRows": config.get("dflash_conv_rows", 0),
+        "DflashSelectorRank": config.get("dflash_selector_rank", 0),
     }
 
 

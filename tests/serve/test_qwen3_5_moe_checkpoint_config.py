@@ -114,14 +114,23 @@ def _save(root, config, recipes, *, frontend=False):
         (root / "generation_config.json").write_text('{}')
 
 
-def test_cpu_conversion_preserves_optional_drafter_metadata(tmp_path, monkeypatch):
+def dflash2_config(g, **kwargs):
+    """A DFlash 2 drafter: the first generation's plus convolutions and a candidate selector."""
+    config = draft_config(g, **kwargs)
+    config["architectures"] = ["DFlash2DraftModel"]
+    config["dflash_config"].update(conv_kernel_size=2, conv_group_size=16, selector_rank=64, selector_top_k=16)
+    return config
+
+
+@pytest.mark.parametrize("second_generation", [False, True])
+def test_cpu_conversion_preserves_optional_drafter_metadata(tmp_path, monkeypatch, second_generation):
     from surogate.serve.artifact.container import Artifact
     from surogate.serve.convert.qwen3_5_moe import convert
     from surogate.serve.convert.common.draft_head import compute_shortlist
     c = config_for()
     c["mtp_num_hidden_layers"] = 0
     g = inv.geometry_from_config(c, token_domain=500)
-    dc = draft_config(g)
+    dc = dflash2_config(g) if second_generation else draft_config(g)
     d = dflash.geometry_from_config(dc, g)
     recipes = recipe.build_recipes(g, dflash=d)
     model, drafter = tmp_path / "renamed", tmp_path / "draft"
@@ -140,6 +149,15 @@ def test_cpu_conversion_preserves_optional_drafter_metadata(tmp_path, monkeypatc
         assert artifact.dflash_target_layers == [0, 2]
         assert artifact.vision_geometry == {}
         assert artifact.layer_types == list(g.layer_types)
+        names = {obj.name for obj in artifact.objects}
+        if second_generation:
+            assert artifact.dflash_geometry["selector_top_k"] == 16
+            assert artifact.find("dflash/layers/0/attention_conv/base_kernel").shape == (2, 2, g.hidden)
+            assert artifact.find("dflash/layers/1/mlp_conv/kernel_projection").shape == (2 * 2 * g.hidden // 16, g.hidden)
+            assert artifact.find("dflash/selector/successor_codebook").shape == (g.vocab, 64)
+        else:
+            assert "conv_kernel" not in artifact.dflash_geometry
+            assert not any("_conv/" in name or "/selector/" in name for name in names)
     assert json.loads(report.read_text())["draft_head"]["rows"] == 500
     from surogate.serve.tools.reference.qwen3_5_moe.bindings import ArtifactBinding
     with ArtifactBinding.open(output) as binding:

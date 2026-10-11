@@ -17,6 +17,10 @@ struct DFlashLayerPlan {
     artifact::ObjectHandle post_attention_norm;
     artifact::ObjectHandle gate_up;
     artifact::ObjectHandle down;
+    artifact::ObjectHandle attention_conv_base;
+    artifact::ObjectHandle attention_conv_projection;
+    artifact::ObjectHandle mlp_conv_base;
+    artifact::ObjectHandle mlp_conv_projection;
 };
 
 struct DFlashPlan {
@@ -24,6 +28,9 @@ struct DFlashPlan {
     artifact::ObjectHandle context_norm;
     std::vector<DFlashLayerPlan> layers;
     artifact::ObjectHandle final_norm;
+    artifact::ObjectHandle selector_projection;
+    artifact::ObjectHandle predecessor_codebook;
+    artifact::ObjectHandle successor_codebook;
 };
 
 inline DFlashPlan bind_dflash(artifact::Binder& binder, const TextGeometry& g,
@@ -74,8 +81,32 @@ inline DFlashPlan bind_dflash(artifact::Binder& binder, const TextGeometry& g,
                                          {2 * d.intermediate, d.hidden});
             target.down    = bind_dflash(prefix + "mlp/down", NumericFormat::W8G32_F16S,
                                          {d.hidden, d.intermediate});
+            if (d.has_conv()) {
+                const auto taps = static_cast<std::uint64_t>(d.conv_kernel);
+                const auto rows = static_cast<std::uint64_t>(d.conv_rows());
+                target.attention_conv_base = bind_dflash(prefix + "attention_conv/base_kernel",
+                                                         NumericFormat::BF16, {2, taps, g.hidden});
+                target.attention_conv_projection =
+                    bind_dflash(prefix + "attention_conv/kernel_projection",
+                                NumericFormat::W8G32_F16S, {rows, g.hidden});
+                target.mlp_conv_base = bind_dflash(prefix + "mlp_conv/base_kernel",
+                                                   NumericFormat::BF16, {2, taps, g.hidden});
+                target.mlp_conv_projection =
+                    bind_dflash(prefix + "mlp_conv/kernel_projection",
+                                NumericFormat::W8G32_F16S, {rows, g.hidden});
+            }
         }
         out.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {d.hidden});
+        if (d.has_selector()) {
+            const auto rank  = static_cast<std::uint64_t>(d.selector_rank);
+            const auto vocab = static_cast<std::uint64_t>(g.output_rows);
+            out.selector_projection  = bind_dflash("dflash/selector/hidden_projection",
+                                                   NumericFormat::W8G32_F16S, {rank, g.hidden});
+            out.predecessor_codebook = bind_dflash("dflash/selector/predecessor_codebook",
+                                                   NumericFormat::BF16, {vocab, rank});
+            out.successor_codebook   = bind_dflash("dflash/selector/successor_codebook",
+                                                   NumericFormat::BF16, {vocab, rank});
+        }
     }
 
     return out;
@@ -116,9 +147,34 @@ inline DFlashWeights materialize_dflash(const DFlashPlan& plan,
             backing, source.gate_up, NumericFormat::W8G32_F16S, 2 * d.intermediate, d.hidden);
         weights.down = artifact::materialized_weight(
             backing, source.down, NumericFormat::W8G32_F16S, d.hidden, d.intermediate);
+        if (d.has_conv()) {
+            // Stored [stage][tap][channel]; the tensor's extents run fastest first.
+            weights.attention_conv_base = artifact::materialized_tensor(
+                backing, source.attention_conv_base, NumericFormat::BF16,
+                {g.hidden, d.conv_kernel, 2});
+            weights.attention_conv_projection = artifact::materialized_weight(
+                backing, source.attention_conv_projection, NumericFormat::W8G32_F16S,
+                d.conv_rows(), d.hidden);
+            weights.mlp_conv_base = artifact::materialized_tensor(
+                backing, source.mlp_conv_base, NumericFormat::BF16, {g.hidden, d.conv_kernel, 2});
+            weights.mlp_conv_projection = artifact::materialized_weight(
+                backing, source.mlp_conv_projection, NumericFormat::W8G32_F16S, d.conv_rows(),
+                d.hidden);
+        }
     }
     target.final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {g.hidden});
+    if (d.has_selector()) {
+        target.selector_projection = artifact::materialized_weight(
+            backing, plan.selector_projection, NumericFormat::W8G32_F16S, d.selector_rank,
+            d.hidden);
+        target.predecessor_codebook = artifact::materialized_tensor(
+            backing, plan.predecessor_codebook, NumericFormat::BF16,
+            {d.selector_rank, g.output_rows});
+        target.successor_codebook = artifact::materialized_tensor(
+            backing, plan.successor_codebook, NumericFormat::BF16,
+            {d.selector_rank, g.output_rows});
+    }
     return target;
 }
 

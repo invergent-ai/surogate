@@ -20,6 +20,14 @@ struct DFlashGeometry {
     std::array<int, 256> target_feature_layers{};
     [[nodiscard]] constexpr int query_size() const { return query_heads * head_dim; }
     [[nodiscard]] constexpr int kv_size() const { return kv_heads * head_dim; }
+    /// DFlash 2: a two-tap dynamic convolution before and after every sublayer of the block.
+    [[nodiscard]] constexpr bool has_conv() const { return conv_kernel > 0; }
+    /// Rows of a sublayer's kernel projection: [stage][tap][channel group].
+    [[nodiscard]] constexpr int conv_rows() const {
+        return has_conv() ? 2 * conv_kernel * (hidden / conv_group) : 0;
+    }
+    /// DFlash 2: a candidate selector walking the draft logits' top tokens per position.
+    [[nodiscard]] constexpr bool has_selector() const { return selector_rank > 0; }
     [[nodiscard]] std::span<const int> target_layers() const {
         return {target_feature_layers.data(), static_cast<std::size_t>(feature_layers)};
     }
@@ -45,6 +53,11 @@ struct DFlashGeometry {
         };
         detail::apply_geometry(g, values, ints, floats, "dflash_geometry");
         for (const auto& entry : ints) {
+            // DFlash 2's fields; a first-generation drafter states none of them.
+            if (entry.name == "conv_kernel" || entry.name == "conv_group" ||
+                entry.name == "selector_rank" || entry.name == "selector_top_k") {
+                continue;
+            }
             if (!values.contains(std::string(entry.name)) ||
                 (entry.name != "mask_token" && g.*(entry.value) <= 0)) {
                 throw std::invalid_argument("missing or invalid dflash_geometry." + std::string(entry.name));
@@ -63,6 +76,13 @@ struct DFlashGeometry {
             (std::int64_t(g.query_heads) + 2LL * g.kv_heads) * g.head_dim > INT32_MAX ||
             std::int64_t(2) * g.intermediate > INT32_MAX) {
             throw std::invalid_argument("inconsistent DFlash checkpoint geometry");
+        }
+        if ((g.conv_kernel > 0) != (g.conv_group > 0) ||
+            (g.has_conv() && (g.conv_kernel != 2 || g.hidden % g.conv_group != 0)) ||
+            (g.selector_rank > 0) != (g.selector_top_k > 0) ||
+            (g.has_selector() && (g.selector_rank % 32 != 0 || g.selector_rank > 1024 ||
+                                  g.selector_top_k > 32))) {
+            throw std::invalid_argument("inconsistent DFlash 2 convolution or selector geometry");
         }
         std::array<bool, 256> seen{};
         for (std::size_t i = 0; i < targets.size(); ++i) {

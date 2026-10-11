@@ -384,7 +384,7 @@ def _vision_contract(cfg):
     return tuple(_ExpectedTensor(s.name, s.shape, s.format, s.layout) for s in dense_vision_contract(cfg))
 
 
-def _dflash_contract(d) -> tuple[_ExpectedTensor, ...]:
+def _dflash_contract(d, vocab) -> tuple[_ExpectedTensor, ...]:
     tensors: list[_ExpectedTensor] = [
         _tensor("dflash/feature_projection", (d.hidden, d.feature_rows), None),
         _tensor("dflash/context_norm", (d.hidden,), BF16),
@@ -407,7 +407,19 @@ def _dflash_contract(d) -> tuple[_ExpectedTensor, ...]:
                 _tensor(prefix + "mlp/down", (d.hidden, d.intermediate), None),
             )
         )
+        conv = getattr(d, "conv_kernel", 0)
+        if conv:
+            # DFlash 2's convolutions; the reference runs first-generation drafters only.
+            rows = 2 * conv * (d.hidden // d.conv_group)
+            for sublayer in ("attention_conv/", "mlp_conv/"):
+                tensors.extend((_tensor(prefix + sublayer + "base_kernel", (2, conv, d.hidden), BF16),
+                                _tensor(prefix + sublayer + "kernel_projection", (rows, d.hidden), None)))
     tensors.append(_tensor("dflash/final_norm", (d.hidden,), BF16))
+    rank = getattr(d, "selector_rank", 0)
+    if rank:
+        tensors.extend((_tensor("dflash/selector/hidden_projection", (rank, d.hidden), None),
+                        _tensor("dflash/selector/predecessor_codebook", (vocab, rank), BF16),
+                        _tensor("dflash/selector/successor_codebook", (vocab, rank), BF16)))
     return tuple(tensors)
 
 
@@ -445,7 +457,7 @@ def _validate_inventory(artifact, cfg, vision, draft):
         + _draft_contract(cfg)
         + (_mtp_contract(cfg) if cfg.mtp_layers else ())
         + _vision_contract(vision)
-        + (_dflash_contract(draft) if draft else ())
+        + (_dflash_contract(draft, cfg.vocab) if draft else ())
     )
     contract = tuple(s for s in contract if s.name != "text/output_head" or s.name in present)
     expected = {s.name: s for s in contract}

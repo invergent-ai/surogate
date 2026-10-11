@@ -414,6 +414,16 @@ SUROGATE_SERVE_DFLASH_PACKED_PREFILL=1 \
   surogate serve /path/to/gemma4-26b-dflash.sinfer --vision --spec dflash --draft-tokens 7
 ```
 
+A DFlash 2 drafter, such as
+[incoai/Qwen3.8-27B-DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) or
+[incoai/Qwen3.6-35B-A3B-DFlash2](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2), is
+prepared the same way, with `--dflash-model`, for any target that serves DFlash, including an
+NVFP4 export. It adds a two-tap convolution over the block's rows around every attention and
+feed-forward sublayer, and a candidate selector: instead of each position's best draft token on
+its own, the server takes the 16 best per position and walks them left to right, scoring each
+token after the one chosen before it. Its blocks are 8 tokens, so serve it with
+`--draft-tokens 7` or fewer.
+
 The drafter was trained against the base model. A fine-tune accepts fewer of its drafts;
 measure acceptance on your own prompts. On a fine-tuned 26B-A4B, seven draft tokens were faster
 than three or fifteen, and faster than `--spec-adaptive`. Speculation speeds up generation,

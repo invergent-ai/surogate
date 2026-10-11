@@ -935,6 +935,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 {
                     auto attention = layout.scope();
                     (void)workspace_recipe::dflash_attention(layout, tokens, plan.geometry.dflash);
+                    (void)workspace_recipe::dflash_conv(layout, tokens, plan.geometry.dflash);
                     scratch(layout,
                             std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
                                                                        width, batch),
@@ -947,6 +948,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 {
                     auto mlp = layout.scope();
                     (void)workspace_recipe::dflash_mlp(layout, tokens, plan.geometry.dflash);
+                    (void)workspace_recipe::dflash_conv(layout, tokens, plan.geometry.dflash);
                     scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
                                         QType::W8G32_F16S, 2 * plan.geometry.dflash.intermediate,
                                         plan.geometry.dflash.hidden, tokens, tokens));
@@ -960,6 +962,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::BF16, plan.geometry.draft_vocab, drafts * batch);
                 } else {
                     matrix(layout, DType::BF16, plan.geometry.output_rows, drafts * batch);
+                }
+                if (plan.geometry.dflash.has_selector()) {
+                    (void)workspace_recipe::dflash_selector(layout, drafts * batch,
+                                                            plan.geometry.dflash);
                 }
                 return finish(layout);
             };

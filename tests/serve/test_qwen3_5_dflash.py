@@ -10,7 +10,7 @@ from surogate.serve.convert.common import dflash
 from surogate.serve.convert.common.draft_head import compute_shortlist
 from surogate.serve.convert.qwen3_5 import convert, inventory
 from tests.serve.test_qwen3_5_checkpoint_config import config_for
-from tests.serve.test_qwen3_5_moe_checkpoint_config import _save, draft_config
+from tests.serve.test_qwen3_5_moe_checkpoint_config import _save, dflash2_config, draft_config
 
 
 @pytest.mark.parametrize("vision", [False, True])
@@ -54,3 +54,23 @@ def test_dense_drafter_round_trip_and_mismatch(tmp_path, monkeypatch, vision, al
     with pytest.raises(ValueError, match="must match the target"):
         convert.convert(model, refused, device="cpu", mtp=False, vision=vision, dflash_model_dir=auxiliary)
     assert not refused.exists()
+
+
+def test_second_generation_drafter_is_validated():
+    config = config_for()
+    config["mtp_num_hidden_layers"] = 0
+    target = inventory.geometry_from_config(config, token_domain=500)
+    g = dflash.geometry_from_config(dflash2_config(target), target)
+    assert (g.conv_kernel, g.conv_group, g.selector_rank, g.selector_top_k, g.conv_rows) == (2, 16, 64, 16, 32)
+    unstated = dflash2_config(target)
+    del unstated["dflash_config"]["selector_rank"], unstated["dflash_config"]["selector_top_k"]
+    with pytest.raises(ValueError, match="DFlash2DraftModel"):
+        dflash.geometry_from_config(unstated, target)
+    three_taps = dflash2_config(target)
+    three_taps["dflash_config"]["conv_kernel_size"] = 3
+    with pytest.raises(ValueError, match="two taps"):
+        dflash.geometry_from_config(three_taps, target)
+    wide = dflash2_config(target)
+    wide["dflash_config"]["selector_top_k"] = 33
+    with pytest.raises(ValueError, match="at most 32"):
+        dflash.geometry_from_config(wide, target)

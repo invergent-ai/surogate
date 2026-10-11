@@ -32,6 +32,17 @@ DFLASH_SERVE_SECTION = ServeSection(
             source=(("mlp.gate_proj.weight", ("DflashFfn", "C")), ("mlp.up_proj.weight", ("DflashFfn", "C"))),
         ),
         ServeObject("mlp/down", "quantised", ("C", "DflashFfn"), source="mlp.down_proj.weight"),
+        # DFlash 2's dynamic convolutions, one per sublayer. The base kernel is [stage (before,
+        # after the sublayer)][tap (this row, the row before)][channel]; the projection makes
+        # each row's per-group additions to it from that sublayer's normed input.
+        ServeObject("attention_conv/base_kernel", "bf16", (2, "DflashConvTaps", "C"),
+                    source="attention_conv.base_kernel"),
+        ServeObject("attention_conv/kernel_projection", "quantised", ("DflashConvRows", "C"),
+                    source="attention_conv.kernel_projection.weight"),
+        ServeObject("mlp_conv/base_kernel", "bf16", (2, "DflashConvTaps", "C"),
+                    source="mlp_conv.base_kernel"),
+        ServeObject("mlp_conv/kernel_projection", "quantised", ("DflashConvRows", "C"),
+                    source="mlp_conv.kernel_projection.weight"),
     ),
     repeat="dflash_layers",
     capability="dflash",
@@ -51,4 +62,12 @@ DFLASH_HEAD_OBJECTS: tuple[ServeObject, ...] = (
 
 DFLASH_TAIL_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("dflash/final_norm", "bf16", ("C",), scope="model", capability="dflash", source="norm.weight"),
+    # DFlash 2's candidate selector: a rank projection of each draft row's normed hidden, and
+    # the codebooks that score a token after its predecessor through it.
+    ServeObject("dflash/selector/hidden_projection", "quantised", ("DflashSelectorRank", "C"), scope="model",
+                capability="dflash", source="candidate_selector.hidden_projection.weight"),
+    ServeObject("dflash/selector/predecessor_codebook", "bf16", ("Vocab", "DflashSelectorRank"), scope="model",
+                capability="dflash", source="candidate_selector.predecessor_codebook"),
+    ServeObject("dflash/selector/successor_codebook", "bf16", ("Vocab", "DflashSelectorRank"), scope="model",
+                capability="dflash", source="candidate_selector.successor_codebook"),
 )

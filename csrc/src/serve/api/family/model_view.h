@@ -71,6 +71,12 @@ struct DFlashLayerWeights {
     Tensor post_attention_norm;
     Weight gate_up;
     Weight down;
+    // DFlash 2 only (empty otherwise): each sublayer's base kernel [2 stages, 2 taps, hidden]
+    // and the projection making a row's per-group dynamic weights from its normed input.
+    Tensor attention_conv_base;
+    Weight attention_conv_projection;
+    Tensor mlp_conv_base;
+    Weight mlp_conv_projection;
 };
 
 struct DFlashWeights {
@@ -78,6 +84,11 @@ struct DFlashWeights {
     Tensor context_norm;
     std::vector<DFlashLayerWeights> layers;
     Tensor final_norm;
+    // DFlash 2's candidate selector (empty otherwise): the rank projection of a draft row's
+    // normed hidden, and the [vocab, rank] codebooks scoring a token after its predecessor.
+    Weight selector_projection;
+    Tensor predecessor_codebook;
+    Tensor successor_codebook;
 };
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,

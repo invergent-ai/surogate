@@ -346,6 +346,42 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens,
     };
 }
 
+/// DFlash 2's convolution buffers for one sublayer: the rows' dynamic weights, the convolved
+/// input, and the sublayer's projected output before its convolution into the residual. Empty
+/// for a first-generation drafter.
+struct DFlashConvRoots {
+    Tensor dynamic;
+    Tensor convolved;
+    Tensor projected;
+};
+
+template <class Allocator>
+DFlashConvRoots dflash_conv(Allocator& allocator, std::int32_t tokens, const family::DFlashGeometry& config) {
+    if (!config.has_conv()) { return {}; }
+    return {
+        matrix(allocator, DType::BF16, config.conv_rows(), tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
+    };
+}
+
+/// DFlash 2's selector buffers: each proposal's candidates and their logits, and its rank-wide
+/// selector hidden.
+struct DFlashSelectorRoots {
+    Tensor ids;
+    Tensor values;
+    Tensor hidden;
+};
+
+template <class Allocator>
+DFlashSelectorRoots dflash_selector(Allocator& allocator, std::int32_t proposals, const family::DFlashGeometry& config) {
+    return {
+        matrix(allocator, DType::I32, config.selector_top_k, proposals),
+        matrix(allocator, DType::FP32, config.selector_top_k, proposals),
+        matrix(allocator, DType::BF16, config.selector_rank, proposals),
+    };
+}
+
 struct DFlashMlpRoots {
     Tensor hidden;
     Tensor intermediate;

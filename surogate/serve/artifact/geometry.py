@@ -111,7 +111,10 @@ VISION_FLOAT_FIELDS = (
 DFLASH_INT_FIELDS = (
     "hidden", "layers", "local_layers", "intermediate", "query_heads", "kv_heads", "head_dim",
     "local_capacity", "mask_token", "block_size", "max_context", "feature_layers", "feature_rows",
+    "conv_kernel", "conv_group", "selector_rank", "selector_top_k",
 )
+#: DFlash 2's fields, absent (zero) on a first-generation drafter.
+DFLASH_OPTIONAL_FIELDS = ("conv_kernel", "conv_group", "selector_rank", "selector_top_k")
 DFLASH_FLOAT_FIELDS = ("rms_epsilon", "rope_theta", "attention_scale")
 
 REQUIRED_TEXT_FIELDS = (
@@ -200,8 +203,14 @@ def cpp_required_fields() -> str:
 def validate_dflash_geometry(values, targets, text):
     g = validate_geometry(values, dflash=True)
     for name in (*DFLASH_INT_FIELDS, *DFLASH_FLOAT_FIELDS):
-        if name not in g or (name != "mask_token" and g[name] <= 0):
+        if name not in DFLASH_OPTIONAL_FIELDS and (name not in g or (name != "mask_token" and g[name] <= 0)):
             raise ValueError(f"dflash_geometry.{name} is required and must be positive")
+    conv, group, rank, top_k = (g.get(name, 0) for name in DFLASH_OPTIONAL_FIELDS)
+    if bool(conv) != bool(group) or (conv and (conv != 2 or g["hidden"] % group)):
+        raise ValueError("DFlash 2 convolutions take two taps over whole channel groups")
+    if bool(rank) != bool(top_k) or (rank and (rank % 32 or rank > 1024 or top_k > 32)):
+        raise ValueError("DFlash 2 selectors take a rank that is a multiple of 32 up to 1024 "
+                         "and at most 32 candidates")
     if not 2 <= g["layers"] <= 256 or g["local_layers"] not in (g["layers"] - 1, g["layers"]):
         raise ValueError("DFlash requires local layers with at most one final full attention layer")
     if g["hidden"] != text.get("hidden") or g["mask_token"] >= text.get("output_rows", 0):

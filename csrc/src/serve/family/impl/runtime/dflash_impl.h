@@ -6,6 +6,7 @@
 #include "api/ops/argmax.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/bidirectional_gqa_attention.h"
+#include "api/ops/dflash2.h"
 #include "api/ops/embedding.h"
 #include "api/ops/kv_cache_append_prefix.h"
 #include "api/ops/linear.h"
@@ -246,8 +247,20 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
                 auto attention_scope = state.execution.work.scope();
                 auto roots =
                     workspace_recipe::dflash_attention(state.execution.work, columns, config);
+                auto conv = workspace_recipe::dflash_conv(state.execution.work, columns, config);
                 ops::rmsnorm(residual, weight.input_norm, config.rms_epsilon, false, roots.hidden,
                              state.execution.device.stream);
+                // DFlash 2: the projections read the normed rows through the block's dynamic
+                // convolution, its weights made from those same normed rows.
+                Tensor attention_input = roots.hidden;
+                if (config.has_conv()) {
+                    ops::linear(roots.hidden, weight.attention_conv_projection, conv.dynamic,
+                                state.execution.device.stream);
+                    ops::dflash_conv(roots.hidden, conv.dynamic, weight.attention_conv_base, 0,
+                                     width, nullptr, conv.convolved,
+                                     state.execution.device.stream);
+                    attention_input = conv.convolved;
+                }
                 Tensor query_raw =
                     roots.query_raw.view({config.head_dim, config.query_heads, columns});
                 Tensor key_raw = roots.key_raw.view({config.head_dim, config.kv_heads, columns});
@@ -255,7 +268,7 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
                 Tensor query_flat = query_raw.view({config.query_size(), columns});
                 Tensor key_flat   = key_raw.view({config.kv_size(), columns});
                 Tensor value_flat = value.view({config.kv_size(), columns});
-                ops::attn_input_proj(roots.hidden, weight.query_key_value, query_flat, key_flat,
+                ops::attn_input_proj(attention_input, weight.query_key_value, query_flat, key_flat,
                                      value_flat, state.execution.device.stream);
                 Tensor query = roots.query.view({config.head_dim, config.query_heads, columns});
                 Tensor key   = roots.key.view({config.head_dim, config.kv_heads, columns});
@@ -286,19 +299,43 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 }
-                ops::linear_add(roots.attention.view({config.query_size(), columns}),
-                                weight.attention_output, residual, state.execution.work,
+                if (config.has_conv()) {
+                    // The sublayer's output reaches the residual stream through the same
+                    // convolution's second stage.
+                    ops::linear(roots.attention.view({config.query_size(), columns}),
+                                weight.attention_output, conv.projected,
                                 state.execution.device.stream);
+                    ops::dflash_conv(conv.projected, conv.dynamic, weight.attention_conv_base, 1,
+                                     width, &residual, residual, state.execution.device.stream);
+                } else {
+                    ops::linear_add(roots.attention.view({config.query_size(), columns}),
+                                    weight.attention_output, residual, state.execution.work,
+                                    state.execution.device.stream);
+                }
             }
             {
                 auto mlp_scope = state.execution.work.scope();
                 auto roots = workspace_recipe::dflash_mlp(state.execution.work, columns, config);
+                auto conv  = workspace_recipe::dflash_conv(state.execution.work, columns, config);
                 ops::rmsnorm(residual, weight.post_attention_norm, config.rms_epsilon, false,
                              roots.hidden, state.execution.device.stream);
-                ops::linear_swiglu(roots.hidden, weight.gate_up, roots.intermediate,
-                                   state.execution.work, state.execution.device.stream);
-                ops::linear_add(roots.intermediate, weight.down, residual, state.execution.work,
+                if (config.has_conv()) {
+                    ops::linear(roots.hidden, weight.mlp_conv_projection, conv.dynamic,
                                 state.execution.device.stream);
+                    ops::dflash_conv(roots.hidden, conv.dynamic, weight.mlp_conv_base, 0, width,
+                                     nullptr, conv.convolved, state.execution.device.stream);
+                    ops::linear_swiglu(conv.convolved, weight.gate_up, roots.intermediate,
+                                       state.execution.work, state.execution.device.stream);
+                    ops::linear(roots.intermediate, weight.down, conv.projected,
+                                state.execution.device.stream);
+                    ops::dflash_conv(conv.projected, conv.dynamic, weight.mlp_conv_base, 1, width,
+                                     &residual, residual, state.execution.device.stream);
+                } else {
+                    ops::linear_swiglu(roots.hidden, weight.gate_up, roots.intermediate,
+                                       state.execution.work, state.execution.device.stream);
+                    ops::linear_add(roots.intermediate, weight.down, residual,
+                                    state.execution.work, state.execution.device.stream);
+                }
             }
         }
 
@@ -319,7 +356,42 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         ops::rmsnorm(packed, state.execution.model.dflash->final_norm, config.rms_epsilon, false,
                      proposal_hidden, state.execution.device.stream);
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
-        if (state.execution.proposal_head == ProposalHead::Full) {
+        if (config.has_selector()) {
+            // DFlash 2: each position's best `selector_top_k` draft logits, walked left to right
+            // with a pair score through the selector's codebooks.
+            const auto proposals = static_cast<std::int32_t>(k) * batch_size;
+            const bool full      = state.execution.proposal_head == ProposalHead::Full;
+            if (!full && !state.execution.model.optimized_proposal.has_value()) {
+                throw std::logic_error("optimized DFlash proposal head is unavailable");
+            }
+            const auto rows   = full ? state.execution.model.geometry.output_rows
+                                     : state.execution.model.geometry.draft_vocab;
+            const auto domain = full ? state.execution.model.geometry.token_domain
+                                     : state.execution.model.geometry.draft_vocab;
+            Tensor logits = state.execution.work.alloc(DType::BF16, {rows, proposals});
+            ops::linear(proposal_hidden,
+                        full ? state.execution.model.output_head
+                             : state.execution.model.optimized_proposal->head,
+                        logits, state.execution.device.stream);
+            auto selector = workspace_recipe::dflash_selector(state.execution.work, proposals, config);
+            ops::dflash_select_top_k(logits, domain, selector.ids, selector.values,
+                                     state.execution.device.stream);
+            if (!full) {
+                Tensor candidates = selector.ids.view({config.selector_top_k * proposals});
+                ops::proposal_remap_token_ids(
+                    candidates,
+                    static_cast<const std::int32_t*>(
+                        state.execution.model.optimized_proposal->token_ids.data),
+                    state.execution.model.geometry.draft_vocab, state.execution.device.stream);
+            }
+            ops::linear(proposal_hidden, state.execution.model.dflash->selector_projection,
+                        selector.hidden, state.execution.device.stream);
+            ops::dflash_select_walk(anchors, selector.ids, selector.values, selector.hidden,
+                                    state.execution.model.dflash->predecessor_codebook,
+                                    state.execution.model.dflash->successor_codebook,
+                                    static_cast<std::int32_t>(k), flat_drafts,
+                                    state.execution.device.stream);
+        } else if (state.execution.proposal_head == ProposalHead::Full) {
             Tensor logits = state.execution.work.alloc(
                 DType::BF16, {state.execution.model.geometry.output_rows,
                               static_cast<std::int32_t>(k) * batch_size});
