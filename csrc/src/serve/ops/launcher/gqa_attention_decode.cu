@@ -8,6 +8,8 @@
 // translation unit fails at link rather than silently landing on another shape.
 #include "ops/launcher/gqa_attention_decode_launch.cuh"
 
+#include <atomic>
+
 namespace sinfer::ops::detail {
 
 #define SINFER_GQA_EXTERN_DECODE(Name)                                                             \
@@ -23,6 +25,26 @@ SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_EXTERN_DECODE)
 #undef SINFER_GQA_EXTERN_DECODE
 
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
+
+namespace {
+// Bit 0: 256-wide heads, bit 1: 512-wide; -1 until the environment is read.
+std::atomic<int> g_resident_query{-1};
+} // namespace
+
+bool gqa_resident_query_enabled(std::int32_t head_dim) {
+    int widths = g_resident_query.load(std::memory_order_relaxed);
+    if (widths < 0) {
+        const char* raw         = std::getenv("SUROGATE_SERVE_GQA_RESIDENT_Q");
+        const std::string value = raw == nullptr ? "1" : raw;
+        widths = value == "0" ? 0 : value == "256" ? 1 : value == "512" ? 2 : 3;
+        g_resident_query.store(widths, std::memory_order_relaxed);
+    }
+    return (head_dim == 256 && (widths & 1) != 0) || (head_dim == 512 && (widths & 2) != 0);
+}
+
+void set_gqa_resident_query_enabled(bool enabled) {
+    g_resident_query.store(enabled ? 3 : 0, std::memory_order_relaxed);
+}
 
 std::int32_t gqa_attention_small_t_max_width(std::int32_t q_heads, std::int32_t kv_heads) {
     if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0) {

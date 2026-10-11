@@ -6,6 +6,7 @@
 #include "api/ops/gqa_attention.h"
 #include "api/ops/qsa_indexer.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/launcher/gqa_attention.h"
 #include "ops/fp8_reference.h"
 #include "ops/op_tester.h"
 
@@ -1956,6 +1957,158 @@ int verify_fp8_current_tokens_match_cached(int dim, int heads, int kv_heads) {
     return failures;
 }
 
+// 256- and 512-wide heads take the resident-query small-T kernel (query tile in shared memory,
+// 128 output dimensions a warp, P in registers, e4m3 codes loaded four chunks at a time). It must
+// write every output and cache bit the route it replaced writes: appended and cached, BF16 and
+// E4M3 caches, decode and verification widths (chunked past the lane step), masked lanes,
+// sliding windows, histories crossing tile, page and partition boundaries, and query groups from
+// two to sixty-four.
+int verify_resident_query_matches_legacy() {
+    int failures = 0;
+    struct Shape {
+        const char* name;
+        int dim;
+        int heads;
+        int kv_heads;
+        int window;
+    };
+    constexpr int pages_per_row = 18;
+    const Shape shapes[] = {{"gemma4_26b_global", 512, 16, 2, 0}, {"gemma4_12b_global", 512, 16, 1, 0},
+                            {"gemma4_31b_global", 512, 32, 4, 0}, {"glm_absorbed", 512, 64, 1, 0},
+                            {"gemma4_26b_window", 256, 16, 8, 128}, {"qwen3_6_27b", 256, 24, 4, 0},
+                            {"qwen3_8_flash_next", 256, 24, 2, 0}, {"gemma3_270m", 256, 4, 1, 64}};
+    const int histories[] = {0, 61, 200, 1023};
+    unsigned seed = 9001U;
+    const auto next = [&] {
+        seed = seed * 1664525U + 1013904223U;
+        return seed >> 8;
+    };
+    for (const Shape& shape : shapes) {
+      const int dim = shape.dim;
+      const int group = shape.heads / shape.kv_heads;
+      const int max_width = std::min(64 / group, 6);
+      for (const DType dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+        for (const int batch : {1, 3}) {
+          for (const int width : {1, 2, 3, 4, 5, 6, 8, 16}) {
+            // One sequence wider than the lane step takes the prompt route, which is unchanged.
+            if (batch == 1 && width > max_width) { continue; }
+            for (const bool masked : {false, true}) {
+              if (masked && batch == 1) { continue; }
+              DeviceArena arena(96U << 20);
+              Tensor q = arena.alloc(DType::BF16, {dim, shape.heads, width, batch});
+              Tensor k = arena.alloc(DType::BF16, {dim, shape.kv_heads, width, batch});
+              Tensor v = arena.alloc(DType::BF16, {dim, shape.kv_heads, width, batch});
+              Tensor positions = arena.alloc(DType::I32, {width, batch});
+              Tensor rows = arena.alloc(DType::I32, {batch});
+              Tensor valid = arena.alloc(DType::I32, {batch});
+              Tensor out = arena.alloc(DType::BF16, {dim, shape.heads, width, batch});
+              const auto fill_bf16 = [&](Tensor tensor) {
+                  std::vector<std::uint16_t> values(tensor.numel());
+                  for (auto& value : values) {
+                      value = f32_to_bf16((static_cast<int>(next() & 0xffff) - 32768) / 16384.0F);
+                  }
+                  CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), tensor.bytes(), cudaMemcpyHostToDevice));
+              };
+              fill_bf16(q);
+              fill_bf16(k);
+              fill_bf16(v);
+              std::vector<int> pos(width * batch), table(pages_per_row * batch), row_ids(batch),
+                  valid_columns(batch);
+              std::uint32_t min_visible = ~0U, max_visible = 0;
+              for (int row = 0; row < batch; ++row) {
+                  const int history = histories[(row + width) % 4];
+                  for (int col = 0; col < width; ++col) { pos[row * width + col] = history + col; }
+                  // Scattered pages: 7 steps through the row's range.
+                  for (int page = 0; page < pages_per_row; ++page) {
+                      table[row * pages_per_row + page] = row * pages_per_row + (page * 7) % pages_per_row;
+                  }
+                  row_ids[row] = batch - 1 - row;
+                  valid_columns[row] = row == 0 ? width : std::max(1, width - 2 * row);
+                  min_visible = std::min(min_visible, static_cast<std::uint32_t>(history + 1));
+                  max_visible = std::max(max_visible, static_cast<std::uint32_t>(history + width));
+              }
+              CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+              CUDA_CHECK(cudaMemcpy(rows.data, row_ids.data(), rows.bytes(), cudaMemcpyHostToDevice));
+              CUDA_CHECK(cudaMemcpy(valid.data, valid_columns.data(), valid.bytes(), cudaMemcpyHostToDevice));
+              PagedKVBatchLayerView cache;
+              cache.head_dim = dim;
+              cache.num_kv_heads = shape.kv_heads;
+              cache.dtype = dtype;
+              cache.k_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, shape.kv_heads, pages_per_row * batch});
+              cache.v_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, shape.kv_heads, pages_per_row * batch});
+              cache.block_tables = arena.alloc(DType::I32, {pages_per_row, batch});
+              CUDA_CHECK(cudaMemcpy(cache.block_tables.data, table.data(), cache.block_tables.bytes(),
+                                    cudaMemcpyHostToDevice));
+              // Every slot holds a history value, the query columns' own slots included: the
+              // cached entry reads them, the append entry overwrites them.
+              std::vector<std::uint8_t> k_bytes(cache.k_pages.bytes()), v_bytes(cache.v_pages.bytes());
+              for (auto* bytes : {&k_bytes, &v_bytes}) {
+                  if (dtype == DType::BF16) {
+                      for (std::size_t i = 0; i + 1 < bytes->size(); i += 2) {
+                          const std::uint16_t value =
+                              f32_to_bf16((static_cast<int>(next() & 0xffff) - 32768) / 16384.0F);
+                          std::memcpy(bytes->data() + i, &value, sizeof(value));
+                      }
+                  } else {
+                      for (auto& byte : *bytes) {
+                          byte = static_cast<std::uint8_t>(next());
+                          if ((byte & 0x7f) == 0x7f) { byte ^= 1; } // e4m3 NaN codes
+                      }
+                  }
+              }
+              const ops::GqaExecutionEnvelope envelope{min_visible, max_visible, shape.window};
+              WorkspaceArena scratch(std::max<std::size_t>(256, ops::gqa_attention_workspace_capacity_bytes(
+                  dim, shape.heads, shape.kv_heads, dtype, envelope, batch, width, width)));
+              const Tensor no_mask{};
+              const Tensor& valid_arg = masked ? valid : no_mask;
+              for (const bool append : {true, false}) {
+                  struct Written {
+                      std::vector<std::uint16_t> out;
+                      std::vector<std::uint8_t> k;
+                      std::vector<std::uint8_t> v;
+                  };
+                  const auto run = [&](bool resident) {
+                      CUDA_CHECK(cudaMemcpy(cache.k_pages.data, k_bytes.data(), k_bytes.size(), cudaMemcpyHostToDevice));
+                      CUDA_CHECK(cudaMemcpy(cache.v_pages.data, v_bytes.data(), v_bytes.size(), cudaMemcpyHostToDevice));
+                      CUDA_CHECK(cudaMemset(out.data, 0, out.bytes()));
+                      ops::detail::set_gqa_resident_query_enabled(resident);
+                      const float scale = 1.0F / std::sqrt(static_cast<float>(dim));
+                      if (append) {
+                          ops::gqa_attention(q, k, v, positions, valid_arg, rows, scale, cache,
+                                             envelope, scratch, out, nullptr);
+                      } else {
+                          ops::gqa_attention_cached(q, positions, valid_arg, rows, scale, cache,
+                                                    envelope, scratch, out, nullptr);
+                      }
+                      cuda_synchronize();
+                      return Written{from_device<std::uint16_t>(out.data, out.numel()),
+                                     from_device<std::uint8_t>(cache.k_pages.data, k_bytes.size()),
+                                     from_device<std::uint8_t>(cache.v_pages.data, v_bytes.size())};
+                  };
+                  const Written legacy = run(false);
+                  const Written resident = run(true);
+                  if (legacy.out != resident.out || legacy.k != resident.k || legacy.v != resident.v) {
+                      std::size_t first = 0;
+                      while (first < legacy.out.size() && legacy.out[first] == resident.out[first]) { ++first; }
+                      std::cerr << "resident-query attention differs from the legacy route: "
+                                << shape.name << " " << (dtype == DType::BF16 ? "bf16" : "fp8")
+                                << " B=" << batch << " W=" << width << (masked ? " masked" : "")
+                                << (append ? " append" : " cached") << " first output " << first
+                                << " of " << legacy.out.size()
+                                << (legacy.k != resident.k || legacy.v != resident.v ? ", cache differs" : "")
+                                << "\n";
+                      ++failures;
+                  }
+              }
+              ops::detail::set_gqa_resident_query_enabled(true);
+            }
+          }
+        }
+      }
+    }
+    return failures;
+}
+
 // A round's layers share Hopper's per-row arrays and FA3 scheduler metadata through an
 // ops::GqaRoundMetadata: each layer of a shared round must match the same layer run on its own,
 // bit for bit, over global and windowed layers (two input sets), whole and split histories, and
@@ -2458,6 +2611,8 @@ int main() {
     failures += verify_fp8_current_tokens_match_cached(256, 8, 4);
     failures += verify_fp8_current_tokens_match_cached(256, 16, 4);
     failures += verify_fp8_current_tokens_match_cached(128, 32, 4);
+    failures += verify_fp8_current_tokens_match_cached(512, 16, 2);
+    failures += verify_resident_query_matches_legacy();
     failures += verify_fp8_image_attention();
     failures += verify_fp8_wide_prompts();
     failures += verify_round_metadata_sharing();
@@ -2523,6 +2678,24 @@ int main() {
                 }
             }
         }
+    }
+    // Gemma 4 26B-A4B's global layers on the small-T route against the oracle: 512 wide, a group
+    // of eight, so a lane step of five or six tokens spans two of the resident-query kernel's
+    // 32-row CTAs, and a history past 1000 keys spans several splits.
+    {
+        const Geometry gemma4_global{"gemma4_26b_global", 16, 2, 512};
+        for (const int tokens : {1, 2, 3, 4, 5, 6}) {
+            for (const AttentionCase& test_case :
+                 {AttentionCase{tokens, 61, static_cast<std::uint32_t>(61 + tokens), 2700U + tokens},
+                  AttentionCase{tokens, 1000, static_cast<std::uint32_t>(1000 + tokens), 2710U + tokens}}) {
+                failures += run_a1_case(gemma4_global, DType::BF16, test_case, MappingPattern::Fragmented);
+                failures += run_a3_case(gemma4_global, DType::BF16, test_case, MappingPattern::Fragmented);
+            }
+        }
+        failures += run_batch_case(gemma4_global, DType::BF16,
+            {6, {61, 1127, 255}, {6, 5, 0}, {2, 0, 1}, MappingPattern::Fragmented, 2720U});
+        failures += run_batch_case(gemma4_global, DType::BF16,
+            {1, {61, 1127, 255, 3}, {1, 1, 0, 1}, {3, 0, 2, 1}, MappingPattern::Fragmented, 2721U});
     }
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")

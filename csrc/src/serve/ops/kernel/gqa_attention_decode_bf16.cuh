@@ -61,12 +61,31 @@ struct GqaSmallTTcSmem {
     static constexpr int kBytes      = kQkvBytes + kPBytes + kPageBytes + kBlockBytes;
 };
 
+/// The resident-query layout (`QResident`): the query tile keeps its own shared region beside
+/// the K/V tiles instead of being loaded once into registers and overwritten, and P stays in
+/// registers. A 512-wide head held its query fragments (128 registers) and a 512-wide output
+/// accumulator (256) at once and spilled about 1.4 KB a thread on every key tile; reading the
+/// query fragments from shared memory per k-step leaves only the accumulator in registers.
+template <typename Geometry, int RowWarps>
+struct GqaSmallTTcResidentSmem {
+    static constexpr int kBc        = GqaSmallTTcSmem<Geometry, 1>::kBc;
+    static constexpr int kQBytes    = RowWarps * 16 * Geometry::HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int kKvBytes   = 2 * kBc * Geometry::HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int kPageBytes = GqaSmallTTcSmem<Geometry, 1>::kPageBytes;
+    static constexpr int kBlockBytes = GqaSmallTTcSmem<Geometry, 1>::kBlockBytes;
+    static constexpr int kBytes     = kQBytes + kKvBytes + kPageBytes + kBlockBytes;
+};
+
 // LaneColumns: each lane's first column is lane_columns[lane] rather than column_begin + lane *
 // full_width -- prompt tiles of several sequences in one launch (#14's packed rounds). A
 // compile-time choice, so every other instantiation is the code it was.
+// QResident: the GqaSmallTTcResidentSmem layout. A lane step's rows may then span several CTAs
+// of Br rows each, gridDim.x / KVHeads of them per KV head; each scores, normalizes and
+// accumulates its rows exactly as one CTA holding every row would, so the output bits match.
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput, typename CacheT = __nv_bfloat16, bool Sparse = false,
-          int SparseBlock = 4, bool LaneColumns = false, int OutputChunk = Geometry::HeadDim>
+          int SparseBlock = 4, bool LaneColumns = false, int OutputChunk = Geometry::HeadDim,
+          bool QResident = false>
 __launch_bounds__(WarpsPerCta > 4 ? 256 : 128, WarpsPerCta > 4 ? 1 : 2)
 __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheT* cache_k,
@@ -80,8 +99,9 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 8);
     static_assert(OutputChunk > 0 && Geometry::HeadDim % OutputChunk == 0);
     static_assert(OutputChunk % 8 == 0);
-    static_assert(OutputChunk == Geometry::HeadDim || !CacheInput::writes_cache,
+    static_assert(OutputChunk == Geometry::HeadDim || !CacheInput::writes_cache || QResident,
                   "output slicing is only used over a populated cache");
+    static_assert(!QResident || !Sparse, "the resident-query layout has no QSA block list");
     static_assert(!LaneColumns || (MultiBatch && !CacheInput::writes_cache && !Sparse),
                   "lane columns are for batched launches over a populated cache");
 
@@ -135,17 +155,26 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     static_assert(Smem::kQkvBytes == QkvRows * D * static_cast<int>(sizeof(__nv_bfloat16)));
     static_assert(Smem::kPBytes == Wc * 16 * Bc * static_cast<int>(sizeof(__nv_bfloat16)));
     static_assert(Smem::kPageIds == PageIds);
+    using ResidentSmem = GqaSmallTTcResidentSmem<Geometry, RowWarps>;
+    static_assert(ResidentSmem::kBc == Bc);
     extern __shared__ __align__(16) unsigned char gqa_small_t_smem[];
+    // Shared layout: [Q/K | V | P | page ids | block ids], Q overwritten by K once its
+    // fragments are in registers; resident: [Q | K | V | page ids | block ids], P in registers.
+    constexpr int kQBytes     = QResident ? ResidentSmem::kQBytes : 0;
+    constexpr int kPagesAt    = QResident ? ResidentSmem::kQBytes + ResidentSmem::kKvBytes
+                                          : Smem::kQkvBytes + Smem::kPBytes;
     auto* qkv_s = reinterpret_cast<__nv_bfloat16*>(gqa_small_t_smem);
     auto* p_s   = reinterpret_cast<__nv_bfloat16*>(gqa_small_t_smem + Smem::kQkvBytes);
-    auto* physical_pages_s =
-        reinterpret_cast<std::int32_t*>(gqa_small_t_smem + Smem::kQkvBytes + Smem::kPBytes);
-    auto* block_ids_s = reinterpret_cast<std::uint16_t*>(gqa_small_t_smem + Smem::kQkvBytes +
-                                                         Smem::kPBytes + Smem::kPageBytes);
-    __nv_bfloat16* k_s = qkv_s;
-    __nv_bfloat16* v_s = qkv_s + Bc * D;
+    auto* physical_pages_s = reinterpret_cast<std::int32_t*>(gqa_small_t_smem + kPagesAt);
+    auto* block_ids_s =
+        reinterpret_cast<std::uint16_t*>(gqa_small_t_smem + kPagesAt + Smem::kPageBytes);
+    __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(gqa_small_t_smem + kQBytes);
+    __nv_bfloat16* v_s = k_s + Bc * D;
 
-    const int kv_head     = static_cast<int>(blockIdx.x);
+    // A resident-query launch gives each KV head gridDim.x / KVHeads CTAs, one per Br rows.
+    const int row_parts   = QResident ? static_cast<int>(gridDim.x) / Geometry::KVHeads : 1;
+    const int kv_head     = static_cast<int>(blockIdx.x) / row_parts;
+    const int row_base    = (static_cast<int>(blockIdx.x) - kv_head * row_parts) * Br;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -181,8 +210,10 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
     }
 
+    // This CTA's rows: all of them unless a resident-query launch split them over row_parts.
+    const int row_end = QResident ? min(row_count, row_base + Br) : row_count;
     auto write_neutral = [&]() {
-        for (int row = tid; row < row_count; row += Threads) {
+        for (int row = row_base + tid; row < row_end; row += Threads) {
             int q_head = 0;
             int token  = 0;
             gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
@@ -192,7 +223,7 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
                 partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = 0.0f;
             }
         }
-        for (int idx = tid; idx < row_count * D; idx += Threads) {
+        for (int idx = row_base * D + tid; idx < row_end * D; idx += Threads) {
             const int row = idx / D;
             const int d   = idx - row * D;
             int q_head    = 0;
@@ -210,10 +241,12 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     // CTA used to return without writing anything, and a group of sixty-four over two warps
     // found that the silent way -- zeros for output and a cache row never appended. An
     // impossible state is reported as one instead of read as an answer.
-    if (tokens > TokenTile || row_count > Br) { __trap(); }
+    if (tokens > TokenTile || row_count > Br * row_parts) { __trap(); }
     if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || split_count <= 0) {
         return;
     }
+    // A row part past a narrower call's rows has nothing to write (the first part appends).
+    if (QResident && row_base >= row_count) { return; }
     if (valid_tokens == 0) {
         write_neutral();
         return;
@@ -303,8 +336,10 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
 
     if constexpr (CacheInput::writes_cache) {
         // The owning split writes each new row. Current attention reads those rows directly from
-        // input below, so no split depends on another split's cache write.
-        for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
+        // input below, so no split depends on another split's cache write. Of a head's row parts
+        // the first writes.
+        const int append_chunks = !QResident || row_base == 0 ? valid_tokens * (D / 8) : 0;
+        for (int chunk = tid; chunk < append_chunks; chunk += Threads) {
             const int token = chunk / (D / 8);
             const int d     = (chunk - token * (D / 8)) * 8;
             const int p_tok = pos[token];
@@ -335,16 +370,17 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     }
 
     for (int idx = tid; idx < Br * D; idx += Threads) {
-        const int row = idx / D;
-        const int d   = idx - row * D;
-        int q_head    = 0;
-        int token     = 0;
+        const int local = idx / D;
+        const int row   = row_base + local;
+        const int d     = idx - local * D;
+        int q_head      = 0;
+        int token       = 0;
         gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
         __nv_bfloat16 value = __float2bfloat16(0.0f);
         if (row < row_count && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
             value = q[gqa_q_index<Geometry>(q_head, d, token)];
         }
-        qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
+        qkv_s[local * D + gqa_small_t_tc_swz(local, d)] = value;
     }
     __syncthreads();
 
@@ -358,19 +394,25 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    const int warp_row0 = (warp % RowWarps) * 16;
+    // warp_row0 is this warp's first row of the lane step; local_row0 the same row in qkv_s.
+    const int local_row0   = (warp % RowWarps) * 16;
+    const int warp_row0    = row_base + local_row0;
     const int output_begin = (warp / RowWarps) * OutputChunk;
     __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
 
-    unsigned af_q[QKKs][4];
+    // Resident: the fragments are read from qkv_s at each k-step instead (one ldmatrix per
+    // k-step and key tile), so none of the QKKs x 4 registers are held across the key loop.
+    unsigned af_q[QResident ? 1 : QKKs][4];
+    if constexpr (!QResident) {
 #pragma unroll
-    for (int k = 0; k < QKKs; ++k) {
-        const int arow = warp_row0 + a_rowoff;
-        const int acol = k * 16 + a_coloff;
-        ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
-                    smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+        for (int k = 0; k < QKKs; ++k) {
+            const int arow = local_row0 + a_rowoff;
+            const int acol = k * 16 + a_coloff;
+            ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                        smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+        }
+        __syncthreads();
     }
-    __syncthreads();
     int physical_page = physical_pages_s[0];
     float acc[PVNt][4];
 #pragma unroll
@@ -385,10 +427,58 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         if (!Sparse && kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
+        // Resident, e4m3 cache: a tile wholly inside the split and already in the cache (every
+        // tile but the last of a decode call) loads kStageGroup chunks' codes before widening
+        // any. The loop below widens each chunk as it lands, one DRAM round trip after
+        // another, sixteen per thread and tile on a 512-wide head.
+        bool staged = false;
+        if constexpr (QResident && kFp8Cache) {
+            // Six warps (a group-6 head's three row warps) do not divide a tile: the last
+            // group then holds chunks past its end, which load and store nothing.
+            constexpr int kChunks     = Bc * (D / 8);
+            constexpr bool kRagged    = kChunks % Threads != 0;
+            constexpr int kPerThread  = (kChunks + Threads - 1) / Threads;
+            constexpr int kStageGroup = kPerThread < 4 ? kPerThread : 4;
+            static_assert(kRagged || kPerThread % kStageGroup == 0);
+            bool cached_tile = k0 >= split_start && k0 + Bc <= split_end;
+            if constexpr (CacheInput::writes_cache) {
+                cached_tile = cached_tile && k0 + Bc <= first_pos;
+            }
+            if (cached_tile) {
+#pragma unroll 1
+                for (int group = 0; group < kPerThread; group += kStageGroup) {
+                    int2 k_raw[kStageGroup];
+                    int2 v_raw[kStageGroup];
+#pragma unroll
+                    for (int i = 0; i < kStageGroup; ++i) {
+                        const int chunk = tid + (group + i) * Threads;
+                        if (kRagged && chunk >= kChunks) { continue; }
+                        const int key_l = chunk / (D / 8);
+                        const int d     = (chunk - key_l * (D / 8)) * 8;
+                        const std::int64_t off = gqa_cache_index<Geometry>(
+                            physical_page, kv_head, d, (k0 + key_l) & kPagedKVPageMask);
+                        k_raw[i] = load_vec<int2>(&cache_k[off]);
+                        v_raw[i] = load_vec<int2>(&cache_v[off]);
+                    }
+#pragma unroll
+                    for (int i = 0; i < kStageGroup; ++i) {
+                        const int chunk = tid + (group + i) * Threads;
+                        if (kRagged && chunk >= kChunks) { continue; }
+                        const int key_l = chunk / (D / 8);
+                        const int d     = (chunk - key_l * (D / 8)) * 8;
+                        store_vec(&k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)],
+                                  gqa_kv_dequant_fp8x8_raw(k_raw[i]));
+                        store_vec(&v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)],
+                                  gqa_kv_dequant_fp8x8_raw(v_raw[i]));
+                    }
+                }
+                staged = true;
+            }
+        }
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+        for (int chunk = staged ? Bc * (D / 8) : tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l      = chunk / (D / 8);
             const int d          = (chunk - key_l * (D / 8)) * 8;
             const int key        = Sparse ? gathered_key(kb, key_l) : k0 + key_l;
@@ -433,18 +523,45 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         __syncthreads();
 
         float score[QKNt][4];
+        if constexpr (QResident) {
+            // k outer, so each query fragment is read once per tile. Every score[nt] still
+            // accumulates k = 0, 1, ... in order: the same MMAs on the same values as below.
 #pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+            for (int nt = 0; nt < QKNt; ++nt) {
+                score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+            }
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int brow = nt * 8 + b_rin;
-                const int bcol = k * 16 + b_koff;
-                ldmatrix_x2(bf[0], bf[1],
-                            smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
-                         af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                unsigned aq[4];
+                const int arow = local_row0 + a_rowoff;
+                const int acol = k * 16 + a_coloff;
+                ldmatrix_x4(aq[0], aq[1], aq[2], aq[3],
+                            smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    unsigned bf[2];
+                    const int brow = nt * 8 + b_rin;
+                    const int bcol = k * 16 + b_koff;
+                    ldmatrix_x2(bf[0], bf[1],
+                                smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
+                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], aq[0], aq[1],
+                             aq[2], aq[3], bf[0], bf[1]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < QKKs; ++k) {
+                    unsigned bf[2];
+                    const int brow = nt * 8 + b_rin;
+                    const int bcol = k * 16 + b_koff;
+                    ldmatrix_x2(bf[0], bf[1],
+                                smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
+                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
+                             af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                }
             }
         }
 
@@ -507,6 +624,15 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
         const float beta1 = (bm1 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm1 - nm1) * Log2E);
 
         float bl0 = 0.0f, bl1 = 0.0f;
+        // Resident: P goes straight into the PV MMA's A fragments. Score tile nt holds keys
+        // nt * 8 + 2 * lid and + 1 of rows gid and gid + 8, which is the A operand's register
+        // (nt % 2) * 2 (row gid) and + 1 (row gid + 8) of k-step nt / 2 -- the registers the
+        // ldmatrix of p_sw below would load, rounded to bf16 the same way.
+        unsigned pa[QResident ? PVKs : 1][4];
+        const auto pack_p = [](float lo, float hi) {
+            const __nv_bfloat162 pair = __floats2bfloat162_rn(lo, hi);
+            return *reinterpret_cast<const unsigned*>(&pair);
+        };
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
             const int col0  = nt * 8 + 2 * lid;
@@ -525,10 +651,15 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
                                   : 0.0f;
             bl0 += p00 + p01;
             bl1 += p10 + p11;
-            p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
-            p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
-            p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-            p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            if constexpr (QResident) {
+                pa[nt / 2][(nt % 2) * 2]     = pack_p(p00, p01);
+                pa[nt / 2][(nt % 2) * 2 + 1] = pack_p(p10, p11);
+            } else {
+                p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
+                p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
+                p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
+                p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            }
         }
         bl0 = warp_sum<4>(bl0, FullMask);
         bl1 = warp_sum<4>(bl1, FullMask);
@@ -545,9 +676,16 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
-                const int pcol = k * 16 + a_coloff;
-                ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
-                            smem_addr(&p_sw[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
+                if constexpr (QResident) {
+                    pf[0] = pa[k][0];
+                    pf[1] = pa[k][1];
+                    pf[2] = pa[k][2];
+                    pf[3] = pa[k][3];
+                } else {
+                    const int pcol = k * 16 + a_coloff;
+                    ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                                smem_addr(&p_sw[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
+                }
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = output_begin + n * 8;

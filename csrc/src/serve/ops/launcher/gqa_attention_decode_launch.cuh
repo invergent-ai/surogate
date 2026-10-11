@@ -170,9 +170,54 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         return;
     }
     const auto dense = [&]<bool LaneColumns>() {
-        // Wide cached prompt tiles otherwise spill their 512-wide output accumulator
-        // alongside the query fragments. Two output groups share the K/V tile while
-        // each warp accumulates only 256 dimensions. Decode and sparse calls stay as-is.
+        // A 512-wide head held its query fragments and its 512-wide output accumulator in
+        // registers at once and spilled about 1.4 KB a thread on every key tile, decode and
+        // verification included; a 256-wide head spilled 150 to 250 bytes (ptxas, sm_121a). The
+        // resident-query kernel keeps the query tile in shared memory (GqaSmallTTcResidentSmem),
+        // each warp accumulating 128 output dimensions of 16 rows, at most eight warps a CTA:
+        // a 512-wide tile of more than 32 rows spans two CTAs (its shared tiles fit 32), a
+        // 256-wide one fits whole. (256 dimensions a warp still spilled about 250 bytes.) Every
+        // output value is the same arithmetic on the same operands as before.
+        // SUROGATE_SERVE_GQA_RESIDENT_Q=0 keeps the old route: wide cached prompt tiles in two
+        // output groups, everything else whole.
+        constexpr bool kResidentCapable = Geometry::HeadDim == 512 || Geometry::HeadDim == 256;
+        constexpr int kRows = TokenTile * Geometry::GroupSize;
+        constexpr int kMaxRowWarps = Geometry::HeadDim == 512 ? 2 : 4;
+        constexpr int kResidentRowWarps = std::min((kRows + 15) / 16, kMaxRowWarps);
+        constexpr int kRowParts = (kRows + 16 * kResidentRowWarps - 1) / (16 * kResidentRowWarps);
+        if constexpr (kResidentCapable) {
+            if (gqa_resident_query_enabled(Geometry::HeadDim)) {
+                constexpr int kOutputChunk = 128;
+                constexpr int kWarps = kResidentRowWarps * (Geometry::HeadDim / kOutputChunk);
+                static_assert(kWarps <= 8);
+                constexpr int kSmem = GqaSmallTTcResidentSmem<Geometry, kResidentRowWarps>::kBytes;
+                static_assert(kSmem <= 99 * 1024, "a resident tile must fit a block's shared memory");
+                const auto kernel = gqa_attention_small_t_tc_partial_bf16_kernel<
+                    Geometry, TokenTile, kWarps, MultiBatch, Masked, CacheInput, CacheT, false, 4,
+                    LaneColumns, kOutputChunk, true>;
+                CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+                const dim3 resident_grid(Geometry::KVHeads * kRowParts, splits,
+                                         invocation.batch_size);
+                kernel<<<resident_grid, 32 * kWarps, kSmem, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data), input,
+                    static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
+                    static_cast<CacheT*>(cache_v.data),
+                    static_cast<const std::int32_t*>(cache.block_tables.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                    cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                    invocation.column_begin, logical_capacity, invocation.sliding_window, scale,
+                    static_cast<float*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    GqaBlockMask{}, lane_columns_of(invocation));
+                return;
+            }
+        }
         constexpr bool kSplitOutput = Geometry::HeadDim == 512 && TokenTile >= 8 &&
                                       !CacheInput::writes_cache;
         constexpr int kDenseWarps = kSplitOutput ? 8 : WarpsPerCta;

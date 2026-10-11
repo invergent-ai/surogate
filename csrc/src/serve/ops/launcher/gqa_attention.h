@@ -41,6 +41,13 @@ std::int32_t gqa_attention_split_capacity(std::int32_t head_dim, std::int32_t q_
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 
+// Whether heads `head_dim` wide (256 or 512) take the resident-query small-T kernel.
+// SUROGATE_SERVE_GQA_RESIDENT_Q: unset or 1 both, 0 neither, 256 or 512 that width only. The
+// setter (both widths) lets a test run both routes in one process; a captured graph keeps the
+// route it was captured with.
+bool gqa_resident_query_enabled(std::int32_t head_dim);
+void set_gqa_resident_query_enabled(bool enabled);
+
 // Widest small-T step this head geometry serves: the lane step packs
 // width x group query rows and holds at most 64, so a group of twelve
 // (24 query heads over 2 KV heads) steps 5 tokens, the others 6.
