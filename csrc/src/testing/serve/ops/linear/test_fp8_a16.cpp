@@ -45,6 +45,9 @@ int run_fp8_a16() {
         Invocation{25, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{49, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{56, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {248320, 5120, 823U, Comparison::Sampled, true, vocabulary_invocations});

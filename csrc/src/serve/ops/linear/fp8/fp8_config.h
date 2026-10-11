@@ -102,7 +102,7 @@ template <int KWarps, int TileTokens, int MinBlocksPerSm,
 struct Fp8A16MmaSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
-                  TileTokens == 40 || TileTokens == 48);
+                  TileTokens == 40 || TileTokens == 48 || TileTokens == 56 || TileTokens == 64);
     static_assert(MinBlocksPerSm > 0);
 
     static constexpr int kKWarps            = KWarps;
@@ -129,7 +129,9 @@ using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 
 inline constexpr std::int32_t kFp8VocabularyFirstA16MmaT = 1;
-inline constexpr std::int32_t kFp8VocabularyLastA16MmaT  = 48;
+/// One call scores up to 64 columns, one pass over the 1.27 GB head: a speculative round at
+/// eight lanes verifies 8 x 8 (DFlash) or 16 x 4 (MTP) columns, which took two passes at 48.
+inline constexpr std::int32_t kFp8VocabularyLastA16MmaT  = 64;
 
 template <int ActiveTokens>
 struct Fp8VocabularyA16MmaProductionSchedule {
@@ -141,7 +143,9 @@ struct Fp8VocabularyA16MmaProductionSchedule {
                                            : ActiveTokens <= 24 ? 24
                                            : ActiveTokens <= 32 ? 32
                                            : ActiveTokens <= 40 ? 40
-                                                                : 48;
+                                           : ActiveTokens <= 48 ? 48
+                                           : ActiveTokens <= 56 ? 56
+                                                                : 64;
     static constexpr int kKWarps         = ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
     static constexpr int kMinBlocksPerSm = kKWarps == 16 ? 1 : 2;
     using Type                           = Fp8A16MmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
