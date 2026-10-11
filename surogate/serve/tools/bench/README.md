@@ -232,4 +232,14 @@ tokens (a system prompt every agent shares, its own task, and earlier tool calls
 appends one reply and one tool result per turn until the prompt reaches `--max`. Per turn it
 records the cached tokens the server reports (`usage.prompt_tokens_details.cached_tokens`; vLLM
 needs `--enable-prompt-tokens-details`), the time to first token and the decode speed, and
-summarizes the cold first turn apart from the warm ones.
+summarizes the cold first turn apart from the warm ones. A turn's first token is the first of
+either channel: a server that splits off a thought the model opened (thinking asked off) streams
+it as `reasoning_content`, where one without a reasoning parser streams it as content.
+
+`--tools` makes the turns real tool calls: the history is `read_file` calls and their results,
+the model is given `read_file`, `search` and `run_shell`, writes its own calls and stops on its
+own (no `ignore_eos`), and every call is answered with a corpus piece. Use it for anything about
+speculative decoding: the default mode's greedy replies turn repetitive, which a draft head
+predicts almost perfectly. Tool calls reach the client only when the reply ends, so `--tools`
+requests are not streamed; a turn records its latency, and the server's request log
+(`--request-log-jsonl`) gives the time to first token, decode speed and draft acceptance.

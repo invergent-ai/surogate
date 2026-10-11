@@ -104,7 +104,9 @@ Each comparison ran both engines on the same kind of GPU with the same requests.
 | DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 32 users, decode | **473.6 tok/s** | vLLM: 406.4 | **1.17×** |
 | DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 8 users, 2,048-token prompts, prefill | **6,042 tok/s** | vLLM: 5,069 | **1.19×** |
 | DGX Spark | Surogate3.7-35B-A3B · NVFP4 | cold 108k-token prompt, time to first token | **22.2 s** | vLLM: 32.4 s | **1.46×** |
-| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | agents at 100k-200k context, warm-turn time to first token (p50), 1 / 8 agents | 2.2 s / **4.7 s** | vLLM: 1.8 s / 7.6 s | 0.82× / **1.62×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | agents at 100k-200k context, warm-turn time to first token (p50), 1 / 8 agents | **1.1 s / 1.9 s** | vLLM: 1.8 s / 7.6 s | **1.62× / 4.02×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 8 agents at 100k-200k context, turns a minute | **15.9** | vLLM: 8.6 | **1.85×** |
+| DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 1M-token context with YaRN: cold prompt, then decode | 946 s, 15.6 tok/s | not measured | — |
 | DGX Spark | Surogate3.7-35B-A3B · NVFP4 | 16 users, real text, MTP | **444.7 tok/s** (362.8 without MTP) | not measured | — |
 | DGX Spark | Qwen3-8B · FP8 | 1 user, decode | **28.8 tok/s** | vLLM: 22.4 | **1.29×** |
 | DGX Spark | Qwen3-8B · FP8 | 8 users, decode | **182.4 tok/s** | vLLM: 153.6 | **1.19×** |
@@ -116,6 +118,13 @@ Each comparison ran both engines on the same kind of GPU with the same requests.
 | DGX Spark | Qwen3.8-27B · NVFP4 | 1 user, real text, MTP | **29.1 tok/s** | vLLM (MTP): 18.6 | **1.56×** |
 | DGX Spark | Qwen3.8-27B · NVFP4 | 8 users, real text, MTP | **199.4 tok/s** | vLLM (MTP): 129.4 | **1.54×** |
 | DGX Spark | Qwen3.8-27B · NVFP4 | 16 users, real text, MTP | **279.9 tok/s** | vLLM (MTP): 188.3 | **1.49×** |
+| DGX Spark | Gemma 4 12B · NVFP4 | 32 users, decode | **483.2 tok/s** | vLLM: 409.6 | **1.18×** |
+| DGX Spark | Gemma 4 31B · NVFP4 | 8 users, decode per user | **7.7 tok/s** | vLLM: 6.1 | **1.26×** |
+| DGX Spark | Gemma 4 31B · NVFP4 | 8 users, 2,048-token prompts, prefill | 1,106 tok/s | vLLM: 1,597 | 0.69× |
+| DGX Spark | Gemma 4 E4B · NVFP4 | 32 users, decode | 972.8 tok/s | vLLM: 976.0 | 1.00× |
+| DGX Spark | Gemma 3 12B · NVFP4 | 32 users, decode | **480.0 tok/s** | vLLM: 406.4 | **1.18×** |
+| DGX Spark | Gemma 4 26B-A4B · NVFP4, DFlash | 32 users, decode | 889.6 tok/s | vLLM (DFlash): 889.6 | 1.00× |
+| DGX Spark | Gemma 4 26B-A4B · NVFP4 | agents at 100k-200k context, warm-turn time to first token (p50), 1 / 4 agents | **2.4 s / 3.5 s** | vLLM: 7.2 s / 8.4 s | **3.03× / 2.41×** |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 1 user, decode | **31.4 tok/s** (with MTP: 45.9 on real text, 67.2 on benchmark prose) | vLLM: does not fit in 121.7 GiB | — |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | 16 users, real text, MTP | **115.7 tok/s** (97.2 without MTP) | vLLM: does not fit | — |
 | DGX Spark | Qwen3.8-Flash-Next · NVFP4 | cold 32k-token prompt, prefill | **2,008 tok/s** | llama.cpp (UD-IQ4_XS GGUF): 629 | **3.2×** |

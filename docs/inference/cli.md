@@ -46,6 +46,7 @@ from earlier tokens; its capacity affects how many requests can run together.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--max-model-len N\|auto` | `auto` | Context limit per request; `auto` fits available GPU memory up to the model's maximum |
+| `--rope-scaling JSON` | off | Extend the context with YaRN (see [Context past the model's native length](#context-past-the-models-native-length)) |
 | `--kv-capacity N\|auto` | follows context | Total cache capacity in tokens; `auto` sizes from free GPU memory, leaving 1024 MiB |
 | `--kv-cache-dtype auto\|fp8\|bf16\|int8` | `auto` | Choose cache precision automatically for the model, or force a specific format |
 | `--kv-cache-dtype-skip-layers L,...` | none | Keep the listed attention layers' cache at BF16 |
@@ -66,6 +67,25 @@ its pages are too scattered to fit, and then only while that 1024 MiB is still f
 When `--max-model-len` is automatic, omitted `--kv-capacity` also defaults to `auto`. When
 context is explicit, omitted cache capacity defaults to that same token count. Use
 `--kv-capacity auto` explicitly to make more cache available for simultaneous requests.
+
+#### Context past the model's native length
+
+`--rope-scaling` takes the Hugging Face `rope_scaling` object, as vLLM does, and serves the
+model with YaRN: the context limit becomes the original length times `factor`. Qwen3.5 / 3.6
+MoE checkpoints (Surogate3.7-35B-A3B, Qwen3.6-35B-A3B) are trained to 262,144 tokens; factor 4
+serves them to 1,048,576:
+
+```bash
+surogate serve surogate/Surogate3.7-35B-A3B-NVFP4 --max-model-len 1048576 \
+  --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'
+```
+
+Only `rope_type: "yarn"` is accepted, with optional `beta_fast` (32), `beta_slow` (1) and
+`attention_factor` (0.1 ln factor + 1); the checkpoint's own rope keys may be included and are
+ignored. Other model families refuse the flag. No reconversion is needed. YaRN changes the
+rotation for every position, so it costs a little quality below the native length (about 0.02
+nats per token at 95k on the 35B); turn it on only where longer contexts are needed. A cold
+million-token prompt takes about 16 minutes on a DGX Spark; later turns reuse the cache.
 
 Compatible conversation context is cached automatically, including after a response
 ends on EOS or a stop string. Completed conversations can also be reused after an
@@ -446,7 +466,7 @@ the model's chat template.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--reasoning-parser NAME` | `qwen3` | Read reasoning in the model's output format; also accepts `deepseek_r1`, `glm4_moe`, `think`, or `none`/`off` |
-| `--tool-call-parser NAME` | `qwen3_xml` | Read tool calls; also accepts `hermes`, `spark25`, `muse_glimmer`, `llama3_json`, `llama4_json`, or `none`/`off` |
+| `--tool-call-parser NAME` | `qwen3_xml` (`gemma4` for Gemma 4) | Read tool calls; also accepts `hermes`, `spark25`, `muse_glimmer`, `llama3_json`, `llama4_json`, `gemma4`, or `none`/`off`. A Gemma 4 checkpoint gets `gemma4` unless the flag names another; that parser does not constrain `tool_choice: "required"` or a named function, and refuses them |
 | `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
 | `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
 

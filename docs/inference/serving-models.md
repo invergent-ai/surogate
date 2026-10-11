@@ -44,7 +44,9 @@ Adjust the settings to your workload:
 - **Simultaneous requests:** `--max-num-seqs` defaults to 1. Raise it to serve more users at
   once. `--kv-capacity auto` uses available GPU memory for the conversation cache.
 - **Context length:** `--max-model-len` defaults to `auto`. Set a number, as above, to choose
-  a specific limit for each request. Longer conversations need more memory.
+  a specific limit for each request. Longer conversations need more memory. A Qwen3.5 / 3.6
+  mixture (Surogate3.7-35B-A3B, Qwen3.6-35B-A3B) serves past its native 262,144 tokens, to a
+  million, with `--rope-scaling` (YaRN; see the [CLI reference](cli.md#context-past-the-models-native-length)).
 - **Cache precision:** the default `auto` chooses FP8 for this Qwen3.6 model. Use
   `--kv-cache-dtype bf16` for BF16 precision; it needs more memory.
 - **Generation speed:** try `--spec mtp --draft-tokens 3` when the checkpoint includes MTP
@@ -185,6 +187,15 @@ for media requests.
 For a GGUF, supply the matching projector with `--mmproj`. To save GPU memory, add
 `--offload-vision`, `--offload-embeddings`, or `--offload-output-head`. These options also
 work when the decoder spans multiple GPUs.
+
+### Gemma 4 tool calls
+
+Gemma 4 writes a tool call in its own notation, `<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>`,
+not in JSON. A server for a Gemma 4 checkpoint reads it with the `gemma4` tool-call parser
+automatically, so OpenAI clients receive ordinary `tool_calls` (start the server with
+`--enable-auto-tool-choice` for `tool_choice: "auto"`). Streaming holds the call back and sends
+the parsed call when the reply ends. `tool_choice: "required"` and a named function are refused
+with that parser: Gemma 4's notation has no grammar to constrain the reply with.
 
 ## Gemma 4 mixture in NVFP4
 
@@ -426,7 +437,10 @@ token after the one chosen before it. Its blocks are 8 tokens, so serve it with
 instead of walking the candidates, to measure what the selector adds.
 
 The drafter was trained against the base model. A fine-tune accepts fewer of its drafts;
-measure acceptance on your own prompts. On a fine-tuned 26B-A4B, seven draft tokens were faster
+measure acceptance on your own prompts. With real tool calls at 100k-200k tokens of context,
+Surogate3.7-35B-A3B (a fine-tuned merge) accepted 26-27% of the stock Qwen3.6-35B-A3B DFlash 2
+drafter's tokens and 78-81% of its own MTP head's, so it is served with `--spec mtp
+--draft-tokens 3`. On a fine-tuned 26B-A4B, seven draft tokens were faster
 than three or fifteen, and faster than `--spec-adaptive`. Speculation speeds up generation,
 including the thinking of a decision request with `"thinking": true`. It does not speed up
 one-pass decisions, which generate one token.

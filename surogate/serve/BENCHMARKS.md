@@ -1,5 +1,99 @@
 # Serving benchmarks
 
+## DGX Spark: Gemma, agent workloads and a million-token context — 2026-10-11
+
+One DGX Spark (GB10, 121.7 GiB unified memory), our engine with FP8 KV against vLLM 0.31 (BF16
+KV: its FP8 cache does not start on the GB10). One server at a time. Builds are named in each
+table; the vLLM rows are vLLM 0.31's from 2026-10-08 to 2026-10-11.
+
+### Gemma, 512 tokens in / 128 out (`gemma/bench_w.py`), build 7ab0f19
+
+Cells are tokens/s per user · total, first token p50 in brackets. Long prompt: 2,048 tokens in, 16
+out, 8 users, prompt tokens/s (first token).
+
+| Model | Load | Surogate | vLLM |
+|---|---|---|---|
+| Gemma 4 12B NVFP4 | 8 users | **21.8 · 172.8** (142 ms) | 19.1 · 147.2 (194 ms) |
+| Gemma 4 12B NVFP4 | 32 users | **13.9 · 483.2** (189 ms) | 12.3 · 409.6 (348 ms) |
+| Gemma 4 12B NVFP4 | long prompt | **4,659** (1,723 ms) | 4,454 (833 ms) |
+| Gemma 4 31B NVFP4 | 8 users | **7.7 · 61.4** (1,215 ms) | 6.1 · 47.4 (737 ms) |
+| Gemma 4 31B NVFP4 | 32 users | 4.5 · 122.9 (**1,724 ms**) | 4.5 · 122.9 (3,306 ms) |
+| Gemma 4 31B NVFP4 | long prompt | 1,106 (9,444 ms) | **1,597** (3,344 ms) |
+| Gemma 4 E4B NVFP4 | 32 users | 30.5 · 972.8 (**82 ms**) | 31.4 · 976.0 (105 ms) |
+| Gemma 4 E4B NVFP4 | long prompt | **10,598** (359 ms) | 10,547 (373 ms) |
+| Gemma 3 12B NVFP4 | 32 users | **13.8 · 480.0** (191 ms) | 11.2 · 406.4 (369 ms) |
+| Gemma 3 12B NVFP4 | long prompt | **5,123** (1,520 ms) | 4,662 (840 ms) |
+| Gemma 4 26B-A4B NVFP4 + z-lab DFlash (7) | 32 users | 31.3 · 889.6 (**497 ms**) | 34.0 · 889.6 (836 ms) |
+
+The long-prompt first token is later on our engine at equal or higher prompt throughput: in this
+closed loop each request's whole latency is prompt plus 16 decoded tokens, and ours decodes
+faster (Gemma 4 12B 8.3 against 5.3 tok/s per user), so the time per request is level or better.
+
+### Agent turns at 100k-200k tokens (`agentic_long_bench.py`)
+
+Each agent opens at ~100k tokens and appends a 200-token reply and a 1-4k-token tool result per
+turn to 200k; thinking off. Warm turns reuse the conversation's cache.
+
+Gemma 4 26B-A4B (FP8-text artifact):
+
+| | 1 agent | 4 agents |
+|---|---|---|
+| Warm turn first token p50 / p90, 38b8692 | 4.56 / 6.87 s | 6.97 / 10.81 s |
+| Same, 0123eb3 (512-wide heads' FP8 query-key product) | **2.38 / 3.46 s** | **3.47 / 5.07 s** |
+| vLLM | 7.20 / 13.70 s | 8.35 / 12.81 s |
+| Cold first turn (p50), 0123eb3 · vLLM | **37.5 s** · 117.6 s | **121 s** · 288 s |
+| Decode per agent, 0123eb3 · vLLM | **31.3** · 23.3 tok/s | **11.6** · 5.4 tok/s |
+| Turns a minute, 0123eb3 · vLLM | **6.1** · 3.0 | **9.5** · 4.3 |
+| Turns that lost their cache, 0123eb3 · vLLM | 0 · 3 | 0 · 5 |
+
+With the z-lab DFlash drafter (7 tokens) one agent decodes at 50.4 tok/s (41% of drafts accepted).
+
+Surogate3.7-35B-A3B NVFP4, build 0123eb3, against vLLM's rows of 2026-10-08:
+
+| | 1 agent | 4 agents | 8 agents |
+|---|---|---|---|
+| Warm turn first token p50 / p90 | **1.11 / 1.62 s** | **1.69 / 2.43 s** | **1.88 / 2.53 s** |
+| vLLM | 1.80 / 2.84 s | 3.87 / 7.73 s | 7.55 / 13.08 s |
+| Cold first turn p50 · vLLM | **22.1 s** · 34.7 s | **64.1 s** · 89.8 s | **121.5 s** · 161.0 s |
+| Decode per agent · vLLM | **46.2** · 35.2 tok/s | **15.4** · 11.1 tok/s | **8.6** · 5.1 tok/s |
+| Turns a minute · vLLM | **9.9** · 7.0 | **14.2** · 9.0 | **15.9** · 8.6 |
+| Turns that lost their cache · vLLM | 0 · 1 | 0 · 11 | 0 · 12 |
+
+### Real tool calls: MTP against DFlash 2 on Surogate3.7-35B-A3B (`agentic_long_bench.py --tools`)
+
+The prose mode's greedy replies turn repetitive (an MTP head accepted 97.9% of its drafts there),
+so speculation is compared with `--tools`: the model writes its own calls (about 32-39 tokens a
+turn, every turn a call) and stops on its own. Server-side numbers from the request logs
+(`gemma/reqlog_sum.py`), build 0123eb3:
+
+| | Turn latency p50 / p90 | Decode p50 | Drafts accepted | Tokens a round | Turns a minute |
+|---|---|---|---|---|---|
+| 1 agent, no speculation | 1.78 / 2.41 s | 46.7 tok/s | - | - | 26.7 |
+| 1 agent, MTP 3 | **1.46 / 2.11 s** | **96.2 tok/s** | 81.5% | 3.56 | **30.8** |
+| 1 agent, DFlash 2 (7, stock drafter) | 1.61 / 2.53 s | 53.5 tok/s | 27.3% | 3.01 | 28.0 |
+| 4 agents, MTP 3 | 4.87 / **6.95 s** | **15.0 tok/s** | 80.6% | 3.52 | **34.5** |
+| 4 agents, DFlash 2 | **4.61** / 7.55 s | 13.3 tok/s | 26.2% | 2.93 | 31.2 |
+| 8 agents, MTP 3 | 5.82 / 9.56 s | 9.7 tok/s | 77.7% | 3.42 | 35.5 |
+
+At four agents and more each turn's cost is mostly the appended tool result's prompt at ~150k
+tokens of context: the server saturates at about 35 turns a minute.
+
+### A million-token context with YaRN (5110824)
+
+Surogate3.7-35B-A3B, `--rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'`,
+no speculation. Three passphrases at 10, 50 and 90% of a haystack of this repository's sources,
+asked for together after one cold prompt (`gemma/needle.py`):
+
+| Prompt | Without YaRN | YaRN | Decode after it |
+|---|---|---|---|
+| 203,377 tokens | 3/3, 59 s | 3/3, 59 s | 42.3 tok/s |
+| 403,459 tokens | refused | 3/3, 183 s | 30.6 tok/s |
+| 1,000,667 tokens | refused | 3/3, 946 s | 15.6 tok/s |
+
+Decode time grows by 4.94 ms per GB of cache read (about 202 GB/s effective, 74% of the GB10's
+273 GB/s). Below the native 262,144 tokens YaRN costs +0.021 ± 0.008 nats on the tokens of a
+900-token answer given its 94,631-token document (top-1 97.0% to 96.6%).
+
 ## Parallel constrained decoding — 2026-09-16
 
 TinyLlama-1.1B Q5_K_M, one HTTP client, physical **GPU 7 (RTX 5090, PCIe x8,

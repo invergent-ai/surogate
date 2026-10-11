@@ -4692,3 +4692,298 @@ this repository's sources (`gemma/needle.py`):
 Below the native context YaRN costs a little, as Qwen documents for static YaRN: the tokens of a
 900-token answer scored given its 94,631-token document, +0.021 ± 0.008 nats against the native
 rotation (top-1 97.0% -> 96.6%). Serve it where contexts past 262,144 are wanted.
+
+## 124
+
+**NVFP4 on the dense Gemma 4, the E-series and Gemma 3; Gemma 4's thought kept out of the answer
+(2026-10-10).** Of the Gemma targets only the 26B-A4B mixture took NVFP4 linears: the dense Gemma
+4, E-series and Gemma 3 targets bound none, and the NVFP4 activation quantizer was built for no
+other Gemma width. Every quantised Gemma 4 export so far drops `response_template` and keeps only
+its channel tokens, which are special, so an answer decoded with specials skipped published
+`thought\n` and the whole thought as content.
+
+- **NVFP4 bindings** (63fcd46) on `gemma4`, `gemma4_e` and `gemma3`: each matrix's divisors come
+  through `materialized_linear` (`WeightPlan::linear`); an NVFP4 export's gate and up are one
+  `mlp/gate_up` matrix, one matmul whose two halves `gelu_mul_fused` reads in place; the workspace
+  is sized from the artifact's stored formats; LoRA is refused on a fused feed-forward.
+- **Gemma widths and a one-token GEMV** (`ops/linear/nvfp4/nvfp4_config.h`).
+  `SINFER_NVFP4_FOR_EACH_ACTIVATION_K` gains the Gemma widths (256, and 1536 up to 21504). At one
+  token every generic shape whose K is instantiated and whole 256s takes `Nvfp4GemvKGeometry`, one
+  instantiation per K for any row count (16 values a lane where K is whole 512s, else 8), where
+  cuBLASLt ran a 128-row MMA tile on a single row; 2112 stays on cuBLASLt.
+  `SUROGATE_NVFP4_GENERIC_GEMV=0` keeps cuBLASLt. `sinfer_linear_nvfp4_a16_test` runs ten generic
+  shapes through the GEMV (da23fad), and `sinfer_linear_nvfp4_a4_test` sets the switch to 0 so its
+  one-token cases stay on the W4A4 route (b4a51e8).
+- **Converters.** `gemma_vl`: ModelOpt and compressed-tensors NVFP4 exports of the dense and
+  E-series models keep their attention and feed-forward codes; modules the export left BF16 go to
+  W8; other quantised modules are read through their values; FP8 exports go through
+  `fp8_block_source`; the encoder-free embedder accepts patch_size x pooling_kernel_size and the
+  `vision_embedder` spelling. The Gemma 3 text converter drops tokenizer ids past the embedding
+  table (`<image_soft_token>` at 262144 on the 270M and 1B), which made the artifact refuse to
+  load. Red Hat's Gemma 3 FP8 exports state their chat template only in `tokenizer_config.json` and
+  `chat_template.json`; the vision converter skipped the missing `chat_template.jinja`, the artifact
+  served as a base model and chat requests were refused. It now takes the template from either, as
+  the Gemma 3 text converter already did (ae30de7).
+- **Reasoning split** (`family/impl/frontend/frontend.cpp`). A Gemma 4 checkpoint without
+  `response_template` takes its reasoning pair from `soc_token`/`eoc_token`
+  (`channel_token_syntax`), and the markers' special tokens (`ReasoningSyntax::marker_tokens`) are
+  decoded even when specials are skipped, so the stream splits on them and drops them.
+  `sinfer_family_frontend_test` sends a thought between the channel tokens to reasoning. The marker
+  lookup encoded the markers with the served vocabulary and threw at construction on one that
+  cannot spell them (the frontend test's tiny vocabulary); such a marker now simply has no special
+  token to keep (ae30de7).
+- **Gemma 3 27B and mixed-format exports** (8b4a21c). `Gqa128_32q16` (128 wide, 32 query heads over
+  16) is registered with its small-T decode translation unit; the 27B refused to start with
+  "gqa_attention workspace: unsupported head geometry". Gemma 3, Gemma 4 and the E-series plan
+  NVFP4 and block-FP8 workspace only for the roles the artifact stores in that format
+  (`stored_roles_format_workspace`, `family/impl/storage_workspace.h`): NVIDIA's Gemma 4 31B keeps
+  attention BF16 (served W8) and its feed-forward NVFP4, and planning its global attention widths
+  (K 16384) as NVFP4 refused startup with "linear workspace: unsupported NVFP4 profile".
+
+## 125
+
+**W8 shapes without a measured entry take the MMA tiles for prompt chunks (2026-10-10).** A W8 shape
+with no entry in the dispatcher's table ran the batch-consistent kernel at every width, and SIMT at
+every width when its rows were not whole 128s or its K not whole 256s. On a DGX Spark
+(`sinfer_w8_route_bench`, 21 Gemma shapes) that cost 1.4-2.7x at 96 to 2,048 columns on Gemma 3 4B
+and Gemma 4 31B projections, 12-18x on Gemma 3 1B's k = 1,152, and 26x on Gemma 3's 262,208-row
+head. Every route matched SIMT on those shapes.
+
+- **`generic_w8_a16_launch`** (`ops/linear/w8/w8_dispatch.cpp`, 37d42b5) keeps a generic shape's
+  batch-independent route through 64 columns (decode) and takes the MMA bands above it, `r32_c128`
+  to 128 columns and `r64_c128` beyond. Hopper, whose consistent kernel runs on wgmma from 33
+  columns, keeps it at every width. Rows in whole 64s qualify. A k that only the row-split MMA
+  routes stage (k % 128) takes them from five columns, since SIMT was its only consistent route.
+- `SUROGATE_SERVE_W8_GENERIC_MMA=0` restores the old routes. The Marlin band still serves measured
+  shapes only.
+- **`sinfer_w8_route_bench`** (1cf02cd) checks every W8G32 launcher against SIMT and, with
+  `bench n k ...`, times each at the token widths the dispatch bands cover beside the dispatcher's
+  own pick, so Gemma's W8 shapes on GB10 get entries from a measurement.
+
+## 126
+
+**A request that names no thinking mode gets the chat template's default (2026-10-10).** The server
+turned thinking on unless asked not to, so Gemma 4 12B, 26B-A4B and 31B spent 42-51 tokens
+thinking before "Paris" where vLLM, following Gemma 4's template, answers in two.
+
+- **`PromptCapabilities::thinking_by_default`**: the Jinja probe (`probe_jinja_capabilities`) reads
+  the template's own default, its render with `enable_thinking` undefined, and
+  `resolve_prompt_semantics` uses it when neither the request nor a flag sets one. Qwen and Granite
+  templates default to thinking, so they are unchanged; the hand-written templates keep thinking
+  on.
+- **`--thinking`** joins `--no-thinking` to fix a default for every request
+  (`ServeOptions::enable_thinking` is now optional); without either, the server-start record
+  reports `default_thinking` as `"template"`.
+- `sinfer_family_frontend_test` probes a template that thinks unless told not to and one that
+  thinks only when asked; `sinfer_serve_options_test` checks that a request overrides the flag and
+  the flag the template.
+
+## 127
+
+**512-wide heads take the tensor-core prompt kernel, two CTAs a query tile (2026-10-10).** A
+512-wide head (Gemma 4's global layers, GLM's absorbed latent) kept its prompts on the split-KV
+tiles: on a DGX Spark the Gemma 4 31B's ten global layers took 172 ms of a 1.55 s prompt round of
+2,017 tokens there. The prompt kernel's whole-row output would be 256 FP32 accumulators a thread
+at that width, past the register file.
+
+- **`kGqaPrefillOutSplit`** (`ops/kernel/gqa_attention_prefill_common.cuh`): two CTAs now share
+  each query tile (grid z). Both compute the whole Q Kᵀ; each stages V and accumulates P V for half
+  the output columns. The query-key product is paid twice; nothing spills (ptxas: 244-255
+  registers, no spill on the dense variants), and the 512-wide arena drops from 96 to 88 KiB
+  (`kGqaPrefillSmemBytes<512>`, 90,112 bytes). Narrower heads are unchanged.
+- `SUROGATE_SERVE_GQA_PROMPT_KERNEL_WIDE=0` keeps 512-wide heads on the tiles
+  (`prompt_kernel_takes`).
+- `sinfer_gqa_attention_test` gains FP8-cache prompt cases at the Gemma 4 31B and 12B global
+  geometries and wide-prompt cases for the registered 512-wide geometry.
+
+#122 gives this split #119's FP8 query-key product.
+
+## 128
+
+**Gemma artifacts can store their projections for the FP8 tensor cores (2026-10-10).** On a DGX
+Spark the FP8 tensor-core linear (`fp8_block::linear`) runs a 2,048-token prompt chunk 1.5 to 4.1
+times faster than our W8 kernels on every Gemma shape measured (96-169 against 37-64 TFLOP/s), and
+reads the same bytes at decode. The W8 prompt GEMMs were 51% of Gemma 4 31B's prompt round and why
+Gemma 3 4B's long prompts ran at half vLLM's rate.
+
+- **`--text-format fp8`** (`gemma_vl` and the Gemma 3 text converter) stores the attention and
+  feed-forward projections as E4M3 with a multiplier per 128 x 128 block, or per row where only K
+  is whole 128s; anything else keeps its format (W8 on a dense model, BF16 on the mixture, whose
+  2,112-wide down projection the FP8 kernels do not contract). The converters quantise BF16 values
+  to either layout (`quantize_fp8_blocks` / `quantize_fp8_rows`).
+- A per-channel FP8 export (Red Hat's Gemma 3) now defaults to it and keeps its own codes and row
+  multipliers (`FP8_E4M3FN_ROW_F32S`) instead of re-encoding them to W8: the weights it shipped,
+  run as the W8A8 FP8 it was made for. `--text-format w8` keeps the old artifact. Block exports and
+  BF16 checkpoints keep their defaults.
+- Workspace planning counts row-scaled FP8 with the block format, one kernel family
+  (`stored_as_workspace_format`), and the Gemma 4 mixture plans FP8 attention and gate/up.
+  `storage_workspace.h` now includes `core/tensor.h` itself: the Qwen 3 and Llama variants include
+  it before anything that defines QType's values, so their builds failed at the FP8 workspace check
+  (a62088a).
+- `tests/serve/test_gemma_fp8_text.py` covers the quantizers and both export paths;
+  `docs/inference/serving-models.md` documents the option (be795ea).
+
+Measured since (DGX Spark, build 7ab0f19): the 31B's FP8-text artifact costs +0.26 to +0.31 ± 0.05
+nats on the fixed-text loss against its W8 artifact, so the 31B keeps W8 text by default; the
+build itself matches vLLM there (10.258 vs 10.250).
+
+## 129
+
+**DFlash 2 drafters for every DFlash target; the Qwen 3.5 quantized exports take a drafter
+(2026-10-11).** The Qwen 3.5 NVFP4 and FP8 exports (the 27B's nvfp4-all among them) refused
+`--dflash-model`. DFlash 2 adds two things to a first-generation drafter: a two-tap dynamic
+convolution before and after each sublayer of the draft block, its weights made per row from the
+normed hidden state, and a candidate selector that walks each position's top logits with a
+low-rank pair score instead of taking the argmax.
+
+- **Exports** (7b70400, 555886f; `convert/qwen3_5/exports/quantized.py`): the NVFP4 and FP8 exports
+  write the drafter's `dflash/*` objects as the groupwise conversion does, the export verifier
+  leaves them to the drafter's own checkpoint, and the report carries the same `dflash` block
+  (model, geometry, target layers) as the Gemma and mixture converters' reports.
+- **DFlash 2** (e35cc50) lives in the shared draft code, so every family that takes a DFlash
+  drafter (Qwen 3.5/3.6/3.8 dense and mixture, Gemma 4, Muse Glimmer) and every Qwen 3.5 quantized
+  export can carry one. The converters read `conv_kernel_size`, `conv_group_size`, `selector_rank`
+  and `selector_top_k` from the drafter config and store the conv base kernels, kernel
+  projections, selector projection and codebooks. New ops **`dflash_conv`**,
+  **`dflash_select_top_k`** and **`dflash_select_walk`** (`api/ops/dflash2.h`), with a GPU test
+  (`sinfer_dflash2_test`). The draft forward applies the convolutions and the selector when the
+  geometry states them; first-generation drafters run as before.
+- Verification is unchanged: a draft is accepted only when it equals the target's token.
+- `SUROGATE_SERVE_DFLASH_SELECTOR=0` drafts each position's best token without the selector, so
+  acceptance can be measured with and without the candidate walk (be463c1).
+
+## 130
+
+**DFlash rounds verify every active lane, fold GDN transitions late, and read the output head once
+(2026-10-11).** On a DGX Spark a DFlash round stopped at eight lanes and left the other active
+requests for later rounds: a 32-user Gemma 4 26B-A4B with its DFlash drafter verified 8 lanes a
+round and got 18.4 tokens/s a user against vLLM's 34.0 with the same drafter, at the same
+per-round cost as 8 users. On Qwen3.8-27B at eight lanes a 140 ms round spent 5.5 ms folding its
+accepted columns into every lane's recurrent state after the verify, and read the 1.27 GB FP8
+output head in two passes of about 5.5 ms each both to score its 56 draft rows and to verify its
+64 columns.
+
+- **Every active lane** (32178e4). The draft attention ops refused wider batches only by a check;
+  their grids already take the batch on z. `bidirectional_gqa_attention` and `swa` accept up to
+  `kMaximumBatchColumns` lanes, like the other ops of the draft round, and `decode_batch_capacity`
+  no longer caps DFlash at eight; `SUROGATE_SERVE_DFLASH_MAX_LANES=N` restores a cap. The batch
+  tests of both ops run 32 and 12 lanes against each lane alone, besides the two-lane case.
+- **Deferred GDN fold** (f2b8ce6). MTP already deferred that fold into the lane's next verify;
+  DFlash now does the same. A round drafting nothing (adaptive window 0) updates the state
+  in place, so it settles the pending transitions first (`settle_deferred_folds`), and a mixed
+  round settles them for lanes that ride it without verifying. Finishing and cancelled lanes still
+  fold at once; pipeline stages keep folding every round. The fused path is bit-exact with folding
+  every round; `SUROGATE_SERVE_DEFER_GDN_FOLD=0` restores the old behaviour for both backends.
+- **64 columns in one pass** (2cc7d5d). The registered FP8 vocabulary kernel took at most 48
+  columns per call, so a round verifying 64 (eight DFlash lanes of eight, or sixteen MTP lanes of
+  four) read the head twice. Tiles of 56 and 64 columns (`kFp8VocabularyLastA16MmaT` 64) let one
+  pass cover it: 94 registers and 36 KB of shared memory per CTA at 64, no spills.
+  `sinfer_linear_fp8_a16_test` also checks 56, 64 and 65 columns.
+- **Shortlist head for drafts** (ca48738, `with_resolved_proposal_head`). When the artifact carries
+  a shortlist head (131,072 rows at 4 bits on Qwen3.5-family NVFP4 exports), DFlash now drafts
+  through it unless `--full-head-draft` or `--lm-head-draft` was given, the same default MTP has.
+  The target still verifies every draft against the full head, so greedy output does not change
+  and sampled output keeps the target's distribution.
+
+## 131
+
+**A staged prompt whose last chunk has run samples its first token at once (2026-10-11).** When no
+mixed round could take the front staged prompt, the scheduler alternated one decode round with one
+lone prefill step. A prompt whose last chunk had already run in a mixed round lands there: all it
+needs is its first token sampled off the tail hidden (the head over one column, no trunk), yet it
+waited behind a decode round, and only once it reached the front, which also kept every staged
+prompt behind it out of the mixed rounds. With 32 users, 512-token prompts and the Gemma 4 26B-A4B
+DFlash drafter on a DGX Spark, each mixed round finished 3.5 prompts that then took a decode round
+each, so only 1.6 rounds a second carried prompts, 13 of 32 lanes sat staged for 2.0 s and the
+total trailed vLLM's (726 vs 890 tokens/s, first token 2.5 s vs 0.84 s).
+
+- **`staged_prompt_at_end`** (`runtime/engine/concurrent_executor.h`): any staged prompt with
+  nothing left to compute takes that step as soon as the scheduler sees it.
+  `SUROGATE_SERVE_EAGER_FINISH=0` restores the alternation.
+- `SUROGATE_SERVE_ROUND_TIMING` now also times the alternation's decode rounds and prefill steps
+  and the finishing steps, which it did not count before.
+
+Measured since (DGX Spark, build 7ab0f19), on the Gemma 3 4B W8 artifact at 32 users (512/128):
+eager finish gives 21.4 tok/s per user and 614 total with first token p50 358 ms, against 20.1,
+624 and 226 ms with `SUROGATE_SERVE_EAGER_FINISH=0`. The request logs show eager finish makes the
+closed-loop benchmark's requests arrive in bursts of ~3 (requests ending together), so prompts
+share bigger mixed rounds, an artifact of fixed-length replies; it stays on.
+
+## 132
+
+**256- and 512-wide small-T attention keeps its query tile in shared memory (2026-10-11).** The
+small-T tensor-core attention kernel (decode, speculative verify and short cached chunks) held
+each warp's query fragments and its whole output accumulator in registers. On a 512-wide head (the
+Gemma 4 global layers) that spilled about 1.4 KB a thread on every key tile; on 256-wide heads 150
+to 250 bytes (ptxas, sm_121a). In Gemma 4 26B-A4B DFlash rounds on a DGX Spark attention took
+12-13% of GPU time, against 5.6-9.3% in vLLM's.
+
+- **Resident-query variant** (`QResident` on `gqa_attention_small_t_tc_partial_bf16_kernel`, layout
+  `GqaSmallTTcResidentSmem`, `ops/kernel/gqa_attention_decode_bf16.cuh`): the query tile stays in
+  shared memory and each k-step's fragment is read with ldmatrix. Each warp accumulates 128 output
+  dimensions of 16 query rows, at most eight warps a CTA; a 512-wide tile of more than 32 rows
+  spans two CTAs. P stays in registers, and the e4m3 cache path loads four chunks' codes before
+  widening any. ptxas reports at most 8 bytes of spill on the 512-wide units and none on the
+  256-wide ones.
+- Every output value is the same arithmetic on the same operands: `sinfer_gqa_attention_test`
+  checks the two routes bit for bit over BF16 and E4M3 caches, eight head shapes (query groups 2 to
+  64, sliding windows included), widths 1 to 16, batch 1 and 3, masked and unmasked lanes.
+- `SUROGATE_SERVE_GQA_RESIDENT_Q=0` keeps the old kernel; `256` or `512` limits the new one to that
+  width (`gqa_resident_query_enabled`). The causal attention bench gains a `d512-h16-kv2` geometry
+  and takes batches up to 32.
+
+The commit was not timed on the GPU. Measured since (DGX Spark, build 7ab0f19): the attention
+microbench at `d512-h16-kv2` is faster in all 18 cells (1 new token 2.75-3.19x); at head dim 256, 1
+token 1.30-1.82x, and 6-16 tokens at batch 8-32 between 6% slower and level. Gemma 4 12B at 32
+users gets 13.9 against 11.8 tok/s per user (on against `SUROGATE_SERVE_GQA_RESIDENT_Q=0`), the 31B
+4.5 against 3.8; Qwen3.8-27B with MTP at 8 users is unchanged (26.0 against 26.0) and its greedy
+replies are byte-identical.
+
+## 133
+
+**A DFlash mixed round takes a chat prompt's last few tokens with the rest (2026-10-11).** A chat
+prompt is cut at its rewrite checkpoint, a few tokens before its end. Mixed rounds already ran both
+pieces in one round (the second segment starting from the state the first leaves), except under
+DFlash, whose drafter must save its own window at the checkpoint. So under DFlash every such prompt
+took a second mixed round, decode lanes' verify included, for those few tokens: with the Gemma 4
+26B-A4B and its DFlash drafter on a DGX Spark (32 users, ~515-token prompts) DFlash ran 6.5 mixed
+rounds for 3.9 prompts where MTP ran 3.5.
+
+- **`consume_mixed_round`** (`family/impl/runtime/program_impl.h`): the drafter takes the two
+  segments' features in turn (`dflash_append_context` per segment) and saves its checkpoint between
+  them (`save_rewrite_checkpoint`), as a round ending at the checkpoint would; `launch_mixed_round`
+  no longer leaves DFlash out of the split.
+- `SUROGATE_SERVE_MIXED_SPLIT=0` keeps a round per segment.
+
+The commit was not timed on the GPU. Measured since (DGX Spark, build 7ab0f19), Qwen3.8-27B with
+DFlash 2 at 8 users on real text: first token p50 357 ms against 518 ms with
+`SUROGATE_SERVE_MIXED_SPLIT=0` (514 ms on the previous build), total 200.8 tok/s against 179.9 on
+the previous build.
+
+## 134
+
+**A GB10 picks its NVFP4 GEMM tile by problem size, not by output rows (2026-10-11).** The wide
+W4A4 route took the CUTLASS 256 tile for every projection with 4096 or more output rows and
+cuBLASLt below that, whatever the token count, a policy measured on prompt rounds only. NVFP4
+shapes with no in-house kernels (dense Gemma 4, Gemma 3, the E-series; #124) run this route from
+two tokens up, so their decode and verify rounds took it too. `sinfer_nvfp4_route_bench` on a DGX
+Spark, over the 13 projection shapes of Gemma 4 E2B, E4B, 12B and 31B at widths 2 to 2048: below
+64 tokens the 256 tile averaged 1.9x cuBLASLt's time on those projections (up to 3.5x the best
+tile's), and cuBLASLt itself fell to 1.75-3.7x the best tile on the large MLP projections at prompt
+widths. Summed over all 208 cells the rule came to 28% over the best tile per cell.
+
+- **`gb10_tile`** (`ops/linear/nvfp4/nvfp4_cublaslt.cpp`, through
+  `nvfp4_cutlass_tile_for(rows, k, tokens)`, 7ab0f19): cuBLASLt for small problems, the 256 swap
+  tile for mid-size weights below 64 tokens (n >= 3840, n x k < 5.5e7), the 128 swap tile from 3e10
+  multiply-adds (n x k x T) and the 256 tile from 1e11: 3.5% over the best tile per cell on the
+  same data. Other GPUs keep the rows rule; `SUROGATE_SERVE_NVFP4_CUTLASS=rows` gives a GB10 the
+  rows rule back.
+- **`sinfer_nvfp4_route_bench`** (d78cff3) quantises one activation per width and times cuBLASLt
+  and the six CUTLASS SM120 tiles `nvfp4_cutlass_gemm` offers on the shapes given, after checking
+  each tile against cuBLASLt.
+
+The commit was not timed in the engine. Measured since (DGX Spark, build 7ab0f19), new rule
+against `SUROGATE_SERVE_NVFP4_CUTLASS=rows`: Gemma 4 12B 172.8 against 131.2 tok/s total at 8
+users, 483.2 against 409.6 at 32, 4,659 against 3,994 tok/s on 2,048-token prompts; Gemma 3 12B
+480.0 against 409.6 at 32 users; Gemma 4 E4B 972.8 against 905.6 at 32 users. Greedy replies on the
+12B are identical to the old rule's (4 of 4, 64 tokens).
