@@ -4597,3 +4597,60 @@ where vLLM's fused FlashInfer kernel spends about 0.44 s.
 Cold 108,173-token prompt to the 35B NVFP4: 33.5 -> 31.7 s with the bf16 Q Kᵀ, 24.0 -> 22.3 s with
 #119's FP8 one (vLLM 0.31: 32.4 s). Wikitext NLL 1.73529 / 1.75298 against the staged path's
 1.73544 / 1.75340 (#119's table). `sinfer_gated_delta_net_test` passes either way.
+
+## 121
+
+**Gemma 4 tool calls come back as `tool_calls` (2026-10-11).** Gemma 4 writes a call in its chat
+template's own notation, `<|tool_call>call:NAME{key:<|"|>text<|"|>,count:2}<tool_call|>`, and every
+Gemma 4 artifact was served with the default Qwen parser, which never finds it. On a DGX Spark the
+Gemma 4 26B-A4B answered a two-city weather request with both calls as plain content and
+`tool_calls` empty, thinking on or off, so no agent loop could take its second turn.
+
+- **`parse_gemma4_tool_call_output`** (`serve/tool_call_parser.cpp`) reads the notation back into
+  JSON arguments: strings between the `<|"|>` marks (commas, braces and the closing marker inside
+  them included), bare or quoted keys, nested objects and lists, `true`, `false`, `None` and
+  numbers; a bare top-level value is typed by the tool's schema, as the XML parsers type theirs.
+  A malformed call stays visible as text. The stream filter holds back from `<|tool_call>`.
+- **`--tool-call-parser gemma4`**, and the default for a vocabulary that spells the three markers
+  as special tokens (`PromptCapabilities::gemma4_tool_calls`) unless `--tool-call-parser` names
+  one. A request with tools already decodes special tokens, so the markers reach the parser.
+- The notation has no grammar here yet: a strict tool is called unconstrained, as under
+  `tool_choice: "auto"`, and `tool_choice: "required"` or a named function is refused.
+
+Two-turn tool loop on the 26B-A4B (`gemma/gtool.py`): turn 1 now finishes `tool_calls` with both
+calls parsed (`{"city":"Paris","unit":"celsius"}`, Tokyo likewise), thinking off and on; turn 2
+answers from the results and reuses turn 1's prompt from the cache.
+
+## 122
+
+**512-wide heads take #119's FP8 query-key product in prompt attention (2026-10-11).** #119 served
+128- and 256-wide heads. A 512-wide head (the global layers of every Gemma 4) kept the bf16 product
+with K and V widened straight from global memory, and its two output-split CTAs each paid it: on a
+DGX Spark 2,048 new tokens over 131,072 cached ones took 499 ms a layer (17.8 TFLOP/s) where a
+256-wide head took 41 ms (109 TFLOP/s). In a long-context agent turn on the Gemma 4 26B-A4B that
+was most of the time to the first token.
+
+- The `QkFp8` variant now serves the output split: each CTA holds the whole e4m3 Q tile and K block
+  and lands and widens only its own half of V (`kGqaPrefillFp8QkSmemBytes<512>`, 53,504 bytes, one
+  CTA to an SM). Query quantization takes two 8-value chunks a lane at that width. ptxas: 249-255
+  registers, at most 24 bytes of stack on two variants.
+- `SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK_WIDE=0` keeps 512-wide heads on the bf16 product.
+
+`sinfer_causal_softmax_attention_bench --entry cached --kv-dtype fp8 --geometry d512-h16-kv2`,
+2,048 new tokens: 54.3 -> 24.7 ms at 16k context, 248.8 -> 99.9 ms at 64k, 498.6 -> 199.6 ms at
+131k (44 TFLOP/s); 256-wide unchanged. Accuracy, Gemma 4 12B: the tokens of a 900-token answer
+(written by vLLM at temperature 0) scored given its 24k-token document move by +0.004 ± 0.013 nats
+against the bf16 product (0.1661 against 0.1623; up to 256 wide 0.1625). Wikitext NLL is no guide
+on Gemma 4's instruction-tuned checkpoints: they score it at 6-11 nats a token in every engine.
+
+`agentic_long_bench.py` (100k -> 200k context, 1-4k-token tool results), Gemma 4 26B-A4B FP8-text
+artifact, FP8 KV, DGX Spark:
+
+| | before | after | vLLM 0.31 (BF16 KV) |
+|---|---|---|---|
+| 1 agent, warm turn TTFT p50 / p90 | 4.56 / 6.87 s | 2.38 / 3.46 s | 7.20 / 13.70 s |
+| 1 agent, cold 110k prompt | 69.6 s | 37.5 s | 117.6 s |
+| 1 agent, turns a minute | 4.6 | 6.1 | 3.0 |
+| 4 agents, warm turn TTFT p50 / p90 | 6.97 / 10.81 s | 3.47 / 5.07 s | 8.35 / 12.81 s |
+| 4 agents, decode per agent | 8.2 tok/s | 11.6 tok/s | 5.4 tok/s |
+| 4 agents, turns a minute | 6.1 | 9.5 | 4.3 |

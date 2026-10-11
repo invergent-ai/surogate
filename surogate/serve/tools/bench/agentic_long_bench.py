@@ -91,7 +91,7 @@ async def request(session, messages):
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    started, first, usage, done, pieces = time.perf_counter(), None, None, False, []
+    started, first, usage, done, pieces, thought = time.perf_counter(), None, None, False, [], []
     async with session.post(args.url + "/v1/chat/completions", json=body) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status}: {(await response.text())[:300]}")
@@ -105,10 +105,17 @@ async def request(session, messages):
             if "error" in chunk:
                 raise RuntimeError(str(chunk["error"])[:300])
             for choice in chunk.get("choices", []):
-                text = (choice.get("delta") or {}).get("content")
+                # The first token is the first of either channel: a server that splits a thought
+                # off (thinking asked off, but the model opened one) streams it as reasoning, where
+                # a server without a reasoning parser streams the same tokens as content.
+                delta = choice.get("delta") or {}
+                text = delta.get("content")
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if (text or reasoning) and first is None:
+                    first = time.perf_counter()
+                if reasoning:
+                    thought.append(reasoning)
                 if text:
-                    if first is None:
-                        first = time.perf_counter()
                     pieces.append(text)
             usage = chunk.get("usage") or usage
     if not done or usage is None or first is None:
@@ -123,6 +130,7 @@ async def request(session, messages):
         "ttft_s": round(first - started, 4),
         "latency_s": round(ended - started, 4),
         "decode_tok_s": round((completion - 1) / max(ended - first, 1e-9), 2),
+        "reasoning_chars": sum(len(piece) for piece in thought),
         "text": "".join(pieces),
     }
 
@@ -162,6 +170,7 @@ def summarize(agents, records, errors, wall):
         "warm_cache_misses": sum(1 for n in new if n > args.out + args.tool_max + 512),
         "warm_cached_fraction_min": (round(min(r["cached"] / r["prompt"] for r in known), 4) if known else None),
         "decode_tok_s_p50": pct([r["decode_tok_s"] for r in warm], 0.5),
+        "turns_with_reasoning": sum(1 for r in records if r.get("reasoning_chars")),
     }
     buckets = {}
     for r in warm:
