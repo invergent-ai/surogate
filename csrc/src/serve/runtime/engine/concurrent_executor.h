@@ -1830,6 +1830,24 @@ private:
         }
     }
 
+    /// A staged prompt with nothing left to compute (its last chunk ran in an earlier round),
+    /// which only needs its first token sampled. SUROGATE_SERVE_EAGER_FINISH=0 leaves such
+    /// prompts to the alternation with decode rounds, in staging order.
+    [[nodiscard]] std::optional<std::uint32_t> staged_prompt_at_end() const {
+        static const bool kEagerFinish = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_EAGER_FINISH");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
+        if (!kEagerFinish) { return std::nullopt; }
+        for (const std::uint32_t lane : prefill_lanes_.span()) {
+            const auto& owner = slots_[lane];
+            if (owner != nullptr && !owner->decode_ready && owner->prefill_remaining == 0) {
+                return lane;
+            }
+        }
+        return std::nullopt;
+    }
+
     /// Returns how many staged prompts the round advanced.
     std::size_t run_mixed_round(const RoundMembership& membership) {
         if (prefill_lanes_.empty()) { throw std::logic_error("no request owns staged prefill"); }
@@ -2285,6 +2303,23 @@ private:
 
                 if (!prefill_lanes_.empty()) {
                     top_up_prefill_lanes();
+                    // A staged prompt whose last chunk has run waits only for the step that
+                    // samples its first token off the tail hidden: the head over one column,
+                    // no trunk. It ran as the fallback below, one per decode round, and only
+                    // once it reached the front, which also kept every prompt behind it out of
+                    // the mixed rounds. MEASURED (Gemma 4 26B-A4B + DFlash, DGX Spark, 32
+                    // users, 512-token prompts): 3.5 prompts finished per mixed round, each
+                    // behind a decode round of its own, so only 1.6 rounds a second carried
+                    // prompts and 13 of 32 lanes sat staged for 2.0 s.
+                    if (const auto finishing = staged_prompt_at_end()) {
+                        const auto t_finish = Clock::now();
+                        last_round_ = LastRound{"prefill", 0, *finishing, last_round_.index + 1};
+                        run_prefill_step(*finishing);
+                        seg_timer_.finish +=
+                            std::chrono::duration<double>(Clock::now() - t_finish).count();
+                        seg_timer_.finish_steps += 1;
+                        continue;
+                    }
                     // Let the staged set grow before spending a round on it (#88). Bounded, so
                     // a prompt whose neighbours never arrive still goes out promptly.
                     if (prefill_lanes_.size() < mixed_prefill_batch_target() &&
@@ -2399,10 +2434,18 @@ private:
                         continue;
                     }
                     if (!membership.empty() && !previous_unit_was_decode) {
+                        const auto t_decode = Clock::now();
                         run_decode_round(membership);
+                        seg_timer_.decode +=
+                            std::chrono::duration<double>(Clock::now() - t_decode).count();
+                        seg_timer_.decode_rounds += 1;
                         previous_unit_was_decode = true;
                     } else {
+                        const auto t_prefill = Clock::now();
                         run_prefill_step(prefill_lanes_.front());
+                        seg_timer_.prefill +=
+                            std::chrono::duration<double>(Clock::now() - t_prefill).count();
+                        seg_timer_.prefill_steps += 1;
                         previous_unit_was_decode = false;
                     }
                     continue;
@@ -2584,9 +2627,9 @@ private:
 
     struct SegmentTimer {
         bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TIMING") != nullptr;
-        double boundary = 0, admit = 0, mixed = 0, decode = 0;
+        double boundary = 0, admit = 0, mixed = 0, decode = 0, prefill = 0, finish = 0;
         double preview = 0, resolve = 0, append = 0, stats = 0;
-        std::uint64_t mixed_rounds = 0, decode_rounds = 0;
+        std::uint64_t mixed_rounds = 0, decode_rounds = 0, prefill_steps = 0, finish_steps = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
         void maybe_report() {
             if (!enabled) { return; }
@@ -2594,15 +2637,17 @@ private:
             if (std::chrono::duration<double>(now - last).count() < 5.0) { return; }
             std::fprintf(stderr,
                          "round-timing: boundary %.0fms admit %.0fms mixed %.0fms/%llu decode "
-                         "%.0fms/%llu | preview %.0fms resolve %.0fms append %.0fms stats %.0fms "
-                         "(per 5s)\n",
+                         "%.0fms/%llu prefill %.0fms/%llu finish %.0fms/%llu | preview %.0fms "
+                         "resolve %.0fms append %.0fms stats %.0fms (per 5s)\n",
                          boundary * 1e3, admit * 1e3, mixed * 1e3,
                          static_cast<unsigned long long>(mixed_rounds), decode * 1e3,
-                         static_cast<unsigned long long>(decode_rounds), preview * 1e3,
+                         static_cast<unsigned long long>(decode_rounds), prefill * 1e3,
+                         static_cast<unsigned long long>(prefill_steps), finish * 1e3,
+                         static_cast<unsigned long long>(finish_steps), preview * 1e3,
                          resolve * 1e3, append * 1e3, stats * 1e3);
-            boundary = admit = mixed = decode = 0;
+            boundary = admit = mixed = decode = prefill = finish = 0;
             preview = resolve = append = stats = 0;
-            mixed_rounds = decode_rounds = 0;
+            mixed_rounds = decode_rounds = prefill_steps = finish_steps = 0;
             last         = now;
         }
     };
