@@ -230,9 +230,11 @@ int run_case(bool mrope, const sinfer::ops::RopeYarn* yarn = nullptr) {
             }
         }
     }
+    std::cout << "block keys (" << (mrope ? "mrope" : "1-d") << (yarn != nullptr ? ", yarn" : "")
+              << "): worst " << worst << " of one BF16 tolerance at block " << worst_at.block
+              << " dim " << worst_at.dim << " (got " << worst_at.got << " want " << worst_at.want
+              << ")\n";
     if (worst >= 1.0) { // report where it diverges before failing
-        std::cerr << "worst: block " << worst_at.block << " dim " << worst_at.dim << " got "
-                  << worst_at.got << " want " << worst_at.want << "\n";
         for (int b = 0; b * kBlock + kBlock <= tokens && b < 3; ++b) {
             const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, coordinate_base);
             const std::size_t base        = cache.cell_offset(b * kBlock);
