@@ -49,53 +49,17 @@ bool wide_dynamic_allowed() noexcept {
     return allowed;
 }
 
-/// Weight rows per block of the generic formats' wide tile (64 columns and up): 16, or 32 with
-/// SUROGATE_GGML_AFFINE_ROWS=32. The arithmetic per output is the same at either height.
+/// Weight rows per block of the generic formats' wide tile (64 columns and up): 32, or 16 with
+/// SUROGATE_GGML_AFFINE_ROWS=16. The arithmetic per output is the same at either height. 32 rows
+/// read the activation tile half as often: 10240 x 2560 IQ4_XS at 4,096 tokens on GB10 takes
+/// 7.4 ms against 9.1 (SINFER_GGML_BENCH), where the Q6_K int8 tile takes 6.1. A group-major
+/// 64 x 128 tile with the same bits (8.3 ms; 13.5 with producer warps) did not beat it.
 int affine_rows() noexcept {
     static const int value = [] {
         const char* raw = std::getenv("SUROGATE_GGML_AFFINE_ROWS");
-        return raw != nullptr && std::strcmp(raw, "32") == 0 ? 32 : 16;
+        return raw != nullptr && std::strcmp(raw, "16") == 0 ? 16 : 32;
     }();
     return value;
-}
-
-/// Whether the generic width-32 formats take the group-major 64 x 128 tile on wide prompts
-/// (dense_affine_gmajor_kernel); SUROGATE_GGML_AFFINE_GMAJOR=0 keeps them on
-/// dense_affine_mma_kernel. Either computes the same bits.
-bool affine_gmajor_allowed() noexcept {
-    static const bool allowed = [] {
-        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR");
-        return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
-    }();
-    return allowed;
-}
-
-/// Producer warps in a group-major block: 0, or 4 with SUROGATE_GGML_AFFINE_GMAJOR_PRODUCERS=4.
-int affine_gmajor_producers() noexcept {
-    static const int producers = [] {
-        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR_PRODUCERS");
-        return raw != nullptr && std::strcmp(raw, "4") == 0 ? 4 : 0;
-    }();
-    return producers;
-}
-
-/// The group-major prompt tile's columns: 128, or 64 with SUROGATE_GGML_AFFINE_GMAJOR_COLS=64.
-int affine_gmajor_cols() noexcept {
-    static const int cols = [] {
-        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR_COLS");
-        return raw != nullptr && std::strcmp(raw, "64") == 0 ? 64 : 128;
-    }();
-    return cols;
-}
-
-/// Whether 9-to-32-token rounds of those formats take the group-major 64 x 32 tile:
-/// SUROGATE_GGML_AFFINE_GMAJOR_SMALL=1 (off by default until measured). Same bits either way.
-bool affine_gmajor_small_allowed() noexcept {
-    static const bool allowed = [] {
-        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR_SMALL");
-        return raw != nullptr && std::strcmp(raw, "1") == 0;
-    }();
-    return allowed;
 }
 
 std::atomic<std::int32_t> tile_multiprocessors_override{0};
@@ -257,41 +221,6 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                     else if (tokens <= 4) { narrow.template operator()<4>(); }
                     else { narrow.template operator()<8>(); }
                     return;
-                }
-            }
-            if constexpr (Type != GgmlType::F16) {
-                if constexpr ((DenseFormat<Type>::kWidth == 32 || DenseFormat<Type>::kWidth == 16) &&
-                              !DenseFormat<Type>::kBias) {
-                    const auto gmajor_tile = [&]<int Cols>() {
-                        const auto run = [&]<int Producers>() {
-                            auto* const kernel = dense_affine_gmajor_kernel<Type, Cols, Producers>;
-                            constexpr int smem = static_cast<int>(sizeof(gmajor::Smem<Cols>));
-                            CUDA_CHECK(set_func_attribute_per_device(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-                            const dim3 grid((rows + gmajor::kRows - 1) / gmajor::kRows,
-                                            (tokens + Cols - 1) / Cols);
-                            kernel<<<grid, Cols * 4 + Producers * 32, smem, stream>>>(
-                                bytes, codes, ds, rows, k, tokens, out, beta != 0);
-                        };
-                        if (affine_gmajor_producers() == 4) { run.template operator()<4>(); }
-                        else { run.template operator()<0>(); }
-                    };
-                    // The group-major 64 x 128 tile, once a prompt fills the device with it.
-                    const std::int32_t row_tiles = (rows + gmajor::kRows - 1) / gmajor::kRows;
-                    if (tokens >= 256 && row_tiles * ((tokens + 127) / 128) >=
-                                             kquant_tile_multiprocessors() &&
-                        affine_gmajor_allowed()) {
-                        if (affine_gmajor_cols() == 64) { gmajor_tile.template operator()<64>(); }
-                        else { gmajor_tile.template operator()<128>(); }
-                        return;
-                    }
-                    // Verify and multi-sequence decode rounds (9 to 32 tokens): the 64 x 32
-                    // tile streams the weight with eight items a thread in flight, where the
-                    // 16-row tile waits on each chunk's loads.
-                    if (tokens > 8 && tokens <= 32 && affine_gmajor_small_allowed()) {
-                        gmajor_tile.template operator()<32>();
-                        return;
-                    }
                 }
             }
             const auto tile = [&]<int Cols>() {
