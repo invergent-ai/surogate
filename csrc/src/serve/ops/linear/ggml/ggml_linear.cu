@@ -6,6 +6,7 @@
 #include "ops/linear/ggml/ggml_dense_block32.cuh"
 #include "ops/linear/ggml/ggml_i8_tile.cuh"
 #include "ops/linear/ggml/ggml_q8_1.h"
+#include "ops/linear/ggml/ggml_tile_order.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -45,8 +46,9 @@ __global__ __launch_bounds__((TileCols / 8) * 32) void dense_i8_kernel(
     static_assert(sizeof(GgmlI8Smem<Codec, TileCols, TileRows>) <= kStaticSharedLimit,
                   "static shared memory above 48 KiB does not build for sm_89");
     __shared__ GgmlI8Smem<Codec, TileCols, TileRows> sm;
-    const int row0 = blockIdx.x * TileRows;
-    const int col0 = blockIdx.y * TileCols;
+    const int2 tile = grouped_tile<8>();
+    const int row0  = tile.x * TileRows;
+    const int col0  = tile.y * TileCols;
     auto row_base = [&](int row) {
         return blocks + static_cast<std::int64_t>(min(row0 + row, rows - 1)) *
                             (k / QK_K) * Codec::kBlockBytes;

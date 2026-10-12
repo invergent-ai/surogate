@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/linear/ggml/ggml_dense_codec.cuh"
+#include "ops/linear/ggml/ggml_tile_order.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 
@@ -120,7 +121,9 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
     __shared__ float dx[Cols * 8];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, lid = lane & 3;
-    const int row0 = blockIdx.x * Rows, col0 = blockIdx.y * Cols;
+    // Bands of 512 weight rows across every column tile (grouped_tile).
+    const int2 tile = grouped_tile<32>();
+    const int row0 = tile.x * Rows, col0 = tile.y * Cols;
     float acc[8][4] = {};
     for (int first = 0; first < k; first += 256) {
         for (int item = tid; item < Cols * 16; item += threads) {
@@ -239,7 +242,9 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_f16_mma_kernel(
     __shared__ __align__(16) __nv_bfloat16 b[Cols * stride];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, lid = lane & 3;
-    const int row0 = blockIdx.x * Rows, col0 = blockIdx.y * Cols;
+    // Bands of 512 weight rows across every column tile (grouped_tile).
+    const int2 tile = grouped_tile<32>();
+    const int row0 = tile.x * Rows, col0 = tile.y * Cols;
     float acc[8][4] = {};
     for (int first = 0; first < k; first += 128) {
         for (int item = tid; item < Rows * 16; item += threads) {
