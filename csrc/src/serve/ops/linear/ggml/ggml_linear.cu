@@ -243,7 +243,10 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                         static_cast<const __half*>(blocks), x, rows, k, tokens, out, beta != 0);
                 } else if (Cols == 32 && affine_staged_rows() != 0) {
                     if constexpr (Cols == 32) {
-                        if (affine_staged_rows() == 16) {
+                        // Under 2,048 rows (the shared expert's 640-row gate and up) a 32-row
+                        // block leaves SMs idle: 640 x 2560 IQ4_XS at 16 tokens takes 16 us at
+                        // 16 rows against 22. Same bits at either height.
+                        if (affine_staged_rows() == 16 || rows < 2048) {
                             dense_affine_staged_kernel<Type, Cols, 16><<<grid, (Cols / 8) * 32, 0, stream>>>(
                                 bytes, codes, ds, rows, k, tokens, out, beta != 0);
                         } else {
