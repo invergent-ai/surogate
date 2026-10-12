@@ -625,6 +625,7 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | `SUROGATE_SERVE_DFLASH_PACKED_PREFILL` | `1` lets a DFlash server prefill several waiting prompts in one round, as a server without speculation does; off by default. See [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair) |
 | `SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE` | `1` lets NVFP4 mixture experts add their outputs in the GEMM epilogue: up to about 3% faster, but the same request can then get slightly different answers from run to run; off by default |
 | `SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB` | GPU memory for prefill and mixed-round CUDA graphs captured while serving; new shapes run without a graph once it is spent; default 512 MiB, 0 captures none |
+| `SUROGATE_SERVE_PROMPT_TOKEN_REUSE` | By default a prompt that opens with a recent prompt's text, such as an agent's next turn, reuses that prompt's token ids and tokenizes only the rest, with the same ids as a whole encode. `0` tokenizes every prompt whole; `verify` tokenizes both ways and fails the request if they differ |
 
 ## Public admission limits
 
