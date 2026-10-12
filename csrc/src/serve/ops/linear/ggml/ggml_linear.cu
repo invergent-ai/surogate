@@ -70,6 +70,15 @@ bool affine_gmajor_allowed() noexcept {
     return allowed;
 }
 
+/// Producer warps in a group-major block: 0, or 4 with SUROGATE_GGML_AFFINE_GMAJOR_PRODUCERS=4.
+int affine_gmajor_producers() noexcept {
+    static const int producers = [] {
+        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR_PRODUCERS");
+        return raw != nullptr && std::strcmp(raw, "4") == 0 ? 4 : 0;
+    }();
+    return producers;
+}
+
 /// The group-major prompt tile's columns: 128, or 64 with SUROGATE_GGML_AFFINE_GMAJOR_COLS=64.
 int affine_gmajor_cols() noexcept {
     static const int cols = [] {
@@ -254,14 +263,18 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                 if constexpr ((DenseFormat<Type>::kWidth == 32 || DenseFormat<Type>::kWidth == 16) &&
                               !DenseFormat<Type>::kBias) {
                     const auto gmajor_tile = [&]<int Cols>() {
-                        auto* const kernel = dense_affine_gmajor_kernel<Type, Cols>;
-                        constexpr int smem = static_cast<int>(sizeof(gmajor::Smem<Cols>));
-                        CUDA_CHECK(set_func_attribute_per_device(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-                        const dim3 grid((rows + gmajor::kRows - 1) / gmajor::kRows,
-                                        (tokens + Cols - 1) / Cols);
-                        kernel<<<grid, Cols * 4, smem, stream>>>(bytes, codes, ds, rows, k, tokens,
-                                                                 out, beta != 0);
+                        const auto run = [&]<int Producers>() {
+                            auto* const kernel = dense_affine_gmajor_kernel<Type, Cols, Producers>;
+                            constexpr int smem = static_cast<int>(sizeof(gmajor::Smem<Cols>));
+                            CUDA_CHECK(set_func_attribute_per_device(
+                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+                            const dim3 grid((rows + gmajor::kRows - 1) / gmajor::kRows,
+                                            (tokens + Cols - 1) / Cols);
+                            kernel<<<grid, Cols * 4 + Producers * 32, smem, stream>>>(
+                                bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                        };
+                        if (affine_gmajor_producers() == 4) { run.template operator()<4>(); }
+                        else { run.template operator()<0>(); }
                     };
                     // The group-major 64 x 128 tile, once a prompt fills the device with it.
                     const std::int32_t row_tiles = (rows + gmajor::kRows - 1) / gmajor::kRows;

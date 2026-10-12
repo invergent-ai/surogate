@@ -246,8 +246,12 @@ __device__ __forceinline__ int class_groups(int groups, int a) {
 }
 } // namespace gmajor
 
-template <GgmlType Type, int kCols>
-__global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_gmajor_kernel(
+// kProducers > 0 splits the block: kCols / 8 warps multiply, kProducers more decode the next
+// step's weight codes into shared memory meanwhile, so the decode's global-load latency is
+// never on the multiplying warps' path (the same bits either way).
+template <GgmlType Type, int kCols, int kProducers = 0>
+__global__ __launch_bounds__(kCols * 4 + kProducers * 32, (kCols == 64 && kProducers == 0) ? 2 : 1)
+void dense_affine_gmajor_kernel(
     const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
     using namespace gmajor;
@@ -258,11 +262,15 @@ __global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_g
     constexpr int kThreads = kCols * 4;           // kCols / 8 warps
     constexpr int kItems   = kRows * (kStepValues / 8) / kThreads; // weight eighths per thread
     constexpr int kXItems  = (kStepValues / 16) * kCols / kThreads; // activation pieces per thread
+    constexpr int kPThreads = kProducers * 32;
+    constexpr int kPItems  = kProducers > 0 ? kRows * (kStepValues / 8) / kPThreads : 0;
     static_assert(kCols == 32 || kCols == 64 || kCols == 128);
+    static_assert(kProducers == 0 || kRows * (kStepValues / 8) % kPThreads == 0);
     extern __shared__ __align__(16) unsigned char gmajor_smem[];
     auto& sm = *reinterpret_cast<Smem<kCols>*>(gmajor_smem);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, lid = lane & 3;
+    const bool producer = kProducers > 0 && tid >= kThreads;
     const int2 tile = grouped_tile<8>();
     const int row0 = tile.x * kRows, col0 = tile.y * kCols;
     const int groups = k / width;
@@ -317,6 +325,25 @@ __global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_g
         }
     };
 
+    // A producer thread's share of a step: its items' codes decoded and stored, branch-free (an
+    // item past the class's last group reads that group again; nothing multiplies it), so the
+    // compiler can put every item's loads in flight before the first decode.
+    auto produce = [&](int buf, int a, int m0) {
+        const int count = class_groups(groups, a);
+        const int ptid  = tid - kThreads;
+#pragma unroll
+        for (int i = 0; i < kPItems; ++i) {
+            const int item = ptid + i * kPThreads;
+            const int row = item / 16, u = (item % 16) / (width / 8), e8 = item % (width / 8);
+            const int m = min(m0 + u, count - 1);
+            const auto* w = weights + std::int64_t(min(row0 + row, rows - 1)) * row_bytes;
+            const DenseAffineEight v = dense_codes_eight<Type>(w, width * (a + 8 * m) + 8 * e8);
+            *reinterpret_cast<uint2*>(&sm.a[buf][row * kStride + width * u + 8 * e8]) =
+                make_uint2(v.lo, v.hi);
+            if (e8 == 0) { sm.scale[buf][u][row] = v.scale; }
+        }
+    };
+
     float run[4][4] = {}, p0[4][4] = {}, p1[4][4] = {}, p2[4][4] = {};
     // The tree, as dense_affine_mma_kernel's epilogue adds it; `a` is the class just finished.
     auto fold = [&](int a) {
@@ -343,10 +370,14 @@ __global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_g
     int a = 0, m0 = 0;
     while (a < 8 && step_count(a) == 0) { fold(a); ++a; }
     if (a < 8) {
-        stage_x(0, a, m0);
+        if (!producer) { stage_x(0, a, m0); }
         cp_commit();
-        decode_a(a, m0);
-        store_a(0);
+        if constexpr (kProducers > 0) {
+            if (producer) { produce(0, a, m0); }
+        } else {
+            decode_a(a, m0);
+            store_a(0);
+        }
     }
     int buf = 0;
     while (a < 8) {
@@ -356,10 +387,13 @@ __global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_g
         const bool has_next = na < 8 && step_count(na) > 0;
         cp_wait<0>();
         __syncthreads(); // this step's tiles are in; every warp is past the previous step's MMA
-        if (has_next) { stage_x(buf ^ 1, na, nm); }
+        if (has_next && !producer) { stage_x(buf ^ 1, na, nm); }
         cp_commit();
         const int count = class_groups(groups, a);
         const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
+        if (producer) {
+            if (has_next) { produce(buf ^ 1, na, nm); }
+        } else {
 #pragma unroll
         for (int u = 0; u < kSteps; ++u) {
             if (m0 + u >= count) { break; }
@@ -396,9 +430,12 @@ __global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_g
         // here overlaps the warps still multiplying, where decoding them first (as the source
         // order had it, and the compiler kept: the loads are conditional) stalled every warp at
         // once, right after the barrier, and kept the codes live across the MMAs.
-        if (has_next) {
-            decode_a(na, nm);
-            store_a(buf ^ 1);
+        if constexpr (kProducers == 0) {
+            if (has_next) {
+                decode_a(na, nm);
+                store_a(buf ^ 1);
+            }
+        }
         }
         if (na != a) {
             fold(a);
@@ -411,6 +448,7 @@ __global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_g
     }
     while (a < 8) { fold(a); ++a; }
     cp_wait<0>();
+    if (producer) { return; }
 #pragma unroll
     for (int mi = 0; mi < 4; ++mi) {
 #pragma unroll
