@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
@@ -207,6 +208,29 @@ std::int32_t sparse_moe_ggml_prefill_min() noexcept {
             return kSparseMoePrefillGgmlKMin;
         }
         return static_cast<std::int32_t>(parsed);
+    }();
+    return value;
+}
+
+std::int32_t sparse_moe_i8_wide128_min() noexcept {
+    static const std::int32_t value = [] {
+        constexpr std::int32_t never = std::numeric_limits<std::int32_t>::max();
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_I8_WIDE128_MIN");
+        if (raw == nullptr || *raw == '\0') {
+            return kSparseMoePrefillI8Wide128Min > 0 ? kSparseMoePrefillI8Wide128Min : never;
+        }
+        char* end         = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end == raw || *end != '\0' || parsed < 0) {
+            std::fprintf(stderr,
+                         "sparse moe: ignoring SUROGATE_SERVE_MOE_I8_WIDE128_MIN=%s (want 0 for "
+                         "off, or a width)\n",
+                         raw);
+            return kSparseMoePrefillI8Wide128Min > 0 ? kSparseMoePrefillI8Wide128Min : never;
+        }
+        if (parsed == 0) { return never; }
+        return static_cast<std::int32_t>(
+            std::clamp<long>(parsed, kSparseMoePrefillWideMin, never));
     }();
     return value;
 }

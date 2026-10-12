@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -148,6 +149,28 @@ struct GgmlI8Smem {
     alignas(16) __half2 Ds[Stages][ExpertBN * 2];
     std::uint8_t Off[kI8HeaderSlots][ExpertBM]; // a covering codec's per-row offset, by superblock parity
 };
+
+/// What every target builds as static shared memory. A tile above it (Q6_K's, or any codec's at
+/// 128 columns) takes the launch's dynamic shared memory instead.
+inline constexpr std::size_t kI8StaticSmemLimit = 48 * 1024;
+
+/// The tile's shared memory in the calling kernel: static when it fits kI8StaticSmemLimit, else
+/// the launch's dynamic shared memory, which the launcher sizes with i8_dynamic_smem_bytes and
+/// opts in to (cudaFuncAttributeMaxDynamicSharedMemorySize).
+template <class Smem>
+__device__ __forceinline__ Smem& i8_tile_smem() {
+    if constexpr (sizeof(Smem) <= kI8StaticSmemLimit) {
+        __shared__ Smem sm;
+        return sm;
+    } else {
+        extern __shared__ __align__(16) unsigned char i8_tile_dynamic_smem[];
+        return *reinterpret_cast<Smem*>(i8_tile_dynamic_smem);
+    }
+}
+template <class Smem>
+[[nodiscard]] constexpr std::size_t i8_dynamic_smem_bytes() {
+    return sizeof(Smem) <= kI8StaticSmemLimit ? 0 : sizeof(Smem);
+}
 
 /// The K loop the gate/up and down kernels share. `row_base(local_row)` is a weight row's
 /// first superblock, `act_row(local_col)` the activation row a tile column reads (a token for

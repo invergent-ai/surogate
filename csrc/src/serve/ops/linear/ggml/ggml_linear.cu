@@ -1,6 +1,7 @@
 #include "ops/linear/ggml/ggml_linear.h"
 
 #include "core/device.h"
+#include "ops/kernel/func_attribute.cuh"
 
 #include "ops/linear/ggml/ggml_dense_decode.cuh"
 #include "ops/linear/ggml/ggml_dense_block32.cuh"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace sinfer::ops::detail::ggml {
@@ -33,6 +35,19 @@ void run_gemv(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
 
 /// Static shared memory every architecture the kernels build for accepts (sm_89 included).
 constexpr std::size_t kStaticSharedLimit = 48 * 1024;
+static_assert(kStaticSharedLimit == kI8StaticSmemLimit);
+/// The most shared memory one block may opt in to on every target (sm_89 and sm_12x: 99 KiB).
+constexpr std::size_t kDynamicSharedLimit = 99 * 1024;
+
+/// Whether a codec whose 128-column tile is above the static limit (Q6_K) may take that tile on
+/// dynamic shared memory, one block to an SM: SUROGATE_SERVE_GGML_WIDE_DYNAMIC=0 keeps it at 64.
+bool wide_dynamic_allowed() noexcept {
+    static const bool allowed = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_GGML_WIDE_DYNAMIC");
+        return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
+    }();
+    return allowed;
+}
 
 std::atomic<std::int32_t> tile_multiprocessors_override{0};
 
@@ -43,9 +58,10 @@ template <class Codec, int TileRows, int TileCols>
 __global__ __launch_bounds__((TileCols / 8) * 32) void dense_i8_kernel(
     const std::uint8_t* blocks, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
-    static_assert(sizeof(GgmlI8Smem<Codec, TileCols, TileRows>) <= kStaticSharedLimit,
-                  "static shared memory above 48 KiB does not build for sm_89");
-    __shared__ GgmlI8Smem<Codec, TileCols, TileRows> sm;
+    // Above 48 KiB (Q6_K's 128-column tile) the tile lives in dynamic shared memory.
+    static_assert(sizeof(GgmlI8Smem<Codec, TileCols, TileRows>) <= kDynamicSharedLimit,
+                  "the tile does not fit the shared memory of an sm_89 block");
+    auto& sm = i8_tile_smem<GgmlI8Smem<Codec, TileCols, TileRows>>();
     const int2 tile = grouped_tile<8>();
     const int row0  = tile.x * TileRows;
     const int col0  = tile.y * TileCols;
@@ -91,27 +107,35 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                 return;
             }
             const auto tile = [&]<int TileRows, int TileCols>() {
+                constexpr std::size_t dynamic =
+                    i8_dynamic_smem_bytes<GgmlI8Smem<Codec, TileCols, TileRows>>();
+                auto* const kernel = dense_i8_kernel<Codec, TileRows, TileCols>;
+                if constexpr (dynamic > 0) {
+                    CUDA_CHECK(set_func_attribute_per_device(
+                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(dynamic)));
+                }
                 const dim3 grid((rows + TileRows - 1) / TileRows,
                                 (tokens + TileCols - 1) / TileCols);
-                dense_i8_kernel<Codec, TileRows, TileCols>
-                    <<<grid, (TileCols / 8) * 32, 0, stream>>>(
-                        static_cast<const std::uint8_t*>(blocks), codes, ds, rows, k,
-                        tokens, out, beta != 0.0f);
+                kernel<<<grid, (TileCols / 8) * 32, dynamic, stream>>>(
+                    static_cast<const std::uint8_t*>(blocks), codes, ds, rows, k, tokens, out,
+                    beta != 0.0f);
             };
             // A wide step takes wider token tiles, so each block unpacks a weight tile once for
             // more columns, while the grid still fills the device: a 128-column block runs alone
-            // on its SM, a 64-column one about two to an SM. Q6_K's 128-column tile needs more
-            // static shared memory than sm_89 allows, so it stops at 64. Every column is still one
+            // on its SM, a 64-column one about two to an SM. Q6_K's 128-column tile is above the
+            // static shared-memory limit and takes it dynamically. Every column is still one
             // warp's, with the same K loop, so a token's result does not depend on its tile.
-            constexpr bool widest_fits = sizeof(GgmlI8Smem<Codec, 128, 64>) <= kStaticSharedLimit;
+            const bool widest = sizeof(GgmlI8Smem<Codec, 128, 64>) <= kStaticSharedLimit ||
+                                wide_dynamic_allowed();
             const auto grid_blocks = [&](int columns) {
                 return ((rows + 63) / 64) * ((tokens + columns - 1) / columns);
             };
             const std::int32_t sms = kquant_tile_multiprocessors();
             if (tokens <= 8) { tile.template operator()<16, 8>(); }
             else if (tokens <= 32) { tile.template operator()<32, 32>(); }
-            else if (widest_fits && tokens >= 256 && grid_blocks(128) >= sms) {
-                if constexpr (widest_fits) { tile.template operator()<64, 128>(); }
+            else if (widest && tokens >= 256 && grid_blocks(128) >= sms) {
+                tile.template operator()<64, 128>();
             }
             else if (tokens >= 128 && grid_blocks(64) >= 2 * sms) { tile.template operator()<64, 64>(); }
             else { tile.template operator()<64, 32>(); }

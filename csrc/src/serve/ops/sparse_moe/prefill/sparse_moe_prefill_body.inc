@@ -391,11 +391,34 @@ inline int prefill_persistent_blocks() {
 // pair at 4,096 tokens took 38.1 ms with three launched per SM against 28.3 with two.
 // SUROGATE_SERVE_MOE_BLOCKS_PER_SM, when set, still names the count outright.
 template <class Kernel>
-inline int prefill_persistent_blocks(Kernel* kernel, int threads) {
+inline int prefill_persistent_blocks(Kernel* kernel, int threads, std::size_t dynamic_smem = 0) {
     const int blocks = prefill_persistent_blocks();
     if (prefill_blocks_per_sm_override() > 0) { return blocks; }
-    const int resident = cooperative_capacity_per_device(kernel, threads, 0);
+    const int resident = cooperative_capacity_per_device(kernel, threads, dynamic_smem);
     return resident > 0 && resident < blocks ? resident : blocks;
+}
+
+// The int8 expert kernels' minimum residency: the codec's own at eight warps or fewer, one block
+// for the sixteen-warp, 128-column tile, which holds an SM's register file by itself.
+template <class Codec, int ExpertWarps>
+constexpr int i8_expert_min_blocks() {
+    return ExpertWarps <= 8 ? Codec::kMinBlocks : 1;
+}
+
+// One persistent launch of an int8 expert kernel: the grid what co-resides, and the tile's
+// shared memory dynamic when it is above the static limit (the 128-column tile).
+template <class Codec, int ExpertWarps, int ExpertBN, class Kernel, class... Args>
+inline void launch_i8_expert(Kernel* kernel, cudaStream_t stream, Args... args) {
+    static_assert(sizeof(ggml::GgmlI8Smem<Codec, ExpertBN>) <= 99 * 1024,
+                  "the tile does not fit the shared memory of an sm_89 block");
+    constexpr std::size_t dynamic =
+        ggml::i8_dynamic_smem_bytes<ggml::GgmlI8Smem<Codec, ExpertBN>>();
+    if constexpr (dynamic > 0) {
+        CUDA_CHECK(set_func_attribute_per_device(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(dynamic)));
+    }
+    kernel<<<prefill_persistent_blocks(kernel, ExpertWarps * 32, dynamic), ExpertWarps * 32,
+             dynamic, stream>>>(args...);
 }
 
 template <int ExpertWarps, int ExpertBN>
@@ -1215,7 +1238,7 @@ sparse_moe_prefill_ggml_down_kernel(
 //   acc += (d*sc)[row,g] * d_x[col,g] * dot - (dmin*m)[row,g] * sum_x[col,g]
 //
 template <class Codec, int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, Codec::kMinBlocks) void
+__global__ __launch_bounds__(ExpertWarps * 32, (i8_expert_min_blocks<Codec, ExpertWarps>())) void
 sparse_moe_prefill_ggml_i8_gate_up_kernel(
     const std::int8_t* __restrict__ codes, const __half2* __restrict__ ds,
     const int* __restrict__ column_token, const int* __restrict__ expert_offsets,
@@ -1223,7 +1246,7 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
     const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
     const std::uint8_t* __restrict__ blocks, __nv_bfloat16* __restrict__ activation) {
     constexpr int WarpCols     = ExpertBN / ExpertWarps;
-    __shared__ ggml::GgmlI8Smem<Codec, ExpertBN> sm;
+    auto& sm = ggml::i8_tile_smem<ggml::GgmlI8Smem<Codec, ExpertBN>>();
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -1289,7 +1312,7 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
 }
 
 template <class Codec, int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, Codec::kMinBlocks) void
+__global__ __launch_bounds__(ExpertWarps * 32, (i8_expert_min_blocks<Codec, ExpertWarps>())) void
 sparse_moe_prefill_ggml_i8_down_kernel(
     const std::int8_t* __restrict__ codes, const __half2* __restrict__ ds,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
@@ -1297,7 +1320,7 @@ sparse_moe_prefill_ggml_i8_down_kernel(
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ blocks,
     __nv_bfloat16* __restrict__ output) {
     constexpr int WarpCols     = ExpertBN / ExpertWarps;
-    __shared__ ggml::GgmlI8Smem<Codec, ExpertBN> sm;
+    auto& sm = ggml::i8_tile_smem<ggml::GgmlI8Smem<Codec, ExpertBN>>();
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -2069,7 +2092,11 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
             return parsed > 0 ? static_cast<std::int32_t>(parsed) : kSparseMoePrefillWideMin;
         }();
         const bool wide_plan   = tokens >= wide_min;
-        const int route_job_bn = wide_plan ? 64 : 32;
+        // The int8 experts' 128-column tile unpacks each weight tile once for twice the columns,
+        // which is what those kernels are bound by when an expert holds more than 64 of them.
+        const int route_job_bn =
+            wide_plan ? (plan.routed_int8 && tokens >= sparse_moe_i8_wide128_min() ? 128 : 64)
+                      : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExperts, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
             route_tiles, route_job_bn, tokens, adaptive, sparse_moe_fault_warp_skew_ns());
@@ -2216,21 +2243,16 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                     throw std::invalid_argument(
                         "sparse_moe prefill: hidden is not a whole number of this codec's blocks");
                 } else {
-                if (wide_plan) {
-                    sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 8, 64>
-                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 8, 64>, 8 * 32),
-                           8 * 32, 0, stream>>>(
-                            act_codes, act_ds, column_token, offsets, route_job_experts,
-                            route_job_columns, weights.slot_of_expert, route_job_count,
-                            routed_gate_codes, routed_activation);
-                } else {
-                    sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 4, 32>
-                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 4, 32>, 4 * 32),
-                           4 * 32, 0, stream>>>(
-                            act_codes, act_ds, column_token, offsets, route_job_experts,
-                            route_job_columns, weights.slot_of_expert, route_job_count,
-                            routed_gate_codes, routed_activation);
-                }
+                const auto tile = [&]<int Warps, int BN>() {
+                    launch_i8_expert<Codec, Warps, BN>(
+                        sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, Warps, BN>, stream,
+                        act_codes, act_ds, column_token, offsets, route_job_experts,
+                        route_job_columns, weights.slot_of_expert, route_job_count,
+                        routed_gate_codes, routed_activation);
+                };
+                if (route_job_bn == 128) { tile.template operator()<16, 128>(); }
+                else if (wide_plan) { tile.template operator()<8, 64>(); }
+                else { tile.template operator()<4, 32>(); }
                 }
             };
             const bool int8_route = plan.routed_int8;
@@ -2373,19 +2395,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                     throw std::invalid_argument("sparse_moe prefill: the expert width is not a "
                                                 "whole number of this codec's blocks");
                 } else {
-                if (wide_plan) {
-                    sparse_moe_prefill_ggml_i8_down_kernel<Codec, 8, 64>
-                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_down_kernel<Codec, 8, 64>, 8 * 32),
-                           8 * 32, 0, stream>>>(
-                            mid_codes, mid_ds, offsets, route_job_experts, route_job_columns,
-                            weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
-                } else {
-                    sparse_moe_prefill_ggml_i8_down_kernel<Codec, 4, 32>
-                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_down_kernel<Codec, 4, 32>, 4 * 32),
-                           4 * 32, 0, stream>>>(
-                            mid_codes, mid_ds, offsets, route_job_experts, route_job_columns,
-                            weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
-                }
+                const auto tile = [&]<int Warps, int BN>() {
+                    launch_i8_expert<Codec, Warps, BN>(
+                        sparse_moe_prefill_ggml_i8_down_kernel<Codec, Warps, BN>, stream,
+                        mid_codes, mid_ds, offsets, route_job_experts, route_job_columns,
+                        weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
+                };
+                if (route_job_bn == 128) { tile.template operator()<16, 128>(); }
+                else if (wide_plan) { tile.template operator()<8, 64>(); }
+                else { tile.template operator()<4, 32>(); }
                 }
             };
             const bool int8_route = plan.routed_int8;
