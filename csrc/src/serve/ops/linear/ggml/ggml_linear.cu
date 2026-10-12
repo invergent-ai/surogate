@@ -70,6 +70,15 @@ bool affine_gmajor_allowed() noexcept {
     return allowed;
 }
 
+/// The group-major prompt tile's columns: 128, or 64 with SUROGATE_GGML_AFFINE_GMAJOR_COLS=64.
+int affine_gmajor_cols() noexcept {
+    static const int cols = [] {
+        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR_COLS");
+        return raw != nullptr && std::strcmp(raw, "64") == 0 ? 64 : 128;
+    }();
+    return cols;
+}
+
 /// Whether 9-to-32-token rounds of those formats take the group-major 64 x 32 tile:
 /// SUROGATE_GGML_AFFINE_GMAJOR_SMALL=1 (off by default until measured). Same bits either way.
 bool affine_gmajor_small_allowed() noexcept {
@@ -259,7 +268,8 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                     if (tokens >= 256 && row_tiles * ((tokens + 127) / 128) >=
                                              kquant_tile_multiprocessors() &&
                         affine_gmajor_allowed()) {
-                        gmajor_tile.template operator()<128>();
+                        if (affine_gmajor_cols() == 64) { gmajor_tile.template operator()<64>(); }
+                        else { gmajor_tile.template operator()<128>(); }
                         return;
                     }
                     // Verify and multi-sequence decode rounds (9 to 32 tokens): the 64 x 32

@@ -230,9 +230,9 @@ inline constexpr int kRows = 64;
 inline constexpr int kStepValues = 128;                // K values of a class per step
 inline constexpr int kStride = kStepValues + 16;       // int8 row stride, conflict-free ldmatrix
 inline constexpr int kMaxSteps = kStepValues / 16;     // groups per step at the narrowest width
-/// A 64 x Cols tile: Cols / 8 warps of eight token columns each. 128 columns for prompts; 32
-/// for verify and multi-sequence decode rounds, where each thread then keeps eight weight items
-/// in flight across a step's MMAs.
+/// A 64 x Cols tile: Cols / 8 warps of eight token columns each. 128 or 64 columns for prompts
+/// (64: two blocks to an SM, so one block's weight loads overlap the other's MMAs); 32 for verify
+/// and multi-sequence decode rounds.
 template <int Cols>
 struct Smem {
     alignas(16) std::int8_t a[2][kRows * kStride];
@@ -247,7 +247,7 @@ __device__ __forceinline__ int class_groups(int groups, int a) {
 } // namespace gmajor
 
 template <GgmlType Type, int kCols>
-__global__ __launch_bounds__(kCols * 4, 1) void dense_affine_gmajor_kernel(
+__global__ __launch_bounds__(kCols * 4, kCols == 64 ? 2 : 1) void dense_affine_gmajor_kernel(
     const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
     using namespace gmajor;
@@ -258,7 +258,7 @@ __global__ __launch_bounds__(kCols * 4, 1) void dense_affine_gmajor_kernel(
     constexpr int kThreads = kCols * 4;           // kCols / 8 warps
     constexpr int kItems   = kRows * (kStepValues / 8) / kThreads; // weight eighths per thread
     constexpr int kXItems  = (kStepValues / 16) * kCols / kThreads; // activation pieces per thread
-    static_assert(kCols == 32 || kCols == 128);
+    static_assert(kCols == 32 || kCols == 64 || kCols == 128);
     extern __shared__ __align__(16) unsigned char gmajor_smem[];
     auto& sm = *reinterpret_cast<Smem<kCols>*>(gmajor_smem);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;

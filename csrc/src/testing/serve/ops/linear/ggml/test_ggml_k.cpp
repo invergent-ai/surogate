@@ -918,9 +918,73 @@ int shared_projection_case(const Fixture& f, int tokens, int map_mode, bool aren
     return !ok;
 }
 
+// SINFER_GGML_BENCH="TYPE:rows:k:tokens[,...]": times linear_launch on the device's own tile plan
+// (random block bytes, 20 launches after 3 warm-ups) instead of running the checks.
+int run_bench(const char* spec) {
+    std::string all(spec);
+    std::size_t start = 0;
+    while (start < all.size()) {
+        const std::size_t end = all.find(',', start);
+        const std::string item = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        start = end == std::string::npos ? all.size() : end + 1;
+        char name[32] = {};
+        int rows = 0, k = 0, tokens = 0;
+        if (std::sscanf(item.c_str(), "%31[^:]:%d:%d:%d", name, &rows, &k, &tokens) != 4) {
+            std::fprintf(stderr, "bench: cannot parse %s\n", item.c_str());
+            return 1;
+        }
+        bool found = false;
+        gg::GgmlType type{};
+#define SINFER_BENCH_TYPE(NAME) if (std::string(name) == #NAME) { type = gg::GgmlType::NAME; found = true; }
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_BENCH_TYPE)
+#undef SINFER_BENCH_TYPE
+        if (!found) { std::fprintf(stderr, "bench: unknown type %s\n", name); return 1; }
+        const std::size_t block_bytes = static_cast<std::size_t>(rows) * (k / gg::block_values(type)) *
+                                        gg::block_bytes(type);
+        std::vector<std::uint8_t> blocks(block_bytes);
+        std::mt19937 rng(7);
+        for (auto& b : blocks) { b = static_cast<std::uint8_t>(rng()); }
+        const auto x = random_activation(k, tokens, 11u);
+        void *d_blocks = nullptr, *d_x = nullptr, *d_out = nullptr, *d_scratch = nullptr;
+        const std::size_t scratch_bytes = gg::linear_workspace_bytes(rows, k, tokens);
+        CHECK_CUDA(cudaMalloc(&d_blocks, blocks.size()));
+        CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+        CHECK_CUDA(cudaMalloc(&d_out, static_cast<std::size_t>(rows) * tokens * sizeof(__nv_bfloat16)));
+        CHECK_CUDA(cudaMalloc(&d_scratch, scratch_bytes));
+        CHECK_CUDA(cudaMemcpy(d_blocks, blocks.data(), blocks.size(), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+        const auto launch = [&] {
+            gg::linear_launch(type, d_blocks, rows, k, static_cast<const __nv_bfloat16*>(d_x), tokens,
+                              static_cast<__nv_bfloat16*>(d_out), d_scratch, scratch_bytes, nullptr);
+        };
+        for (int i = 0; i < 3; ++i) { launch(); }
+        cudaEvent_t t0, t1;
+        CHECK_CUDA(cudaEventCreate(&t0));
+        CHECK_CUDA(cudaEventCreate(&t1));
+        CHECK_CUDA(cudaEventRecord(t0));
+        for (int i = 0; i < 20; ++i) { launch(); }
+        CHECK_CUDA(cudaEventRecord(t1));
+        CHECK_CUDA(cudaEventSynchronize(t1));
+        float ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(&ms, t0, t1));
+        ms /= 20.0f;
+        const double tops = 2.0 * rows * k * static_cast<double>(tokens) / (ms * 1e-3) / 1e12;
+        std::printf("BENCH %-7s rows %6d k %5d tokens %5d  %8.3f ms  %6.1f TOPS  %6.1f GB/s weights\n", name,
+                    rows, k, tokens, ms, tops, block_bytes / (ms * 1e-3) / 1e9);
+        CHECK_CUDA(cudaEventDestroy(t0));
+        CHECK_CUDA(cudaEventDestroy(t1));
+        CHECK_CUDA(cudaFree(d_blocks));
+        CHECK_CUDA(cudaFree(d_x));
+        CHECK_CUDA(cudaFree(d_out));
+        CHECK_CUDA(cudaFree(d_scratch));
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
+    if (const char* bench = std::getenv("SINFER_GGML_BENCH")) { return run_bench(bench); }
     const char* env       = std::getenv("SINFER_GGML_FIXTURE_DIR");
     const std::string dir = env != nullptr ? env : "/tmp/surogate_ggml_test";
     int device_count      = 0;
