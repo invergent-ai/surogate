@@ -62,6 +62,17 @@ int affine_rows() noexcept {
     return value;
 }
 
+/// Weight rows per block of the cp_async-staged 32-column tile (dense_affine_staged_kernel), 16 or
+/// 32; 0 (SUROGATE_GGML_AFFINE_STAGED unset or 0) keeps dense_affine_mma_kernel. Same bits.
+int affine_staged_rows() noexcept {
+    static const int value = [] {
+        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_STAGED");
+        if (raw == nullptr) { return 0; }
+        return std::strcmp(raw, "16") == 0 ? 16 : std::strcmp(raw, "32") == 0 ? 32 : 0;
+    }();
+    return value;
+}
+
 std::atomic<std::int32_t> tile_multiprocessors_override{0};
 
 // Keep the activation quantisation used by GEMV when a graph pads a short
@@ -228,6 +239,17 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                 if constexpr (Type == GgmlType::F16) {
                     dense_f16_mma_kernel<Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
                         static_cast<const __half*>(blocks), x, rows, k, tokens, out, beta != 0);
+                } else if (Cols == 32 && affine_staged_rows() != 0) {
+                    if constexpr (Cols == 32) {
+                        if (affine_staged_rows() == 16) {
+                            dense_affine_staged_kernel<Type, Cols, 16><<<grid, (Cols / 8) * 32, 0, stream>>>(
+                                bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                        } else {
+                            const dim3 tall((rows + 31) / 32, (tokens + Cols - 1) / Cols);
+                            dense_affine_staged_kernel<Type, Cols, 32><<<tall, (Cols / 8) * 32, 0, stream>>>(
+                                bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                        }
+                    }
                 } else if (Cols >= 64 && affine_rows() == 32) {
                     const dim3 tall((rows + 31) / 32, (tokens + Cols - 1) / Cols);
                     dense_affine_mma_kernel<Type, Cols, 32><<<tall, (Cols / 8) * 32, 0, stream>>>(

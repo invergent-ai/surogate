@@ -214,6 +214,148 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
     }
 }
 
+// dense_affine_mma_kernel with its operands staged a 256-value chunk ahead by cp_async: each
+// row's chunk of weight blocks as a 16-byte-aligned window (decoded from shared memory by the same
+// dense_codes_eight, at the same offset modulo 16, so the same values), the activations and their
+// scales. The plain kernel decodes each chunk's weights with synchronous loads from global memory,
+// so every chunk waits on DRAM: at a decode round's 16 tokens it streamed the 10240 x 2560 IQ4_XS
+// projection at ~120 GB/s (S25). The arithmetic is dense_affine_mma_kernel's, so the bits are too.
+template <GgmlType Type>
+struct StagedAffine {
+    static constexpr int kChunkBytes = (256 / block_values(Type)) * block_bytes(Type);
+    static constexpr int kWinUnits   = (kChunkBytes + 30) / 16; // from any offset below sixteen
+    static constexpr int kWin        = kWinUnits * 16;
+};
+
+template <GgmlType Type, int Cols, int Rows>
+__global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_staged_kernel(
+    const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
+    int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
+    static_assert(Rows == 16 || Rows == 32);
+    using Staged = StagedAffine<Type>;
+    constexpr int threads = (Cols / 8) * 32, width = DenseFormat<Type>::kWidth;
+    constexpr int stride = 272, groups = 256 / width, Tiles = Rows / 16;
+    __shared__ __align__(16) std::uint8_t win[2][Rows * Staged::kWin];
+    __shared__ __align__(16) std::int8_t a[Rows * stride], b[2][Cols * stride];
+    __shared__ float2 scales[groups * Rows];
+    __shared__ __align__(16) __half2 dxh[2][Cols * 8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int gid = lane >> 2, lid = lane & 3;
+    const int2 tile = grouped_tile<512 / Rows>();
+    const int row0 = tile.x * Rows, col0 = tile.y * Cols;
+    const std::int64_t row_bytes = std::int64_t(k / block_values(Type)) * block_bytes(Type);
+    const std::uint8_t* const end = weights + std::int64_t(rows) * row_bytes;
+    const int chunks = (k + 255) / 256;
+    float acc[8][Tiles][4] = {};
+
+    auto stage = [&](int buf, int c) {
+        const int first = 256 * c;
+        for (int item = tid; item < Rows * Staged::kWinUnits; item += threads) {
+            const int row = item / Staged::kWinUnits, unit = item - row * Staged::kWinUnits;
+            const std::uint8_t* start = weights + std::int64_t(min(row0 + row, rows - 1)) * row_bytes +
+                                        std::int64_t(c) * Staged::kChunkBytes;
+            const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(
+                reinterpret_cast<std::uintptr_t>(start) & ~std::uintptr_t{15}) + 16 * unit;
+            const std::int64_t left = end - src;
+            const int bytes = left >= 16 ? 16 : (left > 0 ? static_cast<int>(left) : 0);
+            cp_async_zfill<16, Cache::cg>(&win[buf][row * Staged::kWin + 16 * unit], bytes > 0 ? src : weights, bytes);
+        }
+        for (int item = tid; item < Cols * 16; item += threads) {
+            const int col = item / 16, kk = item % 16 * 16;
+            const bool valid = col0 + col < tokens && first + kk < k;
+            cp_async_zfill<16, Cache::cg>(b[buf] + col * stride + kk,
+                codes + (valid ? std::int64_t(col0 + col) * k + first + kk : 0), valid ? 16 : 0);
+        }
+        for (int item = tid; item < Cols * 8; item += threads) {
+            const int col = item / 8, g = item % 8;
+            const bool valid = col0 + col < tokens && first + 32 * g < k;
+            cp_async_zfill<4, Cache::ca>(&dxh[buf][item],
+                ds + (valid ? std::int64_t(col0 + col) * (k / 32) + first / 32 + g : 0), valid ? 4 : 0);
+        }
+    };
+
+    stage(0, 0);
+    cp_commit();
+    for (int c = 0; c < chunks; ++c) {
+        const int buf = c & 1, first = 256 * c;
+        cp_wait<0>();
+        __syncthreads(); // chunk c is in; every warp is past chunk c - 1's MMA (a, b[buf ^ 1])
+        if (c + 1 < chunks) { stage(buf ^ 1, c + 1); }
+        cp_commit();
+        for (int item = tid; item < Rows * 32; item += threads) {
+            const int row = item / 32, kk = item % 32 * 8;
+            DenseAffineEight weight;
+            if (first + kk < k && row0 + row < rows) {
+                const std::uint8_t* start = weights + std::int64_t(row0 + row) * row_bytes +
+                                            std::int64_t(c) * Staged::kChunkBytes;
+                const int off = static_cast<int>(reinterpret_cast<std::uintptr_t>(start) & 15u);
+                weight = dense_codes_eight<Type>(&win[buf][row * Staged::kWin + off], kk);
+            }
+            *reinterpret_cast<uint2*>(a + row * stride + kk) = make_uint2(weight.lo, weight.hi);
+            if (kk % width == 0) { scales[kk / width * Rows + row] = make_float2(weight.scale, weight.bias); }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < groups; ++g) {
+            const int token = warp * 8 + (lane & 7);
+            const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
+            unsigned b0, b1 = 0;
+            if constexpr (width == 32) {
+                ldmatrix_x2(b0, b1, smem_addr(b[buf] + token * stride + g * width + ((lane >> 3) & 1) * 16));
+            } else {
+                b0 = dense_ldmatrix_x1(smem_addr(b[buf] + token * stride + g * width));
+            }
+            const float x0 = __low2float(dxh[buf][(warp * 8 + 2 * lid) * 8 + g * width / 32]);
+            const float x1 = __low2float(dxh[buf][(warp * 8 + 2 * lid + 1) * 8 + g * width / 32]);
+            int sum0 = 0, sum1 = 0;
+            if constexpr (DenseFormat<Type>::kBias) {
+                const int offset = (lane >> 3) % (width / 8) * 8;
+                const auto* v = reinterpret_cast<const int*>(b[buf] + token * stride + g * width + offset);
+                int sum = __dp4a(0x01010101, v[1], __dp4a(0x01010101, v[0], 0));
+                sum += __shfl_xor_sync(0xffffffffu, sum, 8);
+                if constexpr (width == 32) { sum += __shfl_xor_sync(0xffffffffu, sum, 16); }
+                sum0 = __shfl_sync(0xffffffffu, sum, 2 * lid);
+                sum1 = __shfl_sync(0xffffffffu, sum, 2 * lid + 1);
+            }
+#pragma unroll
+            for (int t = 0; t < Tiles; ++t) {
+                const std::int8_t* at = a + (16 * t + ar) * stride + g * width;
+                int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                if constexpr (width == 32) {
+                    unsigned a0, a1, a2, a3;
+                    ldmatrix_x4(a0, a1, a2, a3, smem_addr(at + (lane >> 4) * 16));
+                    mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                } else {
+                    unsigned a0, a1;
+                    ldmatrix_x2(a0, a1, smem_addr(at));
+                    mma_s8_k16(d0, d1, d2, d3, a0, a1, b0);
+                }
+                const float2 s0 = scales[g * Rows + 16 * t + gid], s1 = scales[g * Rows + 16 * t + gid + 8];
+                constexpr bool bias = DenseFormat<Type>::kBias;
+                acc[g % 8][t][0] = dense_affine_fma<bias>(acc[g % 8][t][0], s0.x, s0.y, x0, d0, sum0);
+                acc[g % 8][t][1] = dense_affine_fma<bias>(acc[g % 8][t][1], s0.x, s0.y, x1, d1, sum1);
+                acc[g % 8][t][2] = dense_affine_fma<bias>(acc[g % 8][t][2], s1.x, s1.y, x0, d2, sum0);
+                acc[g % 8][t][3] = dense_affine_fma<bias>(acc[g % 8][t][3], s1.x, s1.y, x1, d3, sum1);
+            }
+        }
+    }
+    cp_wait<0>();
+#pragma unroll
+    for (int t = 0; t < Tiles; ++t) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = row0 + 16 * t + gid + 8 * (e / 2);
+            const int col = col0 + warp * 8 + 2 * lid + (e & 1);
+            if (row < rows && col < tokens) {
+                const float p0 = (acc[0][t][e] + acc[1][t][e]) + (acc[2][t][e] + acc[3][t][e]);
+                const float p1 = (acc[4][t][e] + acc[5][t][e]) + (acc[6][t][e] + acc[7][t][e]);
+                const auto i = std::int64_t(col) * rows + row;
+                out[i] = __float2bfloat16_rn((p0 + p1) + (accumulate ? __bfloat162float(out[i]) : 0.0f));
+            }
+        }
+    }
+}
+
 // F16 weights and BF16 activations are represented exactly by TF32. Keep the
 // same k8 MMA order at every width without adding activation quantization or
 // rounding the stored weights to BF16.
