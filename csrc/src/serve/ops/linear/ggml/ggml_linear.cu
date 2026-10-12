@@ -62,13 +62,15 @@ int affine_rows() noexcept {
     return value;
 }
 
-/// Weight rows per block of the cp_async-staged 32-column tile (dense_affine_staged_kernel), 16 or
-/// 32; 0 (SUROGATE_GGML_AFFINE_STAGED unset or 0) keeps dense_affine_mma_kernel. Same bits.
+/// Weight rows per block of the cp_async-staged 32-column tile (dense_affine_staged_kernel): 32, or
+/// 16 with SUROGATE_GGML_AFFINE_STAGED=16; =0 keeps dense_affine_mma_kernel. Same bits. On GB10 a
+/// 32-token decode round (8 users, MTP 3) streams IQ4_XS from DRAM at 163 GB/s against 148, and
+/// Swift-1.5 IQ2_XS decodes 16.5 tokens/s a user at 8 users against 15.4 (26.2 vs 26.0 at 4).
 int affine_staged_rows() noexcept {
     static const int value = [] {
         const char* raw = std::getenv("SUROGATE_GGML_AFFINE_STAGED");
-        if (raw == nullptr) { return 0; }
-        return std::strcmp(raw, "16") == 0 ? 16 : std::strcmp(raw, "32") == 0 ? 32 : 0;
+        if (raw == nullptr || *raw == '\0') { return 32; }
+        return std::strcmp(raw, "0") == 0 ? 0 : std::strcmp(raw, "16") == 0 ? 16 : 32;
     }();
     return value;
 }

@@ -219,7 +219,7 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
 // dense_codes_eight, at the same offset modulo 16, so the same values), the activations and their
 // scales. The plain kernel decodes each chunk's weights with synchronous loads from global memory,
 // so every chunk waits on DRAM: at a decode round's 16 tokens it streamed the 10240 x 2560 IQ4_XS
-// projection at ~120 GB/s (S25). The arithmetic is dense_affine_mma_kernel's, so the bits are too.
+// projection at ~120 GB/s. The arithmetic is dense_affine_mma_kernel's, so the bits are too.
 template <GgmlType Type>
 struct StagedAffine {
     static constexpr int kChunkBytes = (256 / block_values(Type)) * block_bytes(Type);
