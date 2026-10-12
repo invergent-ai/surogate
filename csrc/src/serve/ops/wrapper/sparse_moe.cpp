@@ -509,8 +509,9 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
         nvfp4_profile ? trtllm_min_tokens()
         : fp8_profile ? detail::sparse_moe_fp8_prefill_min()
         : w8_profile  ? detail::kSparseMoePrefillW8W8Min
-                      : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
-                                                          : detail::kSparseMoePrefillQ4Q6Min);
+                      : std::min(detail::sparse_moe_ggml_prefill_min(),
+                                 routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
+                                                                  : detail::kSparseMoePrefillQ4Q6Min);
     // Under SparseMoeRouting::WidthInvariant an admitted pair takes the prefill family from one
     // token. Only the prefill interval widens: the width-chosen terms stay, because a call can
     // still fall back to them (an adapter-bound round, a hook that resolves experts), so this

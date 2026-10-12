@@ -68,6 +68,9 @@ struct SparseMoePrefillPlan {
 /// SUROGATE_SERVE_MOE_FP8_PREFILL_MIN in [1, 47] so the crossover can be re-measured. Never
 /// above the small-T bound plus one, so no width falls to the per-token decode loop.
 [[nodiscard]] std::int32_t sparse_moe_fp8_prefill_min() noexcept;
+/// The first width a GGML block pair takes the wide kernels at: kSparseMoePrefillGgmlKMin unless
+/// SUROGATE_SERVE_MOE_GGML_PREFILL_MIN (1..47) says otherwise.
+[[nodiscard]] std::int32_t sparse_moe_ggml_prefill_min() noexcept;
 
 /// Whether a routed codec pair takes the int8 tensor-core route.
 [[nodiscard]] bool sparse_moe_routed_int8_profile(QType routed_gate_up, QType routed_down) noexcept;

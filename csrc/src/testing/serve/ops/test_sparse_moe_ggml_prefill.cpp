@@ -534,7 +534,11 @@ int run_mixture(const Mixture& mixture, const std::vector<std::int32_t>& token_c
         const DeviceBuffer drx = to_device_bf16(router_x);
 
         const std::vector<double> reference =
-            run_moe(weights, g, dx, drx, tokens, ops::detail::kSparseMoeSmallTMax);
+            run_moe(weights, g, dx, drx, tokens,
+                    std::min(ops::detail::kSparseMoeSmallTMax,
+                             ops::detail::sparse_moe_ggml_prefill_min() - 1 > 0
+                                 ? ops::detail::sparse_moe_ggml_prefill_min() - 1
+                                 : 1));
         const std::vector<double> prefill = run_moe(weights, g, dx, drx, tokens, tokens);
         failures += compare("T=" + std::to_string(tokens) + " prefill vs small-T", prefill,
                             reference, mixture.relative_to_max);
@@ -724,6 +728,14 @@ int main() {
         return Mixture{name, ops::kSparseMoeFlashNextGeometry, gate_up, down,
                        ops::GatedActivation::Silu, false, 0.02};
     };
+    // With SUROGATE_SERVE_MOE_GGML_PREFILL_MIN lowering the wide kernels' first width, the
+    // narrow rounds a speculative verify makes (four columns a lane) take them too.
+    const bool narrow_wide = std::getenv("SUROGATE_SERVE_MOE_GGML_PREFILL_MIN") != nullptr;
+    if (narrow_wide) {
+        failures += run_mixture(flash_next_iq("Flash-Next IQ3_S/IQ4_NL narrow", QType::IQ3_S, QType::IQ4_NL), {2, 4, 16, 33});
+        failures += run_mixture(flash_next_iq("Flash-Next IQ2_S/Q2_0 narrow", QType::IQ2_S, QType::Q2_0), {2, 4, 16, 33});
+        failures += run_mixture(flash_next_iq("Flash-Next IQ1_M/Q2_0 narrow", QType::IQ1_M, QType::Q2_0), {4, 16});
+    }
     failures += run_mixture(flash_next_iq("Flash-Next IQ3_S/IQ4_NL", QType::IQ3_S, QType::IQ4_NL), {47, 130, 801, 2048});
     failures += run_mixture(flash_next_iq("Flash-Next IQ3_XXS/IQ4_NL", QType::IQ3_XXS, QType::IQ4_NL), {47, 130, 801});
     failures += run_mixture(flash_next_iq("Flash-Next IQ2_S/IQ4_NL", QType::IQ2_S, QType::IQ4_NL), {47, 130, 801});
