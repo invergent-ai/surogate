@@ -99,6 +99,13 @@ Llama, and FP8 for hybrid models such as Qwen3.5/3.6/3.8. Explicit `fp8` uses ha
 storage of BF16; explicit `bf16` keeps BF16 regardless of model family. Changing cache
 precision can affect output quality. `int8` is also available for comparison.
 
+With an FP8 cache on compute capability 12.x GPUs (RTX 50 series, RTX PRO 6000, DGX Spark),
+prompt attention in layers without a sliding window multiplies the attention probabilities,
+rounded to FP8, with the cached values on the FP8 tensor cores. On a DGX Spark this makes prompt
+attention about a third faster, with the same accuracy in our measurements. Set
+`SUROGATE_SERVE_PROMPT_ATTENTION_FP8_PV=0` to keep that product in BF16 (see
+[Environment](cli.md#environment)).
+
 DFlash supports BF16 and FP8 caches. Use `--kv-cache-dtype fp8` to reduce cache memory.
 
 ## Model families
