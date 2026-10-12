@@ -222,7 +222,11 @@ int run_case(bool mrope, const sinfer::ops::RopeYarn* yarn = nullptr) {
         const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, coordinate_base);
         const std::size_t base        = cache.cell_offset(b * kBlock);
         for (int d = 0; d < kHeadDim; ++d) {
-            const double tolerance = 0.008 * std::abs(want[d]) + 0.004;
+            // YaRN scales the rotated components by its attention factor, and the rounding
+            // that sits on them with it, so the absolute floor scales too (the unscaled case
+            // already reaches 0.9 of it at block 64, dim 44).
+            const double floor     = 0.004 * (yarn != nullptr && d < kRotary ? yarn->attention_factor : 1.0);
+            const double tolerance = 0.008 * std::abs(want[d]) + floor;
             const double error     = std::abs(plane_host[base + d] - want[d]) / tolerance;
             if (error > worst) {
                 worst = error;
