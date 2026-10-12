@@ -53,6 +53,18 @@ template <class Codec>
     }
 }
 
+/// Where a tile's own bytes start inside its staged window: the codec's `tile_shift` where it
+/// stages a wider aligned window than its block (GgmlQ20I8Prefill), else zero.
+template <class Codec>
+__device__ __forceinline__ int tile_shift(int tile) {
+    if constexpr (requires { Codec::tile_shift(0); }) {
+        return Codec::tile_shift(tile);
+    } else {
+        (void)tile;
+        return 0;
+    }
+}
+
 __device__ __forceinline__ const std::uint8_t* align_down16(const std::uint8_t* p) {
     return reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(p) &
                                                  ~std::uintptr_t{15});
@@ -249,11 +261,15 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
         if (tid < ExpertBN) {
             cp_async_zfill<8, Cache::ca>(&sm.Ds[stage][tid * 2], d_src + kt * 2, d_valid ? 8 : 0);
         }
-        for (int item = tid; item < ExpertBM * TileUnits; item += ExpertThreads) {
-            const int row  = item / TileUnits;
-            const int unit = item - row * TileUnits;
-            stage_ggml_tile<Codec>(&sm.Cr[stage][row * Codec::kTileStride], row_base(row), kt,
-                                   unit);
+        // A codec whose readers take everything from the header stages no tile (Q3_K, the
+        // covered i-quants).
+        if constexpr (TileUnits > 0) {
+            for (int item = tid; item < ExpertBM * TileUnits; item += ExpertThreads) {
+                const int row  = item / TileUnits;
+                const int unit = item - row * TileUnits;
+                stage_ggml_tile<Codec>(&sm.Cr[stage][row * Codec::kTileStride], row_base(row),
+                                       kt, unit);
+            }
         }
         // A format whose scales travel inside the tile has no header to stage.
         if constexpr (Codec::kHeaderBytes > 0) {
@@ -307,7 +323,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
             for (int item = tid; item < Codec::kScaleGroups * ExpertBM; item += ExpertThreads) {
                 const int row     = item & (ExpertBM - 1);
                 const int idx     = item / ExpertBM;
-                const int off     = Codec::kCover ? sm.Off[slot][row] : 0;
+                const int off     = Codec::kCover ? sm.Off[slot][row] : tile_shift<Codec>(kt);
                 const std::uint8_t* scales = Codec::kScalesInTile
                                                  ? &sm.Cr[stage][row * Codec::kTileStride]
                                                  : &sm.Hdr[slot][row * Codec::kHeaderStride];
@@ -324,7 +340,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
             const int q   = item & 7;
             unsigned lo   = 0;
             unsigned hi   = 0;
-            const int off = Codec::kCover ? sm.Off[slot][row] : 0;
+            const int off = Codec::kCover ? sm.Off[slot][row] : tile_shift<Codec>(kt);
             Codec::unpack(&sm.Cr[stage][row * Codec::kTileStride] + off,
                           &sm.Hdr[slot][row * Codec::kHeaderStride] + off, tib, q, lo, hi);
             *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 4 * q])      = lo;

@@ -22,6 +22,7 @@
 #include <cuda_bf16.h>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace sinfer::ops::detail::ggml {
 
@@ -122,6 +123,40 @@ struct GgmlQ20Prefill : GgmlBlockPrefill<GgmlType::Q2_0> {
         const int codes = tile[2 + lane / 2] >> (4 * (lane & 1));
         return __floats2bfloat162_rn(d * ((codes & 3) - 1), d * (((codes >> 2) & 3) - 1));
     }
+};
+
+/// Q2_0 on the int8 route, staged with four-byte `cp_async` copies. An 18-byte block starts
+/// only two-byte aligned on an odd tile, so each tile stages the 20-byte, four-byte-aligned
+/// window around its block, which then sits at offset 0 (even tile) or 2 (odd tile) of the
+/// staged bytes -- `tile_shift`, which the int8 tile adds wherever it reads them. The windows
+/// need every row to start four-byte aligned, a whole number of 128 values (an even number of
+/// blocks); an even tile's window reads two bytes into the next block of its row, and a row's
+/// last tile is odd, so no window leaves its row. The scalar two-byte route (GgmlQ20Prefill)
+/// stays for rows of an odd block count; staging was more than half of a Q2_0 expert pair's
+/// time there (ablated at 4,096 Flash-Next tokens: 37.9 -> 16.6 ms).
+struct GgmlQ20I8Prefill : GgmlQ20Prefill {
+    static constexpr bool kCpAsync    = true;
+    static constexpr int kStageUnit   = 4;
+    static constexpr int kTileBytes   = 20; // the staged window, five units
+    static constexpr int kHeaderBytes = 0;  // the scale travels in the tile
+    static constexpr int kKMultiple   = 128;
+    static_assert(kTileBytes <= kTileStride && kTileStride % 4 == 0);
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        return 18 * tile - 2 * (tile & 1) + kStageUnit * chunk;
+    }
+    __device__ static __forceinline__ int tile_shift(int tile) { return 2 * (tile & 1); }
+};
+
+/// The int8 codec a row of `K` values takes: one that needs more of K than its format does
+/// (GgmlQ20I8Prefill: a whole number of 128 values) falls back to the format's own.
+template <class Int8Codec, int K>
+struct I8CodecForK {
+    using type = Int8Codec;
+};
+template <int K>
+struct I8CodecForK<GgmlQ20I8Prefill, K> {
+    using type = std::conditional_t<K % GgmlQ20I8Prefill::kKMultiple == 0, GgmlQ20I8Prefill,
+                                    GgmlQ20Prefill>;
 };
 
 /// Q4_K. A 64-value tile is exactly the 32 `qs` bytes of quarter `c`: their low nibbles are the
@@ -1130,7 +1165,7 @@ struct PrefillCodecFor {
 };
 template <> struct PrefillCodecFor<GgmlType::Q2_0> {
     using Codec = GgmlQ20Prefill;
-    using Int8Codec = Codec;
+    using Int8Codec = GgmlQ20I8Prefill; // via I8CodecForK: the scalar route for odd block counts
     static constexpr bool kInt8Route = true;
 };
 template <> struct PrefillCodecFor<GgmlType::Q4_K> { using Codec = GgmlQ4KPrefill; using Int8Codec = Codec; static constexpr bool kInt8Route = true; };

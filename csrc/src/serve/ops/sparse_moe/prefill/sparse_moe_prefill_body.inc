@@ -2238,7 +2238,8 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                 }
                 }
             };
-            const auto launch_i8_gate_up = [&]<class Codec>() {
+            const auto launch_i8_gate_up = [&]<class Int8Codec>() {
+                using Codec = typename ggml::I8CodecForK<Int8Codec, kHidden>::type;
                 if constexpr (kHidden % Codec::kKMultiple != 0) {
                     throw std::invalid_argument(
                         "sparse_moe prefill: hidden is not a whole number of this codec's blocks");
@@ -2390,7 +2391,8 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                 }
                 }
             };
-            const auto launch_i8_down = [&]<class Codec>() {
+            const auto launch_i8_down = [&]<class Int8Codec>() {
+                using Codec = typename ggml::I8CodecForK<Int8Codec, kIntermediate>::type;
                 if constexpr (kIntermediate % Codec::kKMultiple != 0) {
                     throw std::invalid_argument("sparse_moe prefill: the expert width is not a "
                                                 "whole number of this codec's blocks");
