@@ -13,6 +13,7 @@
 // A block is complete as soon as its last position is cached, so `qsa_indexer_append` folds it
 // in the same launch that writes the raw keys.
 
+#include "api/ops/rope.h"
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
@@ -43,6 +44,10 @@ struct QsaIndexerGeometry {
     float rms_eps           = 1.0e-6F;
     std::int32_t mrope_height = 0;
     std::int32_t mrope_width = 0;
+    /// YaRN's coefficients when the model is served with --rope-scaling: the block keys then turn
+    /// as ops::rope's YaRN form turns the indexer queries (rope_theta is not read). Null keeps
+    /// the native rotation.
+    const RopeYarn* yarn = nullptr;
 };
 
 /// Words of a per-row block bitmask covering `keys` cells: one bit per block, LSB first.

@@ -72,8 +72,10 @@ context is explicit, omitted cache capacity defaults to that same token count. U
 
 `--rope-scaling` takes the Hugging Face `rope_scaling` object, as vLLM does, and serves the
 model with YaRN: the context limit becomes the original length times `factor`. Qwen3.5 / 3.6
-MoE checkpoints (Surogate3.7-35B-A3B, Qwen3.6-35B-A3B) are trained to 262,144 tokens; factor 4
-serves them to 1,048,576:
+MoE checkpoints (Surogate3.7-35B-A3B, Qwen3.6-35B-A3B) and Qwen3.8-Flash-Next (its GGUFs and
+NVIDIA's NVFP4 release) are trained to 262,144 tokens; factor 4 serves them to 1,048,576.
+Flash-Next's QSA indexer turns its queries and block keys with the same coefficients as the
+attention, so the blocks it selects past the native length are scored as the model scores them:
 
 ```bash
 surogate serve surogate/Surogate3.7-35B-A3B-NVFP4 --max-model-len 1048576 \

@@ -96,25 +96,32 @@ __device__ __forceinline__ void fixed_axis_frequency(int pair, int* axis, float*
     }
 }
 
-// `Yarn` (Text1D and TextMrope only): pair `pair` turns at yarn->inv_frequency[pair], the angle
-// taken in double and reduced before sincosf, and both coefficients carry yarn->attention_factor.
+// YaRN's coefficients of pair `pair` at `position`: the pair's own frequency, the angle taken in
+// double and reduced before sincosf, and both coefficients scaled by the attention factor. Every
+// kernel that rotates under YaRN (fixed, generic, the QSA indexer's block keys) derives them here,
+// so a query and the key it is scored against turn by the same angles.
+__device__ __forceinline__ void rope_yarn_sincos(std::int32_t position, int pair,
+                                                 const RopeYarn& yarn, float* sine, float* cosine) {
+    constexpr double kInvTwoPi = 1.59154943091895336e-01;
+    constexpr double kTwoPi    = 6.28318530717958648e+00;
+    const double angle  = static_cast<double>(position) * static_cast<double>(yarn.inv_frequency[pair]);
+    const float reduced = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
+    float s, c;
+    sincosf(reduced, &s, &c);
+    *sine   = s * yarn.attention_factor;
+    *cosine = c * yarn.attention_factor;
+}
+
+// `Yarn` (Text1D and TextMrope only): rope_yarn_sincos, on axis pair % 3 for [T,3] positions.
 template <RopeKernelMode Mode, bool Yarn = false>
 __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int tokens, int token,
                                              int pair, float* sine, float* cosine,
                                              const RopeYarn* yarn = nullptr) {
     static_assert(!Yarn || Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope);
     if constexpr (Yarn) {
-        constexpr double kInvTwoPi = 1.59154943091895336e-01;
-        constexpr double kTwoPi    = 6.28318530717958648e+00;
-        const int axis             = Mode == RopeKernelMode::TextMrope ? pair % 3 : 0;
-        const double angle =
-            static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-            static_cast<double>(yarn->inv_frequency[pair]);
-        const float reduced = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
-        float s, c;
-        sincosf(reduced, &s, &c);
-        *sine   = s * yarn->attention_factor;
-        *cosine = c * yarn->attention_factor;
+        const int axis = Mode == RopeKernelMode::TextMrope ? pair % 3 : 0;
+        rope_yarn_sincos(positions[static_cast<std::int64_t>(axis) * tokens + token], pair, *yarn,
+                         sine, cosine);
     } else if constexpr (Mode == RopeKernelMode::DflashText1D) {
         constexpr double kInvTwoPi = 1.59154943091895336e-01;
         constexpr double kTwoPi    = 6.28318530717958648e+00;
@@ -281,7 +288,8 @@ __device__ __forceinline__ void generic_pair_sincos(const std::int32_t* position
                                                     int rotary_dim, int active_pairs, float theta,
                                                     int height_pairs, int width_pairs,
                                                     float frequency_scale, float* sine_out,
-                                                    float* cosine_out) {
+                                                    float* cosine_out,
+                                                    const RopeYarn* yarn = nullptr) {
     // Pairs past `active_pairs` carry a zero frequency, which is an exact identity:
     // cos 1 and sin 0 leave both halves bit-for-bit unchanged. That is how Gemma 4's
     // proportional rope is defined -- 64 real angles for a 512-wide head, then 192 zeros
@@ -290,6 +298,18 @@ __device__ __forceinline__ void generic_pair_sincos(const std::int32_t* position
     if (pair >= active_pairs) {
         *cosine_out = 1.0F;
         *sine_out   = 0.0F;
+        return;
+    }
+    if (yarn != nullptr) {
+        // The fixed kernels' YaRN form, on the axis the sections give (pair % 3 without them),
+        // whatever the head's width or count.
+        int axis = axes == 3 ? pair % 3 : 0;
+        if (axes == 3 && height_pairs >= 0) {
+            axis = pair % 3 == 1 && pair / 3 < height_pairs ? 1
+                 : pair % 3 == 2 && pair / 3 < width_pairs ? 2 : 0;
+        }
+        rope_yarn_sincos(positions[static_cast<std::int64_t>(axis) * tokens + token], pair, *yarn,
+                         sine_out, cosine_out);
         return;
     }
     if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F && frequency_scale == 1.0F) {
@@ -329,7 +349,8 @@ static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_generic_ke
         const std::int32_t* positions, std::int32_t axes, __nv_bfloat16* q, __nv_bfloat16* k,
         std::int32_t head_dim, std::int32_t rotary_dim, std::int32_t active_pairs, float theta,
         std::int32_t q_heads, std::int32_t k_heads, std::int32_t tokens, std::int64_t q_token_stride,
-        std::int64_t k_token_stride, int height_pairs, int width_pairs, float frequency_scale) {
+        std::int64_t k_token_stride, int height_pairs, int width_pairs, float frequency_scale,
+        RopeYarn yarn, bool use_yarn) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -369,7 +390,7 @@ static __global__ __launch_bounds__(kRopeGenericWarps * 32) void rope_generic_ke
          pair += static_cast<int>(blockDim.x)) {
         generic_pair_sincos(positions, axes, tokens, token, pair, head_dim, rotary_dim,
                             active_pairs, theta, height_pairs, width_pairs, frequency_scale,
-                            &sin_cache[pair], &cos_cache[pair]);
+                            &sin_cache[pair], &cos_cache[pair], use_yarn ? &yarn : nullptr);
     }
     __syncthreads();
     if (!active) { return; }

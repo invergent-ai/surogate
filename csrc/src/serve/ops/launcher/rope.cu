@@ -220,7 +220,7 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
 
 void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                     Tensor* q, Tensor* k, cudaStream_t stream, int height_pairs = -1, int width_pairs = -1,
-                    float frequency_scale = 1.0F) {
+                    float frequency_scale = 1.0F, const RopeYarn* yarn = nullptr) {
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
     const int heads     = (q == nullptr ? 0 : q->ne[1]) + (k == nullptr ? 0 : k->ne[1]);
@@ -235,7 +235,8 @@ void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, f
             q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
             k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
             active_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
-            token_stride(q), token_stride(k), height_pairs, width_pairs, frequency_scale);
+            token_stride(q), token_stride(k), height_pairs, width_pairs, frequency_scale,
+            yarn != nullptr ? *yarn : RopeYarn{}, yarn != nullptr);
     };
     if (paired) {
         launch(rope_generic_kernel<2>);
@@ -279,25 +280,29 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pair
     CUDA_CHECK(cudaGetLastError());
 }
 
+// YaRN: the fixed kernels where they are compiled for the geometry and the sections are the
+// i % 3 they hard-wire; the generic kernel, with the same coefficients, everywhere else.
 void rope_yarn_launch(const Tensor& positions, int rotary_dim, const RopeYarn& yarn, Tensor& q,
                       Tensor& k, cudaStream_t stream) {
-    if (!launch_fixed_pair(positions, rotary_dim, 0.0F, q, k, stream, &yarn)) {
-        throw std::invalid_argument(
-            "rope: YaRN is served for head dim 256, rotary dim 64 and Q/K heads 24/4 or 16/2 only");
+    const bool cyclic = positions.ne[1] != 3 || rope_yarn_cyclic(yarn);
+    if (!cyclic || !launch_fixed_pair(positions, rotary_dim, 0.0F, q, k, stream, &yarn)) {
+        launch_generic(positions, rotary_dim, rotary_dim / 2, 1.0F, &q, &k, stream,
+                       yarn.height_pairs, yarn.width_pairs, 1.0F, &yarn);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 void rope_yarn_single_launch(const Tensor& positions, int rotary_dim, const RopeYarn& yarn,
                              Tensor& x, cudaStream_t stream) {
-    const int axes = positions.ne[1];
-    if (!bf16x2_aligned(x) || rotary_dim != 64 ||
+    const int axes    = positions.ne[1];
+    const bool cyclic = axes != 3 || rope_yarn_cyclic(yarn);
+    if (!cyclic || !bf16x2_aligned(x) || rotary_dim != 64 ||
         !(launch_text_single<24>(positions, axes, x, stream, &yarn) ||
           launch_text_single<4>(positions, axes, x, stream, &yarn) ||
           launch_text_single<16>(positions, axes, x, stream, &yarn) ||
           launch_text_single<2>(positions, axes, x, stream, &yarn))) {
-        throw std::invalid_argument(
-            "rope: YaRN is served for head dim 256, rotary dim 64 and 24, 16, 4 or 2 heads only");
+        launch_generic(positions, rotary_dim, rotary_dim / 2, 1.0F, &x, nullptr, stream,
+                       yarn.height_pairs, yarn.width_pairs, 1.0F, &yarn);
     }
     CUDA_CHECK(cudaGetLastError());
 }

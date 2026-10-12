@@ -295,6 +295,12 @@ struct ModelConfig {
                                        geometry.rope_yarn_factor, geometry.rope_yarn_original,
                                        geometry.rope_yarn_beta_fast, geometry.rope_yarn_beta_slow,
                                        geometry.rope_yarn_attention_factor);
+            // [T,3] positions turn over the model's interleaved MRoPE sections, as the native
+            // rotation does (ops::rope_interleaved).
+            if (geometry.mrope_temporal != 0) {
+                rope_yarn->height_pairs = geometry.mrope_height;
+                rope_yarn->width_pairs  = geometry.mrope_width;
+            }
         }
     }
     /// YaRN's coefficients when the model is served with --rope-scaling; every text rotation of
@@ -712,6 +718,10 @@ private:
     bool fused_qk_norm_rope(const Tensor* q_norm, const Tensor* k_norm, int layer, const Tensor& q,
                             const Tensor& k, Tensor& qn, Tensor& kn, const Tensor& rope_positions,
                             bool owns_kv, cudaStream_t stream);
+    /// Rope positions as the rope kernels read them: a contiguous I32 [T] or [T,3], each axis a
+    /// row of T. A strided view -- one column of a [T,3] chunk, a batch row's slice of [rows,3] --
+    /// is copied into the workspace; a contiguous one comes back as it is.
+    Tensor contiguous_positions(const Tensor& positions, cudaStream_t stream);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     /// The short-convolution mixer, for a family whose non-attending layers run one. Same slot
     /// in the same schedule as `gdn_mix`, and the same three phases; a different mixer.

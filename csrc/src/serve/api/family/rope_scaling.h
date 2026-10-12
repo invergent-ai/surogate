@@ -13,9 +13,9 @@ namespace sinfer::family {
 
 /// --rope-scaling: lays YaRN (Hugging Face rope_type "yarn") over the checkpoint's rotation and
 /// extends its context to original * factor, the way vLLM's derived max_model_len does. Only the
-/// fixed text rotation the rope kernels hold YaRN for (head dim 256, rotary dim 64: the Qwen3.5 /
-/// 3.6 family) is served with it; any other is refused rather than run unscaled past its native
-/// context. Applying twice is applying once.
+/// text rotation the rope kernels hold YaRN for (head dim 256, rotary dim 64: the Qwen3.5 / 3.6
+/// family and Qwen3.8-Flash-Next) is served with it; any other is refused rather than run
+/// unscaled past its native context. Applying twice is applying once.
 inline void apply_rope_scaling(TextGeometry& g, const EngineOptions& options) {
     const EngineOptions::RopeScaling& r = options.rope_scaling;
     if (r.factor == 0.0F) { return; }
@@ -24,8 +24,8 @@ inline void apply_rope_scaling(TextGeometry& g, const EngineOptions& options) {
     }
     if (g.head_dim != 256 || g.rotary_dim != 64 || g.rope_theta <= 0.0F) {
         throw std::invalid_argument(
-            "--rope-scaling: YaRN is served for the Qwen3.5/3.6 text rotation (head dim 256, "
-            "rotary dim 64), not this model's");
+            "--rope-scaling: YaRN is served for the Qwen3.5/3.6 and Flash-Next text rotation "
+            "(head dim 256, rotary dim 64), not this model's");
     }
     if (g.rope_yarn_factor != 0.0F) { return; }
     const std::int64_t original = r.original_context != 0 ? r.original_context : g.max_context;

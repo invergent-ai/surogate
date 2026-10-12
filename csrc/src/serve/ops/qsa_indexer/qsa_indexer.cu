@@ -69,6 +69,21 @@ __device__ __forceinline__ void rope_sincos(float position, int pair, int rotary
     sincosf(position * frequency, sine, cosine);
 }
 
+// YaRN's form, the arithmetic of rope.cuh's rope_yarn_sincos (which turns the indexer queries):
+// the pair's own frequency, the angle in double reduced before sincosf, both coefficients scaled
+// by the attention factor.
+__device__ __forceinline__ void rope_yarn_sincos(std::int32_t position, int pair,
+                                                 const RopeYarn& yarn, float* sine, float* cosine) {
+    constexpr double kInvTwoPi = 1.59154943091895336e-01;
+    constexpr double kTwoPi    = 6.28318530717958648e+00;
+    const double angle  = static_cast<double>(position) * static_cast<double>(yarn.inv_frequency[pair]);
+    const float reduced = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
+    float s, c;
+    sincosf(reduced, &s, &c);
+    *sine   = s * yarn.attention_factor;
+    *cosine = c * yarn.attention_factor;
+}
+
 __device__ __forceinline__ std::int32_t* block_positions(__nv_bfloat16* plane,
                                                         const std::int32_t* table, int position) {
     const auto page = indexer_offset(table, position - position % kPagedKVPageSize);
@@ -115,7 +130,8 @@ __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ position
                                        const __nv_bfloat16* __restrict__ key_norm,
                                        __nv_bfloat16* __restrict__ plane, int tokens,
                                        int rotary_dim, float theta, float eps,
-                                       int height_pairs, int width_pairs) {
+                                       int height_pairs, int width_pairs, RopeYarn yarn,
+                                       bool use_yarn) {
     const int warp  = static_cast<int>(threadIdx.x) / kWarp;
     const int lane  = static_cast<int>(threadIdx.x) % kWarp;
     const int token = static_cast<int>(blockIdx.x) * kWarps + warp;
@@ -172,7 +188,11 @@ __global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ position
         const int axis = pair % 3 == 1 && pair < 3 * height_pairs ? 1 :
                          pair % 3 == 2 && pair < 3 * width_pairs ? 2 : 0;
         const auto* axes = block_positions(plane, block_table, first);
-        rope_sincos(static_cast<float>(axes[axis]), pair, rotary_dim, theta, &sin_a, &cos_a);
+        if (use_yarn) {
+            rope_yarn_sincos(axes[axis], pair, yarn, &sin_a, &cos_a);
+        } else {
+            rope_sincos(static_cast<float>(axes[axis]), pair, rotary_dim, theta, &sin_a, &cos_a);
+        }
         value[i] = d < half ? value[i] * cos_a - partner[i] * sin_a
                             : value[i] * cos_a + partner[i] * sin_a;
     }
@@ -685,6 +705,8 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
     require(geometry.rotary_dim > 0 && geometry.rotary_dim <= kHeadDim &&
                 (geometry.rotary_dim % 2) == 0,
             "rotary_dim must be even and within the head");
+    require(geometry.yarn == nullptr || geometry.rotary_dim == 2 * RopeYarn::kPairs,
+            "YaRN block keys need rotary_dim 64");
     require(keys.dtype == DType::BF16 && key_norm.dtype == DType::BF16, "keys must be BF16");
     require(positions.dtype == DType::I32, "positions must be I32");
     require(keys.ne[0] == kHeadDim, "keys must be [head_dim, T]");
@@ -723,7 +745,8 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
         static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
         static_cast<const __nv_bfloat16*>(key_norm.data),
         static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens, geometry.rotary_dim,
-        geometry.rope_theta, geometry.rms_eps, geometry.mrope_height, geometry.mrope_width);
+        geometry.rope_theta, geometry.rms_eps, geometry.mrope_height, geometry.mrope_width,
+        geometry.yarn != nullptr ? *geometry.yarn : RopeYarn{}, geometry.yarn != nullptr);
 }
 
 void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& table_rows,

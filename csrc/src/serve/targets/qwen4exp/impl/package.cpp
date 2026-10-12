@@ -1,5 +1,6 @@
 #include "targets/registry.h"
 #include <api/targets/qwen4exp/package.h>
+#include "api/family/rope_scaling.h"
 #include "family/impl/lora_bind.h"
 #include "family/impl/moe/expert_cache.h"
 #include <api/family/frontend_resources.h>
@@ -92,6 +93,10 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                                                         : family::BankPlanes::Auto;
     auto plan = detail::bind_artifact(binder, features, options.pipeline_stage_first,
                                       options.pipeline_stage_last, planes, options.load_progress);
+    // --rope-scaling reaches every rotation of the model -- its layers, its draft head and its
+    // QSA indexer's queries and block keys -- through the bound geometry (ModelConfig::rope_yarn),
+    // as it reaches the planner through the registry's.
+    family::apply_rope_scaling(plan.bindings.geometry, options);
     // What the runtime will derive from the resident weights once they are on the device: the
     // registry subtracts it from free memory before it resolves the KV capacity, so a pool that
     // sizes itself before that point has to leave it as well.

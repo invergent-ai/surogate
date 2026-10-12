@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
+#include <cstdint>
 #include <array>
 
 namespace sinfer::ops {
@@ -91,18 +92,31 @@ void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta
           cudaStream_t stream);
 
 /**
- * YaRN context extension (Hugging Face `rope_type: "yarn"`), for the text rotation the fixed
- * kernels serve: head dim 256, rotary dim 64, [T] or [T,3] positions (pair i on axis i % 3).
- * Pair i turns at `inv_frequency[i]` instead of theta^(-2i/64), and both cos and sin are
- * multiplied by `attention_factor` -- on the rotated channels only, as transformers' and vLLM's
- * rotary embeddings scale them. The angle is taken in double and reduced before sincosf, so it
- * stays exact to the float's precision out to a million positions.
+ * YaRN context extension (Hugging Face `rope_type: "yarn"`) for a rotary dim of 64 with [T] or
+ * [T,3] positions. Pair i turns at `inv_frequency[i]` instead of theta^(-2i/64), and both cos and
+ * sin are multiplied by `attention_factor` -- on the rotated channels only, as transformers' and
+ * vLLM's rotary embeddings scale them. The angle is taken in double and reduced before sincosf,
+ * so it stays exact to the float's precision out to a million positions.
+ *
+ * For [T,3] positions pair i turns on the height axis when i % 3 == 1 and i / 3 < height_pairs,
+ * on the width axis when i % 3 == 2 and i / 3 < width_pairs, and on the temporal axis otherwise:
+ * interleaved MRoPE over the model's sections, as ops::rope_interleaved assigns them. -1 (or
+ * sections of 11/11/10 and wider) is every pair by i % 3, which is what the fixed kernels compute.
  */
 struct RopeYarn {
     static constexpr int kPairs = 32;
     float inv_frequency[kPairs]{};
-    float attention_factor = 1.0F;
+    float attention_factor     = 1.0F;
+    std::int32_t height_pairs  = -1;
+    std::int32_t width_pairs   = -1;
 };
+
+/// True when `yarn`'s sections put every pair on axis i % 3, the assignment the fixed kernels
+/// hard-wire; other sections take the generic kernel.
+[[nodiscard]] inline bool rope_yarn_cyclic(const RopeYarn& yarn) {
+    return (yarn.height_pairs < 0 || yarn.height_pairs >= (RopeYarn::kPairs + 1) / 3) &&
+           (yarn.width_pairs < 0 || yarn.width_pairs >= RopeYarn::kPairs / 3);
+}
 
 /**
  * YaRN's coefficients the way transformers' _compute_yarn_parameters and vLLM's
@@ -116,8 +130,11 @@ struct RopeYarn {
                                  float beta_fast = 32.0F, float beta_slow = 1.0F,
                                  float attention_factor = 0.0F);
 
-/// ops::rope with YaRN's coefficients, Q and K or a single tensor. Only the fixed text
-/// geometries (Q/K heads 24/4 or 16/2; single tensors of 24, 16, 4 or 2 heads) are served.
+/// ops::rope with YaRN's coefficients, Q and K or a single tensor, rotary dim 64 within any even
+/// head width. The fixed text geometries (head dim 256; Q/K heads 24/4 or 16/2; single tensors
+/// of 24, 16, 4 or 2 heads) take their own kernels; any other -- Flash-Next's 24/2 attention,
+/// its 128-wide QSA indexer heads -- or non-cyclic sections take the generic kernel, which
+/// derives the same coefficients the same way.
 void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& q,
           Tensor& k, cudaStream_t stream);
 void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& x,

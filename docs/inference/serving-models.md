@@ -45,8 +45,9 @@ Adjust the settings to your workload:
   once. `--kv-capacity auto` uses available GPU memory for the conversation cache.
 - **Context length:** `--max-model-len` defaults to `auto`. Set a number, as above, to choose
   a specific limit for each request. Longer conversations need more memory. A Qwen3.5 / 3.6
-  mixture (Surogate3.7-35B-A3B, Qwen3.6-35B-A3B) serves past its native 262,144 tokens, to a
-  million, with `--rope-scaling` (YaRN; see the [CLI reference](cli.md#context-past-the-models-native-length)).
+  mixture (Surogate3.7-35B-A3B, Qwen3.6-35B-A3B) or Qwen3.8-Flash-Next serves past its native
+  262,144 tokens, to a million, with `--rope-scaling` (YaRN; see the
+  [CLI reference](cli.md#context-past-the-models-native-length)).
 - **Cache precision:** the default `auto` chooses FP8 for this Qwen3.6 model. Use
   `--kv-cache-dtype bf16` for BF16 precision; it needs more memory.
 - **Generation speed:** try `--spec mtp --draft-tokens 3` when the checkpoint includes MTP

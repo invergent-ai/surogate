@@ -298,9 +298,11 @@ template <class Target>
 family::TextGeometry served_geometry(const artifact::Reader& reader, const EngineOptions& options) {
     family::TextGeometry geometry = Target::declared_geometry(reader);
     if (options.rope_scaling.factor != 0.0F) {
-        if (std::string_view(Target::target_key) != "qwen3_5_moe") {
-            throw std::invalid_argument("--rope-scaling: YaRN is served by the qwen3_5_moe target only, not " +
-                                        std::string(Target::target_key));
+        const std::string_view key(Target::target_key);
+        if (key != "qwen3_5_moe" && key != "qwen4exp") {
+            throw std::invalid_argument(
+                "--rope-scaling: YaRN is served by the qwen3_5_moe and qwen4exp targets only, not " +
+                std::string(Target::target_key));
         }
         family::apply_rope_scaling(geometry, options);
     }

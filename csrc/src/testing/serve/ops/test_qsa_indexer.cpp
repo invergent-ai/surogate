@@ -55,9 +55,12 @@ float bf16_round(float value) {
 }
 
 // The block key the kernel must produce: mean of the block's raw keys, RMS-normalised with the
-// gain, then split-half NeoX rope at the block's first position.
+// gain, then split-half NeoX rope at the block's first position -- YaRN's form (each pair at its
+// own frequency, cos and sin scaled by the attention factor) when `yarn` is given, with the
+// MRoPE coordinates `base` further on.
 std::vector<float> reference_block_key(const std::vector<float>& raw, int first,
-                                       const std::vector<float>& gain, bool mrope = false) {
+                                       const std::vector<float>& gain, bool mrope = false,
+                                       const sinfer::ops::RopeYarn* yarn = nullptr, int base = 0) {
     std::vector<float> value(kHeadDim, 0.0F);
     for (int c = 0; c < kBlock; ++c) {
         for (int d = 0; d < kHeadDim; ++d) {
@@ -75,10 +78,17 @@ std::vector<float> reference_block_key(const std::vector<float>& raw, int first,
     const int half = kRotary / 2;
     for (int d = 0; d < half; ++d) {
         const int axis = d % 3 == 1 && d < 33 ? 1 : d % 3 == 2 && d < 30 ? 2 : 0;
-        const int coordinate = !mrope ? first : axis == 0 ? 17 + first / 40 : axis == 1 ? 23 + first / 7 : 31 + first % 19;
-        const float angle = static_cast<float>(coordinate) *
-                            std::pow(kTheta, -2.0F * static_cast<float>(d) / kRotary);
-        const float c = std::cos(angle), s = std::sin(angle);
+        const int coordinate = !mrope ? first : base + (axis == 0 ? 17 + first / 40 : axis == 1 ? 23 + first / 7 : 31 + first % 19);
+        float c, s;
+        if (yarn != nullptr) {
+            const double angle = static_cast<double>(coordinate) * yarn->inv_frequency[d];
+            c = static_cast<float>(std::cos(angle) * yarn->attention_factor);
+            s = static_cast<float>(std::sin(angle) * yarn->attention_factor);
+        } else {
+            const float angle = static_cast<float>(coordinate) *
+                                std::pow(kTheta, -2.0F * static_cast<float>(d) / kRotary);
+            c = std::cos(angle), s = std::sin(angle);
+        }
         out[d]        = value[d] * c - value[d + half] * s;
         out[d + half] = value[d + half] * c + value[d] * s;
     }
@@ -135,7 +145,10 @@ void expect(bool condition, const std::string& what) {
 
 } // namespace
 
-int run_case(bool mrope) {
+int run_case(bool mrope, const sinfer::ops::RopeYarn* yarn = nullptr) {
+    // Under YaRN the MRoPE coordinates sit past a million, where only the angle reduced in double
+    // keeps the low-frequency pairs exact.
+    const int base = yarn != nullptr ? 1'000'000 : 0;
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
 
@@ -167,11 +180,12 @@ int run_case(bool mrope) {
         auto g = geometry(2048);
         g.mrope_height = mrope ? 11 : 0;
         g.mrope_width = mrope ? 10 : 0;
+        g.yarn = yarn;
         std::vector<int> rope(3 * (count + 3), -999);
         for (int i = 0; i < count; ++i) {
-            rope[i] = 17 + (begin + i) / 40;
-            rope[count + 3 + i] = 23 + (begin + i) / 7;
-            rope[2 * (count + 3) + i] = 31 + (begin + i) % 19;
+            rope[i] = base + 17 + (begin + i) / 40;
+            rope[count + 3 + i] = base + 23 + (begin + i) / 7;
+            rope[2 * (count + 3) + i] = base + 31 + (begin + i) % 19;
         }
         DeviceBuffer d_rope = to_device_i32(rope);
         Tensor rope_t(d_rope.p, DType::I32, {count, 3});
@@ -204,7 +218,7 @@ int run_case(bool mrope) {
     // and a fixed floor where the value is near zero).
     double worst = 0.0;
     for (int b = 0; b * kBlock + kBlock <= tokens; ++b) {
-        const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope);
+        const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, base);
         const std::size_t base        = cache.cell_offset(b * kBlock);
         for (int d = 0; d < kHeadDim; ++d) {
             const double tolerance = 0.008 * std::abs(want[d]) + 0.004;
@@ -213,7 +227,7 @@ int run_case(bool mrope) {
     }
     if (worst >= 1.0) { // report where it diverges before failing
         for (int b = 0; b * kBlock + kBlock <= tokens && b < 3; ++b) {
-            const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope);
+            const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, base);
             const std::size_t base        = cache.cell_offset(b * kBlock);
             std::cerr << "block " << b << " (first " << b * kBlock << "):";
             for (int d = 0; d < 6; ++d) {
@@ -550,6 +564,11 @@ int main(int argc, char** argv) {
     }
     run_case(false);
     run_case(true);
+    // YaRN (factor 4 over 262,144, as Flash-Next is served at a million tokens): the block keys
+    // turn as the indexer queries' YaRN form does, 1-D and over MRoPE coordinates past 1M.
+    const sinfer::ops::RopeYarn yarn = sinfer::ops::rope_yarn(kRotary, kTheta, 4.0F, 262'144);
+    run_case(false, &yarn);
+    run_case(true, &yarn);
     run_long_case();
     run_tile_union_case();
     return failures ? 1 : 0;

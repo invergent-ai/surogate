@@ -335,8 +335,10 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
     const std::int32_t tokens   = q.ne[2];
     const int axes              = position_axes(positions, tokens);
     const std::int32_t head_dim = q.ne[0];
-    if (head_dim != kTextHeadDim || rotary_dim != 2 * RopeYarn::kPairs || (axes != 1 && axes != 3)) {
-        throw std::invalid_argument("rope: YaRN requires head dim 256, rotary dim 64 and [T] or [T,3] positions");
+    if (rotary_dim != 2 * RopeYarn::kPairs || head_dim < rotary_dim || head_dim % 2 != 0 ||
+        (axes != 1 && axes != 3)) {
+        throw std::invalid_argument(
+            "rope: YaRN requires rotary dim 64 within an even head and [T] or [T,3] positions");
     }
     require_tensor_layout(q, "q", head_dim, q.ne[1], tokens);
     require_tensor_layout(k, "k", head_dim, k.ne[1], tokens);
@@ -357,8 +359,10 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
     const std::int32_t tokens   = x.ne[2];
     const int axes              = position_axes(positions, tokens);
     const std::int32_t head_dim = x.ne[0];
-    if (head_dim != kTextHeadDim || rotary_dim != 2 * RopeYarn::kPairs || (axes != 1 && axes != 3)) {
-        throw std::invalid_argument("rope: YaRN requires head dim 256, rotary dim 64 and [T] or [T,3] positions");
+    if (rotary_dim != 2 * RopeYarn::kPairs || head_dim < rotary_dim || head_dim % 2 != 0 ||
+        (axes != 1 && axes != 3)) {
+        throw std::invalid_argument(
+            "rope: YaRN requires rotary dim 64 within an even head and [T] or [T,3] positions");
     }
     require_tensor_layout(x, "tensor", head_dim, x.ne[1], tokens);
     if (x_numel == 0) { return; }

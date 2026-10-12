@@ -77,6 +77,7 @@ bool qk_norm_rope_launch(const QkNormRope& a, cudaStream_t stream) {
     if (a.yarn != nullptr) {
         // Only the fixed tables' geometries take YaRN; the caller runs ops::rope's YaRN form else.
         if (a.table != nullptr || a.sections[0] != 0 || !whole || a.rotary_dim != 64 || head_dim != 256 ||
+            (axes == 3 && !rope_yarn_cyclic(*a.yarn)) ||
             !((q.ne[1] == 24 && a.k_heads == 4) || (q.ne[1] == 16 && a.k_heads == 2))) {
             return false;
         }

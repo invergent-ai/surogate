@@ -621,6 +621,38 @@ int main() {
     failures += run_single_case(yarn_k, 2, 1'040'000, 8);
     failures += run_single_case(yarn_k, 16, 1'040'000);
 
+    // Flash-Next under YaRN: its 24/2 attention and its QSA indexer's four 128-wide query heads,
+    // which no fixed kernel is compiled for, take the generic kernel's YaRN form; so do [T,3]
+    // positions over sections other than 11/11/10, on its geometry and on a fixed one.
+    Geometry yarn_fn{"flash-next yarn prefill", 256, 64, 1, 64, kTextTheta};
+    yarn_fn.yarn = &yarn;
+    failures += run_pair_case(yarn_fn, 24, 2, 1'000'000);
+    Geometry yarn_fn_decode{"flash-next yarn decode", 256, 64, 1, 1, kTextTheta};
+    yarn_fn_decode.yarn = &yarn;
+    failures += run_pair_case(yarn_fn_decode, 24, 2, 1'048'000, 16, 8);
+    Geometry yarn_fn_k{"flash-next yarn mtp k", 256, 64, 1, 5, kTextTheta};
+    yarn_fn_k.yarn = &yarn;
+    failures += run_single_case(yarn_fn_k, 24, 1'040'000);
+    Geometry yarn_indexer{"flash-next yarn indexer queries", 128, 64, 1, 33, kTextTheta};
+    yarn_indexer.yarn = &yarn;
+    failures += run_single_case(yarn_indexer, 4, 1'040'000);
+    ops::RopeYarn yarn_cyclic = yarn;
+    yarn_cyclic.height_pairs  = 11;
+    yarn_cyclic.width_pairs   = 10;
+    Geometry yarn_indexer_mrope{"flash-next yarn indexer mrope", 128, 64, 3, 17, kTextTheta, 0, {11, 11, 10}};
+    yarn_indexer_mrope.yarn = &yarn_cyclic;
+    failures += run_single_case(yarn_indexer_mrope, 4, 700'000);
+    ops::RopeYarn yarn_sections = yarn;
+    yarn_sections.height_pairs  = 8;
+    yarn_sections.width_pairs   = 6;
+    Geometry yarn_fn_sections{"flash-next yarn mrope sections", 256, 64, 3, 65, kTextTheta, 0, {18, 8, 6}};
+    yarn_fn_sections.yarn = &yarn_sections;
+    failures += run_pair_case(yarn_fn_sections, 24, 2, 700'000);
+    Geometry yarn_fixed_sections{"35b yarn mrope sections", 256, 64, 3, 33, kTextTheta, 0, {18, 8, 6}};
+    yarn_fixed_sections.yarn = &yarn_sections;
+    failures += run_pair_case(yarn_fixed_sections, 16, 2, 700'000);
+    failures += run_single_case(yarn_fixed_sections, 16, 700'000);
+
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;
 }
