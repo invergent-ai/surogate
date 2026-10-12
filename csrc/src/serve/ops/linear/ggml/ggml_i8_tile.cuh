@@ -191,21 +191,24 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
         for (int e = 0; e < 4; ++e) { acc[mi][e] = 0.0f; }
     }
 
+    // Eight columns per warp make ExpertBN * 4 == ExpertThreads: at every K step each thread
+    // stages one 16-byte piece of one activation column, and the first ExpertBN threads that
+    // column's scales as well. Their rows are looked up once, here, rather than at every tile --
+    // for gate/up each lookup is a gather through the caller's column_token.
+    const int x_col         = tid >> 2;
+    const bool x_valid      = x_col < cols;
+    const std::int8_t* x_src =
+        codes + (x_valid ? act_row(x_col) : std::int64_t{0}) * K + 16 * (tid & 3);
+    std::int8_t* x_dst      = &sm.Xs[0][x_col * kI8Stride + 16 * (tid & 3)];
+    const bool d_valid      = tid < ExpertBN && tid < cols;
+    const __half2* d_src    = ds + (d_valid ? act_row(tid) : std::int64_t{0}) * (K / 32);
+
     auto stage_inputs = [&](int stage, int kt) {
         const int k0 = kt * kI8BK;
-        for (int item = tid; item < ExpertBN * 4; item += ExpertThreads) {
-            const int col           = item >> 2;
-            const int k16           = item & 3;
-            const bool valid        = col < cols;
-            const std::int64_t arow = valid ? act_row(col) : 0;
-            cp_async_zfill<16, Cache::cg>(&sm.Xs[stage][col * kI8Stride + 16 * k16],
-                                          codes + arow * K + k0 + 16 * k16, valid ? 16 : 0);
-        }
-        for (int col = tid; col < ExpertBN; col += ExpertThreads) {
-            const bool valid        = col < cols;
-            const std::int64_t arow = valid ? act_row(col) : 0;
-            cp_async_zfill<8, Cache::ca>(&sm.Ds[stage][col * 2], ds + arow * (K / 32) + kt * 2,
-                                         valid ? 8 : 0);
+        cp_async_zfill<16, Cache::cg>(x_dst + stage * (ExpertBN * kI8Stride), x_src + k0,
+                                      x_valid ? 16 : 0);
+        if (tid < ExpertBN) {
+            cp_async_zfill<8, Cache::ca>(&sm.Ds[stage][tid * 2], d_src + kt * 2, d_valid ? 8 : 0);
         }
         for (int item = tid; item < ExpertBM * TileUnits; item += ExpertThreads) {
             const int row  = item / TileUnits;
