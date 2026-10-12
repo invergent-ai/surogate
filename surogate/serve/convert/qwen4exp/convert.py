@@ -30,12 +30,15 @@ from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common.qwen4exp import geometry_block
 from surogate.serve.convert.common.qwen3_5 import vision_geometry_block
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
+from surogate.serve.convert.common.draft_head import load_total_counts, read_special_ids, select_shortlist
+from surogate.serve.convert.common.inventory import GGML_BLOCKS_LAYOUT, TensorSpec
+from surogate.serve.convert.qwen3_5 import draft_head as shortlist
 
 from . import inventory as inv
 from . import recipe as rcp
 from . import vision
 
-RECIPE_ID = "qwen4exp-gguf-config-v5"
+RECIPE_ID = "qwen4exp-gguf-config-v6"
 _GROUP = 32
 
 
@@ -156,6 +159,53 @@ def materialize_unspoken(g, source: GgufSource, name: str) -> bytes:
 # --------------------------------------------------------------------------------------------
 
 
+def _byte_decoder() -> dict[str, int]:
+    """GPT-2's printable stand-ins for raw bytes, inverted: how a byte-level BPE vocabulary --
+    the GGUF's `tokenizer.ggml.tokens` -- spells the bytes a token decodes to."""
+    printable = (list(range(ord("!"), ord("~") + 1)) + list(range(ord("\u00a1"), ord("\u00ac") + 1))
+                 + list(range(ord("\u00ae"), ord("\u00ff") + 1)))
+    stand_ins = printable[:]
+    extra = 0
+    for byte in range(256):
+        if byte not in printable:
+            printable.append(byte)
+            stand_ins.append(256 + extra)
+            extra += 1
+    return {chr(code): byte for byte, code in zip(printable, stand_ins)}
+
+
+def draft_shortlist(g, source: GgufSource, frontend_dir: str | Path) -> np.ndarray | None:
+    """The shortlist draft head's token ids for `--lm-head-draft`: the `g.draft_vocab` tokens the
+    bundled frequency ranking counts most, as the safetensors converter picks them.
+
+    That ranking attests its tokenizer by the sha256 of a `tokenizer.json`, which a GGUF does not
+    carry -- its frontend is rebuilt from the file's own vocabulary. So the vocabulary itself is
+    checked: the ranking's vocabulary size must be the model's, and every top token its manifest
+    names must decode, at the same id, to the same text. None when it does not hold."""
+    ranking = Path(shortlist.__file__).resolve().parents[2] / "tools" / shortlist.DEFAULT_RANKING
+    manifest_path = ranking.with_name(ranking.name.removesuffix(".counts.i64") + ".manifest.json")
+    if not ranking.is_file() or not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tokens = source.kv("tokenizer.ggml.tokens")
+    top = manifest.get("top_tokens") or []
+    if manifest.get("vocab") != g.vocab or not tokens or not top:
+        return None
+    decoder = _byte_decoder()
+
+    def text(token: str) -> str:
+        try:
+            return bytes(decoder[ch] for ch in token).decode("utf-8")
+        except (KeyError, UnicodeDecodeError):
+            return token  # an added token is stored as its text
+    for entry in top:
+        index = int(entry["id"])
+        if index >= len(tokens) or text(tokens[index]) != entry["token"]:
+            return None
+    total = load_total_counts(ranking, g.vocab)
+    return select_shortlist(total, g.draft_vocab, force_include=read_special_ids(frontend_dir))
+
+
 def candidate_sources(g, source: GgufSource) -> dict[str, dict]:
     """The repack planner's candidate map. One tensor of this model has its columns in another
     order -- the GDN output projection follows llama.cpp's tiled value heads -- and its map
@@ -187,12 +237,16 @@ def validate_source_inventory(g: inv.Geometry, source: GgufSource) -> None:
 
 def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             *, device: str = "cuda", mtp: str | Path | None = None,
-            mmproj: str | Path | None = None) -> Path:
+            mmproj: str | Path | None = None, draft_head: bool = True) -> Path:
     """Write the artifact. `device` is accepted so the ingest path can call every converter
     the same way; nothing here needs a GPU, because nothing here quantises any more.
 
     `mtp` is the NextN draft head's own GGUF (`mtp-*-shared-*.gguf`). It is read in
-    place like the shards, so passing it costs an index entry, not a copy.
+    place like the shards, so passing it costs an index entry, not a copy. Beside it goes the
+    shortlist head for `--lm-head-draft` unless `draft_head` is False: the output head's own
+    blocks for the bundled ranking's most frequent tokens (`draft_shortlist`), copied row by row,
+    so a draft step reads about half the full head. It is left out, with a note, when the
+    ranking's vocabulary is not this GGUF's.
     """
     started = time.perf_counter()
     del device
@@ -215,6 +269,17 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
         if mtp is not None and not has_mtp:
             raise ValueError(f"{mtp} carries no blk.{g.layers} NextN head")
         tensor_specs, object_specs = inv.active_specs(geometry=g)
+        # The shortlist only serves speculation, so it rides with the NextN head.
+        head_source = "token_embd.weight" if g.tied_embeddings else "output.weight"
+        draft_ids = draft_shortlist(g, source, frontend_dir) if has_mtp and draft_head else None
+        if has_mtp and draft_head:
+            print(f"draft head: {'of ' + str(len(draft_ids)) + ' rows of ' + head_source if draft_ids is not None else 'left out (the ranking does not match this vocabulary)'}",
+                  flush=True)
+        draft_specs = () if draft_ids is None else (
+            TensorSpec(shortlist.DRAFT_HEAD_OBJECT, (g.draft_vocab, g.hidden),
+                       source.tensor(head_source).type_name, GGML_BLOCKS_LAYOUT),
+            inv.tensor_spec(shortlist.DRAFT_HEAD_TOKEN_IDS_OBJECT, (g.draft_vocab,), inv.I32))
+        draft_vocab = 0 if draft_ids is None else g.draft_vocab
 
         recipes = {item.object_name: item for item in rcp.build_recipes(g)}
         if g.ple_ngram:
@@ -267,7 +332,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             resources["frontend/video_preprocessor_config.json"] = json.dumps({
                 **image_config, "video_processor_type": "Qwen3VLVideoProcessor", "fps": 2.0,
                 "min_frames": 4, "max_frames": 768}).encode()
-        plan = family_conversion.build_object_plan(object_specs, resources)
+        plan = family_conversion.build_object_plan(tuple(object_specs) + draft_specs, resources)
         reader = GgufRecipeReader(source)
 
         specs = list(plan.specs)
@@ -278,7 +343,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             ArtifactIdentity(inv.MODEL_ID, inv.WEIGHTS_ID, architecture="qwen4exp"),
             plan.specs,
             external=external,
-            geometry=geometry_block(g),
+            geometry=geometry_block(g, draft_vocab=draft_vocab),
             vision_geometry=vision_geometry_block(g.declared.hf_config, text_hidden=g.hidden),
             layer_types=g.layer_types,
         ) as writer:
@@ -286,7 +351,11 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
                 t0 = time.perf_counter()
                 if getattr(spec, "runs", ()):
                     continue  # served from the GGUF; the artifact carries no bytes for it
-                if spec.name in resources:
+                if spec.name == shortlist.DRAFT_HEAD_OBJECT:
+                    payload = np.ascontiguousarray(source.raw(head_source)[draft_ids]).tobytes()
+                elif spec.name == shortlist.DRAFT_HEAD_TOKEN_IDS_OBJECT:
+                    payload = i32_bytes(draft_ids.tolist())
+                elif spec.name in resources:
                     payload: bytes = resources[spec.name]
                 elif spec.name in recipes:
                     tensor = rcp.materialize_recipe(recipes[spec.name], reader)
@@ -303,7 +372,8 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             "recipe_id": RECIPE_ID,
             "model_id": inv.MODEL_ID,
             "weights_id": inv.WEIGHTS_ID,
-            "geometry": geometry_block(g),
+            "geometry": geometry_block(g, draft_vocab=draft_vocab),
+            "draft_head": None if draft_ids is None else {"rows": int(len(draft_ids)), "source": head_source},
             "layer_types": list(g.layer_types),
             "gguf": [str(path) for path in source.shards],
             "frontend": str(frontend_dir),
@@ -333,8 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--mmproj", help="matching Flash-Next vision projector GGUF")
     parser.add_argument("--device", default="cuda",
                         help="accepted for a uniform call across the converters; unused")
+    parser.add_argument("--no-draft-head", action="store_true",
+                        help="leave the shortlist head for --lm-head-draft out")
     args = parser.parse_args(argv)
-    convert(args.gguf, args.frontend, args.out, device=args.device, mtp=args.mtp, mmproj=args.mmproj)
+    convert(args.gguf, args.frontend, args.out, device=args.device, mtp=args.mtp, mmproj=args.mmproj,
+            draft_head=not args.no_draft_head)
     return 0
 
 
