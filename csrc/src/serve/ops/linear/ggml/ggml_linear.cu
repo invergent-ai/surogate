@@ -70,6 +70,16 @@ bool affine_gmajor_allowed() noexcept {
     return allowed;
 }
 
+/// Whether 9-to-32-token rounds of those formats take the group-major 64 x 32 tile:
+/// SUROGATE_GGML_AFFINE_GMAJOR_SMALL=1 (off by default until measured). Same bits either way.
+bool affine_gmajor_small_allowed() noexcept {
+    static const bool allowed = [] {
+        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR_SMALL");
+        return raw != nullptr && std::strcmp(raw, "1") == 0;
+    }();
+    return allowed;
+}
+
 std::atomic<std::int32_t> tile_multiprocessors_override{0};
 
 // Keep the activation quantisation used by GEMV when a graph pads a short
@@ -234,19 +244,29 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
             if constexpr (Type != GgmlType::F16) {
                 if constexpr ((DenseFormat<Type>::kWidth == 32 || DenseFormat<Type>::kWidth == 16) &&
                               !DenseFormat<Type>::kBias) {
-                    // The group-major 64 x 128 tile, once a prompt fills the device with it.
-                    const std::int32_t blocks = ((rows + gmajor::kRows - 1) / gmajor::kRows) *
-                                                ((tokens + gmajor::kCols - 1) / gmajor::kCols);
-                    if (tokens >= 256 && blocks >= kquant_tile_multiprocessors() &&
-                        affine_gmajor_allowed()) {
-                        auto* const kernel = dense_affine_gmajor_kernel<Type>;
-                        constexpr int smem = static_cast<int>(sizeof(gmajor::Smem));
+                    const auto gmajor_tile = [&]<int Cols>() {
+                        auto* const kernel = dense_affine_gmajor_kernel<Type, Cols>;
+                        constexpr int smem = static_cast<int>(sizeof(gmajor::Smem<Cols>));
                         CUDA_CHECK(set_func_attribute_per_device(
                             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
                         const dim3 grid((rows + gmajor::kRows - 1) / gmajor::kRows,
-                                        (tokens + gmajor::kCols - 1) / gmajor::kCols);
-                        kernel<<<grid, gmajor::kThreads, smem, stream>>>(
-                            bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                                        (tokens + Cols - 1) / Cols);
+                        kernel<<<grid, Cols * 4, smem, stream>>>(bytes, codes, ds, rows, k, tokens,
+                                                                 out, beta != 0);
+                    };
+                    // The group-major 64 x 128 tile, once a prompt fills the device with it.
+                    const std::int32_t row_tiles = (rows + gmajor::kRows - 1) / gmajor::kRows;
+                    if (tokens >= 256 && row_tiles * ((tokens + 127) / 128) >=
+                                             kquant_tile_multiprocessors() &&
+                        affine_gmajor_allowed()) {
+                        gmajor_tile.template operator()<128>();
+                        return;
+                    }
+                    // Verify and multi-sequence decode rounds (9 to 32 tokens): the 64 x 32
+                    // tile streams the weight with eight items a thread in flight, where the
+                    // 16-row tile waits on each chunk's loads.
+                    if (tokens > 8 && tokens <= 32 && affine_gmajor_small_allowed()) {
+                        gmajor_tile.template operator()<32>();
                         return;
                     }
                 }
