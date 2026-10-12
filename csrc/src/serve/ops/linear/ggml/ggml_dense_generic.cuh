@@ -214,6 +214,186 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
     }
 }
 
+// The generic formats' wide prompt GEMM in group-major order (64 weight rows x 128 tokens,
+// sixteen warps of eight token columns each). The canonical arithmetic of these formats --
+// the decode kernels', and dense_affine_mma_kernel's -- keeps eight accumulators per output,
+// one per group index modulo eight, each summed in K order, and adds them as
+// ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)). This kernel computes the same sums one
+// accumulator at a time: pass a takes groups a, a + 8, a + 16, ..., four to a step, and folds
+// its sum into the tree when the pass ends. A lane then holds one running sum and at most
+// three finished partials per output instead of eight, which is what lets a block hold 64 x
+// 128 outputs -- the weight tile decoded once for 128 columns, the activations read once per
+// 64 rows -- with the same bits as every other width. Width-32 formats without a min term.
+namespace gmajor {
+inline constexpr int kRows = 64, kCols = 128, kWarps = kCols / 8, kThreads = kWarps * 32;
+inline constexpr int kSteps = 4;                    // groups per step
+inline constexpr int kStride = kSteps * 32 + 16;    // int8 row stride, conflict-free ldmatrix
+struct Smem {
+    alignas(16) std::int8_t a[2][kRows * kStride];
+    alignas(16) std::int8_t x[2][kCols * kStride];
+    float scale[2][kSteps][kRows];
+    __half2 dx[2][kSteps][kCols];
+};
+/// The groups of accumulator class `a` among `groups`: a, a + 8, a + 16, ...
+__device__ __forceinline__ int class_groups(int groups, int a) {
+    return groups > a ? (groups - a + 7) / 8 : 0;
+}
+} // namespace gmajor
+
+template <GgmlType Type>
+__global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kernel(
+    const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
+    int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
+    using namespace gmajor;
+    static_assert(DenseFormat<Type>::kWidth == 32 && !DenseFormat<Type>::kBias);
+    extern __shared__ __align__(16) unsigned char gmajor_smem[];
+    auto& sm = *reinterpret_cast<Smem*>(gmajor_smem);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int gid = lane >> 2, lid = lane & 3;
+    const int2 tile = grouped_tile<8>();
+    const int row0 = tile.x * kRows, col0 = tile.y * kCols;
+    const int groups = k / 32;
+    const std::int64_t row_bytes = std::int64_t(k / block_values(Type)) * block_bytes(Type);
+
+    // A step is (class a, first group index m0 within the class); steps run class by class.
+    auto step_count = [&](int a) { return (class_groups(groups, a) + kSteps - 1) / kSteps; };
+    auto stage_x = [&](int buf, int a, int m0) {
+        const int count = class_groups(groups, a);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int item = tid + i * kThreads;      // kSteps x kCols x two 16-byte pieces
+            const int u = item / (2 * kCols), col = (item / 2) % kCols, piece = item & 1;
+            const bool valid = m0 + u < count && col0 + col < tokens;
+            const int g = a + 8 * (m0 + u);
+            cp_async_zfill<16, Cache::cg>(&sm.x[buf][col * kStride + 32 * u + 16 * piece],
+                codes + (valid ? std::int64_t(col0 + col) * k + 32 * g + 16 * piece : 0), valid ? 16 : 0);
+        }
+        {
+            const int u = tid / kCols, col = tid % kCols; // kSteps x kCols scales, one each
+            const bool valid = m0 + u < count && col0 + col < tokens;
+            const int g = a + 8 * (m0 + u);
+            cp_async_zfill<4, Cache::ca>(&sm.dx[buf][u][col],
+                ds + (valid ? std::int64_t(col0 + col) * groups + g : 0), valid ? 4 : 0);
+        }
+    };
+    DenseAffineEight next[2];
+    auto decode_a = [&](int a, int m0) {
+        const int count = class_groups(groups, a);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int item = tid + i * kThreads;      // kRows x kSteps x four eighths
+            const int row = item / (4 * kSteps), u = (item / 4) % kSteps, e8 = item & 3;
+            next[i] = DenseAffineEight{};
+            if (m0 + u < count) {
+                const auto* w = weights + std::int64_t(min(row0 + row, rows - 1)) * row_bytes;
+                next[i] = dense_codes_eight<Type>(w, 32 * (a + 8 * (m0 + u)) + 8 * e8);
+            }
+        }
+    };
+    auto store_a = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int item = tid + i * kThreads;
+            const int row = item / (4 * kSteps), u = (item / 4) % kSteps, e8 = item & 3;
+            *reinterpret_cast<uint2*>(&sm.a[buf][row * kStride + 32 * u + 8 * e8]) =
+                make_uint2(next[i].lo, next[i].hi);
+            if (e8 == 0) { sm.scale[buf][u][row] = next[i].scale; }
+        }
+    };
+
+    float run[4][4] = {}, p0[4][4] = {}, p1[4][4] = {}, p2[4][4] = {};
+    // The tree, as dense_affine_mma_kernel's epilogue adds it; `a` is the class just finished.
+    auto fold = [&](int a) {
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float r = run[mi][e];
+                switch (a) {
+                case 0: p0[mi][e] = r; break;
+                case 1: p0[mi][e] = p0[mi][e] + r; break;
+                case 2: p1[mi][e] = r; break;
+                case 3: p1[mi][e] = p1[mi][e] + r; p0[mi][e] = p0[mi][e] + p1[mi][e]; break;
+                case 4: p1[mi][e] = r; break;
+                case 5: p1[mi][e] = p1[mi][e] + r; break;
+                case 6: p2[mi][e] = r; break;
+                default: p2[mi][e] = p2[mi][e] + r; p1[mi][e] = p1[mi][e] + p2[mi][e]; break;
+                }
+                run[mi][e] = 0.0f;
+            }
+        }
+    };
+
+    int a = 0, m0 = 0;
+    while (a < 8 && step_count(a) == 0) { fold(a); ++a; }
+    if (a < 8) {
+        stage_x(0, a, m0);
+        cp_commit();
+        decode_a(a, m0);
+        store_a(0);
+    }
+    int buf = 0;
+    while (a < 8) {
+        // The step after this one, across a class boundary if this one ends its class.
+        int na = a, nm = m0 + kSteps;
+        if (nm >= class_groups(groups, na)) { ++na; nm = 0; }
+        const bool has_next = na < 8 && step_count(na) > 0;
+        cp_wait<0>();
+        __syncthreads(); // this step's tiles are in; every warp is past the previous step's MMA
+        if (has_next) { stage_x(buf ^ 1, na, nm); }
+        cp_commit();
+        if (has_next) { decode_a(na, nm); }
+        const int count = class_groups(groups, a);
+#pragma unroll
+        for (int u = 0; u < kSteps; ++u) {
+            if (m0 + u >= count) { break; }
+            unsigned b0, b1;
+            ldmatrix_x2(b0, b1, smem_addr(&sm.x[buf][(warp * 8 + (lane & 7)) * kStride + 32 * u +
+                                                     ((lane >> 3) & 1) * 16]));
+            const float x0 = __low2float(sm.dx[buf][u][warp * 8 + 2 * lid]);
+            const float x1 = __low2float(sm.dx[buf][u][warp * 8 + 2 * lid + 1]);
+            const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                unsigned a0, a1, a2, a3;
+                ldmatrix_x4(a0, a1, a2, a3,
+                            smem_addr(&sm.a[buf][(16 * mi + ar) * kStride + 32 * u + (lane >> 4) * 16]));
+                int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                const float s0 = sm.scale[buf][u][16 * mi + gid], s1 = sm.scale[buf][u][16 * mi + gid + 8];
+                run[mi][0] = dense_affine_fma<false>(run[mi][0], s0, 0.0f, x0, d0, 0);
+                run[mi][1] = dense_affine_fma<false>(run[mi][1], s0, 0.0f, x1, d1, 0);
+                run[mi][2] = dense_affine_fma<false>(run[mi][2], s1, 0.0f, x0, d2, 0);
+                run[mi][3] = dense_affine_fma<false>(run[mi][3], s1, 0.0f, x1, d3, 0);
+            }
+        }
+        if (has_next) { store_a(buf ^ 1); }
+        if (na != a) {
+            fold(a);
+            // Classes past the last group (k below 256) hold nothing; their sums are zero.
+            while (++a < 8 && step_count(a) == 0) { fold(a); }
+            if (a != na) { break; } // every remaining class was empty
+        }
+        a = na; m0 = nm; buf ^= 1;
+        if (!has_next) { break; }
+    }
+    while (a < 8) { fold(a); ++a; }
+    cp_wait<0>();
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = row0 + 16 * mi + gid + 8 * (e / 2);
+            const int col = col0 + warp * 8 + 2 * lid + (e & 1);
+            if (row < rows && col < tokens) {
+                const auto i = std::int64_t(col) * rows + row;
+                out[i] = __float2bfloat16_rn((p0[mi][e] + p1[mi][e]) +
+                                             (accumulate ? __bfloat162float(out[i]) : 0.0f));
+            }
+        }
+    }
+}
+
 // F16 weights and BF16 activations are represented exactly by TF32. Keep the
 // same k8 MMA order at every width without adding activation quantization or
 // rounding the stored weights to BF16.

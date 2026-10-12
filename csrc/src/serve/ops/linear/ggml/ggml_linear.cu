@@ -59,6 +59,17 @@ int affine_rows() noexcept {
     return value;
 }
 
+/// Whether the generic width-32 formats take the group-major 64 x 128 tile on wide prompts
+/// (dense_affine_gmajor_kernel); SUROGATE_GGML_AFFINE_GMAJOR=0 keeps them on
+/// dense_affine_mma_kernel. Either computes the same bits.
+bool affine_gmajor_allowed() noexcept {
+    static const bool allowed = [] {
+        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_GMAJOR");
+        return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
+    }();
+    return allowed;
+}
+
 std::atomic<std::int32_t> tile_multiprocessors_override{0};
 
 // Keep the activation quantisation used by GEMV when a graph pads a short
@@ -218,6 +229,25 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                     else if (tokens <= 4) { narrow.template operator()<4>(); }
                     else { narrow.template operator()<8>(); }
                     return;
+                }
+            }
+            if constexpr (Type != GgmlType::F16) {
+                if constexpr (DenseFormat<Type>::kWidth == 32 && !DenseFormat<Type>::kBias) {
+                    // The group-major 64 x 128 tile, once a prompt fills the device with it.
+                    const std::int32_t blocks = ((rows + gmajor::kRows - 1) / gmajor::kRows) *
+                                                ((tokens + gmajor::kCols - 1) / gmajor::kCols);
+                    if (tokens >= 256 && blocks >= kquant_tile_multiprocessors() &&
+                        affine_gmajor_allowed()) {
+                        auto* const kernel = dense_affine_gmajor_kernel<Type>;
+                        constexpr int smem = static_cast<int>(sizeof(gmajor::Smem));
+                        CUDA_CHECK(set_func_attribute_per_device(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+                        const dim3 grid((rows + gmajor::kRows - 1) / gmajor::kRows,
+                                        (tokens + gmajor::kCols - 1) / gmajor::kCols);
+                        kernel<<<grid, gmajor::kThreads, smem, stream>>>(
+                            bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                        return;
+                    }
                 }
             }
             const auto tile = [&]<int Cols>() {
