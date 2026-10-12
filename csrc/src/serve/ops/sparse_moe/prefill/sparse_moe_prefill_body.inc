@@ -361,19 +361,41 @@ MarlinMoePlane& marlin_moe_plane_for(const Weight& weight, std::int32_t experts,
     return plane;
 }
 
+// SUROGATE_SERVE_MOE_BLOCKS_PER_SM (1..32) when set, else 0.
+inline int prefill_blocks_per_sm_override() {
+    static const int per_sm = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_BLOCKS_PER_SM");
+        if (raw == nullptr || *raw == '\0') { return 0; }
+        const long parsed = std::strtol(raw, nullptr, 10);
+        return parsed <= 0 || parsed > 32 ? 0 : static_cast<int>(parsed);
+    }();
+    return per_sm;
+}
+
 inline int prefill_persistent_blocks() {
     static const int blocks = [] {
         int device = 0;
         int sms    = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        const char* raw = std::getenv("SUROGATE_SERVE_MOE_BLOCKS_PER_SM");
-        if (raw == nullptr || *raw == '\0') { return kPrefillBlocksPerSm * sms; }
-        const long parsed = std::strtol(raw, nullptr, 10);
-        if (parsed <= 0 || parsed > 32) { return kPrefillBlocksPerSm * sms; }
-        return static_cast<int>(parsed) * sms;
+        const int per_sm = prefill_blocks_per_sm_override();
+        return (per_sm > 0 ? per_sm : kPrefillBlocksPerSm) * sms;
     }();
     return blocks;
+}
+
+// The persistent grid of one expert kernel: kPrefillBlocksPerSm CTAs per SM, or as many as the
+// kernel's registers and shared memory let co-reside when that is fewer. A CTA past those does
+// not run beside the others but after them, alone with its whole share of the work, so it is a
+// tail on every SM: on GB10 the int8 GGML kernels hold two per SM, and Flash-Next's Q2_0 expert
+// pair at 4,096 tokens took 38.1 ms with three launched per SM against 28.3 with two.
+// SUROGATE_SERVE_MOE_BLOCKS_PER_SM, when set, still names the count outright.
+template <class Kernel>
+inline int prefill_persistent_blocks(Kernel* kernel, int threads) {
+    const int blocks = prefill_persistent_blocks();
+    if (prefill_blocks_per_sm_override() > 0) { return blocks; }
+    const int resident = cooperative_capacity_per_device(kernel, threads, 0);
+    return resident > 0 && resident < blocks ? resident : blocks;
 }
 
 template <int ExpertWarps, int ExpertBN>
@@ -2148,13 +2170,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
         } else if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(sparse_moe_prefill_q4_gate_up_kernel<8, 64>, 8 * 32),
+                       8 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns,
                         weights.slot_of_expert, route_job_count, routed_gate_codes,
                         routed_gate_scales, routed_activation);
             } else {
                 sparse_moe_prefill_q4_gate_up_kernel<4, 32>
-                    <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(sparse_moe_prefill_q4_gate_up_kernel<4, 32>, 4 * 32),
+                       4 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns,
                         weights.slot_of_expert, route_job_count, routed_gate_codes,
                         routed_gate_scales, routed_activation);
@@ -2172,13 +2196,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                 } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_gate_up_kernel<Codec, 8, 64>
-                        <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_gate_up_kernel<Codec, 8, 64>, 8 * 32),
+                           8 * 32, 0, stream>>>(
                             grouped_io, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_gate_codes,
                             routed_activation);
                 } else {
                     sparse_moe_prefill_ggml_gate_up_kernel<Codec, 4, 32>
-                        <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_gate_up_kernel<Codec, 4, 32>, 4 * 32),
+                           4 * 32, 0, stream>>>(
                             grouped_io, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_gate_codes,
                             routed_activation);
@@ -2192,13 +2218,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                 } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 8, 64>
-                        <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 8, 64>, 8 * 32),
+                           8 * 32, 0, stream>>>(
                             act_codes, act_ds, column_token, offsets, route_job_experts,
                             route_job_columns, weights.slot_of_expert, route_job_count,
                             routed_gate_codes, routed_activation);
                 } else {
                     sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 4, 32>
-                        <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_gate_up_kernel<Codec, 4, 32>, 4 * 32),
+                           4 * 32, 0, stream>>>(
                             act_codes, act_ds, column_token, offsets, route_job_experts,
                             route_job_columns, weights.slot_of_expert, route_job_count,
                             routed_gate_codes, routed_activation);
@@ -2274,13 +2302,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
         case QType::Q5G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>, 8 * 32),
+                       8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         weights.slot_of_expert, route_job_count, routed_down_codes,
                         routed_down_high, routed_down_scales, grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>, 4 * 32),
+                       4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         weights.slot_of_expert, route_job_count, routed_down_codes,
                         routed_down_high, routed_down_scales, grouped_io);
@@ -2289,13 +2319,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
         case QType::Q6G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>, 8 * 32),
+                       8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         weights.slot_of_expert, route_job_count, routed_down_codes,
                         routed_down_high, routed_down_scales, grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>, 4 * 32),
+                       4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         weights.slot_of_expert, route_job_count, routed_down_codes,
                         routed_down_high, routed_down_scales, grouped_io);
@@ -2323,12 +2355,14 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                 } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_down_kernel<Codec, 8, 64>
-                        <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_down_kernel<Codec, 8, 64>, 8 * 32),
+                           8 * 32, 0, stream>>>(
                             routed_activation, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
                 } else {
                     sparse_moe_prefill_ggml_down_kernel<Codec, 4, 32>
-                        <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_down_kernel<Codec, 4, 32>, 4 * 32),
+                           4 * 32, 0, stream>>>(
                             routed_activation, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
                 }
@@ -2341,12 +2375,14 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
                 } else {
                 if (wide_plan) {
                     sparse_moe_prefill_ggml_i8_down_kernel<Codec, 8, 64>
-                        <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_down_kernel<Codec, 8, 64>, 8 * 32),
+                           8 * 32, 0, stream>>>(
                             mid_codes, mid_ds, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
                 } else {
                     sparse_moe_prefill_ggml_i8_down_kernel<Codec, 4, 32>
-                        <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                        <<<prefill_persistent_blocks(sparse_moe_prefill_ggml_i8_down_kernel<Codec, 4, 32>, 4 * 32),
+                           4 * 32, 0, stream>>>(
                             mid_codes, mid_ds, offsets, route_job_experts, route_job_columns,
                             weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
                 }
