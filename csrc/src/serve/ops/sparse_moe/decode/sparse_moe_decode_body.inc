@@ -1379,10 +1379,66 @@ void launch_d4_small_t_codec(const PreparedSparseMoeWeights& weights, Tensor& de
 
 } // namespace
 
+// SUROGATE_SERVE_MOE_ROUTE_STATS=<rounds>: how many distinct experts a small-T round's paths
+// name, against the paths themselves, by round width -- what an expert-major round would read
+// once where the per-path kernels read each path's weights. Printed to stderr every that many
+// rounds of a layer stack, cumulative; off (and free) unless set.
+__global__ void sparse_moe_route_stats_kernel(const int* __restrict__ token_ids, int tokens,
+                                              unsigned long long* __restrict__ counters) {
+    constexpr int kWords = (kExperts + 31) / 32;
+    __shared__ unsigned seen[kWords];
+    for (int i = static_cast<int>(threadIdx.x); i < kWords; i += static_cast<int>(blockDim.x)) {
+        seen[i] = 0u;
+    }
+    __syncthreads();
+    for (int i = static_cast<int>(threadIdx.x); i < tokens * kTopK; i += static_cast<int>(blockDim.x)) {
+        const int expert = token_ids[i];
+        if (expert >= 0 && expert < kExperts) { atomicOr(&seen[expert >> 5], 1u << (expert & 31)); }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int distinct = 0;
+        for (int i = 0; i < kWords; ++i) { distinct += __popc(seen[i]); }
+        const int bucket = tokens < 63 ? tokens : 63;
+        atomicAdd(&counters[bucket * 3 + 0], 1ull);
+        atomicAdd(&counters[bucket * 3 + 1], static_cast<unsigned long long>(distinct));
+        atomicAdd(&counters[bucket * 3 + 2], static_cast<unsigned long long>(tokens) * kTopK);
+    }
+}
+
+inline void sparse_moe_route_stats(const int* token_ids, std::int32_t tokens, cudaStream_t stream) {
+    static const long every = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_ROUTE_STATS");
+        return raw != nullptr ? std::strtol(raw, nullptr, 10) : 0L;
+    }();
+    if (every <= 0 || tokens <= 0) { return; }
+    static unsigned long long* counters = [] {
+        unsigned long long* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, 64 * 3 * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(p, 0, 64 * 3 * sizeof(unsigned long long)));
+        return p;
+    }();
+    static long launches = 0;
+    sparse_moe_route_stats_kernel<<<1, 256, 0, stream>>>(token_ids, tokens, counters);
+    CUDA_CHECK(cudaGetLastError());
+    if (++launches % every != 0) { return; }
+    unsigned long long host[64 * 3];
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(host, counters, sizeof(host), cudaMemcpyDeviceToHost));
+    for (int t = 1; t < 64; ++t) {
+        const unsigned long long rounds = host[t * 3];
+        if (rounds == 0) { continue; }
+        std::fprintf(stderr, "moe route stats: width %d%s rounds %llu distinct/round %.1f paths/round %.1f\n",
+                     t, t == 63 ? "+" : "", rounds, static_cast<double>(host[t * 3 + 1]) / rounds,
+                     static_cast<double>(host[t * 3 + 2]) / rounds);
+    }
+}
+
 void decode_launch_d3_small_t(const Tensor& x, const PreparedSparseMoeWeights& weights,
                               const int* token_ids, float* token_activations, std::int32_t tokens,
                               SparseMoeSmallTD3Schedule schedule, cudaStream_t stream,
                               const int* adaptive_route_jobs) {
+    if (adaptive_route_jobs == nullptr) { sparse_moe_route_stats(token_ids, tokens, stream); }
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
         if (adaptive_route_jobs == nullptr) {
