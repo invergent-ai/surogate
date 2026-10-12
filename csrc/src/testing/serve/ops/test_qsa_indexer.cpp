@@ -148,7 +148,7 @@ void expect(bool condition, const std::string& what) {
 int run_case(bool mrope, const sinfer::ops::RopeYarn* yarn = nullptr) {
     // Under YaRN the MRoPE coordinates sit past a million, where only the angle reduced in double
     // keeps the low-frequency pairs exact.
-    const int base = yarn != nullptr ? 1'000'000 : 0;
+    const int coordinate_base = yarn != nullptr ? 1'000'000 : 0;
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
 
@@ -183,9 +183,9 @@ int run_case(bool mrope, const sinfer::ops::RopeYarn* yarn = nullptr) {
         g.yarn = yarn;
         std::vector<int> rope(3 * (count + 3), -999);
         for (int i = 0; i < count; ++i) {
-            rope[i] = base + 17 + (begin + i) / 40;
-            rope[count + 3 + i] = base + 23 + (begin + i) / 7;
-            rope[2 * (count + 3) + i] = base + 31 + (begin + i) % 19;
+            rope[i] = coordinate_base + 17 + (begin + i) / 40;
+            rope[count + 3 + i] = coordinate_base + 23 + (begin + i) / 7;
+            rope[2 * (count + 3) + i] = coordinate_base + 31 + (begin + i) % 19;
         }
         DeviceBuffer d_rope = to_device_i32(rope);
         Tensor rope_t(d_rope.p, DType::I32, {count, 3});
@@ -217,17 +217,24 @@ int run_case(bool mrope, const sinfer::ops::RopeYarn* yarn = nullptr) {
     // The plane stores BF16, so a component is exact only to one BF16 ulp (~0.4 % relative,
     // and a fixed floor where the value is near zero).
     double worst = 0.0;
+    struct { int block = 0, dim = 0; double got = 0.0, want = 0.0; } worst_at;
     for (int b = 0; b * kBlock + kBlock <= tokens; ++b) {
-        const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, base);
+        const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, coordinate_base);
         const std::size_t base        = cache.cell_offset(b * kBlock);
         for (int d = 0; d < kHeadDim; ++d) {
             const double tolerance = 0.008 * std::abs(want[d]) + 0.004;
-            worst = std::max(worst, std::abs(plane_host[base + d] - want[d]) / tolerance);
+            const double error     = std::abs(plane_host[base + d] - want[d]) / tolerance;
+            if (error > worst) {
+                worst = error;
+                worst_at = {b, d, plane_host[base + d], want[d]};
+            }
         }
     }
     if (worst >= 1.0) { // report where it diverges before failing
+        std::cerr << "worst: block " << worst_at.block << " dim " << worst_at.dim << " got "
+                  << worst_at.got << " want " << worst_at.want << "\n";
         for (int b = 0; b * kBlock + kBlock <= tokens && b < 3; ++b) {
-            const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, base);
+            const std::vector<float> want = reference_block_key(raw, b * kBlock, gain, mrope, yarn, coordinate_base);
             const std::size_t base        = cache.cell_offset(b * kBlock);
             std::cerr << "block " << b << " (first " << b * kBlock << "):";
             for (int d = 0; d < 6; ++d) {
