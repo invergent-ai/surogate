@@ -133,6 +133,35 @@ Accuracy: the 900 tokens of a reference answer scored given its 94,631-token doc
 bf16 product: with Gemma 4 12B's on the e4m3 one, the same check on that model gave +0.017 +-
 0.011 nats.
 
+### Prompt attention pipelined (1036448) and whole key blocks landed from precomputed offsets (7b373db)
+
+The e4m3 P V prompt kernel overlaps each key block's softmax with the next block's Q Kᵀ, and lands
+a fully visible block's K and V codes from offsets worked out once instead of per block; both
+bit-exact (the reference answer's NLL is unchanged to the last digit). Kernel
+(`sinfer_causal_softmax_attention_bench`, `d256-h16-kv2`, 2,048 new tokens): 147 -> 169 TFLOP/s
+over 32k cached keys, 147-150 -> 167-171 over 131k. Surogate3.7-35B-A3B, tool-call agents
+(`--tools`, MTP 3), against the same day's runs on a23d89c:
+
+| | a23d89c | 7b373db |
+|---|---|---|
+| 1 agent: warm first token p50 / p90 | 0.72 / 1.19 s | **0.68 / 1.12 s** |
+| 1 agent: turn latency p50 | 1.04 s | **0.98 s** |
+| 1 agent: turns a minute | 40.4 | **42.2** |
+| 4 agents: warm first token p50 / p90 | 1.27 / 2.44 s | **1.22 / 2.39 s** |
+| 4 agents: turn latency p50 | 3.85 s | **3.50 s** |
+| 4 agents: turns a minute | 41.3 | **43.4** |
+| 1 agent at ~1M tokens (YaRN): cold first prompt (995,769 tokens) | 733 s | **676 s** |
+| 1 agent at ~1M tokens: warm first token p50 / p90 | 4.26 / 5.28 s | **3.90 / 4.84 s** |
+| 1 agent at ~1M tokens: turn latency p50 | 5.13 s | **4.78 s** |
+
+Every warm turn reused its conversation's cache (98.3% of the prompt tokens at 150k, 99.7% at a
+million; about 2.2-3.0k new tokens a turn), so what a turn computes is its appended tokens
+against the whole cache: prompt attention is ~57% of a 2,048-token chunk's time at 130k cached
+tokens and ~80% at a million. Larger prompt chunks (`--max-num-batched-tokens` 4096 / 8192) cut
+the 1-agent turn by ~6% and the 4-agent warm turn by ~28%, but the fourth agent's cold 100k
+prompt then waited 144 s instead of 90 (warm agents' short prompts go ahead of long ones), and the
+4-agent run as a whole finished only 2% sooner; the default stays 2,048.
+
 ### A million-token context with YaRN (5110824)
 
 Surogate3.7-35B-A3B, `--rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'`,
