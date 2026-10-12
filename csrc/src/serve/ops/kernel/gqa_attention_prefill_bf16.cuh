@@ -157,6 +157,13 @@ __device__ __forceinline__ int gqa_prefill_pv8_column_key(int column) {
 // on e4m3's largest finite value and small ones keep their subnormal range; divided out with l.
 inline constexpr float kGqaPrefillPv8Scale = 448.0F;
 
+// One key block's softmax in flight in the software-pipelined e4m3 P V loop: the block's row maxima,
+// exponent bases and rescale factors, its row sums, and P packed as the m16n8k32 A operand.
+struct GqaPrefillPv8Softmax {
+    float bm0, bm1, base0, base1, alpha0, alpha1, bl0, bl1;
+    unsigned p8[4];
+};
+
 // Two 16x16 tiles of e4m3 codes, rows keys 0-15 and 16-31 at lanes 0-15 and 16-31's addresses,
 // transposed: lane l gets keys 4(l%4)..+3 of columns l/4 and 8 + l/4 from the first tile (b0, b1)
 // and the same of the second (b2, b3) -- the m16n8k32 B operand of two 8-column n-tiles.
@@ -298,9 +305,10 @@ __device__ __forceinline__ void gqa_prefill_widen_fp8_slice(__nv_bfloat16* dst,
 // `PvFp8` (QkFp8, 32-key blocks, sm_12x) takes O += P V on the e4m3 tensor cores too: P rounded
 // to e4m3 straight from the score registers, V's codes read as the cache holds them by ldmatrix
 // .b8, nothing widened. The bf16 V tile's room holds a second block of K and V codes, so a block's
-// codes land a whole block ahead behind one barrier per block.
+// codes land a whole block ahead behind one barrier per block, and the loop is software-pipelined:
+// block kb + 1's Q Kᵀ goes to the tensor cores with block kb's softmax between its steps.
 // MEASURED (DGX Spark, d256-h16-kv2, 2,048 new tokens over 32K and 131K cached keys): 110 ->
-// 147 TFLOP/s. Skipping parts of the bf16-P V kernel one at a time had shown it waiting, not
+// 147 TFLOP/s, and ~154 pipelined. Skipping parts of the bf16-P V kernel one at a time had shown it waiting, not
 // tensor-bound: its non-tensor work alone (staging, widening, softmax, two barriers) took about as
 // long as the whole kernel.
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
@@ -603,111 +611,153 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         stage_raw.template operator()<true>(k_raw, codes_k, kb, page);
         stage_raw.template operator()<false, DOut>(v_raw, codes_v, kb, page, d_out0);
     };
-    // e4m3 P V: block kb's K (in gqa_prefill_pv8_row order) and V codes into slot
-    // (kb - n_block_min) % 2, both swizzled for their ldmatrix.
-    const auto stage_pv8 = [&](int kb, int page) {
-        stage_raw.template operator()<true, D, kPv8>(raw_slot(k_raw, kb), codes_k, kb, page);
-        stage_raw.template operator()<true, D>(raw_slot(v_raw, kb), codes_v, kb, page);
-    };
     // This thread's two rows' e4m3 Q scales, times the softmax scale (kQk8).
     float qk_scale0 = scale, qk_scale1 = scale;
 
-    // Prologue: commit Q, then kick off the first key block the loop will read (K, or the codes
-    // of K and V and of the next block's K, widening the first K). The e4m3 path lands the first
-    // block's codes and quantizes Q behind them.
-    sinfer::ops::cp_commit();
-    if constexpr (kQk8) {
-        if constexpr (kPv8) {
-            stage_pv8(n_block_min, physical_page);
-        } else {
-            stage_qk8(n_block_min, physical_page);
-        }
-        sinfer::ops::cp_commit();
-        // A warp quantizes and reads only its own 16 rows, so its own barrier publishes them.
-        gqa_prefill_quantize_q_fp8<D>(reinterpret_cast<std::uint8_t*>(q_s), q_scale_s,
-                                      q + gqa_prefill_q_index<Geometry>(q_head, 0, q0, q_heads),
-                                      D * q_heads, tokens - q0, warp_row0, lane);
-        __syncwarp();
-        qk_scale0 = q_scale_s[warp_row0 + gid] * scale;
-        qk_scale1 = q_scale_s[warp_row0 + gid + 8] * scale;
-    } else if constexpr (kRawFp8) {
-        stage_raw.template operator()<false>(raw_slot(k_raw, n_block_min), codes_k, n_block_min,
-                                             physical_page);
-        stage_raw.template operator()<false>(raw_slot(v_raw, n_block_min), codes_v, n_block_min,
-                                             physical_page);
-        sinfer::ops::cp_commit();
-        if (n_block_min + 1 < n_block_max) {
-            stage_raw.template operator()<false>(raw_slot(k_raw, n_block_min + 1), codes_k,
-                                                 n_block_min + 1, page_of(n_block_min + 1));
-        }
-        sinfer::ops::cp_commit();
-        sinfer::ops::cp_wait<1>(); // Q and the first block's codes
-        __syncthreads();
-        gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, n_block_min), tid, 0,
-                                       kGqaPrefillWidenChunks<D>);
-    } else {
-        stage_k(n_block_min, physical_page);
-        sinfer::ops::cp_commit();
-    }
+    if constexpr (kPv8) {
+        // e4m3 P V, software-pipelined the way FlashAttention-3 overlaps a warpgroup's softmax with
+        // its next GEMM: block kb + 1's Q Kᵀ goes to the tensor cores first and block kb's softmax
+        // runs between its contraction steps, so the exp2s, the row maxima and P's e4m3 packing no
+        // longer stand between the two products while the warp's tensor-core work waits. K's codes
+        // therefore land two blocks ahead and V's one, in the same two slots each: at block kb's
+        // barrier the K slot block kb's Q Kᵀ read (a block earlier) and the V slot block kb - 1's
+        // P V read are both free.
+        //   prologue  land K(n0) and V(n0), then K(n0 + 1); quantize Q; S(n0) = Q K(n0)ᵀ
+        //   block kb  wait, barrier: V(kb) and K(kb + 1) have landed
+        //             land V(kb + 1) and K(kb + 2)
+        //             S(kb + 1) = Q K(kb + 1)ᵀ, block kb's softmax between its steps
+        //             O += P(kb) V(kb)
+        constexpr int Ks8 = D / 32;
+        // The lambdas below spell their score arrays' bound out: a lambda parameter whose type names
+        // the kernel's own constexpr QKNt crashes cudafe++ (CUDA 13.0).
+        static_assert(kGqaPrefillBcFor<Geometry::HeadDim> / 8 == QKNt);
+        const auto stage_k8 = [&](int kb, int page) {
+            stage_raw.template operator()<true, D, true>(raw_slot(k_raw, kb), codes_k, kb, page);
+        };
+        const auto stage_v8 = [&](int kb, int page) {
+            stage_raw.template operator()<true, D>(raw_slot(v_raw, kb), codes_v, kb, page);
+        };
+        const int qrow0 = q0 + warp_row0 + gid;
+        const int qrow1 = qrow0 + 8;
+        const int qabs0 = (qrow0 < tokens) ? base_pos + qrow0 : -1;
+        const int qabs1 = (qrow1 < tokens) ? base_pos + qrow1 : -1;
+        const std::uint32_t* mask0 =
+            Sparse && qrow0 < tokens
+                ? block_mask.words + static_cast<std::int64_t>(qrow0) * block_mask.stride
+                : nullptr;
+        const std::uint32_t* mask1 =
+            Sparse && qrow1 < tokens
+                ? block_mask.words + static_cast<std::int64_t>(qrow1) * block_mask.stride
+                : nullptr;
 
-    for (int kb = n_block_min; kb < n_block_max; ++kb) {
-        const int k0 = kb * Bc;
-        // Read ahead of the wait, so the table load hides behind it.
-        const int page1 = (kb + 1 < n_block_max) ? page_of(kb + 1) : physical_page;
-        const int page2 = (kRawFp8 && kb + 2 < n_block_max) ? page_of(kb + 2) : physical_page;
-
-        sinfer::ops::cp_wait<0>();
-        __syncthreads();
-
-        // The e4m3 Q Kᵀ path's next block waits for the barrier after QK, which frees its slot.
-        // Under e4m3 P V the barrier above already freed the other slot (block kb - 1's): the next
-        // block lands there behind this one's whole QK, softmax and PV.
-        if constexpr (kPv8) {
-            if (kb + 1 < n_block_max) { stage_pv8(kb + 1, page1); }
-            sinfer::ops::cp_commit();
-        } else if constexpr (kRawFp8) {
-            if (kb + 1 < n_block_max) {
-                stage_raw.template operator()<false>(raw_slot(v_raw, kb + 1), codes_v, kb + 1,
-                                                     page1);
-            }
-            if (kb + 2 < n_block_max) {
-                stage_raw.template operator()<false>(raw_slot(k_raw, kb + 2), codes_k, kb + 2,
-                                                     page2);
-            }
-            sinfer::ops::cp_commit();
-        } else if constexpr (!kQk8) {
-            // Overlap V(kb) load against the QK MMA below.
-            stage_v(kb, physical_page);
-            sinfer::ops::cp_commit();
-        }
-
-        // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
-        // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
-        // step k+1 while the m16n8k16 MMAs for step k run, so the LSU (ldmatrix)
-        // and tensor pipes overlap instead of stalling on each other.
-        float score[QKNt][4];
+        // Block kb's softmax in kSoftStages stages, spread over the steps of the Q Kᵀ beside it:
+        // scale and mask, the row maxima and the rescale factors, then each n-tile's exp2s and
+        // their e4m3 packing. P is the k32 A operand, P * kGqaPrefillPv8Scale in e4m3: p8[0]/p8[1]
+        // are rows gid/gid+8 over n-tiles 0-1 (keys 4l..4l+3 of the first 16,
+        // gqa_prefill_pv8_column_key), p8[2]/p8[3] the same over n-tiles 2-3; a pair's first key is
+        // the lower byte. The same arithmetic as the unpipelined kernel's, in the same order.
+        constexpr int kSoftStages = 2 + QKNt;
+        const auto soft = [&]<bool Full>(int stage, int kb, float (&s)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4],
+                                         GqaPrefillPv8Softmax& st) {
+            if (stage == 0) {
+                // qk_scale0/1: Q's row scales times the softmax scale.
 #pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
-        }
-        // Swizzled ldmatrix addresses via precomputed per-lane bases + immediates.
-        unsigned af[2][4];
-        unsigned bf[2][QKNt][2];
-        if constexpr (kQk8) {
-            // The same pipeline over D / 32 steps of e4m3 codes, K straight from its raw slot;
-            // V's codes are widened between the steps.
-            constexpr int Ks8    = D / 32;
-            constexpr int Chunks = VWidenChunks;
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    s[nt][0] *= qk_scale0;
+                    s[nt][1] *= qk_scale0;
+                    s[nt][2] *= qk_scale1;
+                    s[nt][3] *= qk_scale1;
+                }
+                st.bm0 = -CUDART_INF_F;
+                st.bm1 = -CUDART_INF_F;
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    if constexpr (!Full) {
+                        // The column's key is gqa_prefill_pv8_column_key's (pairs stay pairs). A
+                        // gathered column past the selection is -1 (both of a pair), and must not
+                        // reach the mask, whose word -1 / 4 is 0.
+                        const int col   = gqa_prefill_pv8_column_key(nt * 8 + 2 * lid);
+                        const int key0  = Gather ? gathered_key(kb, col) : kb * Bc + col;
+                        const int key1  = (Gather && key0 < 0) ? -1 : key0 + 1;
+                        const bool live = !Gather || key0 >= 0;
+                        s[nt][0] = (live && qrow0 < tokens && key0 <= block_mask.last_key(qabs0) &&
+                                    gqa_within_window(qabs0, key0, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
+                                       ? s[nt][0]
+                                       : -CUDART_INF_F;
+                        s[nt][1] = (live && qrow0 < tokens && key1 <= block_mask.last_key(qabs0) &&
+                                    gqa_within_window(qabs0, key1, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
+                                       ? s[nt][1]
+                                       : -CUDART_INF_F;
+                        s[nt][2] = (live && qrow1 < tokens && key0 <= block_mask.last_key(qabs1) &&
+                                    gqa_within_window(qabs1, key0, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
+                                       ? s[nt][2]
+                                       : -CUDART_INF_F;
+                        s[nt][3] = (live && qrow1 < tokens && key1 <= block_mask.last_key(qabs1) &&
+                                    gqa_within_window(qabs1, key1, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
+                                       ? s[nt][3]
+                                       : -CUDART_INF_F;
+                    }
+                    st.bm0 = fmaxf(st.bm0, fmaxf(s[nt][0], s[nt][1]));
+                    st.bm1 = fmaxf(st.bm1, fmaxf(s[nt][2], s[nt][3]));
+                }
+            } else if (stage == 1) {
+                // Online softmax against the running maximum (see the unpipelined kernel below).
+                const float nm0 = fmaxf(m0, warp_max<4>(st.bm0, FullMask));
+                const float nm1 = fmaxf(m1, warp_max<4>(st.bm1, FullMask));
+                st.base0  = (nm0 == -CUDART_INF_F) ? 0.0f : nm0 * Log2E;
+                st.base1  = (nm1 == -CUDART_INF_F) ? 0.0f : nm1 * Log2E;
+                st.alpha0 = (m0 == nm0) ? 1.0f : exp2_approx(fmaf(m0, Log2E, -st.base0));
+                st.alpha1 = (m1 == nm1) ? 1.0f : exp2_approx(fmaf(m1, Log2E, -st.base1));
+                m0        = nm0;
+                m1        = nm1;
+                st.bl0 = st.bl1 = 0.0f;
+                st.p8[0] = st.p8[1] = st.p8[2] = st.p8[3] = 0U;
+            } else {
+                const int nt    = stage - 2;
+                const float p00 = exp2_approx(fmaf(s[nt][0], Log2E, -st.base0));
+                const float p01 = exp2_approx(fmaf(s[nt][1], Log2E, -st.base0));
+                const float p10 = exp2_approx(fmaf(s[nt][2], Log2E, -st.base1));
+                const float p11 = exp2_approx(fmaf(s[nt][3], Log2E, -st.base1));
+                st.bl0 += p00 + p01;
+                st.bl1 += p10 + p11;
+                constexpr float S = kGqaPrefillPv8Scale;
+                const unsigned c0 = __nv_cvt_float2_to_fp8x2(make_float2(p00 * S, p01 * S),
+                                                             __NV_SATFINITE, __NV_E4M3);
+                const unsigned c1 = __nv_cvt_float2_to_fp8x2(make_float2(p10 * S, p11 * S),
+                                                             __NV_SATFINITE, __NV_E4M3);
+                const int reg   = (nt >> 1) * 2;
+                const int shift = (nt & 1) * 16;
+                st.p8[reg] |= (c0 & 0xffffU) << shift;
+                st.p8[reg + 1] |= (c1 & 0xffffU) << shift;
+                if (nt == QKNt - 1) {
+                    l0 = fmaf(l0, st.alpha0, st.bl0);
+                    l1 = fmaf(l1, st.alpha1, st.bl1);
+                }
+            }
+        };
+        // S = Q K(kb)ᵀ for this warp's 16 rows from K's slot, ldmatrix a step ahead of the MMAs.
+        // Interleave: block soft_kb's softmax stages (of soft_s, into st) go between the steps,
+        // stage i once step i * Ks8 / kSoftStages's MMAs are issued.
+        const auto qk8 = [&]<bool Interleave, bool Full>(int kb, float (&s)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4], int soft_kb,
+                                                         float (&soft_s)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4],
+                                                         GqaPrefillPv8Softmax& st) {
             const unsigned k_slot_base =
                 k_lane_base + static_cast<unsigned>(((kb - n_block_min) & (Slots - 1)) * Bc * D);
+            unsigned af[2][4];
+            unsigned bf[2][QKNt][2];
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) { s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f; }
             ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
                         gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
 #pragma unroll
             for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
                 ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
-                            gqa_prefill_swz_addr(
-                                k_slot_base + static_cast<unsigned>(nt2) * QkEightRows, 0u, k_as,
-                                k_r));
+                            gqa_prefill_swz_addr(k_slot_base + static_cast<unsigned>(nt2) * QkEightRows,
+                                                 0u, k_as, k_r));
             }
 #pragma unroll
             for (int k = 0; k < Ks8; ++k) {
@@ -728,221 +778,23 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
                 }
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
-                                 af[cur][0], af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0],
-                                 bf[cur][nt][1]);
+                    mma_fp8_e4m3(s[nt][0], s[nt][1], s[nt][2], s[nt][3], af[cur][0], af[cur][1],
+                                 af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
                 }
-                if constexpr (!kPv8) {
-                    gqa_prefill_widen_fp8_slice<DOut>(v_s, v_raw, tid, k * Chunks / Ks8,
-                                                      (k + 1) * Chunks / Ks8);
-                }
-            }
-        } else {
-            ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
-                        gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
+                if constexpr (Interleave) {
 #pragma unroll
-            for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
-                            gqa_prefill_swz_addr(
-                                k_lane_base + static_cast<unsigned>(nt2) * EightRows, 0u, k_as,
-                                k_r));
-            }
-#pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
-                const int cur = k & 1;
-                const int nxt = cur ^ 1;
-                if (k + 1 < QKKs) {
-                    const unsigned ck = static_cast<unsigned>((k + 1) << 5);
-                    ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
-                                gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
-#pragma unroll
-                    for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                        ldmatrix_x4(
-                            bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0], bf[nxt][nt2 + 1][1],
-                            gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2) * EightRows,
-                                                 ck, k_as, k_r));
+                    for (int i = 0; i < kSoftStages; ++i) {
+                        if (i * Ks8 / kSoftStages == k) {
+                            soft.template operator()<Full>(i, soft_kb, soft_s, st);
+                        }
                     }
                 }
-#pragma unroll
-                for (int nt = 0; nt < QKNt; ++nt) {
-                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
-                             af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
-                }
-                if constexpr (kRawFp8) {
-                    constexpr int Chunks = kGqaPrefillWidenChunks<D>;
-                    gqa_prefill_widen_fp8_slice<D>(v_s, raw_slot(v_raw, kb), tid, k * Chunks / QKKs,
-                                                   (k + 1) * Chunks / QKKs);
-                }
             }
-        }
+        };
 
-        // qk_scale0/1 are the softmax scale itself unless Q was quantized.
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] *= qk_scale0;
-            score[nt][1] *= qk_scale0;
-            score[nt][2] *= qk_scale1;
-            score[nt][3] *= qk_scale1;
-        }
-
-        const int row0             = warp_row0 + gid;
-        const int row1             = warp_row0 + gid + 8;
-        const int qrow0            = q0 + row0;
-        const int qrow1            = q0 + row1;
-        const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
-        const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
-        // A sparse chunk never has a "full" tile: every key must pass its query's selection.
-        //
-        // "Every key in this tile is causally visible" is not "every key in this tile
-        // needs no mask". Under a sliding window a fully-causal tile is precisely an
-        // OLD-key tile -- the ones furthest below the diagonal are the first to fall
-        // out of the window -- so the tile is only mask-free when its oldest key is
-        // still within the window of its newest query.
-        const bool full_score_tile = !Sparse && (q0 + Br <= tokens) &&
-                                     ((k0 + Bc - 1) <= (base_pos + q0)) &&
-                                     gqa_within_window(max_query_abs, k0, metadata.window) && block_mask.image_end == 0;
-        const std::uint32_t* mask0 =
-            Sparse && qrow0 < tokens
-                ? block_mask.words + static_cast<std::int64_t>(qrow0) * block_mask.stride
-                : nullptr;
-        const std::uint32_t* mask1 =
-            Sparse && qrow1 < tokens
-                ? block_mask.words + static_cast<std::int64_t>(qrow1) * block_mask.stride
-                : nullptr;
-
-        // Block row-max on scaled scores.
-        float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
-        if (full_score_tile) {
-#pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
-            }
-        } else {
-#pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                // A gathered column past the selection is -1 (both of a pair: a block holds
-                // whole even pairs), and must not reach the mask, whose word -1 / 4 is 0.
-                // Under e4m3 P V the column's key is gqa_prefill_pv8_column_key's (pairs stay pairs).
-                const int col  = kPv8 ? gqa_prefill_pv8_column_key(nt * 8 + 2 * lid) : nt * 8 + 2 * lid;
-                const int key0 = Gather ? gathered_key(kb, col) : k0 + col;
-                const int key1 = (Gather && key0 < 0) ? -1 : key0 + 1;
-                const bool live = !Gather || key0 >= 0;
-                score[nt][0] = (live && qrow0 < tokens && key0 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key0, metadata.window) &&
-                                gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
-                                   ? score[nt][0]
-                                   : -CUDART_INF_F;
-                score[nt][1] = (live && qrow0 < tokens && key1 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key1, metadata.window) &&
-                                gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
-                                   ? score[nt][1]
-                                   : -CUDART_INF_F;
-                score[nt][2] = (live && qrow1 < tokens && key0 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key0, metadata.window) &&
-                                gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
-                                   ? score[nt][2]
-                                   : -CUDART_INF_F;
-                score[nt][3] = (live && qrow1 < tokens && key1 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key1, metadata.window) &&
-                                gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
-                                   ? score[nt][3]
-                                   : -CUDART_INF_F;
-                bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-                bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
-            }
-        }
-        bm0 = warp_max<4>(bm0, FullMask);
-        bm1 = warp_max<4>(bm1, FullMask);
-
-        // Online softmax against the running maximum, as FlashAttention-2 does: P = exp2(S - m)
-        // feeds the tensor cores straight into the output accumulator, which is rescaled only
-        // when some row's maximum moved. Bits differ from the split-KV kernels', which round P
-        // against each tile's own maximum; --batch-invariant keeps prompts on those.
-        const float nm0 = fmaxf(m0, bm0);
-        const float nm1 = fmaxf(m1, bm1);
-        // A row with no visible key yet keeps an infinite maximum and contributes nothing; its
-        // exponent base is taken as zero so -inf - -inf never makes a NaN.
-        const float base0  = (nm0 == -CUDART_INF_F) ? 0.0f : nm0 * Log2E;
-        const float base1  = (nm1 == -CUDART_INF_F) ? 0.0f : nm1 * Log2E;
-        const float alpha0 = (m0 == nm0) ? 1.0f : exp2_approx(fmaf(m0, Log2E, -base0));
-        const float alpha1 = (m1 == nm1) ? 1.0f : exp2_approx(fmaf(m1, Log2E, -base1));
-        m0 = nm0;
-        m1 = nm1;
-
-        // P, repacked into the PV A-fragment layout, and this thread's share of each row sum;
-        // the quad's shares are added once, after the last block. A masked score is -inf, whose
-        // exp2 is zero.
-        float bl0 = 0.0f, bl1 = 0.0f;
-        unsigned p_frag[PVKs][4];
-        // e4m3 P V: the k32 A operand, P * kGqaPrefillPv8Scale in e4m3. a0/a1 are rows gid/gid+8
-        // over n-tiles 0-1 (keys 4l..4l+3 of the first 16, gqa_prefill_pv8_column_key), a2/a3
-        // the same over n-tiles 2-3; a pair's first key is the lower byte.
-        unsigned p8[4] = {0U, 0U, 0U, 0U};
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const float p00 = exp2_approx(fmaf(score[nt][0], Log2E, -base0));
-            const float p01 = exp2_approx(fmaf(score[nt][1], Log2E, -base0));
-            const float p10 = exp2_approx(fmaf(score[nt][2], Log2E, -base1));
-            const float p11 = exp2_approx(fmaf(score[nt][3], Log2E, -base1));
-            bl0 += p00 + p01;
-            bl1 += p10 + p11;
-            if constexpr (kPv8) {
-                constexpr float S = kGqaPrefillPv8Scale;
-                const unsigned c0 = __nv_cvt_float2_to_fp8x2(make_float2(p00 * S, p01 * S),
-                                                             __NV_SATFINITE, __NV_E4M3);
-                const unsigned c1 = __nv_cvt_float2_to_fp8x2(make_float2(p10 * S, p11 * S),
-                                                             __NV_SATFINITE, __NV_E4M3);
-                const int reg   = (nt >> 1) * 2;
-                const int shift = (nt & 1) * 16;
-                p8[reg] |= (c0 & 0xffffU) << shift;
-                p8[reg + 1] |= (c1 & 0xffffU) << shift;
-            } else {
-                const int pk = nt >> 1;
-                if ((nt & 1) == 0) {
-                    p_frag[pk][0] = pack_bf16x2(p00, p01);
-                    p_frag[pk][1] = pack_bf16x2(p10, p11);
-                } else {
-                    p_frag[pk][2] = pack_bf16x2(p00, p01);
-                    p_frag[pk][3] = pack_bf16x2(p10, p11);
-                }
-            }
-        }
-        l0 = fmaf(l0, alpha0, bl0);
-        l1 = fmaf(l1, alpha1, bl1);
-
-        if constexpr (kPv8) {
-            // Nothing is widened: the next block's codes went in flight after the loop's barrier.
-        } else if constexpr (kQk8) {
-            __syncthreads(); // v_s holds V(kb); every warp is done with this block's codes
-            if (kb + 1 < n_block_max) { stage_qk8(kb + 1, page1); }
-            sinfer::ops::cp_commit();
-        } else if constexpr (kRawFp8) {
-            __syncthreads(); // v_s holds V(kb); every warp is done reading k_s
-        } else {
-            sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
-            __syncthreads();
-
-            // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-            if (kb + 1 < n_block_max) {
-                physical_page = page1;
-                stage_k(kb + 1, physical_page);
-                sinfer::ops::cp_commit();
-            }
-        }
-
-        // The maximum settles early in a long scan, so most blocks skip the rescale; the vote
-        // keeps the branch warp-uniform.
-        if (__any_sync(FullMask, alpha0 != 1.0f || alpha1 != 1.0f)) {
-#pragma unroll
-            for (int n = 0; n < PVNt; ++n) {
-                acc[n][0] *= alpha0;
-                acc[n][1] *= alpha0;
-                acc[n][2] *= alpha1;
-                acc[n][3] *= alpha1;
-            }
-        }
-
-        // O += P V.
-        if constexpr (kPv8) {
-            // Lane l's ldmatrix row is key l of the slot's V codes; a 16-column step of every row
-            // is its 16-byte chunk, swizzled by gqa_prefill_swz8.
+        // O += P V: lane l's ldmatrix row is key l of the slot's V codes; a 16-column step of every
+        // row is its 16-byte chunk, swizzled by gqa_prefill_swz8.
+        const auto pv8 = [&](int kb, const unsigned (&p8)[4]) {
             const unsigned v_row = smem_addr(raw_slot(v_raw, kb)) + static_cast<unsigned>(lane * D);
             const unsigned v_xor = static_cast<unsigned>(lane & 7);
 #pragma unroll
@@ -955,31 +807,408 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
                 mma_fp8_e4m3(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p8[0],
                              p8[1], p8[2], p8[3], b[1], b[3]);
             }
-        } else {
+        };
+        // Block kb: block kb + 1's Q Kᵀ into `next` (Next) with block kb's softmax between its
+        // steps, the rescale, then block kb's P V. Full: no key of the block needs a mask.
+        const auto step = [&]<bool Next, bool Full>(int kb, float (&cur)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4],
+                                                    float (&next)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4]) {
+            GqaPrefillPv8Softmax st;
+            if constexpr (Next) {
+                qk8.template operator()<true, Full>(kb + 1, next, kb, cur, st);
+            } else {
 #pragma unroll
-        for (int n2 = 0; n2 < PVNt; n2 += 2) {
-#pragma unroll
-            for (int k = 0; k < PVKs; ++k) {
-                unsigned vf[4];
-                const unsigned col = static_cast<unsigned>(n2 << 4);
-                ldmatrix_x4_t(vf[0], vf[1], vf[2], vf[3],
-                    gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k) * VSixteenRows,
-                                         col, v_as, v_r));
-                mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0],
-                         p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[0], vf[1]);
-                mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
-                         p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[2], vf[3]);
+                for (int i = 0; i < kSoftStages; ++i) { soft.template operator()<Full>(i, kb, cur, st); }
             }
-            if constexpr (kRawFp8) {
-                constexpr int Groups = PVNt / 2;
-                constexpr int Chunks = kGqaPrefillWidenChunks<D>;
-                const int g          = n2 >> 1;
-                if (kb + 1 < n_block_max) {
-                    gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, kb + 1), tid,
-                                                   g * Chunks / Groups, (g + 1) * Chunks / Groups);
+            // The maximum settles early in a long scan, so most blocks skip the rescale; the vote
+            // keeps the branch warp-uniform.
+            if (__any_sync(FullMask, st.alpha0 != 1.0f || st.alpha1 != 1.0f)) {
+#pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    acc[n][0] *= st.alpha0;
+                    acc[n][1] *= st.alpha0;
+                    acc[n][2] *= st.alpha1;
+                    acc[n][3] *= st.alpha1;
                 }
             }
+            pv8(kb, st.p8);
+        };
+
+        // Prologue. A warp quantizes and reads only its own 16 rows of Q, so its own barrier
+        // publishes them; the first block's codes need the CTA's.
+        stage_k8(n_block_min, physical_page);
+        stage_v8(n_block_min, physical_page);
+        sinfer::ops::cp_commit();
+        if (n_block_min + 1 < n_block_max) { stage_k8(n_block_min + 1, page_of(n_block_min + 1)); }
+        sinfer::ops::cp_commit();
+        gqa_prefill_quantize_q_fp8<D>(reinterpret_cast<std::uint8_t*>(q_s), q_scale_s,
+                                      q + gqa_prefill_q_index<Geometry>(q_head, 0, q0, q_heads),
+                                      D * q_heads, tokens - q0, warp_row0, lane);
+        __syncwarp();
+        qk_scale0 = q_scale_s[warp_row0 + gid] * scale;
+        qk_scale1 = q_scale_s[warp_row0 + gid + 8] * scale;
+        sinfer::ops::cp_wait<1>();
+        __syncthreads();
+        float score[QKNt][4];
+        GqaPrefillPv8Softmax unused;
+        qk8.template operator()<false, true>(n_block_min, score, n_block_min, score, unused);
+
+        for (int kb = n_block_min; kb < n_block_max; ++kb) {
+            const bool has_next = kb + 1 < n_block_max;
+            // Read ahead of the wait, so the table loads hide behind it.
+            const int page1 = has_next ? page_of(kb + 1) : physical_page;
+            const int page2 = kb + 2 < n_block_max ? page_of(kb + 2) : physical_page;
+            sinfer::ops::cp_wait<0>();
+            __syncthreads();
+            if (has_next) { stage_v8(kb + 1, page1); }
+            if (kb + 2 < n_block_max) { stage_k8(kb + 2, page2); }
+            sinfer::ops::cp_commit();
+            // A sparse chunk never has a "full" tile: every key must pass its query's selection.
+            // Under a window a fully causal tile can still hold keys older than the window.
+            const int k0    = kb * Bc;
+            const bool full = !Sparse && (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0)) &&
+                              gqa_within_window(max_query_abs, k0, metadata.window) &&
+                              block_mask.image_end == 0;
+            float next[QKNt][4];
+            if (has_next) {
+                if (full) {
+                    step.template operator()<true, true>(kb, score, next);
+                } else {
+                    step.template operator()<true, false>(kb, score, next);
+                }
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { score[nt][i] = next[nt][i]; }
+                }
+            } else if (full) {
+                step.template operator()<false, true>(kb, score, next);
+            } else {
+                step.template operator()<false, false>(kb, score, next);
+            }
         }
+    } else {
+        // Prologue: commit Q, then kick off the first key block the loop will read (K, or the codes
+        // of K and V and of the next block's K, widening the first K). The e4m3 path lands the first
+        // block's codes and quantizes Q behind them.
+        sinfer::ops::cp_commit();
+        if constexpr (kQk8) {
+            stage_qk8(n_block_min, physical_page);
+            sinfer::ops::cp_commit();
+            // A warp quantizes and reads only its own 16 rows, so its own barrier publishes them.
+            gqa_prefill_quantize_q_fp8<D>(reinterpret_cast<std::uint8_t*>(q_s), q_scale_s,
+                                          q + gqa_prefill_q_index<Geometry>(q_head, 0, q0, q_heads),
+                                          D * q_heads, tokens - q0, warp_row0, lane);
+            __syncwarp();
+            qk_scale0 = q_scale_s[warp_row0 + gid] * scale;
+            qk_scale1 = q_scale_s[warp_row0 + gid + 8] * scale;
+        } else if constexpr (kRawFp8) {
+            stage_raw.template operator()<false>(raw_slot(k_raw, n_block_min), codes_k, n_block_min,
+                                                 physical_page);
+            stage_raw.template operator()<false>(raw_slot(v_raw, n_block_min), codes_v, n_block_min,
+                                                 physical_page);
+            sinfer::ops::cp_commit();
+            if (n_block_min + 1 < n_block_max) {
+                stage_raw.template operator()<false>(raw_slot(k_raw, n_block_min + 1), codes_k,
+                                                     n_block_min + 1, page_of(n_block_min + 1));
+            }
+            sinfer::ops::cp_commit();
+            sinfer::ops::cp_wait<1>(); // Q and the first block's codes
+            __syncthreads();
+            gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, n_block_min), tid, 0,
+                                           kGqaPrefillWidenChunks<D>);
+        } else {
+            stage_k(n_block_min, physical_page);
+            sinfer::ops::cp_commit();
+        }
+
+        for (int kb = n_block_min; kb < n_block_max; ++kb) {
+            const int k0 = kb * Bc;
+            // Read ahead of the wait, so the table load hides behind it.
+            const int page1 = (kb + 1 < n_block_max) ? page_of(kb + 1) : physical_page;
+            const int page2 = (kRawFp8 && kb + 2 < n_block_max) ? page_of(kb + 2) : physical_page;
+
+            sinfer::ops::cp_wait<0>();
+            __syncthreads();
+
+            // The e4m3 Q Kᵀ path's next block waits for the barrier after QK, which frees its slot.
+            if constexpr (kRawFp8) {
+                if (kb + 1 < n_block_max) {
+                    stage_raw.template operator()<false>(raw_slot(v_raw, kb + 1), codes_v, kb + 1,
+                                                         page1);
+                }
+                if (kb + 2 < n_block_max) {
+                    stage_raw.template operator()<false>(raw_slot(k_raw, kb + 2), codes_k, kb + 2,
+                                                         page2);
+                }
+                sinfer::ops::cp_commit();
+            } else if constexpr (!kQk8) {
+                // Overlap V(kb) load against the QK MMA below.
+                stage_v(kb, physical_page);
+                sinfer::ops::cp_commit();
+            }
+
+            // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
+            // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
+            // step k+1 while the m16n8k16 MMAs for step k run, so the LSU (ldmatrix)
+            // and tensor pipes overlap instead of stalling on each other.
+            float score[QKNt][4];
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+            }
+            // Swizzled ldmatrix addresses via precomputed per-lane bases + immediates.
+            unsigned af[2][4];
+            unsigned bf[2][QKNt][2];
+            if constexpr (kQk8) {
+                // The same pipeline over D / 32 steps of e4m3 codes, K straight from its raw slot;
+                // V's codes are widened between the steps.
+                constexpr int Ks8    = D / 32;
+                constexpr int Chunks = VWidenChunks;
+                const unsigned k_slot_base =
+                    k_lane_base + static_cast<unsigned>(((kb - n_block_min) & (Slots - 1)) * Bc * D);
+                ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
+                            gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
+#pragma unroll
+                for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                    ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
+                                gqa_prefill_swz_addr(
+                                    k_slot_base + static_cast<unsigned>(nt2) * QkEightRows, 0u, k_as,
+                                    k_r));
+                }
+#pragma unroll
+                for (int k = 0; k < Ks8; ++k) {
+                    const int cur = k & 1;
+                    const int nxt = cur ^ 1;
+                    if (k + 1 < Ks8) {
+                        const unsigned ck = static_cast<unsigned>((k + 1) << 5);
+                        ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
+                                    gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
+#pragma unroll
+                        for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                            ldmatrix_x4(bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0],
+                                        bf[nxt][nt2 + 1][1],
+                                        gqa_prefill_swz_addr(
+                                            k_slot_base + static_cast<unsigned>(nt2) * QkEightRows, ck,
+                                            k_as, k_r));
+                        }
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < QKNt; ++nt) {
+                        mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
+                                     af[cur][0], af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0],
+                                     bf[cur][nt][1]);
+                    }
+                    gqa_prefill_widen_fp8_slice<DOut>(v_s, v_raw, tid, k * Chunks / Ks8,
+                                                      (k + 1) * Chunks / Ks8);
+                }
+            } else {
+                ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
+                            gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
+#pragma unroll
+                for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                    ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
+                                gqa_prefill_swz_addr(
+                                    k_lane_base + static_cast<unsigned>(nt2) * EightRows, 0u, k_as,
+                                    k_r));
+                }
+#pragma unroll
+                for (int k = 0; k < QKKs; ++k) {
+                    const int cur = k & 1;
+                    const int nxt = cur ^ 1;
+                    if (k + 1 < QKKs) {
+                        const unsigned ck = static_cast<unsigned>((k + 1) << 5);
+                        ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
+                                    gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
+#pragma unroll
+                        for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                            ldmatrix_x4(
+                                bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0], bf[nxt][nt2 + 1][1],
+                                gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2) * EightRows,
+                                                     ck, k_as, k_r));
+                        }
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < QKNt; ++nt) {
+                        mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
+                                 af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                    }
+                    if constexpr (kRawFp8) {
+                        constexpr int Chunks = kGqaPrefillWidenChunks<D>;
+                        gqa_prefill_widen_fp8_slice<D>(v_s, raw_slot(v_raw, kb), tid, k * Chunks / QKKs,
+                                                       (k + 1) * Chunks / QKKs);
+                    }
+                }
+            }
+
+            // qk_scale0/1 are the softmax scale itself unless Q was quantized.
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                score[nt][0] *= qk_scale0;
+                score[nt][1] *= qk_scale0;
+                score[nt][2] *= qk_scale1;
+                score[nt][3] *= qk_scale1;
+            }
+
+            const int row0             = warp_row0 + gid;
+            const int row1             = warp_row0 + gid + 8;
+            const int qrow0            = q0 + row0;
+            const int qrow1            = q0 + row1;
+            const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
+            const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
+            // A sparse chunk never has a "full" tile: every key must pass its query's selection.
+            //
+            // "Every key in this tile is causally visible" is not "every key in this tile
+            // needs no mask". Under a sliding window a fully-causal tile is precisely an
+            // OLD-key tile -- the ones furthest below the diagonal are the first to fall
+            // out of the window -- so the tile is only mask-free when its oldest key is
+            // still within the window of its newest query.
+            const bool full_score_tile = !Sparse && (q0 + Br <= tokens) &&
+                                         ((k0 + Bc - 1) <= (base_pos + q0)) &&
+                                         gqa_within_window(max_query_abs, k0, metadata.window) && block_mask.image_end == 0;
+            const std::uint32_t* mask0 =
+                Sparse && qrow0 < tokens
+                    ? block_mask.words + static_cast<std::int64_t>(qrow0) * block_mask.stride
+                    : nullptr;
+            const std::uint32_t* mask1 =
+                Sparse && qrow1 < tokens
+                    ? block_mask.words + static_cast<std::int64_t>(qrow1) * block_mask.stride
+                    : nullptr;
+
+            // Block row-max on scaled scores.
+            float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+            if (full_score_tile) {
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                    bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+                }
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    // A gathered column past the selection is -1 (both of a pair: a block holds
+                    // whole even pairs), and must not reach the mask, whose word -1 / 4 is 0.
+                    const int col  = nt * 8 + 2 * lid;
+                    const int key0 = Gather ? gathered_key(kb, col) : k0 + col;
+                    const int key1 = (Gather && key0 < 0) ? -1 : key0 + 1;
+                    const bool live = !Gather || key0 >= 0;
+                    score[nt][0] = (live && qrow0 < tokens && key0 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key0, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
+                                       ? score[nt][0]
+                                       : -CUDART_INF_F;
+                    score[nt][1] = (live && qrow0 < tokens && key1 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key1, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
+                                       ? score[nt][1]
+                                       : -CUDART_INF_F;
+                    score[nt][2] = (live && qrow1 < tokens && key0 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key0, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
+                                       ? score[nt][2]
+                                       : -CUDART_INF_F;
+                    score[nt][3] = (live && qrow1 < tokens && key1 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key1, metadata.window) &&
+                                    gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
+                                       ? score[nt][3]
+                                       : -CUDART_INF_F;
+                    bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                    bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+                }
+            }
+            bm0 = warp_max<4>(bm0, FullMask);
+            bm1 = warp_max<4>(bm1, FullMask);
+
+            // Online softmax against the running maximum, as FlashAttention-2 does: P = exp2(S - m)
+            // feeds the tensor cores straight into the output accumulator, which is rescaled only
+            // when some row's maximum moved. Bits differ from the split-KV kernels', which round P
+            // against each tile's own maximum; --batch-invariant keeps prompts on those.
+            const float nm0 = fmaxf(m0, bm0);
+            const float nm1 = fmaxf(m1, bm1);
+            // A row with no visible key yet keeps an infinite maximum and contributes nothing; its
+            // exponent base is taken as zero so -inf - -inf never makes a NaN.
+            const float base0  = (nm0 == -CUDART_INF_F) ? 0.0f : nm0 * Log2E;
+            const float base1  = (nm1 == -CUDART_INF_F) ? 0.0f : nm1 * Log2E;
+            const float alpha0 = (m0 == nm0) ? 1.0f : exp2_approx(fmaf(m0, Log2E, -base0));
+            const float alpha1 = (m1 == nm1) ? 1.0f : exp2_approx(fmaf(m1, Log2E, -base1));
+            m0 = nm0;
+            m1 = nm1;
+
+            // P, repacked into the PV A-fragment layout, and this thread's share of each row sum;
+            // the quad's shares are added once, after the last block. A masked score is -inf, whose
+            // exp2 is zero.
+            float bl0 = 0.0f, bl1 = 0.0f;
+            unsigned p_frag[PVKs][4];
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const float p00 = exp2_approx(fmaf(score[nt][0], Log2E, -base0));
+                const float p01 = exp2_approx(fmaf(score[nt][1], Log2E, -base0));
+                const float p10 = exp2_approx(fmaf(score[nt][2], Log2E, -base1));
+                const float p11 = exp2_approx(fmaf(score[nt][3], Log2E, -base1));
+                bl0 += p00 + p01;
+                bl1 += p10 + p11;
+                const int pk = nt >> 1;
+                if ((nt & 1) == 0) {
+                    p_frag[pk][0] = pack_bf16x2(p00, p01);
+                    p_frag[pk][1] = pack_bf16x2(p10, p11);
+                } else {
+                    p_frag[pk][2] = pack_bf16x2(p00, p01);
+                    p_frag[pk][3] = pack_bf16x2(p10, p11);
+                }
+            }
+            l0 = fmaf(l0, alpha0, bl0);
+            l1 = fmaf(l1, alpha1, bl1);
+
+            if constexpr (kQk8) {
+                __syncthreads(); // v_s holds V(kb); every warp is done with this block's codes
+                if (kb + 1 < n_block_max) { stage_qk8(kb + 1, page1); }
+                sinfer::ops::cp_commit();
+            } else if constexpr (kRawFp8) {
+                __syncthreads(); // v_s holds V(kb); every warp is done reading k_s
+            } else {
+                sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+                __syncthreads();
+
+                // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
+                if (kb + 1 < n_block_max) {
+                    physical_page = page1;
+                    stage_k(kb + 1, physical_page);
+                    sinfer::ops::cp_commit();
+                }
+            }
+
+            // The maximum settles early in a long scan, so most blocks skip the rescale; the vote
+            // keeps the branch warp-uniform.
+            if (__any_sync(FullMask, alpha0 != 1.0f || alpha1 != 1.0f)) {
+#pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    acc[n][0] *= alpha0;
+                    acc[n][1] *= alpha0;
+                    acc[n][2] *= alpha1;
+                    acc[n][3] *= alpha1;
+                }
+            }
+
+            // O += P V.
+#pragma unroll
+            for (int n2 = 0; n2 < PVNt; n2 += 2) {
+#pragma unroll
+                for (int k = 0; k < PVKs; ++k) {
+                    unsigned vf[4];
+                    const unsigned col = static_cast<unsigned>(n2 << 4);
+                    ldmatrix_x4_t(vf[0], vf[1], vf[2], vf[3],
+                        gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k) * VSixteenRows,
+                                             col, v_as, v_r));
+                    mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0],
+                             p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[0], vf[1]);
+                    mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                             p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[2], vf[3]);
+                }
+                if constexpr (kRawFp8) {
+                    constexpr int Groups = PVNt / 2;
+                    constexpr int Chunks = kGqaPrefillWidenChunks<D>;
+                    const int g          = n2 >> 1;
+                    if (kb + 1 < n_block_max) {
+                        gqa_prefill_widen_fp8_slice<D>(k_s, raw_slot(k_raw, kb + 1), tid,
+                                                       g * Chunks / Groups, (g + 1) * Chunks / Groups);
+                    }
+                }
+            }
         }
     }
 
