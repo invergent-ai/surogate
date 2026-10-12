@@ -546,6 +546,56 @@ int run_mixture(const Mixture& mixture, const std::vector<std::int32_t>& token_c
     return failures;
 }
 
+/// SINFER_TEST_MOE_BENCH=<tokens>: one wide call's time per mixture instead of the comparison,
+/// median of seven after two warmups, on the same fixtures and routing -- the A/B loop for the
+/// prefill kernels themselves (a whole layer: router, gate/up, down, shared expert, reduce).
+int bench_mixture(const Mixture& mixture, std::int32_t tokens) {
+    const auto& g = mixture.geometry;
+    Fixture fixture(mixture);
+    const ops::SparseMoeWeights weights = fixture.weights();
+    std::vector<float> x(static_cast<std::size_t>(g.hidden) * tokens);
+    std::vector<float> router_x(static_cast<std::size_t>(g.hidden) * tokens, 0.0F);
+    Rng rng(0xA53Fu + static_cast<std::uint64_t>(tokens));
+    for (auto& v : x) { v = rng.uniform(-0.06F, 0.06F); }
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t e = 0; e < g.experts; ++e) {
+            router_x[static_cast<std::size_t>(t) * g.hidden + e] = rng.uniform(-4.0F, 4.0F);
+        }
+    }
+    const DeviceBuffer dx  = to_device_bf16(x);
+    const DeviceBuffer drx = to_device_bf16(router_x);
+    DeviceBuffer out(static_cast<std::size_t>(g.hidden) * tokens * sizeof(std::uint16_t));
+    const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
+        g, weights.routed_gate_up.qtype, weights.routed_down.qtype, 1, tokens,
+        ops::SparseMoeRouting::ByWidth,
+        weights.shared_down.qdata && weights.shared_down.qtype != QType::W8G32_F16S);
+    WorkspaceArena workspace(workspace_bytes);
+    const Tensor xs(dx.p, DType::BF16, {g.hidden, tokens});
+    const Tensor rs(drx.p, DType::BF16, {g.hidden, tokens});
+    Tensor os(out.p, DType::BF16, {g.hidden, tokens});
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    std::vector<float> ms;
+    for (int i = 0; i < 9; ++i) {
+        workspace.reset();
+        cudaEventRecord(start);
+        ops::sparse_moe(xs, rs, weights, ops::SparseMoeEpilogue::AddResidual, os, workspace,
+                        nullptr, ops::SparseMoeRoundHook{}, ops::SparseMoeRouting::ByWidth);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float t = 0.0F;
+        cudaEventElapsedTime(&t, start, stop);
+        if (i >= 2) { ms.push_back(t); }
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    std::sort(ms.begin(), ms.end());
+    std::printf("BENCH %-30s T=%d  %.3f ms (min %.3f max %.3f)\n", mixture.name, tokens,
+                ms[ms.size() / 2], ms.front(), ms.back());
+    return 0;
+}
+
 // A closed-form shared-expert reference at Flash-Next dimensions. Routed experts
 // contain zero weights, so their contribution is exactly zero. Shared rows carry
 // different scales; token-dependent sigmoid gates catch dropped/sliced outputs.
@@ -638,6 +688,24 @@ int main() {
 
     const Mixture flash_next{"Flash-Next Q2_0/Q2_0", ops::kSparseMoeFlashNextGeometry,
         QType::Q2_0, QType::Q2_0, ops::GatedActivation::Silu, false, 0.02};
+    if (const char* bench = std::getenv("SINFER_TEST_MOE_BENCH")) {
+        const std::int32_t tokens = std::max(1, std::atoi(bench));
+        const auto mixture = [](const char* name, QType gate_up, QType down) {
+            return Mixture{name, ops::kSparseMoeFlashNextGeometry, gate_up, down,
+                           ops::GatedActivation::Silu, false, 0.02};
+        };
+        for (const Mixture& m : {flash_next,
+                                 mixture("Flash-Next IQ3_S/IQ4_NL", QType::IQ3_S, QType::IQ4_NL),
+                                 mixture("Flash-Next IQ3_XXS/IQ4_NL", QType::IQ3_XXS, QType::IQ4_NL),
+                                 mixture("Flash-Next IQ2_S/IQ4_NL", QType::IQ2_S, QType::IQ4_NL),
+                                 mixture("Flash-Next IQ2_S/Q2_0", QType::IQ2_S, QType::Q2_0),
+                                 mixture("Flash-Next IQ2_XXS/Q2_0", QType::IQ2_XXS, QType::Q2_0),
+                                 mixture("Flash-Next IQ1_M/Q2_0", QType::IQ1_M, QType::Q2_0),
+                                 mixture("Flash-Next IQ4_XS/IQ4_NL", QType::IQ4_XS, QType::IQ4_NL)}) {
+            bench_mixture(m, tokens);
+        }
+        return 0;
+    }
     if (std::getenv("SINFER_TEST_NATIVE_SHARED_ONLY")) {
         return (run_native_shared() + run_mixture(flash_next, {47, 130, 801})) ? 1 : 0;
     }
