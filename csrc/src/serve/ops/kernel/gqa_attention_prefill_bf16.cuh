@@ -164,6 +164,12 @@ struct GqaPrefillPv8Softmax {
     unsigned p8[4];
 };
 
+// A warp's scores of one key block in the e4m3 P V loop: an m16n8 fragment per 8-key n-tile. The
+// loop's lambdas take it under this name: a lambda parameter whose type names the kernel's own
+// constexpr n-tile count crashes cudafe++ (CUDA 13.0).
+template <int HeadDim>
+using GqaPrefillPv8Scores = float[kGqaPrefillBcFor<HeadDim> / 8][4];
+
 // Two 16x16 tiles of e4m3 codes, rows keys 0-15 and 16-31 at lanes 0-15 and 16-31's addresses,
 // transposed: lane l gets keys 4(l%4)..+3 of columns l/4 and 8 + l/4 from the first tile (b0, b1)
 // and the same of the second (b2, b3) -- the m16n8k32 B operand of two 8-column n-tiles.
@@ -308,7 +314,7 @@ __device__ __forceinline__ void gqa_prefill_widen_fp8_slice(__nv_bfloat16* dst,
 // codes land a whole block ahead behind one barrier per block, and the loop is software-pipelined:
 // block kb + 1's Q Kᵀ goes to the tensor cores with block kb's softmax between its steps.
 // MEASURED (DGX Spark, d256-h16-kv2, 2,048 new tokens over 32K and 131K cached keys): 110 ->
-// 147 TFLOP/s, and ~154 pipelined. Skipping parts of the bf16-P V kernel one at a time had shown it waiting, not
+// 147 TFLOP/s, ~154 pipelined, ~169 with whole blocks' codes landed from precomputed offsets. Skipping parts of the bf16-P V kernel one at a time had shown it waiting, not
 // tensor-bound: its non-tensor work alone (staging, widening, softmax, two barriers) took about as
 // long as the whole kernel.
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
@@ -628,14 +634,60 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         //             S(kb + 1) = Q K(kb + 1)ᵀ, block kb's softmax between its steps
         //             O += P(kb) V(kb)
         constexpr int Ks8 = D / 32;
-        // The lambdas below spell their score arrays' bound out: a lambda parameter whose type names
-        // the kernel's own constexpr QKNt crashes cudafe++ (CUDA 13.0).
-        static_assert(kGqaPrefillBcFor<Geometry::HeadDim> / 8 == QKNt);
+        // Score arrays in the lambdas' parameter type, GqaPrefillPv8Scores (whose comment says why).
+        using Scores = GqaPrefillPv8Scores<Geometry::HeadDim>;
+        static_assert(sizeof(Scores) == QKNt * 4 * sizeof(float));
+        // A thread's share of a key block's codes is Loads8 16-byte chunks each of K and V: keys
+        // key8 + i * KeysPerStep8, bytes [d8, d8 + 16) of the row. Their places in a slot (K's rows
+        // permuted, both swizzled) and in the cache's page are the same for every block, so they
+        // are worked out once, and a block whose keys are all visible lands from one base pointer
+        // a tensor (a 32-key block never crosses a 64-key page). Blocks on the diagonal, and
+        // gathered ones, take stage_raw's checked path. MEASURED: building the addresses per block
+        // was ~100 integer instructions a thread around its 8 cp.async.
+        constexpr int VecPerRow8   = D / 16;
+        constexpr int KeysPerStep8 = Threads / VecPerRow8;
+        constexpr int Loads8       = Bc / KeysPerStep8;
+        static_assert(Threads % VecPerRow8 == 0 && Loads8 * KeysPerStep8 == Bc);
+        static_assert(kPagedKVPageSize % Bc == 0, "a key block lies in one page");
+        const int key8 = tid / VecPerRow8;
+        const int d8   = (tid % VecPerRow8) * 16;
+        unsigned k_dst8[Loads8];
+        unsigned v_dst8[Loads8];
+#pragma unroll
+        for (int i = 0; i < Loads8; ++i) {
+            const int key = key8 + i * KeysPerStep8;
+            k_dst8[i]     = static_cast<unsigned>(gqa_prefill_swz8<D>(gqa_prefill_pv8_row(key), d8));
+            v_dst8[i]     = static_cast<unsigned>(gqa_prefill_swz8<D>(key, d8));
+        }
+        const auto page_codes = [&](const std::uint8_t* codes, int kb, int page) {
+            return codes + paged_kv_element_offset<D, Geometry::KVHeads>(page, kv_head,
+                                                                         (kb * Bc) & kPagedKVPageMask,
+                                                                         key8 * D + d8);
+        };
+        const auto all_visible = [&](int kb) { return !Gather && kb * Bc + Bc - 1 <= max_query_abs; };
         const auto stage_k8 = [&](int kb, int page) {
-            stage_raw.template operator()<true, D, true>(raw_slot(k_raw, kb), codes_k, kb, page);
+            if (all_visible(kb)) {
+                std::uint8_t* slot = raw_slot(k_raw, kb);
+                const std::uint8_t* src = page_codes(codes_k, kb, page);
+#pragma unroll
+                for (int i = 0; i < Loads8; ++i) {
+                    cp_async<16, Cache::cg>(slot + k_dst8[i], src + i * KeysPerStep8 * D);
+                }
+            } else {
+                stage_raw.template operator()<true, D, true>(raw_slot(k_raw, kb), codes_k, kb, page);
+            }
         };
         const auto stage_v8 = [&](int kb, int page) {
-            stage_raw.template operator()<true, D>(raw_slot(v_raw, kb), codes_v, kb, page);
+            if (all_visible(kb)) {
+                std::uint8_t* slot = raw_slot(v_raw, kb);
+                const std::uint8_t* src = page_codes(codes_v, kb, page);
+#pragma unroll
+                for (int i = 0; i < Loads8; ++i) {
+                    cp_async<16, Cache::cg>(slot + v_dst8[i], src + i * KeysPerStep8 * D);
+                }
+            } else {
+                stage_raw.template operator()<true, D>(raw_slot(v_raw, kb), codes_v, kb, page);
+            }
         };
         const int qrow0 = q0 + warp_row0 + gid;
         const int qrow1 = qrow0 + 8;
@@ -657,7 +709,7 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         // gqa_prefill_pv8_column_key), p8[2]/p8[3] the same over n-tiles 2-3; a pair's first key is
         // the lower byte. The same arithmetic as the unpipelined kernel's, in the same order.
         constexpr int kSoftStages = 2 + QKNt;
-        const auto soft = [&]<bool Full>(int stage, int kb, float (&s)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4],
+        const auto soft = [&]<bool Full>(int stage, int kb, GqaPrefillPv8Scores<Geometry::HeadDim>& s,
                                          GqaPrefillPv8Softmax& st) {
             if (stage == 0) {
                 // qk_scale0/1: Q's row scales times the softmax scale.
@@ -742,8 +794,8 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         // S = Q K(kb)ᵀ for this warp's 16 rows from K's slot, ldmatrix a step ahead of the MMAs.
         // Interleave: block soft_kb's softmax stages (of soft_s, into st) go between the steps,
         // stage i once step i * Ks8 / kSoftStages's MMAs are issued.
-        const auto qk8 = [&]<bool Interleave, bool Full>(int kb, float (&s)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4], int soft_kb,
-                                                         float (&soft_s)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4],
+        const auto qk8 = [&]<bool Interleave, bool Full>(int kb, GqaPrefillPv8Scores<Geometry::HeadDim>& s, int soft_kb,
+                                                         GqaPrefillPv8Scores<Geometry::HeadDim>& soft_s,
                                                          GqaPrefillPv8Softmax& st) {
             const unsigned k_slot_base =
                 k_lane_base + static_cast<unsigned>(((kb - n_block_min) & (Slots - 1)) * Bc * D);
@@ -810,8 +862,8 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         };
         // Block kb: block kb + 1's Q Kᵀ into `next` (Next) with block kb's softmax between its
         // steps, the rescale, then block kb's P V. Full: no key of the block needs a mask.
-        const auto step = [&]<bool Next, bool Full>(int kb, float (&cur)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4],
-                                                    float (&next)[kGqaPrefillBcFor<Geometry::HeadDim> / 8][4]) {
+        const auto step = [&]<bool Next, bool Full>(int kb, GqaPrefillPv8Scores<Geometry::HeadDim>& cur,
+                                                    GqaPrefillPv8Scores<Geometry::HeadDim>& next) {
             GqaPrefillPv8Softmax st;
             if constexpr (Next) {
                 qk8.template operator()<true, Full>(kb + 1, next, kb, cur, st);
@@ -848,7 +900,7 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
         qk_scale1 = q_scale_s[warp_row0 + gid + 8] * scale;
         sinfer::ops::cp_wait<1>();
         __syncthreads();
-        float score[QKNt][4];
+        Scores score;
         GqaPrefillPv8Softmax unused;
         qk8.template operator()<false, true>(n_block_min, score, n_block_min, score, unused);
 
@@ -868,7 +920,7 @@ __launch_bounds__(kGqaPrefillThreads, QkFp8 ? 2 : 1) __global__
             const bool full = !Sparse && (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0)) &&
                               gqa_within_window(max_query_abs, k0, metadata.window) &&
                               block_mask.image_end == 0;
-            float next[QKNt][4];
+            Scores next;
             if (has_next) {
                 if (full) {
                     step.template operator()<true, true>(kb, score, next);
