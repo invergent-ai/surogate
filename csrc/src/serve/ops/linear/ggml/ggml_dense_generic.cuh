@@ -358,7 +358,6 @@ __global__ __launch_bounds__(kCols * 4, 1) void dense_affine_gmajor_kernel(
         __syncthreads(); // this step's tiles are in; every warp is past the previous step's MMA
         if (has_next) { stage_x(buf ^ 1, na, nm); }
         cp_commit();
-        if (has_next) { decode_a(na, nm); }
         const int count = class_groups(groups, a);
         const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
@@ -393,7 +392,14 @@ __global__ __launch_bounds__(kCols * 4, 1) void dense_affine_gmajor_kernel(
                 run[mi][3] = dense_affine_fma<false>(run[mi][3], s1, 0.0f, x1, d3, 0);
             }
         }
-        if (has_next) { store_a(buf ^ 1); }
+        // The next step's weight codes, after this step's MMAs: a warp that waits on its loads
+        // here overlaps the warps still multiplying, where decoding them first (as the source
+        // order had it, and the compiler kept: the loads are conditional) stalled every warp at
+        // once, right after the barrier, and kept the codes live across the MMAs.
+        if (has_next) {
+            decode_a(na, nm);
+            store_a(buf ^ 1);
+        }
         if (na != a) {
             fold(a);
             // Classes past the last group (a row shorter than eight groups) hold nothing.
