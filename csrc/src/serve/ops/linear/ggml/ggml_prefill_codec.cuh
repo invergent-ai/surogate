@@ -831,6 +831,9 @@ struct GgmlIq4NlPrefill {
 
     // ---- the int8 tensor-core route ----
     static constexpr int kTileStride    = 40; // ten words: a multiple of four past the 36 bytes
+    /// Ten 64-wide K steps for a 640-wide down row: the loop's fill is a large part of it, and
+    /// a deeper pipeline keeps the 36-byte tiles' loads ahead of their use (see i8_stages).
+    static constexpr int kStages        = 4;
     static constexpr int kHeaderStride  = 16; // unused; one unit keeps the array well-formed
     static constexpr int kScaleGroups   = 2;
     static constexpr int kScaleWidth    = 32;
@@ -935,7 +938,10 @@ struct GgmlIqCoveredStage {
         return static_cast<std::int64_t>(K / QK_K) * kBlockBytes;
     }
     static constexpr int kTileStride    = 16;  // unused, as Q3_K's
-    static constexpr int kHeaderStride  = 160; // Q3_K's forty words
+    /// The covered span and one unit more: Q3_K's forty words would not leave room for a third
+    /// stage under the 48 KiB static limit (see i8_stages).
+    static constexpr int kHeaderStride  = kHeaderBytes + 16;
+    static constexpr int kStages        = 3;
     static constexpr int kScaleTiles    = kTilesPerBlock;
     static constexpr bool kScalesInTile = false;
     static constexpr bool kHasMin       = false;
