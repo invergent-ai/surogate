@@ -49,6 +49,16 @@ bool wide_dynamic_allowed() noexcept {
     return allowed;
 }
 
+/// Weight rows per block of the generic formats' wide tile (64 columns and up): 16, or 32 with
+/// SUROGATE_GGML_AFFINE_ROWS=32. The arithmetic per output is the same at either height.
+int affine_rows() noexcept {
+    static const int value = [] {
+        const char* raw = std::getenv("SUROGATE_GGML_AFFINE_ROWS");
+        return raw != nullptr && std::strcmp(raw, "32") == 0 ? 32 : 16;
+    }();
+    return value;
+}
+
 std::atomic<std::int32_t> tile_multiprocessors_override{0};
 
 // Keep the activation quantisation used by GEMV when a graph pads a short
@@ -215,6 +225,10 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                 if constexpr (Type == GgmlType::F16) {
                     dense_f16_mma_kernel<Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
                         static_cast<const __half*>(blocks), x, rows, k, tokens, out, beta != 0);
+                } else if (Cols >= 64 && affine_rows() == 32) {
+                    const dim3 tall((rows + 31) / 32, (tokens + Cols - 1) / Cols);
+                    dense_affine_mma_kernel<Type, Cols, 32><<<tall, (Cols / 8) * 32, 0, stream>>>(
+                        bytes, codes, ds, rows, k, tokens, out, beta != 0);
                 } else {
                     dense_affine_mma_kernel<Type, Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
                         bytes, codes, ds, rows, k, tokens, out, beta != 0);

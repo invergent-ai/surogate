@@ -109,22 +109,26 @@ __device__ __forceinline__ unsigned dense_ldmatrix_x1(unsigned address) {
 
 // A 256-value K tile makes each of the eight accumulator indices constant.
 // Sixteen weight rows keep those accumulators in registers while wider token
-// tiles amortize codebook decoding and metadata loads across the batch.
-template <GgmlType Type, int Cols>
+// tiles amortize codebook decoding and metadata loads across the batch. Thirty-
+// two rows (two m16 tiles per warp, 64 accumulators a lane) halve how often the
+// activation tile is re-read per weight row; each output's arithmetic, and so its
+// bits, are the same at either height.
+template <GgmlType Type, int Cols, int Rows = 16>
 __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
     const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
-    constexpr int Rows = 16, threads = (Cols / 8) * 32, width = DenseFormat<Type>::kWidth;
-    constexpr int stride = 272, groups = 256 / width;
+    static_assert(Rows == 16 || Rows == 32);
+    constexpr int threads = (Cols / 8) * 32, width = DenseFormat<Type>::kWidth;
+    constexpr int stride = 272, groups = 256 / width, Tiles = Rows / 16;
     __shared__ __align__(16) std::int8_t a[Rows * stride], b[Cols * stride];
     __shared__ float2 scales[groups * Rows];
     __shared__ float dx[Cols * 8];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, lid = lane & 3;
     // Bands of 512 weight rows across every column tile (grouped_tile).
-    const int2 tile = grouped_tile<32>();
+    const int2 tile = grouped_tile<512 / Rows>();
     const int row0 = tile.x * Rows, col0 = tile.y * Cols;
-    float acc[8][4] = {};
+    float acc[8][Tiles][4] = {};
     for (int first = 0; first < k; first += 256) {
         for (int item = tid; item < Cols * 16; item += threads) {
             const int col = item / 16, kk = item % 16 * 16;
@@ -153,17 +157,11 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
         for (int g = 0; g < groups; ++g) {
             const int token = warp * 8 + (lane & 7);
             const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
-            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            unsigned b0, b1 = 0;
             if constexpr (width == 32) {
-                unsigned a0, a1, a2, a3, b0, b1;
-                ldmatrix_x4(a0, a1, a2, a3, smem_addr(a + ar * stride + g * width + (lane >> 4) * 16));
                 ldmatrix_x2(b0, b1, smem_addr(b + token * stride + g * width + ((lane >> 3) & 1) * 16));
-                mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
             } else {
-                unsigned a0, a1;
-                ldmatrix_x2(a0, a1, smem_addr(a + ar * stride + g * width));
-                const unsigned b0 = dense_ldmatrix_x1(smem_addr(b + token * stride + g * width));
-                mma_s8_k16(d0, d1, d2, d3, a0, a1, b0);
+                b0 = dense_ldmatrix_x1(smem_addr(b + token * stride + g * width));
             }
             const float x0 = dx[(warp * 8 + 2 * lid) * 8 + g * width / 32];
             const float x1 = dx[(warp * 8 + 2 * lid + 1) * 8 + g * width / 32];
@@ -177,24 +175,41 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
                 sum0 = __shfl_sync(0xffffffffu, sum, 2 * lid);
                 sum1 = __shfl_sync(0xffffffffu, sum, 2 * lid + 1);
             }
-            const float2 s0 = scales[g * Rows + gid], s1 = scales[g * Rows + gid + 8];
-            constexpr bool bias = DenseFormat<Type>::kBias;
-            acc[g % 8][0] = dense_affine_fma<bias>(acc[g % 8][0], s0.x, s0.y, x0, d0, sum0);
-            acc[g % 8][1] = dense_affine_fma<bias>(acc[g % 8][1], s0.x, s0.y, x1, d1, sum1);
-            acc[g % 8][2] = dense_affine_fma<bias>(acc[g % 8][2], s1.x, s1.y, x0, d2, sum0);
-            acc[g % 8][3] = dense_affine_fma<bias>(acc[g % 8][3], s1.x, s1.y, x1, d3, sum1);
+#pragma unroll
+            for (int t = 0; t < Tiles; ++t) {
+                const std::int8_t* at = a + (16 * t + ar) * stride + g * width;
+                int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                if constexpr (width == 32) {
+                    unsigned a0, a1, a2, a3;
+                    ldmatrix_x4(a0, a1, a2, a3, smem_addr(at + (lane >> 4) * 16));
+                    mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                } else {
+                    unsigned a0, a1;
+                    ldmatrix_x2(a0, a1, smem_addr(at));
+                    mma_s8_k16(d0, d1, d2, d3, a0, a1, b0);
+                }
+                const float2 s0 = scales[g * Rows + 16 * t + gid], s1 = scales[g * Rows + 16 * t + gid + 8];
+                constexpr bool bias = DenseFormat<Type>::kBias;
+                acc[g % 8][t][0] = dense_affine_fma<bias>(acc[g % 8][t][0], s0.x, s0.y, x0, d0, sum0);
+                acc[g % 8][t][1] = dense_affine_fma<bias>(acc[g % 8][t][1], s0.x, s0.y, x1, d1, sum1);
+                acc[g % 8][t][2] = dense_affine_fma<bias>(acc[g % 8][t][2], s1.x, s1.y, x0, d2, sum0);
+                acc[g % 8][t][3] = dense_affine_fma<bias>(acc[g % 8][t][3], s1.x, s1.y, x1, d3, sum1);
+            }
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int row = row0 + gid + 8 * (e / 2);
-        const int col = col0 + warp * 8 + 2 * lid + (e & 1);
-        if (row < rows && col < tokens) {
-            const float p0 = (acc[0][e] + acc[1][e]) + (acc[2][e] + acc[3][e]);
-            const float p1 = (acc[4][e] + acc[5][e]) + (acc[6][e] + acc[7][e]);
-            const auto i = std::int64_t(col) * rows + row;
-            out[i] = __float2bfloat16_rn((p0 + p1) + (accumulate ? __bfloat162float(out[i]) : 0.0f));
+    for (int t = 0; t < Tiles; ++t) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = row0 + 16 * t + gid + 8 * (e / 2);
+            const int col = col0 + warp * 8 + 2 * lid + (e & 1);
+            if (row < rows && col < tokens) {
+                const float p0 = (acc[0][t][e] + acc[1][t][e]) + (acc[2][t][e] + acc[3][t][e]);
+                const float p1 = (acc[4][t][e] + acc[5][t][e]) + (acc[6][t][e] + acc[7][t][e]);
+                const auto i = std::int64_t(col) * rows + row;
+                out[i] = __float2bfloat16_rn((p0 + p1) + (accumulate ? __bfloat162float(out[i]) : 0.0f));
+            }
         }
     }
 }
