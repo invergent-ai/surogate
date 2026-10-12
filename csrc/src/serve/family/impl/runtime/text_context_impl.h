@@ -2506,9 +2506,11 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         }
     }
     if constexpr (Hooks::prologue) {
-        if (width != 1) { throw std::logic_error("mixed speculative prologue is unavailable"); }
-        // Segment columns take their segment's start and slot; the decode lanes behind them
-        // are one-column segments on their own slots.
+        // Segment columns take their segment's start and slot. Each decode lane behind them owns
+        // `width` consecutive columns, one segment on its own slot -- a speculative verify's
+        // layout (prologue_staging::verify_columns): the n-gram state after each of a lane's
+        // columns lands in that slot's snapshots, and the speculative fold commits the accepted
+        // prefix's last one, as it does after a verify round.
         std::vector<int> begin_host(static_cast<std::size_t>(total));
         std::vector<int> last_host(static_cast<std::size_t>(total), 0);
         std::vector<int> slot_host(static_cast<std::size_t>(prefill_cols));
@@ -2521,8 +2523,9 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             last_host[static_cast<std::size_t>(segment_begin[i] + length - 1)] = 1;
         }
         for (int c = prefill_cols; c < total; ++c) {
-            begin_host[static_cast<std::size_t>(c)] = c;
-            last_host[static_cast<std::size_t>(c)]  = 1;
+            const int column = c - prefill_cols;
+            begin_host[static_cast<std::size_t>(c)] = prefill_cols + column - column % width;
+            last_host[static_cast<std::size_t>(c)]  = column % width == width - 1 ? 1 : 0;
         }
         prologue_.ids           = ids_device;
         prologue_.segment_begin = work_.alloc(DType::I32, {total});
@@ -2533,9 +2536,18 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         Tensor slots_prefill = prologue_.slots.slice(0, 0, prefill_cols);
         copy_i32(slot_host.data(), slots_prefill, s);
         Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, decode_columns);
-        CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
-                                   static_cast<std::size_t>(decode_columns) * sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToDevice, s));
+        if (width == 1) {
+            CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
+                                       static_cast<std::size_t>(decode_columns) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToDevice, s));
+        } else if (decode_columns > 0) {
+            // The lane's slot repeated over its columns; the expansion's own starts and closes
+            // are relative to the decode columns, so the ones written above stand.
+            Tensor begin_scratch = work_.alloc(DType::I32, {decode_columns});
+            Tensor last_scratch  = work_.alloc(DType::I32, {decode_columns});
+            ops::ngram_ple_expand_columns(decode.linear_state_slots, width, slots_decode,
+                                          begin_scratch, last_scratch, s);
+        }
     }
     Tensor positions_decode = positions.slice(0, prefill_cols, decode_columns);
     CUDA_CHECK(cudaMemcpyAsync(positions_decode.data, decode.cache_positions.data,
