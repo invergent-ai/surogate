@@ -1073,6 +1073,24 @@ struct GgmlIq2SPrefill : GgmlIqCoveredStage<block_iq2_s, 6> {
         lo = quad(header, 2 * tile_in_block, q);
         hi = quad(header, 2 * tile_in_block + 1, q);
     }
+    /// Both quads of grid row `row` (`quad`'s q = 2 row and 2 row + 1) from one grid lookup.
+    __device__ static __forceinline__ uint2 row_pair(const std::uint8_t* block, int sub, int row) {
+        const int qh          = block[offsetof(block_iq2_s, qh) + sub];
+        const int index       = block[kQs + 4 * sub + row] | (((qh >> (2 * row)) & 3) << 8);
+        const std::uint64_t r = kIq2sGrid[index];
+        const unsigned signs  = block[kQs + QK_K / 8 + 4 * sub + row];
+        return make_uint2(iq_signed(static_cast<unsigned>(r), iq_sign_bytes(signs & 0x0Fu)),
+                          iq_signed(static_cast<unsigned>(r >> 32), iq_sign_bytes(signs >> 4)));
+    }
+    /// unpack's quads 2 row and 2 row + 1 together, one grid lookup per sub-block.
+    static constexpr bool kUnpackRows = true;
+    __device__ static __forceinline__ void unpack_row(const std::uint8_t* tile,
+                                                      const std::uint8_t* header, int tile_in_block,
+                                                      int row, uint2& lo, uint2& hi) {
+        (void)tile;
+        lo = row_pair(header, 2 * tile_in_block, row);
+        hi = row_pair(header, 2 * tile_in_block + 1, row);
+    }
     /// `index` counts sixteen-value groups in the superblock: sub-block index / 2, its half
     /// index % 2.
     __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
@@ -1102,6 +1120,22 @@ struct GgmlIq2XxsPrefill : GgmlIqCoveredStage<block_iq2_xxs, 5> {
         (void)tile;
         lo = quad(header, 2 * tile_in_block, q);
         hi = quad(header, 2 * tile_in_block + 1, q);
+    }
+    /// Both quads of grid row `row` (`quad`'s q = 2 row and 2 row + 1) from one grid lookup.
+    __device__ static __forceinline__ uint2 row_pair(const std::uint8_t* block, int sub, int row) {
+        const std::uint64_t r = kIq2xxsGrid[block[kQs + 8 * sub + row]];
+        const unsigned aux32  = iq_load_word(block + kQs + 8 * sub + 4);
+        const unsigned signs  = unpack_ksigns(static_cast<std::uint8_t>(aux32 >> (7 * row)));
+        return make_uint2(iq_signed(static_cast<unsigned>(r), __vcmpne4(signs & 0x08040201u, 0u)),
+                          iq_signed(static_cast<unsigned>(r >> 32), __vcmpne4(signs & 0x80402010u, 0u)));
+    }
+    static constexpr bool kUnpackRows = true;
+    __device__ static __forceinline__ void unpack_row(const std::uint8_t* tile,
+                                                      const std::uint8_t* header, int tile_in_block,
+                                                      int row, uint2& lo, uint2& hi) {
+        (void)tile;
+        lo = row_pair(header, 2 * tile_in_block, row);
+        hi = row_pair(header, 2 * tile_in_block + 1, row);
     }
     __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
         const unsigned aux32 = iq_load_word(header + kQs + 8 * index + 4);

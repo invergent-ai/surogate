@@ -335,16 +335,31 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
                 }
             }
         }
-        for (int item = tid; item < ExpertBM * 8; item += ExpertThreads) {
-            const int row = item >> 3;
-            const int q   = item & 7;
-            unsigned lo   = 0;
-            unsigned hi   = 0;
-            const int off = Codec::kCover ? sm.Off[slot][row] : tile_shift<Codec>(kt);
-            Codec::unpack(&sm.Cr[stage][row * Codec::kTileStride] + off,
-                          &sm.Hdr[slot][row * Codec::kHeaderStride] + off, tib, q, lo, hi);
-            *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 4 * q])      = lo;
-            *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 32 + 4 * q]) = hi;
+        if constexpr (requires { Codec::kUnpackRows; }) {
+            // Codecs whose grid rows hold eight values (the IQ2s) unpack a row's two quads from
+            // one lookup: the same bytes as quads 2r and 2r + 1.
+            for (int item = tid; item < ExpertBM * 4; item += ExpertThreads) {
+                const int row = item >> 2;
+                const int r   = item & 3;
+                uint2 lo, hi;
+                const int off = Codec::kCover ? sm.Off[slot][row] : tile_shift<Codec>(kt);
+                Codec::unpack_row(&sm.Cr[stage][row * Codec::kTileStride] + off,
+                                  &sm.Hdr[slot][row * Codec::kHeaderStride] + off, tib, r, lo, hi);
+                *reinterpret_cast<uint2*>(&sm.As[row * kI8Stride + 8 * r])      = lo;
+                *reinterpret_cast<uint2*>(&sm.As[row * kI8Stride + 32 + 8 * r]) = hi;
+            }
+        } else {
+            for (int item = tid; item < ExpertBM * 8; item += ExpertThreads) {
+                const int row = item >> 3;
+                const int q   = item & 7;
+                unsigned lo   = 0;
+                unsigned hi   = 0;
+                const int off = Codec::kCover ? sm.Off[slot][row] : tile_shift<Codec>(kt);
+                Codec::unpack(&sm.Cr[stage][row * Codec::kTileStride] + off,
+                              &sm.Hdr[slot][row * Codec::kHeaderStride] + off, tib, q, lo, hi);
+                *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 4 * q])      = lo;
+                *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 32 + 4 * q]) = hi;
+            }
         }
         __syncthreads();
 
