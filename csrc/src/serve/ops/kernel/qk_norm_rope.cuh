@@ -27,8 +27,9 @@ enum class QkNormForm { D128, Warp };
 /// Which rope kernel's coefficients the rotation reproduces: rope_generic_kernel's,
 /// rope_fixed_kernel's Text1D / TextMrope tables, or rope_table_apply_kernel's (read from a
 /// rope_table, position-major).
-/// The Yarn forms are rope_fixed_kernel's YaRN coefficients for the same two tables.
-enum class QkRopeAngles { Generic, Text1D, TextMrope, Table, Text1DYarn, TextMropeYarn };
+/// The Yarn forms are rope_fixed_kernel's YaRN coefficients for the same two tables, and
+/// rope_generic_kernel's for every other geometry (GenericYarn: Flash-Next's 24 query / 2 key heads).
+enum class QkRopeAngles { Generic, Text1D, TextMrope, Table, Text1DYarn, TextMropeYarn, GenericYarn };
 
 inline constexpr int kQkNormRopeWarps = 8;
 
@@ -78,6 +79,10 @@ static __global__ __launch_bounds__(kQkNormRopeWarps * 32) void qk_norm_rope_ker
             generic_pair_sincos(positions, axes, tokens, token, pair, head_dim, rotary_dim,
                                 active_pairs, theta, height_pairs, width_pairs, 1.0F,
                                 &sin_cache[pair], &cos_cache[pair]);
+        } else if constexpr (Angles == QkRopeAngles::GenericYarn) {
+            generic_pair_sincos(positions, axes, tokens, token, pair, head_dim, rotary_dim,
+                                active_pairs, theta, yarn.height_pairs, yarn.width_pairs, 1.0F,
+                                &sin_cache[pair], &cos_cache[pair], &yarn);
         } else if constexpr (Angles == QkRopeAngles::Table) {
             const float2 cs = table[static_cast<std::int64_t>(positions[token]) * half + pair];
             cos_cache[pair] = cs.x;

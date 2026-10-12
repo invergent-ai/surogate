@@ -198,6 +198,12 @@ int main() {
         {"35b d256/r64 16q2k mrope yarn", 256, 64, 16, 2, 3, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
         {"27b d256/r64 24q4k yarn", 256, 64, 24, 4, 1, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
         {"queries only d256/r64 yarn", 256, 64, 16, 2, 1, 1.0e7F, true, 0, {}, false, true, 0.0F, 4.0F},
+        // YaRN on geometries ops::rope serves with its generic kernel: Flash-Next's 24 query / 2 key
+        // heads (1-D, MRoPE, queries alone) and a 128-wide head.
+        {"flash-next d256/r64 24q2k yarn", 256, 64, 24, 2, 1, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
+        {"flash-next d256/r64 24q2k mrope yarn", 256, 64, 24, 2, 3, 1.0e7F, true, 0, {}, true, true, 0.0F, 4.0F},
+        {"queries only d256/r64 24q2k yarn", 256, 64, 24, 2, 1, 1.0e7F, true, 0, {}, false, true, 0.0F, 4.0F},
+        {"d128/r64 16q8k yarn", 128, 64, 16, 8, 1, 1.0e6F, false, 0, {}, true, true, 0.0F, 4.0F},
         // Outside the domain: declined.
         {"d128/r96 declined", 128, 96, 8, 2, 1, 1.0e4F, false, 0, {}, true, false},
         {"d512/r512 declined", 512, 512, 4, 1, 1, 1.0e6F, true, 64, {}, true, false},

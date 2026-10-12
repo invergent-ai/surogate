@@ -40,6 +40,7 @@ void launch_angles(const QkNormRope& a, int k_heads, QkRopeAngles angles, cudaSt
     case QkRopeAngles::Table: launch<Epilogue, Form, QkRopeAngles::Table>(a, k_heads, stream); break;
     case QkRopeAngles::Text1DYarn: launch<Epilogue, Form, QkRopeAngles::Text1DYarn>(a, k_heads, stream); break;
     case QkRopeAngles::TextMropeYarn: launch<Epilogue, Form, QkRopeAngles::TextMropeYarn>(a, k_heads, stream); break;
+    case QkRopeAngles::GenericYarn: launch<Epilogue, Form, QkRopeAngles::GenericYarn>(a, k_heads, stream); break;
     default: launch<Epilogue, Form, QkRopeAngles::Generic>(a, k_heads, stream); break;
     }
 }
@@ -75,13 +76,13 @@ bool qk_norm_rope_launch(const QkNormRope& a, cudaStream_t stream) {
     QkRopeAngles angles = QkRopeAngles::Generic;
     const bool whole    = a.active_pairs == a.rotary_dim / 2;
     if (a.yarn != nullptr) {
-        // Only the fixed tables' geometries take YaRN; the caller runs ops::rope's YaRN form else.
-        if (a.table != nullptr || a.sections[0] != 0 || !whole || a.rotary_dim != 64 || head_dim != 256 ||
-            (axes == 3 && !rope_yarn_cyclic(*a.yarn)) ||
-            !((q.ne[1] == 24 && a.k_heads == 4) || (q.ne[1] == 16 && a.k_heads == 2))) {
-            return false;
-        }
-        angles = axes == 1 ? QkRopeAngles::Text1DYarn : QkRopeAngles::TextMropeYarn;
+        // rope_yarn_launch's choice: the fixed kernels for their geometries and the i % 3 sections
+        // they hard-wire, the generic kernel with the same coefficients for any other.
+        if (a.table != nullptr || a.sections[0] != 0 || !whole || a.rotary_dim != 64) { return false; }
+        const bool fixed = head_dim == 256 && (axes == 1 || rope_yarn_cyclic(*a.yarn)) &&
+                           ((q.ne[1] == 24 && a.k_heads == 4) || (q.ne[1] == 16 && a.k_heads == 2));
+        angles = !fixed ? QkRopeAngles::GenericYarn
+               : axes == 1 ? QkRopeAngles::Text1DYarn : QkRopeAngles::TextMropeYarn;
     } else if (a.table != nullptr) {
         angles = QkRopeAngles::Table;
     } else if (a.sections[0] == 0 && whole && a.rotary_dim == 64 && a.theta == 1.0e7F &&
