@@ -1384,8 +1384,11 @@ void launch_d4_small_t_codec(const PreparedSparseMoeWeights& weights, Tensor& de
 // once where the per-path kernels read each path's weights. The counting kernel is recorded into
 // captured decode graphs like any other, so replays count too; the totals (cumulative) print to
 // stderr from an eager round at most every that many seconds. Off (and free) unless set.
-__global__ void sparse_moe_route_stats_kernel(const int* __restrict__ token_ids, int tokens,
-                                              unsigned long long* __restrict__ counters) {
+// Static device memory: no allocation, which a first call inside a graph capture could not make.
+__device__ unsigned long long g_route_stats[64 * 3];
+
+__global__ void sparse_moe_route_stats_kernel(const int* __restrict__ token_ids, int tokens) {
+    unsigned long long* counters = g_route_stats;
     constexpr int kWords = (kExperts + 31) / 32;
     __shared__ unsigned seen[kWords];
     for (int i = static_cast<int>(threadIdx.x); i < kWords; i += static_cast<int>(blockDim.x)) {
@@ -1413,13 +1416,7 @@ inline void sparse_moe_route_stats(const int* token_ids, std::int32_t tokens, cu
         return raw != nullptr ? std::strtol(raw, nullptr, 10) : 0L;
     }();
     if (every <= 0 || tokens <= 0) { return; }
-    static unsigned long long* counters = [] {
-        unsigned long long* p = nullptr;
-        CUDA_CHECK(cudaMalloc(&p, 64 * 3 * sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemset(p, 0, 64 * 3 * sizeof(unsigned long long)));
-        return p;
-    }();
-    sparse_moe_route_stats_kernel<<<1, 256, 0, stream>>>(token_ids, tokens, counters);
+    sparse_moe_route_stats_kernel<<<1, 256, 0, stream>>>(token_ids, tokens);
     CUDA_CHECK(cudaGetLastError());
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
@@ -1430,7 +1427,7 @@ inline void sparse_moe_route_stats(const int* token_ids, std::int32_t tokens, cu
     last = now;
     unsigned long long host[64 * 3];
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaMemcpy(host, counters, sizeof(host), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyFromSymbol(host, g_route_stats, sizeof(host)));
     for (int t = 1; t < 64; ++t) {
         const unsigned long long rounds = host[t * 3];
         if (rounds == 0) { continue; }
