@@ -7,7 +7,7 @@
   </picture>
 </a>
 
-<h1>Surogate</h1>
+<h1>Surogate Engine</h1>
 
 <p><strong>Native C++/CUDA LLM training and serving: GGUF, NVFP4, BF16, FP8. <br>
 From your first fine-tune to hundreds of concurrent requests.</strong></p>
