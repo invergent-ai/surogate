@@ -45,7 +45,7 @@ template <class Codec>
 /// Bytes one header staging item moves: the codec's own `kHeaderUnit` where it declares one, else
 /// sixteen on the `cp_async` route and two on the scalar one.
 template <class Codec>
-[[nodiscard]] constexpr int header_unit() {
+[[nodiscard]] __host__ __device__ constexpr int header_unit() {
     if constexpr (requires { Codec::kHeaderUnit; }) {
         return Codec::kHeaderUnit;
     } else {

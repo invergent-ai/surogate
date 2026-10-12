@@ -401,7 +401,7 @@ inline int prefill_persistent_blocks(Kernel* kernel, int threads, std::size_t dy
 // The int8 expert kernels' minimum residency: the codec's own at eight warps or fewer, one block
 // for the sixteen-warp, 128-column tile, which holds an SM's register file by itself.
 template <class Codec, int ExpertWarps>
-constexpr int i8_expert_min_blocks() {
+__host__ __device__ constexpr int i8_expert_min_blocks() {
     return ExpertWarps <= 8 ? Codec::kMinBlocks : 1;
 }
 
