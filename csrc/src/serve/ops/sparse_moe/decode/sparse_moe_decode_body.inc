@@ -1101,8 +1101,117 @@ __global__ void __launch_bounds__(512) sparse_moe_expert_groups_kernel(
     }
 }
 
-// Gate/up: block (row tile, distinct expert). Each warp computes one (entry, row) at a time with
-// dot_two_rows over the entry's token, staged kChunk tokens at a time.
+// dot_two_rows's packed-word8 loop (the GGML codecs') for up to N tokens of one expert: a lane's
+// eight weights of each row are decoded once per group step and multiplied into every token's
+// sums, each token in exactly the order dot_two_rows takes it alone -- the same bits per token.
+template <class Codec, int K, int N>
+__device__ __forceinline__ void dot_two_rows_tokens(const std::uint8_t* codes, const std::uint8_t* high,
+                                                    const std::uint8_t* scales, int row0, int row1,
+                                                    const __nv_bfloat16* x, int x_stride, int n,
+                                                    float (&result0)[N], float (&result1)[N]) {
+    static_assert(Codec::kPackedWord8 && !Codec::kD3PackedWord8 && !kWideRows<Codec, K, 2>);
+    constexpr int kGroups        = kStoredGroups<Codec, K>;
+    constexpr int kLanesPerGroup = Codec::kGroupK / 8;
+    constexpr int kGroupsPerWarp = 32 / kLanesPerGroup;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane / kLanesPerGroup;
+    const int lane_in_group = lane % kLanesPerGroup;
+    constexpr int last_group = K / Codec::kGroupK;
+    float acc0[N], acc1[N];
+#pragma unroll
+    for (int t = 0; t < N; ++t) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
+#pragma unroll
+    for (int group_base = 0; group_base < last_group; group_base += kGroupsPerWarp) {
+        const int group = group_base + lane_group;
+        if (group >= last_group) { break; }
+        const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
+        const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+        float weights0[8];
+        float weights1[8];
+        Codec::load_eight(codes, high, scales, index0, lane_in_group, weights0);
+        Codec::load_eight(codes, high, scales, index1, lane_in_group, weights1);
+#pragma unroll
+        for (int t = 0; t < N; ++t) {
+            if (t >= n) { break; }
+            const uint4 input = load_vec<uint4>(x + t * x_stride + group * Codec::kGroupK + lane_in_group * 8);
+            const float2 x0   = bf16x2_bits_to_float2(input.x);
+            const float2 x1   = bf16x2_bits_to_float2(input.y);
+            const float2 x2   = bf16x2_bits_to_float2(input.z);
+            const float2 x3   = bf16x2_bits_to_float2(input.w);
+            const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                acc0[t] = fmaf(weights0[item], values[item], acc0[t]);
+                acc1[t] = fmaf(weights1[item], values[item], acc1[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < N; ++t) {
+        if (t >= n) { break; }
+        result0[t] = warp_reduce_sum(acc0[t]);
+        result1[t] = warp_reduce_sum(acc1[t]);
+    }
+}
+
+// dot_fp32_rows's packed-word8 loop for up to N inputs (one expert's entries): each row's weights
+// decoded once per group step, every input's sums in dot_fp32_rows's own order.
+template <class Codec, int Rows, int N>
+__device__ __forceinline__ void dot_fp32_rows_tokens(const std::uint8_t* codes, const std::uint8_t* high,
+                                                     const std::uint8_t* scales, int row_base,
+                                                     const float* const (&x)[N], int n,
+                                                     float (&result)[N][Rows]) {
+    static_assert(Codec::kPackedWord8 && !kWideRows<Codec, kIntermediate, Rows>);
+    constexpr int kGroups        = kStoredGroups<Codec, kIntermediate>;
+    constexpr int kLanesPerGroup = Codec::kGroupK / 8;
+    constexpr int kGroupsPerWarp = 32 / kLanesPerGroup;
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int lane_group    = lane / kLanesPerGroup;
+    const int lane_in_group = lane % kLanesPerGroup;
+    constexpr int last_group = kIntermediate / Codec::kGroupK;
+    float acc[N][Rows];
+#pragma unroll
+    for (int t = 0; t < N; ++t) {
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) { acc[t][row] = 0.0f; }
+    }
+    for (int group_base = 0; group_base < last_group; group_base += kGroupsPerWarp) {
+        const int group = group_base + lane_group;
+        if (group >= last_group) { continue; }
+        float values[N][8];
+#pragma unroll
+        for (int t = 0; t < N; ++t) {
+            if (t >= n) { break; }
+            const float4 x0 = load_vec<float4>(x[t] + group * Codec::kGroupK + lane_in_group * 8);
+            const float4 x1 = load_vec<float4>(x[t] + group * Codec::kGroupK + lane_in_group * 8 + 4);
+            values[t][0] = x0.x; values[t][1] = x0.y; values[t][2] = x0.z; values[t][3] = x0.w;
+            values[t][4] = x1.x; values[t][5] = x1.y; values[t][6] = x1.z; values[t][7] = x1.w;
+        }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            const std::int64_t group_index = static_cast<std::int64_t>(row_base + row) * kGroups + group;
+            float weights[8];
+            Codec::load_eight(codes, high, scales, group_index, lane_in_group, weights);
+#pragma unroll
+            for (int t = 0; t < N; ++t) {
+                if (t >= n) { break; }
+#pragma unroll
+                for (int item = 0; item < 8; ++item) {
+                    acc[t][row] = fmaf(weights[item], values[t][item], acc[t][row]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < N; ++t) {
+        if (t >= n) { break; }
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) { result[t][row] = warp_reduce_sum(acc[t][row]); }
+    }
+}
+
+// Gate/up: block (Rows rows, distinct expert), a warp a row; the expert's entries kChunk at a
+// time, their tokens staged, each row's weights decoded once for all of them.
 template <class RoutedCodec, int Rows>
 __global__ void __launch_bounds__(256) sparse_moe_d3_expert_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ groups, int paths,
@@ -1129,37 +1238,44 @@ __global__ void __launch_bounds__(256) sparse_moe_d3_expert_kernel(
                       load_vec<uint4>(x + static_cast<std::int64_t>(token) * kHidden + vector * 8));
         }
         __syncthreads();
-        for (int item = warp; item < count * Rows; item += 8) {
-            const int c = item / Rows, r = item - c * Rows;
-            const int path = entries[c0 + c], token = path / kTopK, slot = path - token * kTopK;
+        for (int r = warp; r < Rows; r += 8) {
             const int j = j0 + r;
-            float gate = 0.0f, up = 0.0f;
-            float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
-            float& second = RoutedCodec::kGateRowsFirst ? up : gate;
-            dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
-                                               row_base + kIntermediate + j, x_shared[c], 0, kHidden,
-                                               first, second);
-            if (routed_gate_up_scale != nullptr) {
-                first *= routed_gate_up_scale[expert * 2];
-                second *= routed_gate_up_scale[expert * 2 + 1];
-            }
-            if (lane == 0) {
-                token_activations[(static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate + j] =
-                    gated_clamped(gate, up, kSwigluLimit, kActivation);
+            float first[kChunk], second[kChunk];
+            dot_two_rows_tokens<RoutedCodec, kHidden, kChunk>(routed_codes, routed_high, routed_scales,
+                                                              row_base + j, row_base + kIntermediate + j,
+                                                              x_shared[0], kHidden, count, first, second);
+#pragma unroll
+            for (int c = 0; c < kChunk; ++c) {
+                if (c >= count) { break; }
+                float gate = 0.0f, up = 0.0f;
+                (RoutedCodec::kGateRowsFirst ? gate : up)  = first[c];
+                (RoutedCodec::kGateRowsFirst ? up : gate)  = second[c];
+                float& f = RoutedCodec::kGateRowsFirst ? gate : up;
+                float& sc = RoutedCodec::kGateRowsFirst ? up : gate;
+                if (routed_gate_up_scale != nullptr) {
+                    f *= routed_gate_up_scale[expert * 2];
+                    sc *= routed_gate_up_scale[expert * 2 + 1];
+                }
+                if (lane == 0) {
+                    const int path = entries[c0 + c], token = path / kTopK, slot = path - token * kTopK;
+                    token_activations[(static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate + j] =
+                        gated_clamped(gate, up, kSwigluLimit, kActivation);
+                }
             }
         }
         __syncthreads();
     }
 }
 
-// Down: block (8 x Rows rows, distinct expert); each warp computes Rows rows of one entry with
-// dot_fp32_rows and stores weight * dot per path.
+// Down: block (8 x Rows rows, distinct expert); a warp takes Rows rows for kChunk entries at a
+// time, each row's weights decoded once for all of them, and stores weight * dot per path.
 template <class RoutedCodec, int Rows>
 __global__ void __launch_bounds__(256) sparse_moe_d4_expert_kernel(
     const int* __restrict__ groups, int paths, const float* __restrict__ token_alpha,
     const float* __restrict__ token_activations, const std::uint8_t* __restrict__ routed_codes,
     const std::uint8_t* __restrict__ routed_high, const std::uint8_t* __restrict__ routed_scales,
     const float* __restrict__ routed_down_scale, float* __restrict__ path_out) {
+    constexpr int kChunk = 4;
     const int index = static_cast<int>(blockIdx.y);
     if (index >= groups[0]) { return; }
     const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
@@ -1167,23 +1283,30 @@ __global__ void __launch_bounds__(256) sparse_moe_d4_expert_kernel(
     const int begin    = groups[1 + paths + index];
     const int end      = groups[1 + paths + index + 1];
     const int* entries = groups + 2 + 2 * paths;
-    const int tile0    = static_cast<int>(blockIdx.x) * Rows * 8;
-    for (int item = warp; item < (end - begin) * 8; item += 8) {
-        const int c = item >> 3, group = item & 7;
-        const int path = entries[begin + c], token = path / kTopK, slot = path - token * kTopK;
-        const int row_base = tile0 + group * Rows;
-        float dot[Rows];
-        float weight = token_alpha[path];
-        dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
-                                         expert * kHidden + row_base,
-                                         token_activations + (static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate,
-                                         0, kIntermediate / RoutedCodec::kGroupK, dot);
-        if (routed_down_scale != nullptr) { weight *= routed_down_scale[expert]; }
-        if (lane == 0) {
+    const int row_base = static_cast<int>(blockIdx.x) * Rows * 8 + warp * Rows;
+    for (int c0 = begin; c0 < end; c0 += kChunk) {
+        const int count = min(kChunk, end - c0);
+        const float* inputs[kChunk];
 #pragma unroll
-            for (int row = 0; row < Rows; ++row) {
-                path_out[(static_cast<std::int64_t>(token) * kPaths + slot) * kHidden + row_base + row] =
-                    weight * dot[row];
+        for (int c = 0; c < kChunk; ++c) {
+            const int path = entries[c0 + (c < count ? c : 0)], token = path / kTopK, slot = path - token * kTopK;
+            inputs[c] = token_activations + (static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate;
+        }
+        float dot[kChunk][Rows];
+        dot_fp32_rows_tokens<RoutedCodec, Rows, kChunk>(routed_codes, routed_high, routed_scales,
+                                                        expert * kHidden + row_base, inputs, count, dot);
+#pragma unroll
+        for (int c = 0; c < kChunk; ++c) {
+            if (c >= count) { break; }
+            const int path = entries[c0 + c], token = path / kTopK, slot = path - token * kTopK;
+            float weight = token_alpha[path];
+            if (routed_down_scale != nullptr) { weight *= routed_down_scale[expert]; }
+            if (lane == 0) {
+#pragma unroll
+                for (int row = 0; row < Rows; ++row) {
+                    path_out[(static_cast<std::int64_t>(token) * kPaths + slot) * kHidden + row_base + row] =
+                        weight * dot[c][row];
+                }
             }
         }
     }
