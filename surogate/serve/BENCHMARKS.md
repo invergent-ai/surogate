@@ -106,6 +106,33 @@ A run with `SUROGATE_SERVE_PROMPT_TOKEN_REUSE=verify` (42 turns) found the reuse
 whole encode on every turn. A warm turn's prefill at ~147k tokens stays 0.83-0.84 s, about 0.5 s
 of it prompt attention at ~110 TFLOP/s, under half the GB10's e4m3 tensor peak.
 
+### e4m3 P V in prompt attention (a23d89c)
+
+The same build with `SUROGATE_SERVE_PROMPT_ATTENTION_FP8_PV=0` and on (the default). The prompt
+kernel alone (`sinfer_causal_softmax_attention_bench`, `d256-h16-kv2`, 2,048 new tokens): 109.6 ->
+147.4 TFLOP/s over 32k cached keys, 110.5 -> 146.7 over 131k. Surogate3.7-35B-A3B:
+
+| | bf16 P V | e4m3 P V |
+|---|---|---|
+| Cold 203,377-token prompt, needles 3/3 | 59 s | **51 s** |
+| Cold 403,459 tokens with YaRN, needles 3/3 | 183 s (5110824) | **150 s** |
+| Cold 1,000,667 tokens with YaRN, needles 3/3 | 946 s (5110824) | **741 s** |
+| 1 agent, MTP 3: warm first token p50 / p90 | 0.86 / 1.43 s | **0.72 / 1.20 s** |
+| 1 agent, MTP 3: turn latency p50 / p90 | 1.19 / 1.77 s | **1.06 / 1.53 s** |
+| 1 agent, MTP 3: turns a minute | 35.8 | **40.0** |
+| 4 agents, MTP 3: warm first token p50 / p90 | 1.79 / 4.55 s (6b627dc) | **1.15 / 1.69 s** |
+| 4 agents, MTP 3: turn latency p50 / p90 | 4.35 / 6.70 s (6b627dc) | **3.92 / 5.28 s** |
+| 4 agents, MTP 3: turns a minute | 35.2 (6b627dc) | **41.5** |
+
+At four agents a turn shares rounds with the other agents' prompts; it now gets its first token
+sooner and shares the rest while it decodes (mean per turn: first token 2.30 -> 1.18 s, decode
+2.13 -> 2.63 s, whole turn 4.44 -> 3.83 s), so its decode p50 reads 11.4 tok/s against 17.0.
+
+Accuracy: the 900 tokens of a reference answer scored given its 94,631-token document moved
+-0.0013 +- 0.0050 nats (paired), top-1 agreement 95.9%. Layers with a sliding window keep the
+bf16 product: with Gemma 4 12B's on the e4m3 one, the same check on that model gave +0.017 +-
+0.011 nats.
+
 ### A million-token context with YaRN (5110824)
 
 Surogate3.7-35B-A3B, `--rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'`,

@@ -626,6 +626,7 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | `SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE` | `1` lets NVFP4 mixture experts add their outputs in the GEMM epilogue: up to about 3% faster, but the same request can then get slightly different answers from run to run; off by default |
 | `SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB` | GPU memory for prefill and mixed-round CUDA graphs captured while serving; new shapes run without a graph once it is spent; default 512 MiB, 0 captures none |
 | `SUROGATE_SERVE_PROMPT_TOKEN_REUSE` | By default a prompt that opens with a recent prompt's text, such as an agent's next turn, reuses that prompt's token ids and tokenizes only the rest, with the same ids as a whole encode. `0` tokenizes every prompt whole; `verify` tokenizes both ways and fails the request if they differ |
+| `SUROGATE_SERVE_PROMPT_ATTENTION_FP8_PV` | With an FP8 KV cache on compute capability 12.x GPUs (RTX 50 series, RTX PRO 6000, DGX Spark), prompt attention over 128- and 256-wide heads in layers without a sliding window multiplies the probabilities, rounded to e4m3, with V's cached codes on the FP8 tensor cores (a third faster on a DGX Spark, with the same accuracy in our measurements). `0` keeps that product in bf16 |
 
 ## Public admission limits
 
