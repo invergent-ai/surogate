@@ -542,6 +542,41 @@ int run_mixture(const Mixture& mixture, const std::vector<std::int32_t>& token_c
         const std::vector<double> prefill = run_moe(weights, g, dx, drx, tokens, tokens);
         failures += compare("T=" + std::to_string(tokens) + " prefill vs small-T", prefill,
                             reference, mixture.relative_to_max);
+        // The expert-major small-T round against the per-path kernels, bit for bit: with the
+        // routing above (few experts shared) and with every token routed like the first (each
+        // expert serving every token of a slice).
+        const std::int32_t slice = std::min(ops::detail::kSparseMoeSmallTMax,
+                                            ops::detail::sparse_moe_ggml_prefill_min() - 1 > 0
+                                                ? ops::detail::sparse_moe_ggml_prefill_min() - 1
+                                                : 1);
+        for (const bool same_routing : {false, true}) {
+            std::vector<float> rx = router_x;
+            if (same_routing) {
+                for (std::int32_t t = 1; t < tokens; ++t) {
+                    std::copy_n(rx.begin(), g.hidden, rx.begin() + static_cast<std::ptrdiff_t>(t) * g.hidden);
+                }
+            }
+            const DeviceBuffer drx2 = to_device_bf16(rx);
+            ops::detail::sparse_moe_set_expert_major_override(-1);
+            const std::vector<double> per_path = run_moe(weights, g, dx, drx2, tokens, slice);
+            ops::detail::sparse_moe_set_expert_major_override(1);
+            const long rounds = ops::detail::sparse_moe_expert_major_rounds();
+            const std::vector<double> expert_major = run_moe(weights, g, dx, drx2, tokens, slice);
+            ops::detail::sparse_moe_set_expert_major_override(0);
+            if (tokens >= 2 && ops::detail::sparse_moe_expert_major_rounds() == rounds) {
+                std::cerr << mixture.name << " T=" << tokens
+                          << ": the expert-major round never ran; the comparison is vacuous\n";
+                ++failures;
+            }
+            if (per_path != expert_major) {
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < per_path.size(); ++i) { differ += per_path[i] != expert_major[i]; }
+                std::cerr << mixture.name << " T=" << tokens << (same_routing ? " (one routing)" : "")
+                          << ": the expert-major round differs from the per-path kernels in " << differ
+                          << " of " << per_path.size() << " values\n";
+                ++failures;
+            }
+        }
     }
     return failures;
 }

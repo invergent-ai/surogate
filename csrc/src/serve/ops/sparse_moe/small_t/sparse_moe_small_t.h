@@ -43,7 +43,18 @@ struct SparseMoeSmallTWorkspace {
     Tensor token_alpha;
     Tensor shared_scale;
     Tensor scratch;
+    /// The expert-major round: the paths grouped by expert, and each path's down output.
+    Tensor groups;
+    Tensor path_out;
 };
+
+/// Whether small-T rounds take the expert-major kernels where they qualify:
+/// SUROGATE_SERVE_MOE_EXPERT_MAJOR (0 off, 1 on), unless a test set the override (1 on, -1 off).
+[[nodiscard]] bool sparse_moe_expert_major_enabled() noexcept;
+void sparse_moe_set_expert_major_override(int mode) noexcept;
+/// Rounds the expert-major kernels took (host count), so a test can tell it exercised them.
+[[nodiscard]] long sparse_moe_expert_major_rounds() noexcept;
+void sparse_moe_count_expert_major_round() noexcept;
 
 /// How many CTAs cover one router row in S1, by the width they have to cover.
 ///
@@ -83,6 +94,9 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
         static_cast<std::int64_t>(geometry.paths()) * geometry.intermediate;
     const std::int32_t per_token = static_cast<std::int32_t>(std::max(partials, activations));
     out.scratch                  = arena.alloc(DType::FP32, {per_token, tokens}, 256);
+    out.groups                   = arena.alloc(DType::I32, {2 + 3 * assignments}, 16);
+    out.path_out                 = arena.alloc(
+        DType::FP32, {static_cast<std::int32_t>(geometry.paths()) * geometry.hidden, tokens}, 256);
     return out;
 }
 

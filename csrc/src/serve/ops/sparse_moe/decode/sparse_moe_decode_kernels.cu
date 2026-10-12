@@ -9,6 +9,7 @@
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/ggml/ggml_moe_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
@@ -18,6 +19,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -84,6 +86,56 @@ namespace geometry_lfm2_moe64 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe64Geometry)
 #include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
 } // namespace geometry_lfm2_moe64
+
+bool sparse_moe_decode_launch_expert_major(const SparseMoeGeometry& geometry, const Tensor& x,
+                                           const PreparedSparseMoeWeights& weights,
+                                           Tensor& destination, const int* token_ids,
+                                           const float* token_alpha, const float* shared_scale,
+                                           float* token_activations, int* groups, float* path_out,
+                                           std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+                                           cudaStream_t stream) {
+    if (geometry == kSparseMoeQwen36Geometry) {
+        return geometry_qwen36::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeFlashNextGeometry) {
+        return geometry_flash_next::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeQwen3MoeGeometry) {
+        return geometry_qwen3_moe::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeQwen3Moe235BGeometry) {
+        return geometry_qwen3_moe_235b::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeGlm53Geometry) {
+        return geometry_glm53::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeGemma4Geometry) {
+        return geometry_gemma4::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeLfm2Moe32Geometry) {
+        return geometry_lfm2_moe32::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    if (geometry == kSparseMoeLfm2Moe64Geometry) {
+        return geometry_lfm2_moe64::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, groups, path_out,
+                                                tokens, schedule, stream);
+    }
+    return false;
+}
 
 void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,
                                          const PreparedSparseMoeWeights& weights, const int* token_ids,

@@ -1056,6 +1056,161 @@ __global__ void sparse_moe_d4_token_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The expert-major small-T round. The per-path kernels above read a routed expert's rows once per
+// (token, path); a round's verify tokens are consecutive positions of a few sequences and share
+// most of their experts (measured on Swift-1.5 Flash-Next with real text: 82 distinct experts for
+// 160 paths at four sequences x 4 verify tokens, 129 for 320 at eight), and those kernels run
+// near the memory bandwidth their path reads need. Here the round's paths are grouped by expert,
+// each distinct expert's gate/up and down rows are read once by blocks that loop over its
+// (token, slot) entries, and every path's value is computed by the same dot routines in the same
+// lane order -- so the per-path values, and the rank-order sum per token, are the per-path
+// kernels' bits.
+// ---------------------------------------------------------------------------------------------
+
+// groups: [0] distinct experts n; [1, 1 + A) the experts, ascending; [1 + A, 2 + 2A) the entry
+// offsets (n + 1 used); [2 + 2A, 2 + 3A) the entries, path = token * kTopK + slot, A = paths.
+__global__ void __launch_bounds__(512) sparse_moe_expert_groups_kernel(
+    const int* __restrict__ token_ids, int paths, int* __restrict__ groups) {
+    __shared__ int count[kExperts];
+    __shared__ int cursor[kExperts];
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int e = tid; e < kExperts; e += 512) { count[e] = 0; }
+    __syncthreads();
+    for (int p = tid; p < paths; p += 512) { atomicAdd(&count[token_ids[p]], 1); }
+    __syncthreads();
+    int* experts = groups + 1;
+    int* offsets = groups + 1 + paths;
+    int* entries = groups + 2 + 2 * paths;
+    if (tid == 0) {
+        int n = 0, running = 0;
+        for (int e = 0; e < kExperts; ++e) {
+            if (count[e] == 0) { continue; }
+            experts[n] = e;
+            offsets[n] = running;
+            cursor[e]  = running;
+            running += count[e];
+            ++n;
+        }
+        offsets[n] = running;
+        groups[0]  = n;
+    }
+    __syncthreads();
+    for (int p = tid; p < paths; p += 512) {
+        entries[atomicAdd(&cursor[token_ids[p]], 1)] = p;
+    }
+}
+
+// Gate/up: block (row tile, distinct expert). Each warp computes one (entry, row) at a time with
+// dot_two_rows over the entry's token, staged kChunk tokens at a time.
+template <class RoutedCodec, int Rows>
+__global__ void __launch_bounds__(256) sparse_moe_d3_expert_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ groups, int paths,
+    const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
+    const std::uint8_t* __restrict__ routed_scales, const float* __restrict__ routed_gate_up_scale,
+    float* __restrict__ token_activations) {
+    constexpr int kChunk = 4;
+    __shared__ __align__(16) __nv_bfloat16 x_shared[kChunk][kHidden];
+    const int index = static_cast<int>(blockIdx.y);
+    if (index >= groups[0]) { return; }
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int expert   = groups[1 + index];
+    const int begin    = groups[1 + paths + index];
+    const int end      = groups[1 + paths + index + 1];
+    const int* entries = groups + 2 + 2 * paths;
+    const int row_base = expert * (2 * kIntermediate);
+    const int j0       = static_cast<int>(blockIdx.x) * Rows;
+    for (int c0 = begin; c0 < end; c0 += kChunk) {
+        const int count = min(kChunk, end - c0);
+        for (int v = tid; v < count * (kHidden / 8); v += 256) {
+            const int c = v / (kHidden / 8), vector = v - c * (kHidden / 8);
+            const int token = entries[c0 + c] / kTopK;
+            store_vec(&x_shared[c][vector * 8],
+                      load_vec<uint4>(x + static_cast<std::int64_t>(token) * kHidden + vector * 8));
+        }
+        __syncthreads();
+        for (int item = warp; item < count * Rows; item += 8) {
+            const int c = item / Rows, r = item - c * Rows;
+            const int path = entries[c0 + c], token = path / kTopK, slot = path - token * kTopK;
+            const int j = j0 + r;
+            float gate = 0.0f, up = 0.0f;
+            float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
+            float& second = RoutedCodec::kGateRowsFirst ? up : gate;
+            dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
+                                               row_base + kIntermediate + j, x_shared[c], 0, kHidden,
+                                               first, second);
+            if (routed_gate_up_scale != nullptr) {
+                first *= routed_gate_up_scale[expert * 2];
+                second *= routed_gate_up_scale[expert * 2 + 1];
+            }
+            if (lane == 0) {
+                token_activations[(static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate + j] =
+                    gated_clamped(gate, up, kSwigluLimit, kActivation);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Down: block (8 x Rows rows, distinct expert); each warp computes Rows rows of one entry with
+// dot_fp32_rows and stores weight * dot per path.
+template <class RoutedCodec, int Rows>
+__global__ void __launch_bounds__(256) sparse_moe_d4_expert_kernel(
+    const int* __restrict__ groups, int paths, const float* __restrict__ token_alpha,
+    const float* __restrict__ token_activations, const std::uint8_t* __restrict__ routed_codes,
+    const std::uint8_t* __restrict__ routed_high, const std::uint8_t* __restrict__ routed_scales,
+    const float* __restrict__ routed_down_scale, float* __restrict__ path_out) {
+    const int index = static_cast<int>(blockIdx.y);
+    if (index >= groups[0]) { return; }
+    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
+    const int expert   = groups[1 + index];
+    const int begin    = groups[1 + paths + index];
+    const int end      = groups[1 + paths + index + 1];
+    const int* entries = groups + 2 + 2 * paths;
+    const int tile0    = static_cast<int>(blockIdx.x) * Rows * 8;
+    for (int item = warp; item < (end - begin) * 8; item += 8) {
+        const int c = item >> 3, group = item & 7;
+        const int path = entries[begin + c], token = path / kTopK, slot = path - token * kTopK;
+        const int row_base = tile0 + group * Rows;
+        float dot[Rows];
+        float weight = token_alpha[path];
+        dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
+                                         expert * kHidden + row_base,
+                                         token_activations + (static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate,
+                                         0, kIntermediate / RoutedCodec::kGroupK, dot);
+        if (routed_down_scale != nullptr) { weight *= routed_down_scale[expert]; }
+        if (lane == 0) {
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                path_out[(static_cast<std::int64_t>(token) * kPaths + slot) * kHidden + row_base + row] =
+                    weight * dot[row];
+            }
+        }
+    }
+}
+
+// The rank-order sum per token, as sparse_moe_d4_token_kernel's epilogue adds it: the destination,
+// then each routed path's weight * dot, then the shared expert's scale * output.
+__global__ void sparse_moe_expert_combine_kernel(const float* __restrict__ path_out,
+                                                 const float* __restrict__ shared_scale,
+                                                 const __nv_bfloat16* __restrict__ shared_output,
+                                                 __nv_bfloat16* __restrict__ destination) {
+    const int token = static_cast<int>(blockIdx.y);
+    const int row   = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+    if (row >= kHidden) { return; }
+    __nv_bfloat16* output = destination + static_cast<std::int64_t>(token) * kHidden + row;
+    float value = __bfloat162float(*output);
+#pragma unroll
+    for (int path = 0; path < kTopK; ++path) {
+        value += path_out[(static_cast<std::int64_t>(token) * kPaths + path) * kHidden + row];
+    }
+    if constexpr (kHasShared) {
+        value += shared_scale[token] *
+                 __bfloat162float(shared_output[static_cast<std::int64_t>(token) * kHidden + row]);
+    }
+    *output = __float2bfloat16_rn(value);
+}
+
 void launch_d1(const Tensor& x, const Weight& router_shared_gate,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     sparse_moe_d1_kernel<<<dim3(kRouterRows, x.ne[1]), kD1Warps * 32, 0, stream>>>(
@@ -1377,7 +1532,101 @@ void launch_d4_small_t_codec(const PreparedSparseMoeWeights& weights, Tensor& de
     throw std::logic_error("sparse_moe: unknown small-T D4 schedule");
 }
 
+template <class Codec, int Rows>
+void launch_d3_expert(const Tensor& x, const PreparedSparseMoeWeights& weights, const int* groups,
+                      std::int32_t paths, float* token_activations, cudaStream_t stream) {
+    const dim3 grid(kIntermediate / Rows, std::min<std::int32_t>(paths, kExperts));
+    sparse_moe_d3_expert_kernel<Codec, Rows><<<grid, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), groups, paths,
+        static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
+        static_cast<const std::uint8_t*>(weights.routed_gate_up.qhigh),
+        static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), weights.routed_gate_up_scale,
+        token_activations);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Codec, int Rows>
+void launch_d4_expert(const PreparedSparseMoeWeights& weights, const int* groups, std::int32_t paths,
+                      const float* token_alpha, const float* token_activations, float* path_out,
+                      cudaStream_t stream) {
+    require_d4_codec_geometry<Codec>();
+    const dim3 grid(kHidden / (Rows * 8), std::min<std::int32_t>(paths, kExperts));
+    sparse_moe_d4_expert_kernel<Codec, Rows><<<grid, 256, 0, stream>>>(
+        groups, paths, token_alpha, token_activations,
+        static_cast<const std::uint8_t*>(weights.routed_down.qdata),
+        static_cast<const std::uint8_t*>(weights.routed_down.qhigh),
+        static_cast<const std::uint8_t*>(weights.routed_down.scales), weights.routed_down_scale,
+        path_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
+
+// The expert-major small-T round (see sparse_moe_expert_groups_kernel) for a GGML routed pair with
+// no expert slot pool and the shared expert, where there is one, already computed; false when the
+// round does not qualify and the per-path kernels must run.
+bool decode_launch_expert_major(const Tensor& x, const PreparedSparseMoeWeights& weights,
+                                Tensor& destination, const int* token_ids, const float* token_alpha,
+                                const float* shared_scale, float* token_activations, int* groups,
+                                float* path_out, std::int32_t tokens,
+                                SparseMoeSmallTD4Schedule schedule, cudaStream_t stream) {
+    if (tokens < 2 || weights.slot_of_expert != nullptr || groups == nullptr || path_out == nullptr ||
+        !ggml::is_ggml_qtype(weights.routed_gate_up.qtype) ||
+        !ggml::is_ggml_qtype(weights.routed_down.qtype)) {
+        return false;
+    }
+    if constexpr (kHasShared) {
+        if (weights.shared_output.data == nullptr) { return false; }
+    }
+    if constexpr (kHidden % (4 * 8) != 0 || kIntermediate % 8 != 0) {
+        return false;
+    } else {
+    const std::int32_t paths = tokens * kTopK;
+    sparse_moe_expert_groups_kernel<<<1, 512, 0, stream>>>(token_ids, paths, groups);
+    CUDA_CHECK(cudaGetLastError());
+    bool launched = false;
+    switch (weights.routed_gate_up.qtype) {
+#define SINFER_D3_EXPERT(NAME)                                                                      \
+    case QType::NAME:                                                                               \
+        launch_d3_expert<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>, 8>(x, weights, groups, paths,    \
+                                                                      token_activations, stream);   \
+        launched = true;                                                                            \
+        break;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_D3_EXPERT)
+#undef SINFER_D3_EXPERT
+    default: break;
+    }
+    if (!launched) { throw std::logic_error("sparse_moe: expert-major gate/up codec mismatch"); }
+    const auto down = [&]<class Codec>() {
+        switch (schedule) {
+        case SparseMoeSmallTD4Schedule::Rows1:
+            launch_d4_expert<Codec, 1>(weights, groups, paths, token_alpha, token_activations, path_out, stream);
+            return;
+        case SparseMoeSmallTD4Schedule::Rows2:
+            launch_d4_expert<Codec, 2>(weights, groups, paths, token_alpha, token_activations, path_out, stream);
+            return;
+        case SparseMoeSmallTD4Schedule::Rows4:
+            launch_d4_expert<Codec, 4>(weights, groups, paths, token_alpha, token_activations, path_out, stream);
+            return;
+        }
+        throw std::logic_error("sparse_moe: unknown small-T D4 schedule");
+    };
+    switch (weights.routed_down.qtype) {
+#define SINFER_D4_EXPERT(NAME)                                                                      \
+    case QType::NAME:                                                                               \
+        down.template operator()<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>();                       \
+        break;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_D4_EXPERT)
+#undef SINFER_D4_EXPERT
+    default: throw std::logic_error("sparse_moe: expert-major down codec mismatch");
+    }
+    sparse_moe_expert_combine_kernel<<<dim3((kHidden + 255) / 256, tokens), 256, 0, stream>>>(
+        path_out, shared_scale, static_cast<const __nv_bfloat16*>(weights.shared_output.data),
+        static_cast<__nv_bfloat16*>(destination.data));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+    }
+}
 
 // SUROGATE_SERVE_MOE_ROUTE_STATS=<seconds>: how many distinct experts a small-T round's paths
 // name, against the paths themselves, by round width -- what an expert-major round would read

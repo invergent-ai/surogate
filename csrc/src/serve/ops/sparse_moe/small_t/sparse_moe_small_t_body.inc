@@ -360,6 +360,16 @@ void small_t_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
         hook->resolve(hook->context, workspace.token_ids, workspace.token_alpha, x, destination,
                       stream);
     }
+    if (sparse_moe_expert_major_enabled() &&
+        sparse_moe_decode_launch_expert_major(
+            kGeometry, x, weights, destination, static_cast<const int*>(workspace.token_ids.data),
+            static_cast<const float*>(workspace.token_alpha.data),
+            static_cast<const float*>(workspace.shared_scale.data),
+            static_cast<float*>(workspace.scratch.data), static_cast<int*>(workspace.groups.data),
+            static_cast<float*>(workspace.path_out.data), plan.tokens, plan.d4_schedule, stream)) {
+        sparse_moe_count_expert_major_round();
+        return;
+    }
     launch_s3_tiled(x, weights, plan, workspace, stream);
     launch_s4_tiled(weights, destination, plan, workspace, stream);
 }

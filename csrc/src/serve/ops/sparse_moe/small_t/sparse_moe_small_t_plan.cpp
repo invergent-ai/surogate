@@ -5,11 +5,43 @@
 #include "core/layout.h"
 
 #include <stdexcept>
+#include <cstdlib>
+#include <atomic>
 
 namespace sinfer::ops::detail {
 
 bool sparse_moe_uses_small_t(std::int32_t tokens) noexcept {
     return tokens >= kSparseMoeSmallTMin && tokens <= kSparseMoeSmallTMax;
+}
+
+namespace {
+std::atomic<int> expert_major_override{0};
+} // namespace
+
+bool sparse_moe_expert_major_enabled() noexcept {
+    const int forced = expert_major_override.load(std::memory_order_relaxed);
+    if (forced != 0) { return forced > 0; }
+    static const bool enabled = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_EXPERT_MAJOR");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return enabled;
+}
+
+void sparse_moe_set_expert_major_override(int mode) noexcept {
+    expert_major_override.store(mode, std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<long> expert_major_round_count{0};
+} // namespace
+
+long sparse_moe_expert_major_rounds() noexcept {
+    return expert_major_round_count.load(std::memory_order_relaxed);
+}
+
+void sparse_moe_count_expert_major_round() noexcept {
+    expert_major_round_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::size_t sparse_moe_small_t_workspace_bytes(const SparseMoeGeometry& geometry,
