@@ -868,15 +868,19 @@ struct GgmlIq4NlPrefill {
 /// IQ4_XS: IQ4_NL's table over a 136-byte superblock, a six-bit scale per 32 (`ls - 32`, low
 /// nibbles in `scales_l`, two high bits each in `scales_h`). A 64-wide tile is 32 `qs` bytes,
 /// the first sixteen one sub-block's and the next sixteen the other's; the header is the eight
-/// bytes ahead of `qs`. Superblocks are eight-byte aligned only, so this one stages through the
-/// scalar two-byte route: it is one layer of the GSQ-RCO builds, not worth a covered stage.
+/// bytes ahead of `qs`. A row is a whole number of 136-byte superblocks, so every superblock,
+/// its header and each tile's `qs` run start eight-byte aligned (half of them sixteen): both
+/// stage as eight-byte `cp_async` copies. The scalar two-byte route this had first, synchronous
+/// loads in the middle of the K loop, left IQ4_XS the slowest expert pair here (31.4 ms at 4,096
+/// Flash-Next tokens against 22 to 25 for the other i-quants).
 struct GgmlIq4XsPrefill {
     using Block = block_iq4_xs;
     static constexpr int kTileBytes   = 32;
     static constexpr int kHeaderBytes = offsetof(block_iq4_xs, qs); // d, scales_h, scales_l: 8
     static constexpr int kBlockBytes  = sizeof(block_iq4_xs);       // 136
-    static constexpr bool kCpAsync    = false;
-    static constexpr int kStageUnit   = 2;
+    static constexpr bool kCpAsync    = true;
+    static constexpr int kStageUnit   = 8;
+    static constexpr int kHeaderUnit  = 8;
     static constexpr bool kCover      = false;
     static constexpr int kMinBlocks   = 2;
     static constexpr int kKMultiple   = QK_K;
@@ -909,10 +913,10 @@ struct GgmlIq4XsPrefill {
         const int ls = ((lo >> (4 * (index & 1))) & 0x0F) | (((high >> (2 * index)) & 0x03) << 4);
         return make_float2(d * static_cast<float>(ls - 32), 0.0f);
     }
-    /// Sixteen-byte chunk `chunk` of the tile's 32 `qs` bytes.
+    /// Eight-byte unit `chunk` of the tile's 32 `qs` bytes.
     __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
         return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_iq4_xs, qs) +
-               32 * (tile % kTilesPerBlock) + 16 * chunk;
+               32 * (tile % kTilesPerBlock) + kStageUnit * chunk;
     }
     __device__ static __forceinline__ int header_offset(int tile) {
         return (tile / kTilesPerBlock) * kBlockBytes;

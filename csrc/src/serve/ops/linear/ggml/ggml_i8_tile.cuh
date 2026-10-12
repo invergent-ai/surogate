@@ -41,6 +41,17 @@ template <class Codec>
     }
 }
 
+/// Bytes one header staging item moves: the codec's own `kHeaderUnit` where it declares one, else
+/// sixteen on the `cp_async` route and two on the scalar one.
+template <class Codec>
+[[nodiscard]] constexpr int header_unit() {
+    if constexpr (requires { Codec::kHeaderUnit; }) {
+        return Codec::kHeaderUnit;
+    } else {
+        return Codec::kCpAsync ? 16 : 2;
+    }
+}
+
 __device__ __forceinline__ const std::uint8_t* align_down16(const std::uint8_t* p) {
     return reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(p) &
                                                  ~std::uintptr_t{15});
@@ -104,8 +115,11 @@ __device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const std::
 #pragma unroll
                 for (int i = 0; i < 8; ++i) { out[i] = 2 * i < bytes ? in[i] : 0; }
             }
-        } else {
+        } else if constexpr (header_unit<Codec>() == 16) {
             cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
+        } else {
+            constexpr int Unit = header_unit<Codec>();
+            cp_async<Unit, Cache::ca>(dst + Unit * unit, src + Unit * unit);
         }
     } else {
         reinterpret_cast<std::uint16_t*>(dst)[unit] =
@@ -157,7 +171,8 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
     // 32-value block format such as Q8_0. The caller's dispatch guarantees it.
     {
     constexpr int TileUnits   = Codec::kTileBytes / Codec::kStageUnit;
-    constexpr int HeaderUnits = Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
+    constexpr int HeaderUnits = Codec::kHeaderBytes / header_unit<Codec>();
+    static_assert(Codec::kHeaderBytes % header_unit<Codec>() == 0, "a whole number of header units");
     // A codec's scale table is indexed by the 32- (or 16-) value group's position inside the
     // run one refresh covers, so its group count is that run's worth of groups and no more.
     static_assert(Codec::kScaleGroups ==
