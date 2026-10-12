@@ -2572,6 +2572,11 @@ int verify_fp8_wide_prompts() {
             if (run.fp8_query && !fp8_query) { continue; }
             ops::set_batch_invariant(run.invariant);
             ops::set_prompt_attention_fp8_query(run.fp8_query);
+            // On sm_12x the FP8 query-key product over 128- and 256-wide heads without a window
+            // takes the probabilities in e4m3 as well (ops::prompt_attention_fp8_pv): FA3's FP8
+            // rounding, held to its bound.
+            const bool pv_fp8 = run.fp8_query && major == 12 && dim <= 256 && c.window == 0 &&
+                                ops::prompt_attention_fp8_pv();
             Tensor out = arena.alloc(DType::BF16, {dim, heads, c.tokens});
             WorkspaceArena scratch(std::max<std::size_t>(256, ops::gqa_attention_workspace_capacity_bytes(
                 dim, heads, kv_heads, cache.dtype, envelope, 1, c.tokens, c.tokens)));
@@ -2582,14 +2587,16 @@ int verify_fp8_wide_prompts() {
             const bool flash = !run.invariant && major == 9 && c.tokens >= 32 && dim <= 256;
             const bool kernel = !run.invariant && !flash && c.tokens >= 64;
             const bool q8 = kernel && run.fp8_query;
+            const bool p8 = q8 && pv_fp8;
             const std::string label = std::string("fp8 wide prompt ") + c.geometry.name +
                                       " T=" + std::to_string(c.tokens) + " keys=" + std::to_string(keys) +
                                       " window=" + std::to_string(c.window) +
-                                      (flash ? " flash-attention-3" : q8 ? " prompt kernel fp8 query" :
+                                      (flash ? " flash-attention-3" : p8 ? " prompt kernel fp8 query and probabilities" :
+                                       q8 ? " prompt kernel fp8 query" :
                                        kernel ? " prompt kernel" : " tiles");
             failures += verify_attention(label, bf16_bits_to_double(from_device<std::uint16_t>(out.data, out.numel())),
                                          q8 ? reference_q8 : reference,
-                                         flash ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
+                                         flash || p8 ? kAttentionFp8QueryCriterion : kAttentionBf16Criterion);
         }
     }
     return failures;

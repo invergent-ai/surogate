@@ -90,6 +90,27 @@ __global__ void gqa_attention_generic_kernel(
     }
 }
 
+// The e4m3 P V product reads V's codes with ldmatrix .b8, an sm_12x instruction: whether the
+// current device is one, once per device.
+bool device_is_sm12x() noexcept {
+    static std::atomic<int> known[64] = {}; // 0 unread, 1 no, 2 yes
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    int state = known[device].load(std::memory_order_relaxed);
+    if (state == 0) {
+        int major = 0;
+        const bool read =
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess;
+        if (!read) { (void)cudaGetLastError(); }
+        state = read && major == 12 ? 2 : 1;
+        known[device].store(state, std::memory_order_relaxed);
+    }
+    return state == 2;
+}
+
 template <typename Visitor>
 void dispatch_prompt_geometry(int dim, int queries, int kv, Visitor&& visitor) {
     if (gqa_shape_is_registered(dim, queries, kv)) {
@@ -215,12 +236,13 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         // the attention is longest.
         // With per-tile block lists (one sequence's chunk, qsa_tile_union) it reads only the
         // blocks the tile's rows selected, instead of every key up to the tile's last query.
-        const auto launch = [&]<bool Sparse, bool QkFp8, bool Gather>() {
+        const auto launch = [&]<bool Sparse, bool QkFp8, bool Gather, bool PvFp8 = false>() {
+            // The e4m3 P V kernel's second code slots take the bf16 V tile's bytes: the same arena.
             constexpr int bytes =
                 QkFp8 ? kGqaPrefillFp8QkSmemBytes<Geometry::HeadDim> : kFp8SmemBytes;
             const auto kernel =
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, Sparse, 4,
-                                                  QkFp8, Gather>;
+                                                  QkFp8, Gather, PvFp8>;
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
             if constexpr (QkFp8) {
@@ -238,13 +260,33 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         };
         const bool gather = selection.tile_blocks != nullptr && selection.tile_counts != nullptr &&
                             selection.tile_rows == kGqaPrefillBr && selection.image_end == 0;
+        // The e4m3 P V product rides on the e4m3 Q K^T path's 32-key blocks and whole rows (128-
+        // and 256-wide heads), on an sm_12x GPU, for layers without a sliding window. A windowed
+        // layer reads at most its window of keys, so its prompt attention is cheap, and its few
+        // keys average P's e4m3 rounding the least. MEASURED (DGX Spark): with the window included,
+        // Gemma 4 12B's own 900-token answer given a 93,832-token document scored +0.017 +- 0.011
+        // nats (paired), top-1 agreement 94.3%; Surogate3.7-35B-A3B, which has no windowed layer,
+        // -0.001 +- 0.005 and 95.9%.
+        constexpr bool kPvFp8Capable = kGqaPrefillBcFor<Geometry::HeadDim> == 32 &&
+                                       kGqaPrefillOutSplit<Geometry::HeadDim> == 1;
+        const bool pv_fp8 = kPvFp8Capable && metadata.window <= 0 &&
+                            ::sinfer::ops::prompt_attention_fp8_pv() && device_is_sm12x();
         const auto launch_sparse = [&]<bool QkFp8>() {
+            const auto pick = [&]<bool Sparse, bool Gather>() {
+                if constexpr (QkFp8 && kPvFp8Capable) {
+                    if (pv_fp8) {
+                        launch.template operator()<Sparse, QkFp8, Gather, true>();
+                        return;
+                    }
+                }
+                launch.template operator()<Sparse, QkFp8, Gather>();
+            };
             if (selection.words == nullptr) {
-                launch.template operator()<false, QkFp8, false>();
+                pick.template operator()<false, false>();
             } else if (gather) {
-                launch.template operator()<true, QkFp8, true>();
+                pick.template operator()<true, true>();
             } else {
-                launch.template operator()<true, QkFp8, false>();
+                pick.template operator()<true, false>();
             }
         };
         if constexpr (kGqaPrefillFp8QkRegistered<Geometry::HeadDim>) {
@@ -555,6 +597,14 @@ bool prompt_attention_fp8_query_wide() noexcept {
         return text == nullptr || std::string_view(text) != "0";
     }();
     return enabled;
+}
+
+bool prompt_attention_fp8_pv() noexcept {
+    static const bool enabled = [] {
+        const char* text = std::getenv("SUROGATE_SERVE_PROMPT_ATTENTION_FP8_PV");
+        return text == nullptr || std::string_view(text) != "0";
+    }();
+    return enabled && prompt_attention_fp8_query();
 }
 
 } // namespace sinfer::ops

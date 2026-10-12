@@ -272,7 +272,8 @@ void gqa_attention_packed_prompts(const Tensor& q, const Tensor& k, const Tensor
  * Prompt attention over an e4m3 cache takes its query-key product in FP8 (PATCHES.md #119). Where
  * the tensor-core prompt kernel serves a prompt (every GPU but Hopper, at head dim 128, 256 or 512),
  * each query row is rounded to e4m3 against its own absolute maximum and multiplies the cache's K
- * codes on the e4m3 tensor cores at twice the bf16 rate; the probabilities still meet V in bf16.
+ * codes on the e4m3 tensor cores at twice the bf16 rate; the probabilities meet V in bf16, or in
+ * e4m3 on sm_12x (prompt_attention_fp8_pv below).
  * Hopper's FlashAttention-3 FP8 kernel already rounds its queries (and probabilities) to e4m3.
  * On by default; SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK=0 starts the process with the bf16
  * product. Process-wide; a relaxed atomic, read at each launch.
@@ -282,5 +283,10 @@ void set_prompt_attention_fp8_query(bool enabled) noexcept;
 /// Whether 512-wide heads take the FP8 query-key product too (on by default);
 /// SUROGATE_SERVE_PROMPT_ATTENTION_FP8_QK_WIDE=0 keeps them on the bf16 one.
 [[nodiscard]] bool prompt_attention_fp8_query_wide() noexcept;
+/// Whether the probabilities meet V in e4m3 too, where the FP8 query-key product runs over 32-key
+/// blocks (128- and 256-wide heads) on an sm_12x GPU, in layers without a sliding window: P is
+/// rounded to e4m3 and multiplies V's codes as the cache holds them. SUROGATE_SERVE_PROMPT_ATTENTION_FP8_PV=0 keeps that product in
+/// bf16 over V widened to bf16.
+[[nodiscard]] bool prompt_attention_fp8_pv() noexcept;
 
 } // namespace sinfer::ops
