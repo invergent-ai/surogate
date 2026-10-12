@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
+#include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
@@ -12,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -353,6 +356,114 @@ __global__ void finish_kernel(const __nv_bfloat16* __restrict__ residual,
     inject[static_cast<std::int64_t>(token) * streams + row] = 2.0F * sigmoid(total * mean_scale);
 }
 
+// The wide mixer's up projection and finish in one pass, for BF16 up rows and four streams: a
+// block computes the gate logits of 32 hidden indices x four streams for 64 tokens on the tensor
+// cores and finishes them from its registers, so the [T, streams * hidden] gate plane is neither
+// written nor read back (at 4,096 tokens and hidden 2,560 that is 84 MB each way, twice a
+// layer). Each gate is rounded to BF16 before its sigmoid, as the stored plane was, and the
+// finish is finish_kernel's arithmetic; only the logits' sums run in the MMA's order instead of
+// cuBLASLt's.
+constexpr int kUpHidden = 32;            // hidden indices a block (x 4 streams = 128 gate rows)
+constexpr int kUpTokens = 64;
+constexpr int kUpK      = 32;            // rank values a stage
+constexpr int kUpStride = kUpK + 8;      // BF16 row stride (80 bytes): conflict-free ldmatrix
+constexpr int kUpMinTokens = 128;        // narrower rounds keep cuBLASLt and finish_kernel
+
+__global__ void __launch_bounds__(256) up_finish_kernel(
+    const __nv_bfloat16* __restrict__ low, const __nv_bfloat16* __restrict__ up,
+    const __nv_bfloat16* __restrict__ residual, const float* __restrict__ gamma,
+    const float* __restrict__ inv, const float* __restrict__ inject_partial, int hidden, int rank,
+    int tokens, __nv_bfloat16* __restrict__ mixed, float* __restrict__ inject) {
+    constexpr int S = 4;
+    __shared__ __align__(16) __nv_bfloat16 As[2][S * kUpHidden * kUpStride];
+    __shared__ __align__(16) __nv_bfloat16 Bs[2][kUpTokens * kUpStride];
+    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+    const int gid = lane >> 2, lid = lane & 3;
+    const int d0 = static_cast<int>(blockIdx.x) * kUpHidden;
+    const int t0 = static_cast<int>(blockIdx.y) * kUpTokens;
+    const int j = warp & 1, q = warp >> 1; // 16 hidden indices x 16 tokens a warp, four streams
+    const int width = S * hidden;
+
+    auto stage = [&](int buf, int k0) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) { // 128 rows x four 16-byte pieces
+            const int item = tid + i * 256;
+            const int row = item >> 2, piece = item & 3;
+            const int s = row / kUpHidden, d = row - s * kUpHidden;
+            cp_async<16, Cache::cg>(&As[buf][row * kUpStride + 8 * piece],
+                                    up + static_cast<std::int64_t>(s * hidden + d0 + d) * rank + k0 + 8 * piece);
+        }
+        { // 64 tokens x four pieces
+            const int t = tid >> 2, piece = tid & 3;
+            const bool valid = t0 + t < tokens;
+            cp_async_zfill<16, Cache::cg>(&Bs[buf][t * kUpStride + 8 * piece],
+                low + (valid ? static_cast<std::int64_t>(t0 + t) * rank + k0 + 8 * piece : 0), valid ? 16 : 0);
+        }
+    };
+
+    float acc[S][2][4] = {};
+    const int steps = rank / kUpK;
+    stage(0, 0);
+    cp_commit();
+    for (int step = 0; step < steps; ++step) {
+        const int buf = step & 1;
+        cp_wait<0>();
+        __syncthreads();
+        if (step + 1 < steps) { stage(buf ^ 1, (step + 1) * kUpK); }
+        cp_commit();
+#pragma unroll
+        for (int kk = 0; kk < kUpK; kk += 16) {
+            unsigned b[4];
+            {
+                const int m = lane >> 3;
+                const int t = 16 * q + (m >> 1) * 8 + (lane & 7);
+                ldmatrix_x4(b[0], b[1], b[2], b[3],
+                            smem_addr(&Bs[buf][t * kUpStride + kk + (m & 1) * 8]));
+            }
+#pragma unroll
+            for (int s = 0; s < S; ++s) {
+                unsigned a0, a1, a2, a3;
+                const int m = lane >> 3;
+                const int row = s * kUpHidden + 16 * j + (m & 1) * 8 + (lane & 7);
+                ldmatrix_x4(a0, a1, a2, a3, smem_addr(&As[buf][row * kUpStride + kk + (m >> 1) * 8]));
+                mma_bf16(acc[s][0][0], acc[s][0][1], acc[s][0][2], acc[s][0][3], a0, a1, a2, a3, b[0], b[1]);
+                mma_bf16(acc[s][1][0], acc[s][1][1], acc[s][1][2], acc[s][1][3], a0, a1, a2, a3, b[2], b[3]);
+            }
+        }
+    }
+
+    const float mean_scale = 1.0F / static_cast<float>(S);
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int d = d0 + 16 * j + gid + 8 * (e >> 1);
+            const int t = t0 + 16 * q + 8 * nt + 2 * lid + (e & 1);
+            if (t >= tokens) { continue; }
+            const std::int64_t base = static_cast<std::int64_t>(t) * width;
+            float sum = 0.0F;
+#pragma unroll
+            for (int s = 0; s < S; ++s) {
+                const float logit = __bfloat162float(__float2bfloat16_rn(acc[s][nt][e]));
+                const float n = __bfloat162float(residual[base + s * hidden + d]) * inv[t * S + s] *
+                                gamma[s * hidden + d];
+                sum = fmaf(sigmoid(logit), n, sum);
+            }
+            mixed[static_cast<std::int64_t>(t) * hidden + d] = __float2bfloat16_rn(sum * mean_scale);
+        }
+    }
+    if (inject != nullptr && blockIdx.x == 0) {
+        const int t = t0 + (tid >> 2), row = tid & 3;
+        if (t < tokens) {
+            float total = 0.0F;
+            for (int s = 0; s < S; ++s) {
+                total += inject_partial[(static_cast<std::int64_t>(t) * S + s) * S + row];
+            }
+            inject[static_cast<std::int64_t>(t) * S + row] = 2.0F * sigmoid(total * mean_scale);
+        }
+    }
+}
+
 __global__ void combine_kernel(const float* __restrict__ extra,
                                const __nv_bfloat16* __restrict__ block_output,
                                const float* __restrict__ inject, int hidden, int streams,
@@ -406,6 +517,15 @@ unsigned grid_for(std::int64_t count) {
 }
 
 bool is_w8(const Weight& weight) { return weight.qtype == QType::W8G32_F16S; }
+
+// SUROGATE_SERVE_HC_UP_FINISH=0 keeps the wide mixer on cuBLASLt's up projection and finish_kernel.
+bool up_finish_allowed() {
+    static const bool allowed = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_HC_UP_FINISH");
+        return raw == nullptr || *raw == '\0' || std::string(raw) != "0";
+    }();
+    return allowed;
+}
 
 // The low-rank projections are BF16 or W8 row-split; the inject rows are read by the norm
 // kernel and stay BF16.
@@ -655,6 +775,19 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
             static_cast<__nv_bfloat16*>(low.data), low_count, low_scale);
     }
     CUDA_CHECK(cudaGetLastError());
+    if (streams == 4 && !is_w8(weights.up) && tokens >= kUpMinTokens && (hidden % kUpHidden) == 0 &&
+        (low_rank % kUpK) == 0 && up_finish_allowed()) {
+        const dim3 grid(static_cast<unsigned>(hidden / kUpHidden),
+                        static_cast<unsigned>((tokens + kUpTokens - 1) / kUpTokens));
+        up_finish_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(low.data),
+            static_cast<const __nv_bfloat16*>(weights.up.qdata), residual_data, gamma,
+            static_cast<const float*>(inv.data), static_cast<const float*>(shares.data), hidden,
+            low_rank, tokens, static_cast<__nv_bfloat16*>(mixed.data),
+            inject != nullptr ? static_cast<float*>(inject->data) : nullptr);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (w8_direct(weights.up, tokens, 1)) {
         w8_projection(weights.up, low, 1, nullptr, static_cast<__nv_bfloat16*>(gate.data), stream);
     } else {

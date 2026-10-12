@@ -250,6 +250,10 @@ int main() {
         // a prefill round.
         {4, 2560, 320, 1, 31u, "hc decode, 4 streams x 2560"},
         {4, 2560, 320, 37, 37u, "hc prefill 37 tokens"},
+        // Prompt widths on the fused up projection and finish (128 tokens and up), the last
+        // token tile ragged.
+        {4, 2560, 320, 130, 89u, "hc fused up/finish 130 tokens"},
+        {4, 2560, 320, 300, 97u, "hc fused up/finish 300 tokens"},
         // A hidden width that is not a multiple of the block, and the geometry's other ends.
         {2, 1032, 64, 5, 41u, "hc two streams, ragged hidden"},
         {3, 768, 32, 3, 43u, "hc three streams"},
