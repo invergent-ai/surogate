@@ -44,6 +44,32 @@ bool ggml_q3k_gate_vetoed() noexcept {
     static const bool vetoed = env_vetoed("SUROGATE_SERVE_MOE_GGML_Q3K");
     return vetoed;
 }
+/// The i-quants (IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ2_XXS, IQ1_M) on the int8 route, on
+/// either side (wide BF16 route when vetoed).
+bool ggml_iq_vetoed() noexcept {
+    static const bool vetoed = env_vetoed("SUROGATE_SERVE_MOE_GGML_IQ");
+    return vetoed;
+}
+/// The i-quants admitted to the prefill family at all; vetoed, their pairs keep the small-T
+/// slices they took before.
+bool ggml_iq_prefill_vetoed() noexcept {
+    static const bool vetoed = env_vetoed("SUROGATE_SERVE_MOE_GGML_IQ_PREFILL");
+    return vetoed;
+}
+bool is_iq(QType qtype) noexcept {
+    switch (qtype) {
+    case QType::IQ4_NL:
+    case QType::IQ4_XS:
+    case QType::IQ3_XXS:
+    case QType::IQ3_S:
+    case QType::IQ2_S:
+    case QType::IQ2_XXS:
+    case QType::IQ1_M:
+        return true;
+    default:
+        return false;
+    }
+}
 
 /// The three K-quants with a hand codec on both prefill routes: the pairs served first.
 bool is_ggml_k_hand(QType qtype) noexcept {
@@ -58,10 +84,12 @@ bool is_ggml_k_hand(QType qtype) noexcept {
 /// one otherwise), and every registered geometry's reduction axes are multiples of 64.
 ///
 /// Only formats covered by `test_sparse_moe_ggml_prefill.cpp`: the published
-/// Gemma 4 mixtures and Flash-Next's Q2_0 routed experts. Q2_K, Q4_0, Q4_1, IQ4_NL and F16 decode on
-/// the same generic codec and would very likely be right, but no artifact here holds experts
-/// in them and nothing measures them, so they keep the small-T slices; to admit one, add its
-/// fixture and mixture to that test and its case here.
+/// Gemma 4 mixtures, Flash-Next's Q2_0 routed experts, and the i-quants of the GSQ-RCO Flash-Next
+/// GGUFs (IQ4_NL down; IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ2_XXS and IQ1_M gate/up), which until
+/// then ran every prompt on the small-T slices at about 200 tokens a second. Q2_K, Q4_0, Q4_1 and
+/// F16 decode on the same generic codec and would very likely be right, but no artifact here
+/// holds experts in them and nothing measures them, so they keep the small-T slices; to admit
+/// one, add its fixture and mixture to that test and its case here.
 std::int32_t ggml_prefill_k_multiple(QType qtype) noexcept {
     switch (qtype) {
     case QType::Q3_K:
@@ -74,6 +102,15 @@ std::int32_t ggml_prefill_k_multiple(QType qtype) noexcept {
     case QType::Q5_0:
     case QType::Q5_1:
         return 64;
+    case QType::IQ4_NL:
+        return ggml_iq_prefill_vetoed() ? 0 : 64;
+    case QType::IQ4_XS:
+    case QType::IQ3_XXS:
+    case QType::IQ3_S:
+    case QType::IQ2_S:
+    case QType::IQ2_XXS:
+    case QType::IQ1_M:
+        return ggml_iq_prefill_vetoed() ? 0 : 256;
     default:
         return 0;
     }
@@ -141,7 +178,7 @@ bool int8_codec_admitted(QType qtype, bool gate_up_side) noexcept {
     case QType::Q3_K:
         return gate_up_side && !ggml_q3k_gate_vetoed();
     default:
-        return false;
+        return is_iq(qtype) && !ggml_iq_vetoed();
     }
 }
 

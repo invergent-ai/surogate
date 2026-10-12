@@ -17,6 +17,7 @@
 #include "ops/linear/ggml/ggml_blocks.h"
 #include "ops/linear/ggml/ggml_dequant.cuh"
 #include "ops/linear/ggml/ggml_moe_codec.cuh"
+#include "ops/linear/ggml/ggml_vecdot.cuh"
 
 #include <cuda_bf16.h>
 #include <cstddef>
@@ -768,6 +769,341 @@ struct GgmlQ3KPrefill {
     }
 };
 
+// ---------------------------------------------------------------------------------------------
+// The i-quants on the int8 tensor-core route. Every one of them is `w = scale * code` with a
+// small signed integer code per value and one scale per 32 (or 16) values, which is all the
+// route asks: a codebook format's code is its grid level with the sign applied (IQ2/IQ3), or its
+// table level (IQ4); IQ1_M's +-1/8 offset becomes an integer once the scale takes the eighth.
+// The codes are what llama.cpp's MMQ feeds its int8 MMAs, decoded here the way this engine's
+// decode-path dot products (ggml_vecdot.cuh) decode them. The BF16 route stays the generic
+// eight-value decoder (GgmlBlockPrefill).
+//
+// The superblock formats are 82 to 110 bytes and only two-byte aligned, so they are staged as
+// Q3_K is: the whole superblock as the "header", covered by sixteen-byte copies from the
+// rounded-down address, once per four tiles, with no per-tile stage.
+
+/// A word at a two-byte-aligned shared address: the two aligned words it straddles,
+/// funnel-shifted (as Q6_K and Q3_K read their covered spans).
+__device__ __forceinline__ unsigned iq_load_word(const std::uint8_t* p) {
+    const auto addr     = reinterpret_cast<std::uintptr_t>(p);
+    const auto* aligned = reinterpret_cast<const unsigned*>(addr & ~std::uintptr_t{3});
+    const unsigned sh   = static_cast<unsigned>(addr & 3u) * 8u;
+    const unsigned w0   = aligned[0];
+    const unsigned w1   = sh ? aligned[1] : 0u;
+    return __funnelshift_r(w0, w1, sh);
+}
+/// The four sign bits `n` (bit i for value i) as a byte mask, 0xFF where the value is negative.
+__device__ __forceinline__ unsigned iq_sign_bytes(unsigned n) {
+    // n * 0x00204081 puts bit i at bit 8i; the mask keeps exactly those four.
+    return __vcmpne4((n * 0x00204081u) & 0x01010101u, 0u);
+}
+/// Four unsigned grid levels with the bytes `negative` marks negated: (g ^ 0xFF) - 0xFF = -g,
+/// and __vsub4 does not borrow between bytes.
+__device__ __forceinline__ unsigned iq_signed(unsigned grid, unsigned negative) {
+    return __vsub4(grid ^ negative, negative);
+}
+/// The 32 codes of a sixteen-level table format (IQ4_NL, IQ4_XS) are sixteen `qs` bytes: low
+/// nibbles the first sixteen values, high nibbles the last. Quad `q` of them, as table levels.
+__device__ __forceinline__ unsigned iq4_quad(unsigned qs_word, int q) {
+    const int2 levels = table16_levels(static_cast<int>(qs_word), kIq4nlValues);
+    return static_cast<unsigned>(q < 4 ? levels.x : levels.y);
+}
+
+/// IQ4_NL: 32 values under one FP16 scale, four-bit codes into the sixteen-level table. Staged
+/// as Q8_0 is -- two 18-byte blocks to a 64-wide tile, scales in the tile, 4-byte units (a tile
+/// starts 36t into its row, a multiple of four and not of sixteen). This is the down projection
+/// of the GSQ-RCO Flash-Next GGUFs, 640 wide, which no 256-value superblock divides.
+struct GgmlIq4NlPrefill {
+    using Block = block_iq4_nl;
+    static constexpr int kBlockValues = QK4_NL;                                // 32
+    static constexpr int kBlockBytes  = sizeof(block_iq4_nl);                  // 18
+    static constexpr int kTileBytes   = (kPrefillTileK / QK4_NL) * kBlockBytes; // 36, exact
+    static constexpr int kHeaderBytes = 0;
+    static constexpr bool kCpAsync    = true;
+    static constexpr int kStageUnit   = 4;
+    static constexpr bool kCover      = false;
+    static constexpr int kMinBlocks   = 2;
+    static constexpr int kKMultiple   = kPrefillTileK;
+    __host__ __device__ static constexpr std::int64_t row_bytes(int K) {
+        return static_cast<std::int64_t>(K / kBlockValues) * kBlockBytes;
+    }
+    static_assert(kTileBytes % kStageUnit == 0, "the tile is a whole number of staged units");
+
+    // ---- the int8 tensor-core route ----
+    static constexpr int kTileStride    = 40; // ten words: a multiple of four past the 36 bytes
+    static constexpr int kHeaderStride  = 16; // unused; one unit keeps the array well-formed
+    static constexpr int kScaleGroups   = 2;
+    static constexpr int kScaleWidth    = 32;
+    static constexpr int kScaleTiles    = 1;
+    static constexpr bool kScalesInTile = true;
+    static constexpr bool kHasMin       = false;
+
+    /// Block 0's `qs` sit two bytes above a word and block 1's on one: halfword loads read both.
+    __device__ static __forceinline__ unsigned qs_word(const std::uint8_t* p) {
+        const auto* h = reinterpret_cast<const std::uint16_t*>(p);
+        return static_cast<unsigned>(h[0]) | (static_cast<unsigned>(h[1]) << 16);
+    }
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)header;
+        (void)tile_in_block;
+        const int j = offsetof(block_iq4_nl, qs) + 4 * (q & 3);
+        lo = iq4_quad(qs_word(tile + j), q);
+        hi = iq4_quad(qs_word(tile + kBlockBytes + j), q);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* tile, int index) {
+        return make_float2(
+            __half2float(*reinterpret_cast<const __half*>(tile + kBlockBytes * index)), 0.0f);
+    }
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        return tile * kTileBytes + kStageUnit * chunk;
+    }
+    __device__ static __forceinline__ int header_offset(int tile) { return tile * kTileBytes; }
+};
+
+/// IQ4_XS: IQ4_NL's table over a 136-byte superblock, a six-bit scale per 32 (`ls - 32`, low
+/// nibbles in `scales_l`, two high bits each in `scales_h`). A 64-wide tile is 32 `qs` bytes,
+/// the first sixteen one sub-block's and the next sixteen the other's; the header is the eight
+/// bytes ahead of `qs`. Superblocks are eight-byte aligned only, so this one stages through the
+/// scalar two-byte route: it is one layer of the GSQ-RCO builds, not worth a covered stage.
+struct GgmlIq4XsPrefill {
+    using Block = block_iq4_xs;
+    static constexpr int kTileBytes   = 32;
+    static constexpr int kHeaderBytes = offsetof(block_iq4_xs, qs); // d, scales_h, scales_l: 8
+    static constexpr int kBlockBytes  = sizeof(block_iq4_xs);       // 136
+    static constexpr bool kCpAsync    = false;
+    static constexpr int kStageUnit   = 2;
+    static constexpr bool kCover      = false;
+    static constexpr int kMinBlocks   = 2;
+    static constexpr int kKMultiple   = QK_K;
+    __host__ __device__ static constexpr std::int64_t row_bytes(int K) {
+        return static_cast<std::int64_t>(K / QK_K) * kBlockBytes;
+    }
+
+    // ---- the int8 tensor-core route ----
+    static constexpr int kTileStride    = 48;
+    static constexpr int kHeaderStride  = 16;
+    static constexpr int kScaleGroups   = 8;
+    static constexpr int kScaleWidth    = 32;
+    static constexpr int kScaleTiles    = kTilesPerBlock;
+    static constexpr bool kScalesInTile = false;
+    static constexpr bool kHasMin       = false;
+
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)header;
+        (void)tile_in_block;
+        const int j = 4 * (q & 3);
+        lo = iq4_quad(*reinterpret_cast<const unsigned*>(tile + j), q);
+        hi = iq4_quad(*reinterpret_cast<const unsigned*>(tile + 16 + j), q);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const float d         = __half2float(*reinterpret_cast<const __half*>(header));
+        const unsigned high   = *reinterpret_cast<const std::uint16_t*>(header + offsetof(block_iq4_xs, scales_h));
+        const std::uint8_t lo = header[offsetof(block_iq4_xs, scales_l) + index / 2];
+        const int ls = ((lo >> (4 * (index & 1))) & 0x0F) | (((high >> (2 * index)) & 0x03) << 4);
+        return make_float2(d * static_cast<float>(ls - 32), 0.0f);
+    }
+    /// Sixteen-byte chunk `chunk` of the tile's 32 `qs` bytes.
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_iq4_xs, qs) +
+               32 * (tile % kTilesPerBlock) + 16 * chunk;
+    }
+    __device__ static __forceinline__ int header_offset(int tile) {
+        return (tile / kTilesPerBlock) * kBlockBytes;
+    }
+};
+
+/// The covered whole-superblock stage the two-byte-aligned i-quants share (Q3_K's): `Units`
+/// sixteen-byte copies reach the `Payload` bytes from any even offset below sixteen.
+template <class B, int Units>
+struct GgmlIqCoveredStage {
+    using Block = B;
+    static constexpr int kTileBytes          = 0; // nothing per tile: the readers use the header
+    static constexpr int kHeaderBytes        = 16 * Units;
+    static constexpr int kHeaderPayloadBytes = sizeof(B);
+    static constexpr int kBlockBytes         = sizeof(B);
+    static constexpr bool kCpAsync           = true;
+    static constexpr int kStageUnit          = 16;
+    static constexpr bool kCover             = true;
+    static constexpr int kMinBlocks          = 2;
+    static constexpr int kKMultiple          = QK_K;
+    static_assert(kHeaderBytes >= kHeaderPayloadBytes + 14, "the cover reaches from any even offset");
+    __host__ __device__ static constexpr std::int64_t row_bytes(int K) {
+        return static_cast<std::int64_t>(K / QK_K) * kBlockBytes;
+    }
+    static constexpr int kTileStride    = 16;  // unused, as Q3_K's
+    static constexpr int kHeaderStride  = 160; // Q3_K's forty words
+    static constexpr int kScaleTiles    = kTilesPerBlock;
+    static constexpr bool kScalesInTile = false;
+    static constexpr bool kHasMin       = false;
+    /// Never reached (no per-tile units); kept so the codec has the full interface.
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        (void)chunk;
+        return (tile / kTilesPerBlock) * kBlockBytes;
+    }
+    __device__ static __forceinline__ int header_offset(int tile) {
+        return (tile / kTilesPerBlock) * kBlockBytes;
+    }
+    __device__ static __forceinline__ float block_scale(const std::uint8_t* block) {
+        return __half2float(*reinterpret_cast<const __half*>(block));
+    }
+};
+
+/// IQ3_XXS (98 bytes): per 32 values, eight one-byte indices into a grid of four-level rows, and
+/// one word holding four seven-bit sign groups (the eighth sign is the parity) and a four-bit
+/// scale, `(2 ls + 1) / 4`.
+struct GgmlIq3XxsPrefill : GgmlIqCoveredStage<block_iq3_xxs, 7> {
+    static constexpr int kScaleGroups = 8;
+    static constexpr int kScaleWidth  = 32;
+    static constexpr int kQs          = offsetof(block_iq3_xxs, qs);
+    __device__ static __forceinline__ unsigned quad(const std::uint8_t* block, int sub, int q) {
+        const unsigned grid    = kIq3xxsGrid[block[kQs + 8 * sub + q]];
+        const unsigned aux32   = iq_load_word(block + kQs + QK_K / 4 + 4 * sub);
+        const unsigned signs   = unpack_ksigns(static_cast<std::uint8_t>(aux32 >> (7 * (q >> 1))));
+        const unsigned negative = __vcmpne4(signs & ((q & 1) ? 0x80402010u : 0x08040201u), 0u);
+        return iq_signed(grid, negative);
+    }
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)tile;
+        lo = quad(header, 2 * tile_in_block, q);
+        hi = quad(header, 2 * tile_in_block + 1, q);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const unsigned aux32 = iq_load_word(header + kQs + QK_K / 4 + 4 * index);
+        const int ls         = static_cast<int>(aux32 >> 28);
+        return make_float2(block_scale(header) * static_cast<float>(2 * ls + 1) * 0.25f, 0.0f);
+    }
+};
+
+/// IQ3_S (110 bytes): per 32 values, eight nine-bit indices (eight bits in `qs`, the ninth in
+/// `qh`) into a grid of four-level rows, a sign bit per value, and a four-bit scale `1 + 2 s`.
+struct GgmlIq3SPrefill : GgmlIqCoveredStage<block_iq3_s, 8> {
+    static constexpr int kScaleGroups = 8;
+    static constexpr int kScaleWidth  = 32;
+    __device__ static __forceinline__ unsigned quad(const std::uint8_t* block, int sub, int q) {
+        const int qh            = block[offsetof(block_iq3_s, qh) + sub];
+        const int index         = block[offsetof(block_iq3_s, qs) + 8 * sub + q] | (((qh >> q) & 1) << 8);
+        const unsigned grid     = kIq3sGrid[index];
+        const unsigned signs    = block[offsetof(block_iq3_s, signs) + 4 * sub + (q >> 1)];
+        return iq_signed(grid, iq_sign_bytes((signs >> (4 * (q & 1))) & 0x0Fu));
+    }
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)tile;
+        lo = quad(header, 2 * tile_in_block, q);
+        hi = quad(header, 2 * tile_in_block + 1, q);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const int s = (header[offsetof(block_iq3_s, scales) + index / 2] >> (4 * (index & 1))) & 0x0F;
+        return make_float2(block_scale(header) * static_cast<float>(1 + 2 * s), 0.0f);
+    }
+};
+
+/// IQ2_S (82 bytes): per 32 values, four ten-bit indices (eight bits in the first half of `qs`,
+/// two in `qh`) into a grid of eight-level rows, a sign byte per row (the second half of `qs`),
+/// and two four-bit scales `(2 ls + 1) / 8`, one per sixteen values -- so sixteen-deep groups.
+struct GgmlIq2SPrefill : GgmlIqCoveredStage<block_iq2_s, 6> {
+    static constexpr int kScaleGroups = 16;
+    static constexpr int kScaleWidth  = 16;
+    static constexpr int kQs          = offsetof(block_iq2_s, qs);
+    __device__ static __forceinline__ unsigned quad(const std::uint8_t* block, int sub, int q) {
+        const int row         = q >> 1; // the grid row of eight values this quad is half of
+        const int qh          = block[offsetof(block_iq2_s, qh) + sub];
+        const int index       = block[kQs + 4 * sub + row] | (((qh >> (2 * row)) & 3) << 8);
+        const std::uint64_t r = kIq2sGrid[index];
+        const unsigned grid   = static_cast<unsigned>((q & 1) ? (r >> 32) : r);
+        const unsigned signs  = block[kQs + QK_K / 8 + 4 * sub + row];
+        return iq_signed(grid, iq_sign_bytes((signs >> (4 * (q & 1))) & 0x0Fu));
+    }
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)tile;
+        lo = quad(header, 2 * tile_in_block, q);
+        hi = quad(header, 2 * tile_in_block + 1, q);
+    }
+    /// `index` counts sixteen-value groups in the superblock: sub-block index / 2, its half
+    /// index % 2.
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const int ls = (header[offsetof(block_iq2_s, scales) + index / 2] >> (4 * (index & 1))) & 0x0F;
+        return make_float2(block_scale(header) * static_cast<float>(2 * ls + 1) * 0.125f, 0.0f);
+    }
+};
+
+/// IQ2_XXS (66 bytes): per 32 values, four one-byte indices into a grid of eight-level rows and
+/// one word of four seven-bit sign groups plus a four-bit scale `(2 ls + 1) / 8`.
+struct GgmlIq2XxsPrefill : GgmlIqCoveredStage<block_iq2_xxs, 5> {
+    static constexpr int kScaleGroups = 8;
+    static constexpr int kScaleWidth  = 32;
+    static constexpr int kQs          = offsetof(block_iq2_xxs, qs);
+    __device__ static __forceinline__ unsigned quad(const std::uint8_t* block, int sub, int q) {
+        const int row           = q >> 1;
+        const std::uint64_t r   = kIq2xxsGrid[block[kQs + 8 * sub + row]];
+        const unsigned grid     = static_cast<unsigned>((q & 1) ? (r >> 32) : r);
+        const unsigned aux32    = iq_load_word(block + kQs + 8 * sub + 4);
+        const unsigned signs    = unpack_ksigns(static_cast<std::uint8_t>(aux32 >> (7 * row)));
+        const unsigned negative = __vcmpne4(signs & ((q & 1) ? 0x80402010u : 0x08040201u), 0u);
+        return iq_signed(grid, negative);
+    }
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)tile;
+        lo = quad(header, 2 * tile_in_block, q);
+        hi = quad(header, 2 * tile_in_block + 1, q);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const unsigned aux32 = iq_load_word(header + kQs + 8 * index + 4);
+        const int ls         = static_cast<int>(aux32 >> 27) | 1;
+        return make_float2(block_scale(header) * static_cast<float>(ls) * 0.125f, 0.0f);
+    }
+};
+
+/// IQ1_M (56 bytes, eight-byte aligned): per 32 values, four eleven-bit indices (eight bits in
+/// `qs`, three in a nibble of `qh` whose fourth bit is the row's offset sign) into the 1-bit grid
+/// of eight levels in {0, 1, 2} standing for -1..1, a row offset of +-1/8, and two three-bit
+/// scales `2 s + 1` per 32 under a block scale spread over the scale words' top nibbles. A value
+/// is `dl * (g - 1 +- 1/8)`; times eight that is `8 g - 7` or `8 g - 9`, an exact int8 code, and
+/// the eighth goes to the scale.
+struct GgmlIq1MPrefill : GgmlIqCoveredStage<block_iq1_m, 5> {
+    static constexpr int kScaleGroups = 16;
+    static constexpr int kScaleWidth  = 16;
+    __device__ static __forceinline__ unsigned quad(const std::uint8_t* block, int sub, int q) {
+        const int row     = q >> 1;
+        const int nibble  = block[offsetof(block_iq1_m, qh) + 2 * sub + (row >> 1)] >> (4 * (row & 1));
+        const int index   = block[offsetof(block_iq1_m, qs) + 4 * sub + row] | ((nibble & 7) << 8);
+        const unsigned g  = (kIq1sGridGpu[index] >> (4 * (q & 1))) & 0x0F0F0F0Fu;
+        return __vsub4(g << 3, (nibble & 8) ? 0x09090909u : 0x07070707u);
+    }
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)tile;
+        lo = quad(header, 2 * tile_in_block, q);
+        hi = quad(header, 2 * tile_in_block + 1, q);
+    }
+    __device__ static __forceinline__ float block_scale(const std::uint8_t* block) {
+        const auto* sc = reinterpret_cast<const std::uint16_t*>(block + offsetof(block_iq1_m, scales));
+        const unsigned short u = static_cast<unsigned short>((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) |
+                                                             ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+        return __half2float(__ushort_as_half(u));
+    }
+    /// `index` counts sixteen-value groups: sub-block index / 2 picks the six bits of the scale
+    /// word, index % 2 which three.
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const auto* sc = reinterpret_cast<const std::uint16_t*>(header + offsetof(block_iq1_m, scales));
+        const int sub  = index / 2;
+        const int s    = (sc[sub / 2] >> (6 * (sub % 2) + 3 * (index & 1))) & 0x07;
+        return make_float2(block_scale(header) * static_cast<float>(2 * s + 1) * 0.125f, 0.0f);
+    }
+};
+
 /// The prefill codec of a stored format: the three K-quants with hand codecs (and the int8
 /// tensor-core route); Q3_K, Q8_0, Q5_0 and Q5_1 with a hand codec on the int8 route only;
 /// everything else the generic BF16 route.
@@ -810,5 +1146,20 @@ template <> struct PrefillCodecFor<GgmlType::Q3_K> {
     using Int8Codec = GgmlQ3KPrefill;
     static constexpr bool kInt8Route = true;
 };
+// The i-quants: the generic BF16 decoder, and their own int8 codecs.
+#define SINFER_IQ_PREFILL_CODEC(NAME, INT8)                                                        \
+    template <> struct PrefillCodecFor<GgmlType::NAME> {                                           \
+        using Codec     = GgmlBlockPrefill<GgmlType::NAME>;                                        \
+        using Int8Codec = INT8;                                                                    \
+        static constexpr bool kInt8Route = true;                                                   \
+    };
+SINFER_IQ_PREFILL_CODEC(IQ4_NL, GgmlIq4NlPrefill)
+SINFER_IQ_PREFILL_CODEC(IQ4_XS, GgmlIq4XsPrefill)
+SINFER_IQ_PREFILL_CODEC(IQ3_XXS, GgmlIq3XxsPrefill)
+SINFER_IQ_PREFILL_CODEC(IQ3_S, GgmlIq3SPrefill)
+SINFER_IQ_PREFILL_CODEC(IQ2_S, GgmlIq2SPrefill)
+SINFER_IQ_PREFILL_CODEC(IQ2_XXS, GgmlIq2XxsPrefill)
+SINFER_IQ_PREFILL_CODEC(IQ1_M, GgmlIq1MPrefill)
+#undef SINFER_IQ_PREFILL_CODEC
 
 } // namespace sinfer::ops::detail::ggml

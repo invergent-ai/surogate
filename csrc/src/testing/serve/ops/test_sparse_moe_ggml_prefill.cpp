@@ -215,10 +215,55 @@ std::vector<std::uint8_t> make_q2_0_blocks(std::int64_t rows, std::int32_t k, st
     return out;
 }
 
+/// The i-quants of the GSQ-RCO Flash-Next GGUFs. Every byte of a codebook format is a valid
+/// encoding -- a grid index of any value names a row of the grid, a sign or scale field any
+/// pattern -- so the bodies take the generator's bytes and only the FP16 block scale is chosen,
+/// each block its own, sized so a decoded value is about a quarter at most.
+template <class Block>
+std::vector<std::uint8_t> make_iq_blocks(std::int64_t rows, std::int32_t k, std::uint64_t seed,
+                                         int values, float d) {
+    const std::int64_t blocks = rows * (k / values);
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(blocks) * sizeof(Block));
+    Rng rng(seed);
+    for (std::int64_t i = 0; i < blocks; ++i) {
+        std::uint8_t* b = out.data() + static_cast<std::size_t>(i) * sizeof(Block);
+        for (std::size_t j = 0; j < sizeof(Block); ++j) { b[j] = static_cast<std::uint8_t>(rng.next()); }
+        const __half scale = __float2half_rn(d * spread(rng));
+        std::memcpy(b, &scale, sizeof(scale)); // `d` leads every one of these blocks
+    }
+    return out;
+}
+
+/// IQ1_M has no `d` field: its FP16 block scale is spread over the top nibbles of the four
+/// scale words, whose low twelve bits are the per-sixteen scales.
+std::vector<std::uint8_t> make_iq1_m_blocks(std::int64_t rows, std::int32_t k, std::uint64_t seed,
+                                            float d) {
+    const std::int64_t blocks = rows * (k / gg::QK_K);
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(blocks) * sizeof(gg::block_iq1_m));
+    auto* b = reinterpret_cast<gg::block_iq1_m*>(out.data());
+    Rng rng(seed);
+    for (std::int64_t i = 0; i < blocks; ++i) {
+        for (auto& v : b[i].qs) { v = static_cast<std::uint8_t>(rng.next()); }
+        for (auto& v : b[i].qh) { v = static_cast<std::uint8_t>(rng.next()); }
+        const __half scale = __float2half_rn(d * spread(rng));
+        std::uint16_t bits = 0;
+        std::memcpy(&bits, &scale, sizeof(bits));
+        std::uint16_t words[4];
+        for (int w = 0; w < 4; ++w) {
+            words[w] = static_cast<std::uint16_t>((rng.next() & 0x0FFFu) | (((bits >> (4 * w)) & 0xFu) << 12));
+        }
+        std::memcpy(b[i].scales, words, sizeof(words));
+    }
+    return out;
+}
+
 /// Values per stored block: 32 for the plain formats, 256 for a K-quant superblock.
 std::int32_t values_per_block(QType qtype) {
     if (qtype == QType::Q2_0) { return 64; }
-    return qtype == QType::Q8_0 || qtype == QType::Q5_0 || qtype == QType::Q5_1 ? 32 : 256;
+    return qtype == QType::Q8_0 || qtype == QType::Q5_0 || qtype == QType::Q5_1 ||
+                   qtype == QType::IQ4_NL
+               ? 32
+               : 256;
 }
 
 /// A tensor of `rows` x `k` in `qtype`, with the nominal scale chosen so a decoded value is
@@ -235,6 +280,13 @@ std::vector<std::uint8_t> make_blocks(QType qtype, std::int64_t rows, std::int32
     case QType::Q8_0: return make_q8_0_blocks(rows, k, seed, 0.0020F);   // 127 d
     case QType::Q5_0: return make_q5_0_blocks(rows, k, seed, 0.016F);    // 16 d
     case QType::Q5_1: return make_q5_1_blocks(rows, k, seed, 0.016F, -0.35F, -0.15F); // 31 d + m
+    case QType::IQ4_NL: return make_iq_blocks<gg::block_iq4_nl>(rows, k, seed, gg::QK4_NL, 0.0020F); // 127 d
+    case QType::IQ4_XS: return make_iq_blocks<gg::block_iq4_xs>(rows, k, seed, gg::QK_K, 0.00006F); // 32*127 d
+    case QType::IQ3_XXS: return make_iq_blocks<gg::block_iq3_xxs>(rows, k, seed, gg::QK_K, 0.0005F); // 7.75*62 d
+    case QType::IQ3_S: return make_iq_blocks<gg::block_iq3_s>(rows, k, seed, gg::QK_K, 0.0005F);     // 31*15 d
+    case QType::IQ2_S: return make_iq_blocks<gg::block_iq2_s>(rows, k, seed, gg::QK_K, 0.0015F);     // 3.9*43 d
+    case QType::IQ2_XXS: return make_iq_blocks<gg::block_iq2_xxs>(rows, k, seed, gg::QK_K, 0.0015F); // 3.9*43 d
+    case QType::IQ1_M: return make_iq1_m_blocks(rows, k, seed, 0.015F);                             // 15*1.1 d
     default: throw std::invalid_argument("no fixture for this format");
     }
 }
@@ -665,6 +717,20 @@ int main() {
 
     failures += run_native_shared();
     failures += run_mixture(flash_next, {47, 130, 801});
+    // The i-quant pairs the GSQ-RCO Flash-Next GGUFs hold (Swift-1.5's IQ3_S: IQ2_S, IQ3_XXS,
+    // IQ3_S or IQ4_XS gate/up over IQ4_NL or Q2_0 down; its IQ2_XS: IQ2_S, IQ2_XXS or IQ1_M over
+    // Q2_0), at Flash-Next's own bound.
+    const auto flash_next_iq = [&](const char* name, QType gate_up, QType down) {
+        return Mixture{name, ops::kSparseMoeFlashNextGeometry, gate_up, down,
+                       ops::GatedActivation::Silu, false, 0.02};
+    };
+    failures += run_mixture(flash_next_iq("Flash-Next IQ3_S/IQ4_NL", QType::IQ3_S, QType::IQ4_NL), {47, 130, 801, 2048});
+    failures += run_mixture(flash_next_iq("Flash-Next IQ3_XXS/IQ4_NL", QType::IQ3_XXS, QType::IQ4_NL), {47, 130, 801});
+    failures += run_mixture(flash_next_iq("Flash-Next IQ2_S/IQ4_NL", QType::IQ2_S, QType::IQ4_NL), {47, 130, 801});
+    failures += run_mixture(flash_next_iq("Flash-Next IQ4_XS/IQ4_NL", QType::IQ4_XS, QType::IQ4_NL), {47, 130, 801});
+    failures += run_mixture(flash_next_iq("Flash-Next IQ2_S/Q2_0", QType::IQ2_S, QType::Q2_0), {47, 130, 801});
+    failures += run_mixture(flash_next_iq("Flash-Next IQ2_XXS/Q2_0", QType::IQ2_XXS, QType::Q2_0), {47, 130, 801});
+    failures += run_mixture(flash_next_iq("Flash-Next IQ1_M/Q2_0", QType::IQ1_M, QType::Q2_0), {47, 130, 801});
     failures += run_mixture(qwen3, {47, 130, 801});
     failures += run_mixture(control, {47, 130, 801});
 
