@@ -1379,10 +1379,11 @@ void launch_d4_small_t_codec(const PreparedSparseMoeWeights& weights, Tensor& de
 
 } // namespace
 
-// SUROGATE_SERVE_MOE_ROUTE_STATS=<rounds>: how many distinct experts a small-T round's paths
+// SUROGATE_SERVE_MOE_ROUTE_STATS=<seconds>: how many distinct experts a small-T round's paths
 // name, against the paths themselves, by round width -- what an expert-major round would read
-// once where the per-path kernels read each path's weights. Printed to stderr every that many
-// rounds of a layer stack, cumulative; off (and free) unless set.
+// once where the per-path kernels read each path's weights. The counting kernel is recorded into
+// captured decode graphs like any other, so replays count too; the totals (cumulative) print to
+// stderr from an eager round at most every that many seconds. Off (and free) unless set.
 __global__ void sparse_moe_route_stats_kernel(const int* __restrict__ token_ids, int tokens,
                                               unsigned long long* __restrict__ counters) {
     constexpr int kWords = (kExperts + 31) / 32;
@@ -1418,10 +1419,15 @@ inline void sparse_moe_route_stats(const int* token_ids, std::int32_t tokens, cu
         CUDA_CHECK(cudaMemset(p, 0, 64 * 3 * sizeof(unsigned long long)));
         return p;
     }();
-    static long launches = 0;
     sparse_moe_route_stats_kernel<<<1, 256, 0, stream>>>(token_ids, tokens, counters);
     CUDA_CHECK(cudaGetLastError());
-    if (++launches % every != 0) { return; }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) { return; }
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(every)) { return; }
+    last = now;
     unsigned long long host[64 * 3];
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaMemcpy(host, counters, sizeof(host), cudaMemcpyDeviceToHost));

@@ -18,6 +18,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
