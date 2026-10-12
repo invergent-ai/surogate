@@ -232,7 +232,8 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                 }
             }
             if constexpr (Type != GgmlType::F16) {
-                if constexpr (DenseFormat<Type>::kWidth == 32 && !DenseFormat<Type>::kBias) {
+                if constexpr ((DenseFormat<Type>::kWidth == 32 || DenseFormat<Type>::kWidth == 16) &&
+                              !DenseFormat<Type>::kBias) {
                     // The group-major 64 x 128 tile, once a prompt fills the device with it.
                     const std::int32_t blocks = ((rows + gmajor::kRows - 1) / gmajor::kRows) *
                                                 ((tokens + gmajor::kCols - 1) / gmajor::kCols);

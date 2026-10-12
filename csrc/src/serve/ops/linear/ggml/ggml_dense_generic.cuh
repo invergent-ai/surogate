@@ -219,20 +219,22 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
 // the decode kernels', and dense_affine_mma_kernel's -- keeps eight accumulators per output,
 // one per group index modulo eight, each summed in K order, and adds them as
 // ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)). This kernel computes the same sums one
-// accumulator at a time: pass a takes groups a, a + 8, a + 16, ..., four to a step, and folds
-// its sum into the tree when the pass ends. A lane then holds one running sum and at most
-// three finished partials per output instead of eight, which is what lets a block hold 64 x
-// 128 outputs -- the weight tile decoded once for 128 columns, the activations read once per
-// 64 rows -- with the same bits as every other width. Width-32 formats without a min term.
+// accumulator at a time: pass a takes groups a, a + 8, a + 16, ..., 128 values of them to a
+// step (four 32-value groups or eight 16-value ones), and folds its sum into the tree when the
+// pass ends. A lane then holds one running sum and at most three finished partials per output
+// instead of eight, which is what lets a block hold 64 x 128 outputs -- the weight tile decoded
+// once for 128 columns, the activations read once per 64 rows -- with the same bits as every
+// other width. Formats without a min term.
 namespace gmajor {
 inline constexpr int kRows = 64, kCols = 128, kWarps = kCols / 8, kThreads = kWarps * 32;
-inline constexpr int kSteps = 4;                    // groups per step
-inline constexpr int kStride = kSteps * 32 + 16;    // int8 row stride, conflict-free ldmatrix
+inline constexpr int kStepValues = 128;                // K values of a class per step
+inline constexpr int kStride = kStepValues + 16;       // int8 row stride, conflict-free ldmatrix
+inline constexpr int kMaxSteps = kStepValues / 16;     // groups per step at the narrowest width
 struct Smem {
     alignas(16) std::int8_t a[2][kRows * kStride];
     alignas(16) std::int8_t x[2][kCols * kStride];
-    float scale[2][kSteps][kRows];
-    __half2 dx[2][kSteps][kCols];
+    float scale[2][kMaxSteps][kRows];
+    __half2 dx[2][kMaxSteps][kCols];
 };
 /// The groups of accumulator class `a` among `groups`: a, a + 8, a + 16, ...
 __device__ __forceinline__ int class_groups(int groups, int a) {
@@ -245,14 +247,17 @@ __global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kerne
     const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
     using namespace gmajor;
-    static_assert(DenseFormat<Type>::kWidth == 32 && !DenseFormat<Type>::kBias);
+    constexpr int width = DenseFormat<Type>::kWidth;
+    static_assert((width == 32 || width == 16) && !DenseFormat<Type>::kBias);
+    constexpr int kSteps  = kStepValues / width; // groups per step
+    constexpr int kPieces = width / 16;          // 16-byte pieces per group
     extern __shared__ __align__(16) unsigned char gmajor_smem[];
     auto& sm = *reinterpret_cast<Smem*>(gmajor_smem);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, lid = lane & 3;
     const int2 tile = grouped_tile<8>();
     const int row0 = tile.x * kRows, col0 = tile.y * kCols;
-    const int groups = k / 32;
+    const int groups = k / width;
     const std::int64_t row_bytes = std::int64_t(k / block_values(Type)) * block_bytes(Type);
 
     // A step is (class a, first group index m0 within the class); steps run class by class.
@@ -261,19 +266,22 @@ __global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kerne
         const int count = class_groups(groups, a);
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            const int item = tid + i * kThreads;      // kSteps x kCols x two 16-byte pieces
-            const int u = item / (2 * kCols), col = (item / 2) % kCols, piece = item & 1;
+            const int item = tid + i * kThreads;      // eight 16-byte pieces x kCols
+            const int p = item / kCols, col = item % kCols;
+            const int u = p / kPieces, piece = p % kPieces;
             const bool valid = m0 + u < count && col0 + col < tokens;
             const int g = a + 8 * (m0 + u);
-            cp_async_zfill<16, Cache::cg>(&sm.x[buf][col * kStride + 32 * u + 16 * piece],
-                codes + (valid ? std::int64_t(col0 + col) * k + 32 * g + 16 * piece : 0), valid ? 16 : 0);
+            cp_async_zfill<16, Cache::cg>(&sm.x[buf][col * kStride + 16 * p],
+                codes + (valid ? std::int64_t(col0 + col) * k + width * g + 16 * piece : 0), valid ? 16 : 0);
         }
-        {
-            const int u = tid / kCols, col = tid % kCols; // kSteps x kCols scales, one each
+#pragma unroll
+        for (int i = 0; i < kSteps * kCols / kThreads; ++i) {
+            const int item = tid + i * kThreads;      // kSteps x kCols activation scales
+            const int u = item / kCols, col = item % kCols;
             const bool valid = m0 + u < count && col0 + col < tokens;
             const int g = a + 8 * (m0 + u);
             cp_async_zfill<4, Cache::ca>(&sm.dx[buf][u][col],
-                ds + (valid ? std::int64_t(col0 + col) * groups + g : 0), valid ? 4 : 0);
+                ds + (valid ? std::int64_t(col0 + col) * (k / 32) + width * g / 32 : 0), valid ? 4 : 0);
         }
     };
     DenseAffineEight next[2];
@@ -281,12 +289,12 @@ __global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kerne
         const int count = class_groups(groups, a);
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            const int item = tid + i * kThreads;      // kRows x kSteps x four eighths
-            const int row = item / (4 * kSteps), u = (item / 4) % kSteps, e8 = item & 3;
+            const int item = tid + i * kThreads;      // kRows x sixteen eighths of a step
+            const int row = item / 16, u = (item % 16) / (width / 8), e8 = item % (width / 8);
             next[i] = DenseAffineEight{};
             if (m0 + u < count) {
                 const auto* w = weights + std::int64_t(min(row0 + row, rows - 1)) * row_bytes;
-                next[i] = dense_codes_eight<Type>(w, 32 * (a + 8 * (m0 + u)) + 8 * e8);
+                next[i] = dense_codes_eight<Type>(w, width * (a + 8 * (m0 + u)) + 8 * e8);
             }
         }
     };
@@ -294,8 +302,8 @@ __global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kerne
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const int item = tid + i * kThreads;
-            const int row = item / (4 * kSteps), u = (item / 4) % kSteps, e8 = item & 3;
-            *reinterpret_cast<uint2*>(&sm.a[buf][row * kStride + 32 * u + 8 * e8]) =
+            const int row = item / 16, u = (item % 16) / (width / 8), e8 = item % (width / 8);
+            *reinterpret_cast<uint2*>(&sm.a[buf][row * kStride + width * u + 8 * e8]) =
                 make_uint2(next[i].lo, next[i].hi);
             if (e8 == 0) { sm.scale[buf][u][row] = next[i].scale; }
         }
@@ -344,22 +352,32 @@ __global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kerne
         cp_commit();
         if (has_next) { decode_a(na, nm); }
         const int count = class_groups(groups, a);
+        const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
         for (int u = 0; u < kSteps; ++u) {
             if (m0 + u >= count) { break; }
-            unsigned b0, b1;
-            ldmatrix_x2(b0, b1, smem_addr(&sm.x[buf][(warp * 8 + (lane & 7)) * kStride + 32 * u +
-                                                     ((lane >> 3) & 1) * 16]));
+            unsigned b0, b1 = 0;
+            const std::int8_t* xb = &sm.x[buf][(warp * 8 + (lane & 7)) * kStride + width * u];
+            if constexpr (width == 32) {
+                ldmatrix_x2(b0, b1, smem_addr(xb + ((lane >> 3) & 1) * 16));
+            } else {
+                b0 = dense_ldmatrix_x1(smem_addr(xb));
+            }
             const float x0 = __low2float(sm.dx[buf][u][warp * 8 + 2 * lid]);
             const float x1 = __low2float(sm.dx[buf][u][warp * 8 + 2 * lid + 1]);
-            const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
             for (int mi = 0; mi < 4; ++mi) {
-                unsigned a0, a1, a2, a3;
-                ldmatrix_x4(a0, a1, a2, a3,
-                            smem_addr(&sm.a[buf][(16 * mi + ar) * kStride + 32 * u + (lane >> 4) * 16]));
+                const std::int8_t* at = &sm.a[buf][(16 * mi + ar) * kStride + width * u];
                 int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-                mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                if constexpr (width == 32) {
+                    unsigned a0, a1, a2, a3;
+                    ldmatrix_x4(a0, a1, a2, a3, smem_addr(at + (lane >> 4) * 16));
+                    mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                } else {
+                    unsigned a0, a1;
+                    ldmatrix_x2(a0, a1, smem_addr(at));
+                    mma_s8_k16(d0, d1, d2, d3, a0, a1, b0);
+                }
                 const float s0 = sm.scale[buf][u][16 * mi + gid], s1 = sm.scale[buf][u][16 * mi + gid + 8];
                 run[mi][0] = dense_affine_fma<false>(run[mi][0], s0, 0.0f, x0, d0, 0);
                 run[mi][1] = dense_affine_fma<false>(run[mi][1], s0, 0.0f, x1, d1, 0);
@@ -370,7 +388,7 @@ __global__ __launch_bounds__(gmajor::kThreads, 1) void dense_affine_gmajor_kerne
         if (has_next) { store_a(buf ^ 1); }
         if (na != a) {
             fold(a);
-            // Classes past the last group (k below 256) hold nothing; their sums are zero.
+            // Classes past the last group (a row shorter than eight groups) hold nothing.
             while (++a < 8 && step_count(a) == 0) { fold(a); }
             if (a != na) { break; } // every remaining class was empty
         }
