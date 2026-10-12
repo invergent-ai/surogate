@@ -366,7 +366,7 @@ void small_t_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
             static_cast<const float*>(workspace.token_alpha.data),
             static_cast<const float*>(workspace.shared_scale.data),
             static_cast<float*>(workspace.scratch.data), static_cast<int*>(workspace.groups.data),
-            static_cast<float*>(workspace.path_out.data), plan.tokens, plan.d4_schedule, stream)) {
+            plan.tokens, plan.d4_schedule, stream)) {
         sparse_moe_count_expert_major_round();
         return;
     }

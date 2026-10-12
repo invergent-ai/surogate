@@ -43,13 +43,14 @@ struct SparseMoeSmallTWorkspace {
     Tensor token_alpha;
     Tensor shared_scale;
     Tensor scratch;
-    /// The expert-major round: the paths grouped by expert, and each path's down output.
+    /// The expert-major round: the paths grouped by expert.
     Tensor groups;
-    Tensor path_out;
 };
 
-/// Whether small-T rounds take the expert-major kernels where they qualify:
-/// SUROGATE_SERVE_MOE_EXPERT_MAJOR (0 off, 1 on), unless a test set the override (1 on, -1 off).
+/// Whether small-T rounds take the expert-major gate/up where they qualify (the default;
+/// SUROGATE_SERVE_MOE_EXPERT_MAJOR=0 keeps the per-path kernels), unless a test set the override
+/// (1 on, -1 off). Measured on GB10 (Flash-Next IQ2_XS, 16-token rounds): gate/up 793 -> 537 us
+/// a layer; 4 users 23.8 -> ~25 tok/s each.
 [[nodiscard]] bool sparse_moe_expert_major_enabled() noexcept;
 void sparse_moe_set_expert_major_override(int mode) noexcept;
 /// Rounds the expert-major kernels took (host count), so a test can tell it exercised them.
@@ -95,8 +96,6 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
     const std::int32_t per_token = static_cast<std::int32_t>(std::max(partials, activations));
     out.scratch                  = arena.alloc(DType::FP32, {per_token, tokens}, 256);
     out.groups                   = arena.alloc(DType::I32, {2 + 3 * assignments}, 16);
-    out.path_out                 = arena.alloc(
-        DType::FP32, {static_cast<std::int32_t>(geometry.paths()) * geometry.hidden, tokens}, 256);
     return out;
 }
 

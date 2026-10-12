@@ -63,14 +63,14 @@ SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena,
                                                                  QType routed_gate_up,
                                                                  QType routed_down);
 
-/// The expert-major small-T round (sparse_moe_decode_body.inc): routed experts read once per
-/// round for every token they serve, the same bits as the per-path kernels. False when the round
+/// The expert-major small-T round (sparse_moe_decode_body.inc): routed gate/up rows read and
+/// decoded once per round for every token they serve, the same bits as the per-path kernels. False when the round
 /// does not qualify (a non-GGML pair, an expert slot pool, a shared expert not yet computed).
 bool sparse_moe_decode_launch_expert_major(const SparseMoeGeometry& geometry, const Tensor& x,
                                            const PreparedSparseMoeWeights& weights,
                                            Tensor& destination, const int* token_ids,
                                            const float* token_alpha, const float* shared_scale,
-                                           float* token_activations, int* groups, float* path_out,
+                                           float* token_activations, int* groups,
                                            std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                            cudaStream_t stream);
 void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,

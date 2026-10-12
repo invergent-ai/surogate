@@ -1061,11 +1061,10 @@ __global__ void sparse_moe_d4_token_kernel(
 // (token, path); a round's verify tokens are consecutive positions of a few sequences and share
 // most of their experts (measured on Swift-1.5 Flash-Next with real text: 82 distinct experts for
 // 160 paths at four sequences x 4 verify tokens, 129 for 320 at eight), and those kernels run
-// near the memory bandwidth their path reads need. Here the round's paths are grouped by expert,
-// each distinct expert's gate/up and down rows are read once by blocks that loop over its
-// (token, slot) entries, and every path's value is computed by the same dot routines in the same
-// lane order -- so the per-path values, and the rank-order sum per token, are the per-path
-// kernels' bits.
+// near the memory bandwidth their path reads need. Here the round's paths are grouped by expert
+// and each distinct expert's gate/up rows are read and decoded once for its (token, slot) entries
+// (dot_two_rows_tokens: every entry in dot_two_rows's own order), writing the per-path
+// activations the per-token down kernel then reads -- the per-path kernels' bits.
 // ---------------------------------------------------------------------------------------------
 
 // groups: [0] distinct experts n; [1, 1 + A) the experts, ascending; [1 + A, 2 + 2A) the entry
@@ -1154,62 +1153,6 @@ __device__ __forceinline__ void dot_two_rows_tokens(const std::uint8_t* codes, c
     }
 }
 
-// dot_fp32_rows's packed-word8 loop for up to N inputs (one expert's entries): each row's weights
-// decoded once per group step, every input's sums in dot_fp32_rows's own order.
-template <class Codec, int Rows, int N>
-__device__ __forceinline__ void dot_fp32_rows_tokens(const std::uint8_t* codes, const std::uint8_t* high,
-                                                     const std::uint8_t* scales, int row_base,
-                                                     const float* const (&x)[N], int n,
-                                                     float (&result)[N][Rows]) {
-    static_assert(Codec::kPackedWord8 && !kWideRows<Codec, kIntermediate, Rows>);
-    constexpr int kGroups        = kStoredGroups<Codec, kIntermediate>;
-    constexpr int kLanesPerGroup = Codec::kGroupK / 8;
-    constexpr int kGroupsPerWarp = 32 / kLanesPerGroup;
-    const int lane          = static_cast<int>(threadIdx.x) & 31;
-    const int lane_group    = lane / kLanesPerGroup;
-    const int lane_in_group = lane % kLanesPerGroup;
-    constexpr int last_group = kIntermediate / Codec::kGroupK;
-    float acc[N][Rows];
-#pragma unroll
-    for (int t = 0; t < N; ++t) {
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) { acc[t][row] = 0.0f; }
-    }
-    for (int group_base = 0; group_base < last_group; group_base += kGroupsPerWarp) {
-        const int group = group_base + lane_group;
-        if (group >= last_group) { continue; }
-        float values[N][8];
-#pragma unroll
-        for (int t = 0; t < N; ++t) {
-            if (t >= n) { break; }
-            const float4 x0 = load_vec<float4>(x[t] + group * Codec::kGroupK + lane_in_group * 8);
-            const float4 x1 = load_vec<float4>(x[t] + group * Codec::kGroupK + lane_in_group * 8 + 4);
-            values[t][0] = x0.x; values[t][1] = x0.y; values[t][2] = x0.z; values[t][3] = x0.w;
-            values[t][4] = x1.x; values[t][5] = x1.y; values[t][6] = x1.z; values[t][7] = x1.w;
-        }
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            const std::int64_t group_index = static_cast<std::int64_t>(row_base + row) * kGroups + group;
-            float weights[8];
-            Codec::load_eight(codes, high, scales, group_index, lane_in_group, weights);
-#pragma unroll
-            for (int t = 0; t < N; ++t) {
-                if (t >= n) { break; }
-#pragma unroll
-                for (int item = 0; item < 8; ++item) {
-                    acc[t][row] = fmaf(weights[item], values[t][item], acc[t][row]);
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (int t = 0; t < N; ++t) {
-        if (t >= n) { break; }
-#pragma unroll
-        for (int row = 0; row < Rows; ++row) { result[t][row] = warp_reduce_sum(acc[t][row]); }
-    }
-}
-
 // Gate/up: block (Rows rows, distinct expert), a warp a row; the expert's entries kChunk at a
 // time, their tokens staged, each row's weights decoded once for all of them.
 template <class RoutedCodec, int Rows>
@@ -1265,73 +1208,6 @@ __global__ void __launch_bounds__(256) sparse_moe_d3_expert_kernel(
         }
         __syncthreads();
     }
-}
-
-// Down: block (8 x Rows rows, distinct expert); a warp takes Rows rows for kChunk entries at a
-// time, each row's weights decoded once for all of them, and stores weight * dot per path.
-template <class RoutedCodec, int Rows>
-__global__ void __launch_bounds__(256) sparse_moe_d4_expert_kernel(
-    const int* __restrict__ groups, int paths, const float* __restrict__ token_alpha,
-    const float* __restrict__ token_activations, const std::uint8_t* __restrict__ routed_codes,
-    const std::uint8_t* __restrict__ routed_high, const std::uint8_t* __restrict__ routed_scales,
-    const float* __restrict__ routed_down_scale, float* __restrict__ path_out) {
-    constexpr int kChunk = 4;
-    const int index = static_cast<int>(blockIdx.y);
-    if (index >= groups[0]) { return; }
-    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
-    const int expert   = groups[1 + index];
-    const int begin    = groups[1 + paths + index];
-    const int end      = groups[1 + paths + index + 1];
-    const int* entries = groups + 2 + 2 * paths;
-    const int row_base = static_cast<int>(blockIdx.x) * Rows * 8 + warp * Rows;
-    for (int c0 = begin; c0 < end; c0 += kChunk) {
-        const int count = min(kChunk, end - c0);
-        const float* inputs[kChunk];
-#pragma unroll
-        for (int c = 0; c < kChunk; ++c) {
-            const int path = entries[c0 + (c < count ? c : 0)], token = path / kTopK, slot = path - token * kTopK;
-            inputs[c] = token_activations + (static_cast<std::int64_t>(token) * kPaths + slot) * kIntermediate;
-        }
-        float dot[kChunk][Rows];
-        dot_fp32_rows_tokens<RoutedCodec, Rows, kChunk>(routed_codes, routed_high, routed_scales,
-                                                        expert * kHidden + row_base, inputs, count, dot);
-#pragma unroll
-        for (int c = 0; c < kChunk; ++c) {
-            if (c >= count) { break; }
-            const int path = entries[c0 + c], token = path / kTopK, slot = path - token * kTopK;
-            float weight = token_alpha[path];
-            if (routed_down_scale != nullptr) { weight *= routed_down_scale[expert]; }
-            if (lane == 0) {
-#pragma unroll
-                for (int row = 0; row < Rows; ++row) {
-                    path_out[(static_cast<std::int64_t>(token) * kPaths + slot) * kHidden + row_base + row] =
-                        weight * dot[c][row];
-                }
-            }
-        }
-    }
-}
-
-// The rank-order sum per token, as sparse_moe_d4_token_kernel's epilogue adds it: the destination,
-// then each routed path's weight * dot, then the shared expert's scale * output.
-__global__ void sparse_moe_expert_combine_kernel(const float* __restrict__ path_out,
-                                                 const float* __restrict__ shared_scale,
-                                                 const __nv_bfloat16* __restrict__ shared_output,
-                                                 __nv_bfloat16* __restrict__ destination) {
-    const int token = static_cast<int>(blockIdx.y);
-    const int row   = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
-    if (row >= kHidden) { return; }
-    __nv_bfloat16* output = destination + static_cast<std::int64_t>(token) * kHidden + row;
-    float value = __bfloat162float(*output);
-#pragma unroll
-    for (int path = 0; path < kTopK; ++path) {
-        value += path_out[(static_cast<std::int64_t>(token) * kPaths + path) * kHidden + row];
-    }
-    if constexpr (kHasShared) {
-        value += shared_scale[token] *
-                 __bfloat162float(shared_output[static_cast<std::int64_t>(token) * kHidden + row]);
-    }
-    *output = __float2bfloat16_rn(value);
 }
 
 void launch_d1(const Tensor& x, const Weight& router_shared_gate,
@@ -1668,22 +1544,13 @@ void launch_d3_expert(const Tensor& x, const PreparedSparseMoeWeights& weights, 
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Codec, int Rows>
-void launch_d4_expert(const PreparedSparseMoeWeights& weights, const int* groups, std::int32_t paths,
-                      const float* token_alpha, const float* token_activations, float* path_out,
-                      cudaStream_t stream) {
-    require_d4_codec_geometry<Codec>();
-    const dim3 grid(kHidden / (Rows * 8), std::min<std::int32_t>(paths, kExperts));
-    sparse_moe_d4_expert_kernel<Codec, Rows><<<grid, 256, 0, stream>>>(
-        groups, paths, token_alpha, token_activations,
-        static_cast<const std::uint8_t*>(weights.routed_down.qdata),
-        static_cast<const std::uint8_t*>(weights.routed_down.qhigh),
-        static_cast<const std::uint8_t*>(weights.routed_down.scales), weights.routed_down_scale,
-        path_out);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 } // namespace
+
+void decode_launch_d4_small_t(const PreparedSparseMoeWeights& weights, Tensor& destination,
+                              const int* token_ids, const float* token_alpha,
+                              const float* shared_scale, const float* token_activations,
+                              std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+                              cudaStream_t stream, const int* adaptive_route_jobs);
 
 // The expert-major small-T round (see sparse_moe_expert_groups_kernel) for a GGML routed pair with
 // no expert slot pool and the shared expert, where there is one, already computed; false when the
@@ -1691,9 +1558,9 @@ void launch_d4_expert(const PreparedSparseMoeWeights& weights, const int* groups
 bool decode_launch_expert_major(const Tensor& x, const PreparedSparseMoeWeights& weights,
                                 Tensor& destination, const int* token_ids, const float* token_alpha,
                                 const float* shared_scale, float* token_activations, int* groups,
-                                float* path_out, std::int32_t tokens,
-                                SparseMoeSmallTD4Schedule schedule, cudaStream_t stream) {
-    if (tokens < 2 || weights.slot_of_expert != nullptr || groups == nullptr || path_out == nullptr ||
+                                std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+                                cudaStream_t stream) {
+    if (tokens < 2 || weights.slot_of_expert != nullptr || groups == nullptr ||
         !ggml::is_ggml_qtype(weights.routed_gate_up.qtype) ||
         !ggml::is_ggml_qtype(weights.routed_down.qtype)) {
         return false;
@@ -1720,33 +1587,12 @@ bool decode_launch_expert_major(const Tensor& x, const PreparedSparseMoeWeights&
     default: break;
     }
     if (!launched) { throw std::logic_error("sparse_moe: expert-major gate/up codec mismatch"); }
-    const auto down = [&]<class Codec>() {
-        switch (schedule) {
-        case SparseMoeSmallTD4Schedule::Rows1:
-            launch_d4_expert<Codec, 1>(weights, groups, paths, token_alpha, token_activations, path_out, stream);
-            return;
-        case SparseMoeSmallTD4Schedule::Rows2:
-            launch_d4_expert<Codec, 2>(weights, groups, paths, token_alpha, token_activations, path_out, stream);
-            return;
-        case SparseMoeSmallTD4Schedule::Rows4:
-            launch_d4_expert<Codec, 4>(weights, groups, paths, token_alpha, token_activations, path_out, stream);
-            return;
-        }
-        throw std::logic_error("sparse_moe: unknown small-T D4 schedule");
-    };
-    switch (weights.routed_down.qtype) {
-#define SINFER_D4_EXPERT(NAME)                                                                      \
-    case QType::NAME:                                                                               \
-        down.template operator()<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>();                       \
-        break;
-        SINFER_GGML_FOR_EACH_TYPE(SINFER_D4_EXPERT)
-#undef SINFER_D4_EXPERT
-    default: throw std::logic_error("sparse_moe: expert-major down codec mismatch");
-    }
-    sparse_moe_expert_combine_kernel<<<dim3((kHidden + 255) / 256, tokens), 256, 0, stream>>>(
-        path_out, shared_scale, static_cast<const __nv_bfloat16*>(weights.shared_output.data),
-        static_cast<__nv_bfloat16*>(destination.data));
-    CUDA_CHECK(cudaGetLastError());
+    // The down projection stays per (token, path) (sparse_moe_d4_token_kernel): S25 measured the
+    // expert-major down kernel slower than it (468 against 426 us a layer at 16 tokens), while
+    // the expert-major gate/up took the per-path one's 793 to 537. It reads the activations the
+    // gate/up wrote, in the per-path kernels' layout, and sums the paths in the same order.
+    decode_launch_d4_small_t(weights, destination, token_ids, token_alpha, shared_scale,
+                             token_activations, tokens, schedule, stream, nullptr);
     return true;
     }
 }

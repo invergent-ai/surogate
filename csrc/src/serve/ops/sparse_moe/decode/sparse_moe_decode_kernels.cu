@@ -91,47 +91,47 @@ bool sparse_moe_decode_launch_expert_major(const SparseMoeGeometry& geometry, co
                                            const PreparedSparseMoeWeights& weights,
                                            Tensor& destination, const int* token_ids,
                                            const float* token_alpha, const float* shared_scale,
-                                           float* token_activations, int* groups, float* path_out,
+                                           float* token_activations, int* groups,
                                            std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                            cudaStream_t stream) {
     if (geometry == kSparseMoeQwen36Geometry) {
         return geometry_qwen36::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
         return geometry_flash_next::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
         return geometry_qwen3_moe::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeQwen3Moe235BGeometry) {
         return geometry_qwen3_moe_235b::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeGlm53Geometry) {
         return geometry_glm53::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeGemma4Geometry) {
         return geometry_gemma4::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeLfm2Moe32Geometry) {
         return geometry_lfm2_moe32::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     if (geometry == kSparseMoeLfm2Moe64Geometry) {
         return geometry_lfm2_moe64::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
-                                                shared_scale, token_activations, groups, path_out,
+                                                shared_scale, token_activations, groups,
                                                 tokens, schedule, stream);
     }
     return false;

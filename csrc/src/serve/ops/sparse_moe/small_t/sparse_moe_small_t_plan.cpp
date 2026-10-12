@@ -23,7 +23,7 @@ bool sparse_moe_expert_major_enabled() noexcept {
     if (forced != 0) { return forced > 0; }
     static const bool enabled = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_MOE_EXPERT_MAJOR");
-        return raw != nullptr && raw[0] == '1';
+        return raw == nullptr || raw[0] != '0';
     }();
     return enabled;
 }
