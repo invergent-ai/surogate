@@ -163,8 +163,9 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
     static_assert(WarpCols == 8, "one n8 fragment per warp");
     constexpr int Stages = GgmlI8Smem<Codec, ExpertBN, ExpertBM>::Stages;
-    // A header is staged Stages tiles ahead of its superblock's first tile and its slot was last
-    // read four tiles before that superblock's predecessor ended, so two slots serve up to four.
+    // A header is staged Stages - 1 tiles ahead of its superblock's first tile, after the barrier
+    // that ends the tile before; its slot was last read by the superblock two back, whose last
+    // tile is five before the new one's first, so two slots serve up to five stages.
     static_assert((ExpertBM == 16 || ExpertBM == 32 || ExpertBM == 64) && kI8BK == 64 &&
                   Stages >= 2 && Stages <= kTilesPerBlock);
     // K is a whole number of the codec's kKMultiple: 256 for the superblock codecs, 64 for a
@@ -251,8 +252,12 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
         }
     };
 
+    // Stages - 1 tiles go ahead. The last stage is filled inside the loop, right after the
+    // barrier that opens each K step: every thread is then past the previous step's MMA, so
+    // that step's stage and the shared unpacked tile are free, and the barrier that used to
+    // close each step only to protect them is gone (two per step instead of three).
 #pragma unroll
-    for (int stage = 0; stage < Stages; ++stage) {
+    for (int stage = 0; stage < Stages - 1; ++stage) {
         // A K shorter than the pipeline stages nothing past its end; every stage still commits,
         // so the wait below counts groups the same way.
         if (stage < KTiles) { stage_inputs(stage, stage); }
@@ -268,8 +273,13 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
         // refreshes per superblock, because one staged header holds every sub-scale of one;
         // a format that carries its scales inside the tile refreshes every tile.
         const int stib  = kt % Codec::kScaleTiles;
-        cp_wait<Stages - 1>();
+        cp_wait<Stages - 2>();
         __syncthreads();
+        {
+            const int next = kt + Stages - 1; // into the stage tile kt - 1 used
+            if (next < KTiles) { stage_inputs(next % Stages, next); }
+            cp_commit();
+        }
         if (stib == 0) {
             for (int item = tid; item < Codec::kScaleGroups * ExpertBM; item += ExpertThreads) {
                 const int row     = item & (ExpertBM - 1);
@@ -393,10 +403,6 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
             }
         }
 
-        __syncthreads();
-        const int next = kt + Stages;
-        if (next < KTiles) { stage_inputs(stage, next); }
-        cp_commit();
     }
     cp_wait<0>();
     __syncthreads();
