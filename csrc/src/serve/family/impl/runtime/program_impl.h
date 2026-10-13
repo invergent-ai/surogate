@@ -521,8 +521,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     // The shared-prefix cache cuts a capturing prompt at the prefix boundary, which a fixed
-    // batch-invariant cut schedule forbids; draft heads keep KV and state it does not copy.
-    if (speculative_backend == SpeculativeBackend::None && !pipeline_stage() && !ops::batch_invariant()) {
+    // batch-invariant cut schedule forbids. An MTP head's KV and the boundary's hidden go with
+    // the prefix (PATCHES #150); a DFlash drafter keeps context it does not copy.
+    if ((speculative_backend == SpeculativeBackend::None || speculative_backend == SpeculativeBackend::Mtp) &&
+        !pipeline_stage() && !ops::batch_invariant()) {
         const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_SLOTS");
         shared_prefix_slots = raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 4U;
         shared_prefix_page_budget = decoder->text_kv.pool().capacity_pages() / 8;
@@ -2885,10 +2887,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
-            if (staged.shared_capture && staged.cursor == *staged.shared_capture) {
-                capture_shared_prefix(sequence, staged);
-            }
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
+            if (staged.shared_capture && staged.cursor == *staged.shared_capture) {
+                // The chunk's last column, which the chunk left in place.
+                capture_shared_prefix(sequence, staged,
+                                      prefill_hidden.slice(
+                                          1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+            }
             if (!request.target_only && speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
@@ -4202,7 +4207,9 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                 if (flash && stage_holds_head()) { dflash->save_rewrite_checkpoint(sequence.lane, device.stream); }
             }
             if (entry.shared_capture && entry.cursor == *entry.shared_capture) {
-                capture_shared_prefix(sequence, entry);
+                capture_shared_prefix(sequence, entry,
+                                      prefill_hidden.slice(
+                                          1, static_cast<std::int32_t>(column + processed) - 1, 1));
             }
             requests[lane_id].prefill->elapsed_seconds += seconds;
             column += processed;

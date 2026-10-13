@@ -315,9 +315,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 auto shared = plan_request_for_sequence(lane, entry->state, prompt, base_plan, true);
                 if (shared.impl_->reuse == ReusePath::AppendAtFrontier &&
                     shared.impl_->reuse_base == entry->tokens) {
-                    // The fork borrows the prefix's whole pages; the request owns the rest.
+                    // The fork borrows the prefix's whole pages; the request owns the rest. The
+                    // MTP head's are borrowed through `tokens - 1` (restore_shared_prefix).
                     shared.impl_->summary.admission.main_kv_pages -=
                         entry->tokens / static_cast<std::uint32_t>(kPagedKVPageSize);
+                    if (entry->backend_pages) {
+                        shared.impl_->summary.admission.backend_kv_pages -=
+                            (entry->tokens - 1) / static_cast<std::uint32_t>(kPagedKVPageSize);
+                    }
                     shared.impl_->shared_prefix = std::move(entry);
                     return shared;
                 }
@@ -461,9 +466,15 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     }
 
     // A fork's borrowed pages are shared and read-only: a reuse that would rewind into them
-    // starts over instead.
+    // starts over instead. The suffix's first write lands at `reuse_base`, so its page must be
+    // owned (rounding up let a rewind into the last borrowed page through); an MTP bridge
+    // rewrites the head's column at `reuse_base - 1`.
     if (plan->reuse != ReusePath::FullReset && sequence.kv && plan->reuse_base > 0 &&
-        pages_for_tokens(plan->reuse_base) < sequence.kv->text.borrowed_pages()) {
+        (plan->reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize) <
+             sequence.kv->text.borrowed_pages() ||
+         (speculative_backend == SpeculativeBackend::Mtp && sequence.kv->backend &&
+          (plan->reuse_base - 1) / static_cast<std::uint32_t>(kPagedKVPageSize) <
+              sequence.kv->backend->borrowed_pages()))) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
     }

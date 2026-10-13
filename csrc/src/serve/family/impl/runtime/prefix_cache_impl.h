@@ -366,15 +366,25 @@ void ProgramImplCore::drop_shared_prefixes() noexcept {
     ++shared_prefix_revision;
 }
 
-void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestControl::Prefill& staged) {
+void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestControl::Prefill& staged,
+                                            const Tensor& boundary_hidden) {
     const std::uint32_t tokens = *staged.shared_capture;
     const std::uint64_t hash = staged.shared_capture_hash;
     staged.shared_capture.reset();
     if (shared_prefix_slots == 0) { return; }
     const auto pages = tokens / static_cast<std::uint32_t>(kPagedKVPageSize);
-    if (!sequence.kv || sequence.kv->backend || sequence.text_kv_valid != tokens ||
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if (!sequence.kv || sequence.kv->backend.has_value() != mtp || sequence.text_kv_valid != tokens ||
         tokens % kPagedKVPageSize != 0 || pages <= sequence.kv->text.borrowed_pages() ||
         pages > sequence.kv->text.mapped_page_count() || shared_prefixes.contains(hash)) {
+        return;
+    }
+    // The head's KV through the boundary's last column (its pairing is the capturing prompt's,
+    // which a fork replaces), and that column's hidden for the fork's bridge.
+    if (mtp && (sequence.mtp_kv_valid < tokens || pages <= sequence.kv->backend->borrowed_pages() ||
+                pages > sequence.kv->backend->mapped_page_count() ||
+                boundary_hidden.dtype != DType::BF16 || boundary_hidden.ne[0] != tail_hidden_store.ne[0] ||
+                boundary_hidden.ne[1] != 1 || !boundary_hidden.is_contiguous())) {
         return;
     }
     const std::uint32_t owned = pages - sequence.kv->text.borrowed_pages();
@@ -394,6 +404,7 @@ void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestCont
     if (!shared_prefix_storage) {
         std::size_t bytes = 0;
         for (const auto& t : tensors) { bytes = (bytes + 255) / 256 * 256 + t.bytes(); }
+        if (mtp) { bytes = (bytes + 255) / 256 * 256 + boundary_hidden.bytes(); }
         bytes = (bytes + 255) / 256 * 256;
         try {
             shared_prefix_storage = std::make_shared<GpuPrefixStorage>(bytes, shared_prefix_slots);
@@ -416,11 +427,12 @@ void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestCont
     entry->state.execution_frontier = tokens;
     entry->state.ledger_frontier = tokens;
     entry->state.text_kv_valid = tokens;
-    entry->state.mtp_kv_valid = 0;
+    entry->state.mtp_kv_valid = mtp ? tokens - 1 : 0;
     entry->state.dflash_context_frontier = 0;
     entry->state.mtp_draft_count = 0;
-    // No hidden is kept: a fork always has prompt left to prefill past the boundary, so the
-    // append path never samples from it, but it needs the frontier marked complete.
+    // Without MTP no hidden is kept: a fork always has prompt left to prefill past the
+    // boundary, so the append path never samples from it, but it needs the frontier marked
+    // complete. Under MTP the bridge reads it; `hidden` below holds it.
     entry->state.tail_hidden_valid = true;
     entry->state.retained = true;
     entry->state.cacheable = true;
@@ -441,6 +453,15 @@ void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestCont
         CUDA_CHECK(cudaMemcpyAsync(copy.data, tensor.data, tensor.bytes(), cudaMemcpyDeviceToDevice,
                                    device.stream));
     }
+    if (mtp) {
+        entry->hidden = boundary_hidden;
+        entry->hidden.data = frame.alloc_bytes(boundary_hidden.bytes()).data;
+        CUDA_CHECK(cudaMemcpyAsync(entry->hidden.data, boundary_hidden.data, boundary_hidden.bytes(),
+                                   cudaMemcpyDeviceToDevice, device.stream));
+        // Every whole page through the boundary: the last one holds column `tokens - 1`, which
+        // forks copy rather than borrow.
+        entry->backend_pages = backend_kv_cache()->pool().share_prefix(*sequence.kv->backend, pages);
+    }
     entry->pages = decoder->text_kv.pool().share_prefix(sequence.kv->text, pages);
     entry->last_use = ++shared_prefix_clock;
     static const bool trace = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_TRACE") != nullptr;
@@ -459,6 +480,12 @@ void ProgramImplCore::restore_shared_prefix(SequenceState& sequence, const Reque
     SequenceKVBundle bundle;
     bundle.text = decoder->text_kv.pool().fork_prefix(entry.pages, entry.tokens,
                                                      plan.text_kv_page_entitlement, device.stream);
+    if (entry.backend_pages) {
+        // Through `tokens - 1`: the boundary page becomes the fork's own copy, where its
+        // bridge rewrites the last column.
+        bundle.backend.emplace(backend_kv_cache()->pool().fork_prefix(
+            entry.backend_pages, entry.tokens - 1, plan.backend_kv_page_entitlement, device.stream));
+    }
     sequence.kv.emplace(std::move(bundle));
     const auto tensors = prefix_state_tensors(sequence, false, false, false);
     if (tensors.size() != entry.current.size()) { throw std::logic_error("shared prefix state layout changed"); }
@@ -469,6 +496,7 @@ void ProgramImplCore::restore_shared_prefix(SequenceState& sequence, const Reque
         CUDA_CHECK(cudaMemcpyAsync(tensors[i].data, entry.current[i].data, tensors[i].bytes(),
                                    cudaMemcpyDeviceToDevice, device.stream));
     }
+    if (entry.hidden.data) { copy_tail(sequence, entry.hidden); }
     entry.last_use = ++shared_prefix_clock;
     ++entry.hits;
     ++checkpoint_revisions[sequence.lane];

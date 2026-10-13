@@ -312,14 +312,22 @@ struct GpuPrefix {
 // A prompt prefix several conversations share (a system prompt, tool definitions), kept on
 // the GPU at a page boundary: its full KV pages, which forks borrow in place, and a copy of
 // the lane's recurrent state there. `state` is the sequence a fork resumes from.
+//
+// Under MTP it also keeps the head's KV pages and the trunk's hidden at the prefix's last
+// token. The head's column at that token was paired with the capturing prompt's next token,
+// which a fork's prompt need not share: a fork borrows the head's pages through `tokens - 1`
+// only (the boundary page is its own copy), and its MTP bridge pairs `hidden` with its own
+// next token, as an append to a retained conversation does.
 struct SharedPrefix {
     std::uint64_t hash = 0;
     std::uint32_t tokens = 0;
     SequenceState state;
     std::shared_ptr<const PagedKVAllocation> pages;
+    std::shared_ptr<const PagedKVAllocation> backend_pages; // MTP only
     std::shared_ptr<GpuPrefixStorage> storage;
     std::uint32_t slot = 0;
     std::vector<Tensor> current;
+    Tensor hidden; // MTP only: the trunk's hidden at token `tokens - 1`
     std::uint64_t last_use = 0;
     std::uint32_t hits = 0;
     ~SharedPrefix() { if (storage) storage->free.push_back(slot); }
@@ -663,7 +671,9 @@ public:
 
     // Shared-prefix cache (SUROGATE_SERVE_SHARED_PREFIX_SLOTS, 0 disables): a page-aligned
     // prompt prefix seen in an earlier request is captured once, mid-prefill, and later
-    // requests on any lane fork it instead of prefilling it again.
+    // requests on any lane fork it instead of prefilling it again. Under MTP the capture also
+    // takes the head's KV and the trunk's hidden at the boundary (`boundary_hidden`, the
+    // chunk's last column), which a fork's bridge reads.
     std::uint32_t shared_prefix_slots = 0;
     std::uint32_t shared_prefix_page_budget = 0;
     std::unordered_map<std::uint64_t, std::shared_ptr<SharedPrefix>> shared_prefixes;
@@ -678,7 +688,8 @@ public:
         const std::vector<std::uint64_t>& hashes, std::int32_t lora_slot) const;
     void plan_shared_prefix_capture(RequestControl::Prefill& staged,
                                     const std::vector<std::uint64_t>& hashes);
-    void capture_shared_prefix(SequenceState& sequence, RequestControl::Prefill& staged);
+    void capture_shared_prefix(SequenceState& sequence, RequestControl::Prefill& staged,
+                               const Tensor& boundary_hidden);
     void restore_shared_prefix(SequenceState& sequence, const RequestPlanImpl& plan);
     [[nodiscard]] std::uint32_t shared_prefix_pages() const noexcept;
     void drop_shared_prefixes() noexcept;
