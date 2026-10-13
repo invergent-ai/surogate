@@ -327,8 +327,8 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
         raise ContractError("model-list response has the wrong shape")
-    if entries[0].get("id") != model or entries[0].get("owned_by") != "sinfer":
-        raise ContractError("model-list response does not identify the configured SInfer model")
+    if entries[0].get("id") != model or entries[0].get("owned_by") != "surogate":
+        raise ContractError("model-list response does not identify the configured Surogate model")
     single_model = json_response(base_url, "GET", f"/v1/models/{model}")
     if single_model.get("id") != model:
         raise ContractError("single-model response has the wrong id")

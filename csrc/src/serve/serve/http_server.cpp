@@ -763,11 +763,11 @@ void HttpServer::register_routes() {
 
 nlohmann::json HttpServer::model_listing() const {
     const auto created = unix_time_now();
-    auto listing = nlohmann::json::parse(
-        make_models_list(public_model_id_, created, service_->lora_adapter_names()));
+    auto listing = nlohmann::json::parse(make_models_list(
+        public_model_id_, created, service_->lora_adapter_names(), service_->max_context()));
     for (const auto& [name, service] : extra_services_) {
         const auto extra = nlohmann::json::parse(
-            make_models_list(name, created, service->lora_adapter_names()));
+            make_models_list(name, created, service->lora_adapter_names(), service->max_context()));
         for (const auto& model : extra.at("data")) {
             listing["data"].push_back(model);
         }

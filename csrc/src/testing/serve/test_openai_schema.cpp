@@ -878,11 +878,26 @@ int test_models_and_error() {
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
-    failures += check(list.at("data").at(0).at("owned_by") == "sinfer", "models list owner");
+    failures += check(list.at("data").at(0).at("owned_by") == "surogate", "models list owner");
+    failures += check(!list.at("data").at(0).contains("max_model_len") &&
+                          !list.at("data").at(0).contains("context_length"),
+                      "models list without a context omits it");
+
+    // The served context, on the model and on each adapter, under vLLM's and OpenRouter's names.
+    const Json sized = Json::parse(make_models_list("qwen3.6-27b", 1, {"adapter-a"}, 1048576));
+    for (const Json& entry : sized.at("data")) {
+        failures += check(entry.at("max_model_len") == 1048576, "models list max_model_len");
+        failures += check(entry.at("context_length") == 1048576, "models list context_length");
+    }
+    failures += check(sized.at("data").size() == 2 && sized.at("data").at(1).at("parent") == "qwen3.6-27b",
+                      "models list adapter entry");
 
     const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
-    failures += check(one.at("owned_by") == "sinfer", "model owner");
+    failures += check(one.at("owned_by") == "surogate", "model owner");
+    const Json one_sized = Json::parse(make_model_object("qwen3.6-27b", 1, 262144));
+    failures += check(one_sized.at("max_model_len") == 262144 && one_sized.at("context_length") == 262144,
+                      "model object context");
 
     ApiError error;
     error.status   = 400;

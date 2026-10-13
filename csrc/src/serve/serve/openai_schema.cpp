@@ -902,29 +902,42 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
+namespace {
+// The served context, under vLLM's name and OpenRouter's, so clients that size prompts from
+// the listing find it whichever they read.
+void add_context_fields(Json& model, std::uint32_t max_model_len) {
+    if (max_model_len == 0) { return; }
+    model["max_model_len"]  = max_model_len;
+    model["context_length"] = max_model_len;
+}
+} // namespace
+
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             const std::vector<std::string>& adapters) {
-    Json data = Json::array({Json{{"id", model_id},
-                                  {"object", "model"},
-                                  {"created", created},
-                                  {"owned_by", "sinfer"}}});
+                             const std::vector<std::string>& adapters, std::uint32_t max_model_len) {
+    Json base = Json{{"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "surogate"}};
+    add_context_fields(base, max_model_len);
+    Json data = Json::array({std::move(base)});
     // Adapters are selectable model ids, so they belong in the listing: a client
     // discovers what it may put in `model`, and an adapter that is loaded but
     // invisible here cannot be found by anything that enumerates first.
     for (const std::string& adapter : adapters) {
-        data.push_back(Json{{"id", adapter},
-                            {"object", "model"},
-                            {"created", created},
-                            {"owned_by", "sinfer"},
-                            {"parent", model_id}});
+        Json entry = Json{{"id", adapter},
+                          {"object", "model"},
+                          {"created", created},
+                          {"owned_by", "surogate"},
+                          {"parent", model_id}};
+        add_context_fields(entry, max_model_len);
+        data.push_back(std::move(entry));
     }
     const Json payload = {{"object", "list"}, {"data", std::move(data)}};
     return dump_lossy(payload);
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created) {
-    const Json payload = {
-        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "sinfer"}};
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_model_len) {
+    Json payload = {
+        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "surogate"}};
+    add_context_fields(payload, max_model_len);
     return dump_lossy(payload);
 }
 

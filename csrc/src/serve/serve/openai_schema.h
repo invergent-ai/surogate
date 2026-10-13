@@ -114,10 +114,13 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                                   std::int64_t created, const CompletionUsage& usage);
 std::string sse_done();
 
-// /v1/models payloads.
+// /v1/models payloads. A nonzero `max_model_len` (the most tokens a request's prompt and output
+// may take together) is listed as `max_model_len` and `context_length`.
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             const std::vector<std::string>& adapters = {});
-std::string make_model_object(const std::string& model_id, std::int64_t created);
+                             const std::vector<std::string>& adapters = {},
+                             std::uint32_t max_model_len = 0);
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_model_len = 0);
 
 // Error object body.
 std::string make_error_body(const ApiError& error);

@@ -71,7 +71,7 @@ advertising those capabilities through the router. See the
 | `POST` | `/v1/responses` | Responses API |
 | `POST` | `/v1/responses/input_tokens` | Count input tokens without generating |
 | `POST` | `/v1/responses/compact` | Returns `400 compaction_not_supported` |
-| `GET` | `/v1/models`, `/v1/models/{id}` | Model listing |
+| `GET` | `/v1/models`, `/v1/models/{id}` | Model listing; each entry also carries the served context in tokens as `max_model_len` and `context_length` |
 | `POST` | `/v1/messages` | **Anthropic** Messages API |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting |
 | `POST` | `/sleep` | Free a model's GPU memory while saving it in system RAM; requires `--enable-sleep-mode` |
