@@ -38,7 +38,7 @@ ran on, and 380.6 s (77 turns) on 4e75898.
 --vision --kv-cache-dtype fp8 --max-model-len 1048576
 --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'
 --kv-capacity 1835008 --max-num-seqs 8 --max-num-batched-tokens 4096
---spec mtp --draft-tokens 2 --enable-auto-tool-choice
+--spec mtp --draft-tokens 3 --enable-auto-tool-choice
 ```
 
 **Needle.** A 1,000,667-token haystack found all three passphrases (3/3); the cold prompt took 1066 s. With the
@@ -64,15 +64,33 @@ turns. At 1M, chunk size makes no measurable difference:
 | 262k + YaRN | 57.3 |
 | 1M + YaRN | 56.9 |
 
-**MTP 2 against MTP 3** (4264d13), real-text decode per user on identical requests:
+**MTP 3 against MTP 2.** MTP 2 decodes prose faster; MTP 3 finishes agent turns sooner, so the setting is MTP 3:
 
-| | 1 user | 2 users | 4 users | Tokens per round |
-|---|---|---|---|---|
-| MTP 3 | 57.1 | 39.6 | 26.0 | 2.69 |
-| **MTP 2** | **59.5** | **40.5** | **26.7** | 2.34 |
+| | Real-text decode per user, 1 / 2 / 4 users (4264d13) | Tokens per round | 4-agent run, 77 turns (5cc6043) |
+|---|---|---|---|
+| MTP 2 | **59.5 / 40.5 / 26.7** | 2.34 | 397.2 s |
+| **MTP 3** | 57.1 / 39.6 / 26.0 | 2.69 | **383.4 s** |
 
-An MTP 3 round costs ~20% more than an MTP 2 round. On prose the third draft is accepted 37% of the time, which
-does not pay for that. On 5cc6043 (PATCHES #148's 16-row step), MTP 3 runs at 57.1 / 39.8 / 27.0.
+An MTP 3 round costs ~20% more than an MTP 2 round. On prose the third draft is accepted only 37% of the time,
+which does not pay for that. In the agent run it is accepted 82% of the time (3.66 tokens a round), which does.
+On 5cc6043 (PATCHES #148's 16-row step), MTP 3 decodes prose at 57.1 / 39.8 / 27.0.
+
+**Two agents on one Spark** (5cc6043, MTP 3): 40 turns in 213.7 s, 11.2 turns a minute, warm first token p50 /
+p90 2.39 / 3.45 s. Four agents: 12.1 turns a minute, 2.90 / 6.17 s.
+
+### The three builds on 5cc6043
+
+Same settings as above, except IQ3_S. Its weights take 54.7 GiB against IQ2_XS's 40.1, so at 1M it starts only
+with a pool of 1,048,576 tokens. Real-text decode is per user with MTP 2.
+
+| | IQ3_S | IQ2_XS | Q2_0 |
+|---|---|---|---|
+| Real-text decode, 1 / 2 / 4 users | 40.7 / 29.3 / 21.2 | **60.2 / 42.3 / 27.3** | 52.1 / 37.4 / 26.8 |
+| 4-agent run, MTP 2 | 424.6 s | 397.2 s | 393.5 s |
+| 4-agent run, MTP 3 | | **383.4 s** | **383.3 s** |
+| Cold first token p50 (MTP 2) | **100.4 s** | 112.8 s | 106.3 s |
+
+IQ2_XS and Q2_0 tie on agent turns, and IQ2_XS decodes faster for one or two users.
 
 ## DGX Spark: Gemma, agent workloads and a million-token context — 2026-10-11
 
