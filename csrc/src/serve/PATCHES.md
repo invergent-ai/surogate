@@ -5375,3 +5375,37 @@ The GenericYarn angles are `generic_pair_sincos` with the YaRN coefficients and 
 does. `test_qk_norm_rope` gains Flash-Next's heads (1-D, MRoPE, queries alone) and a 128-wide head under YaRN.
 
 Swift-1.5 IQ2_XS at 262k, 1 user: 58.3 → 58.4 tok/s. The unfused path cost almost nothing.
+
+## 150
+
+**Shared prompt prefixes under MTP (2026-10-13).** The shared-prefix cache keeps a page-aligned prompt prefix that
+several conversations share, such as a system prompt or tool definitions. It captures the prefix once, mid-prefill,
+and later requests on any lane fork it. It was enabled only without speculation, because a draft head's KV and the
+boundary's hidden were not copied. With `--spec mtp`, every new conversation therefore prefilled the shared preamble
+again: an agent framework's 22k-token preamble (system prompt and 38 tools) took ~13 s before the first token on a
+DGX Spark serving Swift-1.5 IQ3_S.
+
+- **Capture.** `capture_shared_prefix` also shares the MTP head's KV pages through the boundary
+  (`share_prefix` on the backend pool). It keeps the trunk's hidden at the prefix's last token in the entry's slot.
+  That hidden is the last column of the chunk that ends at the boundary, still in `prefill_hidden` at both capture
+  sites. On the lone-chunk path the capture now follows the head's `mtp_kv_valid` update.
+- **Fork.** The head's column at token `tokens - 1` was paired with the capturing prompt's next token, which a fork's
+  prompt need not share. A fork therefore borrows the head's pages through `tokens - 1` only: `fork_prefix` copies
+  the boundary page. It restores the kept hidden as its tail, so its MTP bridge pairs that hidden with its own next
+  token, as an append to a retained conversation does. Admission counts the head's borrowed pages.
+- **Borrowed-page guard.** The guard rounded the reuse base up to whole pages, which let a rewind land inside a
+  fork's last borrowed page and overwrite KV other forks read. It now requires the suffix's first write, and an MTP
+  bridge's column, to land in an owned page.
+- DFlash stays excluded: its drafter keeps context the entry does not copy.
+
+Measured on a DGX Spark, Swift-1.5 IQ3_S at the service's settings (1M + YaRN, MTP 3, 2,048-token chunks), with
+`shared_prefix_check.py`. Five prompts share exactly their first 10,240 tokens and differ at token 10,240, so each
+fork's bridge pairs the kept hidden with a different next token than the capture's.
+
+- **Exactness.** With the cache on and off (`SUROGATE_SERVE_SHARED_PREFIX_SLOTS=0`), every forked answer matches
+  the no-fork one: identical first-token top-5 log-probabilities and identical tokens (49, 52, 136 and 114).
+- **Latency.** The forks' first token comes in 149–167 ms, against 5.86–5.90 s for the full prompt.
+- **Four concurrent agents.** Four agents in two waves, three turns each over a 10.6k-token preamble, ran without
+  errors. The second wave's first-turn TTFT was 0.30–0.56 s, against 6.5–29.9 s for the first wave, which computed
+  the preamble. Later turns of forked conversations restored their turn checkpoints as usual.
+- **Tests.** `sinfer_kv_cache_test` passes.
