@@ -5160,3 +5160,218 @@ difference 0 on all 900 tokens. Measured on a DGX Spark (`sinfer_causal_softmax_
 Tried and dropped: folding the score scale and P's 448 into the exponent's one FMA (32 fewer multiplies a block a
 thread) left the kernel at 154 TFLOP/s and failed `sinfer_gqa_attention_test`'s split-numerator precision case
 (QSA, width 131) on its changed rounding; the softmax's cost is not its multiplies.
+
+## 140
+
+**YaRN for Qwen3.8-Flash-Next, and its MTP head on image prompts (2026-10-12).** Flash-Next is trained to 262,144
+positions and `--rope-scaling` was refused for it: only the `qwen3_5_moe` target took the flag. Its attention uses
+the same text rotation as the 35B (head dim 256, rotary dim 64, theta 1e7). It has 24 query heads and 2 key heads,
+and no fixed rope kernel is compiled for that geometry. Its QSA indexer rotates 128-wide query heads and pooled
+block keys in kernels of its own.
+
+- `ops::rope`'s YaRN form falls back to the generic kernel for any even head width and head count instead of
+  refusing. The coefficients are derived the same way (`rope_yarn_sincos`): the angle is computed in double and
+  reduced before `sincosf`, and both coefficients are multiplied by the attention factor.
+- `RopeYarn` carries the model's interleaved MRoPE sections for [T,3] positions. The fixed kernels hard-wire
+  `i % 3` (the same as 11/11/10), so they keep only cyclic sections; any other layout takes the generic kernel.
+- The QSA indexer rotates its queries with that form, and folds its block keys with the same arithmetic
+  (`QsaIndexerGeometry::yarn`). `test_qsa_indexer`'s absolute floor scales with the attention factor on the
+  rotated dimensions: YaRN multiplies the rounding there by 1.139 at factor 4. The test names its worst block-key
+  element on every run.
+- The `qwen4exp` target lays the scaling over its bound geometry, and the registry admits it next to
+  `qwen3_5_moe`.
+- Image prompts no longer stop the engine. The trunk-layer MTP head rotated an image prompt's [T,3] positions
+  through a strided slice, which `ops::rope` refuses, so the first decode round after any image request failed
+  with "rope: positions must be contiguous". `TextContext::contiguous_positions` now copies the strided view into
+  the workspace first.
+
+`test_rope` covers Flash-Next's 24/2 heads (decode, and prefill past 1M), the MTP head's 24-head tensor, the
+indexer's four 128-wide heads (1-D and MRoPE), and non-cyclic sections on both models' geometries.
+
+## 141
+
+**Flash-Next's speculative decode lanes in mixed rounds.** A round that carried one sequence's prompt chunk next
+to other sequences' speculative decode lanes threw "mixed speculative prologue is unavailable" for any target
+with a layer prologue (Flash-Next's n-gram PLE), and the engine stopped. With `--spec mtp` this happened the first
+time an agent's turn was admitted while another agent was decoding: within seconds with 4 tool-calling agents.
+The mixed round now stages a decode lane's `width` columns as one segment on the lane's slot, the layout a verify
+round gives them (`prologue_staging::verify_columns`). The PLE state after each column lands in the slot's
+snapshots, and the speculative fold commits the last accepted one, as it does after a verify round.
+
+## 142
+
+**i-quant routed experts on the int8 prompt route.** The GSQ-RCO Flash-Next GGUFs (ISTA-DASLab's, and UkisAI's
+Swift-1.5 built from them) store their routed experts in i-quants:
+
+- Swift-1.5 IQ3_S: IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS gate/up over IQ4_NL or Q2_0 down.
+- Swift-1.5 IQ2_XS: IQ2_S, IQ2_XXS and IQ1_M gate/up over Q2_0 down.
+
+None of these types had a K multiple in the prefill plan, so each prompt ran on the small-T decode kernels in
+slices: about 200 tokens a second on a DGX Spark, against ~1,100 for the Q2_0 build. All seven types are
+`w = scale * code`, a small signed integer code per value with a scale per 32 (or 16) values, which is the form
+the int8 tensor-core tile takes. Each type now has an int8 codec that decodes its codes the way the decode-path
+dot products (from llama.cpp) do:
+
+- **IQ4_NL:** two 18-byte blocks to a 64-wide tile, staged in 4-byte units.
+- **IQ4_XS:** the same 16-level table under a six-bit scale per 32.
+- **IQ3_XXS, IQ3_S, IQ2_S, IQ2_XXS, IQ1_M:** superblocks staged whole and covered once per four tiles, as Q3_K
+  is. Codes are grid levels with their signs applied. IQ1_M's ±1/8 row offset is exact as `8 g - 7` or
+  `8 g - 9`, with the eighth moved to the scale.
+
+The switches:
+
+- `SUROGATE_SERVE_MOE_GGML_IQ=0` sends these types to the BF16-activation prefill route.
+- `SUROGATE_SERVE_MOE_GGML_IQ_PREFILL=0` sends them back to the small-T slices.
+- `SUROGATE_SERVE_MOE_GGML_PREFILL_MIN` (1..47, default 47) moves the width from which a GGML pair leaves small-T.
+  Real-text decode per user at 1/4 users: IQ2_XS 54.4/21.5 tok/s at 47, 46.4/18.4 at 2; IQ3_S 36.0/18.8 at 47,
+  36.1/18.1 at 8. The default stays 47.
+
+`test_sparse_moe_ggml_prefill` runs every pair those builds hold, on Flash-Next's geometry, against the small-T
+kernels. `SINFER_TEST_MOE_BENCH=<tokens>` times one wide call per mixture instead.
+
+## 143
+
+**The int8 tile, tuned for the Flash-Next expert pairs** (`ops/linear/ggml/ggml_i8_tile.cuh`; the routed int8
+experts, and the dense Q4_K/Q5_K/Q6_K prompt GEMMs, share it). Measured with `SINFER_TEST_MOE_BENCH=4096` on
+GB10. An ablation of the IQ3_S layer (24.1 ms) showed each K step waiting on memory, about 1.4 µs a step.
+
+- **Pipeline depth per codec** (`i8_stages<Codec>()`): four stages for IQ4_NL, three for the covered i-quants,
+  two for the rest as before. The header slots serve a loop up to four deep. The covered codecs' header stride is
+  cut so that three stages fit under the 48 KiB static limit.
+- **Persistent grid capped by occupancy:** the grid is now the smaller of `kPrefillBlocksPerSm` and what
+  co-resides (`cooperative_capacity_per_device`). Three CTAs an SM ran a third as a tail. Results:
+  - Q2_0 pair: 38.1 → 28.3 ms;
+  - IQ3_S/IQ4_NL: 24.1 → 22.9 ms.
+- **Activation rows looked up once per work item,** outside the K loop.
+- **IQ4_XS stages through eight-byte `cp_async`** (`header_unit<Codec>()`): its 136-byte superblocks are 8-byte
+  aligned. It was the slowest pair at 31.4 ms, against 22–25 ms for the other i-quants.
+- **Q2_0 stages through `cp_async`:** each tile is the 20-byte, four-byte-aligned window around its 18-byte block,
+  read at `tile_shift`. Ablated, staging was more than half of the pair (37.9 → 16.6 ms).
+- **Two barriers per K step, not three:** tile kt + Stages − 1 is staged right after the barrier that opens step
+  kt, into the stage that step kt − 1 used.
+- **128-column tiles on dynamic shared memory** (`i8_tile_smem<Smem>()`). These kernels are bound by instruction
+  issue: the IQ2_S gate/up issues ~550 instructions per warp per step for 16 IMMAs, ~115 of them unpack. Wider
+  tiles amortize the unpack:
+  - Dense Q6_K takes 64 × 128 (`SUROGATE_SERVE_GGML_WIDE_DYNAMIC=0` keeps 64).
+  - Routed experts take 128 columns from `kSparseMoePrefillI8Wide128Min = 4096` tokens: faster at a full slice,
+    slower at half of one.
+- **IQ2_S and IQ2_XXS unpack a grid row's two quads from one lookup** (`kUnpackRows`).
+
+Arithmetic and summation order are unchanged; the prefill tests pass bit for bit.
+
+## 144
+
+**Dense GGML prompt GEMMs: L2-sized bands, and 32 weight rows for the generic formats.**
+
+- **L2-sized bands.** The tile GEMMs (`dense_i8_kernel`, `dense_affine_mma`, `dense_f16_mma`) mapped `blockIdx.x`
+  to the row tile, so a 4,096-column chunk in 64-wide tiles read each weight 64 times, from DRAM once the weight
+  outgrew L2. Swift-1.5 IQ3_S's ~21 MB Q6_K GDN projections made that tile GEMM 24% of a cold prompt.
+  `grouped_tile<Group>()` runs bands of 512 weight rows across every column tile before the next band starts.
+  Output tiles and their arithmetic are unchanged.
+- **32 weight rows for the generic formats.** `dense_affine_mma_kernel` is the prompt GEMM of every format
+  without a hand int8 codec (IQ4_XS and IQ3_S hold most of the Swift-1.5 IQ2_XS dense projections). It takes
+  `Rows` = 32 by default, two m16 tiles a warp, which halves the activation re-reads. 10240 × 2560 IQ4_XS at
+  4,096 tokens: 9.1 → 7.4 ms. `SUROGATE_GGML_AFFINE_ROWS=16` restores 16 rows; the bits are the same at either
+  height.
+- **Tried and removed: a group-major 64 × 128 GEMM.** It summed one accumulator class at a time, to keep the
+  formats' eight-accumulator tree within the register budget at a wider tile. Every variant was slower than the
+  32-row tile:
+
+  | Variant | 10240 × 2560 IQ4_XS, 4,096 tokens |
+  |---|---|
+  | 128 columns | 8.3 ms |
+  | 64 columns | 7.8 ms |
+  | 4 producer warps | 13.5 ms |
+  | 32-column decode tile | slower than the 16-row tile at 16 tokens |
+
+`test_ggml_k` gains `SINFER_GGML_BENCH="TYPE:rows:k:tokens[,...]"`, which times `linear_launch` on the device's
+own plan and prints ms, TOPS and weight GB/s.
+
+## 145
+
+**A shortlist draft head for qwen4exp GGUFs** (`surogate/serve/convert/qwen4exp/convert.py`, `--lm-head-draft`).
+The safetensors converter wrote `text/draft_head` for Flash-Next: the output head's rows for the bundled
+ranking's 131,072 most frequent tokens. The GGUF converter wrote none, so every MTP draft step on a GGUF ran the
+full 248,320-row head: 1.8 ms a step for Swift-1.5's IQ4_XS head on GB10.
+
+- Whenever the NextN head is converted, the GGUF path now copies the output head's own blocks for those rows (no
+  requantisation). `--no-draft-head` leaves the shortlist out.
+- A GGUF carries no tokenizer.json sha256, so `draft_shortlist` checks the vocabulary itself. The ranking's size
+  must be the model's, and each top token in the manifest must decode, at its id, to the same text.
+- `RECIPE_ID` moves to v6.
+
+Real-text decode per user, IQ2_XS at 1/4/8 users: 57.0/23.8/14.1 → 57.3/23.8/14.5 tok/s.
+
+## 146
+
+**The wide hyper-connection mixer fuses its up projection with the finish.** This applies to prompt rounds of
+128 tokens and up, with BF16 up rows and four streams. `up_finish_kernel` computes a block's gate logits (BF16
+MMAs over the low rank, double-buffered `cp_async`) and finishes them from registers. The [T, streams × hidden]
+gate plane is no longer written by cuBLASLt and read back: 84 MB each way at 4,096 Flash-Next tokens, twice a
+layer.
+
+The logits now sum in the MMA's order instead of cuBLASLt's. `SUROGATE_SERVE_HC_UP_FINISH=0` keeps the old pair.
+Swift-1.5 IQ2_XS, one tool-calling agent: cold 100k prompt 65.7 → 64.1 s, warm turn p50 2.22 → 2.18 s.
+
+## 147
+
+**An expert-major small-T MoE round for GGML experts.** The small-T decode kernels read a routed expert's rows,
+and decode its weights, once per (token, path). A verify round's tokens are consecutive positions of a few
+sequences and mostly share experts. Measured with `SUROGATE_SERVE_MOE_ROUTE_STATS=<s>`, which counts distinct
+experts per round into static device memory, graph replays included:
+
+| Sequences × tokens | Distinct experts | Paths |
+|---|---|---|
+| 4 × 4 | 82 | 160 |
+| 8 × 4 | 129 | 320 |
+
+The round applies to a GGML routed pair with no expert slot pool, once the shared expert is computed:
+
+- One block groups the paths by expert.
+- Gate/up blocks per (row tile, distinct expert) run `dot_two_rows_tokens`. It decodes a lane's eight weights of
+  each row once per group step for up to four of the expert's entries. Each entry's sums are taken in exactly the
+  order `dot_two_rows` takes them alone, so the bits per path are unchanged.
+- The down projection stays `sparse_moe_d4_token_kernel`, reading the gate/up's per-path layout.
+
+Four sequences, 16-token rounds (nsys): gate/up 793 → 537 µs a layer. On by default;
+`SUROGATE_SERVE_MOE_EXPERT_MAJOR=0` keeps the per-path gate/up. `test_sparse_moe_ggml_prefill` checks it bit for
+bit against the per-path kernels.
+
+**Tried and removed:** an expert-major down kernel and its combine, 468 µs against the per-token down's 426.
+
+## 148
+
+**A `cp_async`-staged 32-column dense tile for decode rounds** (`dense_affine_staged_kernel<Type, Cols, Rows>`,
+`ops/linear/ggml/ggml_dense_generic.cuh`). In a decode round of 9 to 32 tokens, the generic formats'
+`dense_affine_mma_kernel` decoded each 256-value chunk from synchronous global loads. At 16 tokens it streamed the
+IQ4_XS projections at ~100–120 GB/s.
+
+The staged kernel loads each chunk one step ahead into a two-stage ring (`StagedAffine<Type>`):
+
+- every row's weight blocks as a 16-byte-aligned window, decoded by `dense_codes_eight` from shared memory at the
+  same offset modulo 16;
+- the int8 activations and their half2 scales.
+
+It keeps the same K order and accumulator tree, so the bits are the same: the `test_ggml_k` fixtures (20,724
+cases) pass at 16 and 32 rows.
+
+- **Default height:** 32 rows. Below 2,048 weight rows it takes 16, which fits the shared expert's 640 × 2560
+  gate/up: 22 µs plain, 16 at 16 rows, 22 at 32.
+- **Switches:** `SUROGATE_GGML_AFFINE_STAGED=0` restores the plain tile; `=16` forces 16 rows.
+- **DRAM-bound IQ4_XS 131072 × 2560 at 32 tokens:** 148 → 163 GB/s.
+
+Swift-1.5 IQ2_XS at 1M (YaRN), MTP 3, real-text decode per user at 1/2/4 users (4264d13 → 5cc6043, the 16-row
+step): 57.1/39.6/26.0 → 57.1/39.8/27.0 tok/s.
+
+## 149
+
+**Fused q/k-norm + rope under YaRN for any geometry** (`QkRopeAngles::GenericYarn`,
+`ops/kernel/qk_norm_rope.cuh`). Under YaRN, `qk_norm_rope` took only the fixed kernels' geometries (24/4 and 16/2
+heads). Flash-Next's 24/2 heads at 1M therefore ran two rmsnorms and the generic YaRN rope in each full-attention
+layer and MTP step.
+
+The GenericYarn angles are `generic_pair_sincos` with the YaRN coefficients and sections, which is what
+`rope_generic_kernel` computes, so the fused launch leaves the same bits. The launcher picks as `rope_yarn_launch`
+does. `test_qk_norm_rope` gains Flash-Next's heads (1-D, MRoPE, queries alone) and a 128-wide head under YaRN.
+
+Swift-1.5 IQ2_XS at 262k, 1 user: 58.3 → 58.4 tok/s. The unfused path cost almost nothing.

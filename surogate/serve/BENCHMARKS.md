@@ -1,5 +1,79 @@
 # Serving benchmarks
 
+## DGX Spark: Swift-1.5 Flash-Next GGUF for up to four agents — 2026-10-12
+
+UkisAI's Swift-1.5-Qwen3.8-Flash-Next GSQ-RCO GGUF on one DGX Spark, converted with the shortlist draft head
+(PATCHES #145). Every run uses FP8 KV, `--vision`, 8 sequences and 4,096-token chunks. Speed is measured two ways:
+
+- **Real-text decode:** `bench_real_p90.py`, wiki prose, 256 new tokens, tokens a second per user.
+- **Agent runs:** `agentic_long_bench.py`. With `--tools`, an agent makes real tool calls. Without it, agents
+  grow 50k–100k contexts by 200 tokens a turn, which makes the run deterministic.
+
+### Which build (MTP 3, 262k context)
+
+| Build | Experts (gate/up over down) | Real-text decode, 1 / 4 / 8 users | 1 agent `--tools`, 42 turns | Its cold 100k prompt |
+|---|---|---|---|---|
+| **IQ2_XS** | IQ2_S, IQ2_XXS, IQ1_M over Q2_0 | **54.4 / 21.5 / 14.3** | **159 s** | 64.9 s |
+| Q2_0 | Q2_0 | not measured | 170 s | 74.8 s |
+| IQ3_S | IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS over IQ4_NL / Q2_0 | 36.0 / 18.8 / 11.2 | 488 s | 60.4 s |
+
+The decode columns are from the morning's first build that ran the i-quant prompt route (PATCHES #142). The
+agent columns are from one build in the afternoon. IQ2_XS is the build to serve: it was the fastest of the three
+in the agent run, and it decoded faster than IQ3_S at every user count.
+
+### Over the day: IQ2_XS, 262k context, MTP 3
+
+| | Morning build | 4e75898 |
+|---|---|---|
+| Real-text decode per user, 1 / 4 users | 54.4 / 21.5 tok/s | **61.6 / 26.3** |
+| 1 agent `--tools`: cold 100k prompt | 70.8 s | **62.4 s** |
+| 1 agent `--tools`: warm turn p50 | 2.37 s | **2.13 s** |
+
+PATCHES #142-#147 cover the changes. The deterministic 4-agent run took 402.7 s (78 turns) on the first build it
+ran on, and 380.6 s (77 turns) on 4e75898.
+
+### A million tokens and the serving settings (4264d13, 5cc6043)
+
+```
+--vision --kv-cache-dtype fp8 --max-model-len 1048576
+--rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'
+--kv-capacity 1835008 --max-num-seqs 8 --max-num-batched-tokens 4096
+--spec mtp --draft-tokens 2 --enable-auto-tool-choice
+```
+
+**Needle.** A 1,000,667-token haystack found all three passphrases (3/3); the cold prompt took 1066 s. With the
+KV pool at 1,310,720 tokens, at least 20.4 GiB of memory stayed available. With the pool at 1,835,008 tokens
+(the setting above), 34.6 GiB was free after startup. That pool holds one agent at a million tokens plus 750k
+tokens for the others.
+
+**Four agents.** The deterministic 4-agent run takes as long at 1M as at 262k: 381.0 s against 380.6 s for 77
+turns. At 1M, chunk size makes no measurable difference:
+
+| Chunks | Wall time | Warm first token p50 / p90 | Cold first token p50 |
+|---|---|---|---|
+| 4,096 | 382.4 s | 3.12 / 6.16 s | 115 s |
+| 2,048 | 386.0 s | 3.25 / 5.72 s | 119 s |
+
+4,096 stays, because it gets cold long prompts in sooner.
+
+**One user.** With the same requests, 1M costs 2.6% against 262k:
+
+| Config | tok/s |
+|---|---|
+| 262k | 58.4 |
+| 262k + YaRN | 57.3 |
+| 1M + YaRN | 56.9 |
+
+**MTP 2 against MTP 3** (4264d13), real-text decode per user on identical requests:
+
+| | 1 user | 2 users | 4 users | Tokens per round |
+|---|---|---|---|---|
+| MTP 3 | 57.1 | 39.6 | 26.0 | 2.69 |
+| **MTP 2** | **59.5** | **40.5** | **26.7** | 2.34 |
+
+An MTP 3 round costs ~20% more than an MTP 2 round. On prose the third draft is accepted 37% of the time, which
+does not pay for that. On 5cc6043 (PATCHES #148's 16-row step), MTP 3 runs at 57.1 / 39.8 / 27.0.
+
 ## DGX Spark: Gemma, agent workloads and a million-token context — 2026-10-11
 
 One DGX Spark (GB10, 121.7 GiB unified memory), our engine with FP8 KV against vLLM 0.31 (BF16
