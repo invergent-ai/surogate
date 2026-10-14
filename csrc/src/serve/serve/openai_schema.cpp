@@ -488,6 +488,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
             }
         }
     }
+    s.default_logit_bias = get_bool(body, "default_logit_bias", true);
     if (const std::optional<int> n = get_int(body, "n")) {
         s.n = *n;
         if (s.n != 1) {

@@ -110,7 +110,8 @@ status 1, so a supervisor such as systemd can restart it and health checks stop 
 | `presence_penalty`, `frequency_penalty` | Adjust repetition penalties for previously used tokens |
 | `seed` | Sets the sampler seed; an omitted seed uses the server seed or a fresh per-request seed |
 | `stop` | String or array of strings |
-| `logit_bias` | Map token-id strings to biases in `[-100,100]`; applies to greedy and sampled generation |
+| `logit_bias` | Map token-id strings to biases in `[-100,100]`; applies to greedy and sampled generation, reasoning included. Entries win per token over the server's `--logit-bias` |
+| `default_logit_bias` | Extension; `false` drops the server's `--logit-bias` for this request (also accepted by the Responses and Anthropic endpoints) |
 | `tools`, `tool_choice` | Function tools only; `none`, `auto`, `required`, or a named function object. Automatic choice requires `--enable-auto-tool-choice` |
 | `response_format` | `text`, `json_object`, or `json_schema`; see [Structured output](#structured-output) |
 | `parallel_decoding` | Opt into independent boolean/enum classification on JSON-schema chat requests; see [Parallel constrained decoding](#parallel-constrained-decoding) |

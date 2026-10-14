@@ -471,6 +471,28 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                 "for vision adapters. For unsupported serving modules, use `surogate merge`, then convert and serve the merged checkpoint.");
         }
     }
+    // --logit-bias names token ids of this tokenizer: an id it does not have would fail every
+    // request, so it stops the server here, and the log shows what each id spells.
+    if (!options_.sampling_overrides.logit_bias.empty()) {
+        std::vector<sinfer::TokenId> ids;
+        for (const auto& [token, bias] : options_.sampling_overrides.logit_bias) { ids.push_back(token); }
+        std::sort(ids.begin(), ids.end());
+        std::vector<std::string> texts;
+        try {
+            texts = engine_->token_texts(std::span<const sinfer::TokenId>(ids.data(), ids.size()));
+        } catch (const std::exception& error) {
+            throw std::invalid_argument(std::string("--logit-bias: ") + error.what());
+        }
+        std::string listing;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            listing += (i == 0 ? "" : ", ") + std::to_string(ids[i]) + " " +
+                       nlohmann::json(texts[i]).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) +
+                       " " + nlohmann::json(options_.sampling_overrides.logit_bias.at(ids[i])).dump();
+        }
+        write_console_log(ConsoleLogLevel::Info,
+                          "default logit bias (--logit-bias) on " + std::to_string(ids.size()) +
+                              " tokens: " + listing);
+    }
     prompt_capabilities_ = engine_->prompt_capabilities();
     // Gemma 4 writes its calls in its own notation, which the default Qwen parser never finds: an
     // agent got every call back as prose. A vocabulary that spells Gemma 4's markers takes the

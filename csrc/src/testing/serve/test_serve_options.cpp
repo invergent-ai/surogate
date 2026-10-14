@@ -399,6 +399,41 @@ int main() {
     request.sampling.temperature = 1.1;
     failures += check(to_request_options(request, sampling).execution.sampling.temperature == 1.1F,
                       "request sampling override did not win over the server override");
+    {
+        // --logit-bias: every request carries it; a request's own value wins per token, and
+        // "default_logit_bias": false drops the server's map but keeps the request's.
+        const auto biased = parse({"sinfer-serve", "model.sinfer", "--logit-bias", R"({"5": -5, "7": 2.5})"});
+        failures += check(biased.sampling_overrides.logit_bias.size() == 2 &&
+                              biased.sampling_overrides.logit_bias.at(5) == -5.0F &&
+                              biased.sampling_overrides.logit_bias.at(7) == 2.5F,
+                          "--logit-bias was not parsed");
+        failures += check(defaults.sampling_overrides.logit_bias.empty(), "logit bias should be opt-in");
+        GenerationRequest plain;
+        plain.max_tokens = 1;
+        const auto inherited = to_request_options(plain, biased).execution.sampling.logit_bias;
+        failures += check(inherited.size() == 2 && inherited.at(5) == -5.0F && inherited.at(7) == 2.5F,
+                          "the server logit bias did not reach Engine options");
+        plain.sampling.logit_bias = {{5, 0.0}, {9, -1.0}};
+        const auto merged = to_request_options(plain, biased).execution.sampling.logit_bias;
+        failures += check(merged.size() == 3 && merged.at(5) == 0.0F && merged.at(7) == 2.5F &&
+                              merged.at(9) == -1.0F,
+                          "a request's logit_bias did not win per token over the server's");
+        plain.sampling.default_logit_bias = false;
+        const auto dropped = to_request_options(plain, biased).execution.sampling.logit_bias;
+        failures += check(dropped.size() == 2 && dropped.at(5) == 0.0F && dropped.at(9) == -1.0F,
+                          "default_logit_bias false did not drop the server's logit bias");
+        ServeOptions::ExtraModel extra;
+        extra.name          = "other";
+        extra.artifact_path = "other.sinfer";
+        failures += check(extra_model_options(biased, extra).sampling_overrides.logit_bias.empty(),
+                          "an extra model inherited the primary's token-id logit bias");
+        for (const auto* text : {"[]", "{}", R"({"x": 1})", R"({"-1": 1})", R"({"5": 101})", R"({"5": "a"})", "not json"}) {
+            bool rejected = false;
+            try { (void)parse({"sinfer-serve", "model.sinfer", "--logit-bias", text}); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an invalid --logit-bias was accepted");
+        }
+    }
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");

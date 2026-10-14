@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string_view>
+#include <unordered_map>
 
 namespace sinfer::serve {
 namespace {
@@ -77,6 +78,31 @@ EngineOptions::RopeScaling parse_rope_scaling(const std::string& text) {
         if (std::find(std::begin(kKnown), std::end(kKnown), item.key()) == std::end(kKnown)) {
             throw std::invalid_argument("--rope-scaling: unsupported key \"" + item.key() + "\"");
         }
+    }
+    return out;
+}
+
+/// --logit-bias: the OpenAI `logit_bias` object, {"<token id>": bias, ...}, added to every
+/// request's logits before temperature -- inside the reasoning text too. A request's own
+/// `logit_bias` wins per token id, and `"default_logit_bias": false` drops this map for that
+/// request. Token ids are checked against the tokenizer when the model loads.
+std::unordered_map<sinfer::TokenId, float> parse_logit_bias(const std::string& text) {
+    const auto json = nlohmann::json::parse(text, nullptr, false);
+    if (!json.is_object() || json.empty()) {
+        throw std::invalid_argument("--logit-bias must be a non-empty JSON object of token id -> bias");
+    }
+    std::unordered_map<sinfer::TokenId, float> out;
+    for (auto it = json.begin(); it != json.end(); ++it) {
+        const std::string& key = it.key();
+        if (key.empty() || key.size() > 9 || key.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::invalid_argument("--logit-bias: key \"" + key + "\" is not a token id");
+        }
+        if (!it.value().is_number() || !std::isfinite(it.value().get<double>()) ||
+            it.value().get<double>() < -100.0 || it.value().get<double>() > 100.0) {
+            throw std::invalid_argument("--logit-bias: the bias of token " + key +
+                                        " must be a number in [-100,100]");
+        }
+        out[static_cast<sinfer::TokenId>(std::stol(key))] = static_cast<float>(it.value().get<double>());
     }
     return out;
 }
@@ -212,7 +238,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
+           "[--frequency-penalty F] [--logit-bias JSON] [--seed N] [--greedy] [--decision-temperature T] "
            "[--decision-attempts N]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
@@ -229,6 +255,9 @@ std::string serve_usage_text(const char* argv0) {
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
+           "       --logit-bias '{\"<token id>\": bias, ...}' adds a default OpenAI logit_bias\n"
+           "         (bias in [-100,100]) to every request, reasoning included; a request's\n"
+           "         logit_bias wins per token, and \"default_logit_bias\": false drops it\n"
            "       --rope-scaling takes Hugging Face's rope_scaling object, e.g.\n"
            "         '{\"rope_type\":\"yarn\",\"factor\":4,\"original_max_position_embeddings\":262144}':\n"
            "         YaRN over the Qwen3.5/3.6 MoE rotation, extending the context to\n"
@@ -736,6 +765,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--frequency-penalty") {
             options.sampling_overrides.frequency_penalty = parse_float_in(
                 require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+        } else if (arg == "--logit-bias") {
+            options.sampling_overrides.logit_bias = parse_logit_bias(require_value("--logit-bias"));
         } else if (arg == "--seed") {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
@@ -1015,6 +1046,9 @@ ServeOptions extra_model_options(const ServeOptions& primary, const ServeOptions
     out.lora_modules = extra.lora;
     out.speculative = extra.speculative;
     out.model_priority = extra.priority;
+    // Token ids name one tokenizer's vocabulary: the primary's --logit-bias means other
+    // tokens, or none, in another model.
+    out.sampling_overrides.logit_bias.clear();
     return out;
 }
 

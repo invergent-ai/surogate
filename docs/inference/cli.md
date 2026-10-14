@@ -449,6 +449,11 @@ the family default applies.
 `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, and `--frequency-penalty`
 set server defaults. `--seed` sets the random seed, which can also be overridden per request.
 `--greedy` always forces temperature zero, including when a request asks for another value.
+`--logit-bias '{"<token id>": bias, ...}'` adds a default OpenAI `logit_bias` (biases in `[-100,100]`)
+to every request on the primary model, inside the reasoning text too, before temperature. A
+request's own `logit_bias` wins per token id, and `"default_logit_bias": false` in a request drops
+the server's map. The ids are checked against the model's tokenizer at startup, and the log lists
+the text of each one. Extra `--model` entries do not inherit it.
 Requests also accept `repetition_penalty`.
 
 Sampling honors the requested `top_k` without a fixed candidate cap; `top_k: 0` leaves the

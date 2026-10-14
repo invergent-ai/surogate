@@ -35,6 +35,7 @@ std::uint64_t random_seed() {
 sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
                                                      const ServeOptions& server) {
     sinfer::SamplingOverrides sampling = server.sampling_overrides;
+    if (!request.default_logit_bias) { sampling.logit_bias.clear(); }
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     // vLLM spells "do not truncate" as -1 and every RL rollout sends it. The engine

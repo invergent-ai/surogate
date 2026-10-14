@@ -542,6 +542,7 @@ void reject_unknown_top_level(const Json& body) {
         "chat_template_kwargs",
         "context_management",
         "conversation",
+        "default_logit_bias",
         "include",
         "input",
         "instructions",
@@ -702,6 +703,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         }
     }
     out.generation.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
+    out.generation.sampling.default_logit_bias = optional_bool(body, "default_logit_bias", true);
     validate_metadata(body, out);
     parse_tools(body, out);
     parse_tool_choice(body, out);

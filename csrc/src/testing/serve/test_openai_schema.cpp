@@ -682,6 +682,18 @@ int test_parse_sampling_carried() {
     failures +=
         check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
               "logit_bias carried");
+    failures += check(req.sampling.default_logit_bias, "the server logit bias applies by default");
+    {
+        Json opt_out                  = body;
+        opt_out["default_logit_bias"] = false;
+        failures += check(!parse_chat_completion_request(opt_out, default_limits()).sampling.default_logit_bias,
+                          "default_logit_bias false carried");
+        opt_out["default_logit_bias"] = "no";
+        bool rejected                 = false;
+        try { (void)parse_chat_completion_request(opt_out, default_limits()); }
+        catch (const ApiException&) { rejected = true; }
+        failures += check(rejected, "a non-boolean default_logit_bias was accepted");
+    }
     const sinfer::RequestOptions options = to_request_options(req, default_server());
     failures += check(options.execution.sampling.temperature == 0.7F,
                       "temperature reaches Engine overrides");

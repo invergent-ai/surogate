@@ -132,6 +132,8 @@ struct SamplingParams {
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
     std::unordered_map<int, double> logit_bias;
+    /// `"default_logit_bias": false` (extension): the server's --logit-bias does not apply.
+    bool default_logit_bias = true;
     int n = 1;
 };
 

@@ -453,6 +453,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.temperature     = get_number(body, "temperature");
     s.top_p           = get_number(body, "top_p");
     s.top_k           = get_int(body, "top_k");
+    s.default_logit_bias = get_bool(body, "default_logit_bias", true);
     // The Anthropic API has no presence/frequency penalty or seed; those keep the
     // server defaults resolved in translate.cpp.
 }
