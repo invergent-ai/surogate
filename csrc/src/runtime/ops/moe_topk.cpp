@@ -92,6 +92,42 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                          mRunState.MainStream);
     }
 
+    // Rollout Routing Replay: use the rollout engine's experts for this layer's tokens (rows set per micro-batch via
+    // DslRunState::set_routing_replay); weights are recomputed from these probs, so the router keeps its gradient and
+    // moe_topk_backward (indices treated as constants) is unchanged. Not applied with a correction bias or rounding
+    // (DeepSeek-style routing): no rollout engine of ours produces replay rows for those models yet.
+    if (correction_bias == nullptr && rounding_scale <= 0.0f && !sort_by_index) {
+        if (const std::int16_t* replay = mRunState.routing_replay_rows(layer_idx_any, num_tokens, top_k)) {
+            if (probs.DType == ETensorDType::BF16) {
+                moe_topk_replay(indices.get<int>(),
+                                weights.get<nv_bfloat16>(),
+                                probs.get<nv_bfloat16>(),
+                                replay,
+                                num_tokens,
+                                num_experts,
+                                top_k,
+                                normalize,
+                                softmax,
+                                full_softmax,
+                                mRunState.routing_replay_bad_rows_device(),
+                                mRunState.MainStream);
+            } else {
+                moe_topk_replay(indices.get<int>(),
+                                weights.get<float>(),
+                                probs.get<float>(),
+                                replay,
+                                num_tokens,
+                                num_experts,
+                                top_k,
+                                normalize,
+                                softmax,
+                                full_softmax,
+                                mRunState.routing_replay_bad_rows_device(),
+                                mRunState.MainStream);
+            }
+        }
+    }
+
     // Apply routed_scaling_factor to weights after top-k selection + normalization
     if (scaling_factor != 1.0f) {
         const int n = num_tokens * top_k;

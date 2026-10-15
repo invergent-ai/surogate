@@ -809,6 +809,60 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
 }
 
 /**
+ * @brief Rollout Routing Replay: hand each GPU the rollout engine's expert choices for its micro-batch rows.
+ *
+ * @param rows int16 [local_gpus][num_layers][B*T][top_k], contiguous per GPU; a row starting with -1 is not replayed.
+ * The copy to each device is issued on that GPU's worker thread before this returns, so @p rows may be freed after.
+ */
+void MultiGPUPyTrainer::set_routing_replay(const std::int16_t* rows, int num_layers, int top_k) {
+    if (!rows || num_layers <= 0 || top_k <= 0) {
+        throw std::runtime_error("set_routing_replay: rows, num_layers and top_k are required");
+    }
+    const long tokens = static_cast<long>(B) * static_cast<long>(T);
+    const std::size_t per_gpu =
+        static_cast<std::size_t>(num_layers) * static_cast<std::size_t>(tokens) * static_cast<std::size_t>(top_k);
+    for (int i = 0; i < local_world_size(); ++i) {
+        const std::int16_t* gpu_rows = rows + static_cast<std::size_t>(i) * per_gpu;
+        run_work(
+            [gpu_rows, num_layers, tokens, top_k](sThreadContext& ctx) {
+                auto* dsl_rs = dynamic_cast<dsl::DslRunState*>(&ctx.Model->get_run_state());
+                if (!dsl_rs) {
+                    throw std::runtime_error("set_routing_replay: needs the DSL runtime");
+                }
+                dsl_rs->set_routing_replay(gpu_rows, num_layers, tokens, top_k, dsl_rs->MainStream);
+                CUDA_CHECK(cudaStreamSynchronize(dsl_rs->MainStream));
+            },
+            i);
+    }
+}
+
+void MultiGPUPyTrainer::clear_routing_replay() {
+    run_work([](sThreadContext& ctx) {
+        if (auto* dsl_rs = dynamic_cast<dsl::DslRunState*>(&ctx.Model->get_run_state())) {
+            dsl_rs->clear_routing_replay();
+        }
+    });
+}
+
+std::vector<std::pair<long, long>> MultiGPUPyTrainer::routing_replay_diagnostics() {
+    std::vector<std::pair<long, long>> out(static_cast<std::size_t>(local_world_size()), {0L, 0L});
+    for (int i = 0; i < local_world_size(); ++i) {
+        run_work(
+            [&out, i](sThreadContext& ctx) {
+                auto* dsl_rs = dynamic_cast<dsl::DslRunState*>(&ctx.Model->get_run_state());
+                if (!dsl_rs || !dsl_rs->routing_replay_bad_rows_device()) return;
+                int bad = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&bad, dsl_rs->routing_replay_bad_rows_device(), sizeof(int),
+                                           cudaMemcpyDeviceToHost, dsl_rs->MainStream));
+                CUDA_CHECK(cudaStreamSynchronize(dsl_rs->MainStream));
+                out[static_cast<std::size_t>(i)] = {static_cast<long>(bad), dsl_rs->routing_replay().shape_mismatches};
+            },
+            i);
+    }
+    return out;
+}
+
+/**
  * @brief Run one validation step and return the loss (rank 0).
  *
  * Copies host input/target token IDs into each rank's buffers (same layout as step()),

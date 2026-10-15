@@ -8,7 +8,9 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -393,8 +395,83 @@ public:
         return mMoEZLossCoef;
     }
 
+    /// Rollout Routing Replay (R3): the rollout engine's expert choices for the tokens of the current micro-batch,
+    /// laid out [layer][token][k] as int16 (a row starting with -1 is not replayed). While set, dispatch_moe_topk
+    /// overwrites the computed selection with these rows (kernel moe_topk_replay). Owns its device buffer.
+    struct RoutingReplayState {
+        std::int16_t* rows = nullptr;  ///< Device INT16 [num_layers * num_tokens * top_k]
+        int* bad_rows = nullptr;       ///< Device INT32 [1] rows with an out-of-range expert id
+        std::size_t capacity = 0;      ///< Elements allocated in `rows`
+        int num_layers = 0;
+        long num_tokens = 0;
+        int top_k = 0;
+        long token_offset = 0;  ///< First token of the current forward within the micro-batch (chunked mode)
+        bool active = false;
+        long shape_mismatches = 0;  ///< Forwards that found replay set but with a different token count / top_k
+        RoutingReplayState() = default;
+        RoutingReplayState(const RoutingReplayState&) = delete;
+        RoutingReplayState& operator=(const RoutingReplayState&) = delete;
+        ~RoutingReplayState() {
+            if (rows) cudaFree(rows);
+            if (bad_rows) cudaFree(bad_rows);
+        }
+    };
+
+    /// @brief Copy replay rows ([num_layers][num_tokens][top_k] int16, host) to the device and enable replay.
+    void set_routing_replay(const std::int16_t* host_rows, int num_layers, long num_tokens, int top_k,
+                            cudaStream_t stream) {
+        const std::size_t n = static_cast<std::size_t>(num_layers) * static_cast<std::size_t>(num_tokens) *
+                              static_cast<std::size_t>(top_k);
+        if (n > mRoutingReplay.capacity) {
+            if (mRoutingReplay.rows) cudaFree(mRoutingReplay.rows);
+            mRoutingReplay.rows = nullptr;
+            mRoutingReplay.capacity = 0;
+            if (cudaMalloc(&mRoutingReplay.rows, n * sizeof(std::int16_t)) != cudaSuccess) {
+                throw std::runtime_error("set_routing_replay: device allocation failed");
+            }
+            mRoutingReplay.capacity = n;
+        }
+        if (!mRoutingReplay.bad_rows) {
+            if (cudaMalloc(&mRoutingReplay.bad_rows, sizeof(int)) != cudaSuccess) {
+                throw std::runtime_error("set_routing_replay: device allocation failed");
+            }
+        }
+        cudaMemcpyAsync(mRoutingReplay.rows, host_rows, n * sizeof(std::int16_t), cudaMemcpyHostToDevice, stream);
+        cudaMemsetAsync(mRoutingReplay.bad_rows, 0, sizeof(int), stream);
+        mRoutingReplay.num_layers = num_layers;
+        mRoutingReplay.num_tokens = num_tokens;
+        mRoutingReplay.top_k = top_k;
+        mRoutingReplay.token_offset = 0;
+        mRoutingReplay.shape_mismatches = 0;
+        mRoutingReplay.active = true;
+    }
+    void clear_routing_replay() noexcept {
+        mRoutingReplay.active = false;
+    }
+    void set_routing_replay_token_offset(long offset) noexcept {
+        mRoutingReplay.token_offset = offset;
+    }
+    /// @brief Replay rows for `layer_idx` covering this forward's `num_tokens` tokens, or nullptr if replay is off,
+    /// the layer is out of range, or the shape does not match (counted in shape_mismatches).
+    [[nodiscard]] const std::int16_t* routing_replay_rows(int layer_idx, long num_tokens, int top_k) noexcept {
+        const auto& r = mRoutingReplay;
+        if (!r.active || layer_idx < 0 || layer_idx >= r.num_layers) return nullptr;
+        if (top_k != r.top_k || r.token_offset + num_tokens > r.num_tokens) {
+            mRoutingReplay.shape_mismatches++;
+            return nullptr;
+        }
+        return r.rows + (static_cast<long>(layer_idx) * r.num_tokens + r.token_offset) * r.top_k;
+    }
+    [[nodiscard]] int* routing_replay_bad_rows_device() noexcept {
+        return mRoutingReplay.bad_rows;
+    }
+    [[nodiscard]] const RoutingReplayState& routing_replay() const noexcept {
+        return mRoutingReplay;
+    }
+
 private:
     CompiledExecutor* mActiveExecutor = nullptr;  // unowned back-ref
+    RoutingReplayState mRoutingReplay;
 
     void allocate_non_block_state(const PretrainedConfig& cfg);
     void allocate_simplified_quant_buffers(const PretrainedConfig& cfg, const RuntimeOptions& options);

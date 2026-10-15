@@ -3526,6 +3526,37 @@ void moe_topk_forward(int* expert_indices,
                       float rounding_scale,
                       cudaStream_t stream);
 
+/// @brief Rollout Routing Replay: replace the top-k selection with the rollout engine's experts.
+/// Run right after moe_topk_forward on the same buffers. For each token whose replay row (top_k int16 expert ids)
+/// starts with a non-negative id, the indices are overwritten with the row and the weights recomputed from @p scores
+/// at those experts with the same rule as moe_topk_forward, so moe_topk_backward stays exact. Rows starting with a
+/// negative id keep the computed selection; rows with an out-of-range id are left untouched and counted in
+/// @p bad_rows (device int, may be nullptr). Routed scaling (moe_scale_forward) is applied by the caller afterwards.
+void moe_topk_replay(int* expert_indices,
+                     float* routing_weights,
+                     const float* scores,
+                     const std::int16_t* replay,
+                     int num_tokens,
+                     int num_experts,
+                     int top_k,
+                     bool normalize_weights,
+                     bool softmax_weights,
+                     bool full_softmax_weights,
+                     int* bad_rows,
+                     cudaStream_t stream);
+void moe_topk_replay(int* expert_indices,
+                     nv_bfloat16* routing_weights,
+                     const nv_bfloat16* scores,
+                     const std::int16_t* replay,
+                     int num_tokens,
+                     int num_experts,
+                     int top_k,
+                     bool normalize_weights,
+                     bool softmax_weights,
+                     bool full_softmax_weights,
+                     int* bad_rows,
+                     cudaStream_t stream);
+
 /// @brief Backward through top-k selection (with optional post-selection normalization).
 /// Given gradients wrt the selected weights (num_tokens, top_k), scatter them back to a dense
 /// gradient wrt the full probability matrix (num_tokens, num_experts).

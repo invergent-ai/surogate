@@ -290,6 +290,14 @@ public:
                            const float* visual_embeds,
                            const std::vector<const float*>& deepstack_visual_embeds);
 
+    // Rollout Routing Replay (R3): the rollout engine's expert choices for the next micro-batch(es).
+    // rows: int16 [local_gpus][num_layers][B*T][top_k] (contiguous per GPU); a row starting with -1 is not replayed.
+    // Stays set until clear_routing_replay(); the MoE top-k op then uses these experts instead of its own selection.
+    void set_routing_replay(const std::int16_t* rows, int num_layers, int top_k);
+    void clear_routing_replay();
+    // Per GPU: {rows with an out-of-range expert id since the last set, forwards whose shape did not match}.
+    std::vector<std::pair<long, long>> routing_replay_diagnostics();
+
     // Compute per-token log-probabilities for a batch [B, T].
     // use_lora=true applies LoRA (policy model); use_lora=false skips LoRA (reference model).
     // position_ids: optional [B, T] position IDs for packed sequences (nullptr = sequential).

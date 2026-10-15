@@ -530,6 +530,138 @@ void moe_topk_forward(int* expert_indices,
                               stream);
 }
 
+// ============================================================================
+// Rollout Routing Replay (R3)
+// ============================================================================
+// Overwrites the selection moe_topk_forward just made with the experts the rollout engine chose for the same token
+// (replay row, top_k int16 expert ids; a row whose first id is negative is not replayed and keeps the computed
+// selection). The weights are recomputed from THIS forward's scores at the replayed experts with the same rule as
+// moe_topk_forward (plain, normalized over the selection, or softmax over the selection / over all experts), so the
+// router still receives gradient and moe_topk_backward - which treats the indices as constants - stays exact.
+// Rows with an out-of-range id are left untouched and counted in *bad_rows (if not null).
+template <typename T>
+__global__ void moe_topk_replay_kernel(int* __restrict__ expert_indices,        // (num_tokens, top_k)
+                                       T* __restrict__ routing_weights,         // (num_tokens, top_k)
+                                       const T* __restrict__ scores,            // (num_tokens, num_experts)
+                                       const std::int16_t* __restrict__ replay, // (num_tokens, top_k)
+                                       int num_tokens,
+                                       int num_experts,
+                                       int top_k,
+                                       bool normalize_weights,
+                                       bool softmax_weights,
+                                       bool full_softmax_weights,
+                                       int* __restrict__ bad_rows) {
+    const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token_idx >= num_tokens) return;
+    const std::int16_t* row = replay + static_cast<long>(token_idx) * top_k;
+    if (row[0] < 0) return;
+
+    int idxs[MOE_TOPK_MAX_K];
+    float vals[MOE_TOPK_MAX_K];
+    const T* token_scores = scores + static_cast<long>(token_idx) * num_experts;
+    for (int k = 0; k < top_k; ++k) {
+        const int idx = static_cast<int>(row[k]);
+        if (idx < 0 || idx >= num_experts) {
+            if (bad_rows) atomicAdd(bad_rows, 1);
+            return;
+        }
+        idxs[k] = idx;
+        vals[k] = static_cast<float>(token_scores[idx]);
+    }
+
+    if (softmax_weights) {
+        const bool use_full_softmax = full_softmax_weights && !normalize_weights;
+        float maxv = -INFINITY;
+        const int limit = use_full_softmax ? num_experts : top_k;
+        for (int k = 0; k < limit; ++k) {
+            maxv = fmaxf(maxv, use_full_softmax ? static_cast<float>(token_scores[k]) : vals[k]);
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < limit; ++k) {
+            sum += expf((use_full_softmax ? static_cast<float>(token_scores[k]) : vals[k]) - maxv);
+        }
+        sum = fmaxf(sum, 1e-9f);
+        for (int k = 0; k < top_k; ++k) {
+            vals[k] = expf(vals[k] - maxv) / sum;
+        }
+    } else if (normalize_weights) {
+        float sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            sum += vals[k];
+        }
+        sum = fmaxf(sum, 1e-9f);
+        for (int k = 0; k < top_k; ++k) {
+            vals[k] /= sum;
+        }
+    }
+
+    for (int k = 0; k < top_k; ++k) {
+        expert_indices[static_cast<long>(token_idx) * top_k + k] = idxs[k];
+        routing_weights[static_cast<long>(token_idx) * top_k + k] = static_cast<T>(isfinite(vals[k]) ? vals[k] : 0.0f);
+    }
+}
+
+template <typename T>
+static void moe_topk_replay_launch(int* expert_indices,
+                                   T* routing_weights,
+                                   const T* scores,
+                                   const std::int16_t* replay,
+                                   int num_tokens,
+                                   int num_experts,
+                                   int top_k,
+                                   bool normalize_weights,
+                                   bool softmax_weights,
+                                   bool full_softmax_weights,
+                                   int* bad_rows,
+                                   cudaStream_t stream) {
+    if (num_tokens <= 0 || top_k <= 0) return;
+    const int block_size = 256;
+    const int grid_size = (num_tokens + block_size - 1) / block_size;
+    moe_topk_replay_kernel<T><<<grid_size, block_size, 0, stream>>>(expert_indices,
+                                                                    routing_weights,
+                                                                    scores,
+                                                                    replay,
+                                                                    num_tokens,
+                                                                    num_experts,
+                                                                    top_k,
+                                                                    normalize_weights,
+                                                                    softmax_weights,
+                                                                    full_softmax_weights,
+                                                                    bad_rows);
+}
+
+void moe_topk_replay(int* expert_indices,
+                     float* routing_weights,
+                     const float* scores,
+                     const std::int16_t* replay,
+                     int num_tokens,
+                     int num_experts,
+                     int top_k,
+                     bool normalize_weights,
+                     bool softmax_weights,
+                     bool full_softmax_weights,
+                     int* bad_rows,
+                     cudaStream_t stream) {
+    moe_topk_replay_launch(expert_indices, routing_weights, scores, replay, num_tokens, num_experts, top_k,
+                           normalize_weights, softmax_weights, full_softmax_weights, bad_rows, stream);
+}
+
+void moe_topk_replay(int* expert_indices,
+                     nv_bfloat16* routing_weights,
+                     const nv_bfloat16* scores,
+                     const std::int16_t* replay,
+                     int num_tokens,
+                     int num_experts,
+                     int top_k,
+                     bool normalize_weights,
+                     bool softmax_weights,
+                     bool full_softmax_weights,
+                     int* bad_rows,
+                     cudaStream_t stream) {
+    moe_topk_replay_launch(expert_indices, routing_weights, scores, replay, num_tokens, num_experts, top_k,
+                           normalize_weights, softmax_weights, full_softmax_weights, bad_rows, stream);
+}
+
 void moe_topk_backward(float* d_probs,
                        const float* d_routing_weights,
                        const float* probs,
