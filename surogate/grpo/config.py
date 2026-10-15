@@ -38,6 +38,23 @@ class GRPOLossConfig:
     # bounding single-token influence. Uncapped values still feed the
     # mismatch_kl metric so staleness monitoring sees the truth.
     ratio_clip: float = 7.389056  # e^2
+    # "ipo" (default): prime-rl's IPO loss as above. "cispo": CISPO (MiniMax-M1) - every completion token keeps its
+    # gradient (no probability-difference mask), no KL term, and the stop-gradient importance weight is truncated at
+    # `ratio_clip` (set it to 1 + eps_high). The native seed already computes A * min(ratio, ratio_clip) per kept token,
+    # so CISPO is this parameter setting: masks wider than any probability difference (|p_t - p_i| <= 1), kl_tau = 0.
+    variant: Literal["ipo", "cispo"] = "ipo"
+
+    def __post_init__(self):
+        if self.variant not in ("ipo", "cispo"):
+            raise ValueError(f"loss.variant must be 'ipo' or 'cispo', got {self.variant!r}")
+        if self.variant == "cispo":
+            if self.kl_tau not in (0.0, 1e-3):
+                logger.warning(f"loss.variant=cispo ignores kl_tau={self.kl_tau} (CISPO has no KL term)")
+            self.ipo_mask_low = 2.0
+            self.ipo_mask_high = 2.0
+            self.kl_tau = 0.0
+        if not self.ratio_clip > 0.0:
+            raise ValueError(f"loss.ratio_clip must be positive, got {self.ratio_clip}")
 
 
 @dataclass
