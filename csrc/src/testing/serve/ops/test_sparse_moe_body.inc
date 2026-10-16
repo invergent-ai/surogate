@@ -1338,6 +1338,130 @@ public:
         return failures;
     }
 
+    /// Whether the mixture itself makes one prompt's captured routing depend on the width its
+    /// prefill ran at (Rollout Routing Replay, e2e phase c: the --spec engine prefills a prompt
+    /// eagerly at its own width, a plain engine pads it to a 128-column graph bucket). The same
+    /// `small` token columns run alone and as the first columns of a `wide` round, then through
+    /// `layers - 1` more rounds, each fed its own previous output (RMS-normalized on the host,
+    /// identically for both widths, as a block's norm would). Layer by layer it reports the shared
+    /// columns whose output bits moved and the tokens whose captured expert set changed. Under an
+    /// admitted WidthInvariant pair nothing may move (asserted); the rest is reported. MEASURED
+    /// (GB10, 2026-10-16): W8 ByWidth and NVFP4 at 24 and 33 against 128 move nothing either, so
+    /// the e2e prompt-row differences come from the rest of the forward (the graph's padded chunk
+    /// changes the recurrent layers' chunking and the dense projections' width), not the mixture.
+    int run_width_dependence(std::int32_t small, std::int32_t wide, int layers,
+                             ops::SparseMoeRouting routing, bool expect_identical) {
+        const std::string label = std::string(profile_.name) + " width dependence T=" +
+                                  std::to_string(small) + " vs T=" + std::to_string(wide) +
+                                  (routing == ops::SparseMoeRouting::WidthInvariant ? " (WidthInvariant)"
+                                                                                    : " (ByWidth)");
+        std::vector<float> x(static_cast<std::size_t>(kHidden) * wide);
+        for (std::int32_t token = 0; token < wide; ++token) {
+            const int pattern = token % static_cast<int>(kRoutePatterns.size());
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                const int wobble = (token * 131 + row * 7) % 13 - 6;
+                x[static_cast<std::size_t>(token) * kHidden + row] =
+                    inputs_[pattern][row] * (1.0F + 0.02F * static_cast<float>(wobble) / 6.0F);
+            }
+        }
+        ops::SparseMoeWeights weights{
+            .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(), kHidden),
+            .router_bias        = kSigmoidRouter ? static_cast<const float*>(device_router_bias_.p) : nullptr,
+            .routed_scale       = kRoutedScale,
+            .shared_gated       = kSharedGated,
+            .swiglu_limit       = kSwigluLimit,
+            .activation         = kActivation,
+            .per_expert_scale   = kPerExpertScaled ? static_cast<const float*>(device_per_expert_scale_.p)
+                                                   : nullptr,
+            .routed_gate_up     = routed_gate_.weight(),
+            .routed_down        = routed_down_.weight(),
+            .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
+            .shared_down        = kHasShared ? shared_down_device_->weight() : Weight{},
+            .experts_per_token  = kTopK,
+        };
+        attach_nvfp4_scales(weights);
+        // One round over the first `tokens` columns of `input` (BF16 bits): the output (residual
+        // zero, so the output is the mixture alone) and each column's captured expert set.
+        const auto round = [&](const std::vector<std::uint16_t>& input, std::int32_t tokens) {
+            const std::size_t count = static_cast<std::size_t>(kHidden) * tokens;
+            DeviceBuffer device_input = to_device(std::vector<std::uint16_t>(input.begin(), input.begin() + count));
+            GuardedBf16Output destination_storage(count);
+            cuda_check(cudaMemset(destination_storage.data(), 0, count * sizeof(std::uint16_t)),
+                       "zero width-dependence destination");
+            DeviceBuffer captured = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(tokens) * kTopK, -7));
+            Tensor in(device_input.p, DType::BF16, {kHidden, tokens});
+            Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
+            WorkspaceArena workspace(ops::sparse_moe_workspace_capacity_bytes(
+                kGeometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens, routing));
+            const ops::SparseMoeCaptureTarget target{static_cast<std::int32_t*>(captured.p), tokens, kTopK};
+            {
+                ops::ScopedSparseMoeCapture scope(&target);
+                ops::sparse_moe(in, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
+                                nullptr, ops::SparseMoeRoundHook{}, routing);
+            }
+            cuda_synchronize();
+            std::vector<std::uint16_t> bits(count);
+            cuda_check(cudaMemcpy(bits.data(), destination_storage.data(), count * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToHost), "read width-dependence output");
+            std::vector<std::int32_t> ids = from_device<std::int32_t>(captured, static_cast<std::size_t>(tokens) * kTopK);
+            std::vector<std::array<int, kTopK>> sets(static_cast<std::size_t>(tokens));
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                for (int k = 0; k < kTopK; ++k) { sets[token][k] = ids[static_cast<std::size_t>(token) * kTopK + k]; }
+                std::sort(sets[token].begin(), sets[token].end());
+            }
+            return std::pair{bits, sets};
+        };
+        // The next round's input: input + output, each column RMS-normalized to the first input's scale.
+        const auto next_input = [&](const std::vector<std::uint16_t>& input, const std::vector<std::uint16_t>& output,
+                                    std::int32_t tokens) {
+            std::vector<float> values(static_cast<std::size_t>(kHidden) * tokens);
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                double square = 0.0;
+                for (std::int32_t row = 0; row < kHidden; ++row) {
+                    const std::size_t at = static_cast<std::size_t>(token) * kHidden + row;
+                    values[at] = bf16_to_f32(input[at]) + bf16_to_f32(output[at]);
+                    square += static_cast<double>(values[at]) * values[at];
+                }
+                const float scale = static_cast<float>(1.0 / std::sqrt(square / kHidden + 1e-12));
+                for (std::int32_t row = 0; row < kHidden; ++row) {
+                    values[static_cast<std::size_t>(token) * kHidden + row] *= scale;
+                }
+            }
+            return bf16_bits(values);
+        };
+        std::vector<std::uint16_t> narrow_input = bf16_bits(x), wide_input = narrow_input;
+        int failures = 0;
+        std::cout << label << ":";
+        for (int layer = 0; layer < layers; ++layer) {
+            const auto [narrow_bits, narrow_sets] = round(narrow_input, small);
+            const auto [wide_bits, wide_sets]     = round(wide_input, wide);
+            int moved = 0, changed = 0, non_finite = 0;
+            for (std::int32_t column = 0; column < small; ++column) {
+                const std::size_t first = static_cast<std::size_t>(column) * kHidden;
+                moved += std::memcmp(narrow_bits.data() + first, wide_bits.data() + first,
+                                     kHidden * sizeof(std::uint16_t)) != 0;
+                changed += narrow_sets[column] != wide_sets[column];
+                for (std::int32_t row = 0; row < kHidden; ++row) {
+                    non_finite += !std::isfinite(bf16_to_f32(narrow_bits[first + row]));
+                }
+            }
+            std::cout << " | layer " << layer << ": " << changed << "/" << small << " expert sets changed, "
+                      << moved << "/" << small << " columns' bits moved";
+            if (non_finite != 0) {
+                std::cerr << "\n" << label << ": layer " << layer << " produced non-finite output\n";
+                ++failures;
+            }
+            if (expect_identical && (moved != 0 || changed != 0)) {
+                std::cerr << "\n" << label << ": layer " << layer << " moved under an admitted WidthInvariant pair\n";
+                ++failures;
+            }
+            narrow_input = next_input(narrow_input, narrow_bits, small);
+            wide_input   = next_input(wide_input, wide_bits, wide);
+        }
+        std::cout << "\n";
+        return failures;
+    }
+
     int run_host_bound(std::int32_t tokens, int first_pattern, std::span<const int> excluded) {
         const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) +
                                   " host-bound experts";

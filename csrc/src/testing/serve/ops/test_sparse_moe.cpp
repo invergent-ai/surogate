@@ -182,6 +182,29 @@ int main(int argc, char** argv) {
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe routing capture\n";
         return failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--width-dependence") {
+        // Routing capture records the route each round took; whether the same prompt takes the same
+        // route in two engines depends on how its prefill rounds ran. The --spec engine prefills a
+        // prompt eagerly at its own width (24 and 33 tokens in the e2e prompts), a plain engine
+        // through a graph padded to 128 columns. This isolates the mixture: the admitted W8 pair
+        // under WidthInvariant must not move at all (the control); the rest is reported, layer by
+        // layer (on GB10 nothing moves at these widths, NVFP4 included).
+        int failures = 0;
+        const CodecProfile w8{"w8+w8", QType::W8G32_F16S, QType::W8G32_F16S, {}, false};
+        failures += qwen36::SparseMoeFixture(w8).run_width_dependence(24, 128, 8,
+                                                                      ops::SparseMoeRouting::WidthInvariant, true);
+        failures += qwen36::SparseMoeFixture(w8).run_width_dependence(24, 128, 8, ops::SparseMoeRouting::ByWidth,
+                                                                      false);
+        if (nvfp4_device("sparse_moe width dependence nvfp4")) {
+            const CodecProfile nvfp4{"nvfp4", QType::NVFP4, QType::NVFP4, {}, false};
+            for (const std::int32_t small : {24, 33}) {
+                failures += qwen36::SparseMoeFixture(nvfp4).run_width_dependence(
+                    small, 128, 8, ops::SparseMoeRouting::ByWidth, false);
+            }
+        }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe width dependence\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--width-invariance") {
         // SparseMoeRouting::WidthInvariant: every width from one token, against a wide round's columns.
         // 1..19 are the widths the W8 pair would otherwise send to the decode and small-T
