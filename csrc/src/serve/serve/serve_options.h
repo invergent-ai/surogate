@@ -158,8 +158,8 @@ struct ServeOptions {
     bool enable_sleep_mode = false;
     /// --capture-routing: Rollout Routing Replay for RL rollouts. Every forward records each MoE
     /// layer's selected experts, and a request with "return_routed_experts": true gets them back
-    /// (choice.routed_experts). Refuses --spec (speculative rounds verify drafts, they are not the
-    /// tokens a trainer replays) and turns off mixed prefill/decode rounds and round chaining.
+    /// (choice.routed_experts). Under --spec mtp a verify round's accepted columns are stored and its
+    /// rejected drafts dropped (the draft head is never recorded); DFlash is refused.
     bool capture_routing = false;
     std::vector<LoraModule> lora_modules;
     std::uint32_t max_loras     = 1;

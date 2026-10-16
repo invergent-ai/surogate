@@ -19,6 +19,7 @@
 #include "family/impl/runtime/dflash_context.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/prefix_identity.h"
+#include "family/impl/runtime/routing_rows.h"
 #include "family/impl/archive_storage.h"
 #include "family/impl/radix_prefix_cache.h"
 #include "family/impl/runtime/text_context.h"
@@ -493,17 +494,30 @@ public:
     void collect_logprobs(std::uint32_t lane, GenerationResult& result);
     /// Rollout Routing Replay (SUROGATE_SERVE_CAPTURE_ROUTING=1): every main-model forward copies each
     /// MoE layer's selected expert ids into `routing_device` ([layers][routing_columns][top_k] I32, a fixed
-    /// buffer the decode and prefill graphs record); a round's consumer reads the columns of the lanes that
-    /// asked for routing back into RequestControl::routed_rows by sequence position.
+    /// buffer the decode and prefill graphs record). A round's launch copies the columns it ran to pinned
+    /// host memory in stream order (a later forward may be enqueued before the round is consumed); its
+    /// consumer stores the columns of the lanes that asked for routing into RequestControl::routed_rows by
+    /// sequence position (routing_rows.h).
     void read_routing_columns(std::uint32_t lane, std::uint32_t first_position, std::uint32_t columns);
+    void enqueue_routing_copy(void* host, std::uint32_t first_column, std::uint32_t columns);
+    void store_routing_columns(std::uint32_t lane, const void* host, std::uint32_t host_columns,
+                               routing_replay::RoutingSpan span);
+    [[nodiscard]] std::int32_t* routing_ordinary_slot(std::uint32_t round) const noexcept;
     bool routing_capture_enabled          = false;
     std::int32_t routing_layers           = 0;
     std::int32_t routing_top_k            = 0;
     std::int32_t routing_columns          = 0;
     std::int32_t* routing_device          = nullptr;
     std::vector<std::int32_t> routing_host_scratch;
+    /// Ordinary rounds: one [layers][rows][top_k] slot per round of a chained burst.
     std::unique_ptr<PinnedHostBuffer> routing_ordinary_host;
     std::uint32_t routing_ordinary_rows   = 0;
+    /// Mixed and speculative rounds: the round's first `routing_round_columns` columns
+    /// ([layers][routing_round_columns][top_k]); its decode or verify columns start at
+    /// `routing_decode_offset`, behind the prompt segments a mixed round carries.
+    std::unique_ptr<PinnedHostBuffer> routing_round_host;
+    std::uint32_t routing_round_columns   = 0;
+    std::uint32_t routing_decode_offset   = 0;
     std::function<void(const Tensor&, int, bool)> score_observer(std::uint32_t lane);
     void score_prefill_hidden(std::uint32_t lane, const Tensor& hidden, int base);
     void append_completion_score(std::uint32_t lane, const RawTokenScores& score);
