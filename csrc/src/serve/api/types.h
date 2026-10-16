@@ -433,6 +433,9 @@ struct ExecutionOptions {
     /// Number of raw full-vocabulary alternatives to return, 0..20; -1 disables scoring.
     int prompt_logprobs = -1;
     int top_logprobs = -1;
+    /// Rollout Routing Replay: return the MoE expert ids each token was routed through
+    /// (GenerationResult::routed_experts). Needs an engine started with routing capture.
+    bool capture_routing = false;
     bool allow_prefix_reuse               = true;
     /// Bank slot of the LoRA adapter this request selected, -1 for the base
     /// model. A slot rather than a name: the round stages an integer per lane,
@@ -833,6 +836,13 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    /// Rollout Routing Replay (ExecutionOptions::capture_routing): one row per sequence position --
+    /// prompt positions first, then each generated token -- of routed_layers x routed_top_k
+    /// expert ids, -1 where a token was not run (a reused prompt prefix, the last generated
+    /// token). May be shorter than prompt + completion; missing trailing rows are -1.
+    std::vector<std::int16_t> routed_experts;
+    std::uint32_t routed_layers = 0;
+    std::uint32_t routed_top_k  = 0;
 };
 
 struct ArenaMemorySummary {

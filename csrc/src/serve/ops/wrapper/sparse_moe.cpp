@@ -5,6 +5,7 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "api/ops/sparse_moe.h"
 
+#include "core/device.h"
 #include "core/nvtx.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
@@ -561,10 +562,63 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     sparse_moe(x, x, weights, epilogue, destination, workspace, stream, hook, routing);
 }
 
+namespace {
+
+thread_local const SparseMoeCaptureTarget* t_capture_target = nullptr;
+
+// The capture a call installs from the thread's target: the round's ids, top-k contiguous per
+// token, land at the round's column. Columns past the target's capacity are dropped rather
+// than written out of bounds (the runtime sizes the target for its widest forward).
+void copy_routing_into_target(void* context, const Tensor& ids, std::int32_t first_token,
+                              std::int32_t tokens, cudaStream_t stream) {
+    const auto& target = *static_cast<const SparseMoeCaptureTarget*>(context);
+    if (target.ids == nullptr || first_token < 0 || first_token >= target.capacity_tokens ||
+        tokens <= 0) {
+        return;
+    }
+    const std::int32_t count = std::min(tokens, target.capacity_tokens - first_token);
+    CUDA_CHECK(cudaMemcpyAsync(target.ids + static_cast<std::size_t>(first_token) * target.top_k,
+                               ids.data,
+                               static_cast<std::size_t>(count) * target.top_k * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToDevice, stream));
+}
+
+// `hook` advanced by `offset` columns, for a round that covers a slice of the call's tokens.
+SparseMoeRoundHook shifted(const SparseMoeRoundHook& hook, std::int32_t offset) {
+    SparseMoeRoundHook out = hook;
+    out.capture_base += offset;
+    return out;
+}
+
+} // namespace
+
+const SparseMoeCaptureTarget* sparse_moe_capture_target() noexcept { return t_capture_target; }
+
+ScopedSparseMoeCapture::ScopedSparseMoeCapture(const SparseMoeCaptureTarget* target) noexcept
+    : previous_(t_capture_target) {
+    t_capture_target = target;
+}
+
+ScopedSparseMoeCapture::~ScopedSparseMoeCapture() { t_capture_target = previous_; }
+
 void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
                 SparseMoeEpilogue epilogue, Tensor& destination, WorkspaceArena& workspace,
-                cudaStream_t stream, const SparseMoeRoundHook& hook, SparseMoeRouting routing) {
-    const SparseMoeRoundHook* round_hook = hook.resolve != nullptr ? &hook : nullptr;
+                cudaStream_t stream, const SparseMoeRoundHook& caller_hook,
+                SparseMoeRouting routing) {
+    // A capture installed on this thread joins the caller's hook unless the caller brought its
+    // own. Path selection below reads only `resolve`/`resolve_experts`, so a capture never
+    // changes which kernels run or what they compute.
+    SparseMoeRoundHook hook = caller_hook;
+    if (hook.capture == nullptr) {
+        if (const SparseMoeCaptureTarget* target = sparse_moe_capture_target();
+            target != nullptr && target->ids != nullptr) {
+            hook.capture         = &copy_routing_into_target;
+            hook.capture_context = const_cast<SparseMoeCaptureTarget*>(target);
+            hook.capture_base    = 0;
+        }
+    }
+    const SparseMoeRoundHook* round_hook =
+        hook.resolve != nullptr || hook.capture != nullptr ? &hook : nullptr;
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -626,13 +680,14 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
             const Tensor input = x.slice(1, offset, count);
             const Tensor router_input = router_x.slice(1, offset, count);
             Tensor output = destination.slice(1, offset, count);
+            const SparseMoeRoundHook slice_hook = shifted(hook, offset);
             if (saved_round.slots) {
                 ScopedLoraColumns columns(saved_round.slots->slice(0, offset, count));
-                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook,
-                           routing);
+                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream,
+                           slice_hook, routing);
             } else {
-                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook,
-                           routing);
+                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream,
+                           slice_hook, routing);
             }
         }
         return;
@@ -724,8 +779,10 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
             const Tensor x_slice      = x.slice(1, offset, slice);
             const Tensor router_slice = router_x.slice(1, offset, slice);
             Tensor destination_slice  = destination.slice(1, offset, slice);
+            const SparseMoeRoundHook slice_hook = shifted(hook, offset);
             detail::sparse_moe_small_t_launch(geometry, x_slice, router_slice, prepared.slice(offset, slice),
-                                              destination_slice, plan, views, stream, round_hook);
+                                              destination_slice, plan, views, stream,
+                                              round_hook != nullptr ? &slice_hook : nullptr);
             offset += slice;
         }
         return;
@@ -741,14 +798,21 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
             const Tensor& scores; const LoraBank* banks; const std::int32_t* slots;
             int stride; const SparseMoeRoundHook* next;
         } correction{weights, geometry, views.scratch, adapters, slots, views.slot_stride, round_hook};
-        const SparseMoeRoundHook corrected{
+        SparseMoeRoundHook corrected{
             [](void* context, const Tensor& ids, const Tensor& alpha, const Tensor& input,
                Tensor& output, cudaStream_t stream) {
                 const auto& c = *static_cast<Correction*>(context);
                 lora_router_bias(c.scores, ids, alpha, c.weights.router_bias, c.weights.per_expert_scale,
                                  c.geometry, c.banks, c.slots, c.stride, stream);
-                if (c.next) { c.next->resolve(c.next->context, ids, alpha, input, output, stream); }
+                if (c.next && c.next->resolve) {
+                    c.next->resolve(c.next->context, ids, alpha, input, output, stream);
+                }
             }, &correction};
+        // The decode kernels call capture after resolve, so the corrected ids are the ones
+        // captured.
+        corrected.capture         = hook.capture;
+        corrected.capture_context = hook.capture_context;
+        corrected.capture_base    = hook.capture_base;
         detail::sparse_moe_decode_launch(geometry, x, router_x, prepared, destination, views,
             stream, weights.router_bias ? &corrected : round_hook, adapters, slots);
         return;
@@ -757,8 +821,10 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         const Tensor x_column      = x.slice(1, token, 1);
         const Tensor router_column = router_x.slice(1, token, 1);
         Tensor destination_column  = destination.slice(1, token, 1);
+        const SparseMoeRoundHook token_hook = shifted(hook, token);
         detail::sparse_moe_decode_launch(geometry, x_column, router_column, prepared.slice(token, 1),
-                                         destination_column, views, stream, round_hook, adapters,
+                                         destination_column, views, stream,
+                                         round_hook != nullptr ? &token_hook : nullptr, adapters,
                                          !adapters ? nullptr : adapter_round.slots
                                             ? static_cast<const std::int32_t*>(adapter_round.slots->data) + token
                                             : adapter_round.uniform_cell);

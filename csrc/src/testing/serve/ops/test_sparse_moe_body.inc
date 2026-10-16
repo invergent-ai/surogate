@@ -1208,6 +1208,136 @@ public:
     // Experts the slot table maps to -1 are "computed elsewhere": every kernel of the round
     // must leave their paths out, including the prefill reduce, which once summed a stale
     // grouped column for them (the Flash-Next host-split corruption, 2026-08-29).
+    /// Routing capture (Rollout Routing Replay): a round run under a ScopedSparseMoeCapture must
+    /// write exactly the bits it writes without one, and the captured ids of every token must be
+    /// the experts its route pattern selects. `graph` also records the captured round into a
+    /// CUDA graph and replays it, which is how decode runs.
+    int run_capture(std::int32_t tokens, int first_pattern, bool graph) {
+        const std::string label = std::string(profile_.name) + " capture T=" + std::to_string(tokens);
+        std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
+        std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
+        std::vector<int> pattern_of(tokens);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const int pattern = (first_pattern + token) % static_cast<int>(kRoutePatterns.size());
+            pattern_of[token] = pattern;
+            std::copy(inputs_[pattern].begin(), inputs_[pattern].end(),
+                      input.begin() + static_cast<std::size_t>(token) * kHidden);
+            std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
+                      residual.begin() + static_cast<std::size_t>(token) * kHidden);
+        }
+        DeviceBuffer device_input  = to_device(bf16_bits(input));
+        DeviceBuffer residual_seed = to_device(bf16_bits(residual));
+        ops::SparseMoeWeights weights{
+            .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(),
+                                                    kHidden),
+            .router_bias        = kSigmoidRouter
+                                      ? static_cast<const float*>(device_router_bias_.p)
+                                      : nullptr,
+            .routed_scale       = kRoutedScale,
+            .shared_gated       = kSharedGated,
+            .swiglu_limit       = kSwigluLimit,
+            .activation         = kActivation,
+            .per_expert_scale   = kPerExpertScaled
+                                      ? static_cast<const float*>(device_per_expert_scale_.p)
+                                      : nullptr,
+            .routed_gate_up     = routed_gate_.weight(),
+            .routed_down        = routed_down_.weight(),
+            .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
+            .shared_down        = kHasShared ? shared_down_device_->weight() : Weight{},
+            .experts_per_token  = kTopK,
+        };
+        attach_nvfp4_scales(weights);
+        const std::size_t count = static_cast<std::size_t>(kHidden) * tokens;
+        const std::size_t capacity_bytes = ops::sparse_moe_workspace_capacity_bytes(
+            kGeometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
+        // A margin of four columns past the round: the capture must not write them.
+        const std::int32_t capture_columns = tokens + 4;
+        std::vector<std::int32_t> sentinel(static_cast<std::size_t>(capture_columns) * kTopK, -7);
+        DeviceBuffer captured = to_device(sentinel);
+
+        const auto round = [&](bool capture, cudaStream_t stream, bool replay) {
+            GuardedBf16Output destination_storage(count);
+            cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p,
+                                  count * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice),
+                       "seed capture destination");
+            Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
+            Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
+            WorkspaceArena workspace(capacity_bytes);
+            const ops::SparseMoeCaptureTarget target{static_cast<std::int32_t*>(captured.p),
+                                                     capture_columns, kTopK};
+            const auto launch = [&] {
+                ops::ScopedSparseMoeCapture scope(capture ? &target : nullptr);
+                ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
+                                workspace, stream);
+            };
+            if (replay) {
+                cudaGraph_t graph_handle = nullptr;
+                cudaGraphExec_t exec     = nullptr;
+                cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                           "begin capture graph");
+                launch();
+                cuda_check(cudaStreamEndCapture(stream, &graph_handle), "end capture graph");
+                cuda_check(cudaGraphInstantiate(&exec, graph_handle, 0), "instantiate capture graph");
+                // Reset the target so the ids must come from the replay, then replay.
+                cuda_check(cudaMemcpy(captured.p, sentinel.data(), sentinel.size() * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice), "reset capture target");
+                cuda_check(cudaGraphLaunch(exec, stream), "replay capture graph");
+                cuda_check(cudaStreamSynchronize(stream), "sync capture graph");
+                cudaGraphExecDestroy(exec);
+                cudaGraphDestroy(graph_handle);
+            } else {
+                launch();
+                cuda_synchronize();
+            }
+            std::vector<std::uint16_t> bits(count);
+            cuda_check(cudaMemcpy(bits.data(), destination_storage.data(),
+                                  count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                       "read capture destination");
+            return bits;
+        };
+
+        int failures = 0;
+        const auto plain = round(false, nullptr, false);
+        const auto check = [&](const std::vector<std::uint16_t>& bits, const std::string& how) {
+            if (std::memcmp(bits.data(), plain.data(), count * sizeof(std::uint16_t)) != 0) {
+                std::cerr << label << " " << how << ": output bits differ with capture on\n";
+                ++failures;
+            }
+            std::vector<std::int32_t> ids(static_cast<std::size_t>(capture_columns) * kTopK);
+            cuda_check(cudaMemcpy(ids.data(), captured.p, ids.size() * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost), "read captured ids");
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                std::array<int, kTopK> want = kRoutePatterns[pattern_of[token]].selected;
+                std::array<int, kTopK> got{};
+                for (int k = 0; k < kTopK; ++k) { got[k] = ids[static_cast<std::size_t>(token) * kTopK + k]; }
+                std::sort(want.begin(), want.end());
+                std::sort(got.begin(), got.end());
+                if (want != got) {
+                    std::cerr << label << " " << how << ": token " << token
+                              << " captured experts differ from its pattern's selection\n";
+                    ++failures;
+                    break;
+                }
+            }
+            for (std::size_t at = static_cast<std::size_t>(tokens) * kTopK; at < ids.size(); ++at) {
+                if (ids[at] != -7) {
+                    std::cerr << label << " " << how << ": capture wrote past the round's columns\n";
+                    ++failures;
+                    break;
+                }
+            }
+        };
+        check(round(true, nullptr, false), "eager");
+        if (graph) {
+            cudaStream_t stream = nullptr;
+            cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "capture stream");
+            check(round(true, stream, true), "graph replay");
+            cudaStreamDestroy(stream);
+        }
+        if (failures == 0) { std::cout << label << (graph ? " (eager + graph)" : "") << ": OK\n"; }
+        return failures;
+    }
+
     int run_host_bound(std::int32_t tokens, int first_pattern, std::span<const int> excluded) {
         const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) +
                                   " host-bound experts";

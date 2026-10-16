@@ -345,6 +345,13 @@ struct RoundState {
     /// rounds of up to `attention_metadata_rows` sequences, the spec's batch capacity.
     Tensor attention_metadata;
     std::int32_t attention_metadata_rows = 0;
+    /// Rollout Routing Replay capture buffer, owned by the program and null when capture is off:
+    /// [routing_capture_layers][routing_capture_columns][routing_capture_top_k] I32. A main-model
+    /// layer's mixture copies its selected expert ids into its slice (column = the forward's column).
+    std::int32_t* routing_capture        = nullptr;
+    std::int32_t routing_capture_columns = 0;
+    std::int32_t routing_capture_top_k   = 0;
+    std::int32_t routing_capture_layers  = 0;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

@@ -210,6 +210,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--gpu-memory-limit-mib N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
+           "[--capture-routing] "
            "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
@@ -285,6 +286,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --enable-lora enables adapters; --lora-modules loads named adapters at "
            "startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
+           "       --capture-routing records every token's MoE expert ids for RL routing replay; a "
+           "request asks\n"
+           "         for them with \"return_routed_experts\": true. Refuses --spec.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
            "       --decision-temperature T calibrates the decisions endpoint: every answer is read\n"
            "         from softmax(option logits / T). Default 1 (the model's own distribution);\n"
@@ -676,6 +680,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.data_parallel = true;
         } else if (arg == "--enable-lora") {
             options.enable_lora = true;
+        } else if (arg == "--capture-routing") {
+            options.capture_routing = true;
+            // Read by every program at construction, before its graphs are captured.
+            setenv("SUROGATE_SERVE_CAPTURE_ROUTING", "1", 1);
         } else if (arg == "--lora-modules") {
             // `name=path` entries, comma separated or repeated, as vLLM accepts them.
             std::string spec = require_value("--lora-modules");

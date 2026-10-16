@@ -360,6 +360,10 @@ void small_t_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
         hook->resolve(hook->context, workspace.token_ids, workspace.token_alpha, x, destination,
                       stream);
     }
+    if (hook != nullptr && hook->capture != nullptr) {
+        hook->capture(hook->capture_context, workspace.token_ids, hook->capture_base,
+                      static_cast<std::int32_t>(x.ne[1]), stream);
+    }
     if (sparse_moe_expert_major_enabled() &&
         sparse_moe_decode_launch_expert_major(
             kGeometry, x, weights, destination, static_cast<const int*>(workspace.token_ids.data),

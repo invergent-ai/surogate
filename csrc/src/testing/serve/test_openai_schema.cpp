@@ -10,6 +10,8 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <vector>
+#include <cstdint>
 #include <cstddef>
 #include <functional>
 #include <iostream>
@@ -693,6 +695,64 @@ int test_parse_sampling_carried() {
     return failures;
 }
 
+// Rollout Routing Replay: the request flag parses, and choice.routed_experts has the shape
+// verifiers 0.3.0 reads -- the literal text "routed_experts":{"data":" (data first, no spaces),
+// little-endian int16 rows in C order, the covered range's first position as "start".
+int test_routed_experts_wire() {
+    int failures = 0;
+    const Json body = {{"model", "m"}, {"messages", Json::array({{{"role", "user"}, {"content", "hi"}}})},
+                       {"return_routed_experts", true}};
+    failures += check(parse_chat_completion_request(body, default_limits()).return_routed_experts,
+                      "return_routed_experts parsed");
+    const Json plain = {{"model", "m"}, {"messages", Json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    failures += check(!parse_chat_completion_request(plain, default_limits()).return_routed_experts,
+                      "return_routed_experts defaults false");
+
+    CompletionUsage usage;
+    usage.prompt_tokens     = 3;
+    usage.completion_tokens = 2;
+    TokenDetail detail;
+    detail.include_routed_experts = true;
+    detail.routed_layers          = 2;
+    detail.routed_top_k           = 2;
+    detail.routed_start           = 1;
+    // Positions 1..3 (start 1, three rows), 2 layers x top-2: the values 0..11 with one -1 and a
+    // value past 255 so both bytes of the little-endian int16 matter.
+    detail.routed_experts = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -1, 300};
+    const std::string text = make_chat_completion_response("id-r", "m", 1, "ok", "", "stop", usage, detail);
+    failures += check(text.find("\"routed_experts\":{\"data\":\"") != std::string::npos,
+                      "routed_experts serialises with data first and no spaces");
+    const Json response = Json::parse(text);
+    const Json& routed  = response["choices"][0]["routed_experts"];
+    failures += check(routed["shape"] == Json::array({3, 2, 2}), "routed_experts shape [n, layers, top_k]");
+    failures += check(routed["start"] == 1, "routed_experts start");
+    failures += check(routed["dtype"] == "int16", "routed_experts dtype");
+    // Decode the base64 by hand and check two values: index 0 (= 0) and the last (= 300 = 0x012C).
+    const std::string data = routed["data"].get<std::string>();
+    const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<unsigned char> bytes;
+    for (std::size_t i = 0; i + 3 < data.size(); i += 4) {
+        std::uint32_t v = 0;
+        int pad = 0;
+        for (int j = 0; j < 4; ++j) {
+            const char c = data[i + j];
+            if (c == '=') { v <<= 6; ++pad; } else { v = (v << 6) | static_cast<std::uint32_t>(alphabet.find(c)); }
+        }
+        bytes.push_back(static_cast<unsigned char>(v >> 16));
+        if (pad < 2) bytes.push_back(static_cast<unsigned char>((v >> 8) & 0xFF));
+        if (pad < 1) bytes.push_back(static_cast<unsigned char>(v & 0xFF));
+    }
+    failures += check(bytes.size() == 24, "routed_experts data holds 12 int16 values");
+    if (bytes.size() == 24) {
+        failures += check(bytes[0] == 0 && bytes[1] == 0, "first value 0");
+        failures += check(bytes[20] == 0xFF && bytes[21] == 0xFF, "-1 is 0xFFFF");
+        failures += check(bytes[22] == 0x2C && bytes[23] == 0x01, "300 little-endian");
+    }
+    const std::string without = make_chat_completion_response("id-p", "m", 1, "ok", "", "stop", usage);
+    failures += check(without.find("routed_experts") == std::string::npos, "absent unless requested");
+    return failures;
+}
+
 int test_response_serialization() {
     int failures = 0;
     const CompletionUsage usage{10, 3};
@@ -943,6 +1003,7 @@ int main() {
     failures += test_token_media_rejected();
     failures += test_optional_field_types();
     failures += test_parse_sampling_carried();
+    failures += test_routed_experts_wire();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
     failures += test_chunk_serialization();

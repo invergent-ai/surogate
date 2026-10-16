@@ -33,6 +33,7 @@ struct ResolvedExecutionOptions {
     std::shared_ptr<::sinfer::SubmissionReservation> reservation;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
+    bool capture_routing = false;
     bool allow_prefix_reuse               = true;
     /// Bank slot of the LoRA adapter this request selected, -1 for the base model.
     std::int32_t lora_slot = -1;

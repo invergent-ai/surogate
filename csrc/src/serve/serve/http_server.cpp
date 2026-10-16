@@ -1151,6 +1151,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             detail.prompt_scores = outcome.prompt_scores;
             detail.completion_scores = outcome.completion_scores;
             detail.score_texts = outcome.score_texts;
+            detail.include_routed_experts = outcome.include_routed_experts;
+            detail.routed_experts = outcome.routed_experts;
+            detail.routed_layers = outcome.routed_layers;
+            detail.routed_top_k = outcome.routed_top_k;
+            detail.routed_start = outcome.routed_start;
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -1334,6 +1339,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
 static TokenDetail completion_detail(const GenerationOutcome& outcome, const PreparedRequest& prepared) {
     TokenDetail detail;
+    detail.include_routed_experts = outcome.include_routed_experts;
+    detail.routed_experts = outcome.routed_experts;
+    detail.routed_layers = outcome.routed_layers;
+    detail.routed_top_k = outcome.routed_top_k;
+    detail.routed_start = outcome.routed_start;
     detail.include_token_ids = prepared.return_token_ids;
     detail.include_logprobs = prepared.want_logprobs;
     detail.prompt_token_ids = outcome.prompt_token_ids;

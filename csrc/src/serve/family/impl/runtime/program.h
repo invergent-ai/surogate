@@ -91,6 +91,8 @@ struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     std::shared_ptr<SINFER_FAMILY_RUNTIME_NS::GpuPrefixStorage> gpu_storage;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
+    /// Rollout Routing Replay: return this request's MoE routing (needs SUROGATE_SERVE_CAPTURE_ROUTING=1).
+    bool capture_routing = false;
     ops::SamplingConfig sampling;
     std::unordered_map<TokenId, float> logit_bias;
     std::shared_ptr<const CompiledTokenConstraint> constraint;
@@ -139,6 +141,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     std::shared_ptr<SINFER_FAMILY_RUNTIME_NS::GpuPrefixStorage> gpu_storage;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
+    /// Rollout Routing Replay: return this request's MoE routing (needs SUROGATE_SERVE_CAPTURE_ROUTING=1).
+    bool capture_routing = false;
     ops::SamplingConfig sampling;
     std::unordered_map<TokenId, float> logit_bias;
     std::shared_ptr<const CompiledTokenConstraint> constraint;
@@ -360,6 +364,10 @@ struct RequestControl {
     std::shared_ptr<GpuPrefixStorage> gpu_storage;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
+    /// Rollout Routing Replay: return this request's MoE routing (needs SUROGATE_SERVE_CAPTURE_ROUTING=1).
+    bool capture_routing = false;
+    /// One row per sequence position: n_layers x top_k expert ids (int16), -1 where none was captured.
+    std::vector<std::int16_t> routed_rows;
     std::vector<TokenScore> prompt_scores;
     std::vector<TokenScore> completion_scores;
     std::vector<float> next_token_logits;
@@ -483,6 +491,19 @@ public:
     TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const;
     void cache_logprobs(std::uint32_t lane, const GenerationResult& result);
     void collect_logprobs(std::uint32_t lane, GenerationResult& result);
+    /// Rollout Routing Replay (SUROGATE_SERVE_CAPTURE_ROUTING=1): every main-model forward copies each
+    /// MoE layer's selected expert ids into `routing_device` ([layers][routing_columns][top_k] I32, a fixed
+    /// buffer the decode and prefill graphs record); a round's consumer reads the columns of the lanes that
+    /// asked for routing back into RequestControl::routed_rows by sequence position.
+    void read_routing_columns(std::uint32_t lane, std::uint32_t first_position, std::uint32_t columns);
+    bool routing_capture_enabled          = false;
+    std::int32_t routing_layers           = 0;
+    std::int32_t routing_top_k            = 0;
+    std::int32_t routing_columns          = 0;
+    std::int32_t* routing_device          = nullptr;
+    std::vector<std::int32_t> routing_host_scratch;
+    std::unique_ptr<PinnedHostBuffer> routing_ordinary_host;
+    std::uint32_t routing_ordinary_rows   = 0;
     std::function<void(const Tensor&, int, bool)> score_observer(std::uint32_t lane);
     void score_prefill_hidden(std::uint32_t lane, const Tensor& hidden, int base);
     void append_completion_score(std::uint32_t lane, const RawTokenScores& score);

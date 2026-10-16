@@ -173,6 +173,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     }
     base->prompt_logprobs = options.prompt_logprobs;
     base->top_logprobs = options.top_logprobs;
+    base->capture_routing = options.capture_routing;
     base->allow_prefix_reuse = options.allow_prefix_reuse;
     if (shared_prefix_slots != 0 && options.allow_prefix_reuse && prompt.identity.reusable &&
         !prompt.has_media() && !base->target_only && !gpu_prefix_readout && options.prompt_logprobs < 0) {
@@ -355,6 +356,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->gpu_storage = base.gpu_storage;
     plan->prompt_logprobs = base.prompt_logprobs;
     plan->top_logprobs = base.top_logprobs;
+    plan->capture_routing = base.capture_routing;
     plan->sampling                    = base.sampling;
     plan->logit_bias                   = base.logit_bias;
     plan->constraint                   = base.constraint;

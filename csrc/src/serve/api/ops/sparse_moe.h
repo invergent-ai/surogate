@@ -353,6 +353,45 @@ struct SparseMoeRoundHook {
     std::int32_t expert_batch_size = 0;
     void (*resolve_experts)(void* context, const Tensor& ids, std::int32_t first,
                             std::int32_t count, cudaStream_t stream) = nullptr;
+    /// Routing capture (Rollout Routing Replay, surogate GRPO): called once a round's
+    /// selection is final -- beside `resolve`, whether or not `resolve` is set -- with the
+    /// round's device I32 ids ([experts_per_token, tokens], top-k contiguous per token), the
+    /// round's first column within the outermost sparse_moe call (`capture_base` plus the
+    /// round's offset) and its column count. Unlike `resolve` it never changes which path runs
+    /// or what it computes: path selection reads `resolve`/`resolve_experts` only. It must only
+    /// enqueue work on `stream` (it runs at launch time, also during graph capture).
+    void (*capture)(void* context, const Tensor& ids, std::int32_t first_token,
+                    std::int32_t tokens, cudaStream_t stream) = nullptr;
+    void* capture_context     = nullptr;
+    std::int32_t capture_base = 0;
+};
+
+/// Where a layer's routing is copied when the runtime captures routing: `ids` has room for
+/// `capacity_tokens` columns of `top_k` I32 ids (column c at ids + c * top_k). A sparse_moe
+/// call made while a target is installed on the calling thread (ScopedSparseMoeCapture) and
+/// given no capture of its own copies every round's ids into it at the round's column; columns
+/// past the capacity are not copied. The copy is a device-to-device cudaMemcpyAsync on the
+/// call's stream, so it is recorded into a CUDA graph like the round's kernels.
+struct SparseMoeCaptureTarget {
+    std::int32_t* ids            = nullptr;
+    std::int32_t capacity_tokens = 0;
+    std::int32_t top_k           = 0;
+};
+
+/// The capture target installed on the calling thread, or nullptr.
+[[nodiscard]] const SparseMoeCaptureTarget* sparse_moe_capture_target() noexcept;
+
+/// Installs `target` (nullptr = none) on the calling thread for its lifetime; restores the
+/// previous one after. The target must outlive every sparse_moe call made under the scope.
+class ScopedSparseMoeCapture {
+public:
+    explicit ScopedSparseMoeCapture(const SparseMoeCaptureTarget* target) noexcept;
+    ~ScopedSparseMoeCapture();
+    ScopedSparseMoeCapture(const ScopedSparseMoeCapture&)            = delete;
+    ScopedSparseMoeCapture& operator=(const ScopedSparseMoeCapture&) = delete;
+
+private:
+    const SparseMoeCaptureTarget* previous_;
 };
 
 /// As above with a round hook; a hook with a null `resolve` is the plain call. `routing` is

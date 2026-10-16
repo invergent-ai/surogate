@@ -9,6 +9,7 @@
 #include "family/impl/runtime/program.h"
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 
 #include "family/impl/runtime/schedule.h"
 #include "api/ops/batch_invariant.h"
@@ -516,6 +517,41 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // graphs it captures for them.
     base_rounds_ = ops::lora_enabled() && !ops::batch_invariant() && !pipeline_stage() &&
                    !ops::detail::marlin_fp8_adoption_opted_in();
+    // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
+    // main-model forward copies each layer's selected expert ids into a fixed buffer, which the
+    // graphs captured below record. Allocated before prepare_graphs() so they bake its address.
+    if (const char* capture = std::getenv("SUROGATE_SERVE_CAPTURE_ROUTING");
+        capture != nullptr && std::string_view(capture) == "1") {
+        if (speculative_backend != SpeculativeBackend::None) {
+            throw std::invalid_argument(
+                "routing capture (--capture-routing) needs a non-speculative engine: drop --spec");
+        }
+        if (pipeline_stage()) {
+            throw std::invalid_argument("routing capture (--capture-routing) runs on a single-stage engine");
+        }
+        if (cfg.experts_per_token <= 0) {
+            throw std::invalid_argument("routing capture (--capture-routing) needs a mixture-of-experts model");
+        }
+        routing_capture_enabled = true;
+        routing_layers          = cfg.layers;
+        routing_top_k           = cfg.experts_per_token;
+        routing_columns = static_cast<std::int32_t>(std::max<std::uint32_t>(prefill_chunk, batch_capacity));
+        const std::size_t routing_bytes = static_cast<std::size_t>(routing_layers) * routing_columns *
+                                          routing_top_k * sizeof(std::int32_t);
+        CUDA_CHECK(cudaMalloc(&routing_device, routing_bytes));
+        CUDA_CHECK(cudaMemset(routing_device, 0xFF, routing_bytes));
+        io.routing_capture         = routing_device;
+        io.routing_capture_columns = routing_columns;
+        io.routing_capture_top_k   = routing_top_k;
+        io.routing_capture_layers  = routing_layers;
+        routing_ordinary_rows      = batch_capacity;
+        routing_ordinary_host      = std::make_unique<PinnedHostBuffer>(
+            static_cast<std::size_t>(routing_layers) * routing_ordinary_rows * routing_top_k *
+            sizeof(std::int32_t));
+        std::fprintf(stderr, "routing capture: on (%d layers x top-%d, %d columns, %.1f MiB)\n",
+                     routing_layers, routing_top_k, routing_columns,
+                     static_cast<double>(routing_bytes) / (1024.0 * 1024.0));
+    }
     prepare_graphs();
     work.reset();
     work.reset_peak();
@@ -544,6 +580,7 @@ bool ProgramImplCore::base_round_for(std::span<const std::uint32_t> lanes,
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
     if (chain_one_storage != nullptr) { (void)cudaFree(chain_one_storage); }
+    if (routing_device != nullptr) { (void)cudaFree(routing_device); }
 }
 
 void ProgramImplCore::burst_egress_copy_host(void* user) noexcept {
@@ -871,6 +908,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         request.prompt_logprobs = request_plan.prompt_logprobs;
         request.top_logprobs = request_plan.top_logprobs;
+        request.capture_routing = routing_capture_enabled && request_plan.capture_routing;
+        request.routed_rows.clear();
+        if (request.capture_routing) {
+            // Prompt tokens served from a reused prefix were not run: their rows stay -1.
+            request.routed_rows.assign(static_cast<std::size_t>(prompt_tokens) * routing_layers *
+                                           routing_top_k, std::int16_t{-1});
+        }
         request.next_token_candidates = request_plan.next_token_candidates;
         request.next_token_logits.clear();
         request.cache_prompt = request_plan.cache_prompt;
@@ -1374,11 +1418,45 @@ TokenScoreDelta ProgramImplCore::logprob_delta(std::uint32_t lane, std::size_t f
 
 void ProgramImplCore::collect_logprobs(std::uint32_t lane, GenerationResult& result) {
     if (lane >= max_concurrency) return;
+    if (requests[lane].capture_routing) {
+        // Rows by sequence position: the prompt, then each generated token that was fed back
+        // through the model. The last generated token never was, so its row is -1 (as is any
+        // reused prompt token); the serve layer sizes the result to prompt + completion.
+        result.routed_experts = requests[lane].routed_rows;
+        result.routed_layers  = static_cast<std::uint32_t>(routing_layers);
+        result.routed_top_k   = static_cast<std::uint32_t>(routing_top_k);
+    }
     result.next_token_logits = requests[lane].next_token_logits;
     result.prompt_logprobs = requests[lane].prompt_scores;
     result.completion_logprobs = requests[lane].completion_scores;
     result.completion_logprobs.resize(std::min(result.completion_logprobs.size(), result.generated_token_ids.size()));
     cache_logprobs(lane, result);
+}
+
+void ProgramImplCore::read_routing_columns(std::uint32_t lane, std::uint32_t first_position,
+                                           std::uint32_t columns) {
+    if (!routing_capture_enabled || lane >= max_concurrency || columns == 0) return;
+    RequestControl& request = requests[lane];
+    if (!request.capture_routing) return;
+    const std::uint32_t usable = std::min<std::uint32_t>(columns, static_cast<std::uint32_t>(routing_columns));
+    const std::size_t k        = static_cast<std::size_t>(routing_top_k);
+    routing_host_scratch.resize(static_cast<std::size_t>(routing_layers) * usable * k);
+    // [layers][usable][k] out of the [layers][routing_columns][k] buffer, after the forward.
+    CUDA_CHECK(cudaMemcpy2DAsync(routing_host_scratch.data(), usable * k * sizeof(std::int32_t),
+                                 routing_device, static_cast<std::size_t>(routing_columns) * k * sizeof(std::int32_t),
+                                 usable * k * sizeof(std::int32_t), static_cast<std::size_t>(routing_layers),
+                                 cudaMemcpyDeviceToHost, device.stream));
+    device.synchronize();
+    const std::size_t row_len = static_cast<std::size_t>(routing_layers) * k;
+    const std::size_t end     = (static_cast<std::size_t>(first_position) + usable) * row_len;
+    if (request.routed_rows.size() < end) { request.routed_rows.resize(end, std::int16_t{-1}); }
+    for (std::uint32_t column = 0; column < usable; ++column) {
+        std::int16_t* row = request.routed_rows.data() + (static_cast<std::size_t>(first_position) + column) * row_len;
+        for (std::int32_t layer = 0; layer < routing_layers; ++layer) {
+            const std::int32_t* ids = routing_host_scratch.data() + (static_cast<std::size_t>(layer) * usable + column) * k;
+            for (std::size_t r = 0; r < k; ++r) { row[static_cast<std::size_t>(layer) * k + r] = static_cast<std::int16_t>(ids[r]); }
+        }
+    }
 }
 
 void ProgramImplCore::cache_logprobs(std::uint32_t lane, const GenerationResult& result) {
@@ -2863,6 +2941,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
             }
             processed_prompt_tokens = result.processed_tokens;
+            if (request.capture_routing) {
+                // Columns [0, processed) of this chunk are prompt positions [cursor, cursor + processed).
+                read_routing_columns(sequence.lane, staged.cursor, result.processed_tokens);
+            }
             if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
             if (std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr) {
                 std::fprintf(stderr, "prefill-timing: chunk nominal %u processed %u final %d\n",
@@ -3115,6 +3197,8 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         // functions copy each egress out in order, and one synchronize
         // covers the whole burst.
         std::uint32_t burst = std::min(round_burst_limit, kChainBurstLimit);
+        // Routing capture holds one round's columns, so it never chains rounds.
+        if (routing_capture_enabled) { burst = 1; }
         for (const runtime::RoundBudget& budget : budgets) {
             burst = std::min(burst, budget.generated_tokens_remaining);
         }
@@ -3217,6 +3301,16 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                 .count               = static_cast<std::int32_t>(lanes.size())};
             CUDA_CHECK(cudaLaunchHostFunc(device.stream, &ProgramImplCore::burst_egress_copy_host,
                                           &burst_copy_ctx[round]));
+            if (routing_capture_enabled) {
+                // Column `row` of every layer is lane `lanes[row]`'s input token of this round.
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    routing_ordinary_host->data(),
+                    static_cast<std::size_t>(lanes.size()) * routing_top_k * sizeof(std::int32_t),
+                    routing_device,
+                    static_cast<std::size_t>(routing_columns) * routing_top_k * sizeof(std::int32_t),
+                    static_cast<std::size_t>(lanes.size()) * routing_top_k * sizeof(std::int32_t),
+                    static_cast<std::size_t>(routing_layers), cudaMemcpyDeviceToHost, device.stream));
+            }
         }
         in_flight_ = InFlightRound{.id    = ++in_flight_counter_,
                                    .rows  = static_cast<std::uint32_t>(lanes.size()),
@@ -3264,6 +3358,22 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
                 row_logprobs[round] = burst_rounds_logprobs[round * kMaximumBatchColumns + row];
             }
             validate_licensed_tokens(std::span<const TokenId>(row_tokens, burst));
+            if (request.capture_routing) {
+                // The round ran the lane's last token (position base_E) through every layer.
+                const auto* host = static_cast<const std::int32_t*>(routing_ordinary_host->data());
+                const std::size_t row_len = static_cast<std::size_t>(routing_layers) * routing_top_k;
+                const std::size_t at      = static_cast<std::size_t>(base_E) * row_len;
+                if (request.routed_rows.size() < at + row_len) {
+                    request.routed_rows.resize(at + row_len, std::int16_t{-1});
+                }
+                for (std::int32_t layer = 0; layer < routing_layers; ++layer) {
+                    for (std::int32_t k = 0; k < routing_top_k; ++k) {
+                        request.routed_rows[at + static_cast<std::size_t>(layer) * routing_top_k + k] =
+                            static_cast<std::int16_t>(host[(static_cast<std::size_t>(layer) * lanes.size() + row) *
+                                                               routing_top_k + k]);
+                    }
+                }
+            }
             for (std::uint32_t round = 0; round < burst; ++round) {
                 append_completion_score(lanes[row], burst_rounds_scores[round * kMaximumBatchColumns + row]);
             }
@@ -3348,6 +3458,9 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
     if (prefill_lane >= max_concurrency) {
         return false;
     }
+    // Routing capture maps a forward's columns to one lane's positions per round kind; a mixed
+    // round would interleave prefill segments and decode rows in one buffer.
+    if (routing_capture_enabled) { return false; }
     const RequestControl& request = requests[prefill_lane];
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return false; }
     const RequestControl::Prefill& staged = *request.prefill;

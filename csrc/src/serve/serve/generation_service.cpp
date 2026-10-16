@@ -18,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <thread>
 #include <cstddef>
 #include <mutex>
@@ -126,6 +127,26 @@ void validate_token_media(const GenerationRequest& request) {
             .status = 400,
             .message = "tokens cannot be combined with images or video; send messages without tokens for vision input",
             .param = "tokens"});
+    }
+}
+
+// Rollout Routing Replay: the engine records routing only when it was started with
+// --capture-routing (which sets SUROGATE_SERVE_CAPTURE_ROUTING before the programs are built),
+// and the rows come back with the finished request, not chunk by chunk.
+void validate_routing_request(const GenerationRequest& request) {
+    if (!request.return_routed_experts) { return; }
+    const char* capture = std::getenv("SUROGATE_SERVE_CAPTURE_ROUTING");
+    if (capture == nullptr || std::string_view(capture) != "1") {
+        throw ApiException(ApiError{
+            .status = 400,
+            .message = "return_routed_experts needs a server started with --capture-routing",
+            .param = "return_routed_experts"});
+    }
+    if (request.stream) {
+        throw ApiException(ApiError{
+            .status = 400,
+            .message = "return_routed_experts is returned with the finished response; send stream: false",
+            .param = "return_routed_experts"});
     }
 }
 
@@ -562,6 +583,8 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
     // the model's own stops and the request's are both in reach.
     request_options.execution.prompt_logprobs = request.prompt_logprobs;
     request_options.execution.top_logprobs = request.want_logprobs ? request.top_logprobs : -1;
+    validate_routing_request(request);
+    request_options.execution.capture_routing = request.return_routed_experts;
     request_options.execution.min_tokens = static_cast<std::uint32_t>(request.min_tokens);
     if (request.min_tokens > 0) {
         std::vector<sinfer::TokenId> barrier = engine_->default_stop_tokens();
@@ -659,6 +682,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         prepared.top_logprobs = request.top_logprobs;
         prepared.want_logprobs    = request.want_logprobs;
         prepared.return_token_ids = request.return_token_ids;
+        prepared.return_routed_experts = request.return_routed_experts;
         // Read before the submit takes the prompt: these are the ids the model
         // actually sees, which is the thing a trainer must score against and is not
         // reliably reproducible by re-rendering the messages.
@@ -799,6 +823,26 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     outcome.prompt_scores = std::move(result.prompt_logprobs);
     outcome.completion_scores = std::move(result.completion_logprobs);
+    if (prepared.return_routed_experts) {
+        // The engine keeps one row per sequence position it ran: the prompt (prefix-cache
+        // positions as -1) then every generated token fed back through the model -- all but the
+        // last. The response covers [start, end): start skips the reused prefix, end is the last
+        // row the engine has, never past prompt + completion.
+        outcome.include_routed_experts = true;
+        outcome.routed_layers          = result.routed_layers;
+        outcome.routed_top_k           = result.routed_top_k;
+        const std::size_t row_len =
+            static_cast<std::size_t>(result.routed_layers) * result.routed_top_k;
+        if (row_len > 0) {
+            const std::size_t limit = static_cast<std::size_t>(outcome.prompt_tokens) +
+                                      static_cast<std::size_t>(outcome.completion_tokens);
+            const std::size_t end   = std::min(result.routed_experts.size() / row_len, limit);
+            const std::size_t start = std::min<std::size_t>(result.reused_prompt_tokens, end);
+            outcome.routed_start    = static_cast<std::uint32_t>(start);
+            outcome.routed_experts.assign(result.routed_experts.begin() + start * row_len,
+                                          result.routed_experts.begin() + end * row_len);
+        }
+    }
     populate_score_texts(*engine_, outcome);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;

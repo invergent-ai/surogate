@@ -161,6 +161,27 @@ int main(int argc, char** argv) {
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe prefill under warp skew\n";
         return failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--capture") {
+        // Routing capture (Rollout Routing Replay) on every width class: decode (1), small-T
+        // (2..19), the wide prefill route (20+), and -- where the device runs NVFP4 -- the TRT-LLM
+        // runner's widths. Output bits must not change and the captured ids must be each token's
+        // selection; decode-sized rounds are also checked through a CUDA graph replay.
+        int failures = 0;
+        const CodecProfile w8{"w8+w8", QType::W8G32_F16S, QType::W8G32_F16S, {}, false};
+        for (const std::int32_t tokens : {1, 2, 4, 15, 19, 20, 33, 129, 768}) {
+            qwen36::SparseMoeFixture fixture(w8);
+            failures += fixture.run_capture(tokens, tokens % 3, tokens <= 4);
+        }
+        if (nvfp4_device("sparse_moe capture nvfp4")) {
+            const CodecProfile nvfp4{"nvfp4", QType::NVFP4, QType::NVFP4, {}, false};
+            for (const std::int32_t tokens : {1, 2, 16, 17, 31, 768}) {
+                qwen36::SparseMoeFixture fixture(nvfp4);
+                failures += fixture.run_capture(tokens, tokens % 3, tokens <= 2);
+            }
+        }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe routing capture\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--width-invariance") {
         // SparseMoeRouting::WidthInvariant: every width from one token, against a wide round's columns.
         // 1..19 are the widths the W8 pair would otherwise send to the decode and small-T

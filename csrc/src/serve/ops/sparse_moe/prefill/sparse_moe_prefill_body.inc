@@ -1995,6 +1995,11 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
             const Tensor slice_alpha(alpha, DType::FP32, {assignments});
             hook->resolve(hook->context, slice_ids, slice_alpha, input_slice, output_slice, stream);
         }
+        if (hook != nullptr && hook->capture != nullptr) {
+            const Tensor slice_ids(ids, DType::I32, {assignments});
+            hook->capture(hook->capture_context, slice_ids, hook->capture_base + token0, tokens,
+                          stream);
+        }
 
         if (plan.routed_trtllm) {
             // The routed experts are computed by the vendored TRT-LLM runner, which does its own

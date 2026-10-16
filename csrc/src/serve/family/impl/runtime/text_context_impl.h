@@ -18,6 +18,7 @@
 #include "api/ops/argmax.h"
 #include "api/ops/next_token_nll.h"
 #include "api/ops/sampled_logprob.h"
+#include "api/ops/sparse_moe.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/causal_conv1d_silu.h"
@@ -2002,7 +2003,22 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
     Hooks::post_mixer_norm(x, *post_norm, cfg_.rms_eps, *m.payload, h, work_, s);
     debug_probe<Variant>("post_attention_norm", h, cfg_.n_layers, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    {
+        // Rollout Routing Replay: a main-model layer's mixture copies its selected expert ids into
+        // this layer's slice of the program's capture buffer (column = this forward's column). The
+        // draft head passes the index past the end and is never captured.
+        ops::SparseMoeCaptureTarget routing_target{};
+        const bool capture_routing = io_.routing_capture != nullptr && layer >= 0 &&
+                                     layer < io_.routing_capture_layers;
+        if (capture_routing) {
+            routing_target = {io_.routing_capture + static_cast<std::size_t>(layer) *
+                                                        io_.routing_capture_columns *
+                                                        io_.routing_capture_top_k,
+                              io_.routing_capture_columns, io_.routing_capture_top_k};
+        }
+        ops::ScopedSparseMoeCapture routing_scope(capture_routing ? &routing_target : nullptr);
+        Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    }
     // What a block does after its feed-forward, for a family that does anything: Gemma 4's
     // E-series folds in this layer's per-layer input here, between the feed-forward's residual
     // add and the layer scalar. A no-op for every other target.

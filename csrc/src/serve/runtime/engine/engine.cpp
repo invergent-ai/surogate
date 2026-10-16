@@ -71,6 +71,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     }
     resolved.execution.prompt_logprobs = options.execution.prompt_logprobs;
     resolved.execution.top_logprobs = options.execution.top_logprobs;
+    resolved.execution.capture_routing = options.execution.capture_routing;
     resolved.execution.lora_slot               = options.execution.lora_slot;
     resolved.execution.min_tokens              = options.execution.min_tokens;
     resolved.execution.stop_barrier            = options.execution.stop_barrier;

@@ -1317,6 +1317,11 @@ void launch_d2_d3(const Tensor& x, const PreparedSparseMoeWeights& weights, Tens
     if (hook != nullptr && hook->resolve != nullptr) {
         hook->resolve(hook->context, workspace.ids, workspace.alpha, x, destination, stream);
     }
+    // Routing capture reads the final ids (after any correction resolve made above).
+    if (hook != nullptr && hook->capture != nullptr) {
+        hook->capture(hook->capture_context, workspace.ids, hook->capture_base,
+                      static_cast<std::int32_t>(x.ne[1]), stream);
+    }
 
     if (adapters) {
         moe_lora_low_kernel<<<dim3(moe_lora_rank_rows(workspace), 2 * kPaths, x.ne[1]), 32, 0, stream>>>(

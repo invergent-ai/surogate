@@ -156,6 +156,11 @@ struct ServeOptions {
     /// than at the first request.
     bool enable_lora = false;
     bool enable_sleep_mode = false;
+    /// --capture-routing: Rollout Routing Replay for RL rollouts. Every forward records each MoE
+    /// layer's selected experts, and a request with "return_routed_experts": true gets them back
+    /// (choice.routed_experts). Refuses --spec (speculative rounds verify drafts, they are not the
+    /// tokens a trainer replays) and turns off mixed prefill/decode rounds and round chaining.
+    bool capture_routing = false;
     std::vector<LoraModule> lora_modules;
     std::uint32_t max_loras     = 1;
     /// Banks are padded to this, so it is the rank an adapter may have and not the

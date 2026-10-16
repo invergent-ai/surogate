@@ -68,6 +68,15 @@ struct GenerationOutcome {
     std::vector<TokenScore> completion_scores;
     std::map<TokenId, std::string> score_texts;
     std::vector<float> token_logprobs;
+    /// Rollout Routing Replay (return_routed_experts): rows for sequence positions
+    /// [routed_start, routed_start + n) -- prompt then completion -- of routed_layers x routed_top_k
+    /// expert ids. Positions before routed_start came from the prefix cache and are not covered;
+    /// the last generated token (never fed back through the model) has no row.
+    std::vector<std::int16_t> routed_experts;
+    std::uint32_t routed_start  = 0;
+    std::uint32_t routed_layers = 0;
+    std::uint32_t routed_top_k  = 0;
+    bool include_routed_experts = false;
     /// The text of each completion token, so a probability names the token it
     /// belongs to. Filled only alongside `token_logprobs`.
     std::vector<std::string> token_texts;
@@ -155,6 +164,7 @@ struct PreparedRequest {
     int prompt_logprobs = -1;
     bool want_logprobs    = false;
     bool return_token_ids = false;
+    bool return_routed_experts = false;
     std::vector<sinfer::TokenId> prompt_token_ids;
     std::shared_ptr<RequestLifetime> lifetime;
 };

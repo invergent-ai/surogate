@@ -50,6 +50,14 @@ struct TokenDetail {
     std::vector<std::string> texts;   ///< the text of each completion token, or empty
     bool include_token_ids = false;
     bool include_logprobs  = false;
+    /// Rollout Routing Replay: choice.routed_experts = {"data": base64 of little-endian int16 in C
+    /// order, "shape": [n, layers, top_k], "start": first covered sequence position, "dtype":
+    /// "int16"} -- the vLLM convention verifiers parses ("data" must be the first key).
+    bool include_routed_experts = false;
+    std::vector<std::int16_t> routed_experts;
+    std::uint32_t routed_start  = 0;
+    std::uint32_t routed_layers = 0;
+    std::uint32_t routed_top_k  = 0;
 };
 
 // Non-streaming /v1/completions body, and its streaming chunks. The shape differs from chat

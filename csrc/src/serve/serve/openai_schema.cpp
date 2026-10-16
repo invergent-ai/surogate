@@ -14,6 +14,27 @@ namespace {
 
 using Json = nlohmann::json;
 
+// Standard base64 with padding, for choice.routed_experts.
+std::string routed_base64(const std::vector<std::uint8_t>& bytes) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    std::size_t i = 0;
+    for (; i + 2 < bytes.size(); i += 3) {
+        const std::uint32_t v = (std::uint32_t(bytes[i]) << 16) | (std::uint32_t(bytes[i + 1]) << 8) | bytes[i + 2];
+        out += {alphabet[v >> 18], alphabet[(v >> 12) & 63], alphabet[(v >> 6) & 63], alphabet[v & 63]};
+    }
+    if (i + 1 == bytes.size()) {
+        const std::uint32_t v = std::uint32_t(bytes[i]) << 16;
+        out += {alphabet[v >> 18], alphabet[(v >> 12) & 63], '=', '='};
+    } else if (i + 2 == bytes.size()) {
+        const std::uint32_t v = (std::uint32_t(bytes[i]) << 16) | (std::uint32_t(bytes[i + 1]) << 8);
+        out += {alphabet[v >> 18], alphabet[(v >> 12) & 63], alphabet[(v >> 6) & 63], '='};
+    }
+    return out;
+}
+
 namespace {
 /// Serialize a response body, substituting U+FFFD for any byte sequence that is
 /// not valid UTF-8.
@@ -405,6 +426,9 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
         out.want_logprobs = get_bool(body, "logprobs", false);
     }
+    if (body.contains("return_routed_experts") && !body.at("return_routed_experts").is_null()) {
+        out.return_routed_experts = get_bool(body, "return_routed_experts", false);
+    }
     if (body.contains("return_token_ids") && !body.at("return_token_ids").is_null()) {
         out.return_token_ids = get_bool(body, "return_token_ids", false);
     }
@@ -770,6 +794,24 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
         choice["logprobs"] = Json{{"content", std::move(entries)}};
     }
     if (detail.include_token_ids) { choice["token_ids"] = detail.completion_token_ids; }
+    if (detail.include_routed_experts) {
+        // Rollout Routing Replay: little-endian int16 rows, C order [tokens, layers, top_k].
+        const std::size_t row_len = static_cast<std::size_t>(detail.routed_layers) * detail.routed_top_k;
+        const std::size_t tokens  = row_len == 0 ? 0 : detail.routed_experts.size() / row_len;
+        std::vector<std::uint8_t> bytes(detail.routed_experts.size() * 2);
+        for (std::size_t i = 0; i < detail.routed_experts.size(); ++i) {
+            const auto value = static_cast<std::uint16_t>(detail.routed_experts[i]);
+            bytes[2 * i]     = static_cast<std::uint8_t>(value & 0xFF);
+            bytes[2 * i + 1] = static_cast<std::uint8_t>(value >> 8);
+        }
+        // Json is nlohmann::json (std::map keys, sorted): "data" serialises first, as verifiers'
+        // raw-text parser requires ("routed_experts":{"data":"...).
+        choice["routed_experts"] = Json{
+            {"data", routed_base64(bytes)},
+            {"shape", Json::array({tokens, detail.routed_layers, detail.routed_top_k})},
+            {"start", detail.routed_start},
+            {"dtype", "int16"}};
+    }
     Json payload = {
         {"id", id},
         {"object", "chat.completion"},

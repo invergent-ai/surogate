@@ -222,6 +222,9 @@ struct GenerationRequest {
     int prompt_logprobs = -1;
     bool want_logprobs    = false;
     bool return_token_ids = false;
+    /// Rollout Routing Replay: the MoE expert ids every prompt and completion token was routed
+    /// through, in choice.routed_experts (needs a server started with --capture-routing).
+    bool return_routed_experts = false;
     /// The prompt as token ids, replacing whatever `messages` would have rendered
     /// to. Empty unless the client sent them.
     ///
