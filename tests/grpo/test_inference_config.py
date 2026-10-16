@@ -293,3 +293,40 @@ def test_unset_admission_bounds_are_left_to_the_engine():
     argv = _argv({"model": "m"})
     assert "--max-pending-requests" not in argv
     assert "--pending-timeout-ms" not in argv
+
+
+# ── Rollout Routing Replay ────────────────────────────────────────────
+
+
+def test_routing_capture_is_off_unless_asked_and_never_with_speculation():
+    plain = _argv({"model": "m"})
+    assert "--capture-routing" not in plain
+    for cfg in ({"model": "m", "capture_routing": True}, {"model": "m", "capture_routing": True, "dp": 2}):
+        argv = _argv(cfg)
+        assert argv.count("--capture-routing") == 1
+        # The engine refuses capture with MTP / DFlash speculation.
+        assert not any(flag.startswith("--spec") for flag in argv)
+    assert not any(flag.startswith("--spec") for flag in plain)
+
+
+def test_routing_capture_is_a_flag_the_server_accepts():
+    from surogate.cli.serve import _parse_invocation
+
+    mode, _, native, _, _ = _parse_invocation(_argv({"model": "m", "capture_routing": True})[2:])
+    assert mode == "server" and "--capture-routing" in native
+
+
+def test_routing_capture_across_pipeline_stages_is_refused_before_launch():
+    with pytest.raises(ValueError, match="single-stage"):
+        _argv({"model": "m", "capture_routing": True, "tp": 2})
+
+
+def test_a_split_run_with_routing_replay_captures_on_the_rollout_server():
+    from types import SimpleNamespace
+
+    from surogate.grpo.split import enable_routing_capture
+
+    for replay in (False, True):
+        infer = GRPOInferenceConfig(DictDefault({"model": "m"}))
+        enable_routing_capture(infer, SimpleNamespace(routing_replay=replay))
+        assert ("--capture-routing" in surogate_engine.build_argv(infer)) is replay

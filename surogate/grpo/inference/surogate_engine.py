@@ -97,6 +97,15 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
         argv += ["--enable-auto-tool-choice"]
     if config.seed is not None:
         argv += ["--seed", str(config.seed)]
+    # Rollout Routing Replay. The engine refuses capture with speculative decoding (no --spec is passed
+    # here) or across pipeline stages, and does so after execv, so tp > 1 is refused before launch.
+    if config.capture_routing:
+        if config.tp > 1:
+            raise ValueError(
+                f"capture_routing runs on a single-stage engine; tp ({config.tp}) splits the model into pipeline "
+                "stages (use dp for more GPUs)"
+            )
+        argv += ["--capture-routing"]
 
     argv += _placement(config)
     return argv

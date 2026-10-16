@@ -132,6 +132,10 @@ class GRPOInferenceConfig:
             no gradient at all. Unset, the engine draws a fresh seed per
             request, which is what rollouts need and what colocate already does.
             Set it only to make a server reproducible, never to train.
+        capture_routing: Rollout Routing Replay (`--capture-routing`): the engine records every token's MoE
+            experts and returns them to requests that set `return_routed_experts`. A split run turns it on
+            when the orchestrator's `routing_replay` is set. The engine refuses it with speculative decoding
+            (never passed here) or pipeline stages (`tp` > 1).
     """
 
     host: str | None = None
@@ -184,6 +188,7 @@ class GRPOInferenceConfig:
     max_loras: int | None = 8
     max_lora_rank: int | None = None
     seed: int | None = None
+    capture_routing: bool = False
 
     def __init__(self, cfg: DictDefault):
         self.host = cfg.get("host", self.host)
@@ -259,3 +264,4 @@ class GRPOInferenceConfig:
         self.max_loras = cfg.get("max_loras", self.max_loras)
         self.max_lora_rank = cfg.get("max_lora_rank", self.max_lora_rank)
         self.seed = cfg.get("seed", self.seed)
+        self.capture_routing = bool(cfg.get("capture_routing", self.capture_routing))

@@ -140,6 +140,14 @@ def _watch_components(
     os.kill(os.getpid(), signal.SIGINT)
 
 
+def enable_routing_capture(infer_config: GRPOInferenceConfig, orch_config: GRPOOrchestratorConfig) -> None:
+    """Rollout Routing Replay: the rollout server captures the routing the orchestrator asks it for
+    (`return_routed_experts`); the engine answers 400 to those requests without `--capture-routing`.
+    The judge server never captures."""
+    if orch_config.routing_replay:
+        infer_config.capture_routing = True
+
+
 def grpo_split(
     train_config: GRPOTrainConfig,
     infer_config: GRPOInferenceConfig,
@@ -175,6 +183,7 @@ def grpo_split(
     )
 
     size_pending_capacity(infer_config, orch_config)
+    enable_routing_capture(infer_config, orch_config)
 
     _check_disjoint_gpus(("--infer-gpus", infer_gpu_ids), ("--trainer-gpus", trainer_gpu_ids))
     _check_gpu_count_matches_topology("--infer-gpus", infer_gpu_ids, infer_config)

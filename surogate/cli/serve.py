@@ -132,6 +132,7 @@ _SWITCH_OPTIONS = {
         --elastic-kv-overcommit --enforce-eager --no-prefix-reuse --batch-invariant
         --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
         --enable-sleep-mode --enable-lora --thinking --preserve-thinking --cors --data-parallel
+        --capture-routing
     """.split()),
     "generate": _COMMON_SWITCHES | frozenset("""
         --raw-output --print-token-ids --prefill-warmup --no-cuda-graph
