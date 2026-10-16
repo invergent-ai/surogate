@@ -22,6 +22,7 @@ from surogate import _surogate
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.data import GRPODataLoader
 from surogate.grpo.loss import compute_grpo_per_token_grads, shift_to_target, unshift_to_logical
+from surogate.grpo.routing_replay import moe_layer_ids, trainer_rows
 from surogate.grpo.turn_stats import TurnAccumulator
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
@@ -148,6 +149,23 @@ class GRPOTrainer:
             vocab_size = None
         if vocab_size:
             self._pad_logprob = float(np.log(1.0 / float(vocab_size)))
+
+        # Rollout Routing Replay (R3): the engine's rows follow the model's MoE layers in order; the trainer's
+        # replay buffer is indexed by block. Resolved once from the HF config (see routing_replay.moe_layer_ids).
+        self._r3_num_layers = None
+        self._r3_moe_layers = None
+        try:
+            from surogate.core.model.hf_config import HfConfigFactory
+
+            get_attr = HfConfigFactory.get_config_attr
+            self._r3_num_layers = int(get_attr(config.model_info.config, "num_hidden_layers"))
+            self._r3_moe_layers = moe_layer_ids(config.model_info.config, get_attr)
+        except Exception:
+            pass
+        self._r3_active = False
+        self._r3_stats: dict[str, float] = {}
+        self._r3_warned_pp = False
+        self._r3_step_summary: dict[str, float] = {}
 
         # Import pretrained weights.
         #
@@ -349,8 +367,48 @@ class GRPOTrainer:
                         "train/tokens_per_second": tps,
                         "train/orch_step": float(orch_step),
                         **turn_summary,
+                        **self._r3_step_summary,
                     },
                 )
+
+    def _r3_set_rows(self, mb, seq_len: int, ngpu: int) -> None:
+        """Hand this micro-batch's rollout routing to the native MoE top-k (or clear a previous one)."""
+        routed = mb.get("routed_experts")
+        rows = None
+        if routed is not None and self._r3_num_layers:
+            rows = trainer_rows(routed, seq_len, self._r3_num_layers, self._r3_moe_layers)
+            if rows is None:
+                self._r3_stats["train/r3_unmapped_micro_batches"] = self._r3_stats.get(
+                    "train/r3_unmapped_micro_batches", 0.0) + 1.0
+        if rows is None:
+            if self._r3_active:
+                self.trainer.clear_routing_replay()
+                self._r3_active = False
+            return
+        rows = np.ascontiguousarray(np.broadcast_to(rows[None], (ngpu, *rows.shape)))
+        self.trainer.set_routing_replay(rows)
+        self._r3_active = True
+        replayed = float((routed[:, 0, 0] >= 0).sum())
+        self._r3_stats["train/r3_replayed_tokens"] = self._r3_stats.get("train/r3_replayed_tokens", 0.0) + replayed
+
+    def _r3_after_micro_step(self) -> None:
+        """Accumulate the native replay diagnostics of the micro-step that just ran."""
+        if not self._r3_active:
+            return
+        for bad_rows, mismatches in self.trainer.routing_replay_diagnostics():
+            self._r3_stats["train/r3_bad_rows"] = self._r3_stats.get("train/r3_bad_rows", 0.0) + float(bad_rows)
+            self._r3_stats["train/r3_shape_mismatches"] = self._r3_stats.get(
+                "train/r3_shape_mismatches", 0.0) + float(mismatches)
+
+    def _r3_end_step(self) -> dict[str, float]:
+        """Clear replay after the optimizer step's micro-steps; return and reset this step's R3 metrics."""
+        if self._r3_active:
+            self.trainer.clear_routing_replay()
+            self._r3_active = False
+        stats, self._r3_stats = self._r3_stats, {}
+        if stats.get("train/r3_shape_mismatches") or stats.get("train/r3_bad_rows"):
+            logger.warning(f"routing replay: {stats} (mismatched forwards ran with the trainer's own routing)")
+        return stats
 
     def _prepare_micro_batch(self, mb, seq_len: int) -> dict:
         """Pad one micro-batch's per-token arrays to seq_len.
@@ -737,6 +795,11 @@ class GRPOTrainer:
                 adamw_epsilon=config.adamw_epsilon,
             )
 
+            if self._dispatch_pp and not self._r3_warned_pp and any(
+                    mb.get("routed_experts") is not None for mb in micro_batches):
+                logger.warning("routing replay rows arrived but dispatch-PP does not replay them yet; "
+                               "this run trains with the trainer's own MoE routing")
+                self._r3_warned_pp = True
             if self._dispatch_pp:
                 # dispatch-PP folds forward+backward+optimizer into one staged pass
                 # over all micro-batches, so it replaces both the loop below and the
@@ -845,6 +908,8 @@ class GRPOTrainer:
                 sample_starts = np.asarray([start for start, _ in sample_ranges], dtype=np.int32)
                 sample_ends = np.asarray([end for _, end in sample_ranges], dtype=np.int32)
 
+                self._r3_set_rows(mb, seq_len, ngpu)
+
                 if turn_acc is not None:
                     self._diagnostic_micro_step(
                         turn_acc=turn_acc,
@@ -861,6 +926,7 @@ class GRPOTrainer:
                         loss_scale=float(loss_scale),
                         seq_len=seq_len,
                     )
+                    self._r3_after_micro_step()
                     continue
 
                 self.trainer.step_grpo_native(
@@ -882,6 +948,9 @@ class GRPOTrainer:
                     kl_tau=float(config.loss.kl_tau),
                     ratio_clip=float(config.loss.ratio_clip),
                 )
+                self._r3_after_micro_step()
+
+            self._r3_step_summary = self._r3_end_step()
 
             # 5. Optimizer step — one per orchestrator step (lr/opt_config built above)
             expected_loss_scale = loss_scale

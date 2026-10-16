@@ -6,7 +6,11 @@ across data-parallel workers.
 
 import copy
 
+from surogate.grpo.routing_replay import no_route_bytes
 from surogate.grpo.transport.types import MicroBatch, TrainingSample
+from surogate.utils.logger import get_logger
+
+logger = get_logger()
 
 
 def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch:
@@ -32,6 +36,16 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     if training_example.completion_turn_ids is not None:
         turn_ids = [-1] * len(training_example.prompt_ids) + training_example.completion_turn_ids
 
+    # Routing replay rows ride along token for token ([len, layers, top_k] int16 bytes).
+    routed, dims = training_example.routed_experts, training_example.routed_experts_dims
+    if routed is not None:
+        row_bytes = 2 * int(dims[0]) * int(dims[1]) if dims else 0
+        if not row_bytes or len(routed) != row_bytes * len(input_ids):
+            logger.warning(
+                f"routed_experts length {len(routed)} does not match {len(input_ids)} tokens x dims {dims}; "
+                "dropping replay rows for this sample")
+            routed, dims = None, None
+
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
         loss_mask = loss_mask[:seq_len]
@@ -43,6 +57,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             teacher_logprobs = teacher_logprobs[:seq_len]
         if turn_ids is not None:
             turn_ids = turn_ids[:seq_len]
+        if routed is not None:
+            routed = routed[: seq_len * 2 * int(dims[0]) * int(dims[1])]
 
     assert (
         len(input_ids)
@@ -69,7 +85,32 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
         turn_ids=turn_ids,
+        routed_experts=routed,
+        routed_experts_dims=dims,
     )
+
+
+def _extend_routing(bin_content: MicroBatch, bin_len_before: int, sample: MicroBatch) -> None:
+    """Append a sample's routing rows to a bin; the side without rows gets -1 rows so they stay aligned.
+
+    A bin whose samples disagree on [layers, top_k] runs without replay; it is marked by empty dims so later
+    samples do not re-enable it with misaligned rows.
+    """
+    if bin_content.routed_experts_dims == []:
+        return
+    if bin_content.routed_experts is None and sample.routed_experts is None:
+        return
+    dims = bin_content.routed_experts_dims or sample.routed_experts_dims
+    if (bin_content.routed_experts_dims is not None and sample.routed_experts_dims is not None
+            and list(bin_content.routed_experts_dims) != list(sample.routed_experts_dims)):
+        logger.warning(f"routing replay dims differ inside a micro-batch ({bin_content.routed_experts_dims} vs "
+                       f"{sample.routed_experts_dims}); this micro-batch runs without replay")
+        bin_content.routed_experts, bin_content.routed_experts_dims = None, []
+        return
+    head = bin_content.routed_experts if bin_content.routed_experts is not None else no_route_bytes(bin_len_before, dims)
+    tail = sample.routed_experts if sample.routed_experts is not None else no_route_bytes(len(sample.input_ids), dims)
+    bin_content.routed_experts = head + tail
+    bin_content.routed_experts_dims = list(dims)
 
 
 def packed_samples_into_micro_bs(
@@ -116,6 +157,7 @@ def packed_samples_into_micro_bs(
                     if bin_content.turn_ids is None:
                         bin_content.turn_ids = [-1] * bin_len_before
                     bin_content.turn_ids.extend(sample.turn_ids or [-1] * len(sample.input_ids))
+                _extend_routing(bin_content, bin_len_before, sample)
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
@@ -144,6 +186,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     if micro_batch.turn_ids is not None:
         micro_batch.turn_ids.extend([-1] * padding_size)
+    if micro_batch.routed_experts is not None and micro_batch.routed_experts_dims:
+        micro_batch.routed_experts += no_route_bytes(padding_size, micro_batch.routed_experts_dims)
     # Send padding to the last lora so tokens have ascending lora idx
     micro_batch.lora_num_tokens[-1] += padding_size
 

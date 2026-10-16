@@ -20,6 +20,10 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     completion_turn_ids: list[int] | None = None
     # Total model turns in the source trajectory (before any truncation).
     num_turns: int | None = None
+    # Rollout Routing Replay: the rollout engine's MoE expert ids per token, int16 little-endian, C order
+    # [len(prompt_ids) + len(completion_ids), layers, top_k]; -1 rows = no replay. None when not collected.
+    routed_experts: bytes | None = None
+    routed_experts_dims: list[int] | None = None  # [layers, top_k]
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -45,3 +49,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # Per-token 0-based turn index; -1 for prompt/padding tokens. None when the
     # source env is single-turn (turn structure carries no information there).
     turn_ids: list[int] | None = None
+    # Rollout Routing Replay rows aligned with input_ids: int16 little-endian, C order
+    # [len(input_ids), layers, top_k], -1 = no replay (padding, cache-served prompt tokens).
+    routed_experts: bytes | None = None
+    routed_experts_dims: list[int] | None = None  # [layers, top_k]

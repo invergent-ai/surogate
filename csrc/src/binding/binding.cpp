@@ -1821,17 +1821,23 @@ NB_MODULE(_surogate, m) {
             [](MultiGPUPyTrainer* trainer,
                nb::ndarray<std::int16_t, nb::ndim<4>, nb::c_contig, nb::device::cpu> rows) {
                 const std::size_t local_gpus = static_cast<std::size_t>(trainer->local_world_size());
-                const std::size_t tokens =
-                    static_cast<std::size_t>(trainer->batch_size()) * static_cast<std::size_t>(trainer->seq_length());
+                // Rows cover the whole step sequence: under chunked-sequence training each chunk's forward reads
+                // its slice (step_grpo_native_chunked sets the token offset per chunk).
+                const std::size_t tokens = static_cast<std::size_t>(trainer->batch_size()) *
+                                           static_cast<std::size_t>(trainer->step_seq_length());
                 if (rows.shape(0) != local_gpus || rows.shape(2) != tokens) {
                     throw std::runtime_error(
-                        "routing replay rows must have shape [local_gpus, num_layers, batch_size * seq_length, top_k]");
+                        "routing replay rows must have shape [local_gpus, num_layers, batch_size * step_seq_length, top_k]");
                 }
-                trainer->set_routing_replay(rows.data(), static_cast<int>(rows.shape(1)), static_cast<int>(rows.shape(3)));
+                trainer->set_routing_replay(rows.data(),
+                                            static_cast<int>(rows.shape(1)),
+                                            static_cast<long>(rows.shape(2)),
+                                            static_cast<int>(rows.shape(3)));
             },
             nb::arg("rows"),
             "Rollout Routing Replay: use the rollout engine's expert choices in the MoE top-k op until cleared.\n\n"
-            "- rows: int16 [local_gpus, num_layers, batch_size * seq_length, top_k]; a row starting with -1 is\n"
+            "- rows: int16 [local_gpus, num_layers, batch_size * step_seq_length, top_k] (the full step sequence,\n"
+            "  also under chunked-sequence training); a row starting with -1 is\n"
             "  not replayed (the computed selection is kept). Weights are recomputed from the current router.")
         .def("clear_routing_replay",
              &MultiGPUPyTrainer::clear_routing_replay,

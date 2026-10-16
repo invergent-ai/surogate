@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from surogate.grpo.routing_replay import rows_from_bytes
 from surogate.grpo.transport import setup_micro_batch_receiver
 from surogate.utils.logger import get_logger
 
@@ -24,6 +25,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         teacher_logprobs: float32 [1, T] or None
         turn_ids: int32 [1, T] or None  (-1 = initial prompt or padding; env
             observation tokens carry the index of the turn they precede)
+        routed_experts: int16 [T, layers, top_k] or None  (Rollout Routing Replay rows; -1 = no replay)
     """
     T = len(micro_batch.input_ids)
 
@@ -48,6 +50,9 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
     if micro_batch.turn_ids is not None:
         turn_ids = np.array(micro_batch.turn_ids, dtype=np.int32).reshape(1, T)
 
+    routed_experts = rows_from_bytes(
+        getattr(micro_batch, "routed_experts", None), getattr(micro_batch, "routed_experts_dims", None), T)
+
     return {
         "input_ids": input_ids,
         "targets": targets,
@@ -58,6 +63,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         "temperatures": temperatures,
         "teacher_logprobs": teacher_logprobs,
         "turn_ids": turn_ids,
+        "routed_experts": routed_experts,
     }
 
 

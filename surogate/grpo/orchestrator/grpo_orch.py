@@ -630,7 +630,9 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
 
             # Schedule generating the training batch
             temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
-            sampling_args = get_sampling_args(config.sampling, temperature=temperature)
+            sampling_args = get_sampling_args(
+                config.sampling, temperature=temperature, routing_replay=bool(config.routing_replay)
+            )
             scheduler.set_sampling_args(sampling_args)
             # Cap rollout depth for this step (None on probe/warmup steps, which run
             # to the env's own max_turns and are the only source of depth statistics).
@@ -696,7 +698,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
 
             # Process rollouts in parallel
             def process_rollout(rollout: vf.RolloutOutput) -> list[TrainingSample] | None:
-                return interleave_rollout(rollout)
+                return interleave_rollout(rollout, routing_replay=bool(config.routing_replay))
 
             loop = asyncio.get_event_loop()
             futures = [loop.run_in_executor(rollout_executor, process_rollout, r) for _, r in enumerate(train_rollouts)]

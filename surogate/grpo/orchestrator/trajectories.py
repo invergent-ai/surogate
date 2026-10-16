@@ -1,5 +1,6 @@
 import verifiers as vf
 
+from surogate.grpo.routing_replay import SampleRouting
 from surogate.grpo.transport import TrainingSample
 from surogate.grpo.utils.logger import get_logger
 
@@ -7,7 +8,7 @@ from surogate.grpo.utils.logger import get_logger
 # primitives are immutable.
 
 
-def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
+def interleave_rollout(output: vf.RolloutOutput, routing_replay: bool = False) -> list[TrainingSample] | None:
     """
     Convert vf.RolloutOutput to trainable rollouts by interleaving trajectory steps
     where the extension property holds.
@@ -25,6 +26,8 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
 
     Args:
         output: vf.RolloutOutput containing trajectory data
+        routing_replay: also stitch each step's routed-experts payload (``tokens["routed_experts"]``) into
+            per-sample routing rows (``TrainingSample.routed_experts``), aligned with prompt_ids + completion_ids
     """
     logger = get_logger()
 
@@ -89,13 +92,27 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
         sample.completion_logprobs.extend(tokens["completion_logprobs"])
         sample.completion_temperatures.extend([temperature] * len(completion_ids))
 
+    def new_routing(step: vf.TrajectoryStep) -> SampleRouting | None:
+        if not routing_replay:
+            return None
+        routing = SampleRouting()
+        add_routing(routing, step)
+        return routing
+
+    def add_routing(routing: SampleRouting | None, step: vf.TrajectoryStep) -> None:
+        # The step's prompt+completion positions are the sample's positions (extension property), so the
+        # payload rows land on the sample directly; see SampleRouting for which request owns a position.
+        if routing is not None:
+            tokens = step["tokens"]
+            routing.add_step(len(tokens["prompt_ids"]), len(tokens["completion_ids"]), tokens.get("routed_experts"))
+
     # Track multiple active (prefix, sample) pairs to handle interleaved agents
-    # Each entry is [prefix_tokens, sample] where prefix_tokens is the accumulated token sequence
+    # Each entry is [prefix_tokens, sample, routing] where prefix_tokens is the accumulated token sequence
     active_samples: list[list] = []
 
     first_tokens = trajectory[0]["tokens"]
     first_prefix = first_tokens["prompt_ids"] + first_tokens["completion_ids"]
-    active_samples.append([first_prefix, make_sample(trajectory[0], step_idx=0)])
+    active_samples.append([first_prefix, make_sample(trajectory[0], step_idx=0), new_routing(trajectory[0])])
 
     for step_idx, step in enumerate(trajectory[1:], start=1):
         tokens = step["tokens"]
@@ -103,15 +120,16 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
 
         # Check if this step extends ANY active prefix
         matched_idx = None
-        for idx, (prefix_tokens, _) in enumerate(active_samples):
+        for idx, (prefix_tokens, _, _) in enumerate(active_samples):
             if step_prompt_ids[: len(prefix_tokens)] == prefix_tokens:
                 matched_idx = idx
                 break
 
         if matched_idx is not None:
             # Extension holds - merge into matched sample
-            prefix_tokens, sample = active_samples[matched_idx]
+            prefix_tokens, sample, routing = active_samples[matched_idx]
             extend_sample(sample, step, len(prefix_tokens), step_idx=step_idx)
+            add_routing(routing, step)
             # Update prefix for this sample
             active_samples[matched_idx][0] = tokens["prompt_ids"] + tokens["completion_ids"]
         else:
@@ -121,9 +139,14 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
                 f"Starting new sample (active_prefixes={len(active_samples)}, step_prompt_len={len(step_prompt_ids)})."
             )
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
-            active_samples.append([new_prefix, make_sample(step, step_idx=step_idx)])
+            active_samples.append([new_prefix, make_sample(step, step_idx=step_idx), new_routing(step)])
 
-    samples = [sample for _, sample in active_samples]
+    for _, sample, routing in active_samples:
+        packed = routing.result() if routing is not None else None
+        if packed is not None:
+            sample.routed_experts, sample.routed_experts_dims = packed
+
+    samples = [sample for _, sample, _ in active_samples]
 
     # Turn ids stay the trajectory step index and are deliberately NOT re-based
     # per sample. A trajectory frequently splits into several samples — chat

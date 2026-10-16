@@ -956,6 +956,7 @@ class GRPOOrchestratorConfig:
         bench: Whether to run in benchmark mode. It will automatically set the maximum number of steps to run to 5, max async level to ~infinity and disable reporting.
         seed: Random seed for the orchestrator.
         use_token_client: Whether to use the token-in-token-out (TITO) client for training across all environments. WARNING: Only use this if your environment has a linear history and the chat template has the extension property (i.e. no tokens are ever removed or inserted by the chat template)
+        routing_replay: Rollout Routing Replay (R3). Ask the inference engine for the MoE experts it selected per token (`return_routed_experts`), stitch them into each training sample, and have the trainer replay them in the MoE top-k (stabilises MoE RL). Off by default; needs an engine that returns `routed_experts`.
         token_batch_size: Number of tokens to train on per step (token-based batching). Set this OR batch_size.
         max_inflight_rollouts: Maximum number of rollouts to keep in-flight. Required for token-based batching. If batch_size is set and this is unset, defaults to batch_size * oversampling_factor (or batch_size when oversampling_factor is unset).
         verification: Rollout verification configuration
@@ -1000,6 +1001,9 @@ class GRPOOrchestratorConfig:
     bench: bool | None = False
     seed: int | None = 42
     use_token_client: bool | None = True
+    # Rollout Routing Replay: request the engine's per-token expert ids and ship them with every sample so the
+    # trainer replays the rollout's MoE routing (surogate/grpo/routing_replay.py). Needs an engine that returns them.
+    routing_replay: bool | None = False
     token_batch_size: int | None = None
     max_inflight_rollouts: int | None = None
     dump_metrics: bool | None = False
@@ -1119,6 +1123,7 @@ class GRPOOrchestratorConfig:
         self.bench = cfg.get("bench", self.bench)
         self.seed = cfg.get("seed", self.seed)
         self.use_token_client = cfg.get("use_token_client", self.use_token_client)
+        self.routing_replay = bool(cfg.get("routing_replay", self.routing_replay))
         self.token_batch_size = cfg.get("token_batch_size", self.token_batch_size)
         self.max_inflight_rollouts = cfg.get("max_inflight_rollouts", self.max_inflight_rollouts)
 

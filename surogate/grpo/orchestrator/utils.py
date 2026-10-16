@@ -40,7 +40,7 @@ async def get_semaphore() -> AsyncContextManager:
     return SEMAPHORE
 
 
-def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -> dict:
+def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float, routing_replay: bool = False) -> dict:
     # Convert SamplingConfig to the OpenAI-compatible sampling args the server accepts
     sampling_args = dict(sampling_config.__dict__)
     sampling_args.pop("temp_scheduler", None)
@@ -76,6 +76,10 @@ def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -
     }
     sampling_args["extra_body"]["min_tokens"] = sampling_args.pop("min_tokens")
     sampling_args["extra_body"]["repetition_penalty"] = sampling_args.pop("repetition_penalty")
+    if routing_replay:
+        # Rollout Routing Replay: ask the engine for the experts it picked per token; verifiers keeps the
+        # `routed_experts` payload on each trajectory step (see surogate/grpo/routing_replay.py).
+        sampling_args["extra_body"]["return_routed_experts"] = True
     seed_pinned |= sampling_args["extra_body"].pop("seed", None) is not None
     if seed_pinned:
         logger.warning_once(

@@ -811,14 +811,19 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
 /**
  * @brief Rollout Routing Replay: hand each GPU the rollout engine's expert choices for its micro-batch rows.
  *
- * @param rows int16 [local_gpus][num_layers][B*T][top_k], contiguous per GPU; a row starting with -1 is not replayed.
+ * @param rows int16 [local_gpus][num_layers][B * step_seq_length][top_k], contiguous per GPU; a row starting with -1
+ *        is not replayed. Under chunked-sequence training the rows cover the full sequence and each chunk reads its slice.
  * The copy to each device is issued on that GPU's worker thread before this returns, so @p rows may be freed after.
  */
-void MultiGPUPyTrainer::set_routing_replay(const std::int16_t* rows, int num_layers, int top_k) {
+void MultiGPUPyTrainer::set_routing_replay(const std::int16_t* rows, int num_layers, long num_tokens, int top_k) {
     if (!rows || num_layers <= 0 || top_k <= 0) {
         throw std::runtime_error("set_routing_replay: rows, num_layers and top_k are required");
     }
-    const long tokens = static_cast<long>(B) * static_cast<long>(T);
+    const long tokens = static_cast<long>(B) * static_cast<long>(step_seq_length());
+    if (num_tokens != tokens) {
+        throw std::runtime_error(fmt::format("set_routing_replay: {} token rows, expected B * step_seq_length = {}",
+                                             num_tokens, tokens));
+    }
     const std::size_t per_gpu =
         static_cast<std::size_t>(num_layers) * static_cast<std::size_t>(tokens) * static_cast<std::size_t>(top_k);
     for (int i = 0; i < local_world_size(); ++i) {
@@ -4014,6 +4019,19 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
     }
     const int ep_size = std::max(1, mOptions.EPSize);
     const long T_full = static_cast<long>(T) * seq_chunks;
+    // Rollout Routing Replay: the replay rows cover the full [B, T_full] step sequence while each chunk forward
+    // (Phase A sweep, Phase B re-forward and its backward recompute) runs [B, T] tokens. With B == 1 a chunk's rows
+    // are the contiguous slice from its first token; B > 1 interleaves rows across batch entries, which a slice
+    // cannot express, so it is refused while replay is active.
+    auto set_replay_offset = [](sThreadContext& ctx, long chunk_start, int batch) {
+        auto* rs = dynamic_cast<dsl::DslRunState*>(&ctx.Model->get_run_state());
+        if (!rs || !rs->routing_replay().active) return;
+        if (batch != 1) {
+            throw std::runtime_error(
+                "routing replay with chunked-sequence GRPO needs batch_size 1 (rows are sliced per chunk)");
+        }
+        rs->set_routing_replay_token_offset(chunk_start);
+    };
     const int accum_eff = mGradAccumulation * seq_chunks;
 
     // Skip all-padding tail chunks: with single-sample bins the real tokens
@@ -4118,12 +4136,13 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
         copy_chunk(c);
         const int micro_eff = mTrainMicroStep * seq_chunks + c;
         const long base_pos_a = static_cast<long>(c) * T;
-        run_work([c, seq_chunks, micro_eff, base_pos_a, this](sThreadContext& ctx) {
+        run_work([c, seq_chunks, micro_eff, base_pos_a, set_replay_offset, this](sThreadContext& ctx) {
             Tensor in = ctx.Model->get_input_buffer();
             Tensor pos = ctx.Model->get_position_ids_buffer();
             const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(),
                                                             static_cast<int>(this->T), base_pos_a);
             ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
+            set_replay_offset(ctx, base_pos_a, this->B);
             ctx.Model->forward_no_save(in, pos, *ctx.Communicator, micro_eff);
         });
     }
@@ -4142,6 +4161,7 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
                   micro_eff,
                   accum_eff,
                   window_start,
+                  set_replay_offset,
                   sample_count,
                   loss_config,
                   has_temps,
@@ -4156,6 +4176,7 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
             const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(),
                                                             static_cast<int>(in.Sizes[1]), window_start);
             ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
+            set_replay_offset(ctx, window_start, static_cast<int>(in.Sizes[0]));
             dsl_model->step_grpo_native_window(in,
                                                pos,
                                                tgt,
@@ -4169,7 +4190,10 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
                                                has_teacher);
         });
     }
-    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
+    run_work([set_replay_offset](sThreadContext& ctx) {
+        ctx.Model->set_sequence_chunk(-1, 0);
+        set_replay_offset(ctx, 0, 1);
+    });
     ++mTrainMicroStep;
 }
 
