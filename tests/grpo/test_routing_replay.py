@@ -294,3 +294,25 @@ def test_scheduler_release_reads_routing_before_freeing_the_session():
         assert trainer.routing_reads == [routed] and not trainer.lengths
     finally:
         scheduler.close()
+
+
+def test_trainer_hands_the_native_call_a_writable_array_on_one_gpu():
+    """With one trainer GPU, broadcast_to(rows[None], (1, ...)) is already contiguous, so ascontiguousarray returned the
+    read-only broadcast view as is and the binding (a writable int16 ndarray) refused it at the first micro-batch:
+    "set_routing_replay(): incompatible function arguments" (2026-10-16, 35B GRPO on one RTX PRO 6000)."""
+    pytest.importorskip("surogate._surogate", reason="surogate.grpo.trainer imports the extension")
+    from surogate.grpo.trainer import GRPOTrainer
+
+    seen = []
+
+    class _Strict(_FakeNative):
+        def set_routing_replay(self, rows):
+            seen.append((rows.shape, rows.dtype, rows.flags["WRITEABLE"], rows.flags["C_CONTIGUOUS"]))
+
+    for ngpu in (1, 2):
+        t = object.__new__(GRPOTrainer)
+        t.trainer = _Strict()
+        t._r3_num_layers, t._r3_moe_layers = 4, [1, 3]
+        t._r3_active, t._r3_stats = False, {}
+        t._r3_set_rows({"routed_experts": np.full((5, 2, K), 2, dtype=np.int16)}, seq_len=8, ngpu=ngpu)
+    assert seen == [((1, 4, 8, K), np.int16, True, True), ((2, 4, 8, K), np.int16, True, True)]

@@ -410,7 +410,10 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
             lora_name=config.model.lora_adapter,
             deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
             config=config,
-            prefetch_batches=prefetch_batches,
+            # max_async_level 0 promises synchronous on-policy batches, but prefetching keeps the previous step's
+            # surplus rollouts in flight across the policy update, so they land in the next batch one policy behind
+            # (seen 2026-10-16: a whole batch generated during the trainer's step, accepted 2 s after the update).
+            prefetch_batches=prefetch_batches and config.max_async_level > 0,
         )
         if initial_policy_name is not None:
             scheduler.model_name = initial_policy_name

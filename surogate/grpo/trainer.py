@@ -385,7 +385,10 @@ class GRPOTrainer:
                 self.trainer.clear_routing_replay()
                 self._r3_active = False
             return
-        rows = np.ascontiguousarray(np.broadcast_to(rows[None], (ngpu, *rows.shape)))
+        # np.repeat, not ascontiguousarray(broadcast_to(...)): with one GPU the broadcast view is already contiguous, so
+        # ascontiguousarray returned it as is - read-only - and the binding (writable int16 ndarray) refused it
+        # ("set_routing_replay(): incompatible function arguments"; found 2026-10-16 on a 1-GPU trainer).
+        rows = np.repeat(rows[None], ngpu, axis=0)
         self.trainer.set_routing_replay(rows)
         self._r3_active = True
         replayed = float((routed[:, 0, 0] >= 0).sum())
