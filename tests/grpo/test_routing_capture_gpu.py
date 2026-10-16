@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import requests
 
-from surogate.grpo.routing_replay import SampleRouting, moe_layer_ids, rows_from_bytes, trainer_rows
+from surogate.grpo.routing_replay import SampleRouting, decode_payload, moe_layer_ids, rows_from_bytes, trainer_rows
 
 LAYERS, EXPERTS, TOP_K = 2, 4, 2
 SEQ_LEN = 128
@@ -95,6 +95,9 @@ def test_colocate_capture_round_trips_through_replay(tmp_path, mode, graphs):
     pytest.importorskip("surogate._surogate", reason="needs the built extension")
     import torch
 
+    from openai.types.chat import ChatCompletion
+    from verifiers.utils.response_utils import strip_routed_experts_data
+
     from surogate.grpo.shared_model import SharedModelServer
 
     if not torch.cuda.is_available():
@@ -125,7 +128,11 @@ def test_colocate_capture_round_trips_through_replay(tmp_path, mode, graphs):
         off = generate(PROMPT_A, routed=False).json()
         on_response = generate(PROMPT_A, routed=True)
         on = on_response.json()
-        assert '"routed_experts": {"data": "' in on_response.text
+        # The verifiers client strips the base64 out of the raw body before parsing the completion (its sidecar).
+        stripped, sidecar = strip_routed_experts_data(on_response.content)
+        assert sidecar is not None
+        parsed = ChatCompletion.model_validate_json(stripped).choices[0].model_extra["routed_experts"]
+        assert decode_payload(dict(parsed, data=sidecar))[0].tobytes() == _payload_rows(on["choices"][0])[1].tobytes()
         assert "routed_experts" not in off["choices"][0]
         assert on["choices"][0]["token_ids"] == off["choices"][0]["token_ids"]
         assert ([s["logprob"] for s in on["choices"][0]["logprobs"]["content"]] ==

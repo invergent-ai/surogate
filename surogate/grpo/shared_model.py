@@ -117,7 +117,8 @@ class SharedModelServer:
                 pass
 
             def send_json(self, status, value):
-                data = json.dumps(value, allow_nan=False).encode()
+                # Compact like vLLM: verifiers' routed-experts sidecar finds the payload by '"routed_experts":{"data":"'.
+                data = json.dumps(value, allow_nan=False, separators=(",", ":")).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
