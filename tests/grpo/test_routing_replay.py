@@ -233,3 +233,64 @@ def test_trainer_sets_rows_per_micro_step_collects_diagnostics_and_clears():
     # Rows whose layer count cannot be mapped are skipped and counted.
     t._r3_set_rows({"routed_experts": np.zeros((5, 3, K), dtype=np.int16)}, seq_len=8, ngpu=1)
     assert t._r3_end_step() == {"train/r3_unmapped_micro_batches": 1.0}
+
+
+def test_colocate_payload_selects_moe_layers_and_round_trips():
+    from types import SimpleNamespace
+
+    from surogate.grpo.shared_model import SharedModelServer
+
+    rows = np.arange(5 * 4 * K, dtype=np.int16).reshape(5, 4, K)  # 5 positions, 4 captured layers
+    result = dict(choices=[dict(index=0, token_ids=[1, 2])])
+    server = SimpleNamespace(moe_layers=[1, 3])  # dense layers 0 and 2 never run the MoE top-k op
+    SharedModelServer._attach_routing(server, result, (7, rows))
+    sent = result["choices"][0]["routed_experts"]
+    assert list(sent) == ["data", "shape", "start", "dtype"] and sent["shape"] == [5, 2, K]
+    decoded, start = decode_payload(sent)
+    assert start == 7 and np.array_equal(decoded, rows[:, [1, 3]])
+    # Configs whose MoE layers do not index the captured rows send every captured layer.
+    for layers in (None, [0, 1, 2, 3], [4, 5]):
+        result = dict(choices=[dict(index=0)])
+        SharedModelServer._attach_routing(SimpleNamespace(moe_layers=layers), result, (0, rows))
+        assert np.array_equal(decode_payload(result["choices"][0]["routed_experts"])[0], rows)
+    result = dict(choices=[dict(index=0)])
+    assert "routed_experts" not in SharedModelServer._attach_routing(server, result, None)["choices"][0]
+
+
+def test_scheduler_release_reads_routing_before_freeing_the_session():
+    from surogate.grpo.decode_scheduler import DecodeScheduler
+
+    class Trainer:
+        batch_size, seq_length = 1, 64
+
+        def __init__(self):
+            self.lengths, self.routing_reads = {}, []
+
+        def decode_batch_logits(self, ids, tokens, offsets, resets):
+            for i, session in enumerate(ids.tolist()):
+                self.lengths[session] = (0 if resets[i] else self.lengths[session]) + int(offsets[i + 1] - offsets[i])
+            return np.zeros((len(ids), 2), dtype=np.float32)
+
+        def decode_session_routing(self, session):
+            self.routing_reads.append(session)
+            if session not in self.lengths:
+                return None
+            return 0, np.full((self.lengths[session], L, K), session, dtype=np.int16)
+
+        def release_decode_sessions(self, ids):
+            for session in ids:
+                self.lengths.pop(session, None)
+
+    trainer = Trainer()
+    scheduler = DecodeScheduler(trainer, max_batch=2, prefill_chunk=8, token_budget=256)
+    try:
+        routed, plain = scheduler.new_session(), scheduler.new_session()
+        for session in (routed, plain):
+            scheduler.step(session, [3, 4, 5], True)
+            scheduler.step(session, [6])
+        start, rows = scheduler.release(routed, routing=True)
+        assert start == 0 and rows.shape == (4, L, K) and (rows == routed).all()
+        assert scheduler.release(plain) is None
+        assert trainer.routing_reads == [routed] and not trainer.lengths
+    finally:
+        scheduler.close()

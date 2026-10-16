@@ -1853,6 +1853,55 @@ NB_MODULE(_surogate, m) {
             },
             "Per GPU: (rows with an out-of-range expert id since the last set, forwards whose token count or top_k\n"
             "did not match the replay rows - those forwards ran without replay).")
+        .def("set_routing_capture",
+             &MultiGPUPyTrainer::set_routing_capture,
+             nb::arg("enabled"),
+             nb::call_guard<nb::gil_scoped_release>(),
+             "Colocate Rollout Routing Replay: record the experts each serving forward selects (decode sessions,\n"
+             "persistent decode, next_token_logits). Training and replayed forwards are never captured; outputs are\n"
+             "unchanged.")
+        .def(
+            "decode_session_routing",
+            [](MultiGPUPyTrainer* trainer, std::int64_t session) -> nb::object {
+                RoutingCaptureRows rows;
+                {
+                    nb::gil_scoped_release release;
+                    rows = trainer->decode_session_routing(session);
+                }
+                if (rows.start < 0 || rows.layers <= 0 || rows.top_k <= 0) return nb::none();
+                const std::size_t n = rows.rows.size() / (static_cast<std::size_t>(rows.layers) * rows.top_k);
+                auto* data = new std::int16_t[rows.rows.size()];
+                std::copy(rows.rows.begin(), rows.rows.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<std::int16_t*>(p); });
+                auto array = nb::ndarray<nb::numpy, std::int16_t, nb::ndim<3>>(
+                    data, {n, static_cast<std::size_t>(rows.layers), static_cast<std::size_t>(rows.top_k)}, owner);
+                return nb::make_tuple(rows.start, array);
+            },
+            nb::arg("session"),
+            "A decode session's captured routing (session -1: the persistent decode state) as (start, rows) with\n"
+            "rows int16 [n, num_layers, top_k] for positions [start, start + n), or None when nothing was captured.\n"
+            "Read before release_decode_sessions / reset_decode_state.")
+        .def(
+            "last_routing_capture",
+            [](MultiGPUPyTrainer* trainer) -> nb::object {
+                RoutingCaptureRows rows;
+                {
+                    nb::gil_scoped_release release;
+                    rows = trainer->last_routing_capture();
+                }
+                if (rows.start < 0 || rows.batch <= 0 || rows.layers <= 0 || rows.top_k <= 0) return nb::none();
+                const std::size_t per_row = rows.rows.size() / rows.batch;
+                const std::size_t tokens = per_row / (static_cast<std::size_t>(rows.layers) * rows.top_k);
+                auto* data = new std::int16_t[rows.rows.size()];
+                std::copy(rows.rows.begin(), rows.rows.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<std::int16_t*>(p); });
+                return nb::cast(nb::ndarray<nb::numpy, std::int16_t, nb::ndim<4>>(
+                    data,
+                    {static_cast<std::size_t>(rows.batch), tokens, static_cast<std::size_t>(rows.layers),
+                     static_cast<std::size_t>(rows.top_k)},
+                    owner));
+            },
+            "The last next_token_logits forward's captured routing, int16 [B, T, num_layers, top_k], or None.")
         .def(
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {

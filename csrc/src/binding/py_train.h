@@ -53,6 +53,15 @@ class NCCLCommunicator;
 //! C++ implementation. For C++, each thread has its own DataLoader, providing `B*T` tokens each step. For python,
 //! we have only one interface-visible thread, which gets `nGPU*B*T` tokens per step, and splits them into `B*T`-sized
 //! chunks for each GPU.
+// Captured Rollout Routing Replay rows (see MultiGPUPyTrainer::decode_session_routing / last_routing_capture).
+struct RoutingCaptureRows {
+    int start = -1;  ///< first position covered; -1 when nothing was captured
+    int layers = 0;
+    int top_k = 0;
+    int batch = 0;  ///< last_routing_capture: number of rows (sequences)
+    std::vector<std::int16_t> rows;
+};
+
 class MultiGPUPyTrainer {
 public:
     //! Single-node constructor (original)
@@ -298,6 +307,14 @@ public:
     void clear_routing_replay();
     // Per GPU: {rows with an out-of-range expert id since the last set, forwards whose shape did not match}.
     std::vector<std::pair<long, long>> routing_replay_diagnostics();
+    // Colocate R3 capture: while enabled, serving forwards (decode sessions, persistent decode, next_token_logits)
+    // record each token's selected experts. Training forwards and replayed forwards are never captured.
+    void set_routing_capture(bool enabled);
+    // A decode session's (-1: the persistent decode state's) captured rows, token-major [n][num_layers][top_k],
+    // for positions [start, start + n). start == -1 when nothing was captured.
+    RoutingCaptureRows decode_session_routing(std::int64_t session);
+    // The last next_token_logits forward's rows, [batch][tokens][num_layers][top_k] (start 0).
+    RoutingCaptureRows last_routing_capture();
 
     // Compute per-token log-probabilities for a batch [B, T].
     // use_lora=true applies LoRA (policy model); use_lora=false skips LoRA (reference model).

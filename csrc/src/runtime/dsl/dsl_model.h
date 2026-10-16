@@ -8,6 +8,7 @@
 
 #include "kernels/candidate_objective.h"
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <cstdint>
@@ -404,6 +405,25 @@ public:
     std::vector<float> decode_logits(const std::int32_t* input_ids, int T, bool reset,
                                      int capacity, NCCLCommunicator& comm);
     void reset_decode_state();
+
+    /// Rollout Routing Replay capture for colocated serving. While on, every next_token_logits forward (decode
+    /// sessions, persistent decode and the full re-forward path - never a training forward, never with replay)
+    /// records the experts dispatch_moe_topk selected: decode sessions append them to their own log, the full
+    /// re-forward path keeps the last forward's rows. Numerics are unchanged. Safe to call from any thread.
+    void set_routing_capture(bool enabled) {
+        mRoutingCaptureWanted.store(enabled);
+    }
+    struct RoutingCaptureRows {
+        int start = -1;   ///< first position covered (-1: nothing captured)
+        int layers = 0;   ///< model blocks (all NumLayers; dense blocks stay -1)
+        int top_k = 0;
+        int batch = 0;    ///< last_routing_capture only: rows are [batch * tokens_per_row][layers][top_k]
+        std::vector<std::int16_t> rows;  ///< [n][layers][top_k]
+    };
+    /// Rows a decode session ran through the model (session < 0: the persistent decode state of decode_logits).
+    RoutingCaptureRows decode_session_routing(std::int64_t session) const;
+    /// Rows of the last full re-forward (next_token_logits without a decode state), positions from 0 per row.
+    RoutingCaptureRows last_routing_capture() const;
     std::vector<float> decode_batch_logits(const std::int64_t* sessions,
                                            const std::int32_t* ids,
                                            const std::int32_t* offsets,
@@ -711,6 +731,10 @@ private:
     // Adapter merge state (optional — stacked LoRA)
     std::string mAdapterPath;
     std::unique_ptr<GlmDecodeState> mGlmDecodeState;
+    std::atomic<bool> mRoutingCaptureWanted{false};
+    RoutingCaptureRows mLastRoutingCapture;
+    void record_routing_capture(const std::vector<std::int16_t>& captured, int B, int T, int layers, int top_k,
+                                GlmDecodeState* decode, const std::vector<GlmDecodeState*>& decode_states);
     std::shared_ptr<DecodePagePool> mDecodePagePool = std::make_shared<DecodePagePool>();
     std::unordered_map<std::int64_t, std::shared_ptr<GlmDecodeState>> mDecodeSessions;
     std::unordered_map<std::int64_t, std::pair<std::shared_ptr<GlmDecodeState>, std::uint64_t>> mDecodePrefixes;

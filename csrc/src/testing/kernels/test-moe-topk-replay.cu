@@ -219,3 +219,38 @@ TEST_CASE("moe_topk_backward routes gradient to exactly the replayed experts", "
             REQUIRE(dprobs[t * experts + e] == Catch::Approx(expected[e]).margin(1e-5));
     }
 }
+
+TEST_CASE("moe_topk_capture records the selection exactly and leaves it unchanged", "[moe][replay]") {
+    const int tokens = 53, experts = 256, top_k = 8;
+    std::mt19937 rng(23);
+    auto probs = random_probs(tokens, experts, rng);
+    Device<float> d_probs(probs);
+    Device<int> d_idx(std::vector<int>(tokens * top_k, 0));
+    Device<float> d_w(std::vector<float>(tokens * top_k, 0.0f));
+    moe_topk_forward(d_idx.ptr, d_w.ptr, d_probs.ptr, nullptr, tokens, experts, top_k, true, false, false, false, 0.0f, 0);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    auto idx0 = d_idx.read(tokens * top_k);
+    auto w0 = d_w.read(tokens * top_k);
+
+    // Capture into a larger -1 buffer: nothing past tokens * top_k is written.
+    Device<std::int16_t> d_rows(std::vector<std::int16_t>(tokens * top_k + 16, -1));
+    moe_topk_capture(d_rows.ptr, d_idx.ptr, static_cast<long>(tokens) * top_k, 0);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    auto rows = d_rows.read(tokens * top_k + 16);
+    for (int i = 0; i < tokens * top_k; ++i)
+        REQUIRE(rows[i] == static_cast<std::int16_t>(idx0[i]));
+    for (int i = tokens * top_k; i < tokens * top_k + 16; ++i)
+        REQUIRE(rows[i] == -1);
+    REQUIRE(d_idx.read(tokens * top_k) == idx0);
+    REQUIRE(d_w.read(tokens * top_k) == w0);
+
+    // The captured rows replay to the same selection and weights.
+    Device<int> d_bad(std::vector<int>(1, 0));
+    moe_topk_replay(d_idx.ptr, d_w.ptr, d_probs.ptr, d_rows.ptr, tokens, experts, top_k, true, false, false, d_bad.ptr, 0);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(d_idx.read(tokens * top_k) == idx0);
+    auto w1 = d_w.read(tokens * top_k);
+    for (int i = 0; i < tokens * top_k; ++i)
+        REQUIRE(w1[i] == Catch::Approx(w0[i]).epsilon(1e-6));
+    REQUIRE(d_bad.read(1)[0] == 0);
+}

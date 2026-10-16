@@ -760,6 +760,14 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
     };
     const auto inputs = cpu_tokens(input_ids), pos = cpu_tokens(positions.data());
     const bool decoding = decode || !decode_states.empty();
+    // Rollout Routing Replay capture (serving forwards only; never together with replay). MoE top-k is capture-unsafe
+    // (graph_executor.cpp), so like replay it always runs eagerly and never bakes the buffer into a CUDA graph.
+    const int capture_layers = mModelConfig.NumLayers;
+    const int capture_top_k = mModelConfig.NumExpertsPerTok;
+    const bool capture = mRoutingCaptureWanted.load() && capture_top_k > 0 && !rs.routing_replay().active;
+    if (capture) {
+        rs.reserve_routing_capture(static_cast<std::size_t>(capture_layers) * B * T * capture_top_k);
+    }
     if (decoding) {
         // Reuse the trainer's capacity without replacing buffers referenced by
         // its captured optimizer/backward graphs. LoRA forward derives active
@@ -807,7 +815,9 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
     }
 
     mLoRARunState->is_training = false;
+    std::vector<std::int16_t> captured;
     try {
+        if (capture) rs.begin_routing_capture(capture_layers, static_cast<long>(B) * T, capture_top_k, rs.MainStream);
         if (sampling) {
             mDecodeSampler.prepare(sampling, B, V, dtype, rs.MainStream);
             request.generation_logits_gpu = mDecodeSampler.logits();
@@ -819,14 +829,22 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
             mDecodeSampler.copy_results(samples, rs.MainStream);
         }
         CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        if (capture) {
+            captured.resize(static_cast<std::size_t>(capture_layers) * B * T * capture_top_k);
+            CUDA_CHECK(cudaMemcpy(captured.data(), rs.routing_capture().rows, captured.size() * sizeof(std::int16_t),
+                                  cudaMemcpyDeviceToHost));
+            rs.end_routing_capture();
+        }
     } catch (...) {
         cudaStreamSynchronize(rs.MainStream);
+        rs.end_routing_capture();
         if (masked) mExecutor->clear_doc_masking();
         mLoRARunState->is_training = was_training;
         throw;
     }
     if (masked) mExecutor->clear_doc_masking();
     mLoRARunState->is_training = was_training;
+    if (capture) record_routing_capture(captured, B, T, capture_layers, capture_top_k, decode, decode_states);
     if (sampling) return {};
     std::vector<float> result(static_cast<std::size_t>(B) * V);
     if (dtype == ETensorDType::FP32) {
@@ -840,6 +858,58 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
         }
     }
     return result;
+}
+
+void DslModel::record_routing_capture(const std::vector<std::int16_t>& captured, int B, int T, int layers,
+                                      int top_k, GlmDecodeState* decode,
+                                      const std::vector<GlmDecodeState*>& decode_states) {
+    // captured is [layer][row * T + t][k]; logs are token-major [position][layer][k].
+    const std::size_t row_stride = static_cast<std::size_t>(B) * T * top_k;
+    auto append = [&](std::vector<std::int16_t>& out, int row) {
+        const std::size_t base = out.size();
+        out.resize(base + static_cast<std::size_t>(T) * layers * top_k);
+        for (int t = 0; t < T; ++t)
+            for (int l = 0; l < layers; ++l)
+                std::copy_n(captured.data() + l * row_stride + (static_cast<std::size_t>(row) * T + t) * top_k, top_k,
+                            out.data() + base + (static_cast<std::size_t>(t) * layers + l) * top_k);
+    };
+    const bool decoding = decode || !decode_states.empty();
+    if (!decoding) {
+        mLastRoutingCapture = RoutingCaptureRows{0, layers, top_k, B, {}};
+        for (int row = 0; row < B; ++row) append(mLastRoutingCapture.rows, row);
+        return;
+    }
+    for (int row = 0; row < B; ++row) {
+        GlmDecodeState* state = decode ? decode : decode_states.at(row);
+        const long logged = state->routing_layers ? static_cast<long>(state->routing.size()) /
+                                                        (static_cast<long>(state->routing_layers) * state->routing_top_k)
+                                                  : 0;
+        // Start (or restart) the log where this forward begins when it is not contiguous with what is logged
+        // (first capture, capture switched on mid-session, or a state restored from a cached prefix).
+        if (state->routing_start < 0 || state->routing_layers != layers || state->routing_top_k != top_k ||
+            state->routing_start + logged != state->length) {
+            state->routing.clear();
+            state->routing_start = state->length;
+            state->routing_layers = layers;
+            state->routing_top_k = top_k;
+        }
+        append(state->routing, row);
+    }
+}
+
+DslModel::RoutingCaptureRows DslModel::decode_session_routing(std::int64_t session) const {
+    const GlmDecodeState* state = nullptr;
+    if (session < 0) {
+        state = mGlmDecodeState.get();
+    } else if (const auto it = mDecodeSessions.find(session); it != mDecodeSessions.end()) {
+        state = it->second.get();
+    }
+    if (!state || state->routing_start < 0) return {};
+    return RoutingCaptureRows{state->routing_start, state->routing_layers, state->routing_top_k, 1, state->routing};
+}
+
+DslModel::RoutingCaptureRows DslModel::last_routing_capture() const {
+    return mLastRoutingCapture;
 }
 
 void DslModel::set_decode_cache_budget(std::int64_t bytes) {

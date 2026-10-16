@@ -469,7 +469,68 @@ public:
         return mRoutingReplay;
     }
 
+    /// Rollout Routing Replay capture: while active (serving/decode forwards only - DslModel::next_token_logits
+    /// begins and ends it), dispatch_moe_topk copies each layer's selected experts into rows [layer][token][k]
+    /// (int16, -1 where nothing was written). Never active together with replay. Owns its device buffer.
+    struct RoutingCaptureState {
+        std::int16_t* rows = nullptr;
+        std::size_t capacity = 0;
+        int num_layers = 0;
+        long num_tokens = 0;
+        int top_k = 0;
+        bool active = false;
+        RoutingCaptureState() = default;
+        RoutingCaptureState(const RoutingCaptureState&) = delete;
+        RoutingCaptureState& operator=(const RoutingCaptureState&) = delete;
+        ~RoutingCaptureState() {
+            if (rows) cudaFree(rows);
+        }
+    };
+    /// Makes the capture buffer hold at least `elements` int16 entries (grows only).
+    void reserve_routing_capture(std::size_t elements) {
+        if (mRoutingCapture.rows && elements <= mRoutingCapture.capacity) return;
+        if (mRoutingCapture.rows) {
+            cudaFree(mRoutingCapture.rows);  // synchronizes the device
+            mRoutingCapture.rows = nullptr;
+            mRoutingCapture.capacity = 0;
+        }
+        if (cudaMalloc(&mRoutingCapture.rows, elements * sizeof(std::int16_t)) != cudaSuccess) {
+            mRoutingCapture.rows = nullptr;
+            throw std::runtime_error("reserve_routing_capture: device allocation failed");
+        }
+        mRoutingCapture.capacity = elements;
+    }
+    void begin_routing_capture(int num_layers, long num_tokens, int top_k, cudaStream_t stream) {
+        const std::size_t n = static_cast<std::size_t>(num_layers) * static_cast<std::size_t>(num_tokens) *
+                              static_cast<std::size_t>(top_k);
+        if (!mRoutingCapture.rows || n > mRoutingCapture.capacity) {
+            throw std::runtime_error("begin_routing_capture: forward larger than the capture buffer");
+        }
+        if (cudaMemsetAsync(mRoutingCapture.rows, 0xFF, n * sizeof(std::int16_t), stream) != cudaSuccess) {  // -1
+            throw std::runtime_error("begin_routing_capture: clearing the capture buffer failed");
+        }
+        mRoutingCapture.num_layers = num_layers;
+        mRoutingCapture.num_tokens = num_tokens;
+        mRoutingCapture.top_k = top_k;
+        mRoutingCapture.active = true;
+    }
+    void end_routing_capture() noexcept {
+        mRoutingCapture.active = false;
+    }
+    /// Capture slice for `layer_idx` covering this forward's `num_tokens` tokens, or nullptr when capture is off,
+    /// replay is on, the layer is out of range (e.g. an MTP block), or the forward's shape is not the captured one.
+    [[nodiscard]] std::int16_t* routing_capture_rows(int layer_idx, long num_tokens, int top_k) noexcept {
+        const auto& c = mRoutingCapture;
+        if (!c.active || mRoutingReplay.active || layer_idx < 0 || layer_idx >= c.num_layers) return nullptr;
+        if (top_k != c.top_k || num_tokens != c.num_tokens) return nullptr;
+        return c.rows + static_cast<long>(layer_idx) * c.num_tokens * c.top_k;
+    }
+    [[nodiscard]] const RoutingCaptureState& routing_capture() const noexcept {
+        return mRoutingCapture;
+    }
+
 private:
+    RoutingCaptureState mRoutingCapture;
     CompiledExecutor* mActiveExecutor = nullptr;  // unowned back-ref
     RoutingReplayState mRoutingReplay;
 

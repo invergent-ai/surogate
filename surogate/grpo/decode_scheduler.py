@@ -76,14 +76,15 @@ class DecodeScheduler:
             self.condition.notify()
         return future.result()
 
-    def release(self, session, *, cache=False):
+    def release(self, session, *, cache=False, routing=False):
+        """Free a session. With routing=True, returns its captured expert routing (start, rows) or None."""
         future = Future()
         with self.condition:
             if self.closed:
-                return
-            self.releases.append((session, future, cache))
+                return None
+            self.releases.append((session, future, cache, routing))
             self.condition.notify()
-        future.result()
+        return future.result()
 
     def close(self):
         with self.condition:
@@ -330,9 +331,12 @@ class DecodeScheduler:
                     batch = self._take_batch()
             if releases or stopping:
                 try:
-                    ids = list(self.lengths) if stopping else [session for session, _, _ in releases]
+                    ids = list(self.lengths) if stopping else [session for session, *_ in releases]
+                    routed = {}
                     if not stopping:
-                        for session, _, cache in releases:
+                        for session, _, cache, routing in releases:
+                            if routing:
+                                routed[session] = self.trainer.decode_session_routing(session)
                             if cache and session in self.histories:
                                 self._cache_prefix(session, bytes(self.histories[session]), completed=True)
                     self.trainer.release_decode_sessions(ids)
@@ -344,8 +348,8 @@ class DecodeScheduler:
                         self.trainer.release_decode_prefixes(list(self.prefixes.values()))
                         self.prefixes.clear()
                         self.completed_prefixes.clear()
-                    for _, future, _ in releases:
-                        future.set_result(None)
+                    for session, future, *_ in releases:
+                        future.set_result(routed.get(session))
                 except Exception as exc:
                     # Release remains mandatory if optional caching failed.
                     try:
@@ -357,7 +361,7 @@ class DecodeScheduler:
                             self.lengths.pop(session, None)
                             self.histories.pop(session, None)
                             self.decoding.discard(session)
-                    for _, future, _ in releases:
+                    for _, future, *_ in releases:
                         future.set_exception(exc)
             if stopping:
                 return

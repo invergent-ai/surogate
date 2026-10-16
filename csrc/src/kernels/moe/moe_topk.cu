@@ -662,6 +662,19 @@ void moe_topk_replay(int* expert_indices,
                            normalize_weights, softmax_weights, full_softmax_weights, bad_rows, stream);
 }
 
+// Rollout Routing Replay capture: the selected expert ids as int16 (the replay rows' dtype). Reads only.
+__global__ void moe_topk_capture_kernel(std::int16_t* __restrict__ out, const int* __restrict__ expert_indices, long n) {
+    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = static_cast<std::int16_t>(expert_indices[i]);
+}
+
+void moe_topk_capture(std::int16_t* out, const int* expert_indices, long n, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int block_size = 256;
+    const long grid_size = (n + block_size - 1) / block_size;
+    moe_topk_capture_kernel<<<static_cast<unsigned>(grid_size), block_size, 0, stream>>>(out, expert_indices, n);
+}
+
 void moe_topk_backward(float* d_probs,
                        const float* d_routing_weights,
                        const float* probs,

@@ -3,9 +3,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "utilities/allocator.h"
 #include "runtime/executor/paged_decode_cache.h"
 
@@ -36,6 +38,14 @@ struct GlmDecodeState {
     int length = 0;
     int capacity = 0;
     int limit = 0;
+    // Rollout Routing Replay capture (only while DslModel routing capture is on): host int16 rows
+    // [n][routing_layers][routing_top_k] for positions [routing_start, routing_start + n) - every token this
+    // session ran through the model. A state forked from a cached prefix starts empty (fork() does not copy it),
+    // so the prefix positions are simply not covered.
+    std::vector<std::int16_t> routing;
+    int routing_start = -1;
+    int routing_layers = 0;
+    int routing_top_k = 0;
     TensorAllocator allocator;
     std::unordered_map<std::string, Tensor> buffers;
     std::shared_ptr<DecodePagePool> page_pool = std::make_shared<DecodePagePool>();

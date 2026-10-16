@@ -7,6 +7,7 @@ Weights and adapters belong to the trainer throughout generation.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import threading
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 from surogate.grpo.decode_scheduler import DecodeCapacityError, DecodeScheduler
+from surogate.grpo.routing_replay import moe_layer_ids
 from surogate.grpo.tool_protocol import request_tools, select_protocol
 
 
@@ -83,6 +85,8 @@ class SharedModelServer:
         if self.persistent_decode and not hasattr(trainer, "decode_logits"):
             raise ValueError("GLM persistent decode requires the current native training extension")
         self.vocab = text["vocab_size"]
+        self.moe_layers = moe_layer_ids(text, lambda c, name: c[name])
+        self.routing_capture = False
         eos = settings.get("eos_token_id", text.get("eos_token_id", config.get("eos_token_id", tokenizer.eos_token_id)))
         self.eos = set(eos if isinstance(eos, list) else [eos]) - {None}
         self.scheduler = None
@@ -311,6 +315,14 @@ class SharedModelServer:
                            minimum=minimum, stop=stop, parsed_tools=tools, protocol=protocol, prompt_tail=tail)
 
     def generate(self, request, callback=None):
+        # Rollout Routing Replay: return the experts each token selected (non-streaming responses only).
+        routed = bool(request.get("return_routed_experts")) and callback is None
+        if routed and not self.routing_capture:
+            if not hasattr(self.trainer, "set_routing_capture"):
+                raise ValueError("return_routed_experts requires the current native training extension")
+            # Stays on for the server's lifetime: one small device copy per MoE layer and forward.
+            self.trainer.set_routing_capture(True)
+            self.routing_capture = True
         if self.scheduler:
             session = self.scheduler.new_session()
             completed = False
@@ -318,17 +330,39 @@ class SharedModelServer:
                 result = self._generate(request, callback,
                     lambda tokens, reset, sampling=None: self.scheduler.step(session, tokens, reset, sampling))
                 completed = True
-                return result
             finally:
-                self.scheduler.release(session, cache=completed)
+                routing = self.scheduler.release(session, cache=completed, routing=routed and completed)
+            return self._attach_routing(result, routing) if routed else result
         # One workspace serves all admitted requests; begin_training waits for
         # both the running request and admitted requests waiting on this lock.
         with self.compute_lock:
+            routing = None
             try:
-                return self._generate(request, callback)
+                result = self._generate(request, callback)
+                if routed and self.persistent_decode:
+                    routing = self.trainer.decode_session_routing(-1)
+                elif routed:
+                    # Full re-forwards: the last one covered the prompt and every completion token but the final.
+                    rows = self.trainer.last_routing_capture()
+                    if rows is not None:
+                        routing = 0, rows[0, :len(request["prompt_ids"]) + len(result["choices"][0]["token_ids"]) - 1]
             finally:
                 if self.persistent_decode:
                     self.trainer.reset_decode_state()
+            return self._attach_routing(result, routing) if routed else result
+
+    def _attach_routing(self, result, routing):
+        """Add the verifiers/vLLM payload: rows for positions [start, start + n) of prompt + completion."""
+        if routing is None:
+            return result
+        start, rows = routing
+        if self.moe_layers and len(self.moe_layers) < rows.shape[1] and max(self.moe_layers) < rows.shape[1]:
+            rows = rows[:, self.moe_layers]
+        rows = np.ascontiguousarray(rows, dtype="<i2")
+        # The vLLM / verifiers layout, "data" first.
+        result["choices"][0]["routed_experts"] = dict(data=base64.b64encode(rows.tobytes()).decode("ascii"),
+                                                      shape=list(rows.shape), start=int(start), dtype="int16")
+        return result
 
     def _generate(self, request, callback, decode=None):
         prompt = request["prompt_ids"]

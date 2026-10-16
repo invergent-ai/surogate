@@ -3645,6 +3645,42 @@ std::vector<bool> MultiGPUPyTrainer::admit_decode_sessions(const std::int64_t* s
     return result;
 }
 
+void MultiGPUPyTrainer::set_routing_capture(bool enabled) {
+    // An atomic flag read at the start of each serving forward: safe to set from any thread, without run_work
+    // (the rollout server's decode thread may be inside run_work).
+    for (auto& ctx : mContexts) {
+        if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) model->set_routing_capture(enabled);
+    }
+}
+
+namespace {
+RoutingCaptureRows to_capture_rows(dsl::DslModel::RoutingCaptureRows&& rows) {
+    return RoutingCaptureRows{rows.start, rows.layers, rows.top_k, rows.batch, std::move(rows.rows)};
+}
+}  // namespace
+
+RoutingCaptureRows MultiGPUPyTrainer::decode_session_routing(std::int64_t session) {
+    RoutingCaptureRows result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get()))
+                result = to_capture_rows(model->decode_session_routing(session));
+        },
+        0);
+    return result;
+}
+
+RoutingCaptureRows MultiGPUPyTrainer::last_routing_capture() {
+    RoutingCaptureRows result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get()))
+                result = to_capture_rows(model->last_routing_capture());
+        },
+        0);
+    return result;
+}
+
 void MultiGPUPyTrainer::release_decode_sessions(const std::vector<std::int64_t>& sessions) {
     run_work(
         [&](sThreadContext& ctx) {

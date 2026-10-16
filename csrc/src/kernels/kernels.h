@@ -3557,6 +3557,9 @@ void moe_topk_replay(int* expert_indices,
                      int* bad_rows,
                      cudaStream_t stream);
 
+/// @brief Rollout Routing Replay capture: write @p n selected expert ids (int32) as int16 into @p out.
+void moe_topk_capture(std::int16_t* out, const int* expert_indices, long n, cudaStream_t stream);
+
 /// @brief Backward through top-k selection (with optional post-selection normalization).
 /// Given gradients wrt the selected weights (num_tokens, top_k), scatter them back to a dense
 /// gradient wrt the full probability matrix (num_tokens, num_experts).

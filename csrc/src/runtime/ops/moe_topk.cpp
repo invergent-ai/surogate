@@ -128,6 +128,12 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
         }
     }
 
+    // Rollout Routing Replay capture (serving/decode forwards only, never with replay): record the experts this
+    // forward selected. Reads the indices; the forward's numerics are unchanged.
+    if (std::int16_t* capture = mRunState.routing_capture_rows(layer_idx_any, num_tokens, top_k)) {
+        moe_topk_capture(capture, indices.get<int>(), static_cast<long>(num_tokens) * top_k, mRunState.MainStream);
+    }
+
     // Apply routed_scaling_factor to weights after top-k selection + normalization
     if (scaling_factor != 1.0f) {
         const int n = num_tokens * top_k;
