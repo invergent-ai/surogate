@@ -647,18 +647,41 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
         return false;
     }
 
-    std::uint32_t reclaimable_text    = 0;
-    std::uint32_t reclaimable_backend = 0;
-    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
-        if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
-        reclaimable_text += sequences[other].kv->text.owned_entitlement();
-        if (sequences[other].kv->backend) {
-            reclaimable_backend += sequences[other].kv->backend->owned_entitlement();
+    // Evicting the other retained lanes drops the shared prefixes too, so what comes back is
+    // every entitled page except those of the allocations a holder that stays still reaches:
+    // a lane that is not retained (this one included) or a GPU prefix image, directly or
+    // through the prefixes it borrows from. Adding up the retained lanes' own pages and the
+    // shared-prefix table missed the pages a retained lane borrows from a shared prefix the
+    // table had already let go (4 slots): with agentic traffic, where each turn's prompt
+    // extends the last one, that is most of what retained lanes hold, and an idle replica
+    // refused a long request although evicting would have made room (2026-10-17, 429
+    // "insufficient KV capacity while GPU prefixes are retained"). A pending plan that still
+    // borrows a dropped prefix keeps its pages; the executor re-plans and retries.
+    const auto kept_pages = [&](bool backend_pool) {
+        std::unordered_set<const PagedKVAllocation*> kept;
+        const auto keep = [&](const SequenceKVBundle* kv) {
+            if (kv == nullptr || (backend_pool && !kv->backend)) { return; }
+            const PagedKVAllocation* allocation = backend_pool ? &*kv->backend : &kv->text;
+            for (; allocation != nullptr && kept.insert(allocation).second;
+                 allocation = allocation->prefix()) {}
+        };
+        for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+            if ((other == lane || !sequences[other].retained) && sequences[other].kv) {
+                keep(&*sequences[other].kv);
+            }
         }
-    }
-    // Evicting a retained lane drops the shared prefixes too. Their pages come back once no
-    // running request borrows them; if one does, the executor re-plans and retries.
-    reclaimable_text += shared_prefix_pages();
+        for (const auto& entry : gpu_prefixes) {
+            if (entry.second) { keep(entry.second->pages.get()); }
+        }
+        std::uint32_t pages = 0;
+        for (const PagedKVAllocation* allocation : kept) { pages += allocation->owned_entitlement(); }
+        return pages;
+    };
+    const auto reclaimable = [&](const PagedKVPool& pool, bool backend_pool) {
+        const std::uint32_t kept = kept_pages(backend_pool);
+        return kept < pool.entitled_pages() ? pool.entitled_pages() - kept : 0U;
+    };
+    const std::uint32_t reclaimable_text = reclaimable(decoder->text_kv.pool(), false);
 
     // The retained lanes' entitlements go back before the new one is taken: the pool's test
     // with them folded into the pages being replaced (device gate included).
@@ -682,7 +705,7 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     if (backend == nullptr) { return plan.summary().admission.backend_kv_pages == 0; }
     const std::uint32_t old_backend =
         sequence.kv && sequence.kv->backend ? sequence.kv->backend->owned_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, reclaimable_backend,
+    return can_replace(backend->pool(), old_backend, reclaimable(backend->pool(), true),
                        plan.summary().admission.backend_kv_pages);
 }
 
