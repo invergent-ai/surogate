@@ -142,6 +142,8 @@ private:
     GenerationService* service_ = nullptr;
     /// The primary model's engines: the primary itself first, then its data-parallel replicas.
     std::vector<GenerationService*> replicas_;
+    /// Each replica's KV capacity in pages (its MemorySummary at attach), for the router's KV share.
+    std::vector<std::uint32_t> replica_kv_pages_;
     /// Spreads the primary's requests over `replicas_`; null with a single engine.
     std::unique_ptr<ReplicaRouter> router_;
     /// The routing reservation of the request this worker thread is handling; wake_gate() hands
@@ -170,12 +172,12 @@ private:
     /// Routes `model`: an extra's id, the primary id, or a primary adapter
     /// (writes `lora_adapter`). Throws ApiException 404 otherwise. A request for the primary
     /// goes to one of its replicas: the one `X-data-parallel-rank` names, else the router's
-    /// choice for a prompt with these `prefixes` (conversation_prefix_hashes).
+    /// choice for a prompt with this routing `key` (conversation_routing_key).
     GenerationService& route_model(const std::string& model, std::string* lora_adapter,
                                    const httplib::Request* http = nullptr,
-                                   const std::vector<std::uint64_t>& prefixes = {});
+                                   const RoutingKey& key = {});
     /// One of the primary's replicas for a request (see route_model).
-    GenerationService& route_primary(const httplib::Request* http, const std::vector<std::uint64_t>& prefixes);
+    GenerationService& route_primary(const httplib::Request* http, const RoutingKey& key);
     /// The service a management endpoint (?model=) addresses; primary default.
     GenerationService& routed_management_service(const httplib::Request& req);
     /// Every engine a management endpoint (?model=) addresses: all the primary's replicas for

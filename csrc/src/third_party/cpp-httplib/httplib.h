@@ -138,7 +138,9 @@
 #endif
 
 #ifndef CPPHTTPLIB_LISTEN_BACKLOG
-#define CPPHTTPLIB_LISTEN_BACKLOG 5
+// surogate: upstream's 5 overflows the accept queue on a burst of new connections (our serve
+// closes each connection after one request); the kernel caps it at net.core.somaxconn.
+#define CPPHTTPLIB_LISTEN_BACKLOG 4096
 #endif
 
 /*

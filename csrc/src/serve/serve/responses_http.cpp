@@ -139,7 +139,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             }
         }
         if (t_routed_service == nullptr) {
-            t_routed_service = &route_primary(&req, conversation_prefix_hashes(request.generation));
+            t_routed_service = &route_primary(&req, conversation_routing_key(request.generation));
         }
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
@@ -302,7 +302,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
             }
         }
         if (t_routed_service == nullptr) {
-            t_routed_service = &route_primary(&req, conversation_prefix_hashes(request.generation));
+            t_routed_service = &route_primary(&req, conversation_routing_key(request.generation));
         }
         const int tokens =
             svc().count_prompt_tokens(request.generation, request_cancelled(req), wake_gate());

@@ -17,25 +17,35 @@ using sinfer::serve::ContentKind;
 using sinfer::serve::ContentPart;
 using sinfer::serve::GenerationRequest;
 using sinfer::serve::ReplicaRouter;
+using sinfer::serve::RoutingKey;
 using sinfer::serve::conversation_prefix_hashes;
+using sinfer::serve::conversation_routing_key;
 
 namespace {
 
-/// Admitted requests per replica, as GenerationService::active_requests would report them.
+/// Admitted requests per replica, as GenerationService::active_requests would report them, and
+/// the share of each replica's KV cache in use.
 struct Fleet {
     std::vector<std::size_t> active;
     std::vector<bool> up;
-    explicit Fleet(std::size_t replicas) : active(replicas, 0), up(replicas, true) {}
+    std::vector<double> kv;
+    explicit Fleet(std::size_t replicas) : active(replicas, 0), up(replicas, true), kv(replicas, 0.0) {}
     ReplicaRouter router(ReplicaRouter::Options options = {}) {
         return ReplicaRouter(
             active.size(), [this](std::size_t i) { return active[i]; },
-            [this](std::size_t i) { return static_cast<bool>(up[i]); }, options);
+            [this](std::size_t i) { return static_cast<bool>(up[i]); },
+            [this](std::size_t i) { return kv[i]; }, options);
     }
 };
 
 /// Routes and admits: the reservation is dropped once the replica counts the request itself.
 std::size_t admit(ReplicaRouter& router, Fleet& fleet, const std::vector<std::uint64_t>& prefixes) {
     auto route = router.pick(prefixes);
+    ++fleet.active[route.replica];
+    return route.replica;
+}
+std::size_t admit(ReplicaRouter& router, Fleet& fleet, const RoutingKey& key) {
+    auto route = router.pick(key);
     ++fleet.active[route.replica];
     return route.replica;
 }
@@ -84,13 +94,19 @@ void conversation_hashes_share_their_common_prefix() {
     tokens.prompt_token_ids.assign(2500, 7);
     assert(conversation_prefix_hashes(tokens).size() == 2);
     assert(conversation_prefix_hashes(GenerationRequest{}).empty());
+
+    // The routing key carries the same hashes and the prompt bytes up to each boundary.
+    const RoutingKey key = conversation_routing_key(conversation({"task A", "call tool", "result"}));
+    assert(key.prefixes == second && key.bytes.size() == key.prefixes.size());
+    for (std::size_t i = 1; i < key.bytes.size(); ++i) { assert(key.bytes[i] > key.bytes[i - 1]); }
+    assert(conversation_routing_key(raw).bytes.back() == 12288);  // three 4 KiB chunks
 }
 
 void requests_without_history_spread_evenly() {
     Fleet fleet(4);
     auto router = fleet.router();
     std::vector<std::size_t> per_replica(4, 0);
-    for (int i = 0; i < 40; ++i) { ++per_replica[admit(router, fleet, {})]; }
+    for (int i = 0; i < 40; ++i) { ++per_replica[admit(router, fleet, std::vector<std::uint64_t>{})]; }
     for (const std::size_t count : per_replica) { assert(count == 10); }
 }
 
@@ -101,7 +117,7 @@ void a_burst_spreads_before_anything_is_admitted() {
     std::vector<ReplicaRouter::Route> held;
     std::set<std::size_t> used;
     for (int i = 0; i < 3; ++i) {
-        held.push_back(router.pick({}));
+        held.push_back(router.pick(std::vector<std::uint64_t>{}));
         used.insert(held.back().replica);
     }
     assert(used.size() == 3);
@@ -132,17 +148,60 @@ void a_conversation_stays_on_its_replica() {
     }
 }
 
-void a_shared_system_prompt_attracts_within_the_bound() {
-    // Every task starts with the same system prompt, which the replicas that served one hold in
-    // cache: a new task goes to one of them while that keeps it within 1.25x the mean load...
+void a_shared_system_prompt_does_not_gather_tasks() {
+    // Every task starts with the same system prompt, which every replica that served one holds in
+    // cache. That head is no reason to send a NEW task there: tasks spread as if it were not
+    // cached (it used to draw each one onto a replica hosting another, up to 1.25x the mean).
     Fleet fleet(4);
     auto router = fleet.router();
     std::vector<std::size_t> per_replica(4, 0);
     for (int task = 0; task < 40; ++task) {
-        ++per_replica[admit(router, fleet, conversation_prefix_hashes(conversation({"task " + std::to_string(task)})))];
+        ++per_replica[admit(router, fleet, conversation_routing_key(conversation({"task " + std::to_string(task)})))];
     }
-    // ...so the load stays bounded: 40 tasks over 4 replicas, none above ceil(1.25 x 10).
-    for (const std::size_t count : per_replica) { assert(count <= 13); }
+    for (const std::size_t count : per_replica) { assert(count == 10); }
+}
+
+void a_second_task_is_not_drawn_to_the_first() {
+    // The first task of an agent is idle between tool calls, its replica's cache holding it. The
+    // second, the same system prompt but another task, goes where the cache is free -- before any
+    // third conversation has shown that the system prompt is a shared head.
+    Fleet fleet(2);
+    auto router = fleet.router();
+    const std::size_t first = admit(router, fleet, conversation_routing_key(conversation({"task A"})));
+    --fleet.active[first];   // its turn finished; the agent runs a tool
+    fleet.kv[first] = 0.5;   // ...and its 230k tokens stay cached
+    const std::size_t second = admit(router, fleet, conversation_routing_key(conversation({"task B"})));
+    assert(second != first);
+    // The first task's next turn still goes home: its own prefix is there.
+    --fleet.active[second];
+    assert(admit(router, fleet, conversation_routing_key(conversation({"task A", "reply", "result"}))) == first);
+}
+
+void a_new_task_avoids_a_full_cache() {
+    // Load alone said replica 0 was free; its cache is 90% held by idle conversations a new one
+    // would evict. Two requests running elsewhere cost less than that.
+    Fleet fleet(3);
+    auto router = fleet.router();
+    fleet.active = {0, 2, 2};
+    fleet.kv     = {0.9, 0.0, 0.1};
+    assert(admit(router, fleet, conversation_routing_key(conversation({"new task"}))) == 1);
+}
+
+void a_long_conversation_stays_on_a_busy_replica() {
+    // 70 KB of prompt in its replica's cache: a re-read elsewhere costs more than the imbalance,
+    // so it stays where the bounded-loads rule would have moved it (6 + 1 > ceil(1.25 x 7/4)).
+    Fleet fleet(4);
+    auto router = fleet.router({.replica_capacity = 8});
+    const std::string task(70000, 't');
+    const std::size_t home = admit(router, fleet, conversation_routing_key(conversation({task})));
+    fleet.active.assign(4, 0);
+    fleet.active[home] = 6;
+    assert(admit(router, fleet, conversation_routing_key(conversation({task, "reply", "result"}))) == home);
+    // ...until its replica is full: then it goes, and to the replica with room.
+    fleet.active[home] = 8;
+    const std::size_t moved =
+        admit(router, fleet, conversation_routing_key(conversation({task, "reply", "result", "reply 2", "result 2"})));
+    assert(moved != home);
 }
 
 void an_overloaded_replica_gives_up_the_conversation() {
@@ -211,7 +270,10 @@ int main() {
     requests_without_history_spread_evenly();
     a_burst_spreads_before_anything_is_admitted();
     a_conversation_stays_on_its_replica();
-    a_shared_system_prompt_attracts_within_the_bound();
+    a_shared_system_prompt_does_not_gather_tasks();
+    a_second_task_is_not_drawn_to_the_first();
+    a_new_task_avoids_a_full_cache();
+    a_long_conversation_stays_on_a_busy_replica();
     an_overloaded_replica_gives_up_the_conversation();
     unavailable_replicas_are_skipped();
     a_pinned_request_goes_where_it_was_told();

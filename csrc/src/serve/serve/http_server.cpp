@@ -35,6 +35,14 @@
 #include <cstdlib>
 #include <sstream>
 
+// The listen backlog. cpp-httplib's own default is 5, and this server closes every connection
+// after one request (set_keep_alive_max_count below), so each call is a fresh connect: agent
+// harnesses and rollout clients opening dozens at once overflowed the accept queue
+// (TcpExtListenOverflows 198 on an 8x RTX 5090 box, 2026-10-17) and their connections were
+// dropped or reset with nothing in this server's log. The vendored header raises it; a vendor
+// update that loses that change must not build.
+static_assert(CPPHTTPLIB_LISTEN_BACKLOG >= 1024, "restore the vendored httplib.h listen backlog");
+
 namespace sinfer::serve {
 namespace {
 
@@ -1056,7 +1064,7 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
                 ? parse_chat_completion_request(completed, limits)
                 : parse_completion_request(completed, limits);
         t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
-                                        conversation_prefix_hashes(request));
+                                        conversation_routing_key(request));
         const std::vector<sinfer::TokenId> ids =
             svc().tokenize(request, request_cancelled(req), wake_gate());
         nlohmann::json out{{"count", ids.size()},
@@ -1098,7 +1106,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         request.client_request_id = request_id_of(req);
         // `model` selects a served model or one of the primary's adapters.
         t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
-                                        conversation_prefix_hashes(request));
+                                        conversation_routing_key(request));
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -1377,7 +1385,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
         request                   = parse_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
         t_routed_service          = &route_model(request.model, &request.lora_adapter, &req,
-                                                 conversation_prefix_hashes(request));
+                                                 conversation_routing_key(request));
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -1687,7 +1695,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         const auto extra = extra_services_.find(request.model);
         t_routed_service = extra != extra_services_.end()
                                ? extra->second
-                               : &route_primary(&req, conversation_prefix_hashes(request));
+                               : &route_primary(&req, conversation_routing_key(request));
         const int input_tokens          = svc().count_prompt_tokens(
             request, request_cancelled(req), wake_gate());
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
@@ -1729,7 +1737,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         const auto extra = extra_services_.find(request.model);
         t_routed_service = extra != extra_services_.end()
                                ? extra->second
-                               : &route_primary(&req, conversation_prefix_hashes(request));
+                               : &route_primary(&req, conversation_routing_key(request));
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -1965,12 +1973,25 @@ void HttpServer::attach_replica(GenerationService& service) {
     }
     attached_memory_.emplace(&service, service.memory_summary());
     replicas_.push_back(&service);
+    replica_kv_pages_.clear();
+    for (const GenerationService* replica : replicas_) {
+        replica_kv_pages_.push_back(attached_memory_.at(replica).kv_capacity_page_groups);
+    }
     router_ = std::make_unique<ReplicaRouter>(
         replicas_.size(),
         [this](std::size_t replica) { return replicas_[replica]->active_requests(); },
         [this](std::size_t replica) {
             return replicas_[replica]->healthy() && !replicas_[replica]->is_sleeping();
-        });
+        },
+        // KV in use, idle conversations' retained prefixes included: what a new one would evict.
+        // The published snapshot, never the engine itself, which would queue behind a round.
+        [this](std::size_t replica) {
+            const std::uint32_t capacity = replica_kv_pages_[replica];
+            if (capacity == 0) { return 0.0; }
+            return static_cast<double>(replicas_[replica]->runtime_stats().kv_pages_in_use) /
+                   static_cast<double>(capacity);
+        },
+        ReplicaRouter::Options{.replica_capacity = options_.max_concurrency});
 }
 
 bool HttpServer::is_primary_replica(const GenerationService* service) const {
@@ -1978,7 +1999,7 @@ bool HttpServer::is_primary_replica(const GenerationService* service) const {
 }
 
 GenerationService& HttpServer::route_primary(const httplib::Request* http,
-                                             const std::vector<std::uint64_t>& prefixes) {
+                                             const RoutingKey& key) {
     if (router_ == nullptr) { return *service_; }
     // vLLM's data-parallel pin: a client that keeps its own affinity (one rank per rollout)
     // names the replica outright.
@@ -1986,7 +2007,7 @@ GenerationService& HttpServer::route_primary(const httplib::Request* http,
         http != nullptr ? http->get_header_value("X-data-parallel-rank") : std::string();
     ReplicaRouter::Route route;
     if (rank.empty()) {
-        route = router_->pick(prefixes);
+        route = router_->pick(key);
     } else {
         std::size_t replica = 0;
         const auto [end, error] = std::from_chars(rank.data(), rank.data() + rank.size(), replica);
@@ -1999,7 +2020,7 @@ GenerationService& HttpServer::route_primary(const httplib::Request* http,
                                 std::to_string(replicas_.size()) + ", got '" + rank + "'";
             throw ApiException(std::move(api_error));
         }
-        route = router_->pin(replica, prefixes);
+        route = router_->pin(replica, key);
     }
     t_route_reservation = std::move(route.reservation);
     return *replicas_[route.replica];
@@ -2039,8 +2060,8 @@ GenerationService& HttpServer::routed_management_service(const httplib::Request&
 
 GenerationService& HttpServer::route_model(const std::string& model, std::string* lora_adapter,
                                           const httplib::Request* http,
-                                          const std::vector<std::uint64_t>& prefixes) {
-    if (model == public_model_id_) { return route_primary(http, prefixes); }
+                                          const RoutingKey& key) {
+    if (model == public_model_id_) { return route_primary(http, key); }
     const auto extra = extra_services_.find(model);
     if (extra != extra_services_.end()) { return *extra->second; }
     // Adapter names share one flat namespace across every service (uniqueness
@@ -2048,7 +2069,7 @@ GenerationService& HttpServer::route_model(const std::string& model, std::string
     // only owner. The primary's replicas all hold the primary's adapters.
     if (service_->lora_slot(model) >= 0) {
         if (lora_adapter != nullptr) { *lora_adapter = model; }
-        return route_primary(http, prefixes);
+        return route_primary(http, key);
     }
     for (auto& [name, service] : extra_services_) {
         if (service->lora_slot(model) >= 0) {
