@@ -271,6 +271,9 @@ public:
     [[nodiscard]] std::uint32_t page_entitlement() const noexcept;
     [[nodiscard]] std::uint32_t owned_entitlement() const noexcept;
     [[nodiscard]] std::uint32_t borrowed_pages() const noexcept { return borrowed_pages_; }
+    /// The allocation the first `borrowed_pages()` pages are borrowed from (a fork's source, a
+    /// shared prefix), null when none are; it may borrow in turn.
+    [[nodiscard]] const PagedKVAllocation* prefix() const noexcept { return prefix_.get(); }
     [[nodiscard]] std::uint32_t mapped_page_count() const noexcept;
     [[nodiscard]] std::uint32_t mapped_token_capacity() const noexcept;
     [[nodiscard]] std::int32_t bound_row() const noexcept;
