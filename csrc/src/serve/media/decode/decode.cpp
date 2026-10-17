@@ -464,6 +464,8 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
 
 } // namespace
 
+bool available() noexcept { return true; }
+
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }

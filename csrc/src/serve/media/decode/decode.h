@@ -51,6 +51,10 @@ struct Video {
     std::vector<Image> frames;
 };
 
+/// Whether this binary can decode images and video at all: false when it was built without FFmpeg
+/// (SINFER_ENABLE_FFMPEG=OFF, decode_stub.cpp), where every decode throws.
+[[nodiscard]] bool available() noexcept;
+
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames, bool temporal_pairs = false);

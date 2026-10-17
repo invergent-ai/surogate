@@ -2,6 +2,7 @@
 #include "product/load_progress/load_progress.h"
 #include "product/cuda_visibility/cuda_visibility.h"
 #include "core/sleep.h"
+#include "media/decode/decode.h"
 #include "serve/model_scheduler.h"
 #include "serve/console_log.h"
 #include "serve/decisions_schema.h"
@@ -67,6 +68,16 @@ int main(int argc, char** argv) {
     if (options.help_requested) {
         std::cout << sinfer::serve::serve_usage_text(argv[0]);
         return 0;
+    }
+    // --vision on a binary built without FFmpeg used to start and look healthy, then answer every request
+    // that carried an image with HTTP 500 - a benchmark served that way loses its image tasks silently.
+    if (options.enable_vision && !sinfer::media::decode::available()) {
+        sinfer::serve::write_console_log(
+            sinfer::serve::ConsoleLogLevel::Error,
+            "--vision needs image decoding, but this binary was built without FFmpeg "
+            "(SINFER_ENABLE_FFMPEG=OFF), so every image would be refused. Rebuild with the FFmpeg development "
+            "libraries (libavformat, libavcodec, libavutil, libswscale) installed, or serve without --vision.");
+        return 1;
     }
     try {
         // Before the first CUDA call: the process sees only the cards it was given.

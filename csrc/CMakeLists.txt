@@ -913,7 +913,10 @@ if(SUROGATE_BUILD_SERVE)
                     message(FATAL_ERROR "serve: FFmpeg dev libraries not found (libavformat/libavcodec/libavutil/libswscale). "
                     "Install them, or configure with -DSINFER_ENABLE_FFMPEG=OFF to serve without media decoding.")
                 else()
-                    message(STATUS "serve: FFmpeg dev libraries not found; media-decode stub")
+                    message(WARNING "serve: FFmpeg dev libraries not found (libavformat>=60 libavcodec>=60 "
+                    "libavutil>=58 libswscale>=7): building the media-decode stub. This engine cannot read images "
+                    "or video and refuses to start with --vision. Install them (Ubuntu: libavformat-dev libavcodec-dev "
+                    "libavutil-dev libswscale-dev) and reconfigure, or set -DSINFER_ENABLE_FFMPEG=OFF to say so.")
                 endif()
                 set(SINFER_ENABLE_FFMPEG OFF)
             endif()

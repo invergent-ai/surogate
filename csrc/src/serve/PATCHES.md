@@ -30,7 +30,10 @@ training `surogate-common` build.
    instead of `decode.cpp` when `NINFER_ENABLE_FFMPEG=OFF`.
 3. `src/media/decode/decode_stub.cpp` — NEW FILE (surogate). FFmpeg-free stub
    implementing `media/decode/decode.h`: any image/video input raises a clear
-   runtime error; text serving is unaffected.
+   runtime error; text serving is unaffected. `decode::available()` (true in
+   decode.cpp, false here) lets the server refuse `--vision` at startup on a stub
+   build (2026-10-17: a stub engine with --vision answered every image with HTTP
+   500 while reporting healthy); the configure step warns when it falls back.
 4. `tests/CMakeLists.txt` — `ninfer_media_decode_test` registered only when
    `NINFER_ENABLE_FFMPEG=ON` (it exercises real decoding; cannot pass on the
    stub).

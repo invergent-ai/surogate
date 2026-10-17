@@ -17,6 +17,8 @@ namespace {
 }
 }  // namespace
 
+bool available() noexcept { return false; }
+
 Image decode_image(std::span<const std::uint8_t> /*bytes*/, const Policy& /*policy*/) {
     unavailable();
 }
