@@ -288,6 +288,8 @@ public:
     void dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
+    /// Hashed n-gram memory running statistics of one GPU (empty without a memory); reset after the read.
+    std::vector<float> get_ngram_memory_stats(int gpu_id, bool reset);
     std::vector<std::pair<std::string, Tensor>> get_shared_base_weights();
     int get_valid_token_count(int gpu_id);
     // Per-position training losses of the current optimizer step on one GPU: the

@@ -12,6 +12,8 @@
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/ndarray.h>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +41,10 @@
 #include "tokenizer/tokenizer.h"
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 #include "kernels/glm5.h"
+#include "kernels/kernels.h"
+#include "kernels/ngram_memory.h"
+#include "runtime/ngram/ngram_memory.h"
+#include <cublasLt.h>
 #include "runtime/jit/kimi_delta_rule_kernels.h"
 #include "runtime/jit/glm_dsa_kernels.h"
 
@@ -2159,6 +2165,31 @@ NB_MODULE(_surogate, m) {
             "Returns: dict[str, ndarray] mapping adapter parameter name -> gradient view.\n"
             "Note: blocking; intended for debugging only.")
         .def(
+            "get_ngram_memory_stats",
+            [](MultiGPUPyTrainer* trainer, int gpu_id, bool reset) {
+                const auto raw = trainer->get_ngram_memory_stats(gpu_id, reset);
+                nb::dict ret;
+                if (raw.size() < 8) return ret;
+                const double tokens = raw[0];
+                const double gated = raw[0] - raw[7];
+                ret["tokens"] = tokens;
+                ret["zeroed_tokens"] = static_cast<double>(raw[7]);
+                ret["gate_mean"] = gated > 0 ? raw[1] / gated : 0.0;
+                ret["gate_std"] = gated > 0 ? std::sqrt(std::max(0.0, raw[2] / gated - (raw[1] / gated) * (raw[1] / gated))) : 0.0;
+                ret["gate_gt_0_9"] = gated > 0 ? raw[3] / gated : 0.0;
+                ret["gate_lt_0_1"] = gated > 0 ? raw[4] / gated : 0.0;
+                ret["out_rms_over_residual_rms"] = raw[6] > 0 ? std::sqrt(raw[5] / raw[6]) : 0.0;
+                ret["sum_out_sq"] = static_cast<double>(raw[5]);
+                ret["sum_residual_sq"] = static_cast<double>(raw[6]);
+                return ret;
+            },
+            nb::arg("gpu_id") = 0,
+            nb::arg("reset") = true,
+            "Hashed n-gram memory statistics since the last reset, over every forward that ran the memory\n"
+            "(training and validation forwards; a chunked step counts its KV sweep and its re-forward): gate mean/std,\n"
+            "fraction of tokens with gate > 0.9 and < 0.1, and the RMS of the memory output over the RMS of\n"
+            "the residual it reads. Empty without a memory.")
+        .def(
             "get_lora_weights",
             [](nb::object owner, int gpu_id) {
                 auto* trainer = nb::cast<MultiGPUPyTrainer*>(owner);
@@ -4221,6 +4252,128 @@ NB_MODULE(_surogate, m) {
         .def_rw("capacity", &dsl::GlmDecodeState::capacity)
         .def_prop_ro("bytes", [](const dsl::GlmDecodeState& state) { return state.allocator.total_allocation(); });
 
+    // Hashed n-gram memory op fixtures (tests/test_ngram_memory.py): the kernels and the forward /
+    // backward core of runtime/ngram/ngram_memory.h on caller-owned CUDA tensors (torch), synchronous.
+    m.def("_ngram_memory_rows",
+          [](nb::ndarray<nb::device::cuda, nb::c_contig> ids, nb::ndarray<nb::device::cuda, nb::c_contig> positions,
+             std::optional<nb::ndarray<nb::device::cuda, nb::c_contig>> carry,
+             nb::ndarray<nb::device::cuda, nb::c_contig> rows, const std::string& spec_json) {
+              const auto spec = ngram_memory::Spec::parse(spec_json);
+              const Tensor i = glm_kernel_tensor(ids), p = glm_kernel_tensor(positions);
+              Tensor r = glm_kernel_tensor(rows);
+              if (i.Rank != 2 || i.DType != ETensorDType::INT32 || p.nelem() != i.nelem() ||
+                  r.nelem() != i.nelem() * static_cast<std::size_t>(spec.hash.heads))
+                  throw std::invalid_argument("_ngram_memory_rows: ids/positions int32 [B, T], rows int32 [B*T, heads]");
+              const int* c = nullptr;
+              if (carry.has_value()) c = static_cast<const int*>(carry->data());
+              ngram_memory::rows(r.get<std::int32_t>(), i.get<std::int32_t>(), p.get<std::int32_t>(), c,
+                                 static_cast<int>(i.Sizes[0]), static_cast<int>(i.Sizes[1]), spec.hash, nullptr);
+              CUDA_CHECK(cudaDeviceSynchronize());
+          });
+    m.def("_ngram_memory_gather",
+          [](nb::ndarray<nb::device::cuda, nb::c_contig> rows, nb::ndarray<nb::device::cuda, nb::c_contig> table,
+             nb::ndarray<nb::device::cuda, nb::c_contig> emb, const std::string& spec_json) {
+              const auto spec = ngram_memory::Spec::parse(spec_json);
+              const Tensor r = glm_kernel_tensor(rows), t = glm_kernel_tensor(table);
+              Tensor e = glm_kernel_tensor(emb);
+              const int N = static_cast<int>(r.nelem() / static_cast<std::size_t>(spec.hash.heads));
+              if (e.DType != ETensorDType::BF16 || e.nelem() != static_cast<std::size_t>(N) * spec.embed_dim() ||
+                  t.bytes() < static_cast<std::size_t>(spec.row_count) * spec.row_bytes)
+                  throw std::invalid_argument("_ngram_memory_gather: emb bf16 [N, E], table uint8 [rows * row_bytes]");
+              ngram_memory::gather_iq4nl(e.get<nv_bfloat16>(), r.get<std::int32_t>(),
+                                         reinterpret_cast<const std::uint8_t*>(t.Data), spec.row_bytes, spec.head_dim,
+                                         spec.hash.heads, N, nullptr);
+              CUDA_CHECK(cudaDeviceSynchronize());
+          });
+    {
+        static auto ngram_handle = []() {
+            cublasLtHandle_t h = nullptr;
+            if (cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasLtCreate failed");
+            return h;
+        };
+        static auto ngram_view2 = [](const nb::ndarray<nb::device::cuda, nb::c_contig>& a) {
+            Tensor t = glm_kernel_tensor(a);
+            if (t.Rank > 2) {  // [B, T, X] -> [B*T, X]
+                long rows = 1;
+                for (int d = 0; d + 1 < t.Rank; ++d) rows *= t.Sizes[d];
+                const long cols = t.Sizes[t.Rank - 1];
+                t.Rank = 2;
+                t.Sizes[0] = rows;
+                t.Sizes[1] = cols;
+            }
+            return t;
+        };
+        m.def("_ngram_memory_forward",
+              [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                 const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results, const std::string& spec_json) {
+                  // arrays: r [N,C], emb [N,E], W_k [C,E], W_v [C,E], g_k [C], g_q [C], ids [N]
+                  // results: k [N,C], v [N,C], stats [N,4], u [N,C]
+                  if (arrays.size() != 7 || results.size() != 4)
+                      throw std::invalid_argument("_ngram_memory_forward: 7 inputs, 4 outputs");
+                  const auto spec = ngram_memory::Spec::parse(spec_json);
+                  std::vector<Tensor> in, out;
+                  for (const auto& a : arrays) in.push_back(ngram_view2(a));
+                  for (const auto& a : results) out.push_back(ngram_view2(a));
+                  TensorAllocator allocator;
+                  auto ws = allocator.allocate(ETensorDType::BYTE, "ngram_fixture_ws", EAllocationType::ON_DEVICE,
+                                               {32L << 20});
+                  static cublasLtHandle_t handle = ngram_handle();
+                  ngram_memory::forward_core(out[0], out[1], out[2], out[3], nullptr, in[0], in[1], in[2], in[3],
+                                             in[4].get<float>(), in[5].get<float>(), in[6].get<std::int32_t>(),
+                                             spec.zero_tokens, spec.eps, handle, ws, nullptr);
+                  CUDA_CHECK(cudaDeviceSynchronize());
+              });
+        m.def("_ngram_memory_backward",
+              [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                 const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results, const std::string& spec_json) {
+                  // arrays: r, emb, k, v, stats, g_k, g_q, ids; results: d_res (in: dL/d(r+u), out: dL/dr),
+                  // dW_k, dW_v, dg_k, dg_q (accumulated: pass zeros)
+                  if (arrays.size() != 8 || results.size() != 5)
+                      throw std::invalid_argument("_ngram_memory_backward: 8 inputs, 5 outputs");
+                  const auto spec = ngram_memory::Spec::parse(spec_json);
+                  std::vector<Tensor> in, out;
+                  for (const auto& a : arrays) in.push_back(ngram_view2(a));
+                  for (const auto& a : results) out.push_back(ngram_view2(a));
+                  const long N = in[0].Sizes[0], C = in[0].Sizes[1];
+                  TensorAllocator allocator;
+                  auto ws = allocator.allocate(ETensorDType::BYTE, "ngram_fixture_ws", EAllocationType::ON_DEVICE,
+                                               {32L << 20});
+                  auto dk = allocator.allocate(in[0].DType, "ngram_fixture_dk", EAllocationType::ON_DEVICE, {N, C});
+                  auto dv = allocator.allocate(in[0].DType, "ngram_fixture_dv", EAllocationType::ON_DEVICE, {N, C});
+                  auto w = allocator.allocate(ETensorDType::FP32, "ngram_fixture_w", EAllocationType::ON_DEVICE, {N});
+                  auto partials = allocator.allocate(ETensorDType::FP32, "ngram_fixture_partials",
+                                                     EAllocationType::ON_DEVICE,
+                                                     {ngram_memory::gain_grad_parts(static_cast<int>(N)), C});
+                  static cublasLtHandle_t handle = ngram_handle();
+                  ngram_memory::backward_core(out[0], out[1], out[2], out[3], out[4], dk, dv, w, partials, nullptr,
+                                              in[0], in[1], in[2], in[3], in[4], in[5].get<float>(),
+                                              in[6].get<float>(), in[7].get<std::int32_t>(), spec.zero_tokens, handle,
+                                              ws, nullptr);
+                  CUDA_CHECK(cudaDeviceSynchronize());
+              });
+        m.def("_ngram_memory_residual3_rmsnorm",
+              [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                 const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results, float eps, bool plain) {
+                  // arrays: a, b, u, weight (bf16); results: residual, normed (bf16), rrms (fp32). plain: the
+                  // trainer's fused_residual_rmsnorm_forward on (a, b) instead (u ignored), for the exactness check.
+                  if (arrays.size() != 4 || results.size() != 3)
+                      throw std::invalid_argument("_ngram_memory_residual3_rmsnorm: 4 inputs, 3 outputs");
+                  std::vector<Tensor> in, out;
+                  for (const auto& a : arrays) in.push_back(ngram_view2(a));
+                  for (const auto& a : results) out.push_back(ngram_view2(a));
+                  const int N = static_cast<int>(in[0].Sizes[0]), C = static_cast<int>(in[0].Sizes[1]);
+                  if (plain) {
+                      fused_residual_rmsnorm_forward(out[0], out[1], out[2], in[0], in[1], in[3], nullptr, eps, N, C,
+                                                     nullptr);
+                  } else {
+                      ngram_memory::residual3_rmsnorm_forward(out[0].get<nv_bfloat16>(), out[1].get<nv_bfloat16>(),
+                                                              out[2].get<float>(), in[0].get<nv_bfloat16>(),
+                                                              in[1].get<nv_bfloat16>(), in[2].get<nv_bfloat16>(),
+                                                              in[3].get<nv_bfloat16>(), eps, N, C, nullptr);
+                  }
+                  CUDA_CHECK(cudaDeviceSynchronize());
+              });
+    }
     m.def("_rollout_delta_rule",
           [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
              const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results,

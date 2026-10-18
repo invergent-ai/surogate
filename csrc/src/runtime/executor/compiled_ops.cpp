@@ -428,6 +428,7 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
 
 CompiledExecutor::~CompiledExecutor() {
     free_sequence_chunk_state();
+    free_ngram_buffers();
     // Free persistent GPU buffers
     if (mMoEExpertOffsetsGPU) {
         cudaFree(mMoEExpertOffsetsGPU);

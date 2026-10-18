@@ -80,6 +80,12 @@ public:
         std::vector<std::uint8_t> layer_has_dense_mlp;
         std::vector<std::uint8_t> layer_has_moe;
 
+        /// Hashed n-gram memory (runtime/ngram/ngram_memory.h): the layer holding its dense
+        /// parameters (-1 = no memory), the table embedding width E, and the W_k init std.
+        int ngram_memory_layer = -1;
+        int ngram_memory_embed = 0;
+        float ngram_init_std = 0.02f;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }
@@ -210,6 +216,13 @@ public:
     /// get_lora_weights / get_lora_gradients -- takes them from here so it agrees with the export.
     [[nodiscard]] std::string layer_prefix(int layer) const;
     [[nodiscard]] std::array<std::string, 4> attention_names(int layer) const;
+
+    /// The n-gram memory's layer (-1 = none) and the adapter names of its four tensors, in the
+    /// Flash-Next layout: `<layer>.ple.{key_proj,value_proj,norm_key,norm_query}.weight`.
+    [[nodiscard]] int ngram_memory_layer() const {
+        return mConfig.ngram_memory_layer;
+    }
+    [[nodiscard]] std::array<std::string, 4> ngram_memory_names() const;
 
 private:
     Config mConfig;

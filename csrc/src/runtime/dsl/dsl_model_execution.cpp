@@ -145,6 +145,22 @@ void DslModel::set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack)
     mExecutor->set_sequence_chunk(idx, count, pack);
 }
 
+void DslModel::set_ngram_carry(const std::int32_t* carry, int B, int chunk) {
+    if (!mRunState || mRuntimeConfig.ngram_memory_layer < 0) return;
+    mRunState->NgramCarry.assign(carry, carry + 2 * static_cast<std::size_t>(B));
+    mRunState->NgramCarryChunk = chunk;
+}
+
+std::vector<float> DslModel::ngram_memory_stats(bool reset) {
+    std::vector<float> out;
+    if (!mRunState || !mRunState->NgramStats.Data) return out;
+    out.resize(static_cast<std::size_t>(mRunState->NgramStats.nelem()));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+    CUDA_CHECK(cudaMemcpy(out.data(), mRunState->NgramStats.Data, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    if (reset) CUDA_CHECK(cudaMemset(mRunState->NgramStats.Data, 0, out.size() * sizeof(float)));
+    return out;
+}
+
 void DslModel::zero_sequence_chunk_dkv() {
     if (!mExecutor) {
         throw std::logic_error("DslModel::zero_sequence_chunk_dkv called before allocate_run_state()");

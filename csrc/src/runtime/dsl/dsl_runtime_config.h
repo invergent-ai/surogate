@@ -51,6 +51,12 @@ struct DslRuntimeConfig {
     int ssm_state_size = 0;
     int n_groups = 0;
 
+    /// Hashed n-gram memory (runtime/ngram/ngram_memory.h): the layer whose input it updates
+    /// (-1 = off) and the JSON spec the DSL recorded (surogate/dsl/modules/ngram_memory.py).
+    /// Its dense parameters are adapter tensors of the LoRA manager.
+    int ngram_memory_layer = -1;
+    std::string ngram_memory_spec;
+
     /// Per-layer dimensions. Empty for homogeneous models (use global config).
     std::vector<BlockTypeDims> per_layer_dims;
 

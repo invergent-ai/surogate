@@ -69,6 +69,10 @@ public:
         std::vector<std::uint8_t> layer_has_dense_mlp;
         std::vector<std::uint8_t> layer_has_moe;
 
+        /// Hashed n-gram memory: its layer (-1 = none; that block holds the dense grads) and E.
+        int ngram_memory_layer = -1;
+        int ngram_memory_embed = 0;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }

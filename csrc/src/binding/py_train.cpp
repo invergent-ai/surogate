@@ -661,6 +661,18 @@ void copy_chunk_inputs_for_ctx(IModel& model,
         std::memcpy(ib + static_cast<long>(b) * T, inputs + src_off, T * sizeof(std::int32_t));
         std::memcpy(tb + static_cast<long>(b) * T, targets + src_off, T * sizeof(std::int32_t));
     }
+    // The two tokens before the chunk, per row (hashed n-gram memory; a no-op for other models).
+    {
+        std::vector<std::int32_t> carry(2 * static_cast<std::size_t>(B), -1);
+        for (int b = 0; b < B; ++b) {
+            const long row_off = (static_cast<long>(src_row) * B + b) * T_full;
+            for (int j = 0; j < 2; ++j) {
+                const long p = base_pos - 2 + j;
+                if (p >= 0) carry[static_cast<std::size_t>(b) * 2 + j] = inputs[row_off + p];
+            }
+        }
+        model.set_ngram_carry(carry.data(), B, T > 0 ? static_cast<int>(base_pos / T) : 0);
+    }
     for (int p = 0; p < pos_planes; ++p) {
         for (int b = 0; b < B; ++b) {
             std::int32_t* dst = pb + (static_cast<long>(p) * B + b) * T;
@@ -3362,11 +3374,32 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     }
                     add_layer(prefix + ".mlp.gate", block.router);
                 }
+                // Hashed n-gram memory (its layer only): the dense tensors, by their export names.
+                if (block.ngram_proj.has_value() && block.ngram_gain.has_value() &&
+                    l == names_from.ngram_memory_layer()) {
+                    const auto ngram = names_from.ngram_memory_names();
+                    result.emplace_back(ngram[0], block.ngram_proj->A);
+                    result.emplace_back(ngram[1], block.ngram_proj->B);
+                    result.emplace_back(ngram[2], block.ngram_gain->A);
+                    result.emplace_back(ngram[3], block.ngram_gain->B);
+                }
             }
             CUDA_CHECK(cudaDeviceSynchronize());
         },
         gpu_id);
     return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::get_ngram_memory_stats(int gpu_id, bool reset) {
+    std::vector<float> out;
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+                out = dsl_model->ngram_memory_stats(reset);
+            }
+        },
+        gpu_id);
+    return out;
 }
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(int gpu_id) {
@@ -3485,6 +3518,16 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                         add_layer(prefix + ".mlp.shared_experts.down_proj", block.moe.shared->down);
                     }
                     add_layer(prefix + ".mlp.gate", block.router);
+                }
+                // Hashed n-gram memory: the master tensors (fp32 with lora_dtype fp32; the op reads
+                // the projections' bf16 work copies and the gains' masters).
+                if (block.ngram_proj.has_value() && l == names_from.ngram_memory_layer()) {
+                    auto& master = dsl_model->lora_weights().get_master_block(l, /*stream=*/nullptr);
+                    const auto ngram = names_from.ngram_memory_names();
+                    result.emplace_back(ngram[0], master.ngram_proj->A);
+                    result.emplace_back(ngram[1], master.ngram_proj->B);
+                    result.emplace_back(ngram[2], master.ngram_gain->A);
+                    result.emplace_back(ngram[3], master.ngram_gain->B);
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());

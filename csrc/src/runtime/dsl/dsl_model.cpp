@@ -33,6 +33,7 @@
 #include "runtime/dsl/per_layer_dims.h"
 #include "runtime/lora/lora_attention_geometry.h"
 #include "kernels/kernels.h"
+#include "runtime/ngram/ngram_memory.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/lora/lora_utils.h"
@@ -359,6 +360,11 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     runtime.mamba_head_dim = static_cast<int>(view.mamba_head_dim.value_or(0));
     runtime.ssm_state_size = static_cast<int>(view.ssm_state_size.value_or(0));
     runtime.n_groups = static_cast<int>(view.n_groups.value_or(0));
+    runtime.ngram_memory_layer = static_cast<int>(get_long_attr(module.config, "ngram_memory_layer").value_or(-1));
+    runtime.ngram_memory_spec = get_string_attr(module.config, "ngram_memory_spec").value_or(std::string());
+    if ((runtime.ngram_memory_layer >= 0) != !runtime.ngram_memory_spec.empty()) {
+        throw std::invalid_argument("ngram_memory: the IR carries ngram_memory_layer and ngram_memory_spec together");
+    }
 
     if (view.moe_intermediate_size.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
@@ -1564,6 +1570,20 @@ DslModel::DslModel(const PretrainedConfig& config,
                 wm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * wm.num_grouped_experts;
             }
         }
+        if (mRuntimeConfig.ngram_memory_layer >= 0) {
+            const auto spec = ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec);
+            if (spec.layer != mRuntimeConfig.ngram_memory_layer || spec.layer >= mModelConfig.NumLayers) {
+                throw std::invalid_argument(fmt::format("ngram_memory: layer {} is not a layer of this {}-layer model",
+                                                        spec.layer, mModelConfig.NumLayers));
+            }
+            if (mOptions.EPSize > 1) throw std::invalid_argument("ngram_memory: not supported with ep_size > 1");
+            if (mRuntimeConfig.residual_fp32) {
+                throw std::invalid_argument("ngram_memory: not supported with an FP32 residual stream");
+            }
+            wm.ngram_memory_layer = spec.layer;
+            wm.ngram_memory_embed = spec.embed_dim();
+            wm.ngram_init_std = spec.init_std;
+        }
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
 
         modules::ModularLoRAGradsManager::Config gm{};
@@ -1595,6 +1615,8 @@ DslModel::DslModel(const PretrainedConfig& config,
                 gm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * gm.num_grouped_experts;
             }
         }
+        gm.ngram_memory_layer = wm.ngram_memory_layer;
+        gm.ngram_memory_embed = wm.ngram_memory_embed;
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
         std::vector<std::string> lora_grad_hook_schema_ids(
             static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));
@@ -1603,6 +1625,9 @@ DslModel::DslModel(const PretrainedConfig& config,
             lora_grad_hook_schema_ids[static_cast<std::size_t>(record.layer)] = schema_id_for_hook_target(record);
         }
         mLoRAGrads->set_schema_hook_registry(&mHookRegistry, std::move(lora_grad_hook_schema_ids));
+    } else if (mRuntimeConfig.ngram_memory_layer >= 0) {
+        // The memory's parameters are adapter tensors: without LoRA nothing would hold or train them.
+        throw std::invalid_argument("ngram_memory requires LoRA training (lora: true)");
     }
 
     for (const auto& kv : mModule->hf_mapping) {

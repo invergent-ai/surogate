@@ -152,6 +152,20 @@ void ModularLoRAGradsManager::allocate_gradients() {
         auto& full = mFullGrads.blocks[l];
         auto& shard = mShardedGrads.blocks[l];
 
+        // Hashed n-gram memory (dense [C, E] projections, [C] gains) on its layer; carved from the
+        // dense arena with everything else.
+        if (l == mConfig.ngram_memory_layer) {
+            const long E = mConfig.ngram_memory_embed;
+            LoRALayerWeights<Tensor> proj;
+            proj.A = Tensor::empty(mConfig.grad_dtype, {static_cast<long>(C), E});
+            proj.B = Tensor::empty(mConfig.grad_dtype, {static_cast<long>(C), E});
+            full.ngram_proj = proj;
+            LoRALayerWeights<Tensor> gain;
+            gain.A = Tensor::empty(mConfig.grad_dtype, {static_cast<long>(C)});
+            gain.B = Tensor::empty(mConfig.grad_dtype, {static_cast<long>(C)});
+            full.ngram_gain = gain;
+        }
+
         // Determine block type for this layer (hybrid-aware)
         BlockType bt = BlockType::Dense;
         bool is_hybrid = false;

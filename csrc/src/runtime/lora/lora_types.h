@@ -274,6 +274,11 @@ struct LoRABlockWeights {
     LoRAMoEWeights<TTensor> moe;  ///< For MoE models (per-expert LoRA)
     std::optional<LoRALayerWeights<TTensor>>
         router;  ///< Router gate LoRA for MoE (when train_router enabled) - PEFT-compatible
+    /// Hashed n-gram memory of this layer (runtime/ngram/ngram_memory.h): dense adapter tensors, not
+    /// low-rank pairs. ngram_proj: A = W_k [C, E], B = W_v [C, E]; ngram_gain: A = g_k [C], B = g_q [C]
+    /// (the gate's folded RMSNorm gains). Only the memory's layer carries them.
+    std::optional<LoRALayerWeights<TTensor>> ngram_proj;
+    std::optional<LoRALayerWeights<TTensor>> ngram_gain;
 };
 
 /**
@@ -318,6 +323,8 @@ enum class LoRATargetId : std::uint8_t {
     LinA,    ///< linear-attention in_proj_a
     LinB,    ///< linear-attention in_proj_b
     LinOut,  ///< linear-attention out_proj
+    NgramProj,  ///< n-gram memory key/value projections (dense; the memory's layer only)
+    NgramGain,  ///< n-gram memory gate gains (dense; the memory's layer only)
     Unknown = 255,
 };
 
@@ -363,6 +370,8 @@ inline LoRALayerWeights<TTensor>* get_layer_weight_by_target(LoRABlockWeights<TT
         case LoRATargetId::LinA: return block.linear_attn.in_proj_a.has_value() ? &*block.linear_attn.in_proj_a : nullptr;
         case LoRATargetId::LinB: return block.linear_attn.in_proj_b.has_value() ? &*block.linear_attn.in_proj_b : nullptr;
         case LoRATargetId::LinOut: return block.linear_attn.out_proj.has_value() ? &*block.linear_attn.out_proj : nullptr;
+        case LoRATargetId::NgramProj: return block.ngram_proj.has_value() ? &*block.ngram_proj : nullptr;
+        case LoRATargetId::NgramGain: return block.ngram_gain.has_value() ? &*block.ngram_gain : nullptr;
         case LoRATargetId::SharedUp:
             return (block.moe.shared.has_value() && block.moe.shared->up.has_value()) ? &*block.moe.shared->up
                                                                                       : nullptr;
@@ -473,6 +482,13 @@ inline void for_each_lora_layer_weight(LoRABlockWeights<TTensor>& block, Fn&& fn
     if (auto* layer = get_layer_weight_by_target(block, LoRATargetId::Router)) {
         fn(LoRATargetId::Router, *layer);
     }
+
+    // Last, so the order (and every ordinal derived from it) of adapters without a memory is unchanged.
+    for (LoRATargetId id : {LoRATargetId::NgramProj, LoRATargetId::NgramGain}) {
+        if (auto* layer = get_layer_weight_by_target(block, id)) {
+            fn(id, *layer);
+        }
+    }
 }
 
 template <typename TWeightTensor, typename TGradTensor, typename Fn>
@@ -516,6 +532,8 @@ inline void for_each_lora_layer_weight_pair(LoRABlockWeights<TWeightTensor>& wei
         visit_pair(id);
     }
     visit_pair(LoRATargetId::Router);
+    visit_pair(LoRATargetId::NgramProj);
+    visit_pair(LoRATargetId::NgramGain);
 }
 
 /// Stable integer key for a LoRA target, used to seed per-projection

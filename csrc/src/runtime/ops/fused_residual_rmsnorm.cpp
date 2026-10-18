@@ -90,6 +90,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
 
     const bool declared_ln1 = op.outputs.size() >= 3 &&
         is_block_input_norm(op.outputs[1].slot, op.outputs[2].slot);
+    // Hashed n-gram memory (ngram_memory_op.cpp): its layer's input norm adds the memory's output.
+    const bool ngram_site = ngram_memory_site(fwd_layer_idx, fwd_field);
     const bool declared_ln2 = op.outputs.size() >= 3 &&
         is_block_mlp_norm(op.outputs[1].slot, op.outputs[2].slot);
 
@@ -272,17 +274,28 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
             }
         }
 
-        fused_residual_rmsnorm_forward(kernel_residual_out,
-                                       kernel_y,
-                                       rstd,
-                                       kernel_residual_in,
-                                       kernel_input,
-                                       kernel_weight,
-                                       nullptr,
-                                       op.attrs.eps,
-                                       static_cast<int>(mB * mT),
-                                       mConfig.HiddenSize,
-                                       mRunState.MainStream);
+        if (ngram_site) {
+            // A replay reads the stored residual (above), which holds the memory's output already; a
+            // replay that reached here would recompute the residual from stale inputs.
+            if (mInReplay) {
+                throw std::logic_error("ngram_memory: a replayed forward reached the memory's norm without its "
+                                       "stored residual");
+            }
+            ngram_memory_forward(kernel_residual_out, kernel_y, rstd, kernel_residual_in, kernel_input,
+                                 kernel_weight, op.attrs.eps);
+        } else {
+            fused_residual_rmsnorm_forward(kernel_residual_out,
+                                           kernel_y,
+                                           rstd,
+                                           kernel_residual_in,
+                                           kernel_input,
+                                           kernel_weight,
+                                           nullptr,
+                                           op.attrs.eps,
+                                           static_cast<int>(mB * mT),
+                                           mConfig.HiddenSize,
+                                           mRunState.MainStream);
+        }
         copy_outputs_back();
     }
 
@@ -410,8 +423,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     }
     Tensor& residual_out = *residual_out_ptr;
 
+    const bool ngram_site = ngram_memory_site(ln_layer_idx, ln_field);
+
     // d_residual_next is the incoming gradient from the next layer (may be zero/empty)
     if (residual_out.DType == ETensorDType::FP32 && d_y.DType == ETensorDType::BF16) {
+        if (ngram_site) throw std::runtime_error("ngram_memory: not supported with an FP32 residual stream");
         Tensor d_residual{};
         Tensor d_branch{};
         Tensor d_weight{};
@@ -669,6 +685,11 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
                          mRunState.DeviceProp,
                          mRunState.MainStream,
                          skip_weight_grad);
+    }
+    // Hashed n-gram memory: the gate's query path adds to the residual gradient; the memory's own
+    // parameter gradients accumulate into its adapter gradients.
+    if (ngram_site) {
+        ngram_memory_backward(kernel_d_input, abs_max_ptr);
     }
     copy_bwd_outputs_back();
     jev_diagnostic::rms_after(diagnostic,kernel_d_input,mRunState.DeviceId,mRunState.MainStream);

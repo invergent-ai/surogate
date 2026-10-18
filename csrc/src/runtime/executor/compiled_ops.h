@@ -36,6 +36,7 @@
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "kernels/kernels.h"
 #include "runtime/lora/lora_types.h"
+#include "runtime/ngram/ngram_memory.h"
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
@@ -894,6 +895,44 @@ private:
     IModel::ChunkPackMeta mChunkPack;  ///< active chunk's document geometry
     void ensure_chunk_cu_uploaded();
     ChunkAttnState& chunk_attn_state(int layer_idx, int Hkv, int Hs);
+
+    /// Hashed n-gram memory (runtime/ngram/ngram_memory.h) on the input norm of its layer. The
+    /// forward keeps what the backward of the same (chunk of the) micro-batch needs: the residual
+    /// it read, the table embedding, k, v and the per-token gate statistics; sized for B*T on first
+    /// use, which must not happen under stream capture.
+    struct NgramBuffers {
+        long tokens = 0;
+        int hidden = 0;
+        int embed = 0;
+        Tensor r;      ///< bf16 [N, C] = bf16(residual_in + input)
+        Tensor emb;    ///< bf16 [N, E]
+        Tensor k;      ///< bf16 [N, C]
+        Tensor v;      ///< bf16 [N, C]
+        Tensor u;      ///< bf16 [N, C]
+        Tensor stats;  ///< fp32 [N, kTokenStats]
+        Tensor rows;   ///< int32 [N, heads]
+        Tensor carry;  ///< int32 [B, 2]
+        Tensor gains;  ///< fp32 [2, C]: g_k, g_q
+        Tensor w;      ///< fp32 [N] (backward)
+        Tensor partials;  ///< fp32 [gain_grad_parts(N), C] (backward)
+    };
+    NgramBuffers mNgram;
+    std::shared_ptr<const ngram_memory::Spec> mNgramSpec;
+    const std::uint8_t* mNgramTable = nullptr;
+    /// The memory runs: the model declares it and the adapter holding its parameters is attached (a
+    /// reference-only forward detaches LoRA and therefore runs the base model).
+    [[nodiscard]] bool ngram_memory_active() const;
+    /// The fused residual norm at (layer, field) is the memory's site.
+    [[nodiscard]] bool ngram_memory_site(int layer_idx, const std::string& field) const;
+    const ngram_memory::Spec& ngram_spec();
+    void ensure_ngram_buffers();
+    void free_ngram_buffers();
+    /// Forward on the memory's norm: residual_out = bf16(residual_in + input + u), y / rstd of that sum.
+    void ngram_memory_forward(Tensor& residual_out, Tensor& y, Tensor& rstd, const Tensor& residual_in,
+                              const Tensor& input, const Tensor& weight, float eps);
+    /// Backward on the memory's norm: d_input holds dL/d(sum) on entry and dL/dr on exit; the
+    /// memory's parameter gradients accumulate into its adapter gradients.
+    void ngram_memory_backward(Tensor& d_input, float* abs_max);
 
     const std::int32_t* mCuSeqlensGpu = nullptr;
     const std::int32_t* mCuSeqlensCpu = nullptr;

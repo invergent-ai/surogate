@@ -156,6 +156,34 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
 
     const std::string prefix = fmt::format("lora_layer_{}", layer_idx);
 
+    // Hashed n-gram memory: dense [C, E] projections and [C] gate gains on the memory's layer,
+    // allocated whatever the LoRA targets (an empty target set trains the memory alone).
+    if (layer_idx == mConfig.ngram_memory_layer) {
+        const long E = mConfig.ngram_memory_embed;
+        if (E <= 0) throw std::logic_error("ngram memory: embed width must be positive");
+        const ETensorDType master_dtype = mConfig.lora_config.dtype;
+        const ETensorDType work_dtype = mConfig.work_dtype;
+        master.ngram_proj.emplace();
+        work.ngram_proj.emplace();
+        master.ngram_gain.emplace();
+        work.ngram_gain.emplace();
+        master.ngram_proj->A = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_key_proj", EAllocationType::ON_DEVICE, {C, E}));
+        master.ngram_proj->B = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_value_proj", EAllocationType::ON_DEVICE, {C, E}));
+        master.ngram_gain->A = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_norm_key", EAllocationType::ON_DEVICE, {C}));
+        master.ngram_gain->B = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_norm_query", EAllocationType::ON_DEVICE, {C}));
+        work.ngram_proj->A =
+            mAllocator->allocate(work_dtype, "lora_ngram_key_proj_work", EAllocationType::ON_DEVICE, {C, E});
+        work.ngram_proj->B =
+            mAllocator->allocate(work_dtype, "lora_ngram_value_proj_work", EAllocationType::ON_DEVICE, {C, E});
+        work.ngram_gain->A = mAllocator->allocate(work_dtype, "lora_ngram_norm_key_work", EAllocationType::ON_DEVICE, {C});
+        work.ngram_gain->B =
+            mAllocator->allocate(work_dtype, "lora_ngram_norm_query_work", EAllocationType::ON_DEVICE, {C});
+    }
+
     // Determine block type for this layer (hybrid-aware)
     BlockType bt = BlockType::Dense;  // default: allocate everything
     bool is_hybrid = false;
@@ -537,6 +565,18 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
         if (b.router.has_value()) {
             init_layer(b.router, C, (1ULL << 41) + static_cast<unsigned long long>(l));
         }
+
+        // N-gram memory: W_k ~ N(0, init_std) (its own subsequence range), W_v = 0 so the memory's output
+        // is exactly zero, gate gains 1 (folded multipliers). No other adapter's stream is touched.
+        if (b.ngram_proj.has_value()) {
+            fill_normal(b.ngram_proj->A, b.ngram_proj->A.nelem(), 0.0f, mConfig.ngram_init_std, seed,
+                        (1ULL << 42) + static_cast<unsigned long long>(l), nullptr);
+            fill_zero(b.ngram_proj->B, nullptr);
+        }
+        if (b.ngram_gain.has_value()) {
+            fill_constant(b.ngram_gain->A, 1.0f, static_cast<std::size_t>(b.ngram_gain->A.nelem()), nullptr);
+            fill_constant(b.ngram_gain->B, 1.0f, static_cast<std::size_t>(b.ngram_gain->B.nelem()), nullptr);
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -557,6 +597,17 @@ void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, N
             for (const auto& entry : reader.entries()) present.insert(entry.name());
         } catch (std::exception& e) {
             throw std::runtime_error(fmt::format("Error reading adapter file '{}': {}", file_name, e.what()));
+        }
+        // An adapter with an n-gram memory is part of the model it was trained as: dropping the memory
+        // would load another model.
+        if (mConfig.ngram_memory_layer < 0) {
+            for (const auto& name : present) {
+                if (name.find(".ple.") != std::string::npos) {
+                    throw std::runtime_error(fmt::format(
+                        "adapter '{}' carries an n-gram memory ({}); configure the trainer with the adapter's "
+                        "ngram_memory option", file_name, name));
+                }
+            }
         }
         std::vector<std::string> missing;
         std::unordered_set<std::string> allocated_names;
@@ -829,6 +880,8 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
 
     // Sync router LoRA (when train_router is enabled)
     sync_layer(work.router, master.router, "router");
+    sync_layer(work.ngram_proj, master.ngram_proj, "ngram_proj");
+    sync_layer(work.ngram_gain, master.ngram_gain, "ngram_gain");
 
     return work;
 }
@@ -908,7 +961,9 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
                 linear += r * static_cast<std::size_t>(shape.input) + static_cast<std::size_t>(shape.output) * r;
         }
     }
-    return per_layer * static_cast<std::size_t>(mConfig.num_layers) + linear + masked_experts;
+    const std::size_t ngram =
+        mConfig.ngram_memory_layer >= 0 ? 2 * C * static_cast<std::size_t>(mConfig.ngram_memory_embed) + 2 * C : 0;
+    return per_layer * static_cast<std::size_t>(mConfig.num_layers) + linear + masked_experts + ngram;
 }
 
 namespace {
@@ -975,6 +1030,8 @@ void for_each_lora_tensor(TSet& set, F&& visit) {
         }
 
         visit_layer(block.router);
+        visit_layer(block.ngram_proj);
+        visit_layer(block.ngram_gain);
     }
 }
 
@@ -1101,6 +1158,12 @@ std::size_t ModularLoRAWeightsManager::rebind_to_persistent_arena(std::byte* are
 
 std::string ModularLoRAWeightsManager::layer_prefix(int layer) const {
     return fmt::format("{}.{}", mConfig.tensor_prefix, layer);
+}
+
+std::array<std::string, 4> ModularLoRAWeightsManager::ngram_memory_names() const {
+    const std::string module = layer_prefix(mConfig.ngram_memory_layer) + ".ple.";
+    return {module + "key_proj.weight", module + "value_proj.weight", module + "norm_key.weight",
+            module + "norm_query.weight"};
 }
 
 std::array<std::string, 4> ModularLoRAWeightsManager::attention_names(int layer) const {
@@ -1264,6 +1327,15 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
         if (block.router.has_value() && block.router->has_value()) {
             callback(prefix + ".mlp.gate.lora_A.weight", block.router->A);
             callback(prefix + ".mlp.gate.lora_B.weight", block.router->B);
+        }
+
+        // N-gram memory: dense tensors in the Flash-Next layout (<layer>.ple.*), not LoRA pairs.
+        if (block.ngram_proj.has_value() && block.ngram_gain.has_value()) {
+            const auto names = ngram_memory_names();
+            callback(names[0], block.ngram_proj->A);
+            callback(names[1], block.ngram_proj->B);
+            callback(names[2], block.ngram_gain->A);
+            callback(names[3], block.ngram_gain->B);
         }
     }
 }

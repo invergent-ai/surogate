@@ -394,7 +394,8 @@ __launch_bounds__(ADAMW_BLOCK_THREADS, 4) __global__
                                  float weight_decay,
                                  const float* __restrict__ opt_params,
                                  const int* __restrict__ opt_step,
-                                 const float* __restrict__ gnorm_scale_ptr) {
+                                 const float* __restrict__ gnorm_scale_ptr,
+                                 const float* __restrict__ tensor_hparams) {
     const float gnorm_scale = gnorm_scale_ptr ? *gnorm_scale_ptr : 1.0f;
     float beta1_val = beta1;
     float beta2_val = beta2;
@@ -422,6 +423,9 @@ __launch_bounds__(ADAMW_BLOCK_THREADS, 4) __global__
         const T* g = grads[tensor_idx];
         const int n = sizes[tensor_idx];
         const int s_offset = state_offsets[tensor_idx];
+        // Per-tensor learning-rate and weight-decay multipliers (null: 1 and 1).
+        const float lr_t = tensor_hparams ? lr_val * tensor_hparams[2 * tensor_idx] : lr_val;
+        const float wd_t = tensor_hparams ? weight_decay_val * tensor_hparams[2 * tensor_idx + 1] : weight_decay_val;
 
         float* m = m_buf + s_offset;
         float* v = v_buf + s_offset;
@@ -451,10 +455,10 @@ __launch_bounds__(ADAMW_BLOCK_THREADS, 4) __global__
                     float v_hat = v_i / correction2;
 
                     float param = to_float(p[idx]);
-                    param -= lr_val * m_hat / (sqrtf(v_hat) + eps_val);
+                    param -= lr_t * m_hat / (sqrtf(v_hat) + eps_val);
 
-                    if (weight_decay_val > 0.0f) {
-                        param *= (1.0f - lr_val * weight_decay_val);
+                    if (wd_t > 0.0f) {
+                        param *= (1.0f - lr_t * wd_t);
                     }
 
                     p[idx] = from_float<T>(param);
@@ -485,6 +489,7 @@ static void launch_adamw_update_multi_tensor(T** params,
                                              const float* gnorm_scale,
                                              const float* opt_params,
                                              const int* opt_step,
+                                             const float* tensor_hparams,
                                              cudaStream_t stream) {
     if (num_tensors == 0 || total_params == 0) return;
 
@@ -506,7 +511,8 @@ static void launch_adamw_update_multi_tensor(T** params,
                                                                               weight_decay,
                                                                               opt_params,
                                                                               opt_step,
-                                                                              gnorm_scale);
+                                                                              gnorm_scale,
+                                                                              tensor_hparams);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -527,7 +533,8 @@ void adamw_update_multi_tensor(float** params,
                                const float* gnorm_scale,
                                const float* opt_params,
                                const int* opt_step,
-                               cudaStream_t stream) {
+                               cudaStream_t stream,
+                               const float* tensor_hparams) {
     launch_adamw_update_multi_tensor(params,
                                      grads,
                                      sizes,
@@ -545,6 +552,7 @@ void adamw_update_multi_tensor(float** params,
                                      gnorm_scale,
                                      opt_params,
                                      opt_step,
+                                     tensor_hparams,
                                      stream);
 }
 
@@ -565,7 +573,8 @@ void adamw_update_multi_tensor(nv_bfloat16** params,
                                const float* gnorm_scale,
                                const float* opt_params,
                                const int* opt_step,
-                               cudaStream_t stream) {
+                               cudaStream_t stream,
+                               const float* tensor_hparams) {
     launch_adamw_update_multi_tensor(params,
                                      grads,
                                      sizes,
@@ -583,6 +592,7 @@ void adamw_update_multi_tensor(nv_bfloat16** params,
                                      gnorm_scale,
                                      opt_params,
                                      opt_step,
+                                     tensor_hparams,
                                      stream);
 }
 

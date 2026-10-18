@@ -94,6 +94,10 @@ public:
     virtual void zero_sequence_chunk_dkv() {
         throw std::logic_error("zero_sequence_chunk_dkv: model does not support chunked-sequence training");
     }
+    //! \brief The two tokens before sequence chunk `chunk` of each batch row ([B, 2], oldest first,
+    //! -1 = none), for models whose layers read token n-grams across chunks (the hashed n-gram
+    //! memory). Default: nothing to carry.
+    virtual void set_ngram_carry(const std::int32_t* /*carry*/, int /*B*/, int /*chunk*/) {}
     //! \brief forward() variant that skips saved-for-backward persistence
     //! (the KV sweep of the chunked schedule).
     virtual void forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
