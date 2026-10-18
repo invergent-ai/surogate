@@ -1707,6 +1707,8 @@ def compile_model_spec(
                 "activation",
                 "sliding_rope_type",
                 "full_rope_type",
+                # Hashed n-gram memory spec (JSON; surogate/dsl/modules/ngram_memory.py), set only with the option.
+                "ngram_memory_spec",
             }
             _important_int_attrs = {"d_ff"}
             _important_float_attrs = {

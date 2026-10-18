@@ -402,9 +402,9 @@ class NodeTrainer:
         # Create model config
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
 
-        dsl_extra = {}
-        if getattr(self._config, "ep_size", 1) > 1:
-            dsl_extra["ep_size"] = self._config.ep_size
+        from surogate.dsl.ir_builder import training_dsl_extra
+
+        dsl_extra = training_dsl_extra(self._config) or {}
         ir_json = build_dsl_ir_for_model(self._config.model_dir, extra_config=dsl_extra or None)
         self._config.runtime_config.dsl_ir_json = ir_json
 

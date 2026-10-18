@@ -186,9 +186,9 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     # --- compile the DSL IR + JIT kernels (mirrors SurogateTrainerWrapper) ---
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
 
-    dsl_extra = {}
-    if getattr(config, "ep_size", 1) > 1:
-        dsl_extra["ep_size"] = config.ep_size
+    from surogate.dsl.ir_builder import training_dsl_extra
+
+    dsl_extra = training_dsl_extra(config) or {}
     ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
     config.runtime_config.dsl_ir_json = ir_json
 

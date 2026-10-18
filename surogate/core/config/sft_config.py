@@ -283,6 +283,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Dropout rate for LoRA adapters.
         lora_target_modules (Optional[str], default to 'all'):
             List of comma-separated module names to apply LoRA adapters to.
+        ngram_memory (Optional[dict], defaults to None):
+            Hashed n-gram memory on one layer's input (qwen3_5_moe family; LoRA training): a frozen IQ4_NL
+            n-gram table read through trained projections W_k, W_v [C, E] and gate gains [C] (the engine's
+            single-stream ``ngram_ple`` prologue), e.g. ``{table: .../table.iq4nl, manifest: .../manifest.json,
+            lr: 1e-4}``. W_v starts at 0: the model at step 0 is the base model bit for bit. ``only: true``
+            (default) trains the memory alone (no LoRA adapters). Off when absent. See
+            surogate/dsl/modules/ngram_memory.py and rl/ngram-transplant-2026-10-18/INTERFACE.md.
         train_router (Optional[bool], defaults to False):
             Add a router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`: lora_A [r, hidden],
             lora_B [num_experts, r]) and train it with the other adapters; it is exported in the adapter as
@@ -456,6 +463,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
+    ngram_memory: dict | None = None
     # Routed experts with expert LoRA: None/'all' = every expert, 'none', or a mask file (lora_expert_mask.py).
     lora_expert_mask: str | dict | None = None
     router_aux_loss_coef: float | None = None
@@ -616,6 +624,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
         self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
         self.train_router = cfg.get("train_router", self.train_router)
+        self.ngram_memory = cfg.get("ngram_memory", self.ngram_memory)
+        if self.ngram_memory:
+            from surogate.dsl.modules.ngram_memory import NgramMemoryConfig
+
+            _ngram = NgramMemoryConfig.parse({**dict(self.ngram_memory), "base_lr": self.learning_rate})
+            _ngram.check_table_file()
+            if _ngram.only:
+                # Memory-only PEFT: no LoRA adapters; the memory's dense tensors are the only trainable ones.
+                if "lora_target_modules" in cfg and list(cfg["lora_target_modules"] or []):
+                    raise ValueError("ngram_memory.only: true trains the memory alone; remove lora_target_modules "
+                                     "or set ngram_memory.only: false to combine it with LoRA")
+                if self.train_router:
+                    raise ValueError("ngram_memory.only: true trains the memory alone; train_router must be false")
+                self.lora_target_modules = []
+            self.ngram_memory = _ngram.to_dict()
         self.lora_expert_mask = cfg.get("lora_expert_mask", self.lora_expert_mask)
         self.router_aux_loss_coef = cfg.get("router_aux_loss_coef", self.router_aux_loss_coef)
         self.router_z_loss_coef = cfg.get("router_z_loss_coef", self.router_z_loss_coef)
@@ -1129,6 +1152,27 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             logger.info(
                 "[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture)."
             )
+
+        # Hashed n-gram memory: its parameters are adapter tensors (LoRA only); its buffers are sized on
+        # first use and its chunk carry is host-side, which a captured graph cannot do.
+        if self.ngram_memory:
+            if not self.lora:
+                raise ValueError("ngram_memory requires lora: true (its parameters train as adapter tensors)")
+            if (self.ep_size or 1) > 1:
+                raise ValueError("ngram_memory does not support ep_size > 1")
+            if self.parallelism == "dispatch_pp":
+                raise ValueError("ngram_memory does not support parallelism: dispatch_pp")
+            if self.optimizer == "normuon":
+                raise ValueError("ngram_memory requires optimizer adamw or adamw_8bit")
+            if self.adapter_path and self.adapter_init_mode == "merge":
+                raise ValueError("ngram_memory: an adapter_path is loaded as a trainable adapter "
+                                 "(adapter_init_mode: trainable); the memory cannot be merged into base weights")
+            if self.use_cuda_graphs:
+                logger.info("[ngram_memory]: disabling CUDA graphs.")
+                self.use_cuda_graphs = False
+            if self.lora_dtype != "fp32":
+                logger.warning(f"[ngram_memory]: lora_dtype {self.lora_dtype} keeps the memory's masters in that "
+                               "dtype; fp32 is recommended (W_v starts at 0)")
 
         # Chunked-sequence training (KV-checkpointed chunks): validate and
         # adjust flags before RuntimeOptions is constructed below.

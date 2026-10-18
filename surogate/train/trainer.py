@@ -309,9 +309,8 @@ class SurogateTrainerWrapper:
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
 
         # Pass training-time config overrides that affect graph compilation
-        dsl_extra = {}
-        if getattr(config, "ep_size", 1) > 1:
-            dsl_extra["ep_size"] = config.ep_size
+        from surogate.dsl.ir_builder import training_dsl_extra
+        dsl_extra = training_dsl_extra(config) or {}
         ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
         config.runtime_config.dsl_ir_json = ir_json
         self._block_schema_summary = _summarize_block_schemas(ir_json)
@@ -552,7 +551,9 @@ class SurogateTrainerWrapper:
                 self.start_step = 0
 
         if not hasattr(self, "trainer"):
-            if config.lora and config.lora_rank and config.lora_alpha and config.lora_target_modules:
+            # An n-gram memory alone (ngram_memory.only) trains through the LoRA manager with no target modules.
+            if config.lora and config.lora_rank and config.lora_alpha and (
+                config.lora_target_modules or getattr(config, "ngram_memory", None)):
                 self.trainer = _surogate.SurogateTrainer(
                     ngpu=config.gpus,
                     config=_surogate.PretrainedConfig.from_pretrained(
@@ -952,6 +953,32 @@ class SurogateTrainerWrapper:
 
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
 
+    def _log_ngram_memory_stats(self, step: int) -> None:
+        """Hashed n-gram memory statistics since the last logging step (surogate/dsl/modules/ngram_memory.py):
+        gate distribution and the RMS of the memory's output over the RMS of the residual it reads (DESIGN.md (d):
+        the pre-registered scale check), logged and appended to <output_dir>/ngram_memory_stats.jsonl."""
+        if not getattr(self.config, "ngram_memory", None):
+            return
+        try:
+            stats = dict(self.trainer.get_ngram_memory_stats(0, True))
+        except Exception as exc:  # statistics must never stop a run
+            logger.warning(f"[ngram_memory] statistics unavailable: {exc}")
+            return
+        if not stats:
+            return
+        logger.info(f"[ngram_memory] step {step}: gate mean {stats['gate_mean']:.4f} std {stats['gate_std']:.4f} "
+                    f">0.9 {stats['gate_gt_0_9']:.4f} <0.1 {stats['gate_lt_0_1']:.4f} "
+                    f"out/residual RMS {stats['out_rms_over_residual_rms']:.3e} over {int(stats['tokens'])} tokens")
+        try:
+            import json as _json
+
+            out = Path(self.config.output_dir) / "ngram_memory_stats.jsonl"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with open(out, "a") as fh:
+                fh.write(_json.dumps({"step": int(step), **stats}) + "\n")
+        except Exception as exc:
+            logger.warning(f"[ngram_memory] cannot write statistics: {exc}")
+
     def _record_regression_step(self, metrics: StepMetrics) -> None:
         if not self._regression_artifact_path:
             return
@@ -1220,6 +1247,7 @@ class SurogateTrainerWrapper:
                         metrics.loss,
                         metrics.lr,
                     )
+                self._log_ngram_memory_stats(step)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
@@ -1709,6 +1737,7 @@ class SurogateTrainerWrapper:
                         metrics.loss,
                         metrics.lr,
                     )
+                self._log_ngram_memory_stats(step)
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 

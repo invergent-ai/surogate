@@ -274,6 +274,13 @@ class LoRAMergePlan:
 def _lora_pairs(adapter_weights: dict[str, torch.Tensor]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     """Group the adapter into module -> (lora_A, lora_B); reject what cannot be merged."""
     stripped = {_strip_adapter_key(key): tensor for key, tensor in adapter_weights.items()}
+    ngram = sorted(key for key in stripped if ".ple." in key)
+    if ngram:
+        # A hashed n-gram memory (surogate/dsl/modules/ngram_memory.py) is a layer of its own, not a weight
+        # delta: it is served next to the base (surogate/dsl/ngram_memory_export.py), never merged.
+        raise AdapterMergeError(
+            f"the adapter carries an n-gram memory ({ngram[:2]}); it cannot be merged into base weights. Export it "
+            "with python -m surogate.dsl.ngram_memory_export and serve it next to the merged LoRA")
     pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     unpaired, unsupported, ignored = [], [], []
     for key in stripped:
