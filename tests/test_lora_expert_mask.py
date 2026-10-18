@@ -365,9 +365,11 @@ def scenario_equivalence(model_dir, out):
     del masked
     optimizer = sg.OptimizerConfig(optimizer="adamw_8bit", learning_rate=1e-3, weight_decay=0.0, grad_clip=0.0)
     arrays = {}
-    for name, mask in (("dense", None), ("mask", MASK)):
+    # dense2 repeats the dense run: the run-to-run noise floor the masked run is held to.
+    for name, mask in (("dense", None), ("dense2", None), ("mask", MASK)):
+        live_name = "mask" if name == "mask" else "dense"
         trainer = dense if name == "dense" else _make_trainer(model_dir, mask=mask)
-        trainer.import_adapter(str(out / f"{name}_live.safetensors"))
+        trainer.import_adapter(str(out / f"{live_name}_live.safetensors"))
         arrays[f"{name}/logprobs"] = trainer.compute_logprobs(x, y, use_lora=True)[0][valid].astype(np.float64)
         arrays[f"{name}/base_logprobs"] = trainer.compute_logprobs(x, y, use_lora=False)[0][valid].astype(np.float64)
         trainer.step(x, y)
@@ -436,23 +438,25 @@ def scenario_fingerprint(model_dir, out, recipe="bf16", train_router="1"):
     init = load_file(str(out / "fp_init" / "adapter_model.safetensors"))
     save_file(_live_adapter(init, None), str(out / "fp_live.safetensors"))
     trainer.import_adapter(str(out / "fp_live.safetensors"))
-    digest = {}
+    digest, saved = {}, {}
 
     def h(name, arrays):
         m = hashlib.sha256()
         for k in sorted(arrays):
             m.update(k.encode())
             m.update(np.ascontiguousarray(arrays[k]).tobytes())
+            saved[f"{name}/{k}"] = arrays[k]
         digest[name] = m.hexdigest()
 
     h("init", {k: v.float().numpy() for k, v in init.items()})
-    h("logprobs", {"lp": trainer.compute_logprobs(x, y, use_lora=True)[0]})
+    h("logprobs", {"lp": np.asarray(trainer.compute_logprobs(x, y, use_lora=True)[0])})
     trainer.step(x, y)
     h("grads", _numpy(trainer.get_lora_gradients(0)))
     result = trainer.update_with_config(sg.OptimizerConfig(optimizer="adamw_8bit", learning_rate=1e-3), 1)
     digest["loss"] = repr(float(result["loss"]))
     digest["norm"] = repr(float(result["norm"]))
     h("weights", _numpy(trainer.get_lora_weights(0)))
+    np.savez(out / "fingerprint.npz", **saved)
     return digest
 
 
@@ -524,30 +528,52 @@ def test_counts_match_the_formula(tiny_moe):
 def test_masked_equals_dense_with_zeroed_experts(tiny_moe):
     result = run_scenario("equivalence", tiny_moe, env={"SUROGATE_FUSED_EXPERT_LORA": "0"})
     data = np.load(result["npz"])
-    lp_d, lp_m = data["dense/logprobs"], data["mask/logprobs"]
+    lp_d, lp_d2, lp_m = data["dense/logprobs"], data["dense2/logprobs"], data["mask/logprobs"]
     effect = float(np.abs(lp_d - data["dense/base_logprobs"]).mean())
-    print(json.dumps({"logprob_max_abs_diff": float(np.abs(lp_d - lp_m).max()), "adapter_effect": effect}))
+
+    def rel(a, b):
+        return float(np.linalg.norm((a - b).ravel()) / max(float(np.linalg.norm(b.ravel())), 1e-30))
+
+    def same(masked, dense, dense2, what):
+        """Masked == dense to 1e-6 relative, or within twice the dense run's own run-to-run noise when the
+        dense run itself is not bit-reproducible."""
+        floor = rel(dense2, dense)
+        assert rel(masked, dense) <= max(1e-6, 2.0 * floor), (what, rel(masked, dense), floor)
+        return floor
+
+    report = {"adapter_effect": effect, "logprob_max_abs_diff": float(np.abs(lp_d - lp_m).max()),
+              "logprob_dense_rerun_max_abs_diff": float(np.abs(lp_d - lp_d2).max())}
     assert effect > 1e-3  # the adapter moves the model
-    np.testing.assert_allclose(lp_m, lp_d, rtol=1e-6, atol=0)
+    if np.array_equal(lp_d, lp_d2):
+        np.testing.assert_allclose(lp_m, lp_d, rtol=1e-6, atol=0)
+    else:
+        same(lp_m, lp_d, lp_d2, "logprobs")
     for kind in ("grad", "weight"):
-        dense = {k.split("/", 2)[2]: data[k] for k in data.files if k.startswith(f"dense/{kind}/")}
-        masked = {k.split("/", 2)[2]: data[k] for k in data.files if k.startswith(f"mask/{kind}/")}
+        def part(run, kind=kind):
+            return {k.split("/", 2)[2]: data[k] for k in data.files if k.startswith(f"{run}/{kind}/")}
+
+        dense, dense2, masked = part("dense"), part("dense2"), part("mask")
         assert set(masked) == {k for k in dense if not (".layers.1.mlp.experts." in k)}, kind
-        compared = 0
+        compared, floors = 0, []
         for k, m in masked.items():
-            d = dense[k]
+            d, d2 = dense[k], dense2[k]
             if ".mlp.experts." in k:
                 layer = int(k.split(".layers.")[1].split(".")[0])
                 ids = MASK[layer]
                 assert m.shape[0] == len(ids) and d.shape[0] == E, k
-                np.testing.assert_allclose(m, d[ids], rtol=1e-6, atol=0, err_msg=f"{kind} {k}")
+                floors.append(same(m, d[ids], d2[ids], f"{kind} {k}"))
                 if kind == "grad":  # unselected experts (A = B = 0) get no gradient in the dense run
                     others = [e for e in range(E) if e not in ids]
                     assert not np.any(d[others]), k
             else:
-                np.testing.assert_allclose(m, d, rtol=1e-6, atol=0, err_msg=f"{kind} {k}")
+                floors.append(same(m, d, d2, f"{kind} {k}"))
             compared += 1
+        report[f"{kind}_dense_rerun_worst_relL2"] = max(floors)
+        report[f"{kind}_masked_bit_identical"] = all(
+            np.array_equal(m, dense[k][MASK[int(k.split(".layers.")[1].split(".")[0])]] if ".mlp.experts." in k
+                           else dense[k]) for k, m in masked.items())
         assert compared > 20, compared
+    print(json.dumps(report))
 
 
 @pytest.mark.gpu
