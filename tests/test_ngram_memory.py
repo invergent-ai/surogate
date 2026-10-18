@@ -1363,18 +1363,20 @@ def test_compare_script(tmp_path):
         d.mkdir()
         with open(d / "eval_panels.jsonl", "w") as f:
             for step in (0, 4):
-                for panel in ("P_in_a", "P_ret_b"):
+                for panel in ("P_in_a", "P_teach", "P_ret_b"):
                     for k in range(30):
                         base = 1.0 + 0.01 * k
-                        nll = base + (shift if (step == 4 and panel == "P_in_a") else 0.0) + (0.01 if step == 4 else 0.0)
+                        planted = {"P_in_a": shift, "P_teach": 2 * shift}.get(panel, 0.0)
+                        nll = base + (planted if step == 4 else 0.0) + (0.01 if step == 4 else 0.0)
                         f.write(json.dumps({"step": step, "panel": panel, "id": str(k), "tokens": 100 + k,
                                             "nll": nll}) + "\n")
         for step in (0, 4):
             with gzip.open(d / f"eval_tokens_step{step}.jsonl.gz", "wt") as f:
-                for k in range(30):
-                    lp = (-np.ones(10) * (1.0 + (0.05 if (arm == "shuf" or step == 0) else 0.0))).tolist()
-                    f.write(json.dumps({"step": step, "panel": "P_in_a", "id": str(k), "pos": list(range(10)),
-                                        "lp": lp, "bi": [0, 1, 2, 5, 9, 0, 3, 7, 1, 0], "tri": [0] * 10}) + "\n")
+                for panel, gap in (("P_in_a", 0.05), ("P_teach", 0.10)):
+                    for k in range(30):
+                        lp = (-np.ones(10) * (1.0 + (gap if (arm == "shuf" or step == 0) else 0.0))).tolist()
+                        f.write(json.dumps({"step": step, "panel": panel, "id": str(k), "pos": list(range(10)),
+                                            "lp": lp, "bi": [0, 1, 2, 5, 9, 0, 3, 7, 1, 0], "tri": [0] * 10}) + "\n")
     r = subprocess.run([sys.executable, str(script), str(tmp_path / "real"), str(tmp_path / "shuf"), "--out",
                         str(tmp_path / "c.json"), "--boot", "500"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -1384,4 +1386,7 @@ def test_compare_script(tmp_path):
     lo, hi = rep["final"]["P_in"]["real-shuf"]["ci95"]
     assert lo - 1e-9 <= -0.05 <= hi + 1e-9
     assert abs(rep["final"]["P_ret"]["real-shuf"]["mean"]) < 1e-12
-    assert abs(rep["strata"]["bi"]["unseen"]["real-shuf"]["mean"] + 0.05) < 1e-9
+    assert abs(rep["strata"]["bi"]["unseen"]["real-shuf"]["mean"] + 0.05) < 1e-9          # the pre-P_teach layout = P_in
+    assert abs(rep["strata"]["P_in"]["tri"]["unseen"]["real-shuf"]["mean"] + 0.05) < 1e-9
+    assert abs(rep["strata"]["P_teach"]["bi"]["unseen"]["real-shuf"]["mean"] + 0.10) < 1e-9
+    assert abs(rep["final"]["P_teach"]["real-shuf"]["mean"] + 0.10) < 1e-9
