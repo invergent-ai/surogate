@@ -417,6 +417,11 @@ sinfer_add_test(sinfer_anthropic_schema_test
 sinfer_add_test(sinfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
   LIBRARIES sinfer_serve)
+# Tool-call arguments as vLLM 0.31's qwen3_coder parser returns them, against its recorded outputs.
+sinfer_add_test(sinfer_vllm_tool_arguments_test
+  SOURCES test_vllm_tool_arguments.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES sinfer_serve)

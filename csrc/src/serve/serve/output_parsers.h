@@ -68,8 +68,10 @@ struct ParsedToolCalls {
     std::string content;
     std::vector<ToolCall> tool_calls;
 };
+/// `constrained`: the generation ran under the tool-call grammar (serve/tool_constraints.h).
 [[nodiscard]] ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
                                                std::size_t max_tool_name_length,
-                                               const std::vector<ToolDefinition>& tools = {});
+                                               const std::vector<ToolDefinition>& tools = {},
+                                               bool constrained = false);
 
 } // namespace sinfer::serve

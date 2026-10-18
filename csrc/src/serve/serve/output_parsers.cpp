@@ -250,7 +250,8 @@ ReasoningSplit split_reasoning(ReasoningFormat format, std::string reasoning,
 }
 
 ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
-                                 std::size_t max_tool_name_length, const std::vector<ToolDefinition>& tools) {
+                                 std::size_t max_tool_name_length, const std::vector<ToolDefinition>& tools,
+                                 bool constrained) {
     ParsedToolCalls out;
     switch (format) {
     case ToolCallFormat::None:
@@ -263,7 +264,7 @@ ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
             ? parse_muse_tool_call_output(text, max_tool_name_length, tools)
             : format == ToolCallFormat::Spark25
             ? parse_spark_tool_call_output(text, max_tool_name_length, tools)
-            : parse_qwen_tool_call_output(text, max_tool_name_length, tools);
+            : parse_qwen_tool_call_output(text, max_tool_name_length, tools, constrained);
         out.is_tool_call_response   = parsed.is_tool_call_response;
         out.content                 = std::move(parsed.content);
         out.tool_calls              = std::move(parsed.tool_calls);

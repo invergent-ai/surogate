@@ -17,6 +17,13 @@ int fail(const std::string& message) {
 
 int check(bool condition, const std::string& message) { return condition ? 0 : fail(message); }
 
+sinfer::serve::ToolDefinition tool(const std::string& name, const std::string& properties) {
+    sinfer::serve::ToolDefinition out;
+    out.name            = name;
+    out.parameters_json = R"({"type":"object","properties":)" + properties + "}";
+    return out;
+}
+
 int test_single_call() {
     const sinfer::serve::ParsedToolCallOutput parsed =
         sinfer::serve::parse_qwen_tool_call_output("Calling weather.\n"
@@ -26,7 +33,8 @@ int test_single_call() {
                                                    "<parameter=days>\n2\n</parameter>\n"
                                                    "</function>\n"
                                                    "</tool_call>",
-                                                   64);
+                                                   64,
+                                                   {tool("get_weather", R"({"city":{"type":"string"},"days":{"type":"integer"}})")});
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "single call parsed as tool response");
@@ -50,12 +58,23 @@ int test_arguments_keep_emission_order() {
         "<parameter=alpha>\n{\"y\": 1, \"b\": 2}\n</parameter>\n"
         "<parameter=mid>\n3\n</parameter>\n"
         "</function>\n</tool_call>",
-        64);
+        64, {tool("create", R"({"alpha":{"type":"object"},"mid":{"type":"integer"}})")});
     int failures = check(parsed.tool_calls.size() == 1, "one call parsed");
     if (failures != 0) { return failures; }
-    failures += check(parsed.tool_calls[0].arguments_json == R"({"zeta":"last letter","alpha":{"y":1,"b":2},"mid":3})",
+    // Serialised as vLLM serialises them (Python's json.dumps): ", " and ": " separators.
+    failures += check(parsed.tool_calls[0].arguments_json == R"({"zeta": "last letter", "alpha": {"y": 1, "b": 2}, "mid": 3})",
                       "arguments reordered: " + parsed.tool_calls[0].arguments_json);
     return failures;
+}
+
+// Without a schema for a parameter, vLLM keeps its value as text; so does the engine.
+int test_undeclared_values_stay_text() {
+    const auto parsed = sinfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n<function=f>\n<parameter=n>\n5\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n"
+        "</function>\n</tool_call>",
+        64, {tool("f", R"({"b":{"type":"boolean"}})")});
+    return check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].arguments_json == R"({"n": "5", "b": true})",
+                 "undeclared parameter stays text");
 }
 
 int test_multiple_calls_and_json_values() {
@@ -70,7 +89,7 @@ int test_multiple_calls_and_json_values() {
         "<parameter=value>\nplain text\n</parameter>\n"
         "</function>\n"
         "</tool_call>",
-        64);
+        64, {tool("first", R"({"payload":{"type":"object"}})"), tool("second", R"({"value":{"type":"string"}})")});
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "multiple calls parsed as tool response");
@@ -191,8 +210,9 @@ int test_checkpoint_json_and_schema_strings() {
     }
     const std::string duplicate = "<tool_call><function=f><parameter=x>1</parameter>"
                                   "<parameter=x>2</parameter></function></tool_call>";
-    failures += check(!parse_qwen_tool_call_output(duplicate, 64).is_tool_call_response,
-                      "duplicate parameters do not execute");
+    const auto repeated = parse_qwen_tool_call_output(duplicate, 64);
+    failures += check(repeated.tool_calls.size() == 1 && repeated.tool_calls[0].arguments_json == R"({"x": "2"})",
+                      "a repeated parameter keeps its last value, as vLLM's parser does");
     tool.parameters_json = R"({"properties":{"text":{"anyOf":[{"type":"string"},{"type":"null"}]}}})";
     const auto nullable = parse_qwen_tool_call_output(
         "<tool_call><function=files.write><parameter=text>123</parameter></function></tool_call>", 64, {tool});
@@ -219,7 +239,9 @@ int test_literal_schema_types() {
                                  "</parameter></function></tool_call>";
         const std::string spark = "<tool_call>pick<arg_key>code</arg_key><arg_value>" + raw +
                                   "</arg_value></tool_call>";
-        for (const auto& parsed : {parse_qwen_tool_call_output(qwen, 64, {tool}),
+        // Strict, so generated under the tool grammar: the XML call keeps the schema's reading where vLLM's
+        // conversion (which reads neither const nor $ref) would leave the schema.
+        for (const auto& parsed : {parse_qwen_tool_call_output(qwen, 64, {tool}, true),
                                    parse_spark_tool_call_output(spark, 64, {tool})}) {
             failures += check(parsed.tool_calls.size() == 1, "literal-schema tool call parsed");
             if (parsed.tool_calls.empty()) { continue; }
@@ -301,6 +323,7 @@ int test_gemma4_calls() {
 int main() {
     int failures = 0;
     failures += test_arguments_keep_emission_order();
+    failures += test_undeclared_values_stay_text();
     failures += test_gemma4_calls();
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();

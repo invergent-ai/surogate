@@ -1,5 +1,8 @@
 #include "serve/tool_call_parser.h"
 
+#include "serve/tool_constraints.h"
+#include "serve/vllm_tool_arguments.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -135,29 +138,11 @@ Json argument_value(const std::string& raw, const Json& schema, const std::strin
     return value.is_discarded() ? Json(raw) : value;
 }
 
-bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args, const Json& schema) {
-    constexpr std::string_view kParamOpen  = "<parameter=";
-    constexpr std::string_view kParamClose = "</parameter>";
-    if (!starts_with_at(inner, pos, kParamOpen)) { return false; }
-    const std::size_t name_begin = pos + kParamOpen.size();
-    const std::size_t name_end   = inner.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string key       = std::string(inner.substr(name_begin, name_end - name_begin));
-    if (args.contains(key)) { return false; }
-    pos                         = name_end + 1;
-    const std::size_t value_end = inner.find(kParamClose, pos);
-    if (value_end == std::string_view::npos) { return false; }
-    auto value = inner.substr(pos, value_end - pos);
-    if (value.starts_with('\n')) { value.remove_prefix(1); }
-    if (value.ends_with('\n')) { value.remove_suffix(1); }
-    const std::string raw_value(value);
-    args[key] = argument_value(raw_value, schema, key);
-    pos                         = value_end + kParamClose.size();
-    return true;
-}
+constexpr std::string_view kFunctionOpen  = "<function=";
+constexpr std::string_view kFunctionClose = "</function>";
 
 bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out,
-                        const std::vector<ToolDefinition>& tools) {
+                        const std::vector<ToolDefinition>& tools, bool constrained) {
     // Qwen3/Hermes checkpoints use JSON; Qwen3.5 and the native renderer use
     // function/parameter XML. Both have the same outer tool_call delimiters.
     auto json = Json::parse(block, nullptr, false);
@@ -166,40 +151,45 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, To
         auto args = json.value("arguments", Json::object());
         if (args.is_string()) { args = Json::parse(args.get<std::string>(), nullptr, false); }
         if (!valid_function_name(name, max_name_length) || !args.is_object()) { return false; }
-        out.id = new_tool_call_id(); out.name = name; out.arguments_json = args.dump();
+        out.id = new_tool_call_id(); out.name = name; out.arguments_json = vllm_args::python_json_dumps(args);
         return true;
     }
-    constexpr std::string_view kFunctionOpen  = "<function=";
-    constexpr std::string_view kFunctionClose = "</function>";
-    std::size_t pos                           = 0;
+    std::size_t pos = 0;
     skip_ws(block, pos);
     if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
     const std::size_t name_begin = pos + kFunctionOpen.size();
     const std::size_t name_end   = block.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
+    if (name_end == std::string_view::npos) { return false; }
+    // vLLM reads the name up to the first '>' and strips it.
+    const std::string name = vllm_args::python_strip(block.substr(name_begin, name_end - name_begin));
     if (!valid_function_name(name, max_name_length)) { return false; }
     pos = name_end + 1;
 
     const std::size_t function_end = block.find(kFunctionClose, pos);
     if (function_end == std::string_view::npos) { return false; }
-    const std::string_view params = block.substr(pos, function_end - pos);
-    Json args                     = Json::object();
-    const Json schema = function_schema(name, tools);
-    std::size_t param_pos         = 0;
-    for (;;) {
-        skip_ws(params, param_pos);
-        if (param_pos >= params.size()) { break; }
-        if (!parse_parameter(params, param_pos, args, schema)) { return false; }
-    }
-
+    const vllm_args::Parameters parameters =
+        vllm_args::extract_qwen3_parameters(block.substr(pos, function_end - pos));
     pos = function_end + kFunctionClose.size();
     skip_ws(block, pos);
     if (pos != block.size()) { return false; }
 
-    out.id             = new_tool_call_id();
-    out.name           = name;
-    out.arguments_json = args.dump();
+    // The values as vLLM types them (serve/vllm_tool_arguments.h).
+    const Json schema = function_schema(name, tools);
+    out.arguments_json = vllm_args::qwen3_arguments_json(
+        parameters, schema.contains("properties") ? schema.at("properties") : Json());
+    if (constrained) {
+        // The grammar wrote each value as the schema types it: a string as its bytes, anything else as JSON.
+        // vLLM's reading loses that where the schema is one it does not read ($ref, const, an enum mixing
+        // strings with numbers); keep the schema's reading then, so a strict call still matches its schema.
+        const auto tool = std::find_if(tools.begin(), tools.end(), [&](const auto& item) { return item.name == name; });
+        if (tool != tools.end() && !tool_arguments_match_schema(*tool, out.arguments_json)) {
+            Json args = Json::object();
+            for (const auto& [key, raw] : parameters) { args[key] = argument_value(raw, schema, key); }
+            out.arguments_json = vllm_args::python_json_dumps(args);
+        }
+    }
+    out.id   = new_tool_call_id();
+    out.name = name;
     return true;
 }
 
@@ -398,7 +388,8 @@ ParsedToolCallOutput fallback(const std::string& text) {
 
 static ParsedToolCallOutput parse_tagged_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length, bool spark,
-                                                 const std::vector<ToolDefinition>& tools) {
+                                                 const std::vector<ToolDefinition>& tools,
+                                                 bool constrained) {
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
@@ -430,11 +421,22 @@ static ParsedToolCallOutput parse_tagged_tool_call_output(const std::string& tex
                 close = text.find(kToolClose, close + kToolClose.size());
             }
             if (close == std::string::npos) { return fallback(text); }
+        } else if (!spark && starts_with_at(text, body_begin, kFunctionOpen)) {
+            // A parameter value may spell the closing marker itself (a file that holds a chat template). vLLM
+            // reads such a value as text up to the call's </function>; close after it.
+            const std::size_t name_end     = text.find('>', body_begin);
+            const std::size_t function_end = name_end == std::string::npos ? std::string::npos
+                                                                           : text.find(kFunctionClose, name_end);
+            if (function_end != std::string::npos) {
+                std::size_t after = function_end + kFunctionClose.size();
+                skip_ws(text, after);
+                if (starts_with_at(text, after, kToolClose)) { close = after; }
+            }
         }
         ToolCall call;
-        const auto parser = spark ? parse_spark_call : parse_one_tool_call;
-        if (!parser(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, call, tools)) {
+        const std::string_view block = std::string_view(text).substr(inner_begin, close - inner_begin);
+        if (spark ? !parse_spark_call(block, max_tool_name_length, call, tools)
+                  : !parse_one_tool_call(block, max_tool_name_length, call, tools, constrained)) {
             return fallback(text);
         }
         out.tool_calls.push_back(std::move(call));
@@ -447,13 +449,13 @@ static ParsedToolCallOutput parse_tagged_tool_call_output(const std::string& tex
 }
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text, std::size_t max_name,
-                                                const std::vector<ToolDefinition>& tools) {
-    return parse_tagged_tool_call_output(text, max_name, false, tools);
+                                                const std::vector<ToolDefinition>& tools, bool constrained) {
+    return parse_tagged_tool_call_output(text, max_name, false, tools, constrained);
 }
 
 ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text, std::size_t max_name,
                                                  const std::vector<ToolDefinition>& tools) {
-    return parse_tagged_tool_call_output(text, max_name, true, tools);
+    return parse_tagged_tool_call_output(text, max_name, true, tools, false);
 }
 
 ParsedToolCallOutput parse_muse_tool_call_output(const std::string& text,

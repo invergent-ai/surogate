@@ -15,9 +15,13 @@ struct ParsedToolCallOutput {
     std::vector<ToolCall> tool_calls;
 };
 
+// Function/parameter XML (or JSON) inside `<tool_call>`, with the argument values converted as vLLM 0.31's
+// qwen3_coder / qwen3_xml parser converts them (serve/vllm_tool_arguments.h). `constrained`: the call was generated
+// under the tool grammar, so a value vLLM's reading would take out of the tool's schema keeps the schema's reading.
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
-                                                 const std::vector<ToolDefinition>& tools = {});
+                                                 const std::vector<ToolDefinition>& tools = {},
+                                                 bool constrained = false);
 
 ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text,
                                                   std::size_t max_tool_name_length,

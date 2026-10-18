@@ -873,7 +873,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (prepared.tool_capable) {
         ParsedToolCalls parsed = parse_tool_calls(options_.tool_call_format,
             options_.tool_call_format == ToolCallFormat::MuseAtem ? result.tool_content : outcome.text,
-                                                  prepared.tool_name_max_length, prepared.tools);
+                                                  prepared.tool_name_max_length, prepared.tools,
+                                                  prepared.constrained_tools);
         if (options_.tool_call_format == ToolCallFormat::MuseAtem) { parsed.content = outcome.text; }
         if (!prepared.parallel_tool_calls && parsed.tool_calls.size() > 1) { parsed.tool_calls.resize(1); }
         if ((outcome.finish_reason != sinfer::FinishReason::StopToken &&
