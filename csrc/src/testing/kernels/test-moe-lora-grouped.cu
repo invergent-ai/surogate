@@ -7,7 +7,14 @@
 // tile sizes, both accumulate modes, grids sized with and without the host copy
 // of the offsets, and 300 experts (multi-pass tile scan); reruns must be
 // bit-identical; unsupported shapes and a short workspace launch nothing.
+//
+// Compact expert LoRA (lora_expert_mask): the cuBLAS-path LoRA sequence of the
+// grouped MoE ops with [K, ...] adapters over an active-expert list equals the
+// full [E, ...] layout whose B is zero for the other experts, bit for bit, and
+// stale (NaN) temporaries cannot leak into the output once the product
+// temporary is cleared before its B-GEMM.
 #include <catch2/catch_test_macros.hpp>
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -429,4 +436,233 @@ TEST_CASE("Fused grouped expert LoRA rejects unsupported shapes without launchin
     REQUIRE(cudaGetLastError() == cudaSuccess);
     require_same_bits(dx.read(in.dx0.size()), in.dx0, "workspace rejection leaves dx untouched");
     require_same_bits(dA.read(in.dA0.size()), in.dA0, "workspace rejection leaves dA untouched");
+}
+
+// ---------------------------------------------------------------------------
+// Compact expert LoRA (lora_expert_mask)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+nv_bfloat16 bf16_nan() {
+    const std::uint16_t bits = 0x7FC0;
+    nv_bfloat16 v;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+bool all_finite(const std::vector<nv_bfloat16>& v) {
+    return std::all_of(v.begin(), v.end(), [](nv_bfloat16 e) { return std::isfinite(__bfloat162float(e)); });
+}
+
+struct MaskedProblem {
+    int E = 0;
+    int in = 0;
+    int out = 0;
+    int rank = 0;
+    float scaling = 1.0f;
+    std::vector<int> offsets;  // host copy, E + 1 entries
+    int T = 0;                 // routed rows (tokens x top-k)
+};
+
+struct MaskedResult {
+    std::vector<nv_bfloat16> out, dx, dA, dB;
+};
+
+// The grouped expert-LoRA sequence of the MoE ops' cuBLAS path for one projection
+// (moe_grouped_gemm_gate_up.cpp), with the expert arguments those ops pass:
+//   forward   h = s * (x A^T);  tmp = h B^T (beta 0);  out += tmp     -- the whole temporary is added
+//   backward  h = s * (x A^T);  dB = d_out^T h;  g = s * (d_out B);  dA = g^T x;  dx += g A
+// `active` = nullptr: the [E, ...] layout. Otherwise the [K, ...] compact layout, row s = expert active[s],
+// as the ops run a lora_expert_mask layer. `poison` fills every temporary with NaN first (what an earlier
+// layer or step may leave in the run state's reused buffers); `clear_temp` is the ops' fix: tmp is zeroed
+// before its B-GEMM, because that GEMM writes the selected experts' rows only.
+MaskedResult run_masked_sequence(const MaskedProblem& p,
+                                 const std::vector<nv_bfloat16>& x,
+                                 const std::vector<nv_bfloat16>& A,
+                                 const std::vector<nv_bfloat16>& B,
+                                 const std::vector<nv_bfloat16>& out0,
+                                 const std::vector<nv_bfloat16>& d_out,
+                                 const std::vector<nv_bfloat16>& dx0,
+                                 const std::vector<int>* active,
+                                 bool clear_temp,
+                                 bool poison,
+                                 cublasHandle_t handle) {
+    const bool compact = active != nullptr;
+    const int rows = compact ? static_cast<int>(active->size()) : p.E;
+    const int* act = compact ? active->data() : nullptr;
+    const int n_act = compact ? static_cast<int>(active->size()) : -1;
+    const std::size_t T = p.T, R = p.rank, I = p.in, O = p.out;
+    const nv_bfloat16 zero = __float2bfloat16(0.0f);
+    const nv_bfloat16 fill = poison ? bf16_nan() : zero;
+    const int* host = p.offsets.data();
+    cudaStream_t stream = nullptr;
+
+    Device<int> offsets(p.offsets);
+    Device<nv_bfloat16> xd(x), Ad(A), Bd(B), outd(out0), doutd(d_out), dxd(dx0);
+    Device<nv_bfloat16> h(std::vector<nv_bfloat16>(T * R, fill)), g(std::vector<nv_bfloat16>(T * R, fill));
+    Device<nv_bfloat16> tmp(std::vector<nv_bfloat16>(T * O, fill));
+    Device<nv_bfloat16> dA(std::vector<nv_bfloat16>(static_cast<std::size_t>(rows) * R * I, zero));
+    Device<nv_bfloat16> dB(std::vector<nv_bfloat16>(static_cast<std::size_t>(rows) * O * R, zero));
+    const float half_s = 0.5f * p.scaling;  // vector_add(t, t, t, 0.5 s) scales by s, as the ops do
+
+    // Forward.
+    moe_grouped_gemm(h.ptr, xd.ptr, Ad.ptr, offsets.ptr, p.E, p.rank, p.in, handle, stream, host, 1.0f, 0.0f,
+                     EMMTranspose::TN, act, compact, n_act);
+    vector_add(h.ptr, h.ptr, h.ptr, half_s, static_cast<long>(T * R), stream);
+    if (clear_temp) REQUIRE(cudaMemsetAsync(tmp.ptr, 0, T * O * sizeof(nv_bfloat16), stream) == cudaSuccess);
+    moe_grouped_gemm(tmp.ptr, h.ptr, Bd.ptr, offsets.ptr, p.E, p.out, p.rank, handle, stream, host, 1.0f, 0.0f,
+                     EMMTranspose::TN, act, compact, n_act);
+    vector_add(outd.ptr, outd.ptr, tmp.ptr, 1.0f, static_cast<long>(T * O), stream);
+
+    // Backward: the ops recompute h into the same (possibly stale) buffer.
+    if (poison) {
+        Device<nv_bfloat16> nan_rows(std::vector<nv_bfloat16>(T * R, fill));
+        REQUIRE(cudaMemcpy(h.ptr, nan_rows.ptr, T * R * sizeof(nv_bfloat16), cudaMemcpyDeviceToDevice) ==
+                cudaSuccess);
+    }
+    moe_grouped_gemm(h.ptr, xd.ptr, Ad.ptr, offsets.ptr, p.E, p.rank, p.in, handle, stream, host, 1.0f, 0.0f,
+                     EMMTranspose::TN, act, compact, n_act);
+    vector_add(h.ptr, h.ptr, h.ptr, half_s, static_cast<long>(T * R), stream);
+    moe_grouped_gemm_weight_grad(dB.ptr, doutd.ptr, h.ptr, offsets.ptr, p.E, p.out, p.rank, handle, stream, host,
+                                 1.0f, 0.0f, act, compact, n_act);
+    moe_grouped_gemm(g.ptr, doutd.ptr, Bd.ptr, offsets.ptr, p.E, p.rank, p.out, handle, stream, host, 1.0f, 0.0f,
+                     EMMTranspose::NN, act, compact, n_act);
+    vector_add(g.ptr, g.ptr, g.ptr, half_s, static_cast<long>(T * R), stream);
+    moe_grouped_gemm_weight_grad(dA.ptr, g.ptr, xd.ptr, offsets.ptr, p.E, p.rank, p.in, handle, stream, host, 1.0f,
+                                 0.0f, act, compact, n_act);
+    moe_grouped_gemm(dxd.ptr, g.ptr, Ad.ptr, offsets.ptr, p.E, p.in, p.rank, handle, stream, host, 1.0f, 1.0f,
+                     EMMTranspose::NN, act, compact, n_act);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+
+    MaskedResult r;
+    r.out = outd.read(T * O);
+    r.dx = dxd.read(T * I);
+    r.dA = dA.read(static_cast<std::size_t>(rows) * R * I);
+    r.dB = dB.read(static_cast<std::size_t>(rows) * O * R);
+    return r;
+}
+
+std::vector<nv_bfloat16> expert_rows(const std::vector<nv_bfloat16>& full, std::size_t row_elems,
+                                     const std::vector<int>& ids) {
+    std::vector<nv_bfloat16> rows;
+    rows.reserve(ids.size() * row_elems);
+    for (int e : ids) {
+        rows.insert(rows.end(), full.begin() + static_cast<long>(e * row_elems),
+                    full.begin() + static_cast<long>((e + 1) * row_elems));
+    }
+    return rows;
+}
+
+void run_masked_case(int rank, const std::vector<int>& counts, const std::vector<int>& active, unsigned seed) {
+    MaskedProblem p;
+    p.E = static_cast<int>(counts.size());
+    p.in = 64;   // C
+    p.out = 32;  // M (expert width)
+    p.rank = rank;
+    p.scaling = 2.0f;
+    p.offsets.assign(p.E + 1, 0);
+    for (int e = 0; e < p.E; ++e) p.offsets[e + 1] = p.offsets[e] + counts[e];
+    p.T = p.offsets[p.E];
+    INFO("rank=" << rank << " seed=" << seed << " rows=" << p.T);
+    const std::size_t T = p.T, R = rank, I = p.in, O = p.out, E = p.E;
+
+    std::mt19937 gen(seed);
+    auto random = [&](std::size_t n, float scale) {
+        std::uniform_real_distribution<float> dist(-scale, scale);
+        std::vector<nv_bfloat16> v(n);
+        for (auto& e : v) e = __float2bfloat16(dist(gen));
+        return v;
+    };
+    const auto x = random(T * I, 1.0f), out0 = random(T * O, 1.0f), d_out = random(T * O, 1.0f),
+               dx0 = random(T * I, 1.0f);
+    const auto A_full = random(E * R * I, 0.125f);
+    auto B_full = random(E * O * R, 0.5f);
+    // The dense reference: B of every unselected expert is zero, so only the selected experts adapt.
+    for (int e = 0; e < p.E; ++e) {
+        if (std::find(active.begin(), active.end(), e) == active.end()) {
+            std::fill(B_full.begin() + static_cast<long>(e * O * R), B_full.begin() + static_cast<long>((e + 1) * O * R),
+                      __float2bfloat16(0.0f));
+        }
+    }
+    const auto A_compact = expert_rows(A_full, R * I, active);
+    const auto B_compact = expert_rows(B_full, O * R, active);
+
+    cublasHandle_t handle{};
+    REQUIRE(cublasCreate(&handle) == CUBLAS_STATUS_SUCCESS);
+    const MaskedResult dense =
+        run_masked_sequence(p, x, A_full, B_full, out0, d_out, dx0, nullptr, /*clear_temp=*/false, false, handle);
+    const MaskedResult compact =
+        run_masked_sequence(p, x, A_compact, B_compact, out0, d_out, dx0, &active, /*clear_temp=*/true, false, handle);
+    // Forward output and dx: equal bit for bit (same per-expert GEMMs; the other experts add exactly zero).
+    require_same_bits(compact.out, dense.out, "compact out == dense out with B = 0 elsewhere");
+    require_same_bits(compact.dx, dense.dx, "compact dx == dense dx");
+    // Unselected experts leave their rows untouched: out = out0 and dx = dx0 there.
+    for (int e = 0; e < p.E; ++e) {
+        if (std::find(active.begin(), active.end(), e) != active.end()) continue;
+        for (std::size_t t = static_cast<std::size_t>(p.offsets[e]); t < static_cast<std::size_t>(p.offsets[e + 1]);
+             ++t) {
+            REQUIRE(std::memcmp(&compact.out[t * O], &out0[t * O], O * sizeof(nv_bfloat16)) == 0);
+            REQUIRE(std::memcmp(&compact.dx[t * I], &dx0[t * I], I * sizeof(nv_bfloat16)) == 0);
+        }
+    }
+    // The selected experts' gradients: equal bit for bit.
+    require_same_bits(compact.dA, expert_rows(dense.dA, R * I, active), "compact dA == dense dA (selected)");
+    require_same_bits(compact.dB, expert_rows(dense.dB, O * R, active), "compact dB == dense dB (selected)");
+    REQUIRE(all_finite(compact.out));
+    REQUIRE(all_finite(compact.dA));
+    REQUIRE(all_finite(compact.dB));
+
+    // Poison: NaN in every temporary. With the product temporary cleared before its B-GEMM, as the ops do,
+    // nothing stale reaches out, dx, dA or dB: same bits as before.
+    const MaskedResult poisoned =
+        run_masked_sequence(p, x, A_compact, B_compact, out0, d_out, dx0, &active, /*clear_temp=*/true, true, handle);
+    REQUIRE(all_finite(poisoned.out));
+    REQUIRE(all_finite(poisoned.dx));
+    require_same_bits(poisoned.out, compact.out, "poisoned temporaries: out unchanged");
+    require_same_bits(poisoned.dx, compact.dx, "poisoned temporaries: dx unchanged");
+    require_same_bits(poisoned.dA, compact.dA, "poisoned temporaries: dA unchanged");
+    require_same_bits(poisoned.dB, compact.dB, "poisoned temporaries: dB unchanged");
+    // ... and without that clear the stale rows do leak (the test can see the bug it guards against),
+    // whenever an unselected expert has tokens.
+    bool unselected_tokens = false;
+    for (int e = 0; e < p.E; ++e) {
+        if (std::find(active.begin(), active.end(), e) == active.end() && counts[e] > 0) unselected_tokens = true;
+    }
+    if (unselected_tokens) {
+        const MaskedResult leaked = run_masked_sequence(p, x, A_compact, B_compact, out0, d_out, dx0, &active,
+                                                        /*clear_temp=*/false, true, handle);
+        REQUIRE_FALSE(all_finite(leaked.out));
+    }
+    REQUIRE(cublasDestroy(handle) == CUBLAS_STATUS_SUCCESS);
+}
+
+}  // namespace
+
+TEST_CASE("Compact grouped expert LoRA equals the dense LoRA with unselected experts zeroed",
+          "[moe][lora][grouped][mask]") {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA device required");
+    // E = 16, top-2 over 32 tokens: 64 routed rows, random per-expert counts (seeded), active {1, 5, 9}.
+    std::mt19937 gen(20261018);
+    std::vector<int> counts(16, 0);
+    std::uniform_int_distribution<int> pick(0, 15);
+    for (int t = 0; t < 32; ++t) {
+        const int a = pick(gen);
+        int b = pick(gen);
+        while (b == a) b = pick(gen);
+        ++counts[a];
+        ++counts[b];
+    }
+    const std::vector<int> active = {1, 5, 9};
+    for (int rank : {4, 8}) {  // 4: the per-expert cublasGemmEx loop; 8: the CUTLASS grouped kernel
+        run_masked_case(rank, counts, active, 11u + static_cast<unsigned>(rank));
+        // A selected expert without tokens, and an expert list of one.
+        auto sparse = counts;
+        sparse[5] = 0;
+        sparse[6] += counts[5];
+        run_masked_case(rank, sparse, active, 23u + static_cast<unsigned>(rank));
+        run_masked_case(rank, counts, std::vector<int>{15}, 31u + static_cast<unsigned>(rank));
+    }
 }
