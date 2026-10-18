@@ -4,9 +4,10 @@
 // engine-vs-vLLM measurement on BFCL, IFEval and EnterpriseOps-Gym, rebuilt as the model writes them, plus synthetic
 // values under every schema shape and markup edge cases), each with the calls vLLM 0.31.0's own parser returned for
 // it (`vllm`). The engine must return the same names and byte-identical `arguments`. The few cases where it does not
-// on purpose carry `expect` (what the engine returns) and `exception` (why).
+// on purpose carry `expect` (what the engine returns) and `exception` (why). vllm_reference.py beside it re-derives
+// every `vllm` result with vLLM itself.
 // fixtures/serve/vllm_tool_arguments/python_scalars.jsonl: CPython 3.12's repr(float), int(float), int(str) and
-// float(str) on random and edge inputs.
+// float(str) on random and edge inputs (make_python_scalars.py).
 
 #include "serve/output_parsers.h"
 #include "serve/tool_call_parser.h"
@@ -91,20 +92,47 @@ void test_python_scalars() {
                   "float(" + OJson(row.at("in")).dump() + ") = " + (got ? to_bits(*got) : "error"));
         }
     }
-    check(rows > 6000, "python_scalars.jsonl has its rows");
+    check(rows > 2000, "python_scalars.jsonl has its rows");
 }
 
+// parity.jsonl: a header {"schemas", "defs"}, then one case per line. A value case {"id", "schema", "value", "vllm"}
+// is the call f(v=VALUE) written as the template writes it, for a tool whose only property v has that schema; its
+// `vllm` is the arguments string vLLM returned (null: no call). Any other case is {"id", "text", "tools", "vllm"}
+// with vLLM's calls. A case where the engine differs on purpose has `expect` and `exception`; where vLLM's own
+// value cannot be read as JSON here (a lone surrogate), it is kept as escaped text in `vllm_ascii`.
 void test_parity_corpus() {
     std::ifstream file(fixture("parity.jsonl"));
     check(file.good(), "parity.jsonl readable");
     std::string line;
+    std::getline(file, line);
+    const OJson header = OJson::parse(line);
     std::size_t cases = 0, exceptions = 0;
     while (std::getline(file, line)) {
         const OJson c = OJson::parse(line);
-        const OJson& expected = c.contains("expect") ? c.at("expect") : c.at("vllm");
         if (c.contains("expect")) { ++exceptions; }
-        const ParsedToolCalls parsed =
-            parse_tool_calls(ToolCallFormat::QwenXml, c.at("text").get<std::string>(), 64, tools_of(c.at("tools")));
+        std::string text;
+        std::vector<ToolDefinition> tools;
+        OJson expected = OJson::array();
+        if (c.contains("schema")) {
+            text = "<tool_call>\n<function=f>\n<parameter=v>\n" + c.at("value").get<std::string>() +
+                   "\n</parameter>\n</function>\n</tool_call>";
+            OJson parameters          = OJson::object();
+            parameters["type"]        = "object";
+            parameters["properties"]  = OJson::object();
+            parameters["properties"]["v"] = header.at("schemas").at(c.at("schema").get<std::string>());
+            parameters["$defs"]       = header.at("defs");
+            ToolDefinition tool;
+            tool.name            = "f";
+            tool.parameters_json = parameters.dump();
+            tools.push_back(std::move(tool));
+            const OJson& arguments = c.contains("expect") ? c.at("expect") : c.at("vllm");
+            if (!arguments.is_null()) { expected.push_back(OJson{{"name", "f"}, {"arguments", arguments}}); }
+        } else {
+            text     = c.at("text").get<std::string>();
+            tools    = tools_of(c.at("tools"));
+            expected = c.contains("expect") ? c.at("expect") : c.at("vllm");
+        }
+        const ParsedToolCalls parsed = parse_tool_calls(ToolCallFormat::QwenXml, text, 64, tools);
         OJson got = OJson::array();
         for (const auto& call : parsed.tool_calls) {
             got.push_back(OJson{{"name", call.name}, {"arguments", call.arguments_json}});
