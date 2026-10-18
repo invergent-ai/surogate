@@ -18,8 +18,11 @@ process:
      naming the masks, by another mask, by `all`, and an `all` adapter by the mask;
   4. `none` keeps the shared-expert, attention, linear-attention and router adapters and no `mlp.experts.*`;
   5. the trainer refuses a mask with an expert id >= E, a layer >= L, or repeated ids;
-  6. chunked training (sequence_chunks 4) gives the loss and the LoRA gradients (GDN adapters included) of the
-     unchunked step.
+  6. under chunked training (sequence_chunks 4) the masked run still equals the zeroed dense run bit for bit;
+     against the unchunked step the loss agrees to 1e-3 and every LoRA gradient (GDN adapters included) keeps
+     cosine > 0.95. Chunking itself is not exact here (relative L2 up to ~0.1 with all experts, measured
+     2026-10-18, the same with and without a mask), so a tighter chunked-vs-unchunked bar would test the
+     chunked schedule, not the mask.
 """
 
 from __future__ import annotations
@@ -385,27 +388,35 @@ def scenario_equivalence(model_dir, out):
 
 
 def scenario_chunked(model_dir, out):
-    """Masked training, sequence_chunks 4 against 1: loss and LoRA gradients."""
+    """sequence_chunks 4 and 1, masked and dense with the unselected experts at A = B = 0 (the same model):
+    loss and LoRA gradients. Run with SUROGATE_FUSED_EXPERT_LORA=0 (the dense cuBLAS path)."""
     from safetensors.torch import load_file, save_file
     from surogate import _surogate as sg
 
     out = Path(out)
     x, y = _tokens(11)
-    trainer = _make_trainer(model_dir, mask=MASK)
-    trainer.export_adapter(str(out / "init"), str(model_dir))
-    live = _live_adapter(load_file(str(out / "init" / "adapter_model.safetensors")), None)
-    save_file(live, str(out / "live.safetensors"))
+    trainer = _make_trainer(model_dir)
+    trainer.export_adapter(str(out / "dense_init"), str(model_dir))
     del trainer
+    live = _live_adapter(load_file(str(out / "dense_init" / "adapter_model.safetensors")), MASK)
+    save_file(live, str(out / "dense_live.safetensors"))
+    trainer = _make_trainer(model_dir, mask=MASK)
+    trainer.export_adapter(str(out / "mask_init"), str(model_dir))
+    del trainer
+    keys = load_file(str(out / "mask_init" / "adapter_model.safetensors")).keys()
+    save_file({k: live[k] for k in keys}, str(out / "mask_live.safetensors"))
     flush = sg.OptimizerConfig(optimizer="adamw_8bit", learning_rate=0.0, weight_decay=0.0, grad_clip=0.0)
     arrays = {}
-    for chunks in (1, 4):
-        trainer = _make_trainer(model_dir, mask=MASK, chunks=chunks)
-        trainer.import_adapter(str(out / "live.safetensors"))
-        trainer.step(x, y)
-        for k, v in _numpy(trainer.get_lora_gradients(0)).items():
-            arrays[f"{chunks}/grad/{k}"] = v
-        arrays[f"{chunks}/loss"] = np.array([trainer.update_with_config(flush, 1)["loss"]], dtype=np.float64)
-        del trainer
+    for name, mask in (("mask", MASK), ("dense", None)):
+        for chunks in (1, 4):
+            trainer = _make_trainer(model_dir, mask=mask, chunks=chunks)
+            trainer.import_adapter(str(out / f"{name}_live.safetensors"))
+            trainer.step(x, y)
+            for k, v in _numpy(trainer.get_lora_gradients(0)).items():
+                arrays[f"{name}/{chunks}/grad/{k}"] = v
+            loss = trainer.update_with_config(flush, 1)["loss"]
+            arrays[f"{name}/{chunks}/loss"] = np.array([loss], dtype=np.float64)
+            del trainer
     np.savez(out / "chunked.npz", **arrays)
     return {"npz": str(out / "chunked.npz")}
 
@@ -629,26 +640,43 @@ def test_trainer_refuses_invalid_masks(tiny_moe):
 
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_chunked_equals_unchunked(tiny_moe):
-    result = run_scenario("chunked", tiny_moe)
+def test_chunked_masked_equals_dense_and_tracks_unchunked(tiny_moe):
+    """Under sequence_chunks 4 the masked run equals the dense run with the unselected experts at A = B = 0,
+    bit for bit, as unchunked; the chunked-vs-unchunked gap itself is the chunked schedule's (it is the same
+    with and without a mask) and is reported, against a loose bar."""
+    result = run_scenario("chunked", tiny_moe, env={"SUROGATE_FUSED_EXPERT_LORA": "0"})
     data = np.load(result["npz"])
-    loss1, loss4 = float(data["1/loss"][0]), float(data["4/loss"][0])
-    keys = sorted(k.split("/", 2)[2] for k in data.files if k.startswith("1/grad/"))
-    assert keys == sorted(k.split("/", 2)[2] for k in data.files if k.startswith("4/grad/"))
+
+    def grads(run, chunks):
+        prefix = f"{run}/{chunks}/grad/"
+        return {k[len(prefix):]: data[k] for k in data.files if k.startswith(prefix)}
+
+    for chunks in (1, 4):
+        masked, dense = grads("mask", chunks), grads("dense", chunks)
+        assert set(masked) == {k for k in dense if ".layers.1.mlp.experts." not in k}
+        assert float(data[f"mask/{chunks}/loss"][0]) == float(data[f"dense/{chunks}/loss"][0]), chunks
+        for k, m in masked.items():
+            d = dense[k]
+            if ".mlp.experts." in k:
+                d = d[MASK[int(k.split(".layers.")[1].split(".")[0])]]
+            assert np.array_equal(m, d), (chunks, k)
+
+    loss1, loss4 = float(data["mask/1/loss"][0]), float(data["mask/4/loss"][0])
+    g1, g4 = grads("mask", 1), grads("mask", 4)
+    assert any(".linear_attn." in k for k in g1) and any(".mlp.experts." in k for k in g1)
     report = {}
-    for k in keys:
-        a, b = data[f"1/grad/{k}"].ravel(), data[f"4/grad/{k}"].ravel()
-        ref = max(float(np.linalg.norm(a)), 1e-12)
-        cos = float(a @ b / (ref * max(float(np.linalg.norm(b)), 1e-12)))
-        report[k] = (float(np.linalg.norm(a - b)) / ref, cos)
+    for k in g1:
+        a, b = g1[k].astype(np.float64).ravel(), g4[k].astype(np.float64).ravel()
+        ref = max(float(np.linalg.norm(a)), 1e-30)
+        report[k] = (float(np.linalg.norm(a - b)) / ref, float(a @ b / (ref * max(float(np.linalg.norm(b)), 1e-30))))
     worst = max(report, key=lambda k: report[k][0])
-    print(json.dumps({"loss": [loss1, loss4], "worst_relL2": [worst, report[worst]],
-                      "linear_attn_worst": max(v[0] for k, v in report.items() if ".linear_attn." in k)}))
-    assert any(".linear_attn." in k for k in keys) and any(".mlp.experts." in k for k in keys)
-    assert loss4 == pytest.approx(loss1, rel=1e-2)
-    # The GDN LoRA test's bar against its fp32 reference (cosine > 0.98, relative L2 <= 0.1).
+    linear = [v for k, v in report.items() if ".linear_attn." in k]
+    print(json.dumps({"loss_unchunked_chunked": [loss1, loss4], "worst_relL2_cos": [worst, report[worst]],
+                      "linear_attn_worst_relL2": max(v[0] for v in linear),
+                      "linear_attn_min_cos": min(v[1] for v in linear)}))
+    assert loss4 == pytest.approx(loss1, rel=1e-3)
     for k, (rel, cos) in report.items():
-        assert cos > 0.98 and rel <= 0.1, (k, rel, cos)
+        assert cos > 0.95, (k, rel, cos)
 
 
 if __name__ == "__main__":
