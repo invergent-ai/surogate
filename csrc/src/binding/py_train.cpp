@@ -2125,6 +2125,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         mod_lora.init_a_kaiming = mLoRAConfig->InitAKaimingUniform;
         mod_lora.use_rs_lora = mLoRAConfig->UseRSLoRA;
         mod_lora.train_router = mLoRAConfig->TrainRouter;
+        mod_lora.expert_mask = mLoRAConfig->ExpertMask;
         mod_lora.targets.clear();
         if (mLoRAConfig->TargetModules.count("all") > 0) {
             mod_lora.all_targets = true;

@@ -817,12 +817,50 @@ NB_MODULE(_surogate, m) {
             "- target_modules: Module name suffixes to apply LoRA to.\n"
             "- dtype: Adapter dtype.\n"
             "- use_rslora: Enable RS-LoRA scaling variant.\n"
-            "- train_router: Train MoE router gate during LoRA fine-tuning.")
+            "- train_router: Router LoRA of rank `rank` on the MoE router (the router weight stays frozen).")
         .def_rw("rank", &LoRAAdapterConfig::Rank, "LoRA rank.")
         .def_rw("alpha", &LoRAAdapterConfig::Alpha, "LoRA alpha.")
         .def_rw("dropout", &LoRAAdapterConfig::Dropout, "LoRA dropout probability.")
         .def_rw("use_rslora", &LoRAAdapterConfig::UseRSLoRA, "Whether to use RS-LoRA variant.")
-        .def_rw("train_router", &LoRAAdapterConfig::TrainRouter, "Train MoE router gate during LoRA fine-tuning.")
+        .def_rw("train_router",
+                &LoRAAdapterConfig::TrainRouter,
+                "Router LoRA of rank `rank` on the MoE router (mlp.gate); the full router weight stays frozen.")
+        .def_prop_ro(
+            "expert_mask",
+            [](const LoRAAdapterConfig* cfg) -> std::optional<std::vector<std::vector<int>>> {
+                if (!cfg->ExpertMask.Enabled) return std::nullopt;
+                return cfg->ExpertMask.Layers;
+            },
+            "Routed experts with expert LoRA per layer (lora_expert_mask), or None for every expert.")
+        .def_prop_ro(
+            "expert_mask_source",
+            [](const LoRAAdapterConfig* cfg) { return cfg->ExpertMask.Source; },
+            "Where the expert mask came from ('none' or the mask file), empty without a mask.")
+        .def(
+            "set_expert_mask",
+            [](LoRAAdapterConfig* cfg, const std::vector<std::vector<int>>& layers, const std::string& source) {
+                for (std::size_t l = 0; l < layers.size(); ++l) {
+                    const auto& ids = layers[l];
+                    for (std::size_t i = 0; i < ids.size(); ++i) {
+                        if (ids[i] < 0 || (i > 0 && ids[i] <= ids[i - 1])) {
+                            throw std::invalid_argument(fmt::format(
+                                "lora_expert_mask ({}): layer {} must list sorted, unique, non-negative expert ids",
+                                source, l));
+                        }
+                    }
+                }
+                cfg->ExpertMask.Enabled = true;
+                cfg->ExpertMask.Layers = layers;
+                cfg->ExpertMask.Source = source;
+            },
+            nb::arg("layers"),
+            nb::arg("source"),
+            "Restrict expert LoRA to the given routed experts: layers[l] = sorted expert ids of layer l; layers "
+            "past the end of the list (all of them for an empty list, i.e. lora_expert_mask: none) get none.")
+        .def(
+            "clear_expert_mask",
+            [](LoRAAdapterConfig* cfg) { cfg->ExpertMask = LoRAExpertMask{}; },
+            "Expert LoRA on every routed expert (the default).")
         .def_prop_rw(
             "target_modules",
             [](const LoRAAdapterConfig* cfg) {
@@ -850,15 +888,18 @@ NB_MODULE(_surogate, m) {
                     if (!modules.empty()) modules += ", ";
                     modules += "'" + m + "'";
                 }
+                const std::string mask =
+                    cfg.ExpertMask.Enabled ? fmt::format(", expert_mask='{}'", cfg.ExpertMask.Source) : "";
                 return fmt::format("LoRAAdapterConfig(rank={}, alpha={}, dropout={}, target_modules=[{}], dtype='{}', "
-                                   "use_rslora={}, train_router={})",
+                                   "use_rslora={}, train_router={}{})",
                                    cfg.Rank,
                                    cfg.Alpha,
                                    cfg.Dropout,
                                    modules,
                                    dtype_to_str(cfg.DType),
                                    cfg.UseRSLoRA,
-                                   cfg.TrainRouter);
+                                   cfg.TrainRouter,
+                                   mask);
             },
             "Return a debug string representation.");
 

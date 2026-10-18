@@ -592,7 +592,8 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | `lora_dropout`        | float  | `0.05`    | Dropout rate for LoRA adapters.                                            |
 | `lora_dtype`          | string | `"fp32"`  | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                         |
 | `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
-| `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
+| `train_router`        | bool   | `false`   | Router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`), trained with the other adapters and exported as `mlp.gate.lora_{A,B}`. The full router weight stays frozen. Only applies to MoE models. |
+| `lora_expert_mask`    | string | `"all"`   | Which routed experts get expert LoRA: `all`, `none` or a JSON mask file (below). Only applies to MoE models. |
 | `adapter_path`        | string | `null`    | Path to a PEFT adapter directory to merge into base weights before training. Requires `lora: true`. Not supported with pre-quantized models. |
 | `adapter_init_mode`   | string | `"merge"`  | How `adapter_path` is applied: `merge` folds it into the base weights and trains a fresh adapter; `trainable` loads it as the initial trainable adapter and continues training it. Honored by SFT, DPO, and GRPO. |
 | `merge_adapter`       | bool   | `false`   | Whether to merge LoRA adapters into the base model after training.         |
@@ -607,6 +608,29 @@ projection; the attention output stays `o_proj`. Adapters trained with `all` bef
 them with that explicit list, since an import that lacks any adapter tensor the trainer allocates is refused
 (as is optimizer state of another geometry). Serving stacks without linear-attention LoRA support need such
 adapters merged into the weights.
+
+On an MoE model `gate_proj`, `up_proj` and `down_proj` adapt the routed experts, the shared expert (`up_proj`
+and `down_proj` only) and any dense MLP together. `lora_expert_mask` narrows the routed-expert part per layer
+without touching the others:
+
+- `all` (the default): every routed expert of every MoE layer.
+- `none`: no routed expert; the shared-expert, attention, linear-attention and router adapters stay.
+- a path to a JSON mask file, e.g. one selected by expert routing statistics (ESFT):
+
+  ```json
+  {"format": "surogate-expert-mask-v1", "num_layers": 40, "num_experts": 256,
+   "layers": {"0": [3, 17, 102], "1": [9, 44], "2": []}}
+  ```
+
+  `layers` maps a layer index to the global ids of its selected experts; a layer that is not listed gets
+  none. `num_layers` and `num_experts` are optional and must match the model when given.
+
+Only the selected experts' adapters are allocated, trained and exported (`...layers.N.mlp.experts.<id>.<proj>`,
+global ids), so memory and optimizer state shrink with the selection; a selected expert starts from the same
+initial `lora_A` as without a mask. The exported `adapter_config.json` records the mask as
+`surogate_expert_mask` (the mask file format), and an adapter or checkpoint imports only into a trainer with the
+same mask. Not supported with `ep_size > 1`, `qlora_selective_expert_dequant`, rollout parity (GRPO native
+colocate on MoE models) or `gate_up_proj` targets.
 
 ## MoE Settings
 

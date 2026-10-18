@@ -284,8 +284,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         lora_target_modules (Optional[str], default to 'all'):
             List of comma-separated module names to apply LoRA adapters to.
         train_router (Optional[bool], defaults to False):
-            Train the MoE router gate weights during LoRA fine-tuning.
-            When enabled, the router weights are unfrozen and included in the adapter.
+            Add a router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`: lora_A [r, hidden],
+            lora_B [num_experts, r]) and train it with the other adapters; it is exported in the adapter as
+            `mlp.gate.lora_{A,B}`. The full router weight stays frozen, like every base weight in LoRA mode.
+        lora_expert_mask (Optional[str], defaults to 'all'):
+            Which routed experts of each MoE layer get expert LoRA (the gate_proj/up_proj/down_proj targets):
+            'all' (every expert, the default), 'none' (no routed expert; shared-expert, attention,
+            linear-attention and router adapters are kept) or the path of a JSON mask file
+            {"format": "surogate-expert-mask-v1", "num_layers": L, "num_experts": E,
+            "layers": {"0": [ids...], ...}} (unlisted layers get none). Only the selected experts' adapters are
+            allocated and exported, under their global ids; adapter_config.json records the mask as
+            `surogate_expert_mask`. Not supported with ep_size > 1, qlora_selective_expert_dequant, rollout
+            parity or gate_up_proj targets.
         router_aux_loss_coef (Optional[float], defaults to None):
             MoE auxiliary (load balancing) loss coefficient. None uses the model config default.
         router_z_loss_coef (Optional[float], defaults to None):
@@ -446,6 +456,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
+    # Routed experts with expert LoRA: None/'all' = every expert, 'none', or a mask file (lora_expert_mask.py).
+    lora_expert_mask: str | dict | None = None
     router_aux_loss_coef: float | None = None
     router_z_loss_coef: float | None = None
     qlora_fp4: bool | None = False
@@ -604,6 +616,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
         self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
         self.train_router = cfg.get("train_router", self.train_router)
+        self.lora_expert_mask = cfg.get("lora_expert_mask", self.lora_expert_mask)
         self.router_aux_loss_coef = cfg.get("router_aux_loss_coef", self.router_aux_loss_coef)
         self.router_z_loss_coef = cfg.get("router_z_loss_coef", self.router_z_loss_coef)
         self.qlora_fp4 = cfg.get("qlora_fp4", self.qlora_fp4)
@@ -1253,10 +1266,39 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if self.router_z_loss_coef is not None:
             self.runtime_config.router_z_loss_coef = float(self.router_z_loss_coef)
 
+    def resolve_lora_expert_mask(self):
+        """The parsed `lora_expert_mask` checked against the model and the run options (None = every expert)."""
+        from surogate.core.config.lora_expert_mask import (
+            check_lora_expert_mask_options,
+            parse_lora_expert_mask,
+            validate_lora_expert_mask,
+        )
+        from surogate.core.model.hf_config import HfConfigFactory
+
+        mask = parse_lora_expert_mask(self.lora_expert_mask)
+        if mask is None:
+            return None
+        check_lora_expert_mask_options(mask, lora=bool(self.lora), target_modules=self.lora_target_modules,
+                                       ep_size=self.ep_size, selective_expert_dequant=bool(
+                                           self.qlora_selective_expert_dequant))
+        config = self.model_info.config
+        num_experts = (HfConfigFactory.get_config_attr(config, "num_experts")
+                       or HfConfigFactory.get_config_attr(config, "n_routed_experts")
+                       or HfConfigFactory.get_config_attr(config, "num_local_experts") or 0)
+        num_layers = HfConfigFactory.get_config_attr(config, "num_hidden_layers") or 0
+        if not self.model_info.is_moe_model:
+            num_experts = 0
+        validate_lora_expert_mask(mask, num_layers=int(num_layers), num_experts=int(num_experts))
+        get_logger().info(f"lora_expert_mask ({mask.source}): expert LoRA on {mask.total()} of "
+                          f"{int(num_layers) * int(num_experts)} routed experts")
+        return mask
+
     def create_lora_config(self):
         # Only create LoRA config when lora is enabled
         # When lora=False, lora_config must be None so C++ uses full fine-tuning path
         if not self.lora:
+            if self.lora_expert_mask is not None and str(self.lora_expert_mask).strip().lower() != "all":
+                raise ValueError("lora_expert_mask requires lora: true")
             self.lora_config = None
             return
         self.lora_config = _surogate.LoRAAdapterConfig(
@@ -1268,6 +1310,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             use_rslora=False,
             train_router=self.train_router,
         )
+        mask = self.resolve_lora_expert_mask()
+        if mask is not None:
+            self.lora_config.set_expert_mask(mask.per_layer(), mask.source)
 
     def create_qlora_config(self):
         logger = get_logger()
