@@ -20,6 +20,11 @@ GPU, model level (a random 4-layer qwen3_5_moe, recompute on):
   * per-tensor learning rate and no weight decay for the memory tensors;
   * can it learn: memory alone on a frozen random model, synthetic n-gram language;
   * export round trip (trainer adapter -> engine export -> reload; refusals).
+GPU, the SFT CLI's step (train_step_graphed, its own chunk loop):
+  * zero init is the base model bit for bit (bf16 and fp8-hybrid, 4 chunks, grad accumulation 3, document cuts);
+  * its chunk carry is step_chunked's bit for bit (real and row-shuffled table) and chunked = unchunked;
+  * the SFT CLI end to end with smoke.yaml's and quick_{real,shuf}.yaml's option sets on a tiny full-vocabulary
+    model (all 32 chunks, panels, per-token dumps, checkpoint + resume; NGRAM_SFT_TEMPLATES, NGRAM_TOKENIZER_DIR).
 """
 
 from __future__ import annotations
@@ -610,7 +615,7 @@ def _memory_option(model_dir, residency="host", **kw):
 
 
 def _trainer(model_dir, targets, seq_len, ngram=None, chunks=1, recompute=True, lora_dtype="fp32", train_router=False,
-             recipe="bf16"):
+             recipe="bf16", grad_accum=1):
     from surogate import _surogate as sg
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
@@ -630,7 +635,7 @@ def _trainer(model_dir, targets, seq_len, ngram=None, chunks=1, recompute=True, 
     lora_config = sg.LoRAAdapterConfig(rank=8, alpha=16, dropout=0, dtype=lora_dtype, target_modules=targets,
                                        train_router=train_router)
     tr = sg.SurogateTrainer(ngpu=1, config=sg.PretrainedConfig.from_pretrained(str(model_dir), "bf16"),
-                            options=opts, batch_size=1, seq_len=seq_len // chunks, grad_accum=1,
+                            options=opts, batch_size=1, seq_len=seq_len // chunks, grad_accum=grad_accum,
                             memcpy_all_gather=True, memcpy_send_recv=True, lora_config=lora_config, qlora_config=None)
     tr.import_weights(get_model_weights_path(str(model_dir)))
     return tr
@@ -1390,3 +1395,615 @@ def test_compare_script(tmp_path):
     assert abs(rep["strata"]["P_in"]["tri"]["unseen"]["real-shuf"]["mean"] + 0.05) < 1e-9
     assert abs(rep["strata"]["P_teach"]["bi"]["unseen"]["real-shuf"]["mean"] + 0.10) < 1e-9
     assert abs(rep["final"]["P_teach"]["real-shuf"]["mean"] + 0.10) < 1e-9
+
+
+# ---------------------------------------------------------------------------------------------- the full-step path
+# The SFT CLI never calls tr.step: every optimizer step is train_step_graphed, which for sequence_chunks > 1 runs its
+# own eager chunk loop (a KV sweep left to right, then a reverse re-forward + backward per chunk). Its chunks need the
+# same two-token carry as step_chunked's (the H200 smoke of 2026-10-18 stopped at "chunk 1 has no token carry").
+
+
+def _graphed_rows(seq, n, seed, chunks=4):
+    """n rows of seq tokens for one optimizer step; the last restarts its positions inside chunk 1 and exactly at the
+    start of chunk 2 (document cuts the memory honors across the carry, as packed rows have them)."""
+    xs, ys = zip(*(_tokens(seq, seed=seed + i) for i in range(n)))
+    x, y = np.concatenate(xs), np.concatenate(ys)
+    pos = np.tile(np.arange(seq, dtype=np.int32), (n, 1))
+    T = seq // chunks
+    for start in (T + 7, 2 * T):
+        pos[-1, start:] = np.arange(seq - start, dtype=np.int32)
+    return x, y, pos
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.parametrize("recipe", ["bf16", "fp8-hybrid"])
+def test_full_step_zero_init_is_the_base_model_bit_for_bit(tiny_model, recipe):
+    """train_step_graphed with sequence_chunks 4, grad accumulation 3 and document cuts inside a chunk and at a chunk
+    start, 3 optimizer steps. W_v = 0: the first step's loss and every LoRA gradient equal the memory-off run bit for
+    bit, W_k's and the gains' gradients are exactly zero and W_v's is live; the update leaves the LoRA tensors as in
+    the base run (no clipping) and W_k / gains untouched, makes W_v live, and the next losses move."""
+    from safetensors.torch import save_file
+
+    sg = _gpu()
+    seq, ga = 128, 3
+    x, y, pos = _graphed_rows(seq, ga, seed=21)
+    opt = sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.0)  # grad_clip 0 = off
+    results = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for label, ngram in (("base", None), ("memory", _memory_option(tiny_model, only=False))):
+            tr = _trainer(tiny_model, ["all"], seq, ngram=ngram, chunks=4, lora_dtype="bf16", recipe=recipe,
+                          grad_accum=ga)
+            init, _ = _adapter(tr, tiny_model, tmp, label)
+            live = _randomized(init, seed=11)
+            save_file(live, str(tmp / f"{label}.safetensors"))
+            tr.import_adapter(str(tmp / f"{label}.safetensors"))
+            res = {"live": live, "steps": []}
+            for s in range(3):
+                r = tr.train_step_graphed(x, y, pos, opt, s + 1)
+                res["steps"].append({"loss": float(r["loss"]), "norm": float(r["norm"]),
+                                     "grads": _grads(tr) if s == 0 else None})
+                if s == 0:
+                    res["after1"] = _adapter(tr, tiny_model, tmp, label + "_after1")[0]
+            if ngram:
+                res["stats"] = tr.get_ngram_memory_stats(0, True)
+            results[label] = res
+            del tr
+            torch.cuda.empty_cache()
+    base, on = results["base"], results["memory"]
+    b0, m0 = base["steps"][0], on["steps"][0]
+    print(json.dumps({"loss": [[s["loss"] for s in base["steps"]], [s["loss"] for s in on["steps"]]],
+                      "norm": [b0["norm"], m0["norm"]], "stats": on["stats"]}))
+    assert np.float32(b0["loss"]).tobytes() == np.float32(m0["loss"]).tobytes(), (b0["loss"], m0["loss"])
+    common = set(b0["grads"]) & set(m0["grads"])
+    assert common == set(b0["grads"]) and set(m0["grads"]) - common == set(MEMORY)
+    for k in sorted(common):
+        assert torch.equal(b0["grads"][k], m0["grads"][k]), k
+    assert m0["grads"][VALUE].norm() > 0
+    assert not m0["grads"][KEY].any() and not m0["grads"][NORM_K].any() and not m0["grads"][NORM_Q].any()
+    assert m0["norm"] > b0["norm"]  # the global norm covers W_v's gradient too
+    for k in base["after1"]:
+        assert torch.equal(base["after1"][k], on["after1"][k]), k
+    for k in (KEY, NORM_K, NORM_Q):
+        assert torch.equal(on["after1"][k], on["live"][k]), k
+    assert on["after1"][VALUE].float().abs().max() > 0
+    for s in (1, 2):
+        lb, lm = base["steps"][s]["loss"], on["steps"][s]["loss"]
+        assert math.isfinite(lb) and math.isfinite(lm) and lb != lm, (s, lb, lm)
+    assert on["stats"]["tokens"] > 0 and on["stats"]["out_rms_over_residual_rms"] > 0.0
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.parametrize("arm", ["real", "shuf"])
+def test_full_step_carry_is_step_chunked_and_unchunked(tiny_model, arm):
+    """Live memory (W_v != 0, perturbed gains), memory-only PEFT with fp32 masters, the real table and the
+    row-shuffled control arm, 3 rows per optimizer step.
+    (a) The quick configs' recipe (fp8-hybrid), 4 chunks: the memory gradients of train_step_graphed equal those of
+        the eager chunked step (tr.step per row) bit for bit -- the full-step loop gives every chunk the carry
+        step_chunked gives it (test_live_memory_matches_an_fp32_reference_chunked_and_not ties that one to the
+        unchunked step and an fp32 reference). The two paths' reported loss / norm differ by step_chunked's own
+        reductions (LoRA-only too), so only the gradients are compared.
+    (b) bf16, document cuts inside a chunk and at a chunk start, 2 optimizer steps: the chunked full step agrees
+        with the unchunked one (doc-masked attention) in loss, norm, memory gradients and the updated memory."""
+    from safetensors.torch import save_file
+
+    sg = _gpu()
+    seq, ga = 128, 3
+    opt = sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.0, grad_clip=1.0)
+    ngram = _memory_option(tiny_model, only=True, **({"row_shuffle": SHUFFLE} if arm == "shuf" else {}))
+    x, y, pos_cut = _graphed_rows(seq, ga, seed=31)
+    pos_plain = np.tile(np.arange(seq, dtype=np.int32), (ga, 1))
+    runs = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for label, chunks, recipe, pos, path, n_steps in (("graphed4_fp8", 4, "fp8-hybrid", pos_plain, "graphed", 1),
+                                                          ("eager4_fp8", 4, "fp8-hybrid", pos_plain, "eager", 1),
+                                                          ("graphed4", 4, "bf16", pos_cut, "graphed", 2),
+                                                          ("graphed1", 1, "bf16", pos_cut, "graphed", 2)):
+            tr = _trainer(tiny_model, [], seq, ngram=ngram, chunks=chunks, recipe=recipe, grad_accum=ga)
+            init, cfg = _adapter(tr, tiny_model, tmp, label)
+            assert set(init) == set(MEMORY)
+            assert ("row_shuffle_a" in cfg["surogate_ngram_memory"]) == (arm == "shuf")
+            live = _randomized(init, seed=5, memory_scale=0.05)
+            save_file(live, str(tmp / label / "adapter_model.safetensors"))  # beside its adapter_config.json
+            tr.import_adapter(str(tmp / label / "adapter_model.safetensors"))
+            steps = []
+            for s in range(n_steps):
+                if path == "eager":
+                    for i in range(ga):
+                        tr.step(x[i:i + 1], y[i:i + 1], pos[i:i + 1])
+                    r = tr.update_with_config(opt, s + 1)
+                else:
+                    r = tr.train_step_graphed(x, y, pos, opt, s + 1)
+                steps.append({"loss": float(r["loss"]), "norm": float(r["norm"]), "grads": _grads(tr)})
+            runs[label] = {"steps": steps, "live": live, "after": _adapter(tr, tiny_model, tmp, label + "_after")[0]}
+            del tr
+            torch.cuda.empty_cache()
+
+    def rel(a, b):
+        a, b = a.flatten().double(), b.flatten().double()
+        return float((a - b).norm() / b.norm().clamp_min(1e-30)), float(torch.nn.functional.cosine_similarity(a, b, 0))
+
+    g8, e8 = runs["graphed4_fp8"]["steps"][0], runs["eager4_fp8"]["steps"][0]
+    c4, c1 = runs["graphed4"], runs["graphed1"]
+    report = {"fp8": {"graphed4": (g8["loss"], g8["norm"]), "eager4": (e8["loss"], e8["norm"])},
+              "bf16": [{"loss": (c4["steps"][s]["loss"], c1["steps"][s]["loss"]),
+                        "norm": (c4["steps"][s]["norm"], c1["steps"][s]["norm"]),
+                        "grads": {k.split(".")[-2]: rel(c4["steps"][s]["grads"][k], c1["steps"][s]["grads"][k])
+                                  for k in MEMORY}} for s in range(2)],
+              "update": {k.split(".")[-2]: rel(c4["after"][k].float() - c4["live"][k].float(),
+                                               c1["after"][k].float() - c1["live"][k].float()) for k in MEMORY}}
+    print(json.dumps(report))
+    # (a) the carry of the full-step loop = step_chunked's, bit for bit
+    for k in MEMORY:
+        assert torch.equal(g8["grads"][k], e8["grads"][k]), k
+    assert g8["grads"][KEY].norm() > 0 and g8["grads"][VALUE].norm() > 0
+    # (b) chunked = unchunked within bf16 noise. Measured (real / shuf): loss 5e-6 / 6e-5, norm <= 1.2e-3 relative,
+    # W_v 0.3-0.5%; W_k and the gains, second-order in the residual gradient's bf16 noise (see the live-memory test),
+    # 2-3% at step 1 and 15-18% (cosine >= 0.984) at step 2; the updates' cosines >= 0.989.
+    for s in range(2):
+        l4, l1 = c4["steps"][s]["loss"], c1["steps"][s]["loss"]
+        n4, n1 = c4["steps"][s]["norm"], c1["steps"][s]["norm"]
+        assert abs(l4 - l1) <= 2e-4, (s, l4, l1)
+        assert abs(n4 - n1) <= 5e-3 * n1, (s, n4, n1)
+        for k, (err, cos) in report["bf16"][s]["grads"].items():
+            if k == "value_proj":
+                assert cos > 0.9999 and err <= 0.01, (s, k, err, cos)
+            else:
+                assert cos > 0.97 and err <= 0.25, (s, k, err, cos)
+    for k in MEMORY:
+        assert torch.equal(c4["live"][k], c1["live"][k]), k
+    for k, (err, cos) in report["update"].items():  # the two updates (Adam's first steps ~ lr * sign(g))
+        assert cos > (0.999 if k == VALUE.split(".")[-2] else 0.98), (k, err, cos)
+    assert c4["steps"][1]["loss"] != c4["steps"][0]["loss"]
+
+
+# ---------------------------------------------------------------------------------------------- the SFT CLI end to end
+# The H200 configs (rl/ngram-transplant-2026-10-18/train/{smoke,quick_real,quick_shuf}.yaml) on a tiny full-vocabulary
+# qwen3_5_moe, a small table with Swift-1.5's hash constants and synthetic agentic conversations long enough to fill
+# all 32 chunks. Every option of the H200 config is kept except paths and sizes (_TINY_SIZES). NGRAM_SFT_TEMPLATES=<dir>
+# reads the configs from that directory instead of the copies below. Needs a Qwen3.5 tokenizer: NGRAM_TOKENIZER_DIR or
+# QWEN3_5_MODEL_PATH.
+
+_SMOKE_TEMPLATE = """
+model: /mnt/data/work/merges/surogate37-wp1
+output_dir: /mnt/data/work/rl/sft/runs/ngram-transplant-smoke
+resume_from_checkpoint: false
+save_steps: 1000
+save_total_limit: 2
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+gpus: 1
+sample_packing: false
+sequence_len: 131072
+sequence_chunks: 32
+lmhead_chunks: 512
+num_epochs: 2
+max_steps: 3
+learning_rate: 1.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 1
+final_lr_fraction: 0.1
+max_grad_norm: 1.0
+weight_decay: 0.0
+optimizer: adamw
+adamw_beta1: 0.9
+adamw_beta2: 0.999
+recipe: fp8-hybrid
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dtype: fp32
+lora_dropout: 0.0
+recompute: true
+train_router: false
+train_vision: false
+offload_residual: false
+cpu_training: false
+qlora_fp8: false
+skip_quant_first_layers: 1
+skip_quant_last_layers: 2
+ngram_memory:
+  table: /mnt/data/work/rl/ngram-transplant-2026-10-18/swift15-ple/table.iq4nl
+  manifest: /mnt/data/work/rl/ngram-transplant-2026-10-18/swift15-ple/manifest.json
+  only: true
+  layer: 1
+  init_std: 0.02
+  table_residency: host
+  zero_token_ids: [248056, 248057]
+validation_split_ratio: 0.0
+eval_steps: 1000
+logging_steps: 1
+dataloader_num_workers: 4
+datasets:
+  - {path: /mnt/data/work/rl/ngram-transplant-2026-10-18/train/smoke_rows.jsonl, type: conversation,
+     messages_field: messages, tools_field: tools}
+"""
+
+_QUICK_TEMPLATE = """
+model: /mnt/data/work/merges/surogate37-wp1
+output_dir: /mnt/data/work/rl/sft/runs/ngram-quick-real
+resume_from_checkpoint: true
+save_steps: 4
+save_total_limit: 2
+train_seed: 1234
+eval_seed: 1234
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+gpus: 1
+sample_packing: false
+sequence_len: 131072
+sequence_chunks: 32
+lmhead_chunks: 512
+num_epochs: 1
+max_steps: 17
+learning_rate: 1.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 2
+final_lr_fraction: 0.1
+max_grad_norm: 1.0
+weight_decay: 0.0
+optimizer: adamw
+adamw_beta1: 0.9
+adamw_beta2: 0.999
+recipe: fp8-hybrid
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dtype: fp32
+lora_dropout: 0.0
+recompute: true
+train_router: false
+train_vision: false
+offload_residual: false
+cpu_training: false
+qlora_fp8: false
+skip_quant_first_layers: 1
+skip_quant_last_layers: 2
+ngram_memory:
+  table: /mnt/data/work/rl/ngram-transplant-2026-10-18/swift15-ple/table.iq4nl
+  manifest: /mnt/data/work/rl/ngram-transplant-2026-10-18/swift15-ple/manifest.json
+  only: true
+  layer: 1
+  init_std: 0.02
+  table_residency: host
+  zero_token_ids: [248056, 248057]
+validation_split_ratio: 0.0
+eval_steps: 1000
+eval_panels:
+  - {name: P_in_workplace, path: /d/pin_workplace.jsonl, per_token: true}
+  - {name: P_in_telecom, path: /d/pin_telecom.jsonl, per_token: true}
+  - {name: P_in_terminal, path: /d/pin_terminal.jsonl, per_token: true}
+  - {name: P_teach, path: /d/pteach.jsonl, per_token: true}
+  - {name: P_seen, path: /d/pseen.jsonl}
+  - {name: P_ret_mergecheck, path: /d/pret_mergecheck.tok.jsonl}
+  - {name: P_ret_ifeval, path: /d/pret_ifeval.jsonl}
+  - {name: P_ret_bfcl, path: /d/pret_bfcl.jsonl}
+eval_panels_steps: 4
+logging_steps: 1
+dataloader_num_workers: 4
+datasets:
+  - {path: /d/train_w1.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+  - {path: /d/train_t1.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+  - {path: /d/train_box_telecom.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+  - {path: /d/train_south_telecom.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+  - {path: /d/train_box_terminal.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+  - {path: /d/train_south_terminal.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+  - {path: /d/train_own_rst.jsonl, type: conversation, messages_field: messages, tools_field: tools}
+"""
+
+# H200: 131072 tokens in 32 chunks of 4096, 512 logit chunks of 8 tokens. Here: 1024 in 32 chunks of 32, 4 of 8.
+_TINY_SIZES = {"sequence_len": 1024, "lmhead_chunks": 4}
+
+_WORDS = ("the order account invoice ticket server deploy config network user status report quarterly customer update "
+          "database query result error retry timeout cluster region policy budget meeting schedule draft review "
+          "approve reject refund shipment warehouse inventory forecast metric latency throughput line plan device "
+          "billing roaming data voice outage restart service log file directory permission process").split()
+_TOOLS = [{"type": "function", "function": {"name": "lookup", "description": "Look up a record by id.",
+                                            "parameters": {"type": "object",
+                                                           "properties": {"id": {"type": "string"}},
+                                                           "required": ["id"]}}}]
+
+
+def _cli_text(rng, words):
+    out = []
+    for _ in range(words):
+        out.append(_WORDS[int(rng.integers(len(_WORDS)))])
+        if rng.random() < 0.08:
+            out.append(f"#{int(rng.integers(1000))}.")
+    return " ".join(out)
+
+
+def _cli_conversation(rng, k, words, tools=True):
+    msgs = [{"role": "system", "content": "You are a workplace assistant."},
+            {"role": "user", "content": f"Task {k}: " + _cli_text(rng, 25)},
+            {"role": "assistant", "content": _cli_text(rng, max(words // 3, 5))},
+            {"role": "tool", "content": json.dumps({"id": str(k), "status": _cli_text(rng, 12)})},
+            {"role": "assistant", "content": _cli_text(rng, words)}]
+    row = {"id": f"row{k}", "messages": msgs}
+    if tools:
+        row["tools"] = _TOOLS
+    else:
+        msgs.pop(0)
+        del msgs[1:3]  # user, assistant: a plain chat row (the IFEval / BFCL retention panels)
+    return row
+
+
+def _write_jsonl(path, rows):
+    with open(path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+@pytest.fixture(scope="module")
+def cli_model(tmp_path_factory):
+    """A random 4-layer full-vocabulary qwen3_5_moe with the Qwen3.5 tokenizer + a 16-head IQ4_NL table (head_dim 160)
+    described by a Swift-1.5 manifest with its own head sizes."""
+    import shutil
+
+    _gpu()
+    pytest.importorskip("transformers")
+    pytest.importorskip("yaml")
+    import transformers
+
+    tok_dir = os.environ.get("NGRAM_TOKENIZER_DIR") or os.environ.get("QWEN3_5_MODEL_PATH")
+    if not tok_dir or not (Path(tok_dir) / "tokenizer.json").exists():
+        pytest.skip("SFT CLI test: needs a Qwen3.5 tokenizer (NGRAM_TOKENIZER_DIR or QWEN3_5_MODEL_PATH)")
+    root = tmp_path_factory.mktemp("ngram_cli")
+    mdir = root / "model"
+    text = _text_config(n_layers=4, hidden=256, experts=4)
+    text.update(vocab_size=VOCAB, num_experts_per_tok=2, head_dim=64, eos_token_id=EOS,
+                rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
+                                 "mrope_section": [4, 2, 2], "mrope_interleaved": True})
+    vision = {"depth": 1, "hidden_size": 64, "intermediate_size": 128, "num_heads": 4, "out_hidden_size": 256,
+              "num_position_embeddings": 256, "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+              "in_channels": 3}
+    cfg = transformers.Qwen3_5MoeConfig(text_config=text, vision_config=vision, tie_word_embeddings=False,
+                                        image_token_id=248056, video_token_id=248057)
+    torch.manual_seed(1)
+    model = transformers.Qwen3_5MoeForConditionalGeneration(cfg).to(torch.bfloat16)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("A_log"):
+                p.copy_(torch.log(torch.empty_like(p, dtype=torch.float32).uniform_(0.5, 2.0)).to(p.dtype))
+            elif name.endswith("dt_bias"):
+                p.zero_()
+            elif p.dim() == 1:
+                p.copy_((0.1 * torch.randn_like(p, dtype=torch.float32)).to(p.dtype))
+    model.save_pretrained(mdir, safe_serialization=True)
+    del model
+    _fuse_experts(mdir, 4)
+    for f in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.jinja",
+              "special_tokens_map.json"):
+        if (Path(tok_dir) / f).exists():
+            shutil.copy(Path(tok_dir) / f, mdir / f)
+    sizes = [4099 + 2 * h for h in range(16)]
+    offsets = [int(v) for v in np.cumsum([0] + sizes[:-1])]
+    rows = sum(sizes)
+    raw = iq4nl_encode_rows((np.random.default_rng(0).standard_normal((rows, 160)) * 0.5).astype(np.float32))
+    (root / "table.iq4nl").write_bytes(raw.tobytes())
+    manifest = json.loads(json.dumps(SWIFT15_MANIFEST))
+    manifest["meta"]["qwen4exp.ple.head_offsets"] = offsets
+    manifest["meta"]["qwen4exp.ple.head_vocab_sizes"] = sizes
+    manifest["tensors"][0]["dims"] = [160, rows]
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    return root
+
+
+def _cli_templates():
+    import yaml
+
+    src = os.environ.get("NGRAM_SFT_TEMPLATES")
+    if src:
+        smoke = yaml.safe_load((Path(src) / "smoke.yaml").read_text())
+        real = yaml.safe_load((Path(src) / "quick_real.yaml").read_text())
+        shuf = yaml.safe_load((Path(src) / "quick_shuf.yaml").read_text())
+    else:
+        smoke, real = yaml.safe_load(_SMOKE_TEMPLATE), yaml.safe_load(_QUICK_TEMPLATE)
+        shuf = json.loads(json.dumps(real))
+        shuf["ngram_memory"]["row_shuffle"] = dict(SHUFFLE)
+    shuffle = shuf["ngram_memory"]["row_shuffle"]
+    smoke_shuf = json.loads(json.dumps(smoke))
+    smoke_shuf["ngram_memory"]["row_shuffle"] = dict(shuffle)
+    assert "row_shuffle" not in real["ngram_memory"] and "row_shuffle" not in smoke["ngram_memory"]
+    return {"smoke_real": smoke, "smoke_shuf": smoke_shuf, "quick_real": real, "quick_shuf": shuf}
+
+
+def _tiny_cli_config(template, root, name, max_steps):
+    """The template with paths and sizes swapped for the tiny model; its data and panel files written (same file
+    count and kinds as the template's). Steps: max_steps; panels every step and checkpoints every step (the H200
+    cadence of 4 would never fire in 2 steps)."""
+    cfg = json.loads(json.dumps(template))
+    work = root / name
+    work.mkdir(exist_ok=True)
+    cfg["model"] = str(root / "model")
+    cfg["output_dir"] = str(work / "out")
+    cfg.update(_TINY_SIZES)
+    cfg["max_steps"] = max_steps
+    assert cfg["sequence_len"] % cfg["sequence_chunks"] == 0
+    if cfg.get("resume_from_checkpoint"):
+        cfg["save_steps"] = 1
+    if cfg.get("eval_panels"):
+        cfg["eval_panels_steps"] = 1
+    cfg["ngram_memory"]["table"] = str(root / "table.iq4nl")
+    cfg["ngram_memory"]["manifest"] = str(root / "manifest.json")
+    rng = np.random.default_rng(zlib.crc32(name.split("_")[0].encode()))  # the same data for both arms
+    data = work / "data"
+    data.mkdir(exist_ok=True)
+    lengths = (30, 120, 300, 500, 800, 1200)  # assistant words: 1 to 32 chunks (1200 words: truncated to 1024 tokens)
+    k = 0
+    per_file = max(3, -(-cfg["gradient_accumulation_steps"] * (max_steps + 1) // len(cfg["datasets"])))
+    for i, ds in enumerate(cfg["datasets"]):
+        rows = [_cli_conversation(rng, k + j, lengths[(k + j) % len(lengths)] if len(cfg["datasets"]) > 1
+                                  else (1200, 500, 30)[j % 3]) for j in range(per_file)]
+        k += per_file
+        ds["path"] = str(data / f"train_{i}.jsonl")
+        _write_jsonl(ds["path"], rows)
+    for i, panel in enumerate(cfg.get("eval_panels") or []):
+        tok = str(panel["path"]).endswith(".tok.jsonl")
+        path = data / (f"panel_{i}.tok.jsonl" if tok else f"panel_{i}.jsonl")
+        if tok:
+            rows = []
+            for j, n in enumerate((90, 700, 1500)):
+                ids = rng.integers(1000, 200000, size=n).tolist()
+                ids[n // 2] = EOS
+                rows.append({"id": f"tok{j}", "ids": ids, "spans": [[10, n // 3], [n // 2 + 1, n]]})
+        else:
+            plain = "ifeval" in panel["name"] or "bfcl" in panel["name"]
+            rows = [_cli_conversation(rng, 1000 * (i + 1) + j, n, tools=not plain) for j, n in enumerate((40, 400, 900))]
+        _write_jsonl(path, rows)
+        panel["path"] = str(path)
+    return cfg
+
+
+def _run_sft(cfg, name, root):
+    """The SFT CLI as h200_run.sh runs it (python -m surogate.cli.main sft <yaml>), with the per-step loss curve
+    (SUROGATE_REGRESSION_ARTIFACT) and the chunk trace of train_step_graphed's loop."""
+    import re
+    import shutil
+    import subprocess
+    import sys
+
+    import yaml
+
+    work = root / name.split("@")[0]
+    path = work / f"{name.replace('@', '_')}.yaml"
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    curve_path = work / f"{name.replace('@', '_')}.curve.json"
+    log_path = work / f"{name.replace('@', '_')}.log"
+    short_tmp = tempfile.mkdtemp(prefix="ngcli", dir="/tmp")  # NCCL's AF_UNIX socket paths must stay short
+    env = {**os.environ, "TMPDIR": short_tmp, "SUROGATE_CHUNK_TRACE": "1", "PYTHONUNBUFFERED": "1",
+           "WANDB_MODE": "disabled", "HF_HUB_OFFLINE": "1", "SUROGATE_REGRESSION_ARTIFACT": str(curve_path)}
+    try:
+        with open(log_path, "w") as log:
+            proc = subprocess.run([sys.executable, "-m", "surogate.cli.main", "sft", str(path)], stdout=log,
+                                  stderr=subprocess.STDOUT, env=env, timeout=1800, cwd=str(work))
+    finally:
+        shutil.rmtree(short_tmp, ignore_errors=True)
+    text = log_path.read_text(errors="replace")
+    assert proc.returncode == 0, f"{name}: rc {proc.returncode}\n" + text[-6000:]
+    curve = json.loads(curve_path.read_text())["convergence_curve"]
+    chunks = [int(c) for c in re.findall(r"\[chunk\] phaseB j=\d+ c=(\d+)", text)]
+    out = Path(cfg["output_dir"])
+    stats = [json.loads(line) for line in open(out / "ngram_memory_stats.jsonl")]
+    return {"curve": curve, "max_chunk": max(chunks, default=-1), "stats": stats, "out": out, "log": text}
+
+
+def _check_cli_arm(run, cfg, steps, shuffled):
+    from safetensors.torch import load_file
+
+    assert [int(p["step"]) for p in run["curve"]] == list(range(steps[0], steps[1] + 1)), run["curve"]
+    assert all(math.isfinite(p["loss"]) and math.isfinite(p["grad_norm"]) for p in run["curve"])
+    assert run["max_chunk"] == cfg["sequence_chunks"] - 1, run["max_chunk"]  # the 1024-token rows: all 32 chunks
+    assert "Traceback" not in run["log"]
+    adapter = load_file(str(run["out"] / "adapter_model.safetensors"))
+    assert set(adapter) == set(MEMORY), sorted(adapter)  # memory-only PEFT: no LoRA tensors
+    assert adapter[KEY].shape == (256, 2560) and adapter[VALUE].float().abs().max() > 0
+    acfg = json.loads((run["out"] / "adapter_config.json").read_text())["surogate_ngram_memory"]
+    assert ("row_shuffle_a" in acfg) == shuffled
+
+
+def _first_live(curve):
+    """The first step (1-based) whose forward follows an update with lr > 0. Warmup starts at lr 0 (step 1 of every
+    run updates nothing), so until then W_v = 0 and the arms -- which read different rows -- are one model."""
+    for i, p in enumerate(curve):
+        if p["lr"] > 0:
+            return i + 2
+    return len(curve) + 1
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sft_cli_smoke_config_real_and_shuffled(cli_model):
+    """smoke.yaml's option set (1 conversation per step, 32 chunks, fp8-hybrid, memory-only, host-resident table), 3
+    steps through the SFT CLI, real table and row-shuffled: every chunk of the 1024-token rows runs (the carry); while
+    W_v = 0 (steps 1-2: step 1's lr is 0) the arms' losses and memory output are identical bit for bit although they
+    read different rows (W_v's gradient differs); after the first real update they part."""
+    tmpl = _cli_templates()
+    runs = {}
+    for arm in ("smoke_real", "smoke_shuf"):
+        cfg = _tiny_cli_config(tmpl[arm], cli_model, arm, max_steps=3)
+        runs[arm] = _run_sft(cfg, arm, cli_model)
+        _check_cli_arm(runs[arm], cfg, (1, 3), shuffled=arm.endswith("shuf"))
+    real, shuf = runs["smoke_real"], runs["smoke_shuf"]
+    print(json.dumps({arm: [(p["loss"], p["grad_norm"], p["lr"]) for p in r["curve"]] for arm, r in runs.items()}))
+    live = _first_live(real["curve"])
+    assert live == 3 and [p["lr"] for p in real["curve"]] == [p["lr"] for p in shuf["curve"]]
+    for k in range(live - 1):
+        assert real["curve"][k]["loss"] == shuf["curve"][k]["loss"], k
+    assert real["curve"][0]["grad_norm"] != shuf["curve"][0]["grad_norm"]  # W_v's gradient reads the rows
+    assert real["curve"][live - 1]["loss"] != shuf["curve"][live - 1]["loss"]
+    for r in (real, shuf):  # one line per step (logging_steps 1)
+        assert len(r["stats"]) == 3 and all(st["tokens"] > 0 for st in r["stats"]), r["stats"]
+        assert all(st["out_rms_over_residual_rms"] == 0.0 for st in r["stats"][: live - 1])
+        assert r["stats"][live - 1]["out_rms_over_residual_rms"] > 0.0
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sft_cli_quick_configs_with_panels_and_resume(cli_model):
+    """quick_real.yaml / quick_shuf.yaml's option sets (16 conversations per step over 7 files, 32 chunks, 8 panels,
+    per-token dumps), 2 steps through the SFT CLI, then a resume of each arm to step 3 from its step-1 checkpoint.
+    The per-token panels dump step 0 and the final step with training n-gram counts; the resumed step repeats the
+    original step 2 (the loss bit for bit; norm and the step-2 panels up to fp8-hybrid's delayed-scaling history,
+    which a checkpoint does not hold; warmup makes step 2's lr independent of max_steps); while W_v = 0 the arms'
+    losses and panel rows are identical bit for bit, after it they part."""
+    tmpl = _cli_templates()
+    runs = {}
+    for arm in ("quick_real", "quick_shuf"):
+        cfg = _tiny_cli_config(tmpl[arm], cli_model, arm, max_steps=2)
+        run = _run_sft(cfg, arm, cli_model)
+        _check_cli_arm(run, cfg, (1, 2), shuffled=arm.endswith("shuf"))
+        assert (run["out"] / "step_00000001").is_dir()
+        rows = [json.loads(line) for line in open(run["out"] / "eval_panels.jsonl")]
+        panels = [p["name"] for p in cfg["eval_panels"]]
+        assert len(panels) == 8
+        assert sorted({(r["step"], r["panel"]) for r in rows}) == sorted((s, p) for s in (0, 1, 2) for p in panels)
+        assert all(math.isfinite(r["nll"]) and r["tokens"] > 0 for r in rows)
+        per_token = {p["name"] for p in cfg["eval_panels"] if p.get("per_token")}
+        for step in (0, 2):
+            with gzip.open(run["out"] / f"eval_tokens_step{step}.jsonl.gz", "rt") as f:
+                dumped = [json.loads(line) for line in f]
+            assert {d["panel"] for d in dumped} == per_token
+            assert all(len(d["pos"]) == len(d["lp"]) == len(d["bi"]) == len(d["tri"]) > 0 for d in dumped)
+            assert any(b > 0 for d in dumped for b in d["bi"])  # training bigrams found in the panels
+        assert not (run["out"] / "eval_tokens_step1.jsonl.gz").exists()
+        # resume: the same config to step 3 (the checkpoint after step 1; the loader's position, Adam's moments)
+        cfg3 = json.loads(json.dumps(cfg))
+        cfg3["max_steps"] = 3
+        resumed = _run_sft(cfg3, arm + "@resume", cli_model)
+        assert [int(p["step"]) for p in resumed["curve"]] == [2, 3], resumed["curve"]
+        assert resumed["max_chunk"] == cfg["sequence_chunks"] - 1
+        # fp8-hybrid's delayed scaling keeps an amax history the checkpoint does not hold: after a resume the loss
+        # is exact, the scales after it differ (measured: 3e-4 of the norm, panel rows up to 2.5e-3 nats, mean
+        # 8e-4); the same resume in bf16 is bit for bit (loss, norm, all 24 panel rows). Not the memory's: it has no
+        # FP8 state.
+        exact = cfg["recipe"] == "bf16"
+        r2, o2 = resumed["curve"][0], run["curve"][1]
+        assert (r2["step"], r2["lr"], r2["loss"]) == (o2["step"], o2["lr"], o2["loss"]), (r2, o2)
+        assert r2["grad_norm"] == o2["grad_norm"] if exact else abs(r2["grad_norm"] - o2["grad_norm"]) <= 2e-3 * o2[
+            "grad_norm"], (r2, o2)
+        rows3 = [json.loads(line) for line in open(run["out"] / "eval_panels.jsonl")][len(rows):]
+        assert sorted({r["step"] for r in rows3}) == [2, 3]
+        before = {(r["panel"], r["id"]): r["nll"] for r in rows if r["step"] == 2}
+        after = {(r["panel"], r["id"]): r["nll"] for r in rows3 if r["step"] == 2}
+        assert before.keys() == after.keys()
+        assert all(abs(before[k] - after[k]) <= (0.0 if exact else 5e-3) for k in before), (before, after)
+        runs[arm] = {"curve": run["curve"] + resumed["curve"][1:], "rows": rows + rows3}
+    real, shuf = runs["quick_real"], runs["quick_shuf"]
+    print(json.dumps({arm: [(p["loss"], p["grad_norm"], p["lr"]) for p in r["curve"]] for arm, r in runs.items()}))
+    live = _first_live(real["curve"])
+    assert live == 3 and [p["lr"] for p in real["curve"]] == [p["lr"] for p in shuf["curve"]]
+    for k in range(live - 1):
+        assert real["curve"][k]["loss"] == shuf["curve"][k]["loss"], k
+    assert real["curve"][live - 1]["loss"] != shuf["curve"][live - 1]["loss"]
+
+    def panel(r, step):
+        return {(x["panel"], x["id"]): x["nll"] for x in r["rows"] if x["step"] == step}
+
+    for step in range(live - 1):  # the panels at step s follow s updates
+        assert panel(real, step) == panel(shuf, step) and len(panel(real, step)) == 3 * 8, step
+    for step in range(live - 1, 4):
+        assert panel(real, step) != panel(shuf, step), step

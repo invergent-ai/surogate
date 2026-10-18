@@ -1373,6 +1373,18 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     return gs.chunk_pos_scratch;
                 };
                 const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
+                // The two tokens before chunk c of the step's row (the hashed n-gram memory's context across
+                // chunks; a no-op for other models). This schedule is eager -- chunked training never captures
+                // a graph -- so the model takes host values per chunk, as in step_chunked.
+                auto set_ngram_carry = [&](const Tensor& full_inputs, int c) {
+                    std::int32_t carry[2] = {-1, -1};
+                    const auto* row = reinterpret_cast<const std::int32_t*>(full_inputs.Data);
+                    for (int k = 0; k < 2; ++k) {
+                        const long p = static_cast<long>(c) * T - 2 + k;
+                        if (p >= 0) carry[k] = row[p];
+                    }
+                    ctx.Model->set_ngram_carry(carry, 1, c);
+                };
                 // Per-chunk document geometry from position ids: packed rows
                 // restart positions at each document, so a chunk's segments
                 // and its contiguous KV window fall out of one linear scan.
@@ -1432,6 +1444,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
                         pack.kv_sweep = true;  // loss ops skipped in the KV sweep
                         ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
+                        set_ngram_carry(gs.inputs[j], c);
                         // The loss op lives in the forward graph — stage the
                         // chunk's real targets so phase A's loss terms are
                         // sane (they are wiped by the micro-0 zeroing before
@@ -1454,6 +1467,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
                         pack.reuse_ep = true;  // phase A cached this chunk's plan+splits
                         ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
+                        set_ngram_carry(gs.inputs[j], c);
                         rs.Targets_CPU = tgt_v;
                         if (chunk_trace && ctx.Communicator->rank() == 0) {
                             fprintf(stderr, "[chunk] phaseB j=%d c=%d micro_eff=%d\n", j, c, micro_eff);
