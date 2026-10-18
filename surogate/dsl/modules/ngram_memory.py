@@ -165,12 +165,12 @@ class NgramMemoryConfig:
             raise ValueError(f"ngram_memory: unknown keys {sorted(unknown)} (allowed: {sorted(allowed)})")
         if "table" not in value:
             raise ValueError("ngram_memory: 'table' (the IQ4_NL table file) is required")
-        table = str(value["table"])
+        table = os.path.abspath(str(value["table"]))  # the export and the engine read it from elsewhere
         if isinstance(value.get("meta"), dict):
             meta = TableMeta.from_manifest(value["meta"])
             manifest = value.get("manifest")
         else:
-            manifest = str(value.get("manifest") or Path(table).with_name("manifest.json"))
+            manifest = os.path.abspath(str(value.get("manifest") or Path(table).with_name("manifest.json")))
             if not os.path.exists(manifest):
                 raise ValueError(f"ngram_memory: manifest {manifest} not found")
             meta = TableMeta.from_manifest(json.loads(Path(manifest).read_text()))

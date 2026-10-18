@@ -607,13 +607,14 @@ def _memory_option(model_dir, residency="host", **kw):
             "zero_token_ids": [], **kw}
 
 
-def _trainer(model_dir, targets, seq_len, ngram=None, chunks=1, recompute=True, lora_dtype="fp32", train_router=False):
+def _trainer(model_dir, targets, seq_len, ngram=None, chunks=1, recompute=True, lora_dtype="fp32", train_router=False,
+             recipe="bf16"):
     from surogate import _surogate as sg
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
     from surogate.utils.hf import get_model_weights_path
 
-    opts = sg.RuntimeOptions(recipe="bf16", use_cuda_graphs=False, offload_master=False, offload_grads=False,
+    opts = sg.RuntimeOptions(recipe=recipe, use_cuda_graphs=False, offload_master=False, offload_grads=False,
                              offload_optimizer=False, offload_residual=False, shard_gradients=True)
     if recompute:
         opts.recompute = "true"
@@ -680,8 +681,8 @@ def _grads(tr):
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.parametrize("chunks", [1, 4])
-def test_zero_init_is_the_base_model_bit_for_bit(tiny_model, chunks):
+@pytest.mark.parametrize("chunks,recipe", [(1, "bf16"), (4, "bf16"), (4, "fp8-hybrid")])
+def test_zero_init_is_the_base_model_bit_for_bit(tiny_model, chunks, recipe):
     """W_v = 0: loss, per-token log-probs and every LoRA gradient equal the memory-off run bit for bit; the
     W_v gradient is live, the W_k / gain gradients are exactly zero (no gate gradient through v = 0)."""
     from safetensors.torch import save_file
@@ -693,7 +694,7 @@ def test_zero_init_is_the_base_model_bit_for_bit(tiny_model, chunks):
         results = {}
         for label, ngram in (("base", None), ("memory", _memory_option(tiny_model, only=False))):
             # bf16 adapters (expert LoRA needs them): the memory's masters are bf16 here too.
-            tr = _trainer(tiny_model, ["all"], seq, ngram=ngram, chunks=chunks, lora_dtype="bf16")
+            tr = _trainer(tiny_model, ["all"], seq, ngram=ngram, chunks=chunks, lora_dtype="bf16", recipe=recipe)
             init, cfg = _adapter(tr, tiny_model, tmp, label)
             if ngram:
                 assert init[KEY].shape == (HIDDEN, 512) == init[VALUE].shape
@@ -1003,8 +1004,20 @@ def test_export_round_trip_and_refusals(tiny_model):
         fresh = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model))
         fresh.import_adapter(str(tmp / "trained" / "adapter_model.safetensors"))
         assert np.array_equal(fresh.compute_logprobs(x, y, use_lora=True)[0], lp)
+        base_lp = fresh.compute_logprobs(x, y, use_lora=False)[0].copy()
         del fresh
         torch.cuda.empty_cache()
+
+        # The G2 scorer rebuilds the same trainer from the adapter's own spec and scores given ids.
+        from surogate.dsl.ngram_memory_score import build_scorer, score_rows
+
+        scorer = build_scorer(str(tiny_model), str(tmp / "trained"), seq)
+        rec = next(score_rows(scorer, [{"id": 0, "ids": [int(t) for t in x[0]]}], seq))
+        del scorer
+        torch.cuda.empty_cache()
+        assert rec["logprobs"][0] is None and len(rec["logprobs"]) == seq
+        assert np.array_equal(np.array(rec["logprobs"][1:], dtype=np.float32), lp[: seq - 1])
+        assert np.array_equal(np.array(rec["logprobs_base"][1:], dtype=np.float32), base_lp[: seq - 1])
         plain = _trainer(tiny_model, ["all"], seq)
         with pytest.raises(RuntimeError, match="carries an n-gram memory"):
             plain.import_adapter(str(tmp / "trained" / "adapter_model.safetensors"))

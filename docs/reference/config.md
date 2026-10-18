@@ -632,6 +632,41 @@ initial `lora_A` as without a mask. The exported `adapter_config.json` records t
 same mask. Not supported with `ep_size > 1`, `qlora_selective_expert_dequant`, rollout parity (GRPO native
 colocate on MoE models) or `gate_up_proj` targets.
 
+### Hashed n-gram memory (`ngram_memory`)
+
+A frozen, already trained n-gram embedding table (IQ4_NL rows, e.g. a Qwen3.8-Flash-Next-style
+`per_layer_token_embd.weight`) read by the residual stream entering one decoder layer, through trained dense
+projections: the trainer side of the serving engine's single-stream `ngram_ple` layer prologue (Qwen3.5 MoE
+family, LoRA training). Per token the 16 hashed bigram/trigram rows of the current token and its two
+predecessors in the same conversation are gathered (`e`, E = heads x head_dim values), and the residual r
+gets `sigmoid(sign(z) sqrt|z|) * W_v e` with `z = <RMSNorm(W_k e) g_k, RMSNorm(r) g_q> / sqrt(C)`. W_v starts
+at zero, so step 0 is the base model bit for bit; only W_k, W_v [C, E] and the gains g_k, g_q [C] train
+(their own learning rate, no weight decay); the table stays frozen in pinned host memory.
+
+```yaml
+lora: true
+lora_dtype: fp32            # memory masters in fp32 (bf16 when expert LoRA is combined with it)
+optimizer: adamw
+ngram_memory:
+  table: /path/table.iq4nl  # raw IQ4_NL rows (the GGUF tensor payload)
+  manifest: /path/manifest.json   # GGUF manifest with the qwen4exp.ple.* hash metadata (default: next to table)
+  only: true                # memory-only PEFT: no LoRA adapters (false: combine with lora_target_modules)
+  lr: 1.0e-4                # default: learning_rate
+  layer: 1                  # default: the manifest's layer
+  init_std: 0.02            # W_k init; W_v = 0, gains = 1
+  table_residency: host     # host (pinned, mapped; default) or device
+  zero_token_ids: [248056, 248057]   # memory output 0 at these ids (image/video pads; the engine's rule)
+```
+
+A conversation starts where the position id is 0; under `sequence_chunks` each chunk receives the two tokens
+before it. The PEFT export holds the memory as `...layers.L.ple.{key_proj,value_proj,norm_key,norm_query}.weight`
+with its spec in `adapter_config.json` (`surogate_ngram_memory`); `python -m surogate.dsl.ngram_memory_export
+ADAPTER OUT` writes the engine's inputs (`ngram_memory.safetensors` in the Flash-Next layout +
+`ngram_memory.json`). An adapter with a memory is never merged into base weights. Memory statistics (gate
+distribution, output RMS over residual RMS) are logged at every logging step and appended to
+`<output_dir>/ngram_memory_stats.jsonl`. CUDA graphs are switched off; not supported with `ep_size > 1`,
+dispatch-PP, NorMuon or an FP32 residual stream.
+
 ## MoE Settings
 
 MoE (Mixture-of-Experts) settings control router loss coefficients for load balancing during training.
