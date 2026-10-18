@@ -63,6 +63,10 @@ struct PretrainedConfig {
     // Sliding window attention (optional, per-layer when layer types provided)
     int SlidingWindow = 0;
     std::vector<int> LayerTypes;  // 0 = full attention, 1 = sliding attention
+    // config.json's `layer_types` strings as given ("linear_attention", "full_attention", ...). LayerTypes keeps
+    // only sliding vs not, so a saved config is written from these names, else a hybrid (Qwen3.5 / Qwen3.6
+    // linear-attention) model would come back with every layer "full_attention".
+    std::vector<std::string> LayerTypeNames;
 
     // Normalization
     float RmsNormEps = 1e-5f;
