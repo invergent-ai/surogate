@@ -5455,3 +5455,11 @@ pre-tokenizer regex instead of the checkpoint's (5.18 agrees with the engine on 
 - **Tests.** `sinfer_prompt_parity_test`: 46 requests against the prompts vLLM 0.31 renders for them, with
   Surogate3.7's template and the stock Qwen3.5 one (`fixtures/frontend/prompt_parity`, `make_golden.py`); schema,
   parser, frontend and Jinja-compat tests updated; `tests/serve/test_prompt_parity.py`.
+
+## 152
+
+**No presence penalty by default (2026-10-18).** The Qwen families' built-in sampling defaults (`qwen3`, `qwen3_5`,
+`qwen3_5_moe`, `qwen3_moe`, `qwen4exp`) carried the model cards' `presence_penalty` 1.5, so every request that did
+not send its own was sampled with one. vLLM's default is 0 and these models' generation configs set none: the same
+request was sampled differently here. Every family default is now 0. A request's `presence_penalty`, `--presence-penalty`
+and a generation config's value still apply, in that order (`test_sampling_defaults`).

@@ -1,8 +1,11 @@
 #include "runtime/contract/sampling.h"
 #include "serve/translate.h"
 
+#include <api/targets/qwen3/package.h>
 #include <api/targets/qwen3_5/package.h>
 #include <api/targets/qwen3_5_moe/package.h>
+#include <api/targets/qwen3_moe/package.h>
+#include <api/targets/qwen4exp/package.h>
 
 #include <cmath>
 #include <iostream>
@@ -54,19 +57,22 @@ int main() {
 
     const sinfer::SamplingPreset dense_thinking{
         .temperature = 1.0F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F};
+    // No family default sets a presence penalty: a request that does not ask for one gets none,
+    // as on vLLM, whose default is 0 and whose generation configs for these models set none. The
+    // model cards' 1.5 was applied to every request that did not send its own.
     const sinfer::SamplingPreset dense_non_thinking{
         .temperature      = 0.7F,
         .top_k            = 20,
         .top_p            = 0.8F,
         .min_p            = 0.0F,
-        .presence_penalty = 1.5F,
+        .presence_penalty = 0.0F,
     };
     const sinfer::SamplingPreset moe_thinking{
         .temperature      = 1.0F,
         .top_k            = 20,
         .top_p            = 0.95F,
         .min_p            = 0.0F,
-        .presence_penalty = 1.5F,
+        .presence_penalty = 0.0F,
     };
 
     failures += check(same_preset(qwen3_6.thinking, dense_thinking),
@@ -81,6 +87,14 @@ int main() {
                       "Qwen3.6-35B-A3B defaults mismatch");
     failures += check(throws_runtime([] { (void)Dense27::sampling_defaults("unknown"); }),
                       "unknown model received dense-27B sampling defaults");
+    for (const sinfer::ModelSamplingDefaults& family :
+         {qwen3_6, qwen3_8, qwen3_6_35,
+          sinfer::targets::qwen3::Package::sampling_defaults(sinfer::targets::qwen3::Package::model_id),
+          sinfer::targets::qwen3_moe::Package::sampling_defaults(sinfer::targets::qwen3_moe::Package::model_id),
+          sinfer::targets::qwen4exp::Package::sampling_defaults(sinfer::targets::qwen4exp::Package::model_id)}) {
+        failures += check(family.thinking.presence_penalty == 0.0F && family.non_thinking.presence_penalty == 0.0F,
+                          "a Qwen family default applies a presence penalty nobody asked for");
+    }
 
     const sinfer::ResolvedSamplingParameters thinking = sinfer::runtime::resolve_sampling(
         qwen3_8, sinfer::SamplingMode::Thinking, sinfer::SamplingOverrides{});
@@ -90,7 +104,7 @@ int main() {
                           thinking.presence_penalty == 0.0F && thinking.seed == 0,
                       "omitted overrides did not select Qwen3.8 thinking defaults");
     failures += check(non_thinking.temperature == 0.7F && non_thinking.top_p == 0.8F &&
-                          non_thinking.presence_penalty == 1.5F,
+                          non_thinking.presence_penalty == 0.0F,
                       "omitted overrides did not select Qwen3.8 non-thinking defaults");
 
     sinfer::SamplingOverrides overrides;
@@ -168,6 +182,13 @@ int main() {
                           resolved.repetition_penalty == 1.0F && resolved.min_p == 0.1F &&
                           resolved.top_p == 0.8F,
                       "request > CLI > generation config > family precedence failed");
+    failures += check(resolved.presence_penalty == 0.0F, "a request without presence_penalty got one");
+    request.sampling.presence_penalty = 1.2;
+    failures += check(resolve().presence_penalty == 1.2F, "a request's presence_penalty was not applied");
+    request.sampling.presence_penalty.reset();
+    const auto penalised = sinfer::runtime::load_sampling_defaults(qwen3_8, R"({"presence_penalty": 1.5})");
+    failures += check(sinfer::runtime::resolve_sampling(penalised, sinfer::SamplingMode::Thinking, {}).presence_penalty == 1.5F,
+                      "a generation config's presence_penalty was not applied");
     server.greedy = true;
     failures += check(resolve().temperature == 0.0F, "--greedy lost its forced temperature");
 
