@@ -365,14 +365,18 @@ int test_tools_and_choice() {
     failures += check(req.uses_tools(), "uses_tools true");
     failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
-    // definition_json must be a normalized OpenAI function-tool object for the
-    // Qwen <tools> renderer.
+    // definition_json is the tool as the chat template sees it: vLLM's rendering of the
+    // converted tool, in its key order, with no strict the client did not send.
     const Json def = Json::parse(req.tools[0].definition_json);
     failures += check(def.at("type") == "function", "definition type function");
     failures += check(def.at("function").at("name") == "get_weather", "definition name");
     failures += check(def.at("function").at("parameters").at("required").at(0) == "city",
                       "input_schema mapped to parameters");
-    failures += check(def.at("function").at("strict") == false, "strict defaulted false");
+    failures += check(!def.at("function").contains("strict"), "no strict injected");
+    const auto ordered = nlohmann::ordered_json::parse(req.tools[0].definition_json);
+    failures += check(ordered.begin().key() == "type" &&
+                          ordered.at("function").begin().key() == "name",
+                      "definition keys in vLLM's order, not sorted");
 
     Json any           = body;
     any["tool_choice"] = Json{{"type", "any"}};

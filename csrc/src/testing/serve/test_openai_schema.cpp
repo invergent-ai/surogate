@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -321,6 +322,94 @@ int test_effort_vocabulary_is_the_templates() {
                                                          sinfer::PromptCapabilities{});
                       }).empty(),
                       "disabling thinking was refused by a template that never thinks");
+    return failures;
+}
+
+// The tool a template is handed is the one vLLM hands it: {"type", "function": {"name",
+// "description", "parameters"[, "strict"]}} in that order whatever order the client wrote, null
+// for an absent description or schema, no strict the client did not send -- and the schema itself
+// in the client's own key order. The parsed (sorted) map used to reorder every key alphabetically
+// and add "strict": false.
+int test_tool_definitions_render_as_vllm() {
+    using OJson = nlohmann::ordered_json;
+    int failures = 0;
+    const OJson body = OJson::parse(R"({"model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+          {"function": {"parameters": {"type": "object", "required": ["zeta"],
+                                       "properties": {"zeta": {"type": "string"}, "alpha": {"type": "number"}}},
+                        "description": "d", "name": "f", "examples": [1]},
+           "type": "function"},
+          {"type": "function", "function": {"name": "bare"}},
+          {"type": "function", "function": {"name": "s", "strict": true, "description": "x",
+                                            "parameters": {"type": "object", "properties": {}}}}]})");
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    failures += check(req.tools.size() == 3, "three tools parsed");
+    failures += check(req.tools[0].definition_json ==
+                          R"({"type":"function","function":{"name":"f","description":"d","parameters":)"
+                          R"({"type":"object","required":["zeta"],"properties":{"zeta":{"type":"string"},)"
+                          R"("alpha":{"type":"number"}}}}})",
+                      "tool rendered in vLLM's key order, schema in the client's, extras dropped, no strict");
+    failures += check(req.tools[1].definition_json ==
+                          R"({"type":"function","function":{"name":"bare","description":null,"parameters":null}})",
+                      "absent description and parameters render as null");
+    failures += check(Json::parse(req.tools[1].parameters_json) ==
+                          Json{{"type", "object"}, {"properties", Json::object()}},
+                      "the call parser still gets an empty object schema");
+    failures += check(req.tools[2].definition_json ==
+                          R"({"type":"function","function":{"name":"s","description":"x","parameters":)"
+                          R"({"type":"object","properties":{}},"strict":true}})",
+                      "a strict the client sent is rendered after the schema");
+    failures += check(req.tools[2].strict && req.tools[2].strict_set && !req.tools[0].strict_set,
+                      "strict still drives constrained decoding");
+
+    // tool_choice decides what the model may answer with, not what the prompt lists.
+    for (const OJson& choice : {OJson("none"), OJson("required"),
+                                OJson::parse(R"({"type": "function", "function": {"name": "bare"}})")}) {
+        OJson with_choice          = body;
+        with_choice["tool_choice"] = choice;
+        const GenerationRequest chosen = parse_chat_completion_request(with_choice, default_limits());
+        failures += check(translate(chosen).options.tool_jsons.size() == 3,
+                          "every tool is in the prompt under tool_choice " + choice.dump());
+    }
+    return failures;
+}
+
+int test_reasoning_and_tool_content_forms() {
+    using OJson = nlohmann::ordered_json;
+    int failures = 0;
+    const OJson body = OJson::parse(R"({"model": "m", "messages": [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a", "reasoning": "new name"},
+        {"role": "assistant", "content": "b", "reasoning": "wins", "reasoning_content": "loses"},
+        {"role": "assistant", "content": "<think>x</think>c", "reasoning_content": ""},
+        {"role": "assistant", "content": "d"},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "1", "type": "function",
+            "function": {"name": "f", "arguments": "{\"z\": 1, \"a\": {\"y\": 2, \"b\": 3}}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": [{"type": "text", "text": "l1"}, {"type": "text", "text": "l2"}]},
+        {"role": "user", "content": [{"type": "text", "text": "p1"}, {"type": "text", "text": "p2"}]}]})");
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    failures += check(req.messages[1].reasoning_content == "new name" && req.messages[1].has_reasoning_content,
+                      "vLLM's `reasoning` field is read");
+    failures += check(req.messages[2].reasoning_content == "wins", "`reasoning` wins over reasoning_content");
+    failures += check(req.messages[3].has_reasoning_content && req.messages[3].reasoning_content.empty(),
+                      "an empty reasoning string is kept as given");
+    failures += check(!req.messages[4].has_reasoning_content, "no reasoning is not an empty one");
+    failures += check(req.messages[5].tool_calls[0].arguments_json == R"({"z": 1, "a": {"y": 2, "b": 3}})",
+                      "history arguments kept as sent");
+    failures += check(req.messages[6].content.size() == 1 && req.messages[6].content[0].text == "l1\nl2",
+                      "tool result text parts joined with a newline, as vLLM does");
+    const sinfer::PromptInput joined = translate(req);
+    failures += check(joined.messages[3].has_reasoning_content, "reasoning presence reaches the frontend");
+    failures += check(joined_text(joined.messages[7]) == "p1\np2",
+                      "string-content templates get text parts joined by a newline");
+    sinfer::PromptCapabilities concatenating;
+    concatenating.concatenates_text_parts = true;
+    const sinfer::PromptInput concatenated = to_prompt_input(
+        req, resolve_prompt_semantics(req, default_server(), concatenating),
+        [](const ContentPart&) -> sinfer::OwnedMedia { throw std::logic_error("no media"); });
+    failures += check(joined_text(concatenated.messages[7]) == "p1p2",
+                      "a template that iterates content parts gets them back to back");
     return failures;
 }
 
@@ -993,6 +1082,8 @@ int main() {
     failures += test_reasoning_effort();
     failures += test_effort_vocabulary_is_the_templates();
     failures += test_parse_parts_and_flatten();
+    failures += test_tool_definitions_render_as_vllm();
+    failures += test_reasoning_and_tool_content_forms();
     failures += test_instruction_roles_preserved();
     failures += test_parse_media_in_translate();
     failures += test_reject_unsupported();

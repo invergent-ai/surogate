@@ -40,6 +40,24 @@ int test_single_call() {
     return failures;
 }
 
+// Arguments come back in the order the model wrote them, nested objects included, as vLLM returns
+// them: the client sends them back in the next request's history, where they are rendered to the
+// model as its own earlier call. A sorted map returned them alphabetically.
+int test_arguments_keep_emission_order() {
+    const sinfer::serve::ParsedToolCallOutput parsed = sinfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n<function=create>\n"
+        "<parameter=zeta>\nlast letter\n</parameter>\n"
+        "<parameter=alpha>\n{\"y\": 1, \"b\": 2}\n</parameter>\n"
+        "<parameter=mid>\n3\n</parameter>\n"
+        "</function>\n</tool_call>",
+        64);
+    int failures = check(parsed.tool_calls.size() == 1, "one call parsed");
+    if (failures != 0) { return failures; }
+    failures += check(parsed.tool_calls[0].arguments_json == R"({"zeta":"last letter","alpha":{"y":1,"b":2},"mid":3})",
+                      "arguments reordered: " + parsed.tool_calls[0].arguments_json);
+    return failures;
+}
+
 int test_multiple_calls_and_json_values() {
     const sinfer::serve::ParsedToolCallOutput parsed = sinfer::serve::parse_qwen_tool_call_output(
         "<tool_call>\n"
@@ -282,6 +300,7 @@ int test_gemma4_calls() {
 
 int main() {
     int failures = 0;
+    failures += test_arguments_keep_emission_order();
     failures += test_gemma4_calls();
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();

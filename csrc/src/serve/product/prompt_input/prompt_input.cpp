@@ -13,7 +13,8 @@
 namespace sinfer::product {
 namespace {
 
-using Json = nlohmann::json;
+// Ordered: tools and tool-call arguments reach the template in the order the file writes them.
+using Json = nlohmann::ordered_json;
 
 ChatRole parse_chat_role(std::string_view role) {
     if (role == "system") { return ChatRole::System; }
@@ -261,7 +262,8 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
         if (!root.contains("messages")) {
             throw std::invalid_argument("messages JSON object must contain messages");
         }
-        root = root.at("messages");
+        Json messages = root.at("messages");
+        root          = std::move(messages);
     }
     if (!root.is_array() || root.empty()) {
         throw std::invalid_argument("messages JSON must be a non-empty array");

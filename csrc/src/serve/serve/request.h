@@ -84,7 +84,7 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string parameters_json;
-    std::string definition_json; // normalized OpenAI function-tool object for Qwen prompt rendering
+    std::string definition_json; // the tool as the chat template sees it (template_tool_json)
     bool strict = false;
     bool strict_set = false;
 };
@@ -115,6 +115,10 @@ struct ChatTurn {
     std::string tool_call_id;      // populated for role=tool
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
+    /// The client sent a reasoning string, possibly empty. An empty one still reaches the
+    /// template, which then renders an empty think block rather than looking for one in the
+    /// content -- the difference between "no reasoning" and "reasoning not given".
+    bool has_reasoning_content = false;
 };
 
 // OpenAI sampling fields carried by the protocol adapter.

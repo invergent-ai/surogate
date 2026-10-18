@@ -507,6 +507,10 @@ struct ChatMessage {
     std::string reasoning_content;
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
+    /// The reasoning above was given, even if empty. A template is handed an empty string in that
+    /// case and no reasoning at all otherwise, and the two render differently: Qwen's templates
+    /// look for a `<think>` block in the content only when no reasoning was given.
+    bool has_reasoning_content = false;
 };
 
 // The effort vocabulary a chat template may offer. It is the union of what the
@@ -620,6 +624,11 @@ struct PromptCapabilities {
     /// `<|"|>` string quote) as special tokens: the server reads calls with the gemma4 parser
     /// unless told otherwise.
     bool gemma4_tool_calls = false;
+    /// The template is handed a message's text parts as a list and writes them one after the other,
+    /// as Qwen's `render_content` does -- so "a" and "b" render as "ab", which is what vLLM and
+    /// transformers produce. Without it the parts are joined with a newline first, as vLLM does for
+    /// a template that only takes string content.
+    bool concatenates_text_parts = false;
 };
 
 struct PromptOptions {

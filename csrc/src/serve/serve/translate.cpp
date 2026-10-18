@@ -102,19 +102,13 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     return sampling;
 }
 
+/// The tools the prompt lists: every tool the request carries, whatever tool_choice says, as
+/// vLLM renders them. tool_choice decides what the model may answer with -- the call parser and
+/// constrained decoding enforce it -- not what it is told exists: a prompt that hid the other
+/// tools under a named choice, or all of them under "none", was a different prompt from the one
+/// the same request gets elsewhere.
 std::vector<std::string> effective_tool_jsons(const GenerationRequest& request) {
     std::vector<std::string> tools;
-    if (!request.uses_tools()) { return tools; }
-    if (request.tool_choice.mode == ToolChoiceMode::Named) {
-        for (const ToolDefinition& tool : request.tools) {
-            if (tool.name == request.tool_choice.name) {
-                tools.push_back(tool.definition_json);
-                break;
-            }
-        }
-        return tools;
-    }
-    tools.reserve(request.tools.size());
     for (const ToolDefinition& tool : request.tools) { tools.push_back(tool.definition_json); }
     return tools;
 }
@@ -165,6 +159,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             server.enable_thinking.value_or(capabilities.thinking_by_default)),
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
+        .concatenate_text_parts = capabilities.concatenates_text_parts,
     };
     // Asking a template that always thinks, and carries no switch, to stop thinking.
     // It was accepted and dropped, and the answer came back with the reasoning in it;
@@ -216,6 +211,7 @@ sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
         sinfer::ChatMessage message;
         message.role              = turn.role;
         message.reasoning_content = turn.reasoning_content;
+        message.has_reasoning_content = turn.has_reasoning_content || !turn.reasoning_content.empty();
         message.tool_call_id      = turn.tool_call_id;
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
@@ -224,7 +220,10 @@ sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
 
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Text) {
-                if (!message.parts.empty() && !part.text.empty() &&
+                // vLLM hands a template that iterates content parts the parts themselves, and
+                // joins them with a newline only for one that takes a string. Tool results are
+                // joined at the wire layer already, whichever the template is.
+                if (!semantics.concatenate_text_parts && !message.parts.empty() && !part.text.empty() &&
                     message.parts.back().kind == sinfer::MessagePartKind::Text) {
                     sinfer::MessagePart newline;
                     newline.text = "\n";

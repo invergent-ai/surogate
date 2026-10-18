@@ -827,15 +827,19 @@ int test_jinja_thinking_retention() {
             for (const auto& piece : frontend.token_texts(data.token_ids)) { text += piece; }
             return text;
         };
+        // The artifact's template decides what of a completed turn's reasoning it renders, as
+        // under vLLM and transformers: the frontend no longer strips it first. A template that
+        // gates on the retention variables drops it by default; one that always renders it
+        // (`true`) keeps it; the content is rendered as the client sent it either way.
         const auto dropped = render();
-        failures += check(dropped.find("historical reasoning") == std::string::npos &&
-                          dropped.find("embedded reasoning") == std::string::npos &&
+        failures += check((dropped.find("historical reasoning") == std::string::npos) == (gate != "true") &&
+                          dropped.find("embedded reasoning") != std::string::npos &&
                           dropped.find("old answer") != std::string::npos &&
                           dropped.find("embedded answer") != std::string::npos,
-                          "Jinja default retained completed reasoning or removed the answer");
+                          "the Jinja default did not render completed turns as the template does");
         if (gate == "true") {
             failures += check(dropped.find("active reasoning") != std::string::npos,
-                              "dropping closed reasoning removed the current tool turn's reasoning");
+                              "the current tool turn's reasoning was removed");
         }
         const auto cached = frontend.prepare(input);
         const auto& cached_data = FrontendFactory::inspect(cached);

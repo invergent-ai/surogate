@@ -65,6 +65,8 @@ struct ChatMessage {
     std::string reasoning_content;
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
+    /// reasoning_content was given, possibly empty (sinfer::ChatMessage::has_reasoning_content).
+    bool has_reasoning_content = false;
 
     [[nodiscard]] bool has_media() const noexcept;
     [[nodiscard]] std::string rendered_content(bool add_vision_id = false,
@@ -141,6 +143,15 @@ private:
         : semantics_(semantics) {}
 
     ChatTemplateSemantics semantics_;
+    /// The reproduced template writes a scalar tool-call argument with Jinja's `string` filter,
+    /// as Python prints it (`True`, `None`), rather than as JSON: Qwen3.5's templates do, Qwen3.6's
+    /// do not.
+    bool python_scalar_arguments_ = false;
+    /// What the reproduced template renders when no thinking switch is given: Qwen3.5-0.8B's
+    /// answers directly, the 4B variant's and Qwen3.6's think.
+    bool thinking_by_default_ = true;
+    /// The reproduced template has a `preserve_thinking` switch (Qwen3.6's); Qwen3.5's has none.
+    bool honours_preserve_thinking_ = true;
 
     // Jinja path only. The parsed template is shared rather than owned outright
     // so this stays copyable, which the two hand-written semantics are.

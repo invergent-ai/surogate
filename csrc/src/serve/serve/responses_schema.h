@@ -42,11 +42,11 @@ struct BuiltResponse {
 
 // Parse POST /v1/responses. Only SInfer Responses Core capabilities are
 // accepted; recognized but unsupported OpenAI fields fail explicitly.
-ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
+ResponsesRequest parse_responses_request(const nlohmann::ordered_json& body, const RequestLimits& limits);
 
 // Parse POST /v1/responses/input_tokens. The current OpenAI endpoint accepts
 // model + input; the result still uses GenerationRequest for shared translation.
-ResponsesRequest parse_response_input_tokens_request(const nlohmann::json& body,
+ResponsesRequest parse_response_input_tokens_request(const nlohmann::ordered_json& body,
                                                      const RequestLimits& limits);
 
 BuiltResponse make_response_object(const std::string& id, std::int64_t created_at,

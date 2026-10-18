@@ -128,3 +128,132 @@ assert text.count(old) == 1, "patch_minja: the string-subscript anchor was not f
 open(path, "w").write(text.replace(old, new))
 PY
 fi
+
+# 5. Python's whitespace for `trim` and argument-less `strip()`. Jinja's `trim` filter and the
+#    `.strip()` / `.lstrip()` / `.rstrip()` methods are Python's str.strip(), which removes every
+#    character str.isspace() accepts -- \v, \f, \x1c-\x1f, U+0085, U+00A0, U+1680, U+2000-U+200A,
+#    U+2028, U+2029, U+202F, U+205F and U+3000 besides " \t\n\r". minja removed only those four, so
+#    a message that starts or ends with, say, an ideographic space or a no-break space rendered
+#    differently from transformers (and vLLM). Strips with explicit characters are unchanged.
+if ! grep -q 'python_space_at' "$header"; then
+  python3 - "$header" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = """static std::string strip(const std::string & s, const std::string & chars = "", bool left = true, bool right = true) {
+  auto charset = chars.empty() ? " \\t\\n\\r" : chars;
+"""
+new = """// Byte length of the Python whitespace character (str.isspace) that starts at `pos`, else 0.
+static size_t python_space_at(const std::string & s, size_t pos) {
+  const auto at = [&](size_t i) { return i < s.size() ? static_cast<unsigned char>(s[i]) : 0u; };
+  const unsigned b = at(pos);
+  if (b == ' ' || (b >= 0x09 && b <= 0x0d) || (b >= 0x1c && b <= 0x1f)) return 1;
+  if (b == 0xc2 && (at(pos + 1) == 0x85 || at(pos + 1) == 0xa0)) return 2;
+  if (b == 0xe1 && at(pos + 1) == 0x9a && at(pos + 2) == 0x80) return 3;
+  if (b == 0xe2 && at(pos + 1) == 0x80 && ((at(pos + 2) >= 0x80 && at(pos + 2) <= 0x8a) ||
+                                           at(pos + 2) == 0xa8 || at(pos + 2) == 0xa9 || at(pos + 2) == 0xaf)) return 3;
+  if (b == 0xe2 && at(pos + 1) == 0x81 && at(pos + 2) == 0x9f) return 3;
+  if (b == 0xe3 && at(pos + 1) == 0x80 && at(pos + 2) == 0x80) return 3;
+  return 0;
+}
+
+static std::string strip(const std::string & s, const std::string & chars = "", bool left = true, bool right = true) {
+  if (chars.empty()) {
+    size_t start = 0, end = s.size();
+    while (left && start < end) {
+      const size_t n = python_space_at(s, start);
+      if (n == 0) break;
+      start += n;
+    }
+    while (right && end > start) {
+      size_t n = 0;
+      for (size_t width = 1; width <= 3 && width <= end - start && n == 0; ++width) {
+        if (python_space_at(s, end - width) == width) n = width;
+      }
+      if (n == 0) break;
+      end -= n;
+    }
+    return s.substr(start, end - start);
+  }
+  auto charset = chars;
+"""
+assert text.count(old) == 1, "patch_minja: the strip anchor was not found"
+open(path, "w").write(text.replace(old, new))
+PY
+  grep -q 'python_space_at' "$header" || {
+    echo "patch_minja: the Python whitespace patch did not apply" >&2; exit 1; }
+fi
+
+# 6. Python's float repr. A template prints a float the way Python does: `tojson` through
+#    json.dumps and `{{ x }}` / `| string` through str(), both repr() -- the shortest digits that
+#    round-trip, correctly rounded, in fixed notation from 1e-4 up to 1e16 and with an exponent
+#    outside it. nlohmann's grisu2 digits are sometimes not the correctly rounded ones and it
+#    switches to an exponent a decade early (1e15 is "1e+15" there, "1000000000000000.0" in
+#    Python); minja's str() used std::to_string ("1.000000").
+if ! grep -q 'python_float_repr' "$header"; then
+  python3 - "$header" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+anchor = """  /* Python-style string repr */
+  static void dump_string("""
+helper = """  /* Python's repr() of a float. */
+  static std::string python_float_repr(double value) {
+    if (!std::isfinite(value)) return json(value).dump();
+    char buffer[64];
+    const auto written = std::to_chars(buffer, buffer + sizeof buffer, value, std::chars_format::scientific);
+    const std::string scientific(buffer, written.ptr);
+    const bool negative = scientific[0] == '-';
+    const size_t exponent_at = scientific.find('e');
+    std::string digits;
+    for (size_t k = negative ? 1 : 0; k < exponent_at; ++k) {
+      if (scientific[k] != '.') digits += scientific[k];
+    }
+    while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+    const int exponent = std::stoi(scientific.substr(exponent_at + 1));
+    std::string out = negative ? "-" : "";
+    if (exponent >= 16 || exponent < -4) {
+      out += digits.substr(0, 1);
+      if (digits.size() > 1) out += "." + digits.substr(1);
+      char tail[16];
+      std::snprintf(tail, sizeof tail, "e%c%02d", exponent < 0 ? '-' : '+', exponent < 0 ? -exponent : exponent);
+      return out + tail;
+    }
+    if (exponent < 0) return out + "0." + std::string(static_cast<size_t>(-exponent - 1), '0') + digits;
+    const size_t whole = static_cast<size_t>(exponent) + 1;
+    std::string integer = digits.substr(0, std::min(whole, digits.size()));
+    integer.resize(whole, '0');
+    return out + integer + "." + (digits.size() > whole ? digits.substr(whole) : "0");
+  }
+
+"""
+assert text.count(anchor) == 1, "patch_minja: the float-repr anchor was not found"
+text = text.replace(anchor, helper + anchor)
+old_dump = """    } else {
+      out << primitive_.dump();
+    }
+  }
+"""
+new_dump = """    } else if (primitive_.is_number_float()) {
+      out << python_float_repr(primitive_.get<double>());
+    } else {
+      out << primitive_.dump();
+    }
+  }
+"""
+assert text.count(old_dump) == 1, "patch_minja: the dump anchor was not found"
+text = text.replace(old_dump, new_dump)
+old_str = """    if (is_number_float()) return std::to_string(get<double>());
+"""
+new_str = """    if (is_number_float()) return python_float_repr(get<double>());
+"""
+assert text.count(old_str) == 1, "patch_minja: the to_str anchor was not found"
+text = text.replace(old_str, new_str)
+include_anchor = "#include <algorithm>\n"
+assert include_anchor in text, "patch_minja: the include anchor was not found"
+text = text.replace(include_anchor, include_anchor + "#include <charconv>\n#include <cmath>\n", 1)
+open(path, "w").write(text)
+PY
+  grep -q 'python_float_repr' "$header" || {
+    echo "patch_minja: the float repr patch did not apply" >&2; exit 1; }
+fi

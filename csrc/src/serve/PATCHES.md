@@ -5412,3 +5412,46 @@ fork's bridge pairs the kept hidden with a different next token than the capture
   errors. The second wave's first-turn TTFT was 0.30–0.56 s, against 6.5–29.9 s for the first wave, which computed
   the preamble. Later turns of forked conversations restored their turn checkpoints as usual.
 - **Tests.** `sinfer_kv_cache_test` passes.
+
+## 151
+
+**Prompt-render parity with vLLM's OpenAI server (2026-10-18).** The same Chat Completions request rendered to a
+different prompt here than on vLLM, and the model scored lower on it: BFCL dev 74.2 vs 77.5, EnterpriseOps-Gym 32.8
+vs 37.9 with the same weights. `scripts/serve_prompt_parity.py` compares the engine's `/tokenize` ids with vLLM's own
+preprocessing (ChatCompletionRequest, `tool.model_dump()`, parse_chat_messages, safe_apply_chat_template) on 728
+requests: BFCL dev (132 live_simple, 323 multi_turn_base prompts rebuilt from a vLLM run's log, 54 of them without
+preserve_thinking), 180 EnterpriseOps-Gym requests logged from a vLLM-served run, 39 edge cases. Before: 8 identical
+(the requests without tools), 701 differing, 19 refused. After: 725 identical with Surogate3.7's template and with
+the stock Qwen3.5 one; the other 3 are Thai prompts the reference's transformers 5.17 tokenizes with Qwen2's
+pre-tokenizer regex instead of the checkpoint's (5.18 agrees with the engine on all 728).
+
+- **Tool definitions.** Request bodies were parsed into `nlohmann::json`, a sorted map, and each tool was re-dumped
+  from it: the prompt listed `{"function": {"description", "name", "parameters": {"properties": {alphabetical},
+  "required", "type"}, "strict": false}, "type"}`. vLLM renders `{"type", "function": {"name", "description",
+  "parameters"[, "strict"]}}` with the schema in the client's order, null for an absent description or schema, and
+  `strict` only when sent. Bodies are now parsed as `ordered_json` (chat completions, completions, tokenize,
+  Responses, Messages) and every adapter renders through `template_tool_json` (`serve/tool_definition.h`). `strict`
+  still drives constrained decoding as before.
+- **tool_choice.** `none` removed every tool from the prompt and a named choice all but one; vLLM lists them all.
+  The prompt now lists every tool; the parser and the constraints enforce the choice.
+- **Past reasoning.** For a template rendered from the artifact's own Jinja the frontend dropped completed turns'
+  reasoning (and the content up to `</think>`) unless `preserve_thinking`. The template now decides, as under vLLM:
+  Surogate3.7's keeps every turn's, Qwen3.5's drops those before the last user message. `reasoning` is read as
+  vLLM's name for `reasoning_content` (it wins when both are sent), and an empty one is passed on, so the template
+  does not split the content on `</think>`.
+- **Arguments in responses** keep the order the model wrote them (`tool_call_parser.cpp`, `output_parsers.cpp` on
+  `ordered_json`); a sorted map returned them alphabetically and the client sent that order back in the history.
+  Tool-call grammars list properties in the schema's order (`tool_constraints.cpp`).
+- **Content.** Text parts were joined with a newline; vLLM hands Qwen's templates the parts, which write them back
+  to back (`PromptCapabilities::concatenates_text_parts`, probed for an artifact's own template; the Gemma and LFM2
+  processors keep the newline). A tool result sent as text parts is accepted and joined with newlines, as vLLM does.
+  A developer message for a template without that role becomes a system message, merged with the others at the
+  front when it is not first or not alone (vLLM's `_consolidate_system_messages`), on both render paths.
+- **minja** (`cmake/patch_minja.sh` 5 and 6): `trim` / `strip()` remove Python's whitespace (U+00A0, U+3000, \v,
+  ...), and floats print as Python's repr (1e15 is `1000000000000000.0`; correctly rounded shortest digits).
+- **Hand-written templates.** They trim and print floats the same way. For the Qwen3.5 digests they write scalar
+  arguments as `| string` does (`True`, `None`), ignore `preserve_thinking` (the template has no such switch), and
+  the 0.8B template's default is its own: no thinking unless asked.
+- **Tests.** `sinfer_prompt_parity_test`: 46 requests against the prompts vLLM 0.31 renders for them, with
+  Surogate3.7's template and the stock Qwen3.5 one (`fixtures/frontend/prompt_parity`, `make_golden.py`); schema,
+  parser, frontend and Jinja-compat tests updated; `tests/serve/test_prompt_parity.py`.

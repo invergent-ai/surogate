@@ -51,6 +51,27 @@ void check_string_indices() {
     if (!refused) { throw std::runtime_error("missing base lookup was silently accepted"); }
 }
 
+// Jinja's `trim` and `.strip()` are Python's: Unicode whitespace goes too (cmake/patch_minja.sh 5).
+void check_python_whitespace() {
+    const Json vars{{"s", "　 \x0b\x0c\x1c hi       \u0085 "},
+                    {"z", "​zero width stays​"}};
+    expect("[{{ s | trim }}][{{ s.strip() }}][{{ s.lstrip() | length > 3 }}][{{ z | trim }}]", vars,
+           "[hi][hi][True][​zero width stays​]");
+    expect("[{{ s.strip('　') | length }}]", {{"s", "　a　"}}, "[1]");
+    expect("[{{ e | trim }}]", {{"e", "　  "}}, "[]");
+}
+
+// A float prints as Python's repr() (cmake/patch_minja.sh 6), through tojson and str() alike.
+void check_python_float_repr() {
+    const Json vars{{"n", Json::array({1e15, 1.5e15, 1.2345678901234567e15, -3e15, 1e16, 1e14, 0.1, 1.0, 2.5e-7,
+                                       1e-5, 0.0001, -0.0, 1e300, 123456789.123456789})},
+                    {"f", 1.0}, {"g", 1e15}};
+    expect("{{ n | tojson }}|{{ f }}|{{ g | string }}|{{ f ~ '' }}", vars,
+           "[1000000000000000.0, 1500000000000000.0, 1234567890123456.8, -3000000000000000.0, 1e+16, "
+           "100000000000000.0, 0.1, 1.0, 2.5e-07, 1e-05, 0.0001, -0.0, 1e+300, 123456789.12345679]"
+           "|1.0|1000000000000000.0|1.0");
+}
+
 void check_glm_tool_results() {
     // The guard from GLM-5.3-Flash's checkpoint, followed by its text/list distinction.
     const std::string source = R"({%- macro is_list_of_outputs(m) -%}
@@ -80,6 +101,8 @@ void check_glm_tool_results() {
 int main(int argc, char** argv) {
     try {
         check_string_indices();
+        check_python_whitespace();
+        check_python_float_repr();
         check_glm_tool_results();
         // Optional full-checkpoint cases, with expected prompts supplied by Jinja2.
         // No weights, CUDA context, or checkpoint copy is needed to compare renderers.
@@ -93,7 +116,7 @@ int main(int argc, char** argv) {
             }
             std::cout << "Full checkpoint Jinja2 comparisons passed: " << cases.size() << '\n';
         }
-        std::cout << "Jinja string indexing and GLM tool-result rendering passed\n";
+        std::cout << "Jinja string indexing, Python whitespace and floats, and GLM tool-result rendering passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

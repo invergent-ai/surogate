@@ -5,11 +5,12 @@
 #include <set>
 namespace sinfer::serve {
 namespace {
-using Json = nlohmann::json;
+// Ordered: the grammar lists an object's properties in the order the client's schema does
+// ("any_order": false), as vLLM's structured output does; a sorted map forced them alphabetical.
+using Json = nlohmann::ordered_json;
 // Reject constraints the grammar compiler would otherwise ignore. Metadata is harmless,
 // but an unsupported assertion must never silently weaken the requested language.
-void validate_schema(const nlohmann::json& schema, unsigned depth = 0) {
-    using Json = nlohmann::json;
+void validate_schema(const nlohmann::ordered_json& schema, unsigned depth = 0) {
     if (depth > 64) { throw std::invalid_argument("JSON schema nesting exceeds 64 levels"); }
     if (schema.is_boolean()) { return; }
     if (!schema.is_object()) { throw std::invalid_argument("JSON schema must be an object or boolean"); }

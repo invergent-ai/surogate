@@ -64,9 +64,10 @@ void validate_model(const std::string& requested, const std::string& available) 
     throw ApiException(std::move(error));
 }
 
-Json parse_json_body(const httplib::Request& request) {
+// In the client's key order: the tool schemas in it reach the prompt as written.
+nlohmann::ordered_json parse_json_body(const httplib::Request& request) {
     try {
-        return Json::parse(request.body);
+        return nlohmann::ordered_json::parse(request.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;

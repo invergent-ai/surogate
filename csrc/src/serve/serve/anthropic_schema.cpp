@@ -1,5 +1,7 @@
 #include "serve/anthropic_schema.h"
 
+#include "serve/tool_definition.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -14,7 +16,10 @@
 namespace sinfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+// Ordered throughout: request bodies are read in the client's key order (tool schemas and
+// tool_use inputs reach the prompt as written), and a response's tool_use input keeps the order
+// the model wrote its arguments in.
+using Json = nlohmann::ordered_json;
 
 constexpr std::size_t kMaxToolNameLength = 128;
 
@@ -155,22 +160,31 @@ void parse_tools(const Json& body, GenerationRequest& out) {
             bad_request("tool input_schema must be a JSON object", "tools");
         }
         ToolDefinition tool;
-        tool.name     = require_function_name(item, "tools");
-        Json function = Json{{"name", tool.name}};
+        tool.name = require_function_name(item, "tools");
+        TemplateToolFields rendered{.name = tool.name};
         if (item.contains("description") && !item.at("description").is_null()) {
             if (!item.at("description").is_string()) {
                 bad_request("tool description must be a string", "tools");
             }
-            tool.description        = item.at("description").get<std::string>();
-            function["description"] = tool.description;
+            tool.description     = item.at("description").get<std::string>();
+            rendered.description = tool.description;
         }
         const Json& parameters = item.at("input_schema");
         tool.parameters_json   = parameters.dump();
-        function["parameters"] = parameters;
-        function["strict"]     = false;
-        // Normalized OpenAI-style function tool object consumed verbatim by the
-        // Qwen chat template's <tools> block (render_tools_system_block).
-        tool.definition_json = Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+        rendered.parameters    = parameters;
+        // vLLM's Messages endpoint carries the tool's own `strict` and `defer_loading` into the
+        // function it renders, and nothing when the client sent none. Rendered only: this
+        // endpoint has never constrained a call by `strict`, and a client that sends it with
+        // stop_sequences would be refused if it started to.
+        for (const char* key : {"strict", "defer_loading"}) {
+            if (!item.contains(key) || item.at(key).is_null()) { continue; }
+            if (!item.at(key).is_boolean()) {
+                bad_request(std::string("tool ") + key + " must be a boolean", "tools");
+            }
+            (key[0] == 's' ? rendered.strict : rendered.defer_loading) = item.at(key).get<bool>();
+        }
+        // The tool exactly as the template sees it (template_tool_json).
+        tool.definition_json = template_tool_json(rendered);
         out.tools.push_back(std::move(tool));
     }
 }
@@ -294,6 +308,7 @@ void parse_assistant_content(const Json& content, GenerationRequest& out) {
         } else if (type == "thinking") {
             if (block.contains("thinking") && block.at("thinking").is_string()) {
                 append_text(turn.reasoning_content, block.at("thinking").get<std::string>());
+                turn.has_reasoning_content = true;
             }
         } else if (type == "redacted_thinking") {
             // Opaque redacted reasoning: nothing usable for the text frontend.

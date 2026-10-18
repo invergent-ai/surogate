@@ -1,5 +1,7 @@
 #include "serve/openai_schema.h"
 
+#include "serve/tool_definition.h"
+
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -13,6 +15,9 @@ namespace sinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
+// Request bodies are read in the client's own key order: the tool schemas in them reach the prompt
+// verbatim (template_tool_json), and a sorted map would reorder every object in them.
+using OJson = nlohmann::ordered_json;
 
 // Standard base64 with padding, for choice.routed_experts.
 std::string routed_base64(const std::vector<std::uint8_t>& bytes) {
@@ -73,24 +78,24 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-const Json& require_object(const Json& body) {
+const OJson& require_object(const OJson& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
     return body;
 }
 
-bool get_bool(const Json& obj, const char* key, bool fallback) {
+bool get_bool(const OJson& obj, const char* key, bool fallback) {
     if (!obj.contains(key) || obj.at(key).is_null()) { return fallback; }
     if (!obj.at(key).is_boolean()) { bad_request(std::string(key) + " must be a boolean", key); }
     return obj.at(key).get<bool>();
 }
 
-std::optional<double> get_number(const Json& obj, const char* key) {
+std::optional<double> get_number(const OJson& obj, const char* key) {
     if (!obj.contains(key) || obj.at(key).is_null()) { return std::nullopt; }
     if (!obj.at(key).is_number()) { bad_request(std::string(key) + " must be a number", key); }
     return obj.at(key).get<double>();
 }
 
-std::optional<int> get_int(const Json& obj, const char* key) {
+std::optional<int> get_int(const OJson& obj, const char* key) {
     if (!obj.contains(key) || obj.at(key).is_null()) { return std::nullopt; }
     if (!obj.at(key).is_number_integer()) {
         bad_request(std::string(key) + " must be an integer", key);
@@ -109,7 +114,7 @@ std::optional<int> get_int(const Json& obj, const char* key) {
     return static_cast<int>(value);
 }
 
-std::optional<std::uint64_t> get_u64(const Json& obj, const char* key) {
+std::optional<std::uint64_t> get_u64(const OJson& obj, const char* key) {
     if (!obj.contains(key) || obj.at(key).is_null()) { return std::nullopt; }
     if (!obj.at(key).is_number_integer()) {
         bad_request(std::string(key) + " must be a nonnegative integer", key);
@@ -128,7 +133,7 @@ bool is_valid_function_name(const std::string& name) {
     return true;
 }
 
-std::string require_function_name(const Json& obj, const char* param) {
+std::string require_function_name(const OJson& obj, const char* param) {
     if (!obj.contains("name") || !obj.at("name").is_string()) {
         bad_request("function name must be a string", param);
     }
@@ -139,6 +144,13 @@ std::string require_function_name(const Json& obj, const char* param) {
     return name;
 }
 
+/// A boolean the prompt carries only when the client sent it.
+std::optional<bool> optional_flag(const OJson& obj, const char* key, const char* what) {
+    if (!obj.contains(key) || obj.at(key).is_null()) { return std::nullopt; }
+    if (!obj.at(key).is_boolean()) { bad_request(std::string(what) + " must be a boolean", "tools"); }
+    return obj.at(key).get<bool>();
+}
+
 bool has_tool_named(const GenerationRequest& req, const std::string& name) {
     for (const ToolDefinition& tool : req.tools) {
         if (tool.name == name) { return true; }
@@ -146,11 +158,11 @@ bool has_tool_named(const GenerationRequest& req, const std::string& name) {
     return false;
 }
 
-sinfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field) {
+sinfer::product::media_acquire::Source parse_media_url(const OJson& part, const char* field) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
-    const Json& value = part.at(field);
+    const OJson& value = part.at(field);
     std::string url;
     if (value.is_string()) {
         url = value.get<std::string>();
@@ -173,7 +185,7 @@ sinfer::product::media_acquire::Source parse_media_url(const Json& part, const c
     return source;
 }
 
-void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index) {
+void parse_content_parts(const OJson& content, ChatTurn& turn, std::size_t index) {
     if (content.is_string()) {
         turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
         return;
@@ -182,7 +194,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
         bad_request("message " + std::to_string(index) + " content must be a string or array",
                     "messages");
     }
-    for (const Json& part : content) {
+    for (const OJson& part : content) {
         if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
             bad_request("message " + std::to_string(index) +
                             " content parts must be objects with a string 'type'",
@@ -215,10 +227,36 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
     }
 }
 
-std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t index) {
+/// A tool result's text. Clients that speak in content parts (Claude Code, Cursor, agent SDKs)
+/// send it as a list of text parts; vLLM joins those with newlines, so this does too.
+std::string tool_message_text(const OJson& item, std::size_t index) {
+    if (item.contains("content") && item.at("content").is_string()) {
+        return item.at("content").get<std::string>();
+    }
+    if (!item.contains("content") || !item.at("content").is_array()) {
+        bad_request("tool messages must contain string content or an array of text parts",
+                    "messages");
+    }
+    std::string text;
+    bool first = true;
+    for (const OJson& part : item.at("content")) {
+        if (!part.is_object() || !part.contains("type") || part.at("type") != "text" ||
+            !part.contains("text") || !part.at("text").is_string()) {
+            bad_request("tool message " + std::to_string(index) +
+                            " content parts must be text parts with a string 'text'",
+                        "messages");
+        }
+        if (!first) { text += '\n'; }
+        text += part.at("text").get<std::string>();
+        first = false;
+    }
+    return text;
+}
+
+std::vector<ToolCall> parse_assistant_tool_calls(const OJson& item, std::size_t index) {
     std::vector<ToolCall> calls;
     if (!item.contains("tool_calls") || item.at("tool_calls").is_null()) { return calls; }
-    const Json& tool_calls = item.at("tool_calls");
+    const OJson& tool_calls = item.at("tool_calls");
     if (!tool_calls.is_array() || tool_calls.empty()) {
         bad_request("assistant message " + std::to_string(index) +
                         " tool_calls must be a non-empty array",
@@ -226,7 +264,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t i
     }
     calls.reserve(tool_calls.size());
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
-        const Json& call = tool_calls.at(i);
+        const OJson& call = tool_calls.at(i);
         if (!call.is_object()) { bad_request("tool_calls entries must be objects", "messages"); }
         if (!call.contains("id") || !call.at("id").is_string() ||
             call.at("id").get<std::string>().empty()) {
@@ -240,7 +278,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t i
         if (!call.contains("function") || !call.at("function").is_object()) {
             bad_request("tool_calls entries must contain a function object", "messages");
         }
-        const Json& fn = call.at("function");
+        const OJson& fn = call.at("function");
         ToolCall out;
         out.id   = call.at("id").get<std::string>();
         out.name = require_function_name(fn, "messages");
@@ -248,7 +286,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t i
             bad_request("function tool_calls must contain string arguments", "messages");
         }
         out.arguments_json = fn.at("arguments").get<std::string>();
-        const Json parsed  = Json::parse(out.arguments_json, nullptr, false);
+        const OJson parsed = OJson::parse(out.arguments_json, nullptr, false);
         if (parsed.is_discarded() || !parsed.is_object()) {
             bad_request("function tool_call arguments must be a JSON object string", "messages");
         }
@@ -257,14 +295,14 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t i
     return calls;
 }
 
-void parse_messages(const Json& body, GenerationRequest& out) {
+void parse_messages(const OJson& body, GenerationRequest& out) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
-    const Json& messages = body.at("messages");
+    const OJson& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
         bad_request("messages must be a non-empty array", "messages");
     }
     for (std::size_t i = 0; i < messages.size(); ++i) {
-        const Json& item = messages.at(i);
+        const OJson& item = messages.at(i);
         if (!item.is_object()) {
             bad_request("message " + std::to_string(i) + " must be an object", "messages");
         }
@@ -287,12 +325,9 @@ void parse_messages(const Json& body, GenerationRequest& out) {
                 item.at("tool_call_id").get<std::string>().empty()) {
                 bad_request("tool messages must contain a string tool_call_id", "messages");
             }
-            if (!item.contains("content") || !item.at("content").is_string()) {
-                bad_request("tool messages must contain string content", "messages");
-            }
             turn.tool_call_id = item.at("tool_call_id").get<std::string>();
             turn.content.push_back(
-                ContentPart{ContentKind::Text, item.at("content").get<std::string>(), "text"});
+                ContentPart{ContentKind::Text, tool_message_text(item, i), "text"});
             out.messages.push_back(std::move(turn));
             continue;
         }
@@ -308,13 +343,21 @@ void parse_messages(const Json& body, GenerationRequest& out) {
                                 " must have content or tool_calls",
                             "messages");
             }
-            if (item.contains("reasoning_content") && !item.at("reasoning_content").is_null()) {
-                if (!item.at("reasoning_content").is_string()) {
-                    bad_request("assistant message " + std::to_string(i) +
-                                    " reasoning_content must be a string",
+            // vLLM's own name for it is `reasoning` (what its responses carry), with
+            // `reasoning_content` accepted as the older spelling; `reasoning` wins when both are
+            // sent. A string that is present but empty is still passed on: the template then
+            // renders an empty think block instead of splitting the content on `</think>`.
+            for (const char* key : {"reasoning", "reasoning_content"}) {
+                if (!item.contains(key) || item.at(key).is_null()) { continue; }
+                if (!item.at(key).is_string()) {
+                    bad_request("assistant message " + std::to_string(i) + " " + key +
+                                    " must be a string",
                                 "messages");
                 }
-                turn.reasoning_content = item.at("reasoning_content").get<std::string>();
+                if (!turn.has_reasoning_content) {
+                    turn.reasoning_content     = item.at(key).get<std::string>();
+                    turn.has_reasoning_content = true;
+                }
             }
             out.messages.push_back(std::move(turn));
             continue;
@@ -330,13 +373,13 @@ void parse_messages(const Json& body, GenerationRequest& out) {
     }
 }
 
-void parse_tools(const Json& body, GenerationRequest& out) {
+void parse_tools(const OJson& body, GenerationRequest& out) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
-    const Json& tools = body.at("tools");
+    const OJson& tools = body.at("tools");
     if (!tools.is_array()) { bad_request("tools must be an array", "tools"); }
     out.tools.reserve(tools.size());
     for (std::size_t i = 0; i < tools.size(); ++i) {
-        const Json& item = tools.at(i);
+        const OJson& item = tools.at(i);
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
         if (!item.contains("type") || !item.at("type").is_string()) {
             bad_request("tools entries must contain a string type", "tools");
@@ -347,40 +390,46 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         if (!item.contains("function") || !item.at("function").is_object()) {
             bad_request("function tools must contain a function object", "tools");
         }
-        Json normalized = item;
-        Json& fn        = normalized["function"];
+        const OJson& fn = item.at("function");
         ToolDefinition tool;
         tool.name = require_function_name(fn, "tools");
+        TemplateToolFields rendered{.name = tool.name};
         if (fn.contains("description") && !fn.at("description").is_null()) {
             if (!fn.at("description").is_string()) {
                 bad_request("function description must be a string", "tools");
             }
-            tool.description = fn.at("description").get<std::string>();
+            tool.description     = fn.at("description").get<std::string>();
+            rendered.description = tool.description;
         }
-        if (!fn.contains("parameters") || fn.at("parameters").is_null()) {
-            fn["parameters"] = Json{{"type", "object"}, {"properties", Json::object()}};
+        if (fn.contains("parameters") && !fn.at("parameters").is_null()) {
+            if (!fn.at("parameters").is_object()) {
+                bad_request("function parameters must be a JSON object", "tools");
+            }
+            rendered.parameters  = fn.at("parameters");
+            tool.parameters_json = rendered.parameters.dump();
+        } else {
+            // What the call parser and constrained decoding read. The prompt shows what the
+            // client sent, which is no schema at all.
+            tool.parameters_json = R"({"type":"object","properties":{}})";
         }
-        if (!fn.at("parameters").is_object()) {
-            bad_request("function parameters must be a JSON object", "tools");
-        }
-        tool.parameters_json = fn.at("parameters").dump();
         if (fn.contains("strict") && !fn.at("strict").is_null()) {
             if (!fn.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", "tools");
             }
-            tool.strict = fn.at("strict").get<bool>();
+            tool.strict     = fn.at("strict").get<bool>();
             tool.strict_set = true;
-        } else {
-            fn["strict"] = false;
+            rendered.strict = tool.strict;
         }
-        tool.definition_json = normalized.dump();
+        rendered.defer_loading      = optional_flag(fn, "defer_loading", "function defer_loading");
+        rendered.tool_defer_loading = optional_flag(item, "defer_loading", "tool defer_loading");
+        tool.definition_json        = template_tool_json(rendered);
         out.tools.push_back(std::move(tool));
     }
 }
 
-void parse_tool_choice(const Json& body, GenerationRequest& out) {
+void parse_tool_choice(const OJson& body, GenerationRequest& out) {
     if (!body.contains("tool_choice") || body.at("tool_choice").is_null()) { return; }
-    const Json& choice = body.at("tool_choice");
+    const OJson& choice = body.at("tool_choice");
     if (choice.is_string()) {
         const std::string value = choice.get<std::string>();
         if (value == "none") {
@@ -417,7 +466,7 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
     }
 }
 
-void parse_stop(const Json& body, GenerationRequest& out) {
+void parse_stop(const OJson& body, GenerationRequest& out) {
     out.ignore_eos = get_bool(body, "ignore_eos", false);
     if (const std::optional<int> minimum = get_int(body, "min_tokens")) {
         if (*minimum < 0) { bad_request("min_tokens must be nonnegative", "min_tokens"); }
@@ -446,10 +495,10 @@ void parse_stop(const Json& body, GenerationRequest& out) {
         out.add_generation_prompt = get_bool(body, "add_generation_prompt", true);
     }
     if (body.contains("tokens") && !body.at("tokens").is_null()) {
-        const Json& tokens = body.at("tokens");
+        const OJson& tokens = body.at("tokens");
         if (!tokens.is_array()) { bad_request("tokens must be an array of integers", "tokens"); }
         out.prompt_token_ids.reserve(tokens.size());
-        for (const Json& item : tokens) {
+        for (const OJson& item : tokens) {
             if (!item.is_number_integer()) {
                 bad_request("tokens must be an array of integers", "tokens");
             }
@@ -465,7 +514,7 @@ void parse_stop(const Json& body, GenerationRequest& out) {
         }
     }
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
-    const Json& stop = body.at("stop");
+    const OJson& stop = body.at("stop");
     if (stop.is_string()) {
         if (!stop.get<std::string>().empty()) {
             out.stop_strings.push_back(stop.get<std::string>());
@@ -473,7 +522,7 @@ void parse_stop(const Json& body, GenerationRequest& out) {
         return;
     }
     if (stop.is_array()) {
-        for (const Json& s : stop) {
+        for (const OJson& s : stop) {
             if (!s.is_string()) { bad_request("stop entries must be strings", "stop"); }
             if (!s.get<std::string>().empty()) { out.stop_strings.push_back(s.get<std::string>()); }
         }
@@ -482,7 +531,7 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     bad_request("stop must be a string or array of strings", "stop");
 }
 
-void parse_sampling(const Json& body, GenerationRequest& out) {
+void parse_sampling(const OJson& body, GenerationRequest& out) {
     SamplingParams& s   = out.sampling;
     s.temperature       = get_number(body, "temperature");
     s.top_p             = get_number(body, "top_p");
@@ -493,7 +542,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.frequency_penalty = get_number(body, "frequency_penalty");
     s.seed              = get_u64(body, "seed");
     if (body.contains("logit_bias") && !body.at("logit_bias").is_null()) {
-        const Json& bias = body.at("logit_bias");
+        const OJson& bias = body.at("logit_bias");
         if (!bias.is_object()) { bad_request("logit_bias must be an object", "logit_bias"); }
         for (auto it = bias.begin(); it != bias.end(); ++it) {
             if (!it.value().is_number()) {
@@ -524,7 +573,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     }
 }
 
-void parse_output_features(const Json& body, GenerationRequest& out) {
+void parse_output_features(const OJson& body, GenerationRequest& out) {
     for (const char* key : {"functions", "function_call"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             ApiError error;
@@ -567,11 +616,11 @@ std::string sse_event(const Json& payload) { return "data: " + dump_lossy(payloa
 
 } // namespace
 
-void parse_openai_enable_thinking(const Json& body, GenerationRequest& out) {
+void parse_openai_enable_thinking(const OJson& body, GenerationRequest& out) {
     if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object() &&
         body.at("chat_template_kwargs").contains("enable_thinking") &&
         !body.at("chat_template_kwargs").at("enable_thinking").is_null()) {
-        const Json& value = body.at("chat_template_kwargs").at("enable_thinking");
+        const OJson& value = body.at("chat_template_kwargs").at("enable_thinking");
         if (!value.is_boolean()) {
             bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
                         "chat_template_kwargs");
@@ -581,7 +630,7 @@ void parse_openai_enable_thinking(const Json& body, GenerationRequest& out) {
     }
 }
 
-std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
+std::optional<bool> parse_openai_preserve_thinking(const OJson& body) {
     std::optional<bool> top_level;
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
         if (!body.at("preserve_thinking").is_boolean()) {
@@ -592,7 +641,7 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
 
     std::optional<bool> template_value;
     if (body.contains("chat_template_kwargs")) {
-        const Json& kwargs = body.at("chat_template_kwargs");
+        const OJson& kwargs = body.at("chat_template_kwargs");
         if (!kwargs.is_object()) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
@@ -623,7 +672,7 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     return template_value ? template_value : top_level;
 }
 
-void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
+void parse_openai_reasoning_effort(const OJson& body, GenerationRequest& out) {
     if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) { return; }
     if (!body.at("reasoning_effort").is_string()) {
         bad_request("reasoning_effort must be a string or null", "reasoning_effort");
@@ -643,9 +692,9 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
 // token list, or a list of token lists; the batch forms are one request per prompt, and this
 // server answers one prompt per request, so a single-element list is accepted as the string it
 // wraps and anything longer is refused rather than silently answering only the first.
-std::string parse_completion_prompt(const Json& body) {
+std::string parse_completion_prompt(const OJson& body) {
     if (!body.contains("prompt")) { bad_request("missing required field: prompt", "prompt"); }
-    const Json& prompt = body.at("prompt");
+    const OJson& prompt = body.at("prompt");
     if (prompt.is_string()) { return prompt.get<std::string>(); }
     if (prompt.is_array()) {
         if (prompt.size() == 1 && prompt.front().is_string()) {
@@ -662,7 +711,7 @@ std::string parse_completion_prompt(const Json& body) {
     bad_request("prompt must be a string", "prompt");
 }
 
-void reject_unsupported_completion_features(const Json& body) {
+void reject_unsupported_completion_features(const OJson& body) {
     if (body.contains("parallel_decoding") && body["parallel_decoding"] != false) {
         bad_request("parallel_decoding is only available on chat completions", "parallel_decoding");
     }
@@ -670,7 +719,7 @@ void reject_unsupported_completion_features(const Json& body) {
     // answering a different question than the one asked.
     for (const char* key : {"echo", "suffix", "best_of"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
-            const Json& value = body.at(key);
+            const OJson& value = body.at(key);
             const bool inert  = (value.is_boolean() && !value.get<bool>()) ||
                                (value.is_number_integer() && value.get<int>() <= 1 &&
                                 std::string_view(key) == "best_of");
@@ -684,7 +733,7 @@ void reject_unsupported_completion_features(const Json& body) {
     }
 }
 
-std::string parse_json_response_format(const Json& format, const std::string& param, bool flat_schema) {
+std::string parse_json_response_format(const OJson& format, const std::string& param, bool flat_schema) {
     if (!format.is_object() || !format.contains("type") || !format["type"].is_string()) {
         bad_request(param + " must contain a string type", param);
     }
@@ -708,7 +757,7 @@ std::string parse_json_response_format(const Json& format, const std::string& pa
     return spec["schema"].dump();
 }
 
-GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
+GenerationRequest parse_chat_completion_request(const OJson& body, const RequestLimits& limits) {
     require_object(body);
     GenerationRequest out;
     parse_output_features(body, out);
@@ -990,7 +1039,7 @@ std::string make_error_body(const ApiError& error) {
     return Json{{"error", err}}.dump();
 }
 
-GenerationRequest parse_completion_request(const Json& body, const RequestLimits& limits) {
+GenerationRequest parse_completion_request(const OJson& body, const RequestLimits& limits) {
     require_object(body);
     reject_unsupported_completion_features(body);
 
@@ -1002,7 +1051,7 @@ GenerationRequest parse_completion_request(const Json& body, const RequestLimits
     out.model      = body.at("model").get<std::string>();
     out.raw_prompt = parse_completion_prompt(body);
 
-    Json options = body;
+    OJson options = body;
     if (auto count = get_int(body, "logprobs")) {
         if (*count < 0 || *count > 20) bad_request("logprobs must be between 0 and 20", "logprobs");
         options["logprobs"] = true;

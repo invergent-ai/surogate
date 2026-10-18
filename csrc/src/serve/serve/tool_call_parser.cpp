@@ -13,7 +13,10 @@
 namespace sinfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+// Ordered: a call's arguments are returned in the order the model wrote them, as vLLM returns
+// them. A sorted map reordered them alphabetically, and the client sends that order back in the
+// conversation history, where the template renders it to the model as its own earlier call.
+using Json = nlohmann::ordered_json;
 
 std::string trim_ascii(std::string_view text) {
     std::size_t begin = 0;

@@ -1036,9 +1036,9 @@ std::function<bool()> HttpServer::request_cancelled(const httplib::Request& requ
 void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr;
     t_route_reservation.reset();
-    nlohmann::json body;
+    nlohmann::ordered_json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = nlohmann::ordered_json::parse(req.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
@@ -1051,7 +1051,7 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
         limits.default_max_tokens = options_.default_max_tokens;
         // `max_tokens` is meaningless here and a caller need not send one, so the
         // body is completed before it is parsed as a generation request.
-        nlohmann::json completed = body;
+        const nlohmann::ordered_json& completed = body;
         if (!completed.contains("messages") && !completed.contains("prompt")) {
             ApiError error;
             error.status  = 400;
@@ -1087,9 +1087,9 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr; // keep-alive threads must not inherit a route
     t_route_reservation.reset();
-    nlohmann::json body;
+    nlohmann::ordered_json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = nlohmann::ordered_json::parse(req.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
@@ -1367,9 +1367,9 @@ static TokenDetail completion_detail(const GenerationOutcome& outcome, const Pre
 void HttpServer::handle_completions(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr; // keep-alive threads must not inherit a route
     t_route_reservation.reset();
-    nlohmann::json body;
+    nlohmann::ordered_json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = nlohmann::ordered_json::parse(req.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
@@ -1677,9 +1677,9 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr;
     t_route_reservation.reset();
-    nlohmann::json body;
+    nlohmann::ordered_json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = nlohmann::ordered_json::parse(req.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;
@@ -1713,9 +1713,9 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
 void HttpServer::handle_messages(const httplib::Request& req, httplib::Response& res) {
     t_routed_service = nullptr;
     t_route_reservation.reset();
-    nlohmann::json body;
+    nlohmann::ordered_json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = nlohmann::ordered_json::parse(req.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;

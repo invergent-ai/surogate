@@ -20,22 +20,23 @@ namespace sinfer::serve {
 // independent request/error types; they live in request.h and are shared by the
 // OpenAI and Anthropic schema layers.
 
-// Parse an already-decoded JSON body into a GenerationRequest. Throws ApiException
+// Parse an already-decoded JSON body into a GenerationRequest. The body is an ordered_json so the
+// client's key order survives into the prompt (a nlohmann::json argument converts, sorted). Throws ApiException
 // on malformed or unsupported requests (n>1, tools, non-text response_format, ...).
 // Responses uses a flat json_schema format; Chat Completions nests its schema envelope.
-std::string parse_json_response_format(const nlohmann::json& format, const std::string& param,
+std::string parse_json_response_format(const nlohmann::ordered_json& format, const std::string& param,
                                        bool flat_schema = false);
 
-GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
+GenerationRequest parse_chat_completion_request(const nlohmann::ordered_json& body,
                                                 const RequestLimits& limits);
 
-std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
-void parse_openai_enable_thinking(const nlohmann::json& body, GenerationRequest& out);
+std::optional<bool> parse_openai_preserve_thinking(const nlohmann::ordered_json& body);
+void parse_openai_enable_thinking(const nlohmann::ordered_json& body, GenerationRequest& out);
 
 // Parse a /v1/completions body. The prompt is carried verbatim in
 // `GenerationRequest::raw_prompt`; everything else -- sampling, stops, streaming, the token
 // budget -- is the same request a chat call makes, so the two share one type.
-GenerationRequest parse_completion_request(const nlohmann::json& body,
+GenerationRequest parse_completion_request(const nlohmann::ordered_json& body,
                                            const RequestLimits& limits);
 
 /// Requested raw token probabilities and token strings for response serialization.

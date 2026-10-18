@@ -19,6 +19,9 @@ struct ResolvedPromptSemantics {
     bool enable_thinking = true;
     std::optional<sinfer::ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
+    /// A message's consecutive text parts reach the template as written, one after the other,
+    /// rather than joined by a newline (PromptCapabilities::concatenates_text_parts).
+    bool concatenate_text_parts = false;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,

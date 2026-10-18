@@ -5,7 +5,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <charconv>
+#include <cmath>
+#include <cstdio>
 #include <cctype>
 #include <optional>
 #include <stdexcept>
@@ -87,15 +91,80 @@ void validate_instruction_message(const ChatMessage& message) {
     }
 }
 
-std::string trim_ascii_whitespace(const std::string& text) {
-    std::size_t begin = 0;
-    while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
-        ++begin;
+/// Byte length of the whitespace character starting at `pos` -- one Python's str.isspace() accepts,
+/// which is what Jinja's `trim` strips (U+00A0, U+3000, U+2028, \v, \f, ... as well as ASCII
+/// space) -- or 0.
+std::size_t python_space_at(std::string_view text, std::size_t pos) {
+    const auto at = [&](std::size_t i) {
+        return i < text.size() ? static_cast<unsigned char>(text[i]) : 0U;
+    };
+    const unsigned byte = at(pos);
+    if (byte == ' ' || (byte >= 0x09 && byte <= 0x0d) || (byte >= 0x1c && byte <= 0x1f)) { return 1; }
+    if (byte == 0xc2 && (at(pos + 1) == 0x85 || at(pos + 1) == 0xa0)) { return 2; }
+    if (byte == 0xe1 && at(pos + 1) == 0x9a && at(pos + 2) == 0x80) { return 3; }
+    if (byte == 0xe2 && at(pos + 1) == 0x80 &&
+        ((at(pos + 2) >= 0x80 && at(pos + 2) <= 0x8a) || at(pos + 2) == 0xa8 || at(pos + 2) == 0xa9 ||
+         at(pos + 2) == 0xaf)) {
+        return 3;
     }
+    if (byte == 0xe2 && at(pos + 1) == 0x81 && at(pos + 2) == 0x9f) { return 3; }
+    if (byte == 0xe3 && at(pos + 1) == 0x80 && at(pos + 2) == 0x80) { return 3; }
+    return 0;
+}
 
-    std::size_t end = text.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) { --end; }
+/// Jinja's `trim`: Python's str.strip() (the templates reproduced here trim every message).
+std::string trim_python_whitespace(const std::string& text) {
+    std::size_t begin = 0;
+    std::size_t end   = text.size();
+    while (begin < end) {
+        const std::size_t width = python_space_at(text, begin);
+        if (width == 0) { break; }
+        begin += width;
+    }
+    while (end > begin) {
+        std::size_t width = 0;
+        for (std::size_t w = 1; w <= 3 && w <= end - begin && width == 0; ++w) {
+            if (python_space_at(text, end - w) == w) { width = w; }
+        }
+        if (width == 0) { break; }
+        end -= width;
+    }
     return text.substr(begin, end - begin);
+}
+
+/// Python's repr() of a float, which is how json.dumps and str() write one: the shortest digits
+/// that round-trip, correctly rounded, fixed from 1e-4 up to 1e16 and with an exponent outside.
+/// nlohmann's dump differs in places (1e15 is "1e+15" there).
+std::string python_float_repr(double value) {
+    if (!std::isfinite(value)) { return OrderedJson(value).dump(); }
+    char buffer[64];
+    const auto written =
+        std::to_chars(buffer, buffer + sizeof buffer, value, std::chars_format::scientific);
+    const std::string scientific(buffer, written.ptr);
+    const bool negative          = scientific[0] == '-';
+    const std::size_t exponent_at = scientific.find('e');
+    std::string digits;
+    for (std::size_t k = negative ? 1 : 0; k < exponent_at; ++k) {
+        if (scientific[k] != '.') { digits += scientific[k]; }
+    }
+    while (digits.size() > 1 && digits.back() == '0') { digits.pop_back(); }
+    const int exponent = std::stoi(scientific.substr(exponent_at + 1));
+    std::string out    = negative ? "-" : "";
+    if (exponent >= 16 || exponent < -4) {
+        out += digits.substr(0, 1);
+        if (digits.size() > 1) { out += "." + digits.substr(1); }
+        char tail[16];
+        std::snprintf(tail, sizeof tail, "e%c%02d", exponent < 0 ? '-' : '+',
+                      exponent < 0 ? -exponent : exponent);
+        return out + tail;
+    }
+    if (exponent < 0) {
+        return out + "0." + std::string(static_cast<std::size_t>(-exponent - 1), '0') + digits;
+    }
+    const std::size_t whole = static_cast<std::size_t>(exponent) + 1;
+    std::string integer     = digits.substr(0, std::min(whole, digits.size()));
+    integer.resize(whole, '0');
+    return out + integer + "." + (digits.size() > whole ? digits.substr(whole) : "0");
 }
 
 bool starts_with(const std::string& text, std::string_view prefix) {
@@ -111,7 +180,7 @@ long last_real_user_query(const std::vector<ChatMessage>& messages) {
     for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
         const ChatMessage& message = messages[static_cast<std::size_t>(i)];
         if (message.role != ChatRole::User) { continue; }
-        const std::string content = trim_ascii_whitespace(message.rendered_content());
+        const std::string content = trim_python_whitespace(message.rendered_content());
         if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
             return i;
         }
@@ -219,15 +288,23 @@ std::string tojson_text(const OrderedJson& value) {
         rendered += "}";
         return rendered;
     }
+    if (value.is_number_float()) { return python_float_repr(value.get<double>()); }
     return value.dump();
 }
 
-std::string parameter_text(const OrderedJson& value) {
+std::string parameter_text(const OrderedJson& value, bool python_scalars) {
     if (value.is_string()) { return value.get<std::string>(); }
+    if (python_scalars && !value.is_object() && !value.is_array()) {
+        // `args_value | string`: Python's str() of the value transformers parsed.
+        if (value.is_boolean()) { return value.get<bool>() ? "True" : "False"; }
+        if (value.is_null()) { return "None"; }
+        if (value.is_number_float()) { return python_float_repr(value.get<double>()); }
+        return value.dump();
+    }
     return tojson_text(value);
 }
 
-std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
+std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments, bool python_scalars) {
     if (allow_empty_arguments && call.arguments_json.empty()) {
         return "<tool_call>\n<function=" + call.name + ">\n</function>\n</tool_call>";
     }
@@ -244,7 +321,7 @@ std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
         rendered += "<parameter=";
         rendered += it.key();
         rendered += ">\n";
-        rendered += parameter_text(it.value());
+        rendered += parameter_text(it.value(), python_scalars);
         rendered += "\n</parameter>\n";
     }
     rendered += "</function>\n</tool_call>";
@@ -310,6 +387,38 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
                                     "'");
     }
     throw std::invalid_argument("invalid reasoning effort");
+}
+
+/// The messages vLLM renders for a request with a developer message and a template that has no
+/// developer role, or nothing when there is nothing to change.
+std::optional<std::vector<ChatMessage>> consolidate_developer_messages(const std::vector<ChatMessage>& messages) {
+    const bool has_developer = std::any_of(messages.begin(), messages.end(),
+                                           [](const ChatMessage& m) { return m.role == ChatRole::Developer; });
+    if (!has_developer) { return std::nullopt; }
+    std::size_t instructions = 0;
+    bool late                = false;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        if (!is_instruction_role(messages[i].role)) { continue; }
+        late = late || i > 0;
+        ++instructions;
+    }
+    if (!late && instructions < 2) { return std::nullopt; }
+    std::string merged;
+    std::vector<ChatMessage> result(1);
+    for (const ChatMessage& message : messages) {
+        if (!is_instruction_role(message.role)) {
+            result.push_back(message);
+            continue;
+        }
+        validate_instruction_message(message);
+        const std::string text = message.rendered_content();
+        if (text.empty()) { continue; }
+        if (!merged.empty()) { merged += "\n\n"; }
+        merged += text;
+    }
+    result[0].role = ChatRole::System;
+    result[0].parts.push_back(ChatPart::text_part(std::move(merged)));
+    return result;
 }
 
 } // namespace
@@ -379,7 +488,16 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source,
         digest == kQwen35UnslothThinkingToggleTemplateDigest ||
         digest == kQwen354BThinkingToggleTemplateDigest ||
         digest == kQwen3ThinkingToggleTemplateDigest) {
-        return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
+        CompiledChatTemplate compiled(ChatTemplateSemantics::ThinkingToggle);
+        // The Qwen3.5 family templates print scalar arguments with `| string`, and the 0.8B one
+        // (and its unsloth copy) opens no reasoning turn unless asked to.
+        compiled.python_scalar_arguments_ = digest == kQwen35ThinkingToggleTemplateDigest ||
+                                            digest == kQwen35UnslothThinkingToggleTemplateDigest ||
+                                            digest == kQwen354BThinkingToggleTemplateDigest;
+        compiled.thinking_by_default_ = digest != kQwen35ThinkingToggleTemplateDigest &&
+                                        digest != kQwen35UnslothThinkingToggleTemplateDigest;
+        compiled.honours_preserve_thinking_ = !compiled.python_scalar_arguments_;
+        return compiled;
     }
     if (digest == kReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
@@ -404,6 +522,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     // when thinking is on, which is the same fact the Jinja probe establishes by
     // rendering. A Jinja template's capabilities never come from here.
     result.reasoning_turn = result.enable_thinking;
+    result.thinking_by_default = thinking_by_default_;
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;
@@ -413,9 +532,14 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     return result;
 }
 
-RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
+RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& input_messages,
                                           ChatRenderOptions options) const {
-    if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
+    if (input_messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
+    // None of the reproduced templates has a developer role: vLLM makes a developer message a
+    // system message and, when that leaves one anywhere but first or more than one, merges them
+    // at the front (renderers/hf.py `_consolidate_system_messages`).
+    const std::optional<std::vector<ChatMessage>> consolidated = consolidate_developer_messages(input_messages);
+    const std::vector<ChatMessage>& messages = consolidated ? *consolidated : input_messages;
 
     if (semantics_ == ChatTemplateSemantics::Jinja) {
         // Rendered by the project tokenizer, which already drives minja and is
@@ -433,7 +557,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     std::string leading_instruction;
     if (is_instruction_role(messages[0].role)) {
         validate_instruction_message(messages[0]);
-        leading_instruction = trim_ascii_whitespace(messages[0].rendered_content());
+        leading_instruction = trim_python_whitespace(messages[0].rendered_content());
         message_begin       = 1;
     }
 
@@ -459,7 +583,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
 
     const long last_query_index  = last_real_user_query(messages);
-    const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
+    // Retention is the template's own variable; Qwen3.5's has none, and renders completed turns
+    // the same whatever a request asks.
+    const bool preserve_thinking =
+        honours_preserve_thinking_ && options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
 
     int image_count = 0;
@@ -468,7 +595,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const ChatMessage& message = messages[i];
         if (i < message_begin) { continue; }
         if (is_instruction_role(message.role)) { validate_instruction_message(message); }
-        const std::string content = trim_ascii_whitespace(
+        const std::string content = trim_python_whitespace(
             message.rendered_content(options.add_vision_id, &image_count, &video_count));
         if (is_instruction_role(message.role)) {
             rendered += "<|im_start|>system\n";
@@ -501,14 +628,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         // assistant
         std::string reasoning;
         std::string body = content;
-        if (!message.reasoning_content.empty()) {
+        if (!message.reasoning_content.empty() || message.has_reasoning_content) {
+            // `message.reasoning_content is string`: given, even empty, it is the reasoning,
+            // and the content is not searched for a think block.
             reasoning = message.reasoning_content;
         } else if (!effort_template) {
             ThinkParts parts = derive_think_parts(content);
             reasoning        = std::move(parts.reasoning);
             body             = std::move(parts.content);
         }
-        reasoning = trim_ascii_whitespace(reasoning);
+        reasoning = trim_python_whitespace(reasoning);
 
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered += "<|im_start|>assistant\n";
@@ -523,14 +652,15 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
         rendered += body;
         if (!message.tool_calls.empty()) {
-            const bool body_has_text = !trim_ascii_whitespace(body).empty();
+            const bool body_has_text = !trim_python_whitespace(body).empty();
             for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
                 if (call_index == 0) {
                     if (body_has_text) { rendered += "\n\n"; }
                 } else {
                     rendered += "\n";
                 }
-                rendered += render_tool_call(message.tool_calls[call_index], effort_template);
+                rendered += render_tool_call(message.tool_calls[call_index], effort_template,
+                                             python_scalar_arguments_);
             }
         }
         rendered += "<|im_end|>\n";

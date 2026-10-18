@@ -564,6 +564,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     for (ChatMessage& source : messages) {
         fi::ChatMessage target;
         target.role              = source.role;
+        target.has_reasoning_content = source.has_reasoning_content || !source.reasoning_content.empty();
         target.reasoning_content = std::move(source.reasoning_content);
         target.tool_call_id      = std::move(source.tool_call_id);
         target.tool_calls.reserve(source.tool_calls.size());
@@ -610,6 +611,37 @@ std::string jinja_role_name(ChatRole role) {
         return "tool";
     }
     throw std::invalid_argument("chat template: unknown role");
+}
+
+/// vLLM's handling of a developer message for a template that has no developer role
+/// (renders/hf.py `_convert_developer_to_system` + `_consolidate_system_messages`): the
+/// message becomes a system message, and when that leaves a system message anywhere but first,
+/// or more than one, they are merged into one at the front, their texts joined by a blank line.
+/// Qwen's templates refuse a system message that is not first, so without this a request that
+/// vLLM serves was refused.
+void consolidate_system_messages(nlohmann::ordered_json& messages) {
+    std::size_t systems = 0;
+    bool late_system    = false;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        if (messages[i]["role"] != "system") { continue; }
+        late_system = late_system || i > 0;
+        ++systems;
+    }
+    if (!late_system && systems < 2) { return; }
+    std::string merged;
+    nlohmann::ordered_json result = nlohmann::ordered_json::array({nullptr});
+    for (auto& message : messages) {
+        if (message["role"] != "system") {
+            result.push_back(std::move(message));
+            continue;
+        }
+        const std::string& text = message["content"].get_ref<const std::string&>();
+        if (text.empty()) { continue; }
+        if (!merged.empty()) { merged += "\n\n"; }
+        merged += text;
+    }
+    result[0] = {{"role", "system"}, {"content", std::move(merged)}};
+    messages  = std::move(result);
 }
 
 fi::ChatRenderOptions render_options(const PromptOptions& options) {
@@ -1106,6 +1138,31 @@ public:
                                                reasoning)
                 : chat_template.capabilities();
         capabilities.gemma4_tool_calls = spells_gemma4_tool_calls(*tokenizer);
+        // How a message's text parts reach the template. Qwen's templates -- and the hand-written
+        // reproductions of them -- iterate the parts and write them back to back, which is what
+        // vLLM (content format "openai") and transformers render; an artifact's own template is
+        // asked. The Gemma and LFM2 processors build their own turns and keep the newline join.
+        if (!chat_template.rendered_by_tokenizer()) {
+            capabilities.concatenates_text_parts = true;
+        } else if (!processor.lfm2_vl && !(processor.gemma.version || processor.gemma.muse_glimmer)) {
+            constexpr auto part_a = "surogate_text_part_probe_a";
+            constexpr auto part_b = "surogate_text_part_probe_b";
+            const nlohmann::json probe = nlohmann::json::array({{{"role", "user"}, {"content", nlohmann::json::array({
+                {{"type", "text"}, {"text", part_a}}, {{"type", "text"}, {"text", part_b}}})}}});
+            try {
+                capabilities.concatenates_text_parts =
+                    tokenizer->render_chat_template_json(probe.dump(), {}, true, {})
+                        .find(std::string(part_a) + part_b) != std::string::npos;
+            } catch (const std::exception&) {
+                capabilities.concatenates_text_parts = false;
+            }
+        }
+        if (chat_template.rendered_by_tokenizer()) {
+            // vLLM passes a developer message through only to a template that names the role.
+            const std::string_view source = chat_template.jinja_source();
+            supports_developer_role = source.find("\"developer\"") != std::string_view::npos ||
+                                      source.find("'developer'") != std::string_view::npos;
+        }
         if (tokenizer->renders_chat_template()) {
             // Probe a completed turn: a one-user generation prompt cannot reveal
             // whether the template drops historical assistant reasoning.
@@ -1166,12 +1223,17 @@ public:
         }
         // A checkpoint whose template this family does not reproduce by hand is
         // rendered by the tokenizer, from the artifact's own Jinja.
-        const auto structured_messages = [](const std::vector<fi::ChatMessage>& values) {
+        const auto structured_messages = [this](const std::vector<fi::ChatMessage>& values) {
             auto structured = nlohmann::ordered_json::array();
             for (const fi::ChatMessage& message : values) {
-                nlohmann::ordered_json item{{"role", jinja_role_name(message.role)},
-                                            {"content", message.rendered_content()}};
-                if (!message.reasoning_content.empty()) { item["reasoning_content"] = message.reasoning_content; }
+                nlohmann::ordered_json item{
+                    {"role", message.role == ChatRole::Developer && supports_developer_role
+                                 ? std::string("developer")
+                                 : jinja_role_name(message.role)},
+                    {"content", message.rendered_content()}};
+                if (message.has_reasoning_content || !message.reasoning_content.empty()) {
+                    item["reasoning_content"] = message.reasoning_content;
+                }
                 if (!message.tool_call_id.empty()) { item["tool_call_id"] = message.tool_call_id; }
                 if (!message.tool_calls.empty()) {
                     item["tool_calls"] = nlohmann::ordered_json::array();
@@ -1183,6 +1245,10 @@ public:
                 }
                 structured.push_back(std::move(item));
             }
+            const bool has_developer = std::any_of(values.begin(), values.end(), [](const fi::ChatMessage& m) {
+                return m.role == ChatRole::Developer;
+            });
+            if (has_developer && !supports_developer_role) { consolidate_system_messages(structured); }
             return structured;
         };
         const auto variables = template_variables(options);
@@ -1201,7 +1267,8 @@ public:
                 for (const auto& message : messages) {
                     fi::ChatMessage copy{.role = message.role, .parts = {},
                         .reasoning_content = message.reasoning_content,
-                        .tool_calls = message.tool_calls, .tool_call_id = message.tool_call_id};
+                        .tool_calls = message.tool_calls, .tool_call_id = message.tool_call_id,
+                        .has_reasoning_content = message.has_reasoning_content};
                     // Rendering needs media placeholders, not another copy of
                     // potentially large image/video payloads.
                     for (const auto& part : message.parts) {
@@ -1214,7 +1281,6 @@ public:
                     .reasoning_content = "cache boundary reasoning"});
                 next_turn.push_back(fi::ChatMessage{.role = ChatRole::User,
                     .parts = {fi::ChatPart::text_part("cache boundary next question")}});
-                fi::discard_closed_thinking(next_turn, reasoning);
                 try {
                     const auto future = tokenizer->render_chat_template_json(
                         structured_messages(next_turn).dump(), options.tool_jsons, true, variables);
@@ -1247,6 +1313,8 @@ public:
     PromptCapabilities capabilities;
     fi::ReasoningSyntax reasoning;
     bool preserves_thinking = false;
+    /// The artifact's template has a developer role of its own (see consolidate_system_messages).
+    bool supports_developer_role = false;
     bool vision_enabled = true;
     /// Whether anything was compiled above. A checkpoint with no template is a base model, and
     /// only the raw-prompt path can serve it.
@@ -1569,8 +1637,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     if (impl_->tokenizer->renders_chat_template()) {
-        (void)impl_->template_variables(options); // reject unsupported retention before media work
-        if (!options.preserve_thinking) { fi::discard_closed_thinking(messages, impl_->reasoning); }
+        // Rejects unsupported retention before media work. Past turns' reasoning is not
+        // stripped here: the artifact's template decides what of it to render, as it does
+        // under vLLM and transformers (Surogate3.7's keeps every turn's, Qwen3.5's drops the
+        // turns before the last user message).
+        (void)impl_->template_variables(options);
     }
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -1745,8 +1816,11 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     if (impl_->tokenizer->renders_chat_template()) {
-        (void)impl_->template_variables(options); // reject unsupported retention before media work
-        if (!options.preserve_thinking) { fi::discard_closed_thinking(messages, impl_->reasoning); }
+        // Rejects unsupported retention before media work. Past turns' reasoning is not
+        // stripped here: the artifact's template decides what of it to render, as it does
+        // under vLLM and transformers (Surogate3.7's keeps every turn's, Qwen3.5's drops the
+        // turns before the last user message).
+        (void)impl_->template_variables(options);
     }
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),

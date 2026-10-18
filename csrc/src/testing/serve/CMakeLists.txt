@@ -281,6 +281,16 @@ sinfer_add_test(sinfer_family_frontend_test
 target_include_directories(sinfer_family_frontend_test PRIVATE
   ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/family/impl)
+# Prompt-render parity with vLLM: request bodies through the serving layer against the
+# prompts vLLM renders for them (fixtures/frontend/prompt_parity). No checkpoint: the
+# tokenizer is a byte-level one the test builds.
+sinfer_add_test(sinfer_prompt_parity_test
+  SOURCES family/test_prompt_parity.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES sinfer_serve sinfer_engine sinfer_core)
+target_include_directories(sinfer_prompt_parity_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
 # The tokenizer_config.json chat-template contract: three JSON strings and no
 # tokenizer, so it runs where sinfer_family_frontend_test skips.
 sinfer_add_test(sinfer_family_pretokenizer_digits_test
