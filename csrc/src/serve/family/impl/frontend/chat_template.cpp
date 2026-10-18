@@ -389,35 +389,32 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
     throw std::invalid_argument("invalid reasoning effort");
 }
 
-/// The messages vLLM renders for a request with a developer message and a template that has no
-/// developer role, or nothing when there is nothing to change.
+/// The leading instruction messages as vLLM renders them for a template with no developer role
+/// (renders/hf.py `_convert_developer_to_system` + `_consolidate_system_messages`): when the run of
+/// system/developer messages that opens the conversation holds a developer message and more than
+/// one message, it becomes one system message, the texts joined by a blank line. Instruction
+/// messages later in the conversation keep their place, as this renderer has always rendered them
+/// (vLLM would move a late developer message to the front and refuse a late system one).
 std::optional<std::vector<ChatMessage>> consolidate_developer_messages(const std::vector<ChatMessage>& messages) {
-    const bool has_developer = std::any_of(messages.begin(), messages.end(),
-                                           [](const ChatMessage& m) { return m.role == ChatRole::Developer; });
-    if (!has_developer) { return std::nullopt; }
-    std::size_t instructions = 0;
-    bool late                = false;
-    for (std::size_t i = 0; i < messages.size(); ++i) {
-        if (!is_instruction_role(messages[i].role)) { continue; }
-        late = late || i > 0;
-        ++instructions;
+    std::size_t leading = 0;
+    bool developer      = false;
+    while (leading < messages.size() && is_instruction_role(messages[leading].role)) {
+        developer = developer || messages[leading].role == ChatRole::Developer;
+        ++leading;
     }
-    if (!late && instructions < 2) { return std::nullopt; }
+    if (!developer || leading < 2) { return std::nullopt; }
     std::string merged;
-    std::vector<ChatMessage> result(1);
-    for (const ChatMessage& message : messages) {
-        if (!is_instruction_role(message.role)) {
-            result.push_back(message);
-            continue;
-        }
-        validate_instruction_message(message);
-        const std::string text = message.rendered_content();
+    for (std::size_t i = 0; i < leading; ++i) {
+        validate_instruction_message(messages[i]);
+        const std::string text = messages[i].rendered_content();
         if (text.empty()) { continue; }
         if (!merged.empty()) { merged += "\n\n"; }
         merged += text;
     }
+    std::vector<ChatMessage> result(1);
     result[0].role = ChatRole::System;
     result[0].parts.push_back(ChatPart::text_part(std::move(merged)));
+    result.insert(result.end(), messages.begin() + static_cast<std::ptrdiff_t>(leading), messages.end());
     return result;
 }
 
@@ -536,8 +533,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& input_
                                           ChatRenderOptions options) const {
     if (input_messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
     // None of the reproduced templates has a developer role: vLLM makes a developer message a
-    // system message and, when that leaves one anywhere but first or more than one, merges them
-    // at the front (renderers/hf.py `_consolidate_system_messages`).
+    // system message and merges the system messages it opens with (consolidate_developer_messages).
     const std::optional<std::vector<ChatMessage>> consolidated = consolidate_developer_messages(input_messages);
     const std::vector<ChatMessage>& messages = consolidated ? *consolidated : input_messages;
 

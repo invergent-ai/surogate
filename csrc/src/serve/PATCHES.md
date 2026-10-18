@@ -5446,7 +5446,9 @@ pre-tokenizer regex instead of the checkpoint's (5.18 agrees with the engine on 
   to back (`PromptCapabilities::concatenates_text_parts`, probed for an artifact's own template; the Gemma and LFM2
   processors keep the newline). A tool result sent as text parts is accepted and joined with newlines, as vLLM does.
   A developer message for a template without that role becomes a system message, merged with the others at the
-  front when it is not first or not alone (vLLM's `_consolidate_system_messages`), on both render paths.
+  front when it is not first or not alone (vLLM's `_consolidate_system_messages`). The hand-written path merges
+  only the instruction messages the conversation opens with: it has always rendered a later system or developer
+  turn in place, which vLLM would move to the front (developer) or refuse (system).
 - **minja** (`cmake/patch_minja.sh` 5 and 6): `trim` / `strip()` remove Python's whitespace (U+00A0, U+3000, \v,
   ...), and floats print as Python's repr (1e15 is `1000000000000000.0`; correctly rounded shortest digits).
 - **Hand-written templates.** They trim and print floats the same way. For the Qwen3.5 digests they write scalar
