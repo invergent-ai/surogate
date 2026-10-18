@@ -29,6 +29,9 @@ Option (SFT config ``ngram_memory``)::
       init_std: 0.02
       table_residency: host             # host (pinned, mapped; default) or device
       zero_token_ids: [248056, 248057]  # memory output forced to 0 (the engine's image/video pad rule)
+      row_shuffle: {a: 2654435761, b: 97531}   # CONTROL ARM ONLY (default off): every gathered row r is read as
+                                        # (r * a + b) mod R -- the table's capacity and statistics without its
+                                        # n-gram knowledge. Recorded in the adapter; the engine export refuses it.
 
 With no ``ngram_memory`` the compiled IR is unchanged. With it the model's IR config carries
 ``ngram_memory_layer`` and ``ngram_memory_spec`` (the JSON :meth:`NgramMemoryConfig.spec` returns).
@@ -147,6 +150,8 @@ class NgramMemoryConfig:
     manifest: str | None = None
     #: The run's learning rate (set by the trainer): the memory trains at ``lr / base_lr`` times it.
     base_lr: float | None = None
+    #: Control arm: (a, b) of the row relabelling r -> (r * a + b) mod row_count, or None.
+    row_shuffle: tuple[int, int] | None = None
 
     @classmethod
     def parse(cls, value: Any) -> "NgramMemoryConfig | None":
@@ -159,7 +164,7 @@ class NgramMemoryConfig:
         if not isinstance(value, dict):
             raise ValueError(f"ngram_memory must be a mapping, got {type(value).__name__}")
         allowed = {"table", "manifest", "meta", "layer", "lr", "only", "init_std", "table_residency",
-                   "zero_token_ids", "seed", "base_lr"}
+                   "zero_token_ids", "seed", "base_lr", "row_shuffle"}
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(f"ngram_memory: unknown keys {sorted(unknown)} (allowed: {sorted(allowed)})")
@@ -183,11 +188,13 @@ class NgramMemoryConfig:
         if len(zero) > 4:
             raise ValueError("ngram_memory: at most 4 zero_token_ids")
         lr = value.get("lr")
+        row_shuffle = parse_row_shuffle(value.get("row_shuffle"), meta.row_count)
         cfg = cls(table=table, meta=meta, layer=layer, lr=float(lr) if lr is not None else None,
                   only=bool(value.get("only", True)), init_std=float(value.get("init_std", 0.02)),
                   table_residency=residency, zero_token_ids=zero, seed=int(value.get("seed", 0)),
                   manifest=manifest,
-                  base_lr=float(value["base_lr"]) if value.get("base_lr") is not None else None)
+                  base_lr=float(value["base_lr"]) if value.get("base_lr") is not None else None,
+                  row_shuffle=row_shuffle)
         if layer < 0:
             raise ValueError("ngram_memory: layer must be >= 0")
         if cfg.lr is not None and not cfg.lr > 0:
@@ -208,6 +215,7 @@ class NgramMemoryConfig:
         return {"table": self.table, "manifest": self.manifest, "layer": self.layer, "lr": self.lr,
                 "only": self.only, "init_std": self.init_std, "table_residency": self.table_residency,
                 "zero_token_ids": list(self.zero_token_ids), "seed": self.seed, "base_lr": self.base_lr,
+                "row_shuffle": {"a": self.row_shuffle[0], "b": self.row_shuffle[1]} if self.row_shuffle else None,
                 "meta": {"multipliers": list(m.multipliers), "head_offsets": list(m.head_offsets),
                          "head_vocab_sizes": list(m.head_vocab_sizes), "ngram_size": m.ngram_size,
                          "heads_per_ngram": m.heads_per_ngram, "head_dim": m.head_dim, "row_count": m.row_count,
@@ -233,7 +241,42 @@ class NgramMemoryConfig:
                 "zero_token_ids": list(self.zero_token_ids), "table": self.table, "table_offset": m.table_offset,
                 "table_residency": self.table_residency, "eps": 1e-6, "init_std": self.init_std, "seed": self.seed,
                 "lr_scale": lr_scale, "embed_dim": m.embed_dim, "conv_kernel": m.conv_kernel,
-                "conv_dilation": m.ngram_size}
+                "conv_dilation": m.ngram_size,
+                # only when on, so a run without the control arm compiles to the IR it always had
+                **({"row_shuffle_a": self.row_shuffle[0], "row_shuffle_b": self.row_shuffle[1]}
+                   if self.row_shuffle else {})}
+
+
+def parse_row_shuffle(value: Any, row_count: int) -> tuple[int, int] | None:
+    """``None`` / ``{}`` / ``False`` -> None; ``{a, b}`` -> (a, b), a odd, coprime with the row count (a bijection
+    of the rows), 0 < a < 2^32, 0 <= b < 2^32 (the kernel's uint64 arithmetic)."""
+    if not value:
+        return None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        a, b = value
+    elif isinstance(value, dict) and set(value) <= {"a", "b"} and "a" in value:
+        a, b = value["a"], value.get("b", 0)
+    else:
+        raise ValueError(f"ngram_memory.row_shuffle must be {{a: <odd int>, b: <int>}}, got {value!r}")
+    a, b = int(a), int(b)
+    import math
+
+    if not (0 < a < 2**32 and a % 2 == 1 and 0 <= b < 2**32):
+        raise ValueError(f"ngram_memory.row_shuffle: a must be odd in (0, 2^32) and b in [0, 2^32), got a={a} b={b}")
+    if math.gcd(a, row_count) != 1:
+        raise ValueError(f"ngram_memory.row_shuffle: a={a} shares a factor with the {row_count} rows (not a bijection)")
+    return a, b
+
+
+def shuffle_rows(rows, row_shuffle: tuple[int, int] | None, row_count: int):
+    """The trainer's gather remap, r -> (r * a + b) mod row_count (NumPy reference)."""
+    import numpy as np
+
+    if not row_shuffle:
+        return rows
+    a, b = row_shuffle
+    r = np.asarray(rows, dtype=np.uint64)
+    return ((r * np.uint64(a) + np.uint64(b)) % np.uint64(row_count)).astype(np.int64)
 
 
 def setup_ngram_memory(model, ngram_memory, n_layers: int) -> NgramMemoryConfig | None:

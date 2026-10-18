@@ -1583,6 +1583,8 @@ DslModel::DslModel(const PretrainedConfig& config,
             wm.ngram_memory_layer = spec.layer;
             wm.ngram_memory_embed = spec.embed_dim();
             wm.ngram_init_std = spec.init_std;
+            wm.ngram_row_shuffle_a = spec.row_shuffle.a;
+            wm.ngram_row_shuffle_b = spec.row_shuffle.b;
         }
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
 

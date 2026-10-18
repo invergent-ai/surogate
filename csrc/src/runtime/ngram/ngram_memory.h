@@ -33,6 +33,7 @@ struct Spec {
     std::uint64_t seed = 0;
     float lr_scale = 1.0F;     ///< learning-rate multiplier of the memory parameters
     ZeroTokens zero_tokens;
+    RowShuffle row_shuffle;    ///< control arm: rows relabelled (never served)
 
     [[nodiscard]] bool enabled() const { return layer >= 0; }
     [[nodiscard]] int embed_dim() const { return hash.heads * head_dim; }

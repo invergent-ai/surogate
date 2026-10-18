@@ -152,7 +152,8 @@ void CompiledExecutor::ngram_memory_forward(Tensor& residual_out, Tensor& y, Ten
     ngram_memory::rows(mNgram.rows.get<std::int32_t>(), ids, positions, carry, static_cast<int>(mB),
                        static_cast<int>(mT), spec.hash, stream);
     ngram_memory::gather_iq4nl(mNgram.emb.get<nv_bfloat16>(), mNgram.rows.get<std::int32_t>(), mNgramTable,
-                               spec.row_bytes, spec.head_dim, spec.hash.heads, static_cast<int>(N), stream);
+                               spec.row_bytes, spec.head_dim, spec.hash.heads, static_cast<int>(N), stream,
+                               spec.row_shuffle);
     ngram_memory::residual_add(mNgram.r.get<nv_bfloat16>(), residual_in.get<nv_bfloat16>(), input.get<nv_bfloat16>(),
                                N * C, stream);
 

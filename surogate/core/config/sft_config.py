@@ -283,6 +283,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Dropout rate for LoRA adapters.
         lora_target_modules (Optional[str], default to 'all'):
             List of comma-separated module names to apply LoRA adapters to.
+        eval_panels (Optional[list], defaults to None):
+            Held-out panels scored at step 0, every ``eval_panels_steps`` (default ``eval_steps``) and after the
+            last step: ``[{name, path[, max_rows]}]``, conversations (training format) or pre-tokenized
+            ``{"id", "ids", "spans"}`` rows. Per-row NLL -> <output_dir>/eval_panels.jsonl, per-panel NLL ->
+            eval_panels_summary.jsonl. See surogate/train/eval_panels.py.
         ngram_memory (Optional[dict], defaults to None):
             Hashed n-gram memory on one layer's input (qwen3_5_moe family; LoRA training): a frozen IQ4_NL
             n-gram table read through trained projections W_k, W_v [C, E] and gate gains [C] (the engine's
@@ -464,6 +469,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
     ngram_memory: dict | None = None
+    eval_panels: list | None = None
+    eval_panels_steps: int | None = None
     # Routed experts with expert LoRA: None/'all' = every expert, 'none', or a mask file (lora_expert_mask.py).
     lora_expert_mask: str | dict | None = None
     router_aux_loss_coef: float | None = None
@@ -624,6 +631,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
         self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
         self.train_router = cfg.get("train_router", self.train_router)
+        self.eval_panels = cfg.get("eval_panels", self.eval_panels)
+        if self.eval_panels:
+            _names = []
+            for _p in self.eval_panels:
+                if not isinstance(_p, dict) or "name" not in _p or "path" not in _p:
+                    raise ValueError("eval_panels: each panel is {name, path[, max_rows]}")
+                if not os.path.exists(str(_p["path"])):
+                    raise ValueError(f"eval_panels: {_p['path']} not found")
+                _names.append(str(_p["name"]))
+            if len(set(_names)) != len(_names):
+                raise ValueError(f"eval_panels: duplicate panel names {_names}")
+        self.eval_panels_steps = cfg.get("eval_panels_steps", self.eval_panels_steps)
         self.ngram_memory = cfg.get("ngram_memory", self.ngram_memory)
         if self.ngram_memory:
             from surogate.dsl.modules.ngram_memory import NgramMemoryConfig

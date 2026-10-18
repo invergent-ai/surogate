@@ -46,10 +46,16 @@ def _commit() -> str:
         return "unknown"
 
 
+class ShuffledMemoryError(ValueError):
+    """The adapter's memory was trained on relabelled table rows (the row_shuffle control arm)."""
+
+
 def export_ngram_memory(adapter_dir: str | os.PathLike, out_dir: str | os.PathLike, *,
                         table_sha256: str | None = None, hash_table: bool = False,
-                        hidden_size: int | None = None) -> dict[str, Any]:
-    """Write the engine inputs; returns the json written."""
+                        hidden_size: int | None = None, allow_shuffled: bool = False) -> dict[str, Any]:
+    """Write the engine inputs; returns the json written. A memory trained with ``row_shuffle`` (the control
+    arm) reads table rows the engine does not relabel: it is refused, and with ``allow_shuffled`` (analysis only)
+    written with ``"servable": false`` and its ``row_shuffle``, which the engine converter must refuse."""
     import torch
     from safetensors.torch import load_file, save_file
 
@@ -58,6 +64,12 @@ def export_ngram_memory(adapter_dir: str | os.PathLike, out_dir: str | os.PathLi
     spec = cfg.get("surogate_ngram_memory")
     if not spec:
         raise ValueError(f"{adapter_dir}/adapter_config.json has no surogate_ngram_memory")
+    shuffled = spec.get("row_shuffle_a") is not None
+    if shuffled and not allow_shuffled:
+        raise ShuffledMemoryError(
+            f"{adapter_dir}: the memory was trained with ngram_memory.row_shuffle (a={spec['row_shuffle_a']}, "
+            f"b={spec.get('row_shuffle_b', 0)}), a control arm whose rows the engine does not relabel; it is never "
+            "served (pass allow_shuffled / --allow-shuffled only for an analysis export marked servable: false)")
     tensors = load_file(str(adapter_dir / "adapter_model.safetensors"))
     names = spec["tensors"]
     missing = [names[k] for k in TRAINED if names[k] not in tensors]
@@ -111,6 +123,8 @@ def export_ngram_memory(adapter_dir: str | os.PathLike, out_dir: str | os.PathLi
         "conv_kernel": kernel, "conv_dilation": int(spec.get("conv_dilation", spec["ngram_size"])),
         "conv_frozen_zero": True, "eps": float(spec.get("eps", 1e-6)), "gate_clamp": 1e-6,
         "norm_gain_convention": "folded",
+        "servable": not shuffled,
+        "row_shuffle": {"a": int(spec["row_shuffle_a"]), "b": int(spec.get("row_shuffle_b", 0))} if shuffled else None,
         "table": {"path": table, "format": "IQ4_NL", "row_count": rows, "row_bytes": row_bytes,
                   "head_dim": int(spec["head_dim"]), "offset": int(spec.get("table_offset", 0)),
                   "bytes": rows * row_bytes, "file_bytes": size, "sha256": table_sha256,
@@ -132,9 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--table-sha256", default=None, help="the table file's sha256 (recorded as is)")
     ap.add_argument("--hash-table", action="store_true", help="compute the table file's sha256 (reads it whole)")
     ap.add_argument("--hidden-size", type=int, default=None, help="refuse a memory of another width")
+    ap.add_argument("--allow-shuffled", action="store_true",
+                    help="export a row_shuffle control-arm memory for analysis (marked servable: false)")
     a = ap.parse_args(argv)
     meta = export_ngram_memory(a.adapter_dir, a.out_dir, table_sha256=a.table_sha256, hash_table=a.hash_table,
-                               hidden_size=a.hidden_size)
+                               hidden_size=a.hidden_size, allow_shuffled=a.allow_shuffled)
     print(json.dumps({k: meta[k] for k in ("layer", "hidden", "embed_dim", "heads", "table")}, indent=1))
     return 0
 

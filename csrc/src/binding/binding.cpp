@@ -4282,7 +4282,7 @@ NB_MODULE(_surogate, m) {
                   throw std::invalid_argument("_ngram_memory_gather: emb bf16 [N, E], table uint8 [rows * row_bytes]");
               ngram_memory::gather_iq4nl(e.get<nv_bfloat16>(), r.get<std::int32_t>(),
                                          reinterpret_cast<const std::uint8_t*>(t.Data), spec.row_bytes, spec.head_dim,
-                                         spec.hash.heads, N, nullptr);
+                                         spec.hash.heads, N, nullptr, spec.row_shuffle);
               CUDA_CHECK(cudaDeviceSynchronize());
           });
     {

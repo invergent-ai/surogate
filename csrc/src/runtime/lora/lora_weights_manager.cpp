@@ -598,6 +598,31 @@ void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, N
         } catch (std::exception& e) {
             throw std::runtime_error(fmt::format("Error reading adapter file '{}': {}", file_name, e.what()));
         }
+        // A memory trained on shuffled rows (the control arm) and one trained on the real rows are different
+        // models with identically shaped tensors: the adapter_config.json beside the file says which.
+        if (mConfig.ngram_memory_layer >= 0) {
+            namespace fs = std::filesystem;
+            std::ifstream in(fs::path(file_name).parent_path() / "adapter_config.json");
+            if (in) {
+                nlohmann::json j;
+                try {
+                    j = nlohmann::json::parse(in);
+                } catch (const std::exception&) {
+                    j = nlohmann::json::object();
+                }
+                if (j.contains("surogate_ngram_memory")) {
+                    const auto& s = j.at("surogate_ngram_memory");
+                    const std::uint64_t a = s.value("row_shuffle_a", static_cast<std::uint64_t>(0));
+                    const std::uint64_t b = s.value("row_shuffle_b", static_cast<std::uint64_t>(0));
+                    if (a != mConfig.ngram_row_shuffle_a || (a != 0 && b != mConfig.ngram_row_shuffle_b)) {
+                        throw std::runtime_error(fmt::format(
+                            "adapter '{}' was trained with ngram_memory row_shuffle a={} b={}, this trainer runs a={} "
+                            "b={}: configure the trainer with the adapter's row_shuffle",
+                            file_name, a, b, mConfig.ngram_row_shuffle_a, mConfig.ngram_row_shuffle_b));
+                    }
+                }
+            }
+        }
         // An adapter with an n-gram memory is part of the model it was trained as: dropping the memory
         // would load another model.
         if (mConfig.ngram_memory_layer < 0) {

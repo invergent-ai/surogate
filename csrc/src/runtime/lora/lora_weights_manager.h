@@ -85,6 +85,10 @@ public:
         int ngram_memory_layer = -1;
         int ngram_memory_embed = 0;
         float ngram_init_std = 0.02f;
+        /// The memory's row shuffle (control arm; a = 0: none). An adapter records its own in
+        /// adapter_config.json; import refuses a mismatch.
+        std::uint64_t ngram_row_shuffle_a = 0;
+        std::uint64_t ngram_row_shuffle_b = 0;
 
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;

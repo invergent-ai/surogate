@@ -950,7 +950,26 @@ float MultiGPUPyTrainer::validate_chunked(const std::int32_t* inputs,
     double weighted = 0.0;
     long total_valid = 0;
 
-    for (int c = 0; c < seq_chunks; ++c) {
+    // Chunks after the last one holding a valid target add nothing (they score no token, and causality keeps
+    // them from changing earlier chunks): stop there. Every rank reads the same host targets, so all run the
+    // same chunks. Exact; it makes short rows in long windows cost one chunk instead of seq_chunks.
+    int last_chunk = 0;
+    {
+        int max_src = 0;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            max_src = std::max(max_src, host_batch_row_for_local_rank(i, ep_size));
+        }
+        const long total = (static_cast<long>(max_src) + 1) * B * T_full;
+        for (long k = total - 1; k >= 0; --k) {
+            if (targets[k] >= 0) {
+                last_chunk = std::max(last_chunk, static_cast<int>((k % T_full) / T));
+                if (last_chunk == seq_chunks - 1) break;
+            }
+        }
+    }
+    const int run_chunks = last_chunk + 1;
+
+    for (int c = 0; c < run_chunks; ++c) {
         const long base_pos = static_cast<long>(c) * T;
         for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
             auto& ctx = mContexts.at(i);
@@ -3819,6 +3838,54 @@ std::vector<float> MultiGPUPyTrainer::next_token_logits(const std::int32_t* inpu
     return result;
 }
 
+std::vector<float> MultiGPUPyTrainer::compute_logprobs_chunked(const std::int32_t* input_ids,
+                                                               const std::int32_t* targets,
+                                                               int B_rows,
+                                                               bool use_lora) {
+    const int seq_chunks = std::max(1, mOptions.SequenceChunks);
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    if (B_rows != B) {
+        throw std::runtime_error(fmt::format("compute_logprobs (chunked): {} rows, the trainer runs batches of {}", B_rows, B));
+    }
+    std::vector<float> result(static_cast<std::size_t>(B) * static_cast<std::size_t>(T_full), 0.0f);
+    int last_chunk = 0;
+    for (long k = static_cast<long>(B) * T_full - 1; k >= 0; --k) {
+        if (targets[k] >= 0) {
+            last_chunk = std::max(last_chunk, static_cast<int>((k % T_full) / T));
+            if (last_chunk == seq_chunks - 1) break;
+        }
+    }
+    for (int c = 0; c <= last_chunk; ++c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            if (src_row != 0) throw std::runtime_error("compute_logprobs (chunked): one data-parallel row only");
+            copy_chunk_inputs_for_ctx(*ctx.Model, input_ids, targets, nullptr, src_row, B, T, T_full, base_pos);
+        }
+        run_work([&, c, seq_chunks, base_pos](sThreadContext& ctx) {
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) throw std::runtime_error("compute_logprobs: model is not a DslModel");
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(), static_cast<int>(T), base_pos);
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
+            auto lp = dsl_model->compute_logprobs(in.get<std::int32_t>(), tgt.get<std::int32_t>(), B, T, use_lora,
+                                                  *ctx.Communicator, pos.get<std::int32_t>(), nullptr);
+            if (ctx.Communicator->local_rank() == 0) {
+                for (int b = 0; b < B; ++b) {
+                    std::copy(lp.begin() + static_cast<long>(b) * T, lp.begin() + static_cast<long>(b + 1) * T,
+                              result.begin() + static_cast<long>(b) * T_full + base_pos);
+                }
+            }
+        });
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
+    return result;
+}
+
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
                                                        const std::int32_t* targets,
                                                        int B,
@@ -3826,6 +3893,12 @@ std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input
                                                        bool use_lora,
                                                        const std::int32_t* position_ids,
                                                        const float* temperatures) {
+    if (mOptions.SequenceChunks > 1 && T == this->T * mOptions.SequenceChunks) {
+        if (position_ids || temperatures) {
+            throw std::runtime_error("compute_logprobs over sequence chunks: positions are sequential, no temperatures");
+        }
+        return compute_logprobs_chunked(input_ids, targets, B, use_lora);
+    }
     std::vector<float> result;
     run_work([&result, input_ids, targets, B, T, use_lora, position_ids, temperatures](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());

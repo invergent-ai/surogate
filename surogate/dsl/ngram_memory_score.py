@@ -34,10 +34,12 @@ def memory_option_from_adapter(adapter_dir: str | Path) -> tuple[dict[str, Any],
               "zero_token_ids": list(spec.get("zero_token_ids", [])),
               "table_residency": spec.get("table_residency", "host"), "init_std": float(spec.get("init_std", 0.02)),
               "only": not cfg.get("target_modules")}
+    if spec.get("row_shuffle_a") is not None:  # the control arm scores with its own relabelling
+        option["row_shuffle"] = {"a": int(spec["row_shuffle_a"]), "b": int(spec.get("row_shuffle_b", 0))}
     return option, cfg
 
 
-def build_scorer(model_dir: str, adapter_dir: str, seq_len: int, recipe: str = "bf16"):
+def build_scorer(model_dir: str, adapter_dir: str, seq_len: int, recipe: str = "bf16", chunks: int = 1):
     from surogate import _surogate as sg
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
@@ -47,6 +49,13 @@ def build_scorer(model_dir: str, adapter_dir: str, seq_len: int, recipe: str = "
     opts = sg.RuntimeOptions(recipe=recipe, use_cuda_graphs=False, offload_master=False, offload_grads=False,
                              offload_optimizer=False, offload_residual=False, shard_gradients=True)
     opts.recompute = "true"
+    if chunks > 1:  # long rows: per-token log-probs chunk by chunk (KV prefix / GDN state carried)
+        if seq_len % chunks:
+            raise ValueError(f"seq_len {seq_len} is not a multiple of {chunks} chunks")
+        opts.sequence_chunks = chunks
+        import os
+
+        os.environ.setdefault("SUROGATE_ROPE_MAX_SEQ", str(seq_len))
     opts.dsl_ir_json = build_dsl_ir_for_model(model_dir, extra_config={"ngram_memory": option})
     manifests = compile_jit_kernels(opts.dsl_ir_json)
     if manifests:
@@ -61,7 +70,7 @@ def build_scorer(model_dir: str, adapter_dir: str, seq_len: int, recipe: str = "
                                        dtype="bf16" if "bf16" in dtype else "fp32", target_modules=targets,
                                        train_router=any(".mlp.gate.lora_" in k for k in keys))
     tr = sg.SurogateTrainer(ngpu=1, config=sg.PretrainedConfig.from_pretrained(model_dir, "bf16"), options=opts,
-                            batch_size=1, seq_len=seq_len, grad_accum=1, memcpy_all_gather=True,
+                            batch_size=1, seq_len=seq_len // max(chunks, 1), grad_accum=1, memcpy_all_gather=True,
                             memcpy_send_recv=True, lora_config=lora_config, qlora_config=None)
     tr.import_weights(get_model_weights_path(model_dir))
     tr.import_adapter(str(Path(adapter_dir) / "adapter_model.safetensors"))
@@ -93,12 +102,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--engine", required=True, help="ENGINE.jsonl from ple_parity.py score (its ids are scored)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--recipe", default="bf16")
-    ap.add_argument("--max-len", type=int, default=0, help="trainer sequence length (default: longest row, /128)")
+    ap.add_argument("--max-len", type=int, default=0, help="trainer sequence length (default: longest row, rounded)")
+    ap.add_argument("--chunk", type=int, default=4096, help="tokens per sequence chunk for rows longer than one chunk")
     a = ap.parse_args(argv)
     rows = [json.loads(line) for line in open(a.engine) if line.strip()]
     longest = max(len(r["ids"]) for r in rows)
-    seq_len = a.max_len or (longest + 127) // 128 * 128
-    tr = build_scorer(a.model, a.adapter, seq_len, a.recipe)
+    if a.max_len:
+        seq_len = a.max_len
+    elif longest <= a.chunk:
+        seq_len = (longest + 127) // 128 * 128
+    else:
+        seq_len = (longest + a.chunk - 1) // a.chunk * a.chunk
+    chunks = max(1, seq_len // a.chunk) if seq_len > a.chunk else 1
+    tr = build_scorer(a.model, a.adapter, seq_len, a.recipe, chunks=chunks)
     with open(a.out, "w") as out:
         for rec in score_rows(tr, rows, seq_len):
             lp = [v for v in rec["logprobs"] if v is not None]

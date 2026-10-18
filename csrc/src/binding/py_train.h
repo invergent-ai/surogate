@@ -351,6 +351,10 @@ public:
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions, int B, int T);
 
+    /// compute_logprobs over a full sequence_chunks * T window, chunk by chunk (KV prefix and GDN state carried,
+    /// as validate_chunked); chunks after the last scored one are skipped.
+    std::vector<float> compute_logprobs_chunked(const std::int32_t* input_ids, const std::int32_t* targets, int B,
+                                                bool use_lora);
     std::vector<float> compute_logprobs(const std::int32_t* input_ids,
                                         const std::int32_t* targets,
                                         int B,

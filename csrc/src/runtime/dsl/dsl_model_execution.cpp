@@ -686,8 +686,11 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                              -1,
                              ETensorDType::INT32,
                              std::vector<long>{B, T});
+    // A sequence chunk carries its document geometry in the chunk metadata (as forward() does).
     const bool doc_masking_active =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, input_tensor, position_tensor);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, input_tensor, position_tensor);
 
     auto* logprobs_gpu = scratch.custom_dloss.get<float>();
     CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, token_bytes, rs.MainStream));

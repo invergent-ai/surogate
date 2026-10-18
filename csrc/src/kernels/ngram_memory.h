@@ -60,10 +60,20 @@ struct ZeroTokens {
 void rows(int* rows, const int* ids, const int* positions, const int* carry, int B, int T, const Hash& hash,
           cudaStream_t stream);
 
+/// A consistent random relabelling of the table rows, r -> (r * a + b) mod row_count (a = 0: off). A control
+/// arm with the table's capacity and statistics but none of its n-gram knowledge (never served).
+struct RowShuffle {
+    std::uint64_t a = 0;
+    std::uint64_t b = 0;
+    std::int64_t row_count = 0;
+    [[nodiscard]] bool enabled() const { return a != 0; }
+};
+
 /// emb[t, h*head_dim + i] = bf16_rn(decode(table[rows[t, h]])[i]) for IQ4_NL rows of `row_bytes`
-/// (= head_dim / 32 * 18) bytes at a device-accessible `table` (device memory or mapped pinned host).
+/// (= head_dim / 32 * 18) bytes at a device-accessible `table` (device memory or mapped pinned host); with a
+/// row shuffle the row read is shuffle(rows[t, h]).
 void gather_iq4nl(nv_bfloat16* emb, const int* rows, const std::uint8_t* table, int row_bytes, int head_dim,
-                  int heads, int N, cudaStream_t stream);
+                  int heads, int N, cudaStream_t stream, RowShuffle shuffle = {});
 
 /// out = bf16(float(a) + float(b)), element-wise (the residual the memory reads).
 void residual_add(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long n, cudaStream_t stream);

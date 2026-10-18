@@ -103,7 +103,8 @@ __global__ void rows_kernel(int* __restrict__ rows, const int* __restrict__ ids,
 // ------------------------------------------------------------------------------------------------
 // Gather: the engine's gather_kernel.
 __global__ void gather_kernel(nv_bfloat16* __restrict__ embedding, const int* __restrict__ rows,
-                              const std::uint8_t* __restrict__ table, int row_bytes, int head_dim, int heads) {
+                              const std::uint8_t* __restrict__ table, int row_bytes, int head_dim, int heads,
+                              RowShuffle shuffle) {
     const long t = blockIdx.x;
     const int values = heads * head_dim;
     for (int v = static_cast<int>(threadIdx.x); v < values; v += kThreads) {
@@ -111,7 +112,11 @@ __global__ void gather_kernel(nv_bfloat16* __restrict__ embedding, const int* __
         const int within = v - head * head_dim;
         const int block = within / 32;
         const int lane = within - block * 32;
-        const std::int64_t row = rows[t * heads + head];
+        std::int64_t row = rows[t * heads + head];
+        if (shuffle.a != 0) {  // (r * a + b) mod R; r < 2^31 and a, b < 2^32 keep it inside uint64
+            row = static_cast<std::int64_t>((static_cast<std::uint64_t>(row) * shuffle.a + shuffle.b) %
+                                            static_cast<std::uint64_t>(shuffle.row_count));
+        }
         const std::uint8_t* data = table + row * row_bytes + static_cast<std::int64_t>(block) * 18;
         const float scale = __half2float(
             __ushort_as_half(static_cast<unsigned short>(data[0] | (static_cast<unsigned>(data[1]) << 8))));
@@ -371,9 +376,10 @@ void rows(int* rows, const int* ids, const int* positions, const int* carry, int
 }
 
 void gather_iq4nl(nv_bfloat16* emb, const int* rows, const std::uint8_t* table, int row_bytes, int head_dim,
-                  int heads, int N, cudaStream_t stream) {
+                  int heads, int N, cudaStream_t stream, RowShuffle shuffle) {
     if (N <= 0) return;
-    gather_kernel<<<static_cast<unsigned>(N), kThreads, 0, stream>>>(emb, rows, table, row_bytes, head_dim, heads);
+    gather_kernel<<<static_cast<unsigned>(N), kThreads, 0, stream>>>(emb, rows, table, row_bytes, head_dim, heads,
+                                                                      shuffle);
     CUDA_CHECK(cudaGetLastError());
 }
 

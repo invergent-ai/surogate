@@ -656,7 +656,34 @@ ngram_memory:
   init_std: 0.02            # W_k init; W_v = 0, gains = 1
   table_residency: host     # host (pinned, mapped; default) or device
   zero_token_ids: [248056, 248057]   # memory output 0 at these ids (image/video pads; the engine's rule)
+  row_shuffle: {a: 2654435761, b: 97531}   # CONTROL ARM only (default off): read row r as (r*a + b) mod R
 ```
+
+`row_shuffle` is a control for A/B tests: the gather reads every table row r as `(r * a + b) mod R` (a odd and
+coprime with the row count, so a bijection), keeping the table's capacity and statistics without its n-gram
+knowledge. Off, the compiled spec is unchanged. The adapter records it (`surogate_ngram_memory.row_shuffle_a/b`), a
+trainer with another setting refuses to import it, and the engine export refuses it (`--allow-shuffled` writes an
+analysis export marked `"servable": false`).
+
+### Evaluation panels (`eval_panels`)
+
+Held-out panels scored by the trainer at step 0 (before any update), every `eval_panels_steps` (default
+`eval_steps`) and after the last step, each row as its own window with the trainer's per-token log-probs (chunk by
+chunk under `sequence_chunks`; chunks after the last scored token are skipped). Unlike `validation_datasets` (one
+merged, shuffled loss) every panel and every row keeps its identity, for paired comparisons of two runs:
+
+```yaml
+eval_panels:
+  - {name: P_in, path: /path/pin.jsonl, per_token: true}      # conversations (the training format)
+  - {name: P_ret, path: /path/rows.tok.jsonl}                  # or pre-tokenized {"id", "ids", "spans"} rows
+eval_panels_steps: 4
+```
+
+Outputs in `output_dir`: `eval_panels.jsonl` (step, panel, row id, scored tokens, NLL),
+`eval_panels_summary.jsonl` (per panel and step) and, for `per_token` panels at step 0 and the final eval,
+`eval_tokens_step<S>.jsonl.gz` (per scored position: log-probability and the training-split counts of the bigram and
+trigram ending there, under the n-gram memory's context rule, counted over the `train-*.bin` windows). Requires
+`gpus: 1` and `per_device_train_batch_size: 1`.
 
 A conversation starts where the position id is 0; under `sequence_chunks` each chunk receives the two tokens
 before it. The PEFT export holds the memory as `...layers.L.ple.{key_proj,value_proj,norm_key,norm_query}.weight`

@@ -72,6 +72,14 @@ Spec Spec::parse(const std::string& text) {
     if (static_cast<int>(zero.size()) > kMaxZeroTokens) throw std::invalid_argument("ngram_memory: at most 4 zero tokens");
     s.zero_tokens.count = static_cast<int>(zero.size());
     for (int i = 0; i < s.zero_tokens.count; ++i) s.zero_tokens.ids[i] = zero[static_cast<std::size_t>(i)];
+    if (j.contains("row_shuffle_a")) {
+        const auto a = j.at("row_shuffle_a").get<std::uint64_t>();
+        const auto b = j.value("row_shuffle_b", static_cast<std::uint64_t>(0));
+        if (a == 0 || (a & 1) == 0 || a >= (std::uint64_t{1} << 32) || b >= (std::uint64_t{1} << 32)) {
+            throw std::invalid_argument("ngram_memory: row_shuffle needs an odd a in (0, 2^32) and b in [0, 2^32)");
+        }
+        s.row_shuffle = RowShuffle{a, b, s.row_count};
+    }
     return s;
 }
 

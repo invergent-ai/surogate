@@ -599,6 +599,13 @@ class SurogateTrainerWrapper:
                     memcpy_send_recv=config.memcpy_send_recv,
                 )
 
+        # Held-out panels (eval_panels): per-panel and per-row NLL at fixed steps.
+        self.eval_panels = None
+        if getattr(config, "eval_panels", None):
+            from surogate.train.eval_panels import EvalPanels
+
+            self.eval_panels = EvalPanels(config, self.trainer)
+
         # Apply warmup_ratio if warmup_steps is 0
         self.warmup_steps = config.warmup_steps
         if self.warmup_steps == 0 and config.warmup_ratio > 0:
@@ -1445,6 +1452,10 @@ class SurogateTrainerWrapper:
                 if not use_full_step_graphs:
                     self._load_training_microbatch(in_tokens, out_tokens, pos_ids)
 
+            # Held-out panels (surogate/train/eval_panels.py): step 0 = the model before any update.
+            if self.eval_panels is not None and self.eval_panels.due(step, self.start_step):
+                self.eval_panels.run(step)
+
             # Periodic evaluation (before training step)
             if (
                 self.eval_loader
@@ -1739,6 +1750,8 @@ class SurogateTrainerWrapper:
                     )
                 self._log_ngram_memory_stats(step)
 
+        if self.eval_panels is not None and self.max_steps > self.start_step:
+            self.eval_panels.run(self.max_steps, final=True)  # the trained model
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
     def _maybe_shrink_stack_after_warmup(self) -> None:
