@@ -1046,3 +1046,43 @@ def test_device_residency_matches_host(tiny_model):
             del tr
             torch.cuda.empty_cache()
     assert np.array_equal(out["host"], out["device"])
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_checkpoint_resume_is_exact(tiny_model):
+    """Memory only, AdamW: two steps, a checkpoint, a third step; a fresh trainer resumed from the checkpoint
+    gives the same loss before the third step and the same memory tensors after it, bit for bit (the
+    preemptible H200 run resumes from such checkpoints)."""
+    from surogate import _surogate as sg
+
+    seq = 64
+    xs = [_tokens(seq, seed=s) for s in (31, 32, 33)]
+    opt = sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.0, grad_clip=1.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tr = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model))
+        for step in (1, 2):
+            tr.step(*xs[step - 1])
+            tr.update_with_config(opt, step)
+        tr.save_checkpoint(str(tmp / "ckpt"), 2)
+        loss_a = tr.validate(*xs[2])
+        tr.step(*xs[2])
+        tr.update_with_config(opt, 3)
+        after_a, _ = _adapter(tr, tiny_model, tmp, "a")
+        del tr
+        torch.cuda.empty_cache()
+
+        tr = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model))
+        tr.load_checkpoint(str(tmp / "ckpt"), 2)
+        loss_b = tr.validate(*xs[2])
+        tr.step(*xs[2])
+        tr.update_with_config(opt, 3)
+        after_b, _ = _adapter(tr, tiny_model, tmp, "b")
+        del tr
+        torch.cuda.empty_cache()
+    assert np.float32(loss_a).tobytes() == np.float32(loss_b).tobytes(), (loss_a, loss_b)
+    assert set(after_a) == set(MEMORY)
+    for k in MEMORY:
+        assert torch.equal(after_a[k], after_b[k]), k
+    assert after_a[VALUE].abs().sum() > 0
