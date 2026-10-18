@@ -447,6 +447,13 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
             init_layer(b.moe.shared->up, C, base + 100);
             init_layer(b.moe.shared->down, shared_D, base + 101);
         }
+
+        // Router LoRA (train_router): A like every other target, B = 0. Left out, A kept its allocation's
+        // contents (zeros in practice), and with A = B = 0 both gradients vanish, so the router LoRA never
+        // moved. Its own subsequence range, above the linear-attention one.
+        if (b.router.has_value()) {
+            init_layer(b.router, C, (1ULL << 41) + static_cast<unsigned long long>(l));
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
