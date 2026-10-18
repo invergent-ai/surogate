@@ -70,6 +70,20 @@ void DslModel::export_adapter(const std::string& directory,
             });
             adapter_config["target_modules"] = targets;
         }
+        // lora_expert_mask: the routed experts the adapter covers (the mask file's format, so it can be fed
+        // back as lora_expert_mask). Absent = every expert.
+        if (mLoRAConfig->expert_mask.Enabled) {
+            nlohmann::json layers = nlohmann::json::object();
+            for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+                layers[std::to_string(l)] = *mLoRAConfig->masked_experts(l);
+            }
+            adapter_config["surogate_expert_mask"] = {
+                {"format", "surogate-expert-mask-v1"},
+                {"source", mLoRAConfig->expert_mask.Source},
+                {"num_layers", mModelConfig.NumLayers},
+                {"num_experts", mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->num_experts : 0},
+                {"layers", layers}};
+        }
         std::ofstream config_file(dir / "adapter_config.json");
         config_file << adapter_config.dump(2);
     }
@@ -160,7 +174,7 @@ void require_optimizer_geometry(const char* optimizer, std::size_t saved_params,
     throw std::runtime_error(fmt::format(
         "LoRA {} checkpoint geometry does not match the adapter: the checkpoint's optimizer state covers {} "
         "parameters in {} tensors, this trainer's adapter has {} in {}. Resume with the lora_target_modules "
-        "(and rank) the checkpoint was trained with",
+        "(and rank, and lora_expert_mask) the checkpoint was trained with",
         optimizer, saved_params, saved_tensors, current.first, current.second));
 }
 }  // namespace

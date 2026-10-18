@@ -123,11 +123,15 @@ void ModularLoRAGradsManager::allocate_gradients() {
         return w;
     };
 
+    // lora_expert_mask: grads mirror the weights manager's compact rows (expert_ids) per layer.
+    const std::vector<int>* layer_expert_ids = nullptr;
     auto alloc_grouped_full = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<Tensor> {
         (void)name;
         LoRAGroupedLayerWeights<Tensor> w;
-        w.A = Tensor::empty(mConfig.grad_dtype, {E, r, in_f});
-        w.B = Tensor::empty(mConfig.grad_dtype, {E, out_f, r});
+        const int rows = layer_expert_ids ? static_cast<int>(layer_expert_ids->size()) : E;
+        w.A = Tensor::empty(mConfig.grad_dtype, {rows, r, in_f});
+        w.B = Tensor::empty(mConfig.grad_dtype, {rows, out_f, r});
+        if (layer_expert_ids) w.expert_ids = *layer_expert_ids;
         return w;
     };
     auto alloc_grouped_shard =
@@ -235,9 +239,15 @@ void ModularLoRAGradsManager::allocate_gradients() {
         }
 
         if (layer_is_moe && E > 0) {
-            const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
-                                      mConfig.lora_config.applies_to_gate_up() || mConfig.lora_config.applies_to_up() ||
-                                      mConfig.lora_config.applies_to_down();
+            // lora_expert_mask: no expert adapters in a layer that selects none, compact rows in one that
+            // selects some, the full layout in one that selects all (as ModularLoRAWeightsManager).
+            const std::vector<int>* masked = mConfig.lora_config.masked_experts(l);
+            layer_expert_ids =
+                (masked && static_cast<int>(masked->size()) != mConfig.num_experts) ? masked : nullptr;
+            const bool has_mlp_lora = (mConfig.lora_config.applies_to_gate() ||
+                                       mConfig.lora_config.applies_to_gate_up() ||
+                                       mConfig.lora_config.applies_to_up() || mConfig.lora_config.applies_to_down()) &&
+                                      !(masked && masked->empty());
             if (has_mlp_lora) {
                 full.moe.use_grouped = true;
                 shard.moe.use_grouped = true;
