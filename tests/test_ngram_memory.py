@@ -681,8 +681,9 @@ def _grads(tr):
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.parametrize("chunks,recipe", [(1, "bf16"), (4, "bf16"), (4, "fp8-hybrid")])
-def test_zero_init_is_the_base_model_bit_for_bit(tiny_model, chunks, recipe):
+@pytest.mark.parametrize("chunks,recipe,recompute", [(1, "bf16", True), (4, "bf16", True), (4, "fp8-hybrid", True),
+                                                     (1, "bf16", False)])
+def test_zero_init_is_the_base_model_bit_for_bit(tiny_model, chunks, recipe, recompute):
     """W_v = 0: loss, per-token log-probs and every LoRA gradient equal the memory-off run bit for bit; the
     W_v gradient is live, the W_k / gain gradients are exactly zero (no gate gradient through v = 0)."""
     from safetensors.torch import save_file
@@ -694,7 +695,8 @@ def test_zero_init_is_the_base_model_bit_for_bit(tiny_model, chunks, recipe):
         results = {}
         for label, ngram in (("base", None), ("memory", _memory_option(tiny_model, only=False))):
             # bf16 adapters (expert LoRA needs them): the memory's masters are bf16 here too.
-            tr = _trainer(tiny_model, ["all"], seq, ngram=ngram, chunks=chunks, lora_dtype="bf16", recipe=recipe)
+            tr = _trainer(tiny_model, ["all"], seq, ngram=ngram, chunks=chunks, lora_dtype="bf16", recipe=recipe,
+                          recompute=recompute)
             init, cfg = _adapter(tr, tiny_model, tmp, label)
             if ngram:
                 assert init[KEY].shape == (HIDDEN, 512) == init[VALUE].shape
