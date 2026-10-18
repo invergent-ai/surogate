@@ -450,9 +450,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     }
 
     // CPU-RAM centric training: stream any trainable DSL parameter gradients
-    // through rotating device buffers. LoRA-only runs usually have no DSL grads,
-    // but train_router=true leaves router parameters trainable alongside LoRA,
-    // so this must be keyed on the actual grad set rather than lora_enabled().
+    // through rotating device buffers. LoRA runs have no DSL grads (every base
+    // weight is frozen; train_router adds a router LoRA instead), so this is
+    // keyed on the actual grad set rather than lora_enabled().
     if (mGrads && mOptions.CpuTraining && !mGrads->param_names().empty()) {
         // For single-GPU, configure() may not have been called yet (it requires world_size > 1).
         // Ensure the layer map is built by calling configure with minimal config.

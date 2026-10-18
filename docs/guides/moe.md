@@ -524,15 +524,16 @@ datasets:
 
 ## Verifying Router Training
 
-To confirm the router is being trained when using `train_router: true`:
+`train_router: true` trains a router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`); the full router
+weight stays frozen. To confirm the router LoRA is being trained:
 
-1. **Check adapter checkpoint:** The exported adapter should contain router weights:
+1. **Check adapter checkpoint:** The exported adapter should contain the router LoRA:
    ```python
    from safetensors.torch import load_file
    weights = load_file("output/adapter_model.safetensors")
-   router_keys = [k for k in weights.keys() if "mlp.gate" in k]
-   print(f"Router weights in adapter: {len(router_keys)}")
-   # Should show one per layer (e.g., 28 for 28-layer model)
+   router_keys = [k for k in weights.keys() if ".mlp.gate.lora_" in k]
+   print(f"Router LoRA tensors in adapter: {len(router_keys)}")
+   # Should show two per MoE layer (lora_A and lora_B; e.g., 56 for a 28-layer model)
    ```
 
 2. **Monitor gradient norms:** During training, router gradients contribute to the total gradient norm. You should see non-zero gradients being clipped.

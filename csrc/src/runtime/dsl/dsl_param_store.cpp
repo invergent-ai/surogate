@@ -28,10 +28,6 @@ bool is_rope_param(const std::string& name) {
     return tensor_role_is_rope_name(name);
 }
 
-bool is_router_param(const std::string& name) {
-    return tensor_role_is_router_name(name);
-}
-
 void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
     auto get_long = [&](std::string_view key) -> std::optional<long> {
         auto it = config.find(std::string(key));
@@ -177,7 +173,6 @@ DslParamStore::DslParamStore(const Module& module,
     augment_shape_env(env, module.config);
 
     const bool freeze_base = lora_config && lora_config->enabled();
-    const bool train_router = freeze_base && lora_config->train_router;
 
     if (external_params) {
         mExternalParams = *external_params;
@@ -209,7 +204,11 @@ DslParamStore::DslParamStore(const Module& module,
         }
         entry.trainable = !info.frozen && !is_rope_param(name);
         if (freeze_base) {
-            entry.trainable = !info.frozen && train_router && is_router_param(name);
+            // LoRA mode freezes every base weight, the MoE router included. train_router adds a router
+            // LoRA of rank r (mlp.gate lora_A/lora_B) to the adapter, which the LoRA optimizer trains;
+            // flagging the full router weight trainable as well only allocated a gradient that no
+            // optimizer applies and computed it in every backward.
+            entry.trainable = false;
         }
 
         mParams.emplace(name, entry);
