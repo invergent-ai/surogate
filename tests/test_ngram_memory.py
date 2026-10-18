@@ -24,6 +24,8 @@ GPU, model level (a random 4-layer qwen3_5_moe, recompute on):
 
 from __future__ import annotations
 
+import collections
+import gzip
 import json
 import math
 import os
@@ -1088,3 +1090,298 @@ def test_checkpoint_resume_is_exact(tiny_model):
     for k in MEMORY:
         assert torch.equal(after_a[k], after_b[k]), k
     assert after_a[VALUE].abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------------------------- row shuffle (control)
+
+SHUFFLE = {"a": 2654435761, "b": 97531}
+
+
+class TestRowShuffleConfig:
+    def test_off_is_the_spec_of_today_and_on_adds_two_keys(self):
+        meta = _meta_dict(_small_meta())
+        base = NgramMemoryConfig.parse({"table": "/x", "meta": meta})
+        off = NgramMemoryConfig.parse({"table": "/x", "meta": meta, "row_shuffle": None})
+        on = NgramMemoryConfig.parse({"table": "/x", "meta": meta, "row_shuffle": SHUFFLE})
+        assert base.spec() == off.spec() and "row_shuffle_a" not in base.spec()
+        assert set(on.spec()) - set(base.spec()) == {"row_shuffle_a", "row_shuffle_b"}
+        assert {k: v for k, v in on.spec().items() if not k.startswith("row_shuffle")} == base.spec()
+        assert NgramMemoryConfig.parse(on.to_dict()) == on
+        cfg = _config()
+        ir_base = _ir(cfg, ngram_memory={"table": "/x", "meta": meta})
+        ir_off = _ir(cfg, ngram_memory={"table": "/x", "meta": meta, "row_shuffle": {}})
+        assert ir_base["modules"][0]["config"]["ngram_memory_spec"] == ir_off["modules"][0]["config"]["ngram_memory_spec"]
+
+    def test_validation_and_reference(self):
+        from surogate.dsl.modules.ngram_memory import parse_row_shuffle, shuffle_rows
+
+        R = SWIFT15.row_count
+        assert parse_row_shuffle(SHUFFLE, R) == (2654435761, 97531)
+        for bad in ({"a": 2}, {"a": 0}, {"a": 2**33 + 1}, {"a": 3, "b": -1}, {"c": 1}):
+            with pytest.raises(ValueError):
+                parse_row_shuffle(bad, R)
+        with pytest.raises(ValueError, match="not a bijection"):
+            parse_row_shuffle({"a": 3}, 3 * 101)
+        rows = np.arange(0, R, 9973, dtype=np.int64)
+        got = shuffle_rows(rows, (2654435761, 97531), R)
+        want = np.array([(int(r) * 2654435761 + 97531) % R for r in rows])
+        assert np.array_equal(got, want)
+        # a bijection of the rows (small table, full check)
+        small = 16 * 1009 + 240
+        perm = shuffle_rows(np.arange(small), (2654435761, 97531), small)
+        assert len(np.unique(perm)) == small
+
+
+@pytest.mark.gpu
+def test_gather_with_row_shuffle_is_the_remapped_decode():
+    sg = _gpu()
+    from surogate.dsl.modules.ngram_memory import shuffle_rows
+
+    meta = _small_meta(vocab=211, head_dim=64)
+    raw = _random_table(meta, seed=2)
+    table = torch.from_numpy(raw.reshape(-1)).cuda()
+    rng = np.random.default_rng(5)
+    N = 513
+    rows = rng.integers(0, meta.row_count, size=(N, meta.heads)).astype(np.int32)
+    out = {}
+    for label, sh in (("off", None), ("on", SHUFFLE)):
+        cfg = NgramMemoryConfig.parse({"table": "/unused", "meta": _meta_dict(meta), "row_shuffle": sh})
+        emb = torch.empty((N, meta.embed_dim), dtype=torch.bfloat16, device="cuda")
+        sg._ngram_memory_gather(torch.from_numpy(rows).cuda(), table, emb, json.dumps(cfg.spec()))
+        out[label] = emb.cpu()
+    plain = torch.from_numpy(iq4nl_decode_rows(raw[rows.reshape(-1)], meta.head_dim).reshape(N, -1)).to(torch.bfloat16)
+    remapped_rows = shuffle_rows(rows.reshape(-1), (SHUFFLE["a"], SHUFFLE["b"]), meta.row_count)
+    remapped = torch.from_numpy(iq4nl_decode_rows(raw[remapped_rows], meta.head_dim).reshape(N, -1)).to(torch.bfloat16)
+    assert torch.equal(out["off"], plain)
+    assert torch.equal(out["on"], remapped)
+    assert not torch.equal(out["on"], out["off"])
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_row_shuffle_is_a_permuted_table_end_to_end(tiny_model):
+    """The shuffled arm on table T is exactly the plain memory on the permuted table T'[r] = T[(r a + b) mod R]:
+    per-token log-probs and every memory gradient bit for bit (the whole trainer path, not just the gather).
+    The shuffled adapter records its shuffle; a plain trainer refuses it and the engine export refuses it."""
+    from safetensors.torch import save_file
+
+    from surogate.dsl.modules.ngram_memory import shuffle_rows
+    from surogate.dsl.ngram_memory_export import ShuffledMemoryError, export_ngram_memory
+
+    meta = TableMeta.from_manifest(json.loads((Path(tiny_model) / "table_meta.json").read_text()))
+    raw = np.frombuffer((Path(tiny_model) / "table.iq4nl").read_bytes(), dtype=np.uint8).reshape(meta.row_count, -1)
+    perm = shuffle_rows(np.arange(meta.row_count), (SHUFFLE["a"], SHUFFLE["b"]), meta.row_count)
+    (Path(tiny_model) / "table_perm.iq4nl").write_bytes(raw[perm].tobytes())
+    seq = 128
+    x, y = _tokens(seq, seed=41)
+    out = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for label, opt in (("shuffled", _memory_option(tiny_model, row_shuffle=SHUFFLE)),
+                           ("permuted", {**_memory_option(tiny_model), "table": str(Path(tiny_model) / "table_perm.iq4nl")}),
+                           ("plain", _memory_option(tiny_model))):
+            tr = _trainer(tiny_model, [], seq, ngram=opt)
+            init, cfg = _adapter(tr, tiny_model, tmp, label)
+            live = _randomized(init, seed=7, memory_scale=0.05)
+            save_file(live, str(tmp / label / "adapter_model.safetensors"))  # beside its own adapter_config.json
+            tr.import_adapter(str(tmp / label / "adapter_model.safetensors"))
+            out[label] = {"lp": tr.compute_logprobs(x, y, use_lora=True)[0].copy(), "cfg": cfg}
+            tr.step(x, y)
+            out[label]["grads"] = _grads(tr)
+            del tr
+            torch.cuda.empty_cache()
+        assert out["shuffled"]["cfg"]["surogate_ngram_memory"]["row_shuffle_a"] == SHUFFLE["a"]
+        assert "row_shuffle_a" not in out["plain"]["cfg"]["surogate_ngram_memory"]
+        assert np.array_equal(out["shuffled"]["lp"], out["permuted"]["lp"])
+        for k in MEMORY:
+            assert torch.equal(out["shuffled"]["grads"][k], out["permuted"]["grads"][k]), k
+        assert not np.array_equal(out["shuffled"]["lp"], out["plain"]["lp"])
+        # refusals: a plain trainer cannot load the shuffled adapter (and vice versa); the export refuses it
+        tr = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model))
+        with pytest.raises(RuntimeError, match="row_shuffle"):
+            tr.import_adapter(str(tmp / "shuffled" / "adapter_model.safetensors"))
+        del tr
+        tr = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model, row_shuffle=SHUFFLE))
+        with pytest.raises(RuntimeError, match="row_shuffle"):
+            tr.import_adapter(str(tmp / "plain" / "adapter_model.safetensors"))
+        del tr
+        torch.cuda.empty_cache()
+        with pytest.raises(ShuffledMemoryError):
+            export_ngram_memory(tmp / "shuffled", tmp / "export")
+        meta_json = export_ngram_memory(tmp / "shuffled", tmp / "export_analysis", allow_shuffled=True)
+        assert meta_json["servable"] is False and meta_json["row_shuffle"] == SHUFFLE
+        assert export_ngram_memory(tmp / "plain", tmp / "export_plain")["servable"] is True
+
+
+# ---------------------------------------------------------------------------------------------- chunked log-probs, tail skip
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_chunked_logprobs_and_validate_tail_skip(tiny_model):
+    """compute_logprobs over sequence chunks = the unchunked one (bf16 tolerance) and its mean over the scored
+    tokens = validate; with the scored tokens in chunk 0 only, validate is unchanged bit for bit by any tokens in
+    the later chunks (they are not run, and could not change chunk 0 anyway)."""
+    from safetensors.torch import save_file
+
+    seq = 128
+    x, y = _tokens(seq, seed=43)
+    res = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for chunks in (1, 4):
+            tr = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model), chunks=chunks)
+            init, _ = _adapter(tr, tiny_model, tmp, f"c{chunks}")
+            save_file(_randomized(init, seed=9, memory_scale=0.05), str(tmp / f"c{chunks}" / "adapter_model.safetensors"))
+            tr.import_adapter(str(tmp / f"c{chunks}" / "adapter_model.safetensors"))
+            lp = tr.compute_logprobs(x, y, use_lora=True)[0].astype(np.float64)
+            r = {"lp": lp, "val": tr.validate(x, y)}
+            if chunks == 4:
+                y0 = y.copy()
+                y0[0, 30:] = -100
+                x2 = x.copy()
+                x2[0, 40:] = np.random.default_rng(1).integers(10, 500, size=seq - 40)
+                r["val0"], r["val0b"] = tr.validate(x, y0), tr.validate(x2, y0)
+                lp0 = tr.compute_logprobs(x, y0, use_lora=True)[0].astype(np.float64)
+                r["lp0"] = lp0
+            res[chunks] = r
+            del tr
+            torch.cuda.empty_cache()
+    valid = y[0] != -100
+    for c in (1, 4):
+        nll = -res[c]["lp"][valid].mean()
+        assert abs(nll - res[c]["val"]) < 2e-3 * abs(res[c]["val"]), (c, nll, res[c]["val"])
+    rel = np.abs(res[4]["lp"][valid] - res[1]["lp"][valid]).mean() / np.abs(res[1]["lp"][valid]).mean()
+    assert rel < 2e-2, rel
+    assert np.float32(res[4]["val0"]).tobytes() == np.float32(res[4]["val0b"]).tobytes()
+    assert np.array_equal(res[4]["lp0"][:30], res[4]["lp"][:30])  # chunk 0 alone gives chunk 0's log-probs
+    assert not res[4]["lp0"][40:].any()                          # the skipped chunks are left at 0
+
+
+# ---------------------------------------------------------------------------------------------- eval panels
+
+
+def test_bin_windows_and_ngram_counts(tmp_path):
+    from surogate.train.eval_panels import NgramCounts, context_keys, read_bin_windows
+    from surogate.train.tokenize import TokenizedDataFileWriter
+
+    rng = np.random.default_rng(3)
+    docs = [rng.integers(0, 50, size=n).astype(np.int32) for n in (17, 40, 5)]
+    docs[1][10] = 500  # an EOS inside a document cuts the context
+    T = 48
+    path = tmp_path / "train-000.bin"
+    with TokenizedDataFileWriter(str(path), 1000, masking=True, non_overlapping=True) as w:
+        for d in docs:
+            tok = np.pad(d, (0, T - len(d)), constant_values=500)  # EOS padding with a zero mask
+            mask = np.pad(np.ones(len(d), dtype=np.int32), (0, T - len(d)))
+            w.add_document(tokens=tok, position_ids=np.arange(T), mask=mask)
+    wins = read_bin_windows(str(path), eos=500)
+    assert [list(a) for a in wins] == [list(d) for d in docs]
+    counts = NgramCounts(wins, eos=500)
+    brute_bi, brute_tri = collections.Counter(), collections.Counter()
+    for d in docs:
+        for j in range(len(d)):
+            c1 = 500 if j < 1 or d[j - 1] == 500 else int(d[j - 1])
+            c2 = 500 if (j < 2 or c1 == 500 or d[j - 2] == 500) else int(d[j - 2])
+            brute_bi[(int(d[j]), c1)] += 1
+            brute_tri[(int(d[j]), c1, c2)] += 1
+    q = docs[0]
+    bi, tri = counts.lookup(q, 500)
+    for j in range(len(q)):
+        c1 = 500 if j < 1 or q[j - 1] == 500 else int(q[j - 1])
+        c2 = 500 if (j < 2 or c1 == 500 or q[j - 2] == 500) else int(q[j - 2])
+        assert bi[j] == brute_bi[(int(q[j]), c1)] and tri[j] == brute_tri[(int(q[j]), c1, c2)], j
+    b2, t2 = counts.lookup(np.array([999, 998, 997]), 500)
+    assert not b2.any() and not t2.any()
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_eval_panels_rows_and_tokens(tiny_model, tmp_path):
+    """EvalPanels on pre-tokenized rows: per-row NLL = the mean of the per-token log-probs it dumps = validate;
+    the per-token dump carries the training counts of the n-grams ending at each scored input position."""
+    from types import SimpleNamespace
+
+    from surogate.train.eval_panels import EvalPanels, NgramCounts, read_bin_windows
+    from surogate.train.tokenize import TokenizedDataFileWriter
+
+    seq = 128
+    rng = np.random.default_rng(11)
+    train = [rng.integers(10, 60, size=seq).astype(np.int32) for _ in range(3)]
+    with TokenizedDataFileWriter(str(tmp_path / "train-000.bin"), 512, masking=True, non_overlapping=True) as w:
+        for d in train:
+            w.add_document(tokens=d, position_ids=np.arange(seq), mask=np.ones(seq, dtype=np.int32))
+    rows = [{"id": f"r{k}", "ids": rng.integers(10, 60, size=n).tolist(), "spans": [[3, n]]} for k, n in enumerate((90, 128, 40))]
+    (tmp_path / "panel.tok.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    tr = _trainer(tiny_model, [], seq, ngram=_memory_option(tiny_model))
+    cfg = SimpleNamespace(sequence_len=seq, eval_steps=4, eval_panels_steps=2, output_dir=str(tmp_path), gpus=1,
+                          per_device_train_batch_size=1, ngram_memory={"meta": {"eos_token_id": 500}},
+                          eval_panels=[{"name": "P_in_test", "path": str(tmp_path / "panel.tok.jsonl"), "per_token": True}],
+                          model_dir=str(tiny_model))
+    panels = EvalPanels(cfg, tr)
+    assert panels.due(0, 0) and panels.due(2, 0) and not panels.due(3, 0)
+    res = panels.run(0)
+    val = []
+    for r in rows:
+        ids = np.asarray(r["ids"], dtype=np.int32)
+        x = np.zeros((1, seq), dtype=np.int32)
+        y = np.full((1, seq), -100, dtype=np.int32)
+        x[0, : len(ids)] = ids
+        y[0, 2: len(ids) - 1] = ids[3:]
+        val.append(tr.validate(x, y))
+    del tr
+    torch.cuda.empty_cache()
+    out = [json.loads(l) for l in open(tmp_path / "eval_panels.jsonl")]
+    assert [o["id"] for o in out] == ["r0", "r1", "r2"] and all(o["step"] == 0 for o in out)
+    for o, v, r in zip(out, val, rows):
+        assert o["tokens"] == len(r["ids"]) - 3
+        assert abs(o["nll"] - v) < 2e-3 * abs(v), (o, v)
+    toks = [json.loads(l) for l in gzip.open(tmp_path / "eval_tokens_step0.jsonl.gz", "rt")]
+    counts = NgramCounts(read_bin_windows(str(tmp_path / "train-000.bin"), eos=500), 500)
+    for t, o, r in zip(toks, out, rows):
+        assert t["pos"] == list(range(2, len(r["ids"]) - 1))
+        assert abs(-np.mean(t["lp"]) - o["nll"]) < 1e-5
+        bi, tri = counts.lookup(np.asarray(r["ids"]), 500)
+        assert t["bi"] == bi[t["pos"]].tolist() and t["tri"] == tri[t["pos"]].tolist()
+    assert any(c > 0 for t in toks for c in t["bi"])
+    summ = [json.loads(l) for l in open(tmp_path / "eval_panels_summary.jsonl")]
+    assert summ[0]["panel"] == "P_in_test" and summ[0]["rows"] == 3 and "memory" in summ[0]
+    assert abs(res["P_in_test"] - summ[0]["nll"]) < 1e-12
+
+
+def test_compare_script(tmp_path):
+    """train/compare.py on two synthetic arms: step 0 identical, a planted real - shuf difference recovered."""
+    import subprocess
+    import sys
+
+    script = Path(os.environ.get("NGRAM_COMPARE_SCRIPT", "/mnt/data/work/rl/ngram-transplant-2026-10-18/train/compare.py"))
+    if not script.exists():
+        pytest.skip("compare.py is outside the repo (rl/ngram-transplant-2026-10-18/train)")
+    rng = np.random.default_rng(0)
+    for arm, shift in (("real", -0.05), ("shuf", 0.0)):
+        d = tmp_path / arm
+        d.mkdir()
+        with open(d / "eval_panels.jsonl", "w") as f:
+            for step in (0, 4):
+                for panel in ("P_in_a", "P_ret_b"):
+                    for k in range(30):
+                        base = 1.0 + 0.01 * k
+                        nll = base + (shift if (step == 4 and panel == "P_in_a") else 0.0) + (0.01 if step == 4 else 0.0)
+                        f.write(json.dumps({"step": step, "panel": panel, "id": str(k), "tokens": 100 + k,
+                                            "nll": nll}) + "\n")
+        for step in (0, 4):
+            with gzip.open(d / f"eval_tokens_step{step}.jsonl.gz", "wt") as f:
+                for k in range(30):
+                    lp = (-np.ones(10) * (1.0 + (0.05 if (arm == "shuf" or step == 0) else 0.0))).tolist()
+                    f.write(json.dumps({"step": step, "panel": "P_in_a", "id": str(k), "pos": list(range(10)),
+                                        "lp": lp, "bi": [0, 1, 2, 5, 9, 0, 3, 7, 1, 0], "tri": [0] * 10}) + "\n")
+    r = subprocess.run([sys.executable, str(script), str(tmp_path / "real"), str(tmp_path / "shuf"), "--out",
+                        str(tmp_path / "c.json"), "--boot", "500"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    rep = json.loads((tmp_path / "c.json").read_text())
+    assert rep["step0_max_abs_diff"] == 0.0
+    assert abs(rep["final"]["P_in"]["real-shuf"]["mean"] + 0.05) < 1e-9
+    lo, hi = rep["final"]["P_in"]["real-shuf"]["ci95"]
+    assert lo - 1e-9 <= -0.05 <= hi + 1e-9
+    assert abs(rep["final"]["P_ret"]["real-shuf"]["mean"]) < 1e-12
+    assert abs(rep["strata"]["bi"]["unseen"]["real-shuf"]["mean"] + 0.05) < 1e-9
