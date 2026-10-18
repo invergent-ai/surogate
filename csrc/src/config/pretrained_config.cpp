@@ -358,14 +358,21 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
     if (layer_types) {
         cfg->LayerTypes.clear();
         cfg->LayerTypes.reserve(layer_types->size());
+        cfg->LayerTypeNames.clear();
+        bool all_strings = true;
         for (const auto& item : *layer_types) {
             if (!item.is_string()) {
                 cfg->LayerTypes.push_back(0);
+                all_strings = false;
                 continue;
             }
             const std::string v = item.get<std::string>();
             const bool sliding = (v.find("sliding") != std::string::npos);
             cfg->LayerTypes.push_back(sliding ? 1 : 0);
+            cfg->LayerTypeNames.push_back(v);
+        }
+        if (!all_strings) {
+            cfg->LayerTypeNames.clear();
         }
     } else if (cfg->SlidingWindow > 0 && cfg->ModelTypeName == "gpt_oss" && cfg->NumLayers > 0) {
         // GPT-OSS default: alternating sliding/full attention starting with sliding.
@@ -422,7 +429,10 @@ void save_pretrained_config(const PretrainedConfig& config, const char* file_nam
     if (config.SlidingWindow > 0) {
         config_json["sliding_window"] = config.SlidingWindow;
     }
-    if (!config.LayerTypes.empty()) {
+    if (!config.LayerTypeNames.empty() && config.LayerTypeNames.size() == config.LayerTypes.size()) {
+        // The names config.json gave: the 0/1 coding below cannot express linear attention.
+        config_json["layer_types"] = config.LayerTypeNames;
+    } else if (!config.LayerTypes.empty()) {
         nlohmann::json layer_types = nlohmann::json::array();
         for (int t : config.LayerTypes) {
             layer_types.push_back(t ? "sliding_attention" : "full_attention");

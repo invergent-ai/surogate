@@ -358,6 +358,24 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                    mode_col,
                    false,
                    mRunState.MainStream);
+            // Router LoRA (train_router): this path returns before the generic LoRA epilogue at the end of
+            // dispatch_matmul, so the adapter is added here, onto the FP32 logits, before they are rounded.
+            // The backward (dispatch_matmul_backward) trains it through the generic slice path.
+            if (!op.attrs.lora_slices.empty()) {
+                const Tensor a_flat = flatten_bt(a, mB, mT);
+                const Tensor out_f_flat = flatten_bt(out_f, mB, mT);
+                modules::detail::apply_lora_slices_forward_fp32(op.attrs.lora_slices,
+                                                                op.attrs.layer_idx,
+                                                                a_flat,
+                                                                out_f_flat,
+                                                                static_cast<int>(a_flat.Sizes[0]),
+                                                                mLoRAWeights,
+                                                                mLoRAConfig,
+                                                                mLoRARunState,
+                                                                mRunState.CublasLtHandle,
+                                                                mRunState.CuBlasWorkspace,
+                                                                mRunState.MainStream);
+            }
             if (out.DType != ETensorDType::FP32) {
                 if (out.DType == ETensorDType::BF16) {
                     convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);

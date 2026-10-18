@@ -654,6 +654,7 @@ build_model_config(const Module& module, const PretrainedConfig& base, const Dsl
     cfg.UseQKNorm = base.UseQKNorm;
     cfg.SlidingWindow = base.SlidingWindow;
     cfg.LayerTypes = base.LayerTypes;
+    cfg.LayerTypeNames = base.LayerTypeNames;  // what export_model / checkpoints write back as layer_types
     cfg.UseVisualInputs = base.UseVisualInputs;
     cfg.DeepstackVisualLayers = base.DeepstackVisualLayers;
     cfg.DType = base.DType;
