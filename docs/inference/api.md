@@ -133,8 +133,10 @@ local paths, HTTP(S) URLs, or base64 data URIs. `input_audio` is refused with
 `modality_not_supported`.
 
 For automatic tool choice, start the server with `--enable-auto-tool-choice` and a matching
-`--tool-call-parser` (default `qwen3_xml`; `hermes`, `spark25`, `muse_glimmer`, `llama3_json`, and `llama4_json` are also
-accepted). The model generates tool calls, and your application executes them.
+`--tool-call-parser` (default `hermes`, and `qwen3_coder` for Qwen3.5 / Qwen3.6 checkpoints; `qwen3_xml`, `spark25`,
+`muse_glimmer`, `llama3_json`, and `llama4_json` are also accepted). The model generates tool calls, and your application
+executes them. With `qwen3_coder` the calls are the ones vLLM 0.31 returns for the same tokens, names it was not given
+included; a request with tools gets vLLM's content too, `null` when empty.
 
 Tool choice follows these rules for Chat Completions and Responses:
 

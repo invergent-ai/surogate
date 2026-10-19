@@ -49,6 +49,9 @@ int main() {
     request.tool_choice.mode = ToolChoiceMode::Required;
     assert(!accepts(ToolCallFormat::QwenXml, "Hello!"));
     assert(accepts(ToolCallFormat::QwenXml, xml));
+    // vLLM's qwen3_coder structural tag: the XML call only, no JSON body (its parser would drop one).
+    assert(accepts(ToolCallFormat::Qwen3Coder, xml));
+    assert(!accepts(ToolCallFormat::Qwen3Coder, json));
     assert(accepts(ToolCallFormat::Spark25, spark));
     assert(accepts(ToolCallFormat::Llama3Json, llama));
     assert(accepts(ToolCallFormat::QwenXml, "Let me check.</think>\n\n" + xml, true));
@@ -65,6 +68,11 @@ int main() {
     assert(json_stream.feed("<|py").empty());
     assert(json_stream.feed("thon_tag|>" + llama).empty());
     assert(json_stream.finish(true).empty());
+    // qwen3_coder: a bare <function= opens a call too, so the stream holds it back.
+    ToolCallStreamFilter qwen3_stream(false, false, false, true);
+    assert(qwen3_stream.feed("Checking.\n<funct") == "Checking.");
+    assert(qwen3_stream.feed("ion=weather>\n<parameter=city>\nParis\n</parameter>\n</function>").empty());
+    assert(qwen3_stream.finish(true).empty());
     ToolCallStreamFilter ordinary_stream(true);
     std::string visible = ordinary_stream.feed("An ordinary answer with {braces}.");
     visible += ordinary_stream.finish(false);

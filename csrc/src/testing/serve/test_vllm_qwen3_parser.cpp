@@ -12,7 +12,9 @@
 //
 // SUROGATE_QWEN3_PARSER_CORPUS names a larger corpus of the same shape to run instead.
 
+#ifndef SUROGATE_PARSER_TEST_NO_TOKENIZER // a stand-alone build of this test (no engine tokenizer)
 #include "family/impl/frontend/tokenizer.h"
+#endif
 #include "serve/vllm_qwen3_parser.h"
 
 #include <nlohmann/json.hpp>
@@ -91,6 +93,7 @@ int main() {
     };
 
     // The engine's tokenizer gives every token the text vLLM's gives it (one token decoded alone).
+#ifndef SUROGATE_PARSER_TEST_NO_TOKENIZER
     if (const char* dir = std::getenv("SUROGATE_QWEN3_PARSER_TOKENIZER_DIR")) {
         const std::string root = dir;
         const sinfer::family::frontend_internal::Tokenizer tokenizer(
@@ -103,6 +106,7 @@ int main() {
         check(mismatched == 0, std::to_string(mismatched) + " token texts differ from the engine tokenizer's");
         std::cout << "engine tokenizer: " << texts.size() << " token texts checked, " << mismatched << " differ\n";
     }
+#endif
 
     int rows = 0, skipped = 0, with_calls = 0, calls = 0, nonempty_content = 0;
     while (std::getline(in, line)) {

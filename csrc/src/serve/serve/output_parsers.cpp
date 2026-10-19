@@ -24,8 +24,8 @@ using Json = nlohmann::ordered_json;
 
 /// vLLM's parser names, mapped onto the formats the engine can actually decode.
 /// Several names share a format because the models share a convention: qwen3 and
-/// deepseek_r1 both fence reasoning with `<think>`, hermes and qwen3_xml both emit
-/// the same `<tool_call>` block. Aliases are kept because deployments name the
+/// deepseek_r1 both fence reasoning with `<think>`; qwen3_coder and qwen3_xml are one
+/// parser in vLLM 0.31, as here. Aliases are kept because deployments name the
 /// model's parser, not ours.
 struct ReasoningName {
     std::string_view name;

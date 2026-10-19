@@ -78,6 +78,8 @@ void test_muse_tools() {
 
 void test_tool_call_names() {
     check(parse_tool_call_format("hermes") == ToolCallFormat::QwenXml, "hermes shares the Qwen block");
+    check(parse_tool_call_format("qwen3_coder") == ToolCallFormat::Qwen3Coder, "qwen3_coder is vLLM's parser");
+    check(parse_tool_call_format("qwen3_xml") == ToolCallFormat::Qwen3Coder, "qwen3_xml is the same parser in vLLM");
     check(parse_tool_call_format("llama3_json") == ToolCallFormat::Llama3Json, "llama3_json");
     check(parse_tool_call_format("none") == ToolCallFormat::None, "none disables");
     check(parse_tool_call_format("gemma4") == ToolCallFormat::Gemma4, "gemma4");

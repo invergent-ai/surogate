@@ -485,7 +485,7 @@ the model's chat template.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--reasoning-parser NAME` | `qwen3` | Read reasoning in the model's output format; also accepts `deepseek_r1`, `glm4_moe`, `think`, or `none`/`off` |
-| `--tool-call-parser NAME` | `qwen3_xml` (`gemma4` for Gemma 4) | Read tool calls; also accepts `hermes`, `spark25`, `muse_glimmer`, `llama3_json`, `llama4_json`, `gemma4`, or `none`/`off`. A Gemma 4 checkpoint gets `gemma4` unless the flag names another; that parser does not constrain `tool_choice: "required"` or a named function, and refuses them |
+| `--tool-call-parser NAME` | `hermes` (`qwen3_coder` for Qwen3.5 / Qwen3.6, `gemma4` for Gemma 4) | Read tool calls; also accepts `qwen3_coder` / `qwen3_xml` (one parser, as in vLLM), `spark25`, `muse_glimmer`, `llama3_json`, `llama4_json`, `gemma4`, or `none`/`off`. `qwen3_coder` reads a finished generation exactly as vLLM 0.31's qwen3_coder parser does, from its token ids: any function name is a call, a call cut off by `max_tokens` or missing its closing tags is still a call, `<tool_call>` inside the reasoning ends it, and text after a call is dropped. A checkpoint whose vocabulary has `<tool_call>` as one token and whose template asks for `<function=...>` calls gets `qwen3_coder`; a Gemma 4 checkpoint gets `gemma4`; either unless the flag names another. `hermes` also reads a JSON body inside `<tool_call>`. The gemma4 parser does not constrain `tool_choice: "required"` or a named function, and refuses them |
 | `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
 | `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
 

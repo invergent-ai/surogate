@@ -118,7 +118,7 @@ GPU or use `--devices 0,1` to spread it across two GPUs.
 Thinking is enabled by default. Use `--no-thinking` for direct answers, or pass
 `"chat_template_kwargs": {"enable_thinking": false}` in a request. For lighter reasoning,
 set `"chat_template_kwargs": {"reasoning_effort": "low"}`. Tool calls use the default
-`qwen3_xml` parser; no separate parser flag is needed.
+parser (`hermes`, which reads JSON and XML calls inside `<tool_call>`); no separate parser flag is needed.
 
 The published checkpoints declare a 131,072-token context. The default `--max-model-len auto`
 fits the available memory. See [IBM's model card](https://huggingface.co/ibm-granite/granite-4.2-3b)

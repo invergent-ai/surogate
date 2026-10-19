@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <string_view>
 #include <thread>
 #include <cstddef>
@@ -895,7 +896,38 @@ vllm_qwen3::Result GenerationService::vllm_qwen3_parse(const PreparedRequest& pr
     }
     input.thinking            = prepared.enable_thinking;
     input.suppress_tool_calls = prepared.tool_choice.mode == ToolChoiceMode::None;
-    return vllm_qwen3::parse(input, *qwen3_vocabulary_, prepared.tools);
+    vllm_qwen3::Result parsed = vllm_qwen3::parse(input, *qwen3_vocabulary_, prepared.tools);
+    // SUROGATE_SERVE_TOOL_PARSE_TRACE=FILE: one JSON line per parsed generation -- the parser's input (token ids,
+    // text, tools, tool_choice, thinking) and its result -- so the parse can be checked against vLLM's own parser
+    // offline (rl/engine-goal-2026-10-19/toolcall/check_trace.py).
+    static const char* trace_path = std::getenv("SUROGATE_SERVE_TOOL_PARSE_TRACE");
+    if (trace_path != nullptr) {
+        static std::mutex trace_mutex;
+        static std::ofstream trace(trace_path, std::ios::app);
+        nlohmann::json tools = nlohmann::json::array();
+        for (const auto& tool : prepared.tools) {
+            nlohmann::json parameters = nlohmann::json::parse(tool.parameters_json, nullptr, false);
+            if (parameters.is_discarded()) { parameters = nullptr; }
+            tools.push_back({{"type", "function"}, {"function", {{"name", tool.name}, {"parameters", parameters}}}});
+        }
+        const char* choice = prepared.tool_choice.mode == ToolChoiceMode::None       ? "none"
+                             : prepared.tool_choice.mode == ToolChoiceMode::Required ? "required"
+                             : prepared.tool_choice.mode == ToolChoiceMode::Named    ? "named"
+                                                                                     : "auto";
+        nlohmann::json calls = nlohmann::json::array();
+        for (const auto& call : parsed.calls) { calls.push_back({{"name", call.name}, {"arguments", call.arguments}}); }
+        const nlohmann::json line = {
+            {"ids", input.token_ids}, {"text", input.text}, {"tools", tools}, {"tool_choice", choice},
+            {"thinking", input.thinking}, {"parallel_tool_calls", prepared.parallel_tool_calls},
+            {"finish", static_cast<int>(result.finish_reason)},
+            {"engine", {{"reasoning", parsed.reasoning ? nlohmann::json(*parsed.reasoning) : nlohmann::json(nullptr)},
+                        {"content", parsed.content ? nlohmann::json(*parsed.content) : nlohmann::json(nullptr)},
+                        {"calls", calls}}}};
+        std::lock_guard lock(trace_mutex);
+        trace << line.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << '\n';
+        trace.flush();
+    }
+    return parsed;
 }
 
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
