@@ -4,10 +4,10 @@ running surogate-engine and compare.
 
 The engine must serve the checkpoint the fixture was made with (Surogate3.7-35B-A3B: same tokenizer and chat
 template), at the fixture's max_model_len, without --thinking/--no-thinking (vLLM rendered the template's default),
-with --served-model-name m and a --default-max-tokens of at least the context (the rows taken here are the ones
-whose vLLM had no generation-config default, i.e. "the whole rest of the context"):
+with --served-model-name m and without --default-max-tokens (the rows taken here are the ones whose vLLM had no
+generation-config default, i.e. "the whole rest of the context", which is the engine's default too):
 
-    surogate-engine ART --served-model-name m --max-model-len 4096 --default-max-tokens 262144 ...
+    surogate-engine ART --served-model-name m --max-model-len 4096 ...
     python3 vllm_max_tokens_smoke.py --port 18501 --max-model-len 4096 parity.jsonl
 
 Per row:
@@ -16,8 +16,7 @@ Per row:
     tokens (finish_reason "length") and count the prompt as vLLM did;
   * vLLM accepted it with a larger N: sent streaming, the engine must answer 200 with an event stream (the
     connection is closed after the first event);
-  * /v1/completions without a max_tokens (vLLM: 16, the engine: its default capped to the rest -- the documented
-    exception) is checked against the engine's rule: 200 when the prompt leaves room, else 400.
+  * /v1/completions without a max_tokens is one of the above: both take it as 16.
 Token-id prompts are skipped (the engine's /v1/completions takes text only).
 """
 
@@ -71,7 +70,7 @@ def main():
     rows = [json.loads(line) for line in open(args.fixture)]
     rows = [r for r in rows if r["max_model_len"] == args.max_model_len and r["default_max_tokens"] is None
             and r["prompt"] == "text" and (not keep or r["prompt_tokens"] in keep)]
-    counts = {"refused_same": 0, "exact_budget": 0, "accepted_stream": 0, "exception_rule": 0}
+    counts = {"refused_same": 0, "exact_budget": 0, "accepted_stream": 0}
     failures = []
     large = 0
     started = time.time()
@@ -79,20 +78,7 @@ def main():
         path, body = request_for(row)
         vllm = row["vllm"]
         b = row["body"]
-        absent = all(b.get(f) is None for f in ("max_tokens", "max_completion_tokens"))
         tag = f"row {row['id']} {row['endpoint']} P={row['prompt_tokens']} {json.dumps(b)}"
-        if row["endpoint"] == "completions" and absent:
-            rest = row["max_model_len"] - row["prompt_tokens"]
-            fits = rest >= 1 and b.get("min_tokens", 0) <= rest
-            if fits:
-                status, _, _ = send(args.port, path, dict(body, stream=True), first_event_only=True)
-            else:
-                status, _, _ = send(args.port, path, body)
-            if status != (200 if fits else 400):
-                failures.append(f"{tag}: engine rule expects {200 if fits else 400}, got {status}")
-            else:
-                counts["exception_rule"] += 1
-            continue
         if vllm["status"] != 200:
             status, ctype, data = send(args.port, path, body)
             if status != vllm["status"] or data != vllm["http_body"] or "application/json" not in ctype:

@@ -718,11 +718,22 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         if (request.return_token_ids) { prepared.prompt_token_ids = prompt.token_ids(); }
         // vLLM's rule for prompt + max_tokens against the context (serve/vllm_max_tokens.h): an explicit
         // max_tokens that does not fit is HTTP 400 here, before any GPU work; an absent one is the server
-        // default capped to the rest of the context.
+        // default capped to the rest of the context, or the whole rest without a server default.
+        const std::int64_t rest_of_context =
+            std::max<std::int64_t>(0, max_model_len - static_cast<std::int64_t>(prompt.summary().prompt_tokens));
         if (vllm_max_tokens) {
             MaxTokensDecision decision = decide_max_tokens(prompt.summary());
             if (decision.error) { throw ApiException(std::move(*decision.error)); }
             request_options.execution.requested_output_tokens = static_cast<std::uint32_t>(decision.budget);
+            prepared.output_budget = static_cast<int>(decision.budget);
+        } else {
+            // --overlong-max-tokens cap: the request plan caps what is asked to the rest of the context. No
+            // max_tokens and no --default-max-tokens asks for all of it.
+            if (request.max_tokens <= 0) {
+                request_options.execution.requested_output_tokens = static_cast<std::uint32_t>(max_model_len);
+            }
+            prepared.output_budget = static_cast<int>(std::min<std::int64_t>(
+                request_options.execution.requested_output_tokens, rest_of_context));
         }
         if (request.parallel_decoding) {
             auto state = std::make_shared<ParallelDecodingRequest>();
@@ -734,7 +745,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
                     throw ApiException({.message="parallel_decoding field exceeds the model context limit", .param="response_format"});
                 }
             }
-            state->max_tokens = request.max_tokens > 0 ? request.max_tokens : options_.default_max_tokens;
+            state->max_tokens = static_cast<std::size_t>(prepared.output_budget);
             // Reserve a conservative bound before doing GPU work: every possible
             // assembled result fits the client's requested completion budget.
             std::size_t bound = engine_->encode_fragment("{}").size();

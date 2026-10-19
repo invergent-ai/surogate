@@ -33,6 +33,9 @@ struct ResponsesRuntimeValues {
     float temperature       = 1.0F;
     float top_p             = 1.0F;
     int cached_input_tokens = 0;
+    /// The budget the request runs with (PreparedRequest::output_budget), echoed as max_output_tokens as vLLM echoes
+    /// sampling_params.max_tokens; 0 = unknown, the request's own value is echoed.
+    int max_output_tokens   = 0;
 };
 
 struct BuiltResponse {

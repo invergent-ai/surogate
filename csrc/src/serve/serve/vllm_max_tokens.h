@@ -30,9 +30,10 @@
 // message carrying vLLM's " (parameter=..., value=...)" suffix where its VLLMValidationError has a parameter
 // (vllm/exceptions.py), and HTTP 400 for a streaming request too: vLLM opens the stream only after these steps.
 //
-// One deliberate difference: vLLM's /v1/completions takes an absent max_tokens as 16 (the OpenAI default) and checks
-// it like a given one; here every endpoint takes an absent max_tokens as "the server default, capped to the rest of
-// the context" (--default-max-tokens), which is what vLLM does for chat, and for completions sent "max_tokens": null.
+// Without a max_tokens: chat and Responses get the server default capped to the rest of the context, or the whole
+// rest when there is none (--default-max-tokens not given = vLLM on a checkpoint whose generation_config has no
+// max_new_tokens, as Surogate3.7's has none). /v1/completions takes an absent or null max_tokens as 16, vLLM's
+// CompletionRequest default, and checks it like a given one (openai_schema.cpp parse_completion_request).
 //
 // --overlong-max-tokens cap (ServeOptions::overlong_max_tokens) skips all of this and keeps the engine's earlier
 // behaviour, an overlong max_tokens silently capped to the rest of the context.

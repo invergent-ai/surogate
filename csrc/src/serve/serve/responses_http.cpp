@@ -113,6 +113,7 @@ ResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
     ResponsesRuntimeValues runtime;
     runtime.temperature = prepared.sampling.temperature;
     runtime.top_p       = prepared.sampling.top_p;
+    runtime.max_output_tokens = prepared.output_budget;
     if (outcome != nullptr) {
         runtime.cached_input_tokens = static_cast<int>(outcome->metrics.prefix_cache_hit_tokens);
     }

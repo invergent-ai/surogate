@@ -276,8 +276,8 @@ precisions. Force `q4` only when you want the RAM saving from reducing wider wei
 | `--max-num-batched-tokens N` | 2048 | Prompt tokens processed at a time; must be a positive multiple of 128 |
 | `--max-pending-requests N` | 16 | Additional requests allowed to wait |
 | `--pending-timeout-ms N` | 30000 | Time allowed for model wake-up, prompt preparation, and waiting to start generation |
-| `--overlong-max-tokens reject\|cap` | `reject` | A `max_tokens` that does not fit the context next to the prompt: `reject` answers HTTP 400 as vLLM 0.31 does (`BadRequestError`, "This model's maximum context length is ..."); `cap` silently caps it to the rest of the context (the earlier behaviour). A request without `max_tokens` gets `--default-max-tokens`, capped to the rest of the context, either way |
-| `--default-max-tokens N` | 8192 | Output limit when a request omits it |
+| `--overlong-max-tokens reject\|cap` | `reject` | A `max_tokens` that does not fit the context next to the prompt: `reject` answers HTTP 400 as vLLM 0.31 does (`BadRequestError`, "This model's maximum context length is ..."); `cap` silently caps it to the rest of the context (the earlier behaviour). A chat / Responses request without `max_tokens` gets `--default-max-tokens`, capped to the rest of the context, either way; `/v1/completions` without one asks for 16 under `reject`, as vLLM does |
+| `--default-max-tokens N` | none | Output limit when a request omits it (vLLM's generation-config `max_new_tokens`). Not given: the rest of the context, as vLLM serving a checkpoint without `max_new_tokens`; with `--kv-admission reserve` that reserves the whole context per request |
 | `--kv-admission reserve\|ondemand` | ondemand | How a request's KV cache is committed: its prompt at admission and the rest as it generates (ondemand), or prompt + output limit up front (reserve) |
 | `--kv-admission-headroom N` | 256 | Ondemand: output tokens a request is given room for when it is admitted |
 | `--kv-admission-watermark F` | 0.01 | Ondemand: fraction of the KV cache an admission leaves free while other requests run |

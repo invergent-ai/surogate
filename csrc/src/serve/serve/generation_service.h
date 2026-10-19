@@ -149,6 +149,10 @@ struct PreparedRequest {
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens                      = 0;
+    /// The output tokens this request may generate, as vLLM's sampling_params.max_tokens: the client's max_tokens,
+    /// or the server default / the rest of the context without one (serve/vllm_max_tokens.h). The Responses API
+    /// echoes it as max_output_tokens.
+    int output_budget                      = 0;
     bool include_usage                     = false;
     bool tool_capable                      = false;
     bool constrained_tools                 = false;

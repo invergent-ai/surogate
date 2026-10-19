@@ -131,8 +131,8 @@ MaxTokensQuery max_tokens_query(const GenerationRequest& request, std::int64_t m
     if (request.max_tokens_set) {
         query.requested       = request.max_tokens_wide.value_or(request.max_tokens);
         query.requested_param = request.max_tokens_param;
-    } else {
-        query.default_max_tokens = request.max_tokens;
+    } else if (request.max_tokens > 0) {
+        query.default_max_tokens = request.max_tokens; // --default-max-tokens; none = the whole rest
     }
     query.min_tokens          = request.min_tokens;
     query.text_prompt         = request.prompt_token_ids.empty();

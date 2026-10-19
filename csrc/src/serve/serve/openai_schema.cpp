@@ -1109,6 +1109,13 @@ GenerationRequest parse_completion_request(const OJson& body, const RequestLimit
     }
 
     parse_max_tokens(body, "max_tokens", limits, out);
+    if (!out.max_tokens_set && limits.vllm_max_tokens) {
+        // vLLM's CompletionRequest: max_tokens defaults to 16 (the OpenAI default), "max_tokens": null too
+        // (completion/protocol.py:61 and normalize_null_max_tokens), and is then checked like a given value.
+        out.max_tokens       = kVllmCompletionDefaultMaxTokens;
+        out.max_tokens_set   = true;
+        out.max_tokens_param = "max_tokens";
+    }
     if (!out.max_tokens_set) { out.max_tokens = limits.default_max_tokens; }
     return out;
 }

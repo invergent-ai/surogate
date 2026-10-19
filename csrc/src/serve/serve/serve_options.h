@@ -13,9 +13,10 @@
 
 namespace sinfer::serve {
 
-// Protocol default when the client omits max_tokens. Engine independently
-// clamps the request to its effective context capacity.
-inline constexpr int kDefaultMaxTokens                    = 8192;
+// --default-max-tokens when not given: 0, no server default. A chat / Responses request without max_tokens then gets
+// the rest of the context, as vLLM 0.31 gives it when the checkpoint's generation_config has no max_new_tokens
+// (vllm/entrypoints/serve/utils/api_utils.py get_max_tokens); --default-max-tokens N plays that max_new_tokens.
+inline constexpr int kDefaultMaxTokens                    = 0;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 
 /// --overlong-max-tokens: `reject` refuses a max_tokens that does not fit the context next to the prompt with

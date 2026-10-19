@@ -218,9 +218,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
            "[--decision-attempts N]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
-           "       --default-max-tokens defaults to " +
-           std::to_string(kDefaultMaxTokens) +
-           " when omitted; without a max_tokens a request gets that, capped to the rest of the context\n"
+           "       --default-max-tokens N: without a max_tokens a request gets N, capped to the rest of the context;\n"
+           "         not given, it gets the rest of the context (vLLM with no generation-config max_new_tokens).\n"
+           "         /v1/completions without max_tokens gets 16, as in vLLM (--overlong-max-tokens reject)\n"
            "       --overlong-max-tokens reject (default) refuses prompt + max_tokens > context with HTTP 400\n"
            "         as vLLM does; cap caps max_tokens to the rest of the context instead\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"

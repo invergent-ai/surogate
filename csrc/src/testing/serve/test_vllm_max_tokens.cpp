@@ -15,14 +15,14 @@
 // token-id prompt (which the engine's /v1/completions does not take; its chat token-in path counts the same way)
 // check the decision alone.
 //
-// Documented exception: /v1/completions without a max_tokens (absent or null). vLLM reads it as 16 (the OpenAI
-// default) and checks that like a given value; the engine gives such a request its --default-max-tokens capped to the
-// rest of the context, as vLLM does for chat. Those rows check that, handed vLLM's 16, the decision is vLLM's answer,
-// and that the engine's own answer is the chat rule's.
+// No exceptions: /v1/completions without a max_tokens (absent or null) asks for vLLM's 16 and is checked like a given
+// value; chat without one gets the generation-config default (the fixture's default_max_tokens = --default-max-tokens)
+// capped to the rest of the context, or the whole rest without a default (--default-max-tokens not given).
 
 #include "family/impl/frontend/tokenizer.h"
 #include "serve/openai_schema.h"
 #include "serve/request.h"
+#include "serve/responses_schema.h"
 #include "serve/serve_options.h"
 #include "serve/vllm_max_tokens.h"
 
@@ -90,7 +90,7 @@ int main() {
     std::ifstream in(fixture("parity.jsonl"));
     check(in.good(), "parity.jsonl missing");
     std::string line;
-    int rows = 0, parsed = 0, exceptions = 0, refusals = 0, char_refusals = 0, at_least = 0, streams = 0;
+    int rows = 0, parsed = 0, refusals = 0, char_refusals = 0, at_least = 0, streams = 0, completions_absent = 0;
     std::int64_t vocabulary_chars = 0;
     while (std::getline(in, line)) {
         const OJson row = OJson::parse(line);
@@ -115,7 +115,7 @@ int main() {
         if (body.value("stream", false)) { ++streams; }
 
         RequestLimits limits;
-        limits.default_max_tokens = def.is_null() ? INT_MAX : def.get<int>();
+        limits.default_max_tokens = def.is_null() ? 0 : def.get<int>(); // 0 = --default-max-tokens not given
         limits.vllm_max_tokens    = true;
         const bool absent = (!body.contains("max_tokens") || body.at("max_tokens").is_null()) &&
                             (!body.contains("max_completion_tokens") || body.at("max_completion_tokens").is_null());
@@ -154,24 +154,8 @@ int main() {
         check(query.text_prompt, id + ": a text prompt");
         const OJson got = answer(decide_vllm_max_tokens(query));
         if (!chat && absent) {
-            ++exceptions;
-            MaxTokensQuery as_vllm = query;
-            as_vllm.requested      = 16;
-            as_vllm.default_max_tokens.reset();
-            const OJson with16 = answer(decide_vllm_max_tokens(as_vllm));
-            check(with16 == expected, id + " with vLLM's 16\n  engine " + with16.dump() + "\n  vllm   " +
-                                          expected.dump());
-            // The engine's own rule: the chat one -- the default capped to the rest, refusals only for a prompt that
-            // leaves nothing.
-            const std::int64_t rest   = C - P;
-            const std::int64_t budget = std::min<std::int64_t>(rest, def.is_null() ? INT_MAX : def.get<std::int64_t>());
-            const std::int64_t min    = body.value("min_tokens", 0);
-            if (rest >= 1 && min <= budget) {
-                check(got == OJson{{"status", 200}, {"max_tokens", budget}}, id + " engine rule: " + got.dump());
-            } else {
-                check(got.at("status") == 400, id + " engine rule should refuse: " + got.dump());
-            }
-            continue;
+            ++completions_absent;
+            check(query.requested == 16 && !query.default_max_tokens, id + ": completions without max_tokens is 16");
         }
         check(got == expected, id + "\n  engine " + got.dump() + "\n  vllm   " + expected.dump());
     }
@@ -197,6 +181,61 @@ int main() {
         request.max_tokens     = 262144;
         const MaxTokensDecision rest = decide_vllm_max_tokens(max_tokens_query(request, 262144, 255970, 1000000, 128));
         check(!rest.error && rest.budget == 6174, "task_091 without max_tokens should get the remaining 6174");
+        request.max_tokens = 0; // and without --default-max-tokens
+        const MaxTokensDecision none = decide_vllm_max_tokens(max_tokens_query(request, 262144, 255970, 1000000, 128));
+        check(!none.error && none.budget == 6174, "task_091 without any default should get the remaining 6174");
+    }
+    // The defaults, as the HTTP handlers build them from ServeOptions: no --default-max-tokens = no server default.
+    {
+        check(parse_options({"s", "m.sinfer"}).default_max_tokens == 0, "--default-max-tokens should default to none");
+        check(parse_options({"s", "m.sinfer", "--default-max-tokens", "32768"}).default_max_tokens == 32768,
+              "--default-max-tokens 32768 not parsed");
+        bool refused = false;
+        try { (void)parse_options({"s", "m.sinfer", "--default-max-tokens", "0"}); } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        check(refused, "--default-max-tokens 0 should be refused");
+
+        RequestLimits limits;
+        limits.vllm_max_tokens = true;
+        check(limits.default_max_tokens == 0, "RequestLimits should default to no server default");
+        const OJson chat = {{"model", "m"}, {"messages", OJson::array({{{"role", "user"}, {"content", "x"}}})}};
+        const GenerationRequest c = parse_chat_completion_request(chat, limits);
+        const MaxTokensQuery cq   = max_tokens_query(c, 262144, 1000, 3000, 128);
+        check(!c.max_tokens_set && !cq.requested && !cq.default_max_tokens, "chat without max_tokens: no default");
+        const MaxTokensDecision cd = decide_vllm_max_tokens(cq);
+        check(!cd.error && cd.budget == 261144, "chat without max_tokens should get the whole rest");
+        OJson chat_null = chat;
+        chat_null["max_tokens"] = nullptr;
+        const MaxTokensDecision cn = decide_vllm_max_tokens(
+            max_tokens_query(parse_chat_completion_request(chat_null, limits), 262144, 1000, 3000, 128));
+        check(!cn.error && cn.budget == 261144, "chat with max_tokens null should get the whole rest");
+
+        for (const bool null_field : {false, true}) {
+            OJson completion = {{"model", "m"}, {"prompt", "x"}};
+            if (null_field) { completion["max_tokens"] = nullptr; }
+            const GenerationRequest r = parse_completion_request(completion, limits);
+            check(r.max_tokens_set && r.max_tokens == 16 && r.max_tokens_param == "max_tokens",
+                  "completions without max_tokens should ask for vLLM's 16");
+            const MaxTokensDecision d = decide_vllm_max_tokens(max_tokens_query(r, 262144, 1000, 3000, 128));
+            check(!d.error && d.budget == 16, "completions without max_tokens should run with 16");
+            const MaxTokensDecision full = decide_vllm_max_tokens(max_tokens_query(r, 4096, 4090, 8000, 128));
+            check(full.error && full.error->message.find("you requested 16 output tokens") != std::string::npos,
+                  "completions' 16 is checked like a given value: " +
+                      (full.error ? full.error->message : std::string("accepted")));
+        }
+        RequestLimits cap; // --overlong-max-tokens cap keeps the earlier rule for completions: the server default
+        cap.default_max_tokens = 8192;
+        const GenerationRequest old = parse_completion_request(OJson{{"model", "m"}, {"prompt", "x"}}, cap);
+        check(!old.max_tokens_set && old.max_tokens == 8192, "cap mode completions should keep the server default");
+
+        const ResponsesRequest responses =
+            parse_responses_request(OJson{{"model", "m"}, {"input", "x"}}, limits);
+        check(!responses.generation.max_tokens_set && responses.generation.max_tokens == 0,
+              "Responses without max_output_tokens: no default");
+        const MaxTokensDecision rd =
+            decide_vllm_max_tokens(max_tokens_query(responses.generation, 4096, 96, 300, 128));
+        check(!rd.error && rd.budget == 4000, "Responses without max_output_tokens should get the whole rest");
     }
     // Responses names its field max_output_tokens.
     {
@@ -345,7 +384,7 @@ int main() {
           "fixture smaller than expected");
     std::cout << "vllm_max_tokens: " << rows << " vLLM answers (" << refusals << " refusals, of them " << char_refusals
               << " on the character bound and " << at_least << " worded 'at least'; " << streams << " streaming), "
-              << parsed << " through the request parser, " << exceptions << " documented exceptions; failures="
-              << failures << '\n';
+              << parsed << " through the request parser, " << completions_absent
+              << " of them completions without max_tokens (vLLM's 16); failures=" << failures << '\n';
     return failures == 0 ? 0 : 1;
 }
