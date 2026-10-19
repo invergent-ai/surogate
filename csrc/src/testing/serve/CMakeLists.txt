@@ -425,6 +425,12 @@ sinfer_add_test(sinfer_vllm_tool_arguments_test
   SOURCES test_vllm_tool_arguments.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_serve)
+# prompt + max_tokens against the context, decided as vLLM 0.31 decides it (fixtures/serve/vllm_max_tokens), and
+# the same refusals over HTTP from a server whose engine is a stand-in (no model, no GPU work).
+sinfer_add_test(sinfer_vllm_max_tokens_test
+  SOURCES test_vllm_max_tokens.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES sinfer_serve)
