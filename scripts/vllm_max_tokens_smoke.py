@@ -44,7 +44,9 @@ def send(port, path, body, first_event_only=False, timeout=900):
     connection.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
     response = connection.getresponse()
     if first_event_only and response.status == 200:
-        line = response.fp.readline()
+        line = response.readline()  # through the chunked decoding
+        while line in (b"\r\n", b"\n"):
+            line = response.readline()
         connection.close()
         return response.status, response.getheader("Content-Type", ""), line.decode(errors="replace")
     data = response.read().decode()
@@ -144,7 +146,7 @@ def main():
                         counts["accepted_stream"] += 1
     print(json.dumps({"rows": len(rows), **counts, "failures": len(failures),
                       "seconds": round(time.time() - started, 1)}))
-    for failure in failures[:50]:
+    for failure in failures:
         print("FAIL", failure)
     return 1 if failures else 0
 
