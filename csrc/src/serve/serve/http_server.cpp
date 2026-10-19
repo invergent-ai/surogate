@@ -1192,6 +1192,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             detail.routed_layers = outcome.routed_layers;
             detail.routed_top_k = outcome.routed_top_k;
             detail.routed_start = outcome.routed_start;
+            detail.null_empty_content = outcome.content_null_if_empty;
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(

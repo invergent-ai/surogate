@@ -278,7 +278,9 @@ sinfer::RequestOptions to_request_options(const GenerationRequest& request,
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
-    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    // vLLM's qwen3_coder parser reads a request's tools' calls even under tool_choice "none" (to drop their text).
+    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history() ||
+        (server.tool_call_format == ToolCallFormat::Qwen3Coder && !request.tools.empty());
     options.stop.include_model_defaults = !request.ignore_eos;
     options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {

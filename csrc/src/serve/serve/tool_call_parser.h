@@ -9,6 +9,9 @@
 
 namespace sinfer::serve {
 
+/// A fresh `call_<16 hex>` id for a parsed tool call.
+[[nodiscard]] std::string new_tool_call_id();
+
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;
@@ -39,10 +42,17 @@ ParsedToolCallOutput parse_gemma4_tool_call_output(const std::string& text,
 // buffered tool region; malformed/non-tool output flushes it verbatim.
 class ToolCallStreamFilter {
 public:
-    explicit ToolCallStreamFilter(bool json_tools = false, bool muse_tools = false, bool gemma_tools = false)
-        : json_tools_(json_tools), muse_tools_(muse_tools), gemma_tools_(gemma_tools) {}
+    explicit ToolCallStreamFilter(bool json_tools = false, bool muse_tools = false, bool gemma_tools = false,
+                                  bool qwen3_coder = false)
+        : json_tools_(json_tools), muse_tools_(muse_tools), gemma_tools_(gemma_tools), qwen3_coder_(qwen3_coder) {}
     std::string feed(std::string_view text);
     std::string finish(bool is_tool_call_response);
+    /// Ends the stream without publishing what it held back: the caller publishes the final content itself.
+    void discard() noexcept {
+        finished_ = true;
+        pending_.clear();
+        tool_region_.clear();
+    }
 
     [[nodiscard]] std::size_t emitted_bytes() const noexcept { return emitted_bytes_; }
 
@@ -50,6 +60,7 @@ private:
     bool json_tools_ = false;
     bool muse_tools_ = false;
     bool gemma_tools_ = false;
+    bool qwen3_coder_ = false;
     std::string pending_;
     std::string tool_region_;
     std::size_t emitted_bytes_ = 0;

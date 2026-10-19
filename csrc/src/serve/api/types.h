@@ -646,6 +646,10 @@ struct PromptCapabilities {
     /// `<|"|>` string quote) as special tokens: the server reads calls with the gemma4 parser
     /// unless told otherwise.
     bool gemma4_tool_calls = false;
+    /// The vocabulary spells `<tool_call>` and `</tool_call>` as single tokens and the chat template asks for
+    /// Qwen3-Coder's `<function=NAME><parameter=KEY>` calls (Qwen3.5 / Qwen3.6): served with vLLM's qwen3_coder
+    /// parser unless told otherwise (serve/vllm_qwen3_parser.h).
+    bool qwen3_coder_tool_calls = false;
     /// The template is handed a message's text parts as a list and writes them one after the other,
     /// as Qwen's `render_content` does -- so "a" and "b" render as "ab", which is what vLLM and
     /// transformers produce. Without it the parts are joined with a newline first, as vLLM does for

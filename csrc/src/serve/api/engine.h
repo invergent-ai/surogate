@@ -5,6 +5,9 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
+#include <string_view>
+#include <utility>
 
 namespace sinfer {
 
@@ -99,6 +102,10 @@ public:
     /// The tokenizer's longest token in code points, vLLM's max_chars_per_token: vLLM refuses a
     /// prompt text longer than that many characters per token the context leaves it.
     [[nodiscard]] std::size_t max_chars_per_token() const;
+    /// transformers' `all_special_tokens` of the tokenizer, with their ids.
+    [[nodiscard]] std::vector<std::pair<TokenId, std::string>> named_special_tokens() const;
+    /// The id of the token spelled exactly `spelling`, if the vocabulary has one.
+    [[nodiscard]] std::optional<TokenId> token_id(std::string_view spelling) const;
     /// The stop token ids this model ends on by default. A request asking for a
     /// minimum length bars exactly these until it is reached.
     [[nodiscard]] std::vector<TokenId> default_stop_tokens() const;

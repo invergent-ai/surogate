@@ -10,6 +10,7 @@
 #include "serve/model_scheduler.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
+#include "serve/vllm_qwen3_parser.h"
 
 #include <chrono>
 #include <cstddef>
@@ -56,6 +57,8 @@ struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
+    /// Chat Completions: empty content is written as null, as vLLM writes a parser's empty content.
+    bool content_null_if_empty = false;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;
@@ -288,6 +291,11 @@ public:
     [[nodiscard]] std::vector<int> devices() const override { return engine_->devices(); }
 
 private:
+    /// The request is read with vLLM's qwen3_coder parser (serve/vllm_qwen3_parser.h): it has tools, and the tool
+    /// grammar did not write its calls.
+    [[nodiscard]] bool vllm_qwen3_applies(const PreparedRequest& prepared) const;
+    [[nodiscard]] vllm_qwen3::Result vllm_qwen3_parse(const PreparedRequest& prepared,
+                                                      const sinfer::GenerationResult& result) const;
     GenerationOutcome run_parallel(PreparedRequest& prepared, const StreamSink* sink,
                                     const std::function<bool()>& is_cancelled);
 
@@ -323,6 +331,8 @@ private:
     mutable std::mutex adapter_memory_mutex_;
     std::unique_ptr<sinfer::Engine> engine_;
     sinfer::PromptCapabilities prompt_capabilities_;
+    /// --tool-call-parser qwen3_coder (serve/vllm_qwen3_parser.h): the tokenizer facts the parser needs.
+    std::optional<vllm_qwen3::Vocabulary> qwen3_vocabulary_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     bool shared_training_ = false; // guarded by request_capacity_->mutex
     std::mutex decision_codes_mutex_;

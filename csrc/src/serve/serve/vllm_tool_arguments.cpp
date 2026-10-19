@@ -578,7 +578,10 @@ std::string normalized_type(const std::string& type) {
     return name;
 }
 
-PyValue coerce(const std::string& value, const Json& schema) {
+/// `coerce_to_schema_type(value, extract_types_from_schema(schema))`. `identical` (when given) is set to whether
+/// Python would return the very `value` object: the string type, or nothing accepting it.
+PyValue coerce(const std::string& value, const Json& schema, bool* identical = nullptr) {
+    if (identical != nullptr) { *identical = false; }
     std::set<std::string> declared;
     schema_types(schema, declared);
     std::set<std::string> types;
@@ -588,6 +591,7 @@ PyValue coerce(const std::string& value, const Json& schema) {
         if (candidate == "null") {
             if (ascii_iequals(value, "null")) { return PyValue{}; }
         } else if (candidate == "string") {
+            if (identical != nullptr) { *identical = true; }
             return PyValue::string(value);
         } else if (candidate == "integer") {
             if (auto digits = python_int(value)) { return PyValue::integer(std::move(*digits)); }
@@ -605,7 +609,85 @@ PyValue coerce(const std::string& value, const Json& schema) {
         }
     }
     if (auto parsed = python_json_loads(value)) { return std::move(*parsed); }
+    if (identical != nullptr) { *identical = true; }
     return PyValue::string(value);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// vllm/parser/engine/parser_engine.py: ParserEngine._coerce_value / _coerce_dict, for arguments that came as JSON.
+
+bool python_same_type(const PyValue& a, const PyValue& b) {
+    const auto group = [](PyValue::Kind kind) {
+        return kind == PyValue::Kind::True ? PyValue::Kind::False : kind; // both are bool
+    };
+    return group(a.kind) == group(b.kind);
+}
+
+bool python_equal(const PyValue& a, const PyValue& b) {
+    if (!python_same_type(a, b)) { return false; }
+    switch (a.kind) {
+    case PyValue::Kind::Null: return true;
+    case PyValue::Kind::False:
+    case PyValue::Kind::True: return a.kind == b.kind;
+    case PyValue::Kind::Int:
+    case PyValue::Kind::String: return a.text == b.text;
+    case PyValue::Kind::Float: return a.number == b.number;
+    case PyValue::Kind::Array:
+        if (a.items.size() != b.items.size()) { return false; }
+        for (std::size_t i = 0; i < a.items.size(); ++i) {
+            if (!python_equal(a.items[i], b.items[i])) { return false; }
+        }
+        return true;
+    case PyValue::Kind::Object:
+        if (a.members.size() != b.members.size()) { return false; }
+        for (const auto& [key, value] : a.members) {
+            const auto other = std::find_if(b.members.begin(), b.members.end(),
+                                            [&](const auto& member) { return member.first == key; });
+            if (other == b.members.end() || !python_equal(value, other->second)) { return false; }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool coerce_members(std::vector<std::pair<std::string, PyValue>>& members, const Json& properties);
+
+/// `_coerce_value`: whether `value` changed; it is replaced in place when it did.
+bool coerce_value(PyValue& value, const Json& schema) {
+    if (value.kind == PyValue::Kind::String) {
+        bool identical = false;
+        PyValue coerced = coerce(value.text, schema, &identical);
+        if (identical) { return false; }
+        value = std::move(coerced);
+        return true;
+    }
+    if (value.kind == PyValue::Kind::Object) {
+        const auto nested = schema.find("properties");
+        return nested != schema.end() && nested->is_object() && coerce_members(value.members, *nested);
+    }
+    if (value.kind == PyValue::Kind::Array) {
+        const auto items = schema.find("items");
+        if (items == schema.end() || !items->is_object()) { return false; }
+        bool changed = false;
+        for (auto& item : value.items) { changed = coerce_value(item, *items) || changed; }
+        return changed;
+    }
+    std::string as_text;
+    write_value(as_text, value);
+    PyValue coerced = coerce(as_text, schema);
+    if (python_same_type(coerced, value) && python_equal(coerced, value)) { return false; }
+    value = std::move(coerced);
+    return true;
+}
+
+bool coerce_members(std::vector<std::pair<std::string, PyValue>>& members, const Json& properties) {
+    bool changed = false;
+    for (auto& [key, value] : members) {
+        const auto property = properties.find(key);
+        if (property == properties.end() || !property->is_object()) { continue; }
+        changed = coerce_value(value, *property) || changed;
+    }
+    return changed;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -946,6 +1028,49 @@ std::string python_json_dumps(const Json& value) {
     }
     default: return "null";
     }
+}
+
+std::string fix_arg_types(std::string_view args_json, const Json& properties) {
+    if (!properties.is_object() || properties.empty()) { return std::string(args_json); }
+    std::optional<PyValue> args = python_json_loads(args_json);
+    if (!args || args->kind != PyValue::Kind::Object) { return std::string(args_json); }
+    if (!coerce_members(args->members, properties)) { return std::string(args_json); }
+    std::string out;
+    write_value(out, *args);
+    return out;
+}
+
+std::pair<std::optional<std::string>, std::string> extract_json_name_and_args(std::string_view raw_body) {
+    const std::string body = python_strip(raw_body);
+    std::optional<PyValue> parsed = python_json_loads(body);
+    if (!parsed || parsed->kind != PyValue::Kind::Object) { return {std::string(), body}; }
+    std::optional<std::string> name = std::string();
+    for (const auto& [key, value] : parsed->members) {
+        if (key == "name") { name = value.kind == PyValue::Kind::String ? std::optional(value.text) : std::nullopt; }
+    }
+    for (const char* field : {"arguments", "parameters"}) {
+        for (const auto& [key, value] : parsed->members) {
+            if (key != field) { continue; }
+            if (value.kind == PyValue::Kind::String) { return {name, value.text}; }
+            std::string out;
+            write_value(out, value);
+            return {name, out};
+        }
+    }
+    PyValue rest;
+    rest.kind = PyValue::Kind::Object;
+    for (const auto& member : parsed->members) {
+        if (member.first != "name") { rest.members.push_back(member); }
+    }
+    std::string out;
+    write_value(out, rest);
+    return {name, out};
+}
+
+std::size_t regex_space_size(std::string_view text, std::size_t pos) {
+    if (pos >= text.size()) { return 0; }
+    const CodePoint cp = decode_utf8(text, pos);
+    return cp.valid && regex_isspace(cp.value) ? cp.size : 0;
 }
 
 } // namespace sinfer::serve::vllm_args

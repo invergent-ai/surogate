@@ -425,6 +425,12 @@ sinfer_add_test(sinfer_vllm_tool_arguments_test
   SOURCES test_vllm_tool_arguments.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_serve)
+# A finished generation's reasoning, content and tool calls as vLLM 0.31's qwen3 parser returns them, against its
+# own results on Surogate3.7 outputs (fixtures/serve/vllm_qwen3_parser).
+sinfer_add_test(sinfer_vllm_qwen3_parser_test
+  SOURCES test_vllm_qwen3_parser.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES sinfer_serve)
 # prompt + max_tokens against the context, decided as vLLM 0.31 decides it (fixtures/serve/vllm_max_tokens), and
 # the same refusals over HTTP from a server whose engine is a stand-in (no model, no GPU work).
 sinfer_add_test(sinfer_vllm_max_tokens_test

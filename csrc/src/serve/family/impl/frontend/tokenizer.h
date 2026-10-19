@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -106,6 +107,14 @@ public:
     /// The longest token string in the vocabulary, added tokens included, in code points: what
     /// vLLM calls max_chars_per_token, max(len(t) for t in tokenizer.get_vocab()).
     [[nodiscard]] std::size_t max_chars_per_token() const noexcept { return max_chars_per_token_; }
+    /// transformers' `all_special_tokens` (5.x): tokenizer_config.json's named tokens (bos, eos, unk, sep, pad,
+    /// cls, mask) and its `extra_special_tokens` -- or, where it has none, `additional_special_tokens` -- with
+    /// their ids. vLLM's parsers drop these from the output text (serve/vllm_qwen3_parser.h).
+    [[nodiscard]] const std::vector<std::pair<int, std::string>>& named_special_tokens() const noexcept {
+        return named_special_tokens_;
+    }
+    /// The id of a token spelled exactly `spelling` (an added token's content, or a vocabulary entry), if any.
+    [[nodiscard]] std::optional<int> token_id(std::string_view spelling) const;
 
 private:
     std::vector<std::string> id_to_token_;
@@ -146,6 +155,7 @@ private:
     struct PrefixCache;
     std::size_t longest_added_token_ = 0;
     std::size_t max_chars_per_token_ = 0;
+    std::vector<std::pair<int, std::string>> named_special_tokens_;
     std::shared_ptr<PrefixCache> prefix_cache_;
     void append_ids_with_added_tokens(std::string_view text, std::vector<int>& ids,
                                       std::vector<std::uint32_t>* added_bytes,

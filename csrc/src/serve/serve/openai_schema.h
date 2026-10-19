@@ -51,6 +51,8 @@ struct TokenDetail {
     std::vector<std::string> texts;   ///< the text of each completion token, or empty
     bool include_token_ids = false;
     bool include_logprobs  = false;
+    /// Empty content is written as null (vLLM's parsers never return an empty string).
+    bool null_empty_content = false;
     /// Rollout Routing Replay: choice.routed_experts = {"data": base64 of little-endian int16 in C
     /// order, "shape": [n, layers, top_k], "start": first covered sequence position, "dtype":
     /// "int16"} -- the vLLM convention verifiers parses ("data" must be the first key).

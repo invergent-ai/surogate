@@ -845,7 +845,8 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
                                           const std::string& reasoning, const char* finish_reason,
                                           const CompletionUsage& usage,
                                           const TokenDetail& detail) {
-    Json message = {{"role", "assistant"}, {"content", content}};
+    Json message = {{"role", "assistant"},
+                    {"content", content.empty() && detail.null_empty_content ? Json(nullptr) : Json(content)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
     Json choice = {{"index", 0}, {"message", std::move(message)},
                    {"finish_reason", finish_reason}};

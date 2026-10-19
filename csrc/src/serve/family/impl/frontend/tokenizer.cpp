@@ -905,6 +905,41 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
             max_chars_per_token_ = std::max(max_chars_per_token_, code_points(token.content));
         }
     }
+    {
+        // transformers 5's all_special_tokens: the named special tokens, then the extra ones.
+        const auto spelling_of = [](const Json& value) -> std::optional<std::string> {
+            if (value.is_string()) { return value.get<std::string>(); }
+            if (value.is_object() && value.contains("content") && value.at("content").is_string()) {
+                return value.at("content").get<std::string>();
+            }
+            return std::nullopt;
+        };
+        std::vector<std::string> spellings;
+        for (const char* key : {"bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token",
+                                "mask_token"}) {
+            if (tokenizer_config.contains(key)) {
+                if (auto spelling = spelling_of(tokenizer_config.at(key))) { spellings.push_back(std::move(*spelling)); }
+            }
+        }
+        const char* extra_key = tokenizer_config.contains("extra_special_tokens") ? "extra_special_tokens"
+                                                                                 : "additional_special_tokens";
+        if (tokenizer_config.contains(extra_key)) {
+            const Json& extra = tokenizer_config.at(extra_key);
+            if (extra.is_object() || extra.is_array()) {
+                for (const auto& item : extra) {
+                    if (auto spelling = spelling_of(item)) { spellings.push_back(std::move(*spelling)); }
+                }
+            }
+        }
+        for (const auto& spelling : spellings) {
+            const std::optional<int> id = token_id(spelling);
+            if (!id) { continue; }
+            if (std::none_of(named_special_tokens_.begin(), named_special_tokens_.end(),
+                             [&](const auto& token) { return token.second == spelling; })) {
+                named_special_tokens_.emplace_back(*id, spelling);
+            }
+        }
+    }
     prefix_cache_ = std::make_shared<PrefixCache>();
     if (valid_token_ids_.size() < id_to_token_.size()) {
         valid_token_ids_.resize(id_to_token_.size());
@@ -1207,6 +1242,16 @@ std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) cons
         bytes.push_back(byte->second);
     }
     return bytes;
+}
+
+std::optional<int> Tokenizer::token_id(std::string_view spelling) const {
+    for (const AddedToken& token : added_tokens_) {
+        if (token.content == spelling) { return token.id; }
+    }
+    if (const auto it = vocab_token_to_id_.find(std::string(spelling)); it != vocab_token_to_id_.end()) {
+        return it->second;
+    }
+    return std::nullopt;
 }
 
 bool Tokenizer::is_special_token(int id) const noexcept {

@@ -1797,6 +1797,7 @@ if(SINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/output_parsers.cpp
     ${SERVE_ROOT}/serve/tool_call_parser.cpp
     ${SERVE_ROOT}/serve/vllm_tool_arguments.cpp
+    ${SERVE_ROOT}/serve/vllm_qwen3_parser.cpp
     ${SERVE_ROOT}/serve/vllm_max_tokens.cpp
     ${SERVE_ROOT}/serve/tool_constraints.cpp
     ${SERVE_ROOT}/serve/translate.cpp

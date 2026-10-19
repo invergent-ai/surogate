@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "serve/generation_service.h"
 #include "serve/vllm_max_tokens.h"
+#include "serve/vllm_qwen3_parser.h"
 #include <set>
 
 #include "product/media_acquire/acquire.h"
@@ -317,9 +318,9 @@ void populate_score_texts(Engine& engine, GenerationOutcome& outcome) {
 class ServiceOutputSink final : public sinfer::OutputSink {
 public:
     ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools, bool muse_tools,
-                      bool gemma_tools)
+                      bool gemma_tools, bool qwen3_coder = false)
         : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), muse_tools_(muse_tools),
-          tool_filter_(json_tools, muse_tools, gemma_tools) {}
+          tool_filter_(json_tools, muse_tools, gemma_tools, qwen3_coder) {}
 
     void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
@@ -350,11 +351,22 @@ public:
         return content_bytes_;
     }
 
+    /// The content published so far.
+    [[nodiscard]] const std::string& streamed_content() const noexcept { return streamed_; }
+
+    /// Ends the stream with `tail` as the rest of the content, instead of what the filter held back.
+    std::size_t finish_with(const std::string& tail) {
+        if (filter_tool_calls_) { tool_filter_.discard(); }
+        publish_content(tail);
+        return content_bytes_;
+    }
+
 private:
     void publish_content(const std::string& text) {
         if (text.empty() || !sink_->on_content) { return; }
         sink_->on_content(text);
         content_bytes_ += text.size();
+        streamed_ += text;
     }
 
     Engine* engine_ = nullptr;
@@ -363,6 +375,7 @@ private:
     bool muse_tools_ = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
+    std::string streamed_;
 };
 
 } // namespace
@@ -500,6 +513,30 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     // gemma4 parser unless --tool-call-parser named one.
     if (prompt_capabilities_.gemma4_tool_calls && !options_.tool_call_format_explicit) {
         options_.tool_call_format = ToolCallFormat::Gemma4;
+    }
+    // A Qwen3.5 / Qwen3.6 checkpoint is read with vLLM's own qwen3_coder parser unless told otherwise: the calls
+    // vLLM returns as calls (any name, cut off or not) come back as calls here too (serve/vllm_qwen3_parser.h).
+    if (prompt_capabilities_.qwen3_coder_tool_calls && !options_.tool_call_format_explicit) {
+        options_.tool_call_format = ToolCallFormat::Qwen3Coder;
+    }
+    if (options_.tool_call_format == ToolCallFormat::Qwen3Coder &&
+        options_.reasoning_format == ReasoningFormat::ThinkTags) {
+        vllm_qwen3::Vocabulary vocabulary;
+        const auto id_of = [&](std::string_view spelling) {
+            return engine_->token_id(spelling).value_or(-1);
+        };
+        vocabulary.think_start = id_of("<think>");
+        vocabulary.think_end   = id_of("</think>");
+        vocabulary.tool_start  = id_of("<tool_call>");
+        vocabulary.tool_end    = id_of("</tool_call>");
+        static constexpr std::array<std::string_view, 9> kGrammar{"<think>", "</think>", "<tool_call>",
+            "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>", ">"};
+        for (const auto& [id, spelling] : engine_->named_special_tokens()) {
+            if (std::find(kGrammar.begin(), kGrammar.end(), spelling) == kGrammar.end()) {
+                vocabulary.drop_tokens.emplace(id, spelling);
+            }
+        }
+        qwen3_vocabulary_ = std::move(vocabulary);
     }
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -834,15 +871,44 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 }
 
+bool GenerationService::vllm_qwen3_applies(const PreparedRequest& prepared) const {
+    return qwen3_vocabulary_.has_value() && !prepared.tools.empty() && !prepared.constrained_tools;
+}
+
+vllm_qwen3::Result GenerationService::vllm_qwen3_parse(const PreparedRequest& prepared,
+                                                       const sinfer::GenerationResult& result) const {
+    vllm_qwen3::Input input;
+    input.token_ids.assign(result.generated_token_ids.begin(), result.generated_token_ids.end());
+    const std::vector<std::string> bytes = engine_->token_texts(result.generated_token_ids);
+    input.token_texts.reserve(bytes.size());
+    for (const auto& piece : bytes) { input.token_texts.push_back(vllm_qwen3::utf8_replace(piece)); }
+    // vLLM's output.text: the stop token that ended the generation is not detokenized; a stop string ends it.
+    std::size_t kept = bytes.size();
+    if (result.finish_reason == sinfer::FinishReason::StopToken && kept != 0) { --kept; }
+    std::string raw;
+    for (std::size_t i = 0; i < kept; ++i) { raw += bytes[i]; }
+    input.text = vllm_qwen3::output_text(raw);
+    if (result.finish_reason == sinfer::FinishReason::StopString && !result.stop_sequence.empty()) {
+        if (const std::size_t at = input.text.find(result.stop_sequence); at != std::string::npos) {
+            input.text.resize(at);
+        }
+    }
+    input.thinking            = prepared.enable_thinking;
+    input.suppress_tool_calls = prepared.tool_choice.mode == ToolChoiceMode::None;
+    return vllm_qwen3::parse(input, *qwen3_vocabulary_, prepared.tools);
+}
+
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     if (prepared.parallel_decoding) { return run_parallel(prepared, sink, is_cancelled); }
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*engine_, *sink, prepared.tool_capable,
+        output_sink = std::make_unique<ServiceOutputSink>(*engine_, *sink,
+            prepared.tool_capable || vllm_qwen3_applies(prepared),
             options_.tool_call_format == ToolCallFormat::Llama3Json,
             options_.tool_call_format == ToolCallFormat::MuseAtem,
-            options_.tool_call_format == ToolCallFormat::Gemma4);
+            options_.tool_call_format == ToolCallFormat::Gemma4,
+            options_.tool_call_format == ToolCallFormat::Qwen3Coder);
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;
@@ -916,6 +982,44 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
+    // vLLM 0.31's qwen3_coder parser, exactly, on the generated token ids (serve/vllm_qwen3_parser.h): every request
+    // with tools, except calls the tool grammar wrote (tool_choice required / named, strict tools), which keep the
+    // reading below.
+    if (vllm_qwen3_applies(prepared) && outcome.finish_reason != sinfer::FinishReason::Cancelled) {
+        const vllm_qwen3::Result parsed = vllm_qwen3_parse(prepared, result);
+        std::vector<ToolCall> calls;
+        if (prepared.tool_capable) { // tool_choice "none": vLLM returns no calls (and the parser dropped their text)
+            for (const auto& call : parsed.calls) {
+                calls.push_back({.id = new_tool_call_id(), .name = call.name, .arguments_json = call.arguments});
+            }
+            if (!prepared.parallel_tool_calls && calls.size() > 1) { calls.resize(1); }
+        }
+        const bool is_tool_call_response = !calls.empty();
+        outcome.tool_calls               = std::move(calls);
+        outcome.content_null_if_empty    = true;
+        std::string content              = parsed.content.value_or("");
+        std::optional<std::size_t> streamed;
+        if (output_sink) {
+            // The content already streamed stays; what follows it in vLLM's content is streamed now. The stream
+            // keeps the engine's start of content (no leading whitespace after the reasoning).
+            const std::string& sent = output_sink->streamed_content();
+            std::string_view target = content;
+            if (!target.starts_with(sent)) {
+                while (!target.empty() && std::isspace(static_cast<unsigned char>(target.front())) != 0) {
+                    target.remove_prefix(1);
+                }
+            }
+            const std::string tail = target.starts_with(sent) ? std::string(target.substr(sent.size())) : std::string();
+            content  = sent + tail;
+            streamed = output_sink->finish_with(tail);
+        } else {
+            outcome.reasoning = parsed.reasoning.value_or("");
+        }
+        outcome.text = std::move(content);
+        (void)is_tool_call_response;
+        finalize_output_text(outcome, options_.reasoning_format, streamed);
+        return outcome;
+    }
     if (!prepared.tool_capable) { outcome.text += result.tool_content; }
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {

@@ -378,6 +378,26 @@ bool Engine::supports_chat() const {
         impl_->active);
 }
 
+std::vector<std::pair<TokenId, std::string>> Engine::named_special_tokens() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& target_ptr) -> std::vector<std::pair<TokenId, std::string>> {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.named_special_tokens();
+        },
+        impl_->active);
+}
+
+std::optional<TokenId> Engine::token_id(std::string_view spelling) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& target_ptr) -> std::optional<TokenId> {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.token_id(spelling);
+        },
+        impl_->active);
+}
+
 std::size_t Engine::max_chars_per_token() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

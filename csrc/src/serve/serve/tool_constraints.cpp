@@ -176,10 +176,13 @@ std::string make_tool_constraint(const GenerationRequest& request, ToolCallForma
                     schema_format(schema, "muse_xml"), newline + "</atem:invoke>" + newline +
                     "</atem:function_calls>"));
             }
-        } else if (format == ToolCallFormat::QwenXml) {
+        } else if (format == ToolCallFormat::QwenXml || format == ToolCallFormat::Qwen3Coder) {
             for (const auto& newline : {std::string{}, std::string{"\n"}}) {
-                tags.push_back(tag("<tool_call>" + newline + "{\"name\": " + quoted + ", \"arguments\": ",
-                    schema_format(schema, "json"), "}" + newline + "</tool_call>"));
+                // vLLM's qwen3_coder parser reads no JSON body, so its structural tag offers none.
+                if (format == ToolCallFormat::QwenXml) {
+                    tags.push_back(tag("<tool_call>" + newline + "{\"name\": " + quoted + ", \"arguments\": ",
+                        schema_format(schema, "json"), "}" + newline + "</tool_call>"));
+                }
                 tags.push_back(tag("<tool_call>" + newline + "<function=" + tool.name + ">" + newline,
                     schema_format(schema, "qwen_xml"), newline + "</function>" + newline + "</tool_call>"));
             }

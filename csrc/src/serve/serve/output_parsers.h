@@ -31,7 +31,8 @@ enum class ReasoningFormat {
 /// How a model emits a tool call.
 enum class ToolCallFormat {
     None,        ///< tool calls are not parsed out of the text
-    QwenXml,     ///< JSON or function/parameter XML inside `<tool_call>` (qwen3_xml, hermes)
+    QwenXml,     ///< JSON or function/parameter XML inside `<tool_call>` (hermes)
+    Qwen3Coder,  ///< vLLM 0.31's qwen3_coder / qwen3_xml parser, exactly (serve/vllm_qwen3_parser.h)
     MuseAtem,    ///< Muse-Glimmer ATEM function and parameter tags
     Spark25,     ///< `<tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>`
     Llama3Json,  ///< bare `{"name":..,"parameters":{..}}`, optionally after `<|python_tag|>`

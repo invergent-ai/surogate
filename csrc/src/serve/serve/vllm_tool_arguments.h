@@ -68,4 +68,19 @@ using Parameters = std::vector<std::pair<std::string, std::string>>;
 /// Python's `int(value)` of a finite float with no fractional part, exact at any magnitude.
 [[nodiscard]] std::string python_int_of_float(double value);
 
+/// vLLM's `ParserEngine._fix_arg_types` for any arguments JSON: the values `properties` (the tool's schema
+/// `properties`) declares are coerced -- strings as above, objects and arrays recursed into by their own
+/// `properties` / `items`, other values through their JSON text -- and the JSON is written again only when one
+/// changed. Text that is not a JSON object comes back as it is.
+[[nodiscard]] std::string fix_arg_types(std::string_view args_json, const nlohmann::ordered_json& properties);
+
+/// vLLM's `ParserEngine._extract_name_and_args` for a call body that has no name of its own: the stripped body read
+/// as a JSON object, its "name" (nullopt when that is not a string) and its "arguments" or "parameters" (a string
+/// as it is, anything else as JSON), else the object without "name". Not an object: an empty name and the stripped
+/// body.
+[[nodiscard]] std::pair<std::optional<std::string>, std::string> extract_json_name_and_args(std::string_view raw_body);
+
+/// The size in bytes of the `\s` (Python `regex` module) character at `pos`, 0 when there is none.
+[[nodiscard]] std::size_t regex_space_size(std::string_view text, std::size_t pos);
+
 } // namespace sinfer::serve::vllm_args

@@ -388,6 +388,18 @@ bool spells_gemma4_tool_calls(const fi::Tokenizer& tokenizer) {
     return true;
 }
 
+/// Whether `<tool_call>` and `</tool_call>` are each one token, as in the Qwen3.5 / Qwen3.6 vocabulary.
+bool spells_qwen3_coder_tool_calls(const fi::Tokenizer& tokenizer) {
+    for (const std::string marker : {"<tool_call>", "</tool_call>"}) {
+        std::vector<int> ids;
+        try {
+            ids = tokenizer.encode(marker, {.parse_added_tokens = true, .add_bos = false});
+        } catch (const std::invalid_argument&) { return false; }
+        if (ids.size() != 1) { return false; }
+    }
+    return true;
+}
+
 /// The reasoning markers a checkpoint states, or the `<think>` pair when it states none.
 ///
 /// `response_template.fields.thinking` is how the published Gemma 4 files spell it, beside
@@ -1146,6 +1158,10 @@ public:
                                                reasoning)
                 : chat_template.capabilities();
         capabilities.gemma4_tool_calls = spells_gemma4_tool_calls(*tokenizer);
+        capabilities.qwen3_coder_tool_calls =
+            chat_template.rendered_by_tokenizer() && spells_qwen3_coder_tool_calls(*tokenizer) &&
+            chat_template.jinja_source().find("<function=") != std::string_view::npos &&
+            chat_template.jinja_source().find("<parameter=") != std::string_view::npos;
         // How a message's text parts reach the template. Qwen's templates -- and the hand-written
         // reproductions of them -- iterate the parts and write them back to back, which is what
         // vLLM (content format "openai") and transformers render; an artifact's own template is
@@ -1899,6 +1915,21 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 }
 
 bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template; }
+
+std::vector<std::pair<TokenId, std::string>> Frontend::named_special_tokens() const {
+    std::vector<std::pair<TokenId, std::string>> out;
+    if (impl_ == nullptr) { return out; }
+    for (const auto& [id, spelling] : impl_->tokenizer->named_special_tokens()) {
+        out.emplace_back(static_cast<TokenId>(id), spelling);
+    }
+    return out;
+}
+
+std::optional<TokenId> Frontend::token_id(std::string_view spelling) const {
+    if (impl_ == nullptr) { return std::nullopt; }
+    const std::optional<int> id = impl_->tokenizer->token_id(spelling);
+    return id ? std::optional<TokenId>(static_cast<TokenId>(*id)) : std::nullopt;
+}
 
 std::size_t Frontend::max_chars_per_token() const noexcept {
     return impl_ != nullptr ? impl_->tokenizer->max_chars_per_token() : 0;

@@ -9,7 +9,9 @@
 #include <string>
 #include <string_view>
 #include <memory>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace sinfer::family {
@@ -164,6 +166,10 @@ public:
     [[nodiscard]] bool supports_chat() const noexcept;
     /// The tokenizer's longest token in code points (vLLM's max_chars_per_token).
     [[nodiscard]] std::size_t max_chars_per_token() const noexcept;
+    /// transformers' `all_special_tokens` with their ids (Tokenizer::named_special_tokens).
+    [[nodiscard]] std::vector<std::pair<TokenId, std::string>> named_special_tokens() const;
+    /// The id of the token spelled exactly `spelling`, if the vocabulary has one.
+    [[nodiscard]] std::optional<TokenId> token_id(std::string_view spelling) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] std::string reasoning_close() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

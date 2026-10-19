@@ -46,10 +46,11 @@ struct ToolCallName {
     ToolCallFormat format;
 };
 
-constexpr std::array<ToolCallName, 9> kToolCallNames{{
+constexpr std::array<ToolCallName, 10> kToolCallNames{{
     {"none", ToolCallFormat::None},
     {"off", ToolCallFormat::None},
-    {"qwen3_xml", ToolCallFormat::QwenXml},
+    {"qwen3_coder", ToolCallFormat::Qwen3Coder},
+    {"qwen3_xml", ToolCallFormat::Qwen3Coder},
     {"hermes", ToolCallFormat::QwenXml},
     {"muse_glimmer", ToolCallFormat::MuseAtem},
     {"spark25", ToolCallFormat::Spark25},
@@ -259,6 +260,7 @@ ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
         return out;
     case ToolCallFormat::MuseAtem:
     case ToolCallFormat::QwenXml:
+    case ToolCallFormat::Qwen3Coder: // without the token ids: the text-only reading (GenerationService reads ids)
     case ToolCallFormat::Spark25: {
         ParsedToolCallOutput parsed = format == ToolCallFormat::MuseAtem
             ? parse_muse_tool_call_output(text, max_tool_name_length, tools)

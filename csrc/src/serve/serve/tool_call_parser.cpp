@@ -61,6 +61,8 @@ bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     return true;
 }
 
+} // namespace
+
 std::string new_tool_call_id() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<std::uint64_t> dist;
@@ -69,6 +71,8 @@ std::string new_tool_call_id() {
                   static_cast<unsigned long long>(dist(rng)));
     return std::string(buf.data());
 }
+
+namespace {
 
 Json function_schema(std::string_view name, const std::vector<ToolDefinition>& tools) {
     for (const auto& tool : tools) {
@@ -576,6 +580,7 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
     if (json_tools_) {
         for (const auto candidate : {"<|python_tag|>", "{", "["}) { marker = std::min(marker, pending_.find(candidate)); }
     }
+    if (qwen3_coder_) { marker = std::min(marker, pending_.find("<function=")); }
     if (marker != std::string::npos) {
         std::size_t safe_end = marker;
         while (safe_end != 0 &&
@@ -592,6 +597,7 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
 
     std::size_t prefix = longest_suffix_prefix(pending_, kToolOpen);
     if (json_tools_) { prefix = std::max(prefix, longest_suffix_prefix(pending_, "<|python_tag|>")); }
+    if (qwen3_coder_) { prefix = std::max(prefix, longest_suffix_prefix(pending_, "<function=")); }
     std::size_t safe_end     = pending_.size() - prefix;
     while (safe_end != 0 && std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
         --safe_end;
