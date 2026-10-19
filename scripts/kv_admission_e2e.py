@@ -397,8 +397,10 @@ def image_body(i, args):
 
 def synthetic_body(i, tokens, args):
     rng = random.Random(1000 + i)
-    # About 1.3 tokens a word for this vocabulary; numbers make it non-repetitive.
-    words = int(tokens / 1.35)
+    # About 2.17 tokens a word for this vocabulary: the numbers (which make it non-repetitive)
+    # tokenize digit by digit. Measured on 24 prompts (2026-10-19): 2.15-2.18. Until then this
+    # divided by 1.35, so earlier "--prompt-tokens 100000:160000" runs got 164-254k tokens.
+    words = int(tokens / 2.17)
     text = " ".join(f"{rng.choice(WORDS)}{rng.randint(0, 9999)}" if rng.random() < 0.3 else rng.choice(WORDS)
                     for _ in range(words))
     ask = ("Write a long, detailed report on what this log shows, section by section." if args.long_answer
