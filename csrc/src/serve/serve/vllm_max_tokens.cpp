@@ -1,7 +1,9 @@
 #include "serve/vllm_max_tokens.h"
 
 #include <algorithm>
+#include <optional>
 #include <string>
+#include <utility>
 
 namespace sinfer::serve {
 

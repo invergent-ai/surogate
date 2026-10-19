@@ -186,11 +186,11 @@ int main() {
         check(d.error.has_value() && d.error->status == 400, "task_091 shape not refused");
         if (d.error) {
             check(make_error_body(*d.error) ==
-                      R"({"error":{"message":"This model's maximum context length is 262144 tokens. However, you )"
-                      R"(requested 32768 output tokens and your prompt contains at least 229377 input tokens, for a )"
-                      R"(total of at least 262145 tokens. Please reduce the length of the input prompt or the number )"
-                      R"(of requested output tokens. (parameter=input_tokens, value=229377)","type":"BadRequestError",)"
-                      R"("param":"input_tokens","code":400}})",
+                      R"j({"error":{"message":"This model's maximum context length is 262144 tokens. However, you )j"
+                      R"j(requested 32768 output tokens and your prompt contains at least 229377 input tokens, for a )j"
+                      R"j(total of at least 262145 tokens. Please reduce the length of the input prompt or the number )j"
+                      R"j(of requested output tokens. (parameter=input_tokens, value=229377)","type":"BadRequestError",)j"
+                      R"j("param":"input_tokens","code":400}})j",
                   "task_091 body: " + make_error_body(*d.error));
         }
         request.max_tokens_set = false; // no max_tokens: the rest of the context, no error
