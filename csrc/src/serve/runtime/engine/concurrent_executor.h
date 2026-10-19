@@ -12,6 +12,7 @@
 #include "runtime/generation/generation_budget.h"
 #include "runtime/generation/readout_policy.h"
 #include "api/family/frontend.h"
+#include "api/family/prepared_prompt.h"
 
 #include <algorithm>
 #include <numeric>
@@ -91,6 +92,7 @@ public:
             kv_on_demand_ = instance.program->kv_on_demand();
         }
         kv_forced_preemption_ = parse_kv_forced_preemption(std::getenv("SUROGATE_SERVE_KV_FORCE_PREEMPT"));
+        kv_media_limit_       = options.media_live_bytes / 2;
         {
             const char* why = options.kv_admission.mode == KvAdmission::Reserve ? "" :
                               kPipelined ? " (a pipeline reserves)" :
@@ -607,6 +609,9 @@ private:
         // ran on before, which its result adds up.
         bool kv_preemptable = false;
         std::optional<family::PreparedPrompt> kv_original_prompt;
+        /// Bytes of prepared media `kv_original_prompt` keeps alive (they count against the
+        /// frontend's --media-live-mib budget until the request completes).
+        std::size_t kv_retained_media = 0;
         std::uint32_t kv_preemptions = 0;
         std::optional<GenerationTimings> kv_carried_timings;
         std::optional<SpeculativeStats> kv_carried_speculative;
@@ -799,6 +804,7 @@ private:
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
         release_planning_state(request);
+        release_kv_original_prompt(request);
         request->prompt = {};
         {
             std::lock_guard lock(request->mutex);
@@ -812,6 +818,7 @@ private:
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         release_planning_state(request);
+        release_kv_original_prompt(request);
         request->prompt = {};
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
@@ -906,6 +913,22 @@ private:
         slots_[lane].reset();
         lane_released_at_[lane] = ++lane_release_clock_;
         invalidate_lane_plans(lane);
+    }
+
+    [[nodiscard]] static std::size_t prompt_media_bytes(const family::PreparedPrompt& prompt) {
+        std::size_t bytes = 0;
+        for (const auto& payload : family::PreparedPromptAccess::view(prompt).media_payloads) {
+            if (payload) { bytes += payload->patch_elements * sizeof(std::uint16_t); }
+        }
+        return bytes;
+    }
+
+    void release_kv_original_prompt(const std::shared_ptr<Request>& request) noexcept {
+        if (request->kv_retained_media != 0) {
+            kv_media_retained_ -= std::min(kv_media_retained_, request->kv_retained_media);
+            request->kv_retained_media = 0;
+        }
+        request->kv_original_prompt.reset();
     }
 
     static void add_carried_timings(GenerationTimings& into, const GenerationTimings& carried) noexcept {
@@ -1350,6 +1373,15 @@ private:
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
+        // An image request admitted on demand keeps its prepared media for a recompute, and
+        // that counts against the frontend's live-media budget until it completes: past half
+        // of it, an image request takes its whole reservation instead and keeps nothing.
+        if (!request->base_plan && kv_on_demand_ && request->kv_preemptions == 0 &&
+            request->prompt) {
+            const std::size_t media = prompt_media_bytes(request->prompt);
+            request->options.execution.reserve_kv =
+                media != 0 && kv_media_retained_ + media > kv_media_limit_;
+        }
         if (!request->base_plan) {
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
@@ -1564,6 +1596,8 @@ private:
             request->kv_preemptable = kv_on_demand_ && summary.on_demand_kv;
             if (request->kv_preemptable && !request->kv_original_prompt) {
                 request->kv_original_prompt.emplace(request->prompt.clone());
+                request->kv_retained_media = prompt_media_bytes(request->prompt);
+                kv_media_retained_ += request->kv_retained_media;
             }
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
@@ -3019,6 +3053,8 @@ private:
     /// Lanes the growth pass could not grow this round and that wait for the device gate.
     std::vector<std::uint8_t> kv_stalled_;
     KvForcedPreemption kv_forced_preemption_;
+    std::size_t kv_media_limit_    = 0; ///< prepared media on-demand requests may keep (bytes)
+    std::size_t kv_media_retained_ = 0; ///< prepared media they keep now
     ops::EngineOpsContext* ops_context_ = nullptr;
     int device_ = 0;
     std::thread worker_;

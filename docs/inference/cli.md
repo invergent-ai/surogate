@@ -289,7 +289,10 @@ sampling state carry on). Requests are admitted strictly in arrival order. A req
 plus output limit could never fit the cache is refused at once, as before. `surogate_kv_preemptions_total`
 and `surogate_kv_recomputed_tokens_total` count the pauses and the tokens they recomputed.
 Requests that return prompt log-probabilities or routing, decision readouts, DFlash drafting and
-multi-GPU pipelines keep the up-front reservation.
+multi-GPU pipelines keep the up-front reservation. An image request admitted this way keeps its
+prepared media until it completes, so that a recompute can encode it again; that media counts
+against `--media-live-mib`, and once it would take more than half of it, further image requests
+are given the up-front reservation instead.
 
 Set `--max-num-seqs 256` (or higher) to allow more than 128 active requests per model.
 More simultaneous requests need more memory and may increase response latency; pair this

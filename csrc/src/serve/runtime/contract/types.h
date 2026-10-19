@@ -58,6 +58,9 @@ struct ResolvedExecutionOptions {
     /// Set by the executor when it re-admits a request it preempted (--kv-admission ondemand):
     /// the prompt then ends with the tokens this request already generated.
     std::shared_ptr<const KvResumeState> resume;
+    /// Admit with the whole reservation even under --kv-admission ondemand: the executor asks
+    /// this for an image request whose media it could not keep for a recompute.
+    bool reserve_kv = false;
 };
 
 struct ResolvedRequestOptions {

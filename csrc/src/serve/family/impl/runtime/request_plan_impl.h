@@ -242,7 +242,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.on_demand_kv = kv_on_demand_ && !base->target_only && !gpu_prefix_readout &&
                                  options.prompt_logprobs < 0 &&
                                  !(options.capture_routing && routing_capture_enabled) &&
-                                 options.next_token_candidates.empty();
+                                 options.next_token_candidates.empty() && !options.reserve_kv;
     if (options.resume && !base->summary.on_demand_kv) {
         throw std::invalid_argument("a request that cannot be recomputed was preempted");
     }

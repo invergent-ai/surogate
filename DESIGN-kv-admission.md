@@ -67,6 +67,10 @@ default 256), `--kv-admission-watermark F` (fraction of KV pages, default 0.01).
 8. **Not preemptable -> admitted with the full reservation (reserve semantics)**: prompt_logprobs,
    routing capture (SUROGATE_SERVE_CAPTURE_ROUTING), target-only / GPU-prefix / candidate
    readouts (one token anyway). Engine-wide reserve: DFlash backend, multi-GPU pipelines.
+   Image requests are preemptable: the executor keeps a clone of the prepared prompt, whose media
+   payloads then stay alive (and count against the frontend's `--media-live-mib` budget) until
+   the request completes. While on-demand image requests keep more than half of that budget, a
+   new image request is planned with its full reservation instead (`reserve_kv`).
 
 ## Output identity
 
