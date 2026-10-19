@@ -587,7 +587,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
     request_options.execution.top_logprobs = request.want_logprobs ? request.top_logprobs : -1;
     validate_routing_request(request);
     request_options.execution.capture_routing = request.return_routed_experts;
-    request_options.execution.min_tokens = static_cast<std::uint32_t>(request.min_tokens);
+    request_options.execution.min_tokens = static_cast<std::uint32_t>(std::max(0, request.min_tokens));
     if (request.min_tokens > 0) {
         std::vector<sinfer::TokenId> barrier = engine_->default_stop_tokens();
         for (const sinfer::TokenId id : request_options.stop.token_ids) { barrier.push_back(id); }

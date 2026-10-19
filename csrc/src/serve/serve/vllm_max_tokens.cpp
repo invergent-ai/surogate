@@ -58,7 +58,9 @@ MaxTokensDecision decide_vllm_max_tokens(const MaxTokensQuery& query) {
     // 1.
     if (std::optional<ApiError> error = vllm_max_tokens_above_context(query)) { return refuse(std::move(*error)); }
 
-    const std::int64_t max_input = C - M;
+    // C - M, with M kept above -2^40 so the products below cannot overflow: no prompt reaches that bound, so
+    // steps 2 and 3 never refuse (nor print these) for such an M, and step 5 prints M itself.
+    const std::int64_t max_input = C - std::max<std::int64_t>(M, -(std::int64_t{1} << 40));
     if (query.text_prompt) {
         // 2. TokenizeParams._text_len_check (vllm/renderers/params.py:346), before the text is tokenized.
         const std::int64_t max_input_chars = max_input * query.max_chars_per_token;
@@ -100,10 +102,15 @@ MaxTokensDecision decide_vllm_max_tokens(const MaxTokensQuery& query) {
         budget = std::min(budget, *query.default_max_tokens);
     }
 
-    // 5./6. SamplingParams._verify_args (vllm/sampling_params.py:625-639).
+    // 5./6. SamplingParams._verify_args (vllm/sampling_params.py:625-639), in its order.
     if (budget < 1) {
         return refuse(bad_request("max_tokens must be at least 1, got " + std::to_string(budget) + ".", "max_tokens",
                                   budget));
+    }
+    if (query.min_tokens < 0) {
+        return refuse(bad_request("min_tokens must be greater than or equal to 0, got " +
+                                      std::to_string(query.min_tokens) + ".",
+                                  "", std::nullopt));
     }
     if (query.min_tokens > budget) {
         return refuse(bad_request("min_tokens must be less than or equal to max_tokens=" + std::to_string(budget) +
@@ -122,7 +129,7 @@ MaxTokensQuery max_tokens_query(const GenerationRequest& request, std::int64_t m
     query.max_model_len = max_model_len;
     query.prompt_tokens = prompt_tokens;
     if (request.max_tokens_set) {
-        query.requested       = request.max_tokens;
+        query.requested       = request.max_tokens_wide.value_or(request.max_tokens);
         query.requested_param = request.max_tokens_param;
     } else {
         query.default_max_tokens = request.max_tokens;

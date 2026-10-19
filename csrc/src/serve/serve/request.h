@@ -217,6 +217,9 @@ struct GenerationRequest {
     bool max_tokens_set = false;
     /// The field max_tokens came from (max_tokens, max_completion_tokens, max_output_tokens), for vLLM's message.
     std::string max_tokens_param = "max_tokens";
+    /// The client's max_tokens when it does not fit `max_tokens` (which then saturates); vLLM's rule words its
+    /// refusal with the value as sent.
+    std::optional<std::int64_t> max_tokens_wide;
     bool stream         = false;
     bool include_usage  = false;
     std::optional<bool> enable_thinking; // non-standard extension; falls back to server default

@@ -24,7 +24,8 @@
 //      (reachable only with a negative M)                                                 (api_utils.py:184)
 //      budget = min(C - P, M if given else the server default)
 //   5. budget < 1                 -> "max_tokens must be at least 1, got <budget>."     (sampling_params.py:625)
-//   6. min_tokens > budget        -> "min_tokens must be less than or equal to max_tokens=<budget>, got ..."
+//   6. min_tokens < 0             -> "min_tokens must be greater than or equal to 0, got <min_tokens>."
+//      min_tokens > budget        -> "min_tokens must be less than or equal to max_tokens=<budget>, got ..."
 // Every refusal is vLLM's body: {"error": {"message", "type": "BadRequestError", "param", "code": 400}}, the
 // message carrying vLLM's " (parameter=..., value=...)" suffix where its VLLMValidationError has a parameter
 // (vllm/exceptions.py), and HTTP 400 for a streaming request too: vLLM opens the stream only after these steps.

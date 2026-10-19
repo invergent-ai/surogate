@@ -223,6 +223,52 @@ int main() {
                              std::string::npos,
               "token-in count: " + (d.error ? d.error->message : std::string("accepted")));
     }
+    // A negative min_tokens is refused where vLLM's SamplingParams refuses it: after the context checks, with its
+    // words (checked against vLLM 0.31's render server: min_tokens=-1 on a short chat prompt).
+    {
+        RequestLimits limits;
+        limits.vllm_max_tokens = true;
+        OJson request = {{"model", "m"}, {"messages", OJson::array({{{"role", "user"}, {"content", "x"}}})},
+                         {"min_tokens", -1}};
+        const GenerationRequest r = parse_chat_completion_request(request, limits);
+        const MaxTokensDecision d = decide_vllm_max_tokens(max_tokens_query(r, 4096, 100, 300, 128));
+        check(d.error && make_error_body(*d.error) ==
+                             R"j({"error":{"message":"min_tokens must be greater than or equal to 0, got -1.",)j"
+                             R"j("type":"BadRequestError","param":null,"code":400}})j",
+              "negative min_tokens: " + (d.error ? make_error_body(*d.error) : std::string("accepted")));
+    }
+    // A max_tokens beyond 32 bits is worded with its value, as vLLM does (both bodies are vLLM 0.31's, from its
+    // render server on a 4096 context).
+    {
+        RequestLimits limits;
+        limits.vllm_max_tokens = true;
+        const OJson big = {{"model", "m"}, {"prompt", "x"}, {"max_tokens", 3000000000LL}};
+        const GenerationRequest r = parse_completion_request(big, limits);
+        const auto error = vllm_max_tokens_above_context(max_tokens_query(r, 4096, 0, 0, 0));
+        check(error && make_error_body(*error) ==
+                           R"j({"error":{"message":"max_tokens=3000000000 cannot be greater than max_model_len=4096. )j"
+                           R"j(Please request fewer output tokens. (parameter=max_tokens, value=3000000000)",)j"
+                           R"j("type":"BadRequestError","param":"max_tokens","code":400}})j",
+              "max_tokens beyond int: " + (error ? make_error_body(*error) : std::string("accepted")));
+        const OJson negative = {{"model", "m"}, {"messages", OJson::array({{{"role", "user"}, {"content", "x"}}})},
+                                {"max_tokens", -3000000000LL}};
+        const GenerationRequest n = parse_chat_completion_request(negative, limits);
+        const MaxTokensDecision d = decide_vllm_max_tokens(max_tokens_query(n, 4096, 11, 30, 128));
+        check(d.error && make_error_body(*d.error) ==
+                             R"j({"error":{"message":"max_tokens must be at least 1, got -3000000000. )j"
+                             R"j((parameter=max_tokens, value=-3000000000)","type":"BadRequestError",)j"
+                             R"j("param":"max_tokens","code":400}})j",
+              "max_tokens below int: " + (d.error ? make_error_body(*d.error) : std::string("accepted")));
+        RequestLimits cap; // the earlier parser refuses both
+        for (const OJson* body : {&big, &negative}) {
+            bool refused = false;
+            try {
+                (void)(body->contains("prompt") ? parse_completion_request(*body, cap)
+                                                : parse_chat_completion_request(*body, cap));
+            } catch (const ApiException&) { refused = true; }
+            check(refused, "cap mode should refuse a max_tokens beyond int while parsing");
+        }
+    }
     // --overlong-max-tokens cap keeps the parser's earlier refusal of a max_tokens below 1, and the earlier shape.
     {
         RequestLimits limits; // vllm_max_tokens = false
@@ -234,6 +280,15 @@ int main() {
                 refused = error.error().message == "max_tokens must be positive" && error.error().numeric_code == 0;
             }
             check(refused, std::string("cap mode should refuse ") + field + "=0 while parsing");
+        }
+        {
+            OJson request = {{"model", "m"}, {"messages", OJson::array({{{"role", "user"}, {"content", "x"}}})},
+                             {"min_tokens", -1}};
+            bool refused = false;
+            try { (void)parse_chat_completion_request(request, limits); } catch (const ApiException& error) {
+                refused = error.error().message == "min_tokens must be nonnegative";
+            }
+            check(refused, "cap mode should refuse min_tokens=-1 while parsing");
         }
         ApiError old;
         old.message = "m";

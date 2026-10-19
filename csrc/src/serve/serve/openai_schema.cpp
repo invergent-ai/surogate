@@ -2,6 +2,7 @@
 
 #include "serve/tool_definition.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -112,6 +113,43 @@ std::optional<int> get_int(const OJson& obj, const char* key) {
         bad_request(std::string(key) + " is out of range", key);
     }
     return static_cast<int>(value);
+}
+
+// vLLM takes any integer for max_tokens and words its refusal with the value as sent
+// (serve/vllm_max_tokens.h), so under that rule the field is read at 64 bits.
+std::optional<std::int64_t> get_int64(const OJson& obj, const char* key) {
+    if (!obj.contains(key) || obj.at(key).is_null()) { return std::nullopt; }
+    if (!obj.at(key).is_number_integer()) {
+        bad_request(std::string(key) + " must be an integer", key);
+    }
+    if (obj.at(key).is_number_unsigned()) {
+        const std::uint64_t value = obj.at(key).get<std::uint64_t>();
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            bad_request(std::string(key) + " is out of range", key);
+        }
+        return static_cast<std::int64_t>(value);
+    }
+    return obj.at(key).get<std::int64_t>();
+}
+
+// max_tokens / max_completion_tokens as the request spells it. Under vLLM's rule any integer is
+// kept (the int field saturates; max_tokens_wide holds the value), and one below 1 is refused
+// later, where vLLM refuses it.
+void parse_max_tokens(const OJson& body, const char* key, const RequestLimits& limits,
+                      GenerationRequest& out) {
+    std::optional<std::int64_t> value;
+    if (limits.vllm_max_tokens) {
+        value = get_int64(body, key);
+    } else if (const std::optional<int> narrow = get_int(body, key)) {
+        value = *narrow;
+    }
+    if (!value) { return; }
+    if (*value <= 0 && !limits.vllm_max_tokens) { bad_request("max_tokens must be positive", "max_tokens"); }
+    out.max_tokens = static_cast<int>(std::clamp<std::int64_t>(*value, std::numeric_limits<int>::min(),
+                                                               std::numeric_limits<int>::max()));
+    if (out.max_tokens != *value) { out.max_tokens_wide = *value; }
+    out.max_tokens_set   = true;
+    out.max_tokens_param = key;
 }
 
 std::optional<std::uint64_t> get_u64(const OJson& obj, const char* key) {
@@ -466,10 +504,12 @@ void parse_tool_choice(const OJson& body, GenerationRequest& out) {
     }
 }
 
-void parse_stop(const OJson& body, GenerationRequest& out) {
+void parse_stop(const OJson& body, GenerationRequest& out, const RequestLimits& limits) {
     out.ignore_eos = get_bool(body, "ignore_eos", false);
     if (const std::optional<int> minimum = get_int(body, "min_tokens")) {
-        if (*minimum < 0) { bad_request("min_tokens must be nonnegative", "min_tokens"); }
+        // Under vLLM's max_tokens rule a negative one is refused where vLLM refuses it, after the
+        // context checks (serve/vllm_max_tokens.h).
+        if (*minimum < 0 && !limits.vllm_max_tokens) { bad_request("min_tokens must be nonnegative", "min_tokens"); }
         out.min_tokens = *minimum;
     }
     if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
@@ -776,7 +816,7 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
     parse_tool_choice(body, out);
     out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
     parse_messages(body, out);
-    parse_stop(body, out);
+    parse_stop(body, out, limits);
     parse_sampling(body, out);
 
     out.stream = get_bool(body, "stream", false);
@@ -794,20 +834,9 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
 
-    std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
-    if (max_tokens) {
-        out.max_tokens_param = "max_completion_tokens";
-    } else {
-        max_tokens = get_int(body, "max_tokens");
-    }
-    if (max_tokens) {
-        if (*max_tokens <= 0 && !limits.vllm_max_tokens) { bad_request("max_tokens must be positive", "max_tokens"); }
-        out.max_tokens     = *max_tokens;
-        out.max_tokens_set = true;
-    } else {
-        out.max_tokens     = limits.default_max_tokens;
-        out.max_tokens_set = false;
-    }
+    parse_max_tokens(body, "max_completion_tokens", limits, out);
+    if (!out.max_tokens_set) { parse_max_tokens(body, "max_tokens", limits, out); }
+    if (!out.max_tokens_set) { out.max_tokens = limits.default_max_tokens; }
     return out;
 }
 
@@ -1068,7 +1097,7 @@ GenerationRequest parse_completion_request(const OJson& body, const RequestLimit
         options["logprobs"] = true;
         options["top_logprobs"] = *count;
     }
-    parse_stop(options, out);
+    parse_stop(options, out, limits);
     parse_sampling(body, out);
 
     out.stream = get_bool(body, "stream", false);
@@ -1079,15 +1108,8 @@ GenerationRequest parse_completion_request(const OJson& body, const RequestLimit
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
 
-    const std::optional<int> max_tokens = get_int(body, "max_tokens");
-    if (max_tokens) {
-        if (*max_tokens <= 0 && !limits.vllm_max_tokens) { bad_request("max_tokens must be positive", "max_tokens"); }
-        out.max_tokens     = *max_tokens;
-        out.max_tokens_set = true;
-    } else {
-        out.max_tokens     = limits.default_max_tokens;
-        out.max_tokens_set = false;
-    }
+    parse_max_tokens(body, "max_tokens", limits, out);
+    if (!out.max_tokens_set) { out.max_tokens = limits.default_max_tokens; }
     return out;
 }
 
