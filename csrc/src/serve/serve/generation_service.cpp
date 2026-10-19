@@ -523,20 +523,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     if (options_.tool_call_format == ToolCallFormat::Qwen3Coder &&
         options_.reasoning_format == ReasoningFormat::ThinkTags) {
         vllm_qwen3::Vocabulary vocabulary;
-        const auto id_of = [&](std::string_view spelling) {
-            return engine_->token_id(spelling).value_or(-1);
-        };
-        vocabulary.think_start = id_of("<think>");
-        vocabulary.think_end   = id_of("</think>");
-        vocabulary.tool_start  = id_of("<tool_call>");
-        vocabulary.tool_end    = id_of("</tool_call>");
-        static constexpr std::array<std::string_view, 9> kGrammar{"<think>", "</think>", "<tool_call>",
-            "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>", ">"};
-        for (const auto& [id, spelling] : engine_->named_special_tokens()) {
-            if (std::find(kGrammar.begin(), kGrammar.end(), spelling) == kGrammar.end()) {
-                vocabulary.drop_tokens.emplace(id, spelling);
-            }
-        }
+        for (const auto& special : engine_->named_special_tokens()) { vocabulary.special_tokens.push_back(special.second); }
         qwen3_vocabulary_ = std::move(vocabulary);
     }
     request_capacity_    = std::make_shared<RequestCapacity>(
@@ -879,10 +866,7 @@ bool GenerationService::vllm_qwen3_applies(const PreparedRequest& prepared) cons
 vllm_qwen3::Result GenerationService::vllm_qwen3_parse(const PreparedRequest& prepared,
                                                        const sinfer::GenerationResult& result) const {
     vllm_qwen3::Input input;
-    input.token_ids.assign(result.generated_token_ids.begin(), result.generated_token_ids.end());
     const std::vector<std::string> bytes = engine_->token_texts(result.generated_token_ids);
-    input.token_texts.reserve(bytes.size());
-    for (const auto& piece : bytes) { input.token_texts.push_back(vllm_qwen3::utf8_replace(piece)); }
     // vLLM's output.text: the stop token that ended the generation is not detokenized; a stop string ends it.
     std::size_t kept = bytes.size();
     if (result.finish_reason == sinfer::FinishReason::StopToken && kept != 0) { --kept; }
@@ -917,7 +901,7 @@ vllm_qwen3::Result GenerationService::vllm_qwen3_parse(const PreparedRequest& pr
         nlohmann::json calls = nlohmann::json::array();
         for (const auto& call : parsed.calls) { calls.push_back({{"name", call.name}, {"arguments", call.arguments}}); }
         const nlohmann::json line = {
-            {"ids", input.token_ids}, {"text", input.text}, {"tools", tools}, {"tool_choice", choice},
+            {"ids", result.generated_token_ids}, {"text", input.text}, {"tools", tools}, {"tool_choice", choice},
             {"thinking", input.thinking}, {"parallel_tool_calls", prepared.parallel_tool_calls},
             {"finish", static_cast<int>(result.finish_reason)},
             {"engine", {{"reasoning", parsed.reasoning ? nlohmann::json(*parsed.reasoning) : nlohmann::json(nullptr)},

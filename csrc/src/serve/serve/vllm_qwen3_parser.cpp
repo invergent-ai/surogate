@@ -40,13 +40,6 @@ bool is_tool_state(State state) {
            state == State::ToolBetween;
 }
 
-/// The terminals vLLM matches by token id. Once a request carries token ids (always, when served), a lexed spelling
-/// of one of them is text (StreamingParserEngine._process_lex_tokens, `strict`).
-bool is_token_id_terminal(Terminal terminal) {
-    return terminal == Terminal::ThinkStart || terminal == Terminal::ThinkEnd || terminal == Terminal::ToolStart ||
-           terminal == Terminal::ToolEnd || terminal == Terminal::Drop;
-}
-
 enum class Event { Text, Reasoning, ReasoningEnd, ToolCallStart, ToolName, ArgValue, ToolCallEnd };
 
 struct Transition {
@@ -192,126 +185,6 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------------------------
-// vllm/parser/engine/token_id_scanner.py, for one delta holding the whole output.
-
-struct Item {
-    bool terminal = false; // a PreLexedTerminal; else a TextChunk
-    Terminal kind  = Terminal::Content;
-    std::string text;
-};
-
-struct Scan {
-    std::vector<Item> items;
-    /// What the scanner holds back until finish(): a text that waited for a terminal's spelling, then those
-    /// terminals (flush_pending).
-    std::string deferred_text;
-    std::vector<Item> deferred_terminals;
-};
-
-/// _rebuild_from_anchors: the terminals placed in the text from the right, each at the rightmost spelling of it
-/// before the next one; the text between them taken from the output itself.
-void rebuild_from_anchors(const std::string& text, const std::vector<Item>& results, Scan& scan) {
-    std::vector<const Item*> anchors;
-    for (const auto& item : results) {
-        if (item.terminal) { anchors.push_back(&item); }
-    }
-    if (anchors.empty()) {
-        scan.items.push_back({false, Terminal::Content, text});
-        return;
-    }
-    std::vector<std::ptrdiff_t> positions(anchors.size(), -1);
-    std::size_t search_end = text.size();
-    for (std::size_t i = anchors.size(); i-- != 0;) {
-        const std::string& spelling = anchors[i]->text;
-        const std::size_t pos = spelling.size() <= search_end
-                                    ? std::string_view(text).substr(0, search_end).rfind(spelling)
-                                    : std::string_view::npos;
-        if (pos != std::string_view::npos) {
-            positions[i] = static_cast<std::ptrdiff_t>(pos);
-            search_end   = pos;
-        }
-    }
-    std::size_t consumed = 0;
-    for (std::size_t i = 0; i < anchors.size(); ++i) {
-        const std::ptrdiff_t pos = positions[i];
-        if (pos >= static_cast<std::ptrdiff_t>(consumed)) {
-            if (static_cast<std::size_t>(pos) > consumed) {
-                scan.items.push_back({false, Terminal::Content, text.substr(consumed, pos - consumed)});
-            }
-            scan.items.push_back(*anchors[i]);
-            consumed = static_cast<std::size_t>(pos) + anchors[i]->text.size();
-        } else {
-            const bool later = std::any_of(positions.begin() + static_cast<std::ptrdiff_t>(i) + 1, positions.end(),
-                                           [](std::ptrdiff_t p) { return p >= 0; });
-            if (!later && consumed < text.size() && anchors[i]->kind != Terminal::Drop) {
-                scan.deferred_text += text.substr(consumed);
-                consumed = text.size();
-            }
-            scan.deferred_terminals.push_back(*anchors[i]);
-        }
-    }
-    if (consumed < text.size()) { scan.items.push_back({false, Terminal::Content, text.substr(consumed)}); }
-}
-
-Scan scan_output(const Input& input, const Vocabulary& vocabulary) {
-    Scan scan;
-    const auto terminal_of = [&](TokenId id) -> std::optional<Terminal> {
-        if (id == vocabulary.think_start) { return Terminal::ThinkStart; }
-        if (id == vocabulary.think_end) { return Terminal::ThinkEnd; }
-        if (id == vocabulary.tool_start) { return Terminal::ToolStart; }
-        if (id == vocabulary.tool_end) { return Terminal::ToolEnd; }
-        if (vocabulary.drop_tokens.contains(id)) { return Terminal::Drop; }
-        return std::nullopt;
-    };
-    const bool has_special = std::any_of(input.token_ids.begin(), input.token_ids.end(),
-                                         [&](TokenId id) { return id >= 0 && terminal_of(id).has_value(); });
-    if (!has_special) {
-        if (!input.text.empty()) { scan.items.push_back({false, Terminal::Content, input.text}); }
-        return scan;
-    }
-    std::vector<Item> results;
-    std::string run;
-    for (std::size_t i = 0; i < input.token_ids.size(); ++i) {
-        const TokenId id = input.token_ids[i];
-        const std::string piece =
-            i < input.token_texts.size() ? input.token_texts[i] : vocabulary.token_text(id);
-        if (const auto terminal = terminal_of(id)) {
-            if (!run.empty()) { results.push_back({false, Terminal::Content, std::move(run)}); }
-            run.clear();
-            results.push_back({true, *terminal, piece});
-        } else {
-            run += piece;
-        }
-    }
-    if (!run.empty()) { results.push_back({false, Terminal::Content, std::move(run)}); }
-    if (input.text.empty()) {
-        // No text to place the terminals in: they wait for finish().
-        for (auto& item : results) {
-            if (item.terminal) { scan.deferred_terminals.push_back(std::move(item)); }
-        }
-        return scan;
-    }
-    // _recover_holdback_text
-    std::string reconstructed;
-    for (const auto& item : results) { reconstructed += item.text; }
-    if (reconstructed.empty()) {
-        scan.items.push_back({false, Terminal::Content, input.text});
-        scan.items.insert(scan.items.end(), results.begin(), results.end());
-        return scan;
-    }
-    const std::size_t pos = input.text.find(reconstructed);
-    if (pos == 0) {
-        scan.items = std::move(results);
-    } else if (pos != std::string::npos) {
-        scan.items.push_back({false, Terminal::Content, input.text.substr(0, pos)});
-        scan.items.insert(scan.items.end(), results.begin(), results.end());
-    } else {
-        rebuild_from_anchors(input.text, results, scan);
-    }
-    return scan;
-}
-
-// ---------------------------------------------------------------------------------------------------------------
 // StreamingParserEngine (state machine) and ParserEngine (events -> result), one pass over the whole output.
 
 struct Slot {
@@ -338,28 +211,16 @@ std::optional<std::string> name_in_body(std::string_view body) {
     return std::nullopt;
 }
 
+/// One StreamingParserEngine pass over a whole text (no token ids: the served parse hands the engine text only),
+/// with ParserEngine's handling of the events it emits.
 class Pass {
 public:
-    Pass(const Input& input, const std::vector<Literal>& literals)
-        : state_(input.thinking ? State::Reasoning : State::Content), strict_(!input.token_ids.empty()),
-          suppress_(input.suppress_tool_calls), lexer_(literals) {}
+    /// `skip_tool_parsing`: the reasoning pass (ParserEngineReasoningAdapter runs the engine so).
+    Pass(State initial, bool skip_tool_parsing, bool suppress_tool_calls, const std::vector<Literal>& literals)
+        : state_(initial), skip_tool_parsing_(skip_tool_parsing), suppress_(suppress_tool_calls), lexer_(literals) {}
 
-    void process(const std::vector<Item>& items) {
-        for (const auto& item : items) {
-            if (item.terminal) {
-                lex(lexer_.flush());
-                on_terminal(item.kind, item.text);
-            } else if (!item.text.empty()) {
-                lex(lexer_.feed(item.text));
-            }
-        }
-    }
-
-    void finish(Scan& scan) {
-        std::vector<Item> pending;
-        if (!scan.deferred_text.empty()) { pending.push_back({false, Terminal::Content, scan.deferred_text}); }
-        pending.insert(pending.end(), scan.deferred_terminals.begin(), scan.deferred_terminals.end());
-        process(pending);
+    void run(const std::string& text) {
+        if (!text.empty()) { lex(lexer_.feed(text)); }
         lex(lexer_.flush());
         if (is_tool_state(state_)) {
             if (tool_index_ >= 0) { on_event(Event::ToolCallEnd, {}); }
@@ -368,6 +229,14 @@ public:
             on_event(Event::ReasoningEnd, {});
             state_ = State::Content;
         }
+    }
+
+    /// The reasoning pass: ParserEngine.extract_reasoning joins the chunks as they came.
+    [[nodiscard]] std::optional<std::string> reasoning() const {
+        return reasoning_.empty() ? std::nullopt : std::optional(reasoning_);
+    }
+    [[nodiscard]] std::optional<std::string> raw_content() const {
+        return content_.empty() ? std::nullopt : std::optional(content_);
     }
 
     Result result(const std::vector<ToolDefinition>& tools) {
@@ -424,7 +293,7 @@ private:
 
     void lex(const std::vector<LexToken>& tokens) {
         for (const auto& token : tokens) {
-            if (token.terminal == Terminal::Content || (strict_ && is_token_id_terminal(token.terminal))) {
+            if (token.terminal == Terminal::Content) {
                 if (!token.value.empty()) { emit_for_state(token.value); }
             } else {
                 on_terminal(token.terminal, token.value);
@@ -432,12 +301,44 @@ private:
         }
     }
 
+    /// The terminals of the tool grammar (transitions into or out of a tool state), and those that leave it.
+    static bool is_tool_terminal(Terminal terminal) {
+        return terminal == Terminal::ToolStart || terminal == Terminal::ToolEnd || terminal == Terminal::FuncPrefix ||
+               terminal == Terminal::FuncEnd || terminal == Terminal::ParamStart || terminal == Terminal::ParamEnd ||
+               terminal == Terminal::CloseAngle;
+    }
+    static bool is_tool_exit_terminal(Terminal terminal) { return terminal == Terminal::ToolEnd; }
+
     void on_terminal(Terminal terminal, const std::string& value) {
         const std::optional<Transition> next = transition(state_, terminal);
         if (!next) {
             if (terminal == Terminal::Drop) { return; }
+            if (skip_tool_parsing_ && is_tool_exit_terminal(terminal)) { in_skipped_tool_span_ = false; }
             emit_for_state(value);
             return;
+        }
+        if (skip_tool_parsing_ && is_tool_terminal(terminal)) {
+            // The reasoning pass: a tool terminal is text, except that one which ends the reasoning implicitly
+            // (<tool_call>) still ends it.
+            const bool is_opener = is_tool_state(next->next);
+            const bool is_exit   = is_tool_exit_terminal(terminal);
+            if (!(is_exit && !is_opener && !in_skipped_tool_span_)) {
+                if (is_opener) {
+                    in_skipped_tool_span_ = true;
+                } else if (is_exit) {
+                    in_skipped_tool_span_ = false;
+                }
+                const bool ends_reasoning = std::find(next->events.begin(), next->events.begin() + next->event_count,
+                                                      Event::ReasoningEnd) != next->events.begin() + next->event_count;
+                if (ends_reasoning) {
+                    state_ = State::Content;
+                    on_event(Event::ReasoningEnd, value);
+                    on_event(Event::Text, value);
+                    return;
+                }
+                emit_for_state(value);
+                return;
+            }
         }
         state_ = next->next;
         for (int i = 0; i < next->event_count; ++i) {
@@ -511,8 +412,9 @@ private:
     }
 
     State state_;
-    bool strict_;
+    bool skip_tool_parsing_;
     bool suppress_;
+    bool in_skipped_tool_span_ = false;
     Lexer lexer_;
     int tool_index_ = -1;
     std::vector<Slot> slots_;
@@ -531,7 +433,7 @@ std::vector<Literal> literals_for(const Vocabulary& vocabulary) {
         {"<parameter=", Terminal::ParamStart},   {"</parameter>", Terminal::ParamEnd},
         {">", Terminal::CloseAngle},
     };
-    for (const auto& [id, spelling] : vocabulary.drop_tokens) {
+    for (const auto& spelling : vocabulary.special_tokens) {
         if (spelling.empty()) { continue; }
         const bool configured = std::any_of(out.begin(), out.begin() + 9, [&](const Literal& l) { return l.text == spelling; });
         const bool seen = std::any_of(out.begin() + 9, out.end(), [&](const Literal& l) { return l.text == spelling; });
@@ -543,11 +445,25 @@ std::vector<Literal> literals_for(const Vocabulary& vocabulary) {
 } // namespace
 
 Result parse(const Input& input, const Vocabulary& vocabulary, const std::vector<ToolDefinition>& tools) {
-    Scan scan = scan_output(input, vocabulary);
-    Pass pass(input, literals_for(vocabulary));
-    pass.process(scan.items);
-    pass.finish(scan);
-    return pass.result(tools);
+    const std::vector<Literal> literals = literals_for(vocabulary);
+    // DelegatingParser.parse: the reasoning adapter's extract_reasoning (Qwen3Parser: the whole output is content
+    // when thinking is off), then _extract_tool_calls on that content with the tool adapter, whose engine starts in
+    // content (extract_tool_calls_from_content).
+    std::optional<std::string> reasoning;
+    std::optional<std::string> content;
+    if (input.thinking) {
+        Pass first(State::Reasoning, /*skip_tool_parsing=*/true, false, literals);
+        first.run(input.text);
+        reasoning = first.reasoning();
+        content   = first.raw_content();
+    } else {
+        content = input.text;
+    }
+    Pass second(State::Content, false, input.suppress_tool_calls, literals);
+    second.run(content.value_or(""));
+    Result out    = second.result(tools);
+    out.reasoning = std::move(reasoning);
+    return out;
 }
 
 std::string output_text(std::string_view bytes) {

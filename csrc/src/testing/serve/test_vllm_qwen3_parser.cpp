@@ -19,7 +19,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -76,39 +80,44 @@ int main() {
     std::getline(in, line);
     const Json header = Json::parse(line);
 
-    std::unordered_map<vllm_qwen3::TokenId, std::string> texts;
+    std::unordered_map<std::int32_t, std::string> texts;
     for (const auto& [id, text] : header.at("token_texts").items()) { texts[std::stoi(id)] = text.get<std::string>(); }
     vllm_qwen3::Vocabulary vocabulary;
-    vocabulary.think_start = header.at("think_start");
-    vocabulary.think_end   = header.at("think_end");
-    vocabulary.tool_start  = header.at("tool_start");
-    vocabulary.tool_end    = header.at("tool_end");
-    for (const auto& [id, text] : header.at("drop_tokens").items()) {
-        vocabulary.drop_tokens[std::stoi(id)] = text.get<std::string>();
-    }
-    vocabulary.token_text = [&](vllm_qwen3::TokenId id) {
-        const auto it = texts.find(id);
-        check(it != texts.end(), "no text for token " + std::to_string(id));
-        return it != texts.end() ? it->second : std::string();
-    };
+    for (const auto& [id, text] : header.at("drop_tokens").items()) { vocabulary.special_tokens.push_back(text); }
 
-    // The engine's tokenizer gives every token the text vLLM's gives it (one token decoded alone).
+    // With the checkpoint's tokenizer at hand: the engine's tokenizer gives every token the text transformers gives it
+    // (one token decoded alone), and the transformers' all_special_tokens it reads are the ones vLLM drops.
 #ifndef SUROGATE_PARSER_TEST_NO_TOKENIZER
+    std::unique_ptr<sinfer::family::frontend_internal::Tokenizer> tokenizer;
+    std::string tokenizer_json, config_json, generation_json; // the resources the tokenizer reads at construction
     if (const char* dir = std::getenv("SUROGATE_QWEN3_PARSER_TOKENIZER_DIR")) {
         const std::string root = dir;
-        const sinfer::family::frontend_internal::Tokenizer tokenizer(
-            {read_file(root + "/tokenizer.json"), read_file(root + "/tokenizer_config.json"),
-             read_file(root + "/generation_config.json")});
+        tokenizer_json  = read_file(root + "/tokenizer.json");
+        config_json     = read_file(root + "/tokenizer_config.json");
+        generation_json = read_file(root + "/generation_config.json");
+        tokenizer = std::make_unique<sinfer::family::frontend_internal::Tokenizer>(
+            sinfer::family::frontend_internal::TokenizerResources{tokenizer_json, config_json, generation_json});
         int mismatched = 0;
         for (const auto& [id, text] : texts) {
-            if (vllm_qwen3::utf8_replace(tokenizer.decode_token_bytes(id, false)) != text) { ++mismatched; }
+            if (vllm_qwen3::utf8_replace(tokenizer->decode_token_bytes(id, false)) != text) { ++mismatched; }
         }
         check(mismatched == 0, std::to_string(mismatched) + " token texts differ from the engine tokenizer's");
-        std::cout << "engine tokenizer: " << texts.size() << " token texts checked, " << mismatched << " differ\n";
+        std::vector<std::string> named;
+        for (const auto& special : tokenizer->named_special_tokens()) { named.push_back(special.second); }
+        std::vector<std::string> expected = vocabulary.special_tokens;
+        std::sort(named.begin(), named.end());
+        std::sort(expected.begin(), expected.end());
+        check(named == expected, "the engine tokenizer's all_special_tokens differ from transformers'");
+        std::cout << "engine tokenizer: " << texts.size() << " token texts checked, " << mismatched << " differ; "
+                  << named.size() << " special tokens\n";
     }
 #endif
 
-    int rows = 0, skipped = 0, with_calls = 0, calls = 0, nonempty_content = 0;
+    int rows = 0, skipped = 0, with_calls = 0, calls = 0, nonempty_content = 0, decoded = 0;
+    std::int32_t stop_id = header.value("stop_id", -1); // the generation's stop token, <|im_end|>
+    for (const auto& [id, text] : texts) {
+        if (stop_id < 0 && text == "<|im_end|>") { stop_id = id; }
+    }
     while (std::getline(in, line)) {
         const Json row = Json::parse(line);
         const Json& expected = row.at("vllm");
@@ -118,14 +127,34 @@ int main() {
         }
         ++rows;
         vllm_qwen3::Input input;
-        input.text      = row.at("text").get<std::string>();
-        input.token_ids = row.at("ids").get<std::vector<vllm_qwen3::TokenId>>();
-        input.thinking  = row.at("thinking").get<bool>();
+        input.text     = row.at("text").get<std::string>();
+        input.thinking = row.at("thinking").get<bool>();
+        // The text the engine hands the parser for these token ids (GenerationService: the stop token's own text
+        // left out): vLLM's output.text.
+#ifndef SUROGATE_PARSER_TEST_NO_TOKENIZER
+        if (tokenizer) {
+            std::vector<std::int32_t> ids = row.at("ids").get<std::vector<std::int32_t>>();
+            if (!ids.empty() && ids.back() == stop_id) { ids.pop_back(); }
+            std::string raw;
+            for (const auto id : ids) { raw += tokenizer->decode_token_bytes(id, false); }
+            const bool cut = row.at("id").get<std::string>().find("/cut") != std::string::npos ||
+                             std::isdigit(static_cast<unsigned char>(row.at("id").get<std::string>().back()));
+            if (!cut) {
+                ++decoded;
+                check(vllm_qwen3::output_text(raw) == input.text, row.at("id").get<std::string>() + ": decoded text");
+            }
+        }
+#endif
         const bool has_tools      = row.at("tools").is_array() && !row.at("tools").empty();
         input.suppress_tool_calls = has_tools && row.at("tool_choice") == "none";
         const vllm_qwen3::Result result = vllm_qwen3::parse(input, vocabulary, tools_of(row.at("tools")));
+        // Serving (DelegatingParser._extract_tool_calls, GenerationService::run): calls are returned for tool_choice
+        // "auto" with tools; a request without tools defaults to tool_choice "none".
+        const bool returns_calls = has_tools && row.at("tool_choice") != "none";
         Json got_calls = Json::array();
-        for (const auto& call : result.calls) { got_calls.push_back({{"name", call.name}, {"arguments", call.arguments}}); }
+        for (const auto& call : result.calls) {
+            if (returns_calls) { got_calls.push_back({{"name", call.name}, {"arguments", call.arguments}}); }
+        }
         const Json got = {{"reasoning", optional_json(result.reasoning)},
                           {"content", optional_json(result.content)},
                           {"calls", got_calls}};
@@ -147,7 +176,7 @@ int main() {
     check(vllm_qwen3::utf8_replace("\xED\xA0\x80") == "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD", "surrogate");
 
     std::cout << "vllm_qwen3_parser: " << rows << " outputs (" << with_calls << " with " << calls << " calls, "
-              << nonempty_content << " with content), " << skipped << " that vLLM itself refused; failures="
+              << nonempty_content << " with content; " << decoded << " decoded by the engine), " << skipped << " that vLLM itself refused; failures="
               << failures << '\n';
     return failures == 0 ? 0 : 1;
 }
