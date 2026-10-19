@@ -187,8 +187,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->sampling.suppressed[i] = options.stop_barrier[i];
     }
     // Nothing has been produced yet, so the barrier is up for the prefill's own
-    // token; the per-round staging lowers it once the request is long enough.
-    base->sampling.suppressed_count = static_cast<std::int32_t>(base->stop_barrier_count);
+    // token; the per-round staging lowers it once the request is long enough. A request
+    // resumed after a preemption has produced its generated tokens already, and its prefill's
+    // token is barred exactly when the decode step it stands for would have been.
+    const bool resumed_past_minimum =
+        options.resume && options.resume->generated_tokens >= base->min_tokens;
+    base->sampling.suppressed_count =
+        resumed_past_minimum ? 0 : static_cast<std::int32_t>(base->stop_barrier_count);
     // A prefill graph chunk writes its whole 128-rounded bucket, pad columns included,
     // so the request must own the pages that window can reach as well as its output
     // extent, or mapping the chunk lands outside the entitlement and the round dies.
@@ -217,6 +222,47 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
     if (base->target_only) { base->backend_kv_page_entitlement = 0; }
+    base->text_kv_page_limit    = base->text_kv_page_entitlement;
+    base->backend_kv_page_limit = base->backend_kv_page_entitlement;
+    base->summary.reservation   = runtime::AdmissionResources{
+          .active_lanes     = 1,
+          .main_kv_pages    = base->text_kv_page_entitlement,
+          .backend_kv_pages = base->backend_kv_page_entitlement,
+    };
+    // --kv-admission ondemand: the prompt and a headroom are entitled now, the rest a round at
+    // a time (grow_lane_kv), up to the reservation above. A request whose state a recompute
+    // cannot reproduce -- prompt scores, routing rows, target-only and GPU-prefix readouts --
+    // keeps the whole reservation and is never preempted.
+    if (options.resume &&
+        (!kv_on_demand_ || options.resume->generated_tokens == 0 ||
+         options.resume->generated_tokens >= base->summary.prompt_tokens)) {
+        throw std::invalid_argument("resumed request does not describe its generated tokens");
+    }
+    base->resume = options.resume;
+    base->summary.on_demand_kv = kv_on_demand_ && !base->target_only && !gpu_prefix_readout &&
+                                 options.prompt_logprobs < 0 &&
+                                 !(options.capture_routing && routing_capture_enabled) &&
+                                 options.next_token_candidates.empty();
+    if (options.resume && !base->summary.on_demand_kv) {
+        throw std::invalid_argument("a request that cannot be recomputed was preempted");
+    }
+    if (base->summary.on_demand_kv) {
+        const std::uint32_t admitted_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            reserved_context_tokens,
+            std::max<std::uint64_t>(static_cast<std::uint64_t>(base->summary.prompt_tokens) +
+                                        kv_admission.headroom_tokens,
+                                    graph_reach_tokens)));
+        base->text_kv_page_entitlement = pages_for_tokens(admitted_tokens);
+        if (base->backend_kv_page_entitlement != 0) {
+            const std::uint32_t backend_tokens =
+                speculative_backend == SpeculativeBackend::Mtp
+                    ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                          capacity, static_cast<std::uint64_t>(admitted_tokens) + draft_window - 1ULL))
+                    : admitted_tokens;
+            base->backend_kv_page_entitlement =
+                std::min(base->backend_kv_page_limit, pages_for_tokens(backend_tokens));
+        }
+    }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,
         .main_kv_pages    = base->text_kv_page_entitlement,
@@ -362,6 +408,9 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->constraint                   = base.constraint;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->text_kv_page_limit          = base.text_kv_page_limit;
+    plan->backend_kv_page_limit       = base.backend_kv_page_limit;
+    plan->resume                      = base.resume;
     plan->lora_slot                   = base.lora_slot;
     plan->min_tokens                  = base.min_tokens;
     plan->stop_barrier_count          = base.stop_barrier_count;

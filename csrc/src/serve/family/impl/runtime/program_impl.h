@@ -623,7 +623,8 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         return pool.can_replace_entitlement(old_pages, new_pages);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages)) {
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages) ||
+        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages)) {
         return false;
     }
     const family::PagedKVCache* backend = backend_kv_cache();
@@ -631,6 +632,26 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     const std::uint32_t old_backend =
         sequence.kv && sequence.kv->backend ? sequence.kv->backend->owned_entitlement() : 0;
     return can_replace(backend->pool(), old_backend, plan.summary().admission.backend_kv_pages);
+}
+
+bool ProgramImplCore::leaves_kv_watermark(std::uint32_t lane, std::uint32_t old_pages,
+                                          std::uint32_t reclaimable_pages,
+                                          std::uint32_t new_pages) const noexcept {
+    // --kv-admission ondemand: while other requests run, an admission leaves this many pages
+    // free for their growth, so a full pool does not turn every round into a preemption.
+    if (!kv_on_demand_ || kv_watermark_pages == 0) { return true; }
+    bool others_running = false;
+    for (std::uint32_t other = 0; other < max_concurrency && !others_running; ++other) {
+        const Lifecycle state = requests[other].lifecycle;
+        others_running = other != lane && (state == Lifecycle::Prefilling ||
+                                           state == Lifecycle::Active || state == Lifecycle::Pending);
+    }
+    if (!others_running) { return true; }
+    const PagedKVPool& pool = decoder->text_kv.pool();
+    const std::uint64_t committed = static_cast<std::uint64_t>(pool.entitled_pages()) - old_pages -
+                                    std::min<std::uint64_t>(reclaimable_pages,
+                                                            pool.entitled_pages() - old_pages);
+    return committed + new_pages + kv_watermark_pages <= pool.capacity_pages();
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
@@ -697,7 +718,9 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.summary().admission.main_kv_pages)) {
+                     plan.summary().admission.main_kv_pages) ||
+        !leaves_kv_watermark(lane, old_text, reclaimable_text,
+                             plan.summary().admission.main_kv_pages)) {
         return false;
     }
 
@@ -737,6 +760,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     request.lora_slot         = request_plan.lora_slot;
     request.min_tokens        = request_plan.min_tokens;
     request.stop_barrier_count = request_plan.stop_barrier_count;
+    request.resumed_tokens     = request_plan.resume ? request_plan.resume->generated_tokens : 0U;
+    request.text_kv_page_limit = request_plan.summary.on_demand_kv ? request_plan.text_kv_page_limit : 0U;
+    request.backend_kv_page_limit =
+        request_plan.summary.on_demand_kv ? request_plan.backend_kv_page_limit : 0U;
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (prompt_tokens != request_plan.summary.prompt_tokens ||
@@ -949,8 +976,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.next_token_logits.clear();
         request.cache_prompt = request_plan.cache_prompt;
         request.completion_scores.clear();
+        if (request_plan.resume) { request.completion_scores = request_plan.resume->completion_scores; }
         request.constraint = request_plan.constraint ? request_plan.constraint->create_state() : nullptr;
-        request.constraint_frontier = prompt_tokens;
+        // A resumed request's grammar state starts at its own prompt's end and replays the
+        // tokens it generated before it was preempted (update_constraint walks the ledger).
+        request.constraint_frontier = prompt_tokens - request.resumed_tokens;
         request.token_bitmask_host.clear();
         request.logit_bias_host.clear();
         if (!request_plan.logit_bias.empty()) {
@@ -963,7 +993,19 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                        cudaMemcpyHostToDevice, device.stream));
             request_plan.sampling.logit_bias = static_cast<const float*>(bias.data);
         }
+        // The token a resumed request's prefill samples is the one its next decode step would
+        // have drawn; it takes that step's RNG key (SamplingConfig::continue_decode_key).
+        request_plan.sampling.continue_decode_key = request_plan.resume ? 1 : 0;
         install_sampling(sequence, request, request_plan.sampling);
+        if (request_plan.resume && request.sampling_host.token_counts != nullptr &&
+            request_plan.resume->token_counts.size() == static_cast<std::size_t>(cfg.token_domain)) {
+            // The penalties go on counting what this request generated before it was preempted.
+            // Pageable source: the copy is staged before this returns.
+            CUDA_CHECK(cudaMemcpyAsync(request.sampling_host.token_counts,
+                                       request_plan.resume->token_counts.data(),
+                                       request_plan.resume->token_counts.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, device.stream));
+        }
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
@@ -3173,8 +3215,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                              .produced      = 1};
         // Kept for the life of the request, not just this pending step: the
         // minimum-length barrier measures what has been generated as the ledger
-        // beyond the prompt, every round.
-        request.prompt_tokens = prompt_tokens;
+        // beyond the prompt, every round. A resumed request's own prompt is shorter than the
+        // prefill's by the tokens it had generated.
+        request.prompt_tokens = prompt_tokens - request.resumed_tokens;
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
             .summary = summary,
@@ -5328,6 +5371,92 @@ void ProgramImplCore::kv_settle() noexcept {
             region->wait_idle();
         } catch (...) {}
     }
+}
+
+void ProgramImplCore::configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept {
+    kv_admission  = options;
+    kv_on_demand_ = options.mode == KvAdmission::OnDemand && !pipeline_stage() &&
+                    speculative_backend != SpeculativeBackend::DFlash;
+    const double fraction = std::clamp(static_cast<double>(options.watermark), 0.0, 0.5);
+    kv_watermark_pages    = kv_on_demand_
+                                ? static_cast<std::uint32_t>(
+                                      fraction * static_cast<double>(decoder->text_kv.pool().capacity_pages()))
+                                : 0U;
+}
+
+bool ProgramImplCore::grow_lane_kv(std::uint32_t lane) {
+    if (!kv_on_demand_ || lane >= max_concurrency) { return true; }
+    SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (request.text_kv_page_limit == 0 || !sequence.kv || request.lifecycle != Lifecycle::Active) {
+        return true;
+    }
+    const auto pages_for = [](std::uint64_t tokens) {
+        return static_cast<std::uint32_t>((tokens + kPagedKVPageSize - 1) / kPagedKVPageSize);
+    };
+    // The most one unit writes past the frontier: an ordinary burst of kChainBurstLimit rounds,
+    // or a verify round's anchor and drafts (whose head writes draft_window further).
+    const std::uint64_t reach = std::max<std::uint32_t>(kChainBurstLimit, draft_window + 1U) + 1U;
+    const std::uint64_t frontier = sequence.execution_frontier;
+    PagedKVAllocation& text = sequence.kv->text;
+    const std::uint32_t text_pages = std::max(
+        text.page_entitlement(),
+        std::min(request.text_kv_page_limit, pages_for(std::min<std::uint64_t>(capacity, frontier + reach))));
+    std::uint32_t backend_pages = 0;
+    if (sequence.kv->backend) {
+        backend_pages = std::max(
+            sequence.kv->backend->page_entitlement(),
+            std::min(request.backend_kv_page_limit,
+                     pages_for(std::min<std::uint64_t>(capacity, frontier + reach + draft_window))));
+    }
+    const bool text_grows    = text_pages > text.page_entitlement();
+    const bool backend_grows = sequence.kv->backend && backend_pages > sequence.kv->backend->page_entitlement();
+    if (!text_grows && !backend_grows) { return true; }
+    std::array<PagedKVResize, 2> changes{};
+    std::size_t count = 0;
+    if (text_grows) {
+        if (!decoder->text_kv.pool().can_replace_entitlement(text.owned_entitlement(),
+                                                             text_pages - text.borrowed_pages())) {
+            ++kv_growth_refusals;
+            return false;
+        }
+        changes[count++] = PagedKVResize{.allocation       = &text,
+                                         .mapped_pages     = text.mapped_page_count(),
+                                         .page_entitlement = text_pages};
+    }
+    if (backend_grows) {
+        PagedKVAllocation& backend = *sequence.kv->backend;
+        if (!backend_kv_cache()->pool().can_replace_entitlement(backend.owned_entitlement(),
+                                                                backend_pages - backend.borrowed_pages())) {
+            ++kv_growth_refusals;
+            return false;
+        }
+        changes[count++] = PagedKVResize{.allocation       = &backend,
+                                         .mapped_pages     = backend.mapped_page_count(),
+                                         .page_entitlement = backend_pages};
+    }
+    try {
+        resize_paged_kv_bundle(std::span<const PagedKVResize>(changes.data(), count));
+    } catch (const std::bad_alloc&) {
+        ++kv_growth_refusals;
+        return false;
+    }
+    return true;
+}
+
+std::shared_ptr<runtime::KvResumeState> ProgramImplCore::capture_resume_state(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    const RequestControl& request = requests[lane];
+    auto state = std::make_shared<runtime::KvResumeState>();
+    if (request.sampling_host.token_counts != nullptr) {
+        state->token_counts.resize(static_cast<std::size_t>(cfg.token_domain));
+        CUDA_CHECK(cudaMemcpyAsync(state->token_counts.data(), request.sampling_host.token_counts,
+                                   state->token_counts.size() * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        device.synchronize();
+    }
+    state->completion_scores = request.completion_scores;
+    return state;
 }
 
 void ProgramImplCore::reset_memory_peaks() noexcept {

@@ -83,6 +83,27 @@ struct KvCapacityPolicy {
     }
 };
 
+/// How a request's KV pages are committed (--kv-admission).
+///
+/// Reserve commits prompt + max_tokens at admission, so a request never needs a page it was not
+/// promised; with an agentic default of 262,144 output tokens that is the whole context per
+/// request, and a replica runs one request at a time. OnDemand commits the prompt and a small
+/// headroom, grows each sequence a round at a time, and when the pool runs short preempts the
+/// running request that arrived last and recomputes it later (DESIGN-kv-admission.md).
+enum class KvAdmission : std::uint8_t {
+    Reserve,
+    OnDemand,
+};
+
+struct KvAdmissionOptions {
+    KvAdmission mode               = KvAdmission::OnDemand;
+    /// Decode tokens a request is entitled to beyond its prompt when it is admitted.
+    std::uint32_t headroom_tokens  = 256;
+    /// Fraction of the KV pool an admission leaves free while other requests run, so their
+    /// growth does not preempt at once (vLLM's watermark).
+    float watermark                = 0.01F;
+};
+
 enum class ProposalHead : std::uint8_t {
     Full,
     Optimized,
@@ -282,6 +303,7 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    KvAdmissionOptions kv_admission;
 
     // Auto: e4m3 where linear-attention layers carry the stack -- it halves the
     // cache for the same token count (measured exactly 2x capacity on the 27B) at
@@ -931,6 +953,18 @@ struct RuntimeStats {
     // with a retryable error and the engine went on. A rising count means the card is too full
     // for the traffic (KV capacity, workspace or another process), not that anything crashed.
     std::uint64_t device_oom_rounds            = 0;
+    // --kv-admission ondemand. Running requests preempted because the pool could not grow a
+    // sequence, the KV tokens they dropped (recomputed when they resume), and the growth
+    // requests the pool refused (each one led to idle-KV eviction or a preemption).
+    std::uint64_t kv_preemptions               = 0;
+    std::uint64_t kv_recomputed_tokens         = 0;
+    std::uint64_t kv_growth_refusals           = 0;
+    // Preempted requests waiting to resume (included in `waiting_requests`).
+    std::uint32_t kv_preempted_waiting         = 0;
+    // Pages admission may commit (an elastic pool's cap; else `kv_pages`), and whether this
+    // engine admits on demand (1) or reserves prompt + max_tokens (0).
+    std::uint32_t kv_capacity_pages            = 0;
+    std::uint32_t kv_on_demand                 = 0;
 };
 
 struct LoadSummary {

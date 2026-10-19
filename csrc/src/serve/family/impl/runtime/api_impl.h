@@ -291,6 +291,36 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+void Program<Variant>::configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept {
+    impl_->configure_kv_admission(options);
+}
+
+template <>
+bool Program<Variant>::kv_on_demand() const noexcept {
+    return impl_->kv_on_demand();
+}
+
+template <>
+bool Program<Variant>::grow_lane_kv(std::uint32_t lane) {
+    return impl_->grow_lane_kv(lane);
+}
+
+template <>
+std::shared_ptr<runtime::KvResumeState> Program<Variant>::capture_resume_state(std::uint32_t lane) {
+    return impl_->capture_resume_state(lane);
+}
+
+template <>
+std::uint32_t Program<Variant>::lane_kv_tokens(std::uint32_t lane) const noexcept {
+    return impl_->lane_kv_tokens(lane);
+}
+
+template <>
+std::uint64_t Program<Variant>::kv_growth_refusals() const noexcept {
+    return impl_->kv_growth_refusals;
+}
+
+template <>
 const void* Program<Variant>::stage_export_buffer() const noexcept {
     return impl_->stage_export_buffer();
 }

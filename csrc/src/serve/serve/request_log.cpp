@@ -515,6 +515,20 @@ std::string format_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
+    // The KV pool decides who waits: what is committed and what holds data, as a share of what
+    // admission may commit, and under --kv-admission ondemand what preemption has cost so far.
+    const sinfer::RuntimeStats& kv = report.scheduler;
+    if (kv.kv_capacity_pages != 0) {
+        const auto percent = [&](std::uint32_t pages) {
+            return 100.0 * static_cast<double>(pages) / static_cast<double>(kv.kv_capacity_pages);
+        };
+        out << std::setprecision(1) << " kv_entitled=" << percent(kv.kv_pages_entitled)
+            << "% kv_in_use=" << percent(kv.kv_pages_in_use) << '%';
+        if (kv.kv_on_demand != 0) {
+            out << " preempted=" << kv.kv_preemptions << " recomputed=" << kv.kv_recomputed_tokens
+                << " preempted_waiting=" << kv.kv_preempted_waiting;
+        }
+    }
     return out.str();
 }
 
@@ -564,6 +578,9 @@ std::string format_server_start_json(
           {"max_concurrency", options.max_concurrency},
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},
+          {"kv_admission", options.kv_admission.mode == sinfer::KvAdmission::Reserve ? "reserve" : "ondemand"},
+          {"kv_admission_headroom_tokens", options.kv_admission.headroom_tokens},
+          {"kv_admission_watermark", options.kv_admission.watermark},
           {"prefill_chunk", options.prefill_chunk},
           {"log_stats_interval_ms", options.log_stats_interval_ms},
           {"kv_cache", kv_cache_name(options.kv_cache)},
@@ -682,7 +699,15 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
                                   {"prefilling", report.scheduler.prefilling_requests},
                                   {"decode_ready", report.scheduler.decode_ready_requests},
-                                  {"waiting", report.scheduler.waiting_requests}};
+                                  {"waiting", report.scheduler.waiting_requests},
+                                  {"preempted_waiting", report.scheduler.kv_preempted_waiting}};
+    record["kv"] = Json{{"on_demand", report.scheduler.kv_on_demand != 0},
+                        {"capacity_pages", report.scheduler.kv_capacity_pages},
+                        {"entitled_pages", report.scheduler.kv_pages_entitled},
+                        {"in_use_pages", report.scheduler.kv_pages_in_use},
+                        {"preemptions", report.scheduler.kv_preemptions},
+                        {"recomputed_tokens", report.scheduler.kv_recomputed_tokens},
+                        {"growth_refusals", report.scheduler.kv_growth_refusals}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};

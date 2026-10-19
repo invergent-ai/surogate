@@ -277,6 +277,19 @@ precisions. Force `q4` only when you want the RAM saving from reducing wider wei
 | `--max-pending-requests N` | 16 | Additional requests allowed to wait |
 | `--pending-timeout-ms N` | 30000 | Time allowed for model wake-up, prompt preparation, and waiting to start generation |
 | `--default-max-tokens N` | 8192 | Output limit when a request omits it |
+| `--kv-admission reserve\|ondemand` | ondemand | How a request's KV cache is committed: its prompt at admission and the rest as it generates (ondemand), or prompt + output limit up front (reserve) |
+| `--kv-admission-headroom N` | 256 | Ondemand: output tokens a request is given room for when it is admitted |
+| `--kv-admission-watermark F` | 0.01 | Ondemand: fraction of the KV cache an admission leaves free while other requests run |
+
+With `--kv-admission ondemand` a request starts as soon as its prompt fits, however large its
+output limit, and its cache grows a step at a time. When the cache runs out, the running request
+that arrived last is paused: its cache is released, it goes back to the front of the queue, and it
+continues later by recomputing its prompt and the tokens it had produced (its stream, budget and
+sampling state carry on). Requests are admitted strictly in arrival order. A request whose prompt
+plus output limit could never fit the cache is refused at once, as before. `surogate_kv_preemptions_total`
+and `surogate_kv_recomputed_tokens_total` count the pauses and the tokens they recomputed.
+Requests that return prompt log-probabilities or routing, decision readouts, DFlash drafting and
+multi-GPU pipelines keep the up-front reservation.
 
 Set `--max-num-seqs 256` (or higher) to allow more than 128 active requests per model.
 More simultaneous requests need more memory and may increase response latency; pair this

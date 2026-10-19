@@ -99,6 +99,12 @@ struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     std::shared_ptr<const CompiledTokenConstraint> constraint;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    /// The pages the request may grow to (its reserve-mode entitlement); equal to the two above
+    /// unless it is admitted on demand.
+    std::uint32_t text_kv_page_limit    = 0;
+    std::uint32_t backend_kv_page_limit = 0;
+    /// A request the executor preempted and re-admits (--kv-admission ondemand).
+    std::shared_ptr<const runtime::KvResumeState> resume;
     std::shared_ptr<const family::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<family::RewriteCheckpointSpec> rewrite_checkpoint;
@@ -149,6 +155,9 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     std::shared_ptr<const CompiledTokenConstraint> constraint;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::uint32_t text_kv_page_limit          = 0;
+    std::uint32_t backend_kv_page_limit       = 0;
+    std::shared_ptr<const runtime::KvResumeState> resume;
     /// The adapter slot the request selected; read once at admission.
     std::int32_t lora_slot = -1;
     std::uint32_t min_tokens         = 0;
@@ -387,6 +396,13 @@ struct RequestControl {
     std::uint32_t min_tokens         = 0;
     std::uint32_t stop_barrier_count = 0;
     std::uint32_t prompt_tokens      = 0;
+    /// Trailing prompt tokens this request generated before a KV preemption (0 otherwise):
+    /// its own prompt is the first `prompt_tokens` of the prefill's.
+    std::uint32_t resumed_tokens     = 0;
+    /// --kv-admission ondemand: the pages this request's sequence may grow to (its reserve-mode
+    /// entitlement). Zero when it was admitted with all of them.
+    std::uint32_t text_kv_page_limit    = 0;
+    std::uint32_t backend_kv_page_limit = 0;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
@@ -536,6 +552,33 @@ public:
     [[nodiscard]] bool kv_under_pressure() const noexcept;
     /// Round boundary: perform a reserve release another engine asked for, report pressure.
     bool kv_service_pressure() noexcept;
+
+    /// --kv-admission (DESIGN-kv-admission.md), set once by the executor before any request is
+    /// planned. On demand only where a recompute reproduces a sequence: not on a pipeline stage
+    /// and not with a DFlash drafter, whose context has its own growth rules.
+    void configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept;
+    [[nodiscard]] bool kv_on_demand() const noexcept { return kv_on_demand_; }
+    /// Grows a decode-ready lane's entitlement (both pools, together) to cover what its next
+    /// unit can write: an eight-round burst or one verify round, never past the reservation it
+    /// was admitted under. Host bookkeeping only. False when the pool, or an overcommitting
+    /// pool's device gate, refused; nothing changed then.
+    [[nodiscard]] bool grow_lane_kv(std::uint32_t lane);
+    /// What a preempted request needs back when it is recomputed: its penalty counts (a device
+    /// copy, waited for) and its completion scores. The caller then aborts the lane.
+    [[nodiscard]] std::shared_ptr<runtime::KvResumeState> capture_resume_state(std::uint32_t lane);
+    /// Tokens of KV the lane holds (what a preemption drops).
+    [[nodiscard]] std::uint32_t lane_kv_tokens(std::uint32_t lane) const noexcept {
+        return lane < max_concurrency ? sequences[lane].text_kv_valid : 0U;
+    }
+    /// An admission that takes `new_pages` for `lane` (giving back `old_pages` it holds and the
+    /// `reclaimable_pages` an eviction frees) leaves the on-demand watermark free.
+    [[nodiscard]] bool leaves_kv_watermark(std::uint32_t lane, std::uint32_t old_pages,
+                                           std::uint32_t reclaimable_pages,
+                                           std::uint32_t new_pages) const noexcept;
+    runtime::KvAdmissionOptions kv_admission{.mode = KvAdmission::Reserve};
+    bool kv_on_demand_               = false;
+    std::uint32_t kv_watermark_pages = 0;
+    std::uint64_t kv_growth_refusals = 0;
 
     void reset_memory_peaks() noexcept;
 

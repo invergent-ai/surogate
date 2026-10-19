@@ -17,6 +17,20 @@ using ::sinfer::ResolvedSamplingParameters;
 using ::sinfer::StopPolicy;
 using ::sinfer::StopString;
 using ::sinfer::TokenId;
+using ::sinfer::KvAdmission;
+using ::sinfer::KvAdmissionOptions;
+
+/// What a request preempted under --kv-admission ondemand carries back into its next admission,
+/// beyond the tokens it generated (which become the end of its prompt). Captured from its lane
+/// just before the lane is cleared (Program::capture_resume_state).
+struct KvResumeState {
+    /// How many trailing prompt tokens this request generated before it was preempted.
+    std::uint32_t generated_tokens = 0;
+    /// The lane's penalty occurrence counts, [token_domain]; empty when no penalty is active.
+    std::vector<std::int32_t> token_counts;
+    /// Scores of the generated tokens (top_logprobs), one per generated token, or empty.
+    std::vector<TokenScore> completion_scores;
+};
 
 // Engine has already selected the registered model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
@@ -41,6 +55,9 @@ struct ResolvedExecutionOptions {
     std::uint32_t min_tokens         = 0;
     std::array<TokenId, 4> stop_barrier{};
     std::uint32_t stop_barrier_count = 0;
+    /// Set by the executor when it re-admits a request it preempted (--kv-admission ondemand):
+    /// the prompt then ends with the tokens this request already generated.
+    std::shared_ptr<const KvResumeState> resume;
 };
 
 struct ResolvedRequestOptions {
@@ -73,6 +90,12 @@ struct RequestPlanSummary {
     std::size_t transient_bytes           = 0;
     std::size_t transient_alignment       = 1;
     AdmissionResources admission;
+    /// What the request may grow to: prompt + output reservation, the reserve-mode admission.
+    /// Equal to `admission` unless the request is admitted on demand.
+    AdmissionResources reservation;
+    /// Admitted with only its prompt and headroom entitled; it grows by rounds, and may be
+    /// preempted and recomputed when the pool runs short (--kv-admission ondemand).
+    bool on_demand_kv = false;
     std::uint64_t service_work_quanta = 0;
 };
 

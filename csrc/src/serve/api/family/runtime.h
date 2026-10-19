@@ -229,6 +229,16 @@ public:
     /// device asked, and reports whether the device is under pressure.
     bool kv_service_pressure() noexcept;
     void reset_memory_peaks() noexcept;
+    /// --kv-admission (DESIGN-kv-admission.md): set once by the executor, before any request.
+    void configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept;
+    /// Requests are admitted with their prompt and grow by rounds (ondemand, where supported).
+    [[nodiscard]] bool kv_on_demand() const noexcept;
+    /// Grows a decode-ready lane's KV entitlement to cover its next round; false when refused.
+    [[nodiscard]] bool grow_lane_kv(std::uint32_t lane);
+    /// A preempted request's penalty counts and completion scores, before its lane is aborted.
+    [[nodiscard]] std::shared_ptr<runtime::KvResumeState> capture_resume_state(std::uint32_t lane);
+    [[nodiscard]] std::uint32_t lane_kv_tokens(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint64_t kv_growth_refusals() const noexcept;
     /// Pipeline stage before the last: the pinned buffer holding the residual it exports
     /// (the next stage's `pipeline_import_pinned`); null for a whole-model program.
     [[nodiscard]] const void* stage_export_buffer() const noexcept;

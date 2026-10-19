@@ -232,6 +232,11 @@ sinfer::RuntimeStats sum_runtime_stats(const std::vector<GenerationService*>& se
         total.kv_pages_resident_at_granule += s.kv_pages_resident_at_granule;
         total.admission_unblocked_heads += s.admission_unblocked_heads;
         total.device_oom_rounds += s.device_oom_rounds;
+        total.kv_preemptions += s.kv_preemptions;
+        total.kv_recomputed_tokens += s.kv_recomputed_tokens;
+        total.kv_growth_refusals += s.kv_growth_refusals;
+        total.kv_preempted_waiting += s.kv_preempted_waiting;
+        total.kv_capacity_pages += s.kv_capacity_pages;
     }
     return total;
 }
@@ -815,6 +820,12 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
             {"pages_resident_at_granule", stats.kv_pages_resident_at_granule},
             {"pages_mapped", stats.kv_pages_mapped},
             {"admission_unblocked_heads", stats.admission_unblocked_heads},
+            {"kv_admission", stats.kv_on_demand != 0 ? "ondemand" : "reserve"},
+            {"capacity_pages", stats.kv_capacity_pages},
+            {"preemptions", stats.kv_preemptions},
+            {"recomputed_tokens", stats.kv_recomputed_tokens},
+            {"growth_refusals", stats.kv_growth_refusals},
+            {"preempted_waiting", stats.kv_preempted_waiting},
             {"pool_bytes", bytes(stats.kv_pages)},
             {"in_use_bytes", bytes(stats.kv_pages_in_use)},
             {"resident_at_granule_bytes", bytes(stats.kv_pages_resident_at_granule)},
@@ -934,6 +945,20 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
         metric("admission_unblocked_heads_total", r.labels, r.stats.admission_unblocked_heads);
     }
 
+    help("kv_preemptions_total", "counter",
+         "Running requests preempted because the KV pool could not grow a sequence "
+         "(--kv-admission ondemand); each resumes by recomputing its prompt and output.");
+    for (const Row& r : rows) { metric("kv_preemptions_total", r.labels, r.stats.kv_preemptions); }
+    help("kv_recomputed_tokens_total", "counter",
+         "KV tokens dropped by preemptions, recomputed when the requests resume.");
+    for (const Row& r : rows) { metric("kv_recomputed_tokens_total", r.labels, r.stats.kv_recomputed_tokens); }
+    help("kv_growth_refusals_total", "counter",
+         "Times the KV pool refused to grow a running sequence (idle KV was evicted or a request "
+         "preempted).");
+    for (const Row& r : rows) { metric("kv_growth_refusals_total", r.labels, r.stats.kv_growth_refusals); }
+    help("kv_on_demand", "gauge", "1 when requests are admitted with their prompt only and grow on demand.");
+    for (const Row& r : rows) { metric("kv_on_demand", r.labels, r.stats.kv_on_demand); }
+
     help("requests", "gauge", "Requests in each scheduler state.");
     for (const Row& r : rows) {
         const auto state = [&](std::string_view which, std::uint64_t value) {
@@ -945,6 +970,7 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
         state("prefilling", r.stats.prefilling_requests);
         state("decode_ready", r.stats.decode_ready_requests);
         state("waiting", r.stats.waiting_requests);
+        state("preempted_waiting", r.stats.kv_preempted_waiting);
         state("reserving", r.stats.reserving_requests);
     }
 
@@ -959,6 +985,7 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
             out += "\"} " + std::to_string(value) + "\n";
         };
         pages("pool", r.stats.kv_pages);
+        pages("capacity", r.stats.kv_capacity_pages);
         pages("entitled", r.stats.kv_pages_entitled);
         pages("in_use", r.stats.kv_pages_in_use);
         pages("resident_at_granule", r.stats.kv_pages_resident_at_granule);

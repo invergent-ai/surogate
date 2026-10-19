@@ -191,6 +191,8 @@ std::string serve_usage_text(const char* argv0) {
            "N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--kv-admission reserve|ondemand] [--kv-admission-headroom N] "
+           "[--kv-admission-watermark F] "
            "[--adapter-update-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices "
            "A,B,...] [--data-parallel] "
@@ -237,6 +239,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --kv-admission ondemand (default) admits a request when its prompt and\n"
+           "         --kv-admission-headroom tokens (256) fit, leaving --kv-admission-watermark of\n"
+           "         the pool (0.01) free while others run, grows sequences a round at a time and,\n"
+           "         when the pool runs short, preempts the running request that arrived last and\n"
+           "         recomputes it later; reserve commits prompt + max_tokens at admission.\n"
            "       --kv-cache-dtype defaults to auto: BF16 for attention-only models and on "
            "Hopper, FP8 for hybrids elsewhere.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
@@ -413,6 +420,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             // comparison is like-for-like without translation.
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-num-seqs"), "max-num-seqs"));
+        } else if (arg == "--kv-admission") {
+            const std::string mode = require_value("--kv-admission");
+            if (mode == "reserve") {
+                options.kv_admission.mode = KvAdmission::Reserve;
+            } else if (mode == "ondemand" || mode == "on-demand") {
+                options.kv_admission.mode = KvAdmission::OnDemand;
+            } else {
+                throw std::invalid_argument("--kv-admission must be reserve or ondemand");
+            }
+        } else if (arg == "--kv-admission-headroom") {
+            options.kv_admission.headroom_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--kv-admission-headroom"), "kv-admission-headroom"));
+        } else if (arg == "--kv-admission-watermark") {
+            options.kv_admission.watermark = parse_float_in(
+                require_value("--kv-admission-watermark"), "kv-admission-watermark", 0.0F, 0.5F);
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));

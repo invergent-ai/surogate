@@ -7,6 +7,7 @@
 #include "api/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
+#include "runtime/engine/kv_admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "runtime/generation/readout_policy.h"
@@ -55,6 +56,18 @@ public:
     // Pipeline programs (runtime/engine/pipeline_instance.h) expose per-group rounds; the
     // worker loop then keeps several groups in flight across the stages (step C3).
     static constexpr bool kPipelined = requires(typename Package::Program& p) { p.tick(); p.group_count(); };
+    // --kv-admission ondemand needs the program to grow lanes and hand back what a recompute
+    // needs; a pipeline's stages do not, and keep the reservation at admission.
+    static constexpr bool kOnDemandCapable =
+        !kPipelined && requires(typename Package::Program& p, std::uint32_t lane,
+                                const KvAdmissionOptions& options) {
+            p.configure_kv_admission(options);
+            p.kv_on_demand();
+            p.grow_lane_kv(lane);
+            p.capture_resume_state(lane);
+            p.lane_kv_tokens(lane);
+            p.kv_growth_refusals();
+        };
     using Clock    = std::chrono::steady_clock;
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
@@ -73,7 +86,23 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        if constexpr (kOnDemandCapable) {
+            instance.program->configure_kv_admission(options.kv_admission);
+            kv_on_demand_ = instance.program->kv_on_demand();
+        }
+        kv_forced_preemption_ = parse_kv_forced_preemption(std::getenv("SUROGATE_SERVE_KV_FORCE_PREEMPT"));
+        {
+            const char* why = options.kv_admission.mode == KvAdmission::Reserve ? "" :
+                              kPipelined ? " (a pipeline reserves)" :
+                              options.speculative.backend == SpeculativeBackend::DFlash ? " (DFlash reserves)" : "";
+            std::fprintf(stderr,
+                         "kv-admission: %s%s (headroom %u tokens, watermark %.3f of %u pages)\n",
+                         kv_on_demand_ ? "ondemand" : "reserve", why,
+                         options.kv_admission.headroom_tokens, options.kv_admission.watermark,
+                         admission_capacity_.main_kv_pages);
+        }
         slots_.resize(max_concurrency_);
+        kv_stalled_.assign(max_concurrency_, 0);
         lane_plan_versions_.resize(max_concurrency_);
         lane_released_at_.resize(max_concurrency_);
         cancellation_snapshot_.resize(max_concurrency_);
@@ -449,6 +478,17 @@ private:
         snapshot.kv_pages_mapped            = kv.mapped_pages;
         snapshot.kv_page_bytes              = kv.page_bytes;
         snapshot.device_oom_rounds          = device_oom_rounds_;
+        snapshot.kv_capacity_pages          = kv.capacity_pages;
+        snapshot.kv_on_demand               = kv_on_demand_ ? 1U : 0U;
+        if constexpr (kOnDemandCapable) {
+            snapshot.kv_growth_refusals = instance_.program->kv_growth_refusals();
+        }
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (const auto& waiting : pending_) {
+                snapshot.kv_preempted_waiting += waiting->kv_preemptions != 0 ? 1U : 0U;
+            }
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -560,6 +600,16 @@ private:
         /// The prompt's prefix-cache reuse, published under `mutex` when its prefill completes
         /// so the consumer thread can hand it to the sink before the first output.
         std::optional<std::uint32_t> prompt_ready;
+
+        // --kv-admission ondemand. The prompt as it arrived, kept while the request may be
+        // preempted (its media payloads too): a resume prefills it again followed by what was
+        // generated. Times preempted, and the timings and speculative counts of the lanes it
+        // ran on before, which its result adds up.
+        bool kv_preemptable = false;
+        std::optional<family::PreparedPrompt> kv_original_prompt;
+        std::uint32_t kv_preemptions = 0;
+        std::optional<GenerationTimings> kv_carried_timings;
+        std::optional<SpeculativeStats> kv_carried_speculative;
 
         std::optional<BasePlan> base_plan;
         std::vector<std::optional<Plan>> lane_plans;
@@ -784,6 +834,12 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            if (request->kv_carried_timings) {
+                add_carried_timings(result.timings, *request->kv_carried_timings);
+            }
+            if (request->kv_carried_speculative) {
+                add_carried_speculative(result.speculative, *request->kv_carried_speculative);
+            }
             if constexpr (requires { instance_.program->collect_logprobs(*request->lane, result); }) {
                 instance_.program->collect_logprobs(*request->lane, result);
             }
@@ -850,6 +906,203 @@ private:
         slots_[lane].reset();
         lane_released_at_[lane] = ++lane_release_clock_;
         invalidate_lane_plans(lane);
+    }
+
+    static void add_carried_timings(GenerationTimings& into, const GenerationTimings& carried) noexcept {
+        into.vision_seconds += carried.vision_seconds;
+        into.prefill_seconds += carried.prefill_seconds;
+        into.decode_seconds += carried.decode_seconds;
+    }
+
+    static void add_carried_speculative(SpeculativeStats& into, const SpeculativeStats& carried) {
+        into.rounds += carried.rounds;
+        into.drafted_tokens += carried.drafted_tokens;
+        into.accepted_tokens += carried.accepted_tokens;
+        into.fallback_steps += carried.fallback_steps;
+        const auto add = [](std::vector<std::uint64_t>& to, const std::vector<std::uint64_t>& from) {
+            if (to.size() < from.size()) { to.resize(from.size(), 0); }
+            for (std::size_t i = 0; i < from.size(); ++i) { to[i] += from[i]; }
+        };
+        add(into.accepted_per_position, carried.accepted_per_position);
+        add(into.rounds_per_draft_window, carried.rounds_per_draft_window);
+    }
+
+    // ---- --kv-admission ondemand (DESIGN-kv-admission.md) ------------------------------------
+
+    /// Gives back one piece of idle KV for a lane that cannot grow: the retained prefix-cache lane
+    /// released longest ago (evicting it drops the shared prefixes and the host archive too), or,
+    /// with no lane retained, the shared prefixes alone, once per pass.
+    bool release_idle_kv(bool& prefixes_dropped) {
+        std::optional<std::uint32_t> oldest;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane) &&
+                (!oldest || lane_released_at_[lane] < lane_released_at_[*oldest])) {
+                oldest = lane;
+            }
+        }
+        if (oldest) {
+            instance_.program->evict_retained_lane(*oldest);
+            invalidate_lane_plans(*oldest);
+            prefixes_dropped = true;
+            return true;
+        }
+        if (prefixes_dropped) { return false; }
+        prefixes_dropped = true;
+        instance_.program->evict_archived_prefixes();
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { invalidate_lane_plans(lane); }
+        return true;
+    }
+
+    /// Takes a running request off its lane and puts it back into the waiting queue, in arrival
+    /// order (at the front: every waiting request arrived after it), with no admission deadline:
+    /// it was admitted once. Its pages, its MTP head's pages and its recurrent state go with the
+    /// lane; it resumes by prefilling its prompt followed by what it generated, and carries back
+    /// what the program needs to go on exactly (KvResumeState).
+    void preempt_lane(std::uint32_t lane, const char* why) {
+        if constexpr (kOnDemandCapable) {
+            const std::shared_ptr<Request> request = slots_[lane];
+            if (request == nullptr || !request->kv_preemptable || !request->kv_original_prompt) {
+                throw std::logic_error("preempted lane holds no recomputable request");
+            }
+            const std::uint32_t dropped   = instance_.program->lane_kv_tokens(lane);
+            const std::size_t generated   = request->generated.size();
+            std::shared_ptr<KvResumeState> state;
+            if (generated != 0) {
+                state                   = instance_.program->capture_resume_state(lane);
+                state->generated_tokens = static_cast<std::uint32_t>(generated);
+                GenerationTimings timings = instance_.program->generation_timings_lane(lane);
+                SpeculativeStats speculative = instance_.program->speculative_stats_lane(lane);
+                if (request->kv_carried_timings) { add_carried_timings(timings, *request->kv_carried_timings); }
+                if (request->kv_carried_speculative) {
+                    add_carried_speculative(speculative, *request->kv_carried_speculative);
+                }
+                request->kv_carried_timings     = timings;
+                request->kv_carried_speculative = std::move(speculative);
+            }
+            instance_.program->abort_lane(lane);
+            if (prefill_lanes_.contains(lane)) { release_prefill_owner(lane); }
+            slots_[lane].reset();
+            lane_released_at_[lane] = ++lane_release_clock_;
+            invalidate_lane_plans(lane);
+
+            request->lane.reset();
+            request->decode_ready           = false;
+            request->prefill_remaining      = 0;
+            request->remaining_service_work = 0;
+            request->admission_resources    = {};
+            request->backfill_epoch         = 0;
+            request->backfill_class         = BackfillClass::None;
+            if (generated != 0) {
+                request->prompt = request->kv_original_prompt->with_continuation(request->generated);
+                request->options.execution.resume = std::move(state);
+                request->options.execution.requested_output_tokens = request->budget->remaining();
+            } else {
+                // Preempted before its first token: it waits as it arrived.
+                request->prompt = request->kv_original_prompt->clone();
+                request->options.execution.resume.reset();
+                request->budget.reset();
+            }
+            request->deadline = Clock::time_point::max();
+            ++request->kv_preemptions;
+            ++cumulative_stats_.kv_preemptions;
+            cumulative_stats_.kv_recomputed_tokens += dropped;
+            std::size_t waiting = 0;
+            {
+                std::lock_guard lock(queue_mutex_);
+                std::vector<std::uint64_t> orders;
+                orders.reserve(pending_.size());
+                for (const auto& queued : pending_) { orders.push_back(queued->id); }
+                const std::size_t at = kv_requeue_position(orders, request->id);
+                pending_.insert(pending_.begin() + static_cast<std::ptrdiff_t>(at), request);
+                waiting = pending_.size();
+            }
+            std::fprintf(stderr,
+                         "kv-admission: preempted request %llu on lane %u (%s): %u KV tokens dropped, "
+                         "%zu generated; %zu waiting, preemptions %llu\n",
+                         static_cast<unsigned long long>(request->id), lane, why, dropped, generated,
+                         waiting, static_cast<unsigned long long>(cumulative_stats_.kv_preemptions));
+        } else {
+            (void)lane;
+            (void)why;
+            throw std::logic_error("this engine cannot preempt");
+        }
+    }
+
+    /// A lane that cannot grow with nothing left to give way, while the device gate is not what
+    /// refused: the pages it needs are held by a GPU prefix image no lane owns.
+    void fail_lane_kv(std::uint32_t lane) {
+        const std::shared_ptr<Request> request = slots_[lane];
+        instance_.program->abort_lane(lane);
+        if (prefill_lanes_.contains(lane)) { release_prefill_owner(lane); }
+        complete_error(request, std::make_exception_ptr(RequestError(
+                                    RequestErrorKind::Overloaded,
+                                    "insufficient KV capacity to continue while GPU prefixes are retained")));
+        remove_completed_slot(lane);
+    }
+
+    /// Before each round: every decode-ready lane's entitlement covers what the round can write,
+    /// growing oldest first; when the pool is short, idle KV goes, then the request that arrived
+    /// last is preempted (kv_admission_policy.h).
+    void ensure_decode_kv() {
+        if constexpr (kOnDemandCapable) {
+            std::fill(kv_stalled_.begin(), kv_stalled_.end(), 0);
+            bool changed = false;
+            if (kv_forced_preemption_.every != 0) {
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    const auto& request = slots_[lane];
+                    if (request != nullptr && request->decode_ready && request->kv_preemptable &&
+                        kv_forced_preemption_.due(request->generated.size(), request->kv_preemptions)) {
+                        preempt_lane(lane, "forced by SUROGATE_SERVE_KV_FORCE_PREEMPT");
+                        changed = true;
+                    }
+                }
+            }
+            std::vector<KvGrowthLane> lanes;
+            bool growth = false;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                const auto& request = slots_[lane];
+                if (request == nullptr) { continue; }
+                lanes.push_back(KvGrowthLane{.lane         = lane,
+                                             .order        = request->id,
+                                             .preemptable  = request->kv_preemptable,
+                                             .needs_growth = request->decode_ready});
+                growth = growth || request->decode_ready;
+            }
+            if (growth) {
+                bool prefixes_dropped = false;
+                std::uint32_t growing = 0;
+                const KvGrowthHooks hooks{
+                    .grow = [&](std::uint32_t lane) {
+                        growing = lane;
+                        return instance_.program->grow_lane_kv(lane);
+                    },
+                    .release_idle = [&] { return release_idle_kv(prefixes_dropped); },
+                    .preempt =
+                        [&](std::uint32_t lane) {
+                            preempt_lane(lane, lane == growing ? "it could not grow and arrived last"
+                                                               : "a request that arrived earlier needs its pages");
+                        },
+                };
+                const KvGrowthOutcome outcome = ensure_kv_growth(std::move(lanes), hooks);
+                changed = changed || !outcome.preempted.empty();
+                bool all_stalled = !outcome.blocked.empty();
+                for (const std::uint32_t lane : outcome.blocked) {
+                    if (instance_.program->kv_under_pressure()) {
+                        kv_stalled_[lane] = 1; // the device gate: memory comes back elsewhere
+                    } else {
+                        fail_lane_kv(lane);
+                        changed = true;
+                    }
+                }
+                for (std::uint32_t lane = 0; lane < max_concurrency_ && all_stalled; ++lane) {
+                    all_stalled = slots_[lane] == nullptr || !slots_[lane]->decode_ready || kv_stalled_[lane] != 0;
+                }
+                if (all_stalled && prefill_lanes_.empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            if (changed) { publish_runtime_stats(); }
+        }
     }
 
     void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
@@ -974,7 +1227,7 @@ private:
             const auto lane = static_cast<std::uint32_t>(
                 (static_cast<std::uint64_t>(next_decode_lane_) + offset) % max_concurrency_);
             const auto& request = slots_[lane];
-            if (request == nullptr || !request->decode_ready) { continue; }
+            if (request == nullptr || !request->decode_ready || kv_stalled_[lane] != 0) { continue; }
             if (!request->budget) {
                 throw std::logic_error("decode-ready request has no generation budget");
             }
@@ -1038,8 +1291,10 @@ private:
         if (prefill_lanes_.contains(*request->lane)) {
             release_prefill_owner(*request->lane);
         }
-        request->begin = step.summary;
-        {
+        // A request resumed after a preemption keeps what its first prefill reused: that is
+        // what its prompt cost, and what its client was told.
+        if (!request->begin) {
+            request->begin = step.summary;
             std::lock_guard lock(request->mutex);
             request->prompt_ready = step.summary.reused_prompt_tokens;
         }
@@ -1300,9 +1555,16 @@ private:
         // waiting, and one round can prefill them together (#14).
         bool ran_gpu_unit        = true;
         try {
-            request->budget.emplace(summary.effective_output_tokens,
-                                    summary.effective_limit_reason);
-            request->generated.reserve(summary.effective_output_tokens);
+            // A resumed request goes on with the budget, tokens and output it already has.
+            if (!request->budget) {
+                request->budget.emplace(summary.effective_output_tokens,
+                                        summary.effective_limit_reason);
+                request->generated.reserve(summary.effective_output_tokens);
+            }
+            request->kv_preemptable = kv_on_demand_ && summary.on_demand_kv;
+            if (request->kv_preemptable && !request->kv_original_prompt) {
+                request->kv_original_prompt.emplace(request->prompt.clone());
+            }
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
@@ -1425,7 +1687,9 @@ private:
                 continue;
             }
             const RequestPlanSummary& head_base = head->base_plan->summary();
-            if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
+            // The whole reservation (prompt + output), also on demand: an admitted request can
+            // then always finish alone, and one that never could is refused before it starts.
+            if (!admission_resources_fit(head_base.reservation, admission_capacity_)) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::ContextLengthExceeded,
@@ -1465,6 +1729,23 @@ private:
                                         : AdmissionProgress::None;
             }
 
+            if (kv_on_demand_) {
+                // First come, first served: the head waits for its prompt's pages, and nothing
+                // behind it goes first. Running requests finish or are preempted for it never;
+                // they give their pages back as they complete.
+                bool running = false;
+                for (std::uint32_t lane = 0; lane < max_concurrency_ && !running; ++lane) {
+                    running = slots_[lane] != nullptr;
+                }
+                if (!running) {
+                    (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
+                        RequestErrorKind::Overloaded, "insufficient KV capacity while GPU prefixes are retained")));
+                    control_progress = true;
+                    continue;
+                }
+                protection_.reset();
+                return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
+            }
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
                 (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
@@ -2297,6 +2578,7 @@ private:
                         }
                     }
                 }
+                if (kv_on_demand_) { ensure_decode_kv(); }
                 const RoundMembership membership = build_round_membership();
                 seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
                 seg_timer_.maybe_report();
@@ -2733,6 +3015,10 @@ private:
     bool stopping_ = false;
     bool failed_   = false;
     std::uint64_t device_oom_rounds_ = 0; ///< rounds recovered from out of device memory
+    bool kv_on_demand_ = false;           ///< --kv-admission ondemand, where the program supports it
+    /// Lanes the growth pass could not grow this round and that wait for the device gate.
+    std::vector<std::uint8_t> kv_stalled_;
+    KvForcedPreemption kv_forced_preemption_;
     ops::EngineOpsContext* ops_context_ = nullptr;
     int device_ = 0;
     std::thread worker_;

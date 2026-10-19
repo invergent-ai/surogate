@@ -57,6 +57,11 @@ public:
     [[nodiscard]] PreparedPrompt clone() const;
     /// Copy the prompt with a text continuation, retaining media and its position axes.
     [[nodiscard]] PreparedPrompt with_suffix(std::span<const TokenId> suffix) const;
+    /// The prompt continued by tokens the model generated after it -- the sequence its own
+    /// decode built -- with positions as `with_suffix` and the prompt's identity (reuse,
+    /// rewrite checkpoint) kept. A request preempted under --kv-admission ondemand resumes
+    /// from this.
+    [[nodiscard]] PreparedPrompt with_continuation(std::span<const TokenId> generated) const;
 
 private:
     explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;

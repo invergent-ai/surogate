@@ -52,7 +52,30 @@ struct SamplingConfig {
     static constexpr int kMaxSuppressed = 4;
     std::int32_t suppressed[kMaxSuppressed] = {-1, -1, -1, -1};
     std::int32_t suppressed_count           = 0;
+    /// Nonzero for a request resumed after a KV preemption (--kv-admission ondemand): its prompt
+    /// ends with the tokens it already generated, and the token its prefill samples is the one a
+    /// decode step would have drawn next. A kSamplePurposePrefill draw then takes that step's key,
+    /// (seed, position - 1, kSamplePurposeDecode) -- a decode step keys by the cache position of
+    /// the token it feeds -- so the request's random stream goes on as if it had not been
+    /// preempted. Every other purpose ignores it.
+    std::int32_t continue_decode_key        = 0;
 };
+
+/// The (position, purpose) a row's draw is keyed by; see SamplingConfig::continue_decode_key.
+struct SampleKey {
+    std::int32_t position = 0;
+    std::int32_t purpose  = 0;
+};
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline SampleKey sample_key(const SamplingConfig& config, std::int32_t position,
+                            std::int32_t purpose) noexcept {
+    if (config.continue_decode_key != 0 && purpose == kSamplePurposePrefill && position > 0) {
+        return SampleKey{position - 1, kSamplePurposeDecode};
+    }
+    return SampleKey{position, purpose};
+}
 
 // Recompute greedy verification tokens when a request has logit overrides.
 // logits: BF16 [physical_rows,width,batch], targets: I32 [width,batch].

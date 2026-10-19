@@ -62,7 +62,8 @@ __launch_bounds__(kSamplerBlock) __global__
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tid           = static_cast<int>(threadIdx.x);
     const float inv_temp    = 1.0f / cfg.temperature;
-    const int position      = logical_positions[col];
+    const SampleKey key     = sample_key(cfg, logical_positions[col], purpose);
+    const int position      = key.position;
 
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
@@ -95,7 +96,7 @@ __launch_bounds__(kSamplerBlock) __global__
         const float x =
             sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg) * inv_temp;
         if (x < floor_value) { continue; }
-        const float z = x + sampling_gumbel(cfg.seed, position, purpose, static_cast<unsigned>(v));
+        const float z = x + sampling_gumbel(cfg.seed, position, key.purpose, static_cast<unsigned>(v));
         if (sampling_better(z, v, best, best_v)) {
             best   = z;
             best_v = v;
@@ -191,7 +192,8 @@ __launch_bounds__(kSamplerBlock) __global__
 
     if (tid != 0) { return; }
     const int support = n_support;
-    const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
+    const SampleKey key = sample_key(cfg, logical_positions[row], purpose);
+    const float u     = sampling_uniform(cfg.seed, key.position, key.purpose, 0u);
     float acc         = 0.0f;
     int picked        = cand_idx[support - 1];
     for (int j = 0; j < support; ++j) {
@@ -431,7 +433,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
     if (tid == 0) {
         const int support = n_support;
-        const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
+        const SampleKey key = sample_key(cfg, logical_positions[col], purpose);
+        const float u     = sampling_uniform(cfg.seed, key.position, key.purpose, 0u);
         float acc         = 0.0f;
         int picked        = cand_idx[support - 1];
         for (int j = 0; j < support; ++j) {

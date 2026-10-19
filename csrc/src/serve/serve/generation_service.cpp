@@ -410,6 +410,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
+    engine_options.kv_admission             = options_.kv_admission;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.kv_cache_skip_layers     = options_.kv_cache_skip_layers;

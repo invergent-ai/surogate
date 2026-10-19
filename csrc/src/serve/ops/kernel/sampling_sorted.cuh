@@ -284,7 +284,8 @@ static __global__ void sampling_wide_kernel(const __nv_bfloat16* logits, const u
     __shared__ SortedSamplingScratch scratch;
     const auto* keys = sorted ? sorted + int64_t(row) * domain :
         sampling_sort_local(logits + int64_t(row) * physical_rows, domain, cfg, scratch);
-    const auto result = sampling_sorted(keys, domain, cfg, positions[row], purpose, scratch);
+    const SampleKey key = sample_key(cfg, positions[row], purpose);
+    const auto result = sampling_sorted(keys, domain, cfg, key.position, key.purpose, scratch);
     if (threadIdx.x == 0) {
         out[row] = result.token;
         if (cfg.token_counts && result.token < domain) { atomicAdd(cfg.token_counts + result.token, 1); }

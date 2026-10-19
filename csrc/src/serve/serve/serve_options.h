@@ -85,6 +85,9 @@ struct ServeOptions {
     std::uint32_t max_thinking_requests    = 0; // decisions with thinking=true; 0 disables
     std::uint32_t max_image_requests       = 0; // decisions with images; 0 disables
     std::uint32_t pending_timeout_ms       = 30000;
+    // --kv-admission reserve|ondemand, --kv-admission-headroom N, --kv-admission-watermark F
+    // (api/types.h KvAdmissionOptions, DESIGN-kv-admission.md).
+    KvAdmissionOptions kv_admission;
     // --adapter-update-timeout-ms N (0 = inherit pending_timeout_ms, as this
     // shared one number for both jobs before the flag existed). Separate
     // because they bound different things: above is how long ONE request may

@@ -1395,6 +1395,14 @@ PreparedPrompt PreparedPrompt::with_suffix(std::span<const TokenId> suffix) cons
     result->identity = {.reusable = false};
     return PreparedPrompt(std::move(result));
 }
+
+PreparedPrompt PreparedPrompt::with_continuation(std::span<const TokenId> generated) const {
+    PreparedPrompt out = with_suffix(generated);
+    // Unlike a raw suffix, generated tokens are exactly what the request's own sequence holds
+    // after its prompt (ResidentPrefixIdentity::append_generated), so its identity still holds.
+    out.data_->identity = data_->identity;
+    return out;
+}
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
