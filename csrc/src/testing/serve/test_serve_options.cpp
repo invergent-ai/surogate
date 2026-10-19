@@ -319,6 +319,30 @@ int main() {
         failures += check(rejected, "invalid extra-model GPU placement was accepted");
     }
 
+    // --kv-admission (DESIGN-kv-admission.md): on demand by default, reserve on request.
+    failures += check(defaults.kv_admission.mode == sinfer::KvAdmission::OnDemand &&
+                          defaults.kv_admission.headroom_tokens == 256 &&
+                          defaults.kv_admission.watermark == 0.01F,
+                      "KV admission defaults are not ondemand / 256 / 0.01");
+    {
+        const ServeOptions kv = parse({"sinfer-serve", "model.sinfer", "--kv-admission", "reserve",
+                                       "--kv-admission-headroom", "1024", "--kv-admission-watermark",
+                                       "0.05"});
+        failures += check(kv.kv_admission.mode == sinfer::KvAdmission::Reserve &&
+                              kv.kv_admission.headroom_tokens == 1024 &&
+                              kv.kv_admission.watermark == 0.05F,
+                          "--kv-admission options did not reach serving options");
+        failures += check(parse({"sinfer-serve", "model.sinfer", "--kv-admission", "ondemand"})
+                                  .kv_admission.mode == sinfer::KvAdmission::OnDemand,
+                          "--kv-admission ondemand not parsed");
+        for (auto args : {std::vector<std::string>{"sinfer-serve", "model.sinfer", "--kv-admission", "lazy"},
+                          std::vector<std::string>{"sinfer-serve", "model.sinfer", "--kv-admission-watermark", "0.9"}}) {
+            bool rejected = false;
+            try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an invalid --kv-admission option was accepted");
+        }
+    }
+
     const auto wide = parse({"sinfer-serve", "model.sinfer", "--max-num-seqs", "513",
                              "--model", "extra=other.sinfer,max-num-seqs=257"});
     failures += check(wide.max_concurrency == 513 && wide.extra_models.size() == 1 &&

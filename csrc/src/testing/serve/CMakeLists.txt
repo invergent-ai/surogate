@@ -249,6 +249,9 @@ sinfer_add_test(sinfer_sampling_defaults_test
 sinfer_add_test(sinfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES sinfer_core)
+sinfer_add_test(sinfer_kv_admission_test
+  SOURCES test_kv_admission.cpp
+  LIBRARIES sinfer_core)
 sinfer_add_test(sinfer_elastic_kv_region_test
   SOURCES test_elastic_kv_region.cpp
   LIBRARIES sinfer_core)
