@@ -103,6 +103,9 @@ public:
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
+    /// The longest token string in the vocabulary, added tokens included, in code points: what
+    /// vLLM calls max_chars_per_token, max(len(t) for t in tokenizer.get_vocab()).
+    [[nodiscard]] std::size_t max_chars_per_token() const noexcept { return max_chars_per_token_; }
 
 private:
     std::vector<std::string> id_to_token_;
@@ -142,6 +145,7 @@ private:
     // encode_reusing_prefix(): recent prompts' ids and where their added tokens start.
     struct PrefixCache;
     std::size_t longest_added_token_ = 0;
+    std::size_t max_chars_per_token_ = 0;
     std::shared_ptr<PrefixCache> prefix_cache_;
     void append_ids_with_added_tokens(std::string_view text, std::vector<int>& ids,
                                       std::vector<std::uint32_t>* added_bytes,

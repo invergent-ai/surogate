@@ -736,8 +736,9 @@ ResponsesRequest parse_request_impl(const RJson& body, const RequestLimits& limi
             bad_request("max_output_tokens must be at least 16", "max_output_tokens",
                         "invalid_value");
         }
-        out.generation.max_tokens     = *max_output;
-        out.generation.max_tokens_set = true;
+        out.generation.max_tokens       = *max_output;
+        out.generation.max_tokens_set   = true;
+        out.generation.max_tokens_param = "max_output_tokens";
     } else {
         out.generation.max_tokens     = limits.default_max_tokens;
         out.generation.max_tokens_set = false;

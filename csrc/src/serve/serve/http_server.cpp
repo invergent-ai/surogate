@@ -1129,6 +1129,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.vllm_max_tokens    = options_.overlong_max_tokens == OverlongMaxTokens::Reject;
         request                   = parse_chat_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
         // `model` selects a served model or one of the primary's adapters.
@@ -1409,6 +1410,7 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.vllm_max_tokens    = options_.overlong_max_tokens == OverlongMaxTokens::Reject;
         request                   = parse_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
         t_routed_service          = &route_model(request.model, &request.lora_adapter, &req,

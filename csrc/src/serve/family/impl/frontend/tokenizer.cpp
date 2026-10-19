@@ -892,6 +892,19 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     for (const AddedToken& token : added_tokens_) {
         longest_added_token_ = std::max(longest_added_token_, token.content.size());
     }
+    {
+        const auto code_points = [](std::string_view text) {
+            return static_cast<std::size_t>(std::count_if(text.begin(), text.end(), [](char byte) {
+                return (static_cast<unsigned char>(byte) & 0xC0U) != 0x80U;
+            }));
+        };
+        for (const std::string& token : id_to_token_) {
+            max_chars_per_token_ = std::max(max_chars_per_token_, code_points(token));
+        }
+        for (const AddedToken& token : added_tokens_) {
+            max_chars_per_token_ = std::max(max_chars_per_token_, code_points(token.content));
+        }
+    }
     prefix_cache_ = std::make_shared<PrefixCache>();
     if (valid_token_ids_.size() < id_to_token_.size()) {
         valid_token_ids_.resize(id_to_token_.size());

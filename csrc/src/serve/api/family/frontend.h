@@ -162,6 +162,8 @@ public:
     /// Whether this artifact carries a chat template, and so whether the chat-shaped
     /// endpoints have anything to render with.
     [[nodiscard]] bool supports_chat() const noexcept;
+    /// The tokenizer's longest token in code points (vLLM's max_chars_per_token).
+    [[nodiscard]] std::size_t max_chars_per_token() const noexcept;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] std::string reasoning_close() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

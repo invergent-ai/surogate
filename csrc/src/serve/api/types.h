@@ -667,6 +667,16 @@ struct PromptInput {
     PromptOptions options;
 };
 
+struct PromptSummary {
+    std::uint32_t prompt_tokens = 0;
+    bool has_media              = false;
+    /// Unicode code points of the text the prompt was tokenized from: the rendered chat template,
+    /// or a /v1/completions prompt as written. 0 for token ids, and for a media prompt whose
+    /// template the processor renders itself. vLLM bounds this text by the context before it
+    /// tokenizes it (serve/vllm_max_tokens.h), so the serving layer needs the same count.
+    std::uint64_t prompt_characters = 0;
+};
+
 enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
     MediaBudgetExceeded,
@@ -680,11 +690,17 @@ class RequestError final : public std::invalid_argument {
 public:
     RequestError(RequestErrorKind kind, std::string message)
         : std::invalid_argument(std::move(message)), kind_(kind) {}
+    /// A prompt refused for its length, with what it measured: the serving layer words the
+    /// refusal from these (vLLM's message counts the prompt and the context).
+    RequestError(RequestErrorKind kind, std::string message, PromptSummary prompt)
+        : std::invalid_argument(std::move(message)), kind_(kind), prompt_(prompt) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+    [[nodiscard]] const std::optional<PromptSummary>& prompt() const noexcept { return prompt_; }
 
 private:
     RequestErrorKind kind_;
+    std::optional<PromptSummary> prompt_;
 };
 
 /// The request is not acceptable: a prompt that does not fit, a token outside the domain, a
@@ -705,11 +721,6 @@ private:
 class InvalidRequest : public std::invalid_argument {
 public:
     explicit InvalidRequest(std::string message) : std::invalid_argument(std::move(message)) {}
-};
-
-struct PromptSummary {
-    std::uint32_t prompt_tokens = 0;
-    bool has_media              = false;
 };
 
 struct PromptPreparationStats {

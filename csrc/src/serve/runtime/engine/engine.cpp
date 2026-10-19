@@ -338,7 +338,7 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw RequestError(
                     RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                    context_capacity_error(info.prompt_tokens, target_ptr->capacity), info);
             }
             const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -358,7 +358,7 @@ PreparedPrompt Engine::prepare_text(std::string_view text, bool allow_prefix_ide
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw RequestError(
                     RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                    context_capacity_error(info.prompt_tokens, target_ptr->capacity), info);
             }
             const PromptPreparationStats preparation = prepared.preparation_stats();
             // A raw prompt has no reasoning turn to resume, so the session starts outside one.
@@ -378,6 +378,16 @@ bool Engine::supports_chat() const {
         impl_->active);
 }
 
+std::size_t Engine::max_chars_per_token() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& target_ptr) -> std::size_t {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.max_chars_per_token();
+        },
+        impl_->active);
+}
+
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -390,7 +400,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw RequestError(
                     RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                    context_capacity_error(info.prompt_tokens, target_ptr->capacity), info);
             }
             const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(

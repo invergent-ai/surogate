@@ -104,7 +104,7 @@ status 1, so a supervisor such as systemd can restart it and health checks stop 
 | `model` | Selects a served model or one of its named LoRA adapters |
 | `messages` | Roles `system`, `user`, `assistant`, `tool` |
 | `stream`, `stream_options.include_usage` | SSE; with `include_usage` a dedicated usage chunk precedes `[DONE]` |
-| `max_completion_tokens`, `max_tokens` | `max_completion_tokens` wins; default from `--default-max-tokens` (8192) |
+| `max_completion_tokens`, `max_tokens` | `max_completion_tokens` wins; default from `--default-max-tokens` (8192), capped to the rest of the context. As in vLLM, a given value larger than the context, or one that does not fit next to the prompt, is HTTP 400 before generation (`--overlong-max-tokens`) |
 | `temperature`, `top_p`, `top_k`, `min_p` | Request values override sampling defaults; `top_k: -1` or `0` disables the request's top-k limit |
 | `repetition_penalty` | Multiplicative penalty; must be positive; `1` disables it |
 | `presence_penalty`, `frequency_penalty` | Adjust repetition penalties for previously used tokens |

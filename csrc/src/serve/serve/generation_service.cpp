@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "serve/generation_service.h"
+#include "serve/vllm_max_tokens.h"
 #include <set>
 
 #include "product/media_acquire/acquire.h"
@@ -634,6 +635,21 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
+    // vLLM refuses a max_tokens larger than the context before it renders the prompt.
+    const bool vllm_max_tokens = options_.overlong_max_tokens == OverlongMaxTokens::Reject;
+    const std::int64_t max_model_len = engine_->options().max_context;
+    if (vllm_max_tokens) {
+        if (std::optional<ApiError> error =
+                vllm_max_tokens_above_context(max_tokens_query(request, max_model_len, 0, 0, 0))) {
+            throw ApiException(std::move(*error));
+        }
+    }
+    // The rest of vLLM's rule, once the prompt is measured (serve/vllm_max_tokens.h).
+    const auto decide_max_tokens = [&](const sinfer::PromptSummary& summary) {
+        return decide_vllm_max_tokens(max_tokens_query(request, max_model_len, summary.prompt_tokens,
+                                                       static_cast<std::int64_t>(summary.prompt_characters),
+                                                       static_cast<std::int64_t>(engine_->max_chars_per_token())));
+    };
     prepared.lifetime = begin_request(is_cancelled, before_prepare);
 
     try {
@@ -663,16 +679,28 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         // is the whole point of the token-in endpoint, and the messages are still
         // parsed above for the tools and the parser state they carry.
         sinfer::PreparedPrompt prompt;
-        if (!request.prompt_token_ids.empty()) {
-            try {
-                prompt = engine_->prepare_tokens(request.prompt_token_ids);
-            } catch (const std::out_of_range& error) {
-                throw ApiException(ApiError{.status = 400, .message = error.what(), .param = "tokens"});
+        try {
+            if (!request.prompt_token_ids.empty()) {
+                try {
+                    prompt = engine_->prepare_tokens(request.prompt_token_ids);
+                } catch (const std::out_of_range& error) {
+                    throw ApiException(ApiError{.status = 400, .message = error.what(), .param = "tokens"});
+                }
+            } else if (request.raw_prompt.has_value()) {
+                prompt = engine_->prepare_text(*request.raw_prompt);
+            } else {
+                prompt = engine_->prepare(std::move(*input), control);
             }
-        } else if (request.raw_prompt.has_value()) {
-            prompt = engine_->prepare_text(*request.raw_prompt);
-        } else {
-            prompt = engine_->prepare(std::move(*input), control);
+        } catch (const sinfer::RequestError& error) {
+            // A prompt longer than the context is refused by the engine as soon as it is measured; vLLM words
+            // that refusal from the same measurements.
+            if (vllm_max_tokens && error.kind() == sinfer::RequestErrorKind::ContextLengthExceeded &&
+                error.prompt()) {
+                if (MaxTokensDecision decision = decide_max_tokens(*error.prompt()); decision.error) {
+                    throw ApiException(std::move(*decision.error));
+                }
+            }
+            throw;
         }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
@@ -688,6 +716,14 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         // actually sees, which is the thing a trainer must score against and is not
         // reliably reproducible by re-rendering the messages.
         if (request.return_token_ids) { prepared.prompt_token_ids = prompt.token_ids(); }
+        // vLLM's rule for prompt + max_tokens against the context (serve/vllm_max_tokens.h): an explicit
+        // max_tokens that does not fit is HTTP 400 here, before any GPU work; an absent one is the server
+        // default capped to the rest of the context.
+        if (vllm_max_tokens) {
+            MaxTokensDecision decision = decide_max_tokens(prompt.summary());
+            if (decision.error) { throw ApiException(std::move(*decision.error)); }
+            request_options.execution.requested_output_tokens = static_cast<std::uint32_t>(decision.budget);
+        }
         if (request.parallel_decoding) {
             auto state = std::make_shared<ParallelDecodingRequest>();
             state->plan = compile_parallel_plan(std::move(parallel_fields),

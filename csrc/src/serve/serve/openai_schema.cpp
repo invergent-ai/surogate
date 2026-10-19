@@ -795,9 +795,13 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
     out.preserve_thinking = parse_openai_preserve_thinking(body);
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
-    if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
     if (max_tokens) {
-        if (*max_tokens <= 0) { bad_request("max_tokens must be positive", "max_tokens"); }
+        out.max_tokens_param = "max_completion_tokens";
+    } else {
+        max_tokens = get_int(body, "max_tokens");
+    }
+    if (max_tokens) {
+        if (*max_tokens <= 0 && !limits.vllm_max_tokens) { bad_request("max_tokens must be positive", "max_tokens"); }
         out.max_tokens     = *max_tokens;
         out.max_tokens_set = true;
     } else {
@@ -1033,6 +1037,13 @@ std::string make_model_object(const std::string& model_id, std::int64_t created,
 }
 
 std::string make_error_body(const ApiError& error) {
+    if (error.numeric_code != 0) {
+        // vLLM's ErrorResponse.model_dump(): message, type, param, code (an int).
+        OJson err     = {{"message", error.message}, {"type", error.type}};
+        err["param"]  = error.param.empty() ? OJson(nullptr) : OJson(error.param);
+        err["code"]   = error.numeric_code;
+        return OJson{{"error", err}}.dump();
+    }
     Json err     = {{"message", error.message}, {"type", error.type}};
     err["param"] = error.param.empty() ? Json(nullptr) : Json(error.param);
     err["code"]  = error.code.empty() ? Json(nullptr) : Json(error.code);
@@ -1070,7 +1081,7 @@ GenerationRequest parse_completion_request(const OJson& body, const RequestLimit
 
     const std::optional<int> max_tokens = get_int(body, "max_tokens");
     if (max_tokens) {
-        if (*max_tokens <= 0) { bad_request("max_tokens must be positive", "max_tokens"); }
+        if (*max_tokens <= 0 && !limits.vllm_max_tokens) { bad_request("max_tokens must be positive", "max_tokens"); }
         out.max_tokens     = *max_tokens;
         out.max_tokens_set = true;
     } else {

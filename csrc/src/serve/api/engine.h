@@ -96,6 +96,9 @@ public:
     /// Whether the loaded artifact carries a chat template. False for a base model, and the
     /// chat-shaped endpoints refuse rather than render nothing.
     [[nodiscard]] bool supports_chat() const;
+    /// The tokenizer's longest token in code points, vLLM's max_chars_per_token: vLLM refuses a
+    /// prompt text longer than that many characters per token the context leaves it.
+    [[nodiscard]] std::size_t max_chars_per_token() const;
     /// The stop token ids this model ends on by default. A request asking for a
     /// minimum length bars exactly these until it is reached.
     [[nodiscard]] std::vector<TokenId> default_stop_tokens() const;

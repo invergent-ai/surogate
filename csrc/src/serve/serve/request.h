@@ -30,6 +30,9 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    /// vLLM's error shape: `code` is the HTTP status as a number (and the keys come in vLLM's order). 0 = the
+    /// string `code` above.
+    int numeric_code = 0;
 };
 
 class ApiException : public std::runtime_error {
@@ -46,6 +49,9 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    /// --overlong-max-tokens reject: a max_tokens below 1 is left for vLLM's check after the prompt is counted
+    /// (serve/vllm_max_tokens.h), which is where vLLM refuses it, instead of being refused while parsing.
+    bool vllm_max_tokens = false;
 };
 
 struct CompletionUsage {
@@ -209,6 +215,8 @@ struct GenerationRequest {
     int min_tokens = 0;
     int max_tokens      = 0; // 0 => use server default
     bool max_tokens_set = false;
+    /// The field max_tokens came from (max_tokens, max_completion_tokens, max_output_tokens), for vLLM's message.
+    std::string max_tokens_param = "max_tokens";
     bool stream         = false;
     bool include_usage  = false;
     std::optional<bool> enable_thinking; // non-standard extension; falls back to server default

@@ -104,6 +104,8 @@ struct PreparedPromptData {
     PromptIdentity identity;
     bool starts_in_reasoning = false;
     bool uses_chat_template = false;
+    /// Code points of the text tokenized into token_ids (PromptSummary::prompt_characters).
+    std::uint64_t prompt_characters = 0;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;

@@ -205,7 +205,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-thinking-requests N] [--max-image-requests N] "
            "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] [--spec-adaptive] "
-           "[--default-max-tokens N] "
+           "[--default-max-tokens N] [--overlong-max-tokens reject|cap] "
            "[--vision] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
            "[--enforce-eager] [--no-prefix-reuse] [--batch-invariant] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
@@ -220,7 +220,9 @@ std::string serve_usage_text(const char* argv0) {
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
-           " when omitted\n"
+           " when omitted; without a max_tokens a request gets that, capped to the rest of the context\n"
+           "       --overlong-max-tokens reject (default) refuses prompt + max_tokens > context with HTTP 400\n"
+           "         as vLLM does; cap caps max_tokens to the rest of the context instead\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
@@ -532,6 +534,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 spec == "all" ? kSpeculateAtAnyWidth
                               : static_cast<std::uint32_t>(
                                     parse_nonnegative_int(spec.c_str(), "spec-max-lanes"));
+        } else if (arg == "--overlong-max-tokens") {
+            const std::string policy = require_value("--overlong-max-tokens");
+            if (policy == "reject") {
+                options.overlong_max_tokens = OverlongMaxTokens::Reject;
+            } else if (policy == "cap") {
+                options.overlong_max_tokens = OverlongMaxTokens::Cap;
+            } else {
+                throw std::invalid_argument("--overlong-max-tokens must be reject or cap");
+            }
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

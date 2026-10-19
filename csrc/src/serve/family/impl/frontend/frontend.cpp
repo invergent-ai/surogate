@@ -653,6 +653,14 @@ fi::ChatRenderOptions render_options(const PromptOptions& options) {
                                  .tool_jsons            = options.tool_jsons};
 }
 
+// Python's len() of the same text: every byte that does not continue a UTF-8 sequence starts a
+// code point.
+std::uint64_t utf8_code_points(std::string_view text) {
+    return static_cast<std::uint64_t>(std::count_if(text.begin(), text.end(), [](char byte) {
+        return (static_cast<unsigned char>(byte) & 0xC0U) != 0x80U;
+    }));
+}
+
 std::uint32_t checked_token_count(std::size_t count) {
     if (count == 0) {
         throw std::invalid_argument("prepared prompt must contain at least one token");
@@ -1407,8 +1415,9 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.prompt_tokens = checked_token_count(data_->token_ids.size()),
-                         .has_media     = data_->has_media()};
+    return PromptSummary{.prompt_tokens     = checked_token_count(data_->token_ids.size()),
+                         .has_media         = data_->has_media(),
+                         .prompt_characters = data_->prompt_characters};
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
@@ -1675,6 +1684,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                 rendered = impl_->render_chat(messages, options);
                 opens_reasoning = options.add_generation_prompt &&
                     fi::prompt_opens_reasoning(rendered->text, impl_->reasoning.open);
+                result.prompt_characters = utf8_code_points(rendered->text);
             }
             auto media_options = render_options(options);
             media_options.template_variables = impl_->template_variables(options);
@@ -1738,6 +1748,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             opens_reasoning = options.add_generation_prompt &&
                               fi::prompt_opens_reasoning(rendered.text, impl_->reasoning.open);
         }
+        result.prompt_characters    = utf8_code_points(rendered.text);
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.prepare.tokenize_seconds =
@@ -1889,6 +1900,10 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 
 bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template; }
 
+std::size_t Frontend::max_chars_per_token() const noexcept {
+    return impl_ != nullptr ? impl_->tokenizer->max_chars_per_token() : 0;
+}
+
 std::vector<TokenId> Frontend::encode_fragment(std::string_view text) const {
     return impl_->tokenizer->encode(text, {.parse_added_tokens=false, .add_bos=false});
 }
@@ -1900,6 +1915,7 @@ PreparedPrompt Frontend::prepare_text(std::string_view text, bool allow_prefix_i
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids.assign(encoded.begin(), encoded.end());
+    result.prompt_characters = utf8_code_points(text);
     assign_text_positions(result);
     result.identity.reusable = allow_prefix_identity;
     result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
