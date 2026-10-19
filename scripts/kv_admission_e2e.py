@@ -191,6 +191,8 @@ def shape(body, args):
 
 
 def selected_rows(args):
+    if getattr(args, "images", 0):
+        return [{"id": f"image-{i}", "category": "image", "body": image_body(i, args)} for i in range(args.images)]
     rows = load_requests(args.requests, set(args.categories.split(",")) if args.categories else None)
     random.Random(args.shuffle_seed).shuffle(rows)
     return rows[: args.n]
@@ -200,6 +202,8 @@ def cmd_generate(args):
     """The requests one at a time against one engine, each answer recorded (identity needs only one
     engine up at a time: generate on each, then compare)."""
     key = read_key(args.api_key_file)
+    if args.images and not args.model:
+        args.model = served_model(args.url, key)
     rows = selected_rows(args)
     results = [None] * len(rows)
     if args.concurrency > 1:
@@ -358,29 +362,66 @@ def served_model(url, key=None):
         connection.close()
 
 
+def png_blocks(seed, width=448, height=336):
+    """A PNG of random coloured rectangles (stdlib only), for image requests."""
+    import struct
+    import zlib
+    rng = random.Random(seed)
+    pixels = [[(255, 255, 255)] * width for _ in range(height)]
+    for _ in range(6):
+        x0, y0 = rng.randrange(width - 40), rng.randrange(height - 40)
+        w, h = rng.randrange(30, width - x0), rng.randrange(30, height - y0)
+        colour = (rng.randrange(256), rng.randrange(256), rng.randrange(256))
+        for y in range(y0, y0 + h):
+            row = pixels[y]
+            for x in range(x0, x0 + w):
+                row[x] = colour
+    raw = b"".join(b"\x00" + bytes(c for px in row for c in px) for row in pixels)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def image_body(i, args):
+    import base64
+    url = "data:image/png;base64," + base64.b64encode(png_blocks(500 + i)).decode()
+    return {"model": args.model or "model",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": "Describe every coloured rectangle in this image: its colour, position and "
+                                         "size, then write a short story inspired by it."}]}],
+            "chat_template_kwargs": {"enable_thinking": False}}
+
+
 def synthetic_body(i, tokens, args):
     rng = random.Random(1000 + i)
     # About 1.3 tokens a word for this vocabulary; numbers make it non-repetitive.
     words = int(tokens / 1.35)
     text = " ".join(f"{rng.choice(WORDS)}{rng.randint(0, 9999)}" if rng.random() < 0.3 else rng.choice(WORDS)
                     for _ in range(words))
+    ask = ("Write a long, detailed report on what this log shows, section by section." if args.long_answer
+           else "In one short sentence: what is the most frequent word in it?")
     return {"model": args.model or "model",
-            "messages": [{"role": "user", "content": "Here is a log dump:\n" + text +
-                          "\n\nIn one short sentence: what is the most frequent word in it?"}],
+            "messages": [{"role": "user", "content": "Here is a log dump:\n" + text + "\n\n" + ask}],
             "chat_template_kwargs": {"enable_thinking": False}}
 
 
 def cmd_load(args):
     key = read_key(args.api_key_file)
     bodies = []
-    if args.synthetic and not args.model:
+    if args.images:
+        args.model = args.model or served_model(args.url, key)
+        bodies = [(f"image-{i}", "image", image_body(i, args)) for i in range(args.images)]
+    elif args.synthetic and not args.model:
         args.model = served_model(args.url, key)
-    if args.synthetic:
+    if args.synthetic and not args.images:
         lo, hi = (int(x) for x in args.prompt_tokens.split(":"))
         rng = random.Random(args.shuffle_seed)
         for i in range(args.synthetic):
             bodies.append((f"synthetic-{i}", "synthetic", synthetic_body(i, rng.randint(lo, hi), args)))
-    else:
+    elif not args.images:
         rows = load_requests(args.requests, set(args.categories.split(",")) if args.categories else None)
         random.Random(args.shuffle_seed).shuffle(rows)
         while len(rows) < args.n:
@@ -471,6 +512,9 @@ def main():
     sub.choices["load"].add_argument("--url", required=True)
     sub.choices["load"].add_argument("--concurrency", type=int, default=16)
     sub.choices["load"].add_argument("--synthetic", type=int, default=0)
+    sub.choices["load"].add_argument("--long-answer", action="store_true")
+    for name in ("load", "generate"):
+        sub.choices[name].add_argument("--images", type=int, default=0)
     sub.choices["load"].add_argument("--prompt-tokens", default="100000:150000")
     args = parser.parse_args()
     return {"identity": cmd_identity, "load": cmd_load, "generate": cmd_generate,
