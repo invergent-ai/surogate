@@ -52,7 +52,7 @@ def post_chat(url, body, key=None, timeout=7200):
         headers["Authorization"] = "Bearer " + key
     started = time.monotonic()
     out = {"status": None, "content": "", "reasoning": "", "tool_calls": [], "usage": None,
-           "finish_reason": None, "ttft": None, "seconds": None, "error": None}
+           "finish_reason": None, "ttft": None, "seconds": None, "error": None, "logprobs": []}
     try:
         connection.request("POST", "/v1/chat/completions", body=json.dumps(body), headers=headers)
         response = connection.getresponse()
@@ -67,6 +67,7 @@ def post_chat(url, body, key=None, timeout=7200):
             out["content"] = message.get("content") or ""
             out["reasoning"] = message.get("reasoning_content") or message.get("reasoning") or ""
             out["tool_calls"] = message.get("tool_calls") or []
+            out["logprobs"] = ((choice.get("logprobs") or {}).get("content")) or []
             out["finish_reason"] = choice.get("finish_reason")
             out["usage"] = payload.get("usage")
             out["ttft"] = time.monotonic() - started
@@ -100,6 +101,7 @@ def post_chat(url, body, key=None, timeout=7200):
                             out["ttft"] = time.monotonic() - started
                         out["content"] += text
                         out["reasoning"] += reasoning
+                        out["logprobs"].extend(((choice.get("logprobs") or {}).get("content")) or [])
                         for call in delta.get("tool_calls") or []:
                             slot = calls.setdefault(call.get("index", 0), {"name": "", "arguments": ""})
                             function = call.get("function") or {}
@@ -176,6 +178,9 @@ def shape(body, args):
                 body.pop(field, None)
     if args.seed is not None:
         body["seed"] = args.seed
+    if getattr(args, "top_logprobs", 0):
+        body["logprobs"] = True
+        body["top_logprobs"] = args.top_logprobs
     if args.no_stream:
         body["stream"] = False
         body.pop("stream_options", None)
@@ -196,10 +201,19 @@ def cmd_generate(args):
     engine up at a time: generate on each, then compare)."""
     key = read_key(args.api_key_file)
     rows = selected_rows(args)
+    results = [None] * len(rows)
+    if args.concurrency > 1:
+        # All at once (the batch composition a loaded server gives them), recorded in order.
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            for i, result in enumerate(pool.map(lambda row: post_chat(args.url, shape(row["body"], args), key), rows)):
+                results[i] = result
     with open(args.out, "w", encoding="utf-8") as handle:
         for i, row in enumerate(rows):
-            result = post_chat(args.url, shape(row["body"], args), key)
+            result = results[i] or post_chat(args.url, shape(row["body"], args), key)
+            scores = [[e.get("token"), e.get("logprob"),
+                       [t.get("logprob") for t in (e.get("top_logprobs") or [])]] for e in result["logprobs"]]
             handle.write(json.dumps({"id": row["id"], "category": row["category"], "flat": flatten(result),
+                                     "scores": scores,
                                      "usage": result["usage"], "finish_reason": result["finish_reason"],
                                      "error": result["error"], "seconds": result["seconds"]}) + "\n")
             handle.flush()
@@ -238,6 +252,56 @@ def cmd_compare(args):
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=1)
     return 0 if report["different"] == 0 and report["errors"] == 0 else 1
+
+
+def cmd_gaps(args):
+    """Where two recordings with logprobs first differ by token, and how close the base run's top two
+    candidates were there: a recompute that only perturbs the arithmetic flips near-ties, a wrong
+    state flips confident tokens."""
+    def read(path):
+        with open(path, encoding="utf-8") as handle:
+            return {row["id"]: row for row in map(json.loads, handle)}
+    base, test = read(args.base), read(args.test)
+    rows = []
+    for rid, a in base.items():
+        b = test.get(rid)
+        if not b or a["error"] or b["error"] or not a.get("scores") or not b.get("scores"):
+            continue
+        ta = [s[0] for s in a["scores"]]
+        tb = [s[0] for s in b["scores"]]
+        at = next((i for i, (x, y) in enumerate(zip(ta, tb)) if x != y), None)
+        if at is None:
+            rows.append({"id": rid, "identical": ta == tb, "tokens": len(ta), "scored_test": len(b["scores"]),
+                         "tokens_test": (b["usage"] or {}).get("completion_tokens")})
+            continue
+        def gap(entry):
+            tops = sorted([x for x in entry[2] if x is not None], reverse=True)
+            return tops[0] - tops[1] if len(tops) >= 2 else None
+
+        def drift(lo, hi):
+            # Mean |logprob difference| of the shared tokens in [lo, hi): how far the two runs'
+            # arithmetic has moved apart before they pick different tokens.
+            values = [abs(a["scores"][i][1] - b["scores"][i][1]) for i in range(lo, min(hi, at))
+                      if a["scores"][i][1] is not None and b["scores"][i][1] is not None]
+            return sum(values) / len(values) if values else None
+        rows.append({"id": rid, "identical": False, "first_token": at, "tokens": len(ta),
+                     "base_gap": gap(a["scores"][at]), "test_gap": gap(b["scores"][at]),
+                     "base_token": ta[at], "test_token": tb[at],
+                     "base_logprob": a["scores"][at][1], "test_logprob": b["scores"][at][1],
+                     "drift_before": drift(0, args.resume_at), "drift_after": drift(args.resume_at, at)})
+    differing = [r for r in rows if not r["identical"]]
+    gaps = sorted(r["base_gap"] for r in differing if r.get("base_gap") is not None)
+    summary = {"compared": len(rows), "identical": len(rows) - len(differing), "different": len(differing),
+               "first_token_min": min((r["first_token"] for r in differing), default=None),
+               "gap_p50": gaps[len(gaps) // 2] if gaps else None, "gap_max": gaps[-1] if gaps else None,
+               "gaps_over_0.5": sum(1 for g in gaps if g > 0.5), "rows": rows}
+    print(json.dumps({k: v for k, v in summary.items() if k != "rows"}, indent=1))
+    for r in differing:
+        print(json.dumps(r))
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=1)
+    return 0
 
 
 def cmd_identity(args):
@@ -283,6 +347,17 @@ WORDS = ("system log record value process network request response cache memory 
          "queue error warning module function service token index buffer file stream batch").split()
 
 
+def served_model(url, key=None):
+    parsed = urllib.parse.urlparse(url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    try:
+        connection.request("GET", "/v1/models", headers=headers)
+        return json.loads(connection.getresponse().read())["data"][0]["id"]
+    finally:
+        connection.close()
+
+
 def synthetic_body(i, tokens, args):
     rng = random.Random(1000 + i)
     # About 1.3 tokens a word for this vocabulary; numbers make it non-repetitive.
@@ -298,6 +373,8 @@ def synthetic_body(i, tokens, args):
 def cmd_load(args):
     key = read_key(args.api_key_file)
     bodies = []
+    if args.synthetic and not args.model:
+        args.model = served_model(args.url, key)
     if args.synthetic:
         lo, hi = (int(x) for x in args.prompt_tokens.split(":"))
         rng = random.Random(args.shuffle_seed)
@@ -374,12 +451,19 @@ def main():
         p.add_argument("--seed", type=int)
         p.add_argument("--model")
         p.add_argument("--no-stream", action="store_true")
+        p.add_argument("--top-logprobs", type=int, default=0)
         p.add_argument("--shuffle-seed", type=int, default=7)
         p.add_argument("--api-key-file")
         p.add_argument("--out")
     sub.choices["identity"].add_argument("--base", required=True)
     sub.choices["identity"].add_argument("--test", required=True)
     sub.choices["generate"].add_argument("--url", required=True)
+    sub.choices["generate"].add_argument("--concurrency", type=int, default=1)
+    gaps = sub.add_parser("gaps")
+    gaps.add_argument("--resume-at", type=int, default=64, help="first forced preemption (tokens)")
+    gaps.add_argument("--base", required=True)
+    gaps.add_argument("--test", required=True)
+    gaps.add_argument("--out")
     compare = sub.add_parser("compare")
     compare.add_argument("--base", required=True)
     compare.add_argument("--test", required=True)
@@ -390,7 +474,7 @@ def main():
     sub.choices["load"].add_argument("--prompt-tokens", default="100000:150000")
     args = parser.parse_args()
     return {"identity": cmd_identity, "load": cmd_load, "generate": cmd_generate,
-            "compare": cmd_compare}[args.command](args)
+            "compare": cmd_compare, "gaps": cmd_gaps}[args.command](args)
 
 
 if __name__ == "__main__":

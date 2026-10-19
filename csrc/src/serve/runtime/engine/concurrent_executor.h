@@ -1599,6 +1599,17 @@ private:
                 request->kv_retained_media = prompt_media_bytes(request->prompt);
                 kv_media_retained_ += request->kv_retained_media;
             }
+            // SUROGATE_SERVE_KV_ADMIT_TRACE=1: one line per admission, in admission order -- what
+            // a test reads to check first come, first served and the pages each request took.
+            static const bool kv_admit_trace = std::getenv("SUROGATE_SERVE_KV_ADMIT_TRACE") != nullptr;
+            if (kv_admit_trace) {
+                std::fprintf(stderr,
+                             "kv-admit: request %llu lane %u prompt %u reused %u pages %u/%u preemptions %u%s\n",
+                             static_cast<unsigned long long>(request->id), lane, summary.prompt_tokens,
+                             summary.reusable_prompt_tokens, summary.admission.main_kv_pages,
+                             summary.reservation.main_kv_pages, request->kv_preemptions,
+                             summary.on_demand_kv ? "" : " reserved");
+            }
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
