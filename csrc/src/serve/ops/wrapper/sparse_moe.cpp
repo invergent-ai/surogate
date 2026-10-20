@@ -520,8 +520,14 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     const bool width_invariant =
         routing == SparseMoeRouting::WidthInvariant &&
         detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
-    // Adapted rounds execute their columns concurrently in one set of launches.
+    // Adapted rounds execute their columns concurrently in one set of launches; a wide one runs
+    // the expert-major kernels in slices of at most kSparseMoeAdapterSlice.
     std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry, max_tokens);
+    if (max_tokens >= detail::kSparseMoeAdapterGroupedMin) {
+        required = std::max(required, detail::sparse_moe_decode_workspace_bytes(
+                                          geometry, std::min(max_tokens, detail::kSparseMoeAdapterSlice),
+                                          true));
+    }
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
     const std::int32_t small_last =
         std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
@@ -671,12 +677,14 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         // against block-FP8 experts, whose wide rounds would leave the grouped GEMM.
         throw std::invalid_argument("sparse_moe: adapters on block-FP8 routed experts are not supported");
     }
-    if (adapters && tokens > resolve_tokens) {
+    const std::int32_t adapter_slice = std::min(resolve_tokens, detail::kSparseMoeAdapterSlice);
+    if (adapters && tokens > adapter_slice) {
         // Adapter routing is batched too. Keep each hook invocation within the cache's
-        // capacity and preserve the adapter column IDs when advancing through the request.
+        // capacity, and each round within the expert-major kernels' slice, and preserve the
+        // adapter column IDs when advancing through the request.
         const LoraRound saved_round = adapter_round;
-        for (std::int32_t offset = 0; offset < tokens; offset += resolve_tokens) {
-            const auto count = std::min(resolve_tokens, tokens - offset);
+        for (std::int32_t offset = 0; offset < tokens; offset += adapter_slice) {
+            const auto count = std::min(adapter_slice, tokens - offset);
             const Tensor input = x.slice(1, offset, count);
             const Tensor router_input = router_x.slice(1, offset, count);
             Tensor output = destination.slice(1, offset, count);
@@ -702,6 +710,9 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                   : nvfp4_routed
                                   ? tokens >= trtllm_min_tokens()
                                   : detail::sparse_moe_uses_prefill(tokens, gate_up, down));
+    // A wide adapter round allocates the expert-major kernels' tiles and partials; the decode
+    // launch takes them where the routed codec has those kernels.
+    const bool adapter_grouped = adapters && tokens >= detail::kSparseMoeAdapterGroupedMin;
     const bool use_small_t =
         !adapters && !use_prefill && resolve_tokens >= 3 && (detail::sparse_moe_uses_small_t(tokens) ||
                          ((nvfp4_routed || ggml_k_routed || fp8_routed) && tokens > 1));
@@ -721,7 +732,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                                     down)
                 .workspace_bytes;
     } else {
-        required = detail::sparse_moe_decode_workspace_bytes(geometry, adapters ? tokens : 1);
+        required = detail::sparse_moe_decode_workspace_bytes(geometry, adapters ? tokens : 1,
+                                                             adapter_grouped);
     }
     const bool native_shared = detail::native_shared(weights);
     if (native_shared) { required += native_shared_capacity(geometry, tokens, tokens); }
@@ -787,7 +799,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         }
         return;
     }
-    auto views = detail::allocate_sparse_moe_decode_workspace(workspace, geometry, adapters ? tokens : 1);
+    auto views = detail::allocate_sparse_moe_decode_workspace(workspace, geometry, adapters ? tokens : 1,
+                                                              adapter_grouped);
     if (adapters) {
         views.slot_stride = adapter_round.slots ? 1 : 0;
         views.lora_rank   = lora_store_for_current_device().max_rank();

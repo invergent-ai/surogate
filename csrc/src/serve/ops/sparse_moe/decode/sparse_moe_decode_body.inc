@@ -123,6 +123,49 @@ __global__ void moe_lora_router_kernel(const __nv_bfloat16* x, const LoraBank* b
     if (threadIdx.x == 0) { scores[row] = moe_lora_adjust(banks, row < kExperts ? 0 : 1, slot, row < kExperts ? row : 0, scores[row] + delta); }
 }
 
+// moe_lora_router_kernel for a wide adapter round, in two launches. That kernel computes a token's
+// rank dots against its bank's A once per router row although they do not depend on the row --
+// at a prefill slice of 1,024 tokens it took as long as the expert kernels. Here each token's dots
+// are taken once (`low`, the round's lora_low before the experts' low-rank inputs overwrite it),
+// in the same lanes and order, and each row's delta from them as that kernel's lane 0 takes it.
+__global__ void moe_lora_router_low_kernel(const __nv_bfloat16* x, const LoraBank* banks,
+                                           const int* slot, float* low, int slot_stride) {
+    const int token = blockIdx.z;
+    x += token * kHidden;
+    slot += token * slot_stride;
+    low += token * 2 * kPaths * kMoeLoraMaxRank;
+    if (*slot < 0) { return; }
+    const int r = blockIdx.x, which = blockIdx.y;   // bank 0: the router rows; 1: the shared gate
+    const LoraBank bank = banks[which];
+    if (!bank.a || r >= bank.rank) { return; }
+    const auto* a = static_cast<const __nv_bfloat16*>(bank.a) + *slot * bank.a_stride;
+    float dot = 0;
+    for (int k = threadIdx.x; k < bank.k; k += 32) {
+        dot = fmaf(__bfloat162float(a[r * bank.k + k]), __bfloat162float(x[k]), dot);
+    }
+    dot = warp_reduce_sum(dot);
+    if (threadIdx.x == 0) { low[which * kMoeLoraMaxRank + r] = dot; }
+}
+
+__global__ void moe_lora_router_apply_kernel(const LoraBank* banks, const int* slot, const float* low,
+                                             float* scores, int slot_stride) {
+    const int row   = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int token = blockIdx.y;
+    if (row >= kRouterRows) { return; }
+    slot += token * slot_stride;
+    if (*slot < 0) { return; }
+    const int which     = row < kExperts ? 0 : 1;
+    const LoraBank bank = banks[which];
+    if (!bank.a) { return; }
+    const auto* b = static_cast<const __nv_bfloat16*>(bank.b) + *slot * bank.b_stride +
+                    (row < kExperts ? row : 0) * bank.rank;
+    low += token * 2 * kPaths * kMoeLoraMaxRank + which * kMoeLoraMaxRank;
+    float delta = 0;
+    for (int r = 0; r < bank.rank; ++r) { delta = fmaf(__bfloat162float(b[r]), low[r], delta); }
+    scores += token * kDecodeScratch;
+    scores[row] = moe_lora_adjust(banks, which, slot, row < kExperts ? row : 0, scores[row] + delta);
+}
+
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores) {
@@ -266,24 +309,38 @@ struct Nvfp4CodecFor {
     }
 
     /// Accumulates values [8 piece, 8 piece + 8) of a wide load against `x`: the eight products,
-    /// then their group's scale once.
-    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
-                                                      int piece, const float (&x)[8], float& acc) {
+    /// then their group's scale once. Split in two -- the piece's weights, then their products --
+    /// so a caller with several inputs decodes a piece once for all of them (WideRowsTokens).
+    __device__ static __forceinline__ void wide_weights(const uint4& codes, std::uint32_t scale_bits,
+                                                        int piece, float (&weights)[8], float& scale) {
         const std::uint32_t word = piece == 0   ? codes.x
                                    : piece == 1 ? codes.y
                                    : piece == 2 ? codes.z
                                                 : codes.w;
-        float part = 0.0f;
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             const float2 decoded =
                 detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(word >> (8 * pair)));
-            part = fmaf(decoded.x, x[2 * pair], part);
-            part = fmaf(decoded.y, x[2 * pair + 1], part);
+            weights[2 * pair]     = decoded.x;
+            weights[2 * pair + 1] = decoded.y;
         }
-        const float scale =
-            detail::decode_nvfp4_e4m3(static_cast<std::uint8_t>(scale_bits >> (piece < 2 ? 0 : 8)));
+        scale = detail::decode_nvfp4_e4m3(static_cast<std::uint8_t>(scale_bits >> (piece < 2 ? 0 : 8)));
+    }
+
+    __device__ static __forceinline__ void wide_apply(const float (&weights)[8], float scale,
+                                                      const float (&x)[8], float& acc) {
+        float part = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { part = fmaf(weights[item], x[item], part); }
         acc = fmaf(part, scale, acc);
+    }
+
+    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
+                                                      int piece, const float (&x)[8], float& acc) {
+        float weights[8];
+        float scale;
+        wide_weights(codes, scale_bits, piece, weights, scale);
+        wide_apply(weights, scale, x, acc);
     }
 
     __device__ static __forceinline__ void
@@ -350,18 +407,31 @@ struct W8Codec {
     }
 
     /// Accumulates values [8 piece, 8 piece + 8) of a wide load against `x`, each weight
-    /// rounded as load_eight rounds it.
-    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
-                                                      int piece, const float (&x)[8], float& acc) {
-        const float scale =
-            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
+    /// rounded as load_eight rounds it. Split in two as NVFP4's is; the scale is in the weights.
+    __device__ static __forceinline__ void wide_weights(const uint4& codes, std::uint32_t scale_bits,
+                                                        int piece, float (&weights)[8], float& scale) {
+        scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
         const std::uint32_t words[2] = {piece == 0 ? codes.x : codes.z,
                                         piece == 0 ? codes.y : codes.w};
 #pragma unroll
         for (int item = 0; item < 8; ++item) {
             const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
-            acc = fmaf(w8_a16_weight(static_cast<std::int8_t>(code), scale), x[item], acc);
+            weights[item]  = w8_a16_weight(static_cast<std::int8_t>(code), scale);
         }
+    }
+
+    __device__ static __forceinline__ void wide_apply(const float (&weights)[8], float /*scale*/,
+                                                      const float (&x)[8], float& acc) {
+#pragma unroll
+        for (int item = 0; item < 8; ++item) { acc = fmaf(weights[item], x[item], acc); }
+    }
+
+    __device__ static __forceinline__ void wide_piece(const uint4& codes, std::uint32_t scale_bits,
+                                                      int piece, const float (&x)[8], float& acc) {
+        float weights[8];
+        float scale;
+        wide_weights(codes, scale_bits, piece, weights, scale);
+        wide_apply(weights, scale, x, acc);
     }
 };
 
@@ -536,6 +606,71 @@ inline constexpr bool kWideRows = [] {
         return false;
     }
 }();
+
+/// WideRows::dot for up to N inputs against one lane's loads, which stay in registers across
+/// calls: each piece's weights are decoded once and applied to every input, and every input's
+/// sums are taken in WideRows::dot's own order -- the bits each input gets alone. `x(t, k,
+/// values)` fills input t's eight values from k; n (warp-uniform) inputs are live, and lane 0
+/// holds each live input's row sums in `result`.
+template <class Codec, int K, int Rows>
+struct WideRowsTokens {
+    using Wide = WideRows<Codec, K, Rows>;
+    static constexpr int kPerStep = Wide::kLoads / Wide::kSteps;
+    static_assert(Wide::kLoads % Wide::kSteps == 0);
+
+    template <int N, int L, class X>
+    __device__ static __forceinline__ void dot(const uint4 (&packed)[L],
+                                               const std::uint32_t (&scale_bits)[L], X&& x, int n,
+                                               float (&result)[N][Rows]) {
+        static_assert(L >= Wide::kLoads);
+        const int lane = static_cast<int>(threadIdx.x) & 31;
+        float acc[N][Wide::kLoads];
+#pragma unroll
+        for (int t = 0; t < N; ++t) {
+#pragma unroll
+            for (int i = 0; i < Wide::kLoads; ++i) { acc[t][i] = 0.0f; }
+        }
+#pragma unroll
+        for (int step = 0; step < Wide::kSteps; ++step) {
+            int row, chunk;
+            Wide::slot(lane, step, row, chunk);
+#pragma unroll
+            for (int piece = 0; piece < Wide::kPieces; ++piece) {
+                float weights[kPerStep][8];
+                float scale[kPerStep];
+#pragma unroll
+                for (int m = 0; m < kPerStep; ++m) {
+                    const int i = step + m * Wide::kSteps;
+                    Codec::wide_weights(packed[i], scale_bits[i], piece, weights[m], scale[m]);
+                }
+#pragma unroll
+                for (int t = 0; t < N; ++t) {
+                    if (t >= n) { break; }
+                    float values[8];
+                    x(t, chunk * Codec::kWideValues + piece * 8, values);
+#pragma unroll
+                    for (int m = 0; m < kPerStep; ++m) {
+                        Codec::wide_apply(weights[m], scale[m], values, acc[t][step + m * Wide::kSteps]);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < N; ++t) {
+#pragma unroll
+            for (int r = 0; r < Rows; ++r) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int i = 0; i < Wide::kLoads; ++i) {
+                    int row, chunk;
+                    Wide::slot(lane, i, row, chunk);
+                    if (row == r) { sum += acc[t][i]; }
+                }
+                if (t < n) { result[t][r] = warp_reduce_sum(sum); } else { result[t][r] = 0.0f; }
+            }
+        }
+    }
+};
 
 /// A staged BF16 input as WideRows::dot reads it.
 struct SharedBf16Input {
@@ -1210,6 +1345,400 @@ __global__ void __launch_bounds__(256) sparse_moe_d3_expert_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Adapter rounds, expert-major. An adapter-bound round runs on the per-path kernels above at
+// every width (the vendored runner carries no LoRA with FP4 experts), and they read a routed
+// expert's rows once per (token, path): a prefill chunk read its experts' weights once per token.
+// Here a wide adapter round's paths are grouped by expert, and each tile of an expert's entries
+// reads the expert's rows once into registers for all of them. Every (token, path, row) value is
+// the per-path kernels' own: the same dot (WideRowsTokens is WideRows::dot per input), the same
+// LoRA expand and adjust, the same epilogue, and the down projection's paths added to the
+// residual by one combine in path order, as sparse_moe_d4_nine_warp_kernel adds them. Routing,
+// the round hook and the low-rank inputs are the per-path launches'; the router's adapter is
+// moe_lora_router_low/apply_kernel, moe_lora_router_kernel's arithmetic without its per-row repeat.
+// On an RTX 5090 (35B-A3B NVFP4, rank-16 adapter on every expert, 4,096-token prefill chunks) a
+// card's adapter prefill went from 1,522 to 4,617 tok/s, outputs and captured routing unchanged.
+// ---------------------------------------------------------------------------------------------
+
+/// The per-path down kernel's rows per warp, which the expert-major one keeps: the shape of a
+/// row's dot (WideRows<Codec, kIntermediate, kD4Rows>) is part of its bits.
+constexpr int kD4Rows = kIntermediate <= 512 ? 4 : kIntermediate <= 1024 ? 2 : 1;
+constexpr int kAdapterChunk = 8;
+constexpr int kAdapterWarps = 8;
+
+/// How the expert-major kernels stage an input of K values for a wide codec: in its chunks of
+/// kWideValues values, the chunk stride padded by 16 bytes where the chunk is an even number of
+/// 16-byte words. WideRows gives lane i chunk (step * 32 + i) or (i % kChunks), so unpadded 64- or
+/// 128-byte chunks put the eight lanes of one 16-byte shared-memory phase on the same four banks;
+/// an odd stride in 16-byte words spreads them over all 32.
+template <class Codec, class T, int K>
+struct AdapterStaging {
+    static constexpr int kChunkBytes = Codec::kWideValues * static_cast<int>(sizeof(T));
+    static_assert(kChunkBytes % 16 == 0);
+    static constexpr int kStride = (kChunkBytes / 16) % 2 == 0 ? Codec::kWideValues + 16 / static_cast<int>(sizeof(T))
+                                                                : Codec::kWideValues;
+    static constexpr int kSize = K / Codec::kWideValues * kStride;
+    __device__ static __forceinline__ int at(int k) {
+        return k / Codec::kWideValues * kStride + k % Codec::kWideValues;
+    }
+};
+
+template <class RoutedCodec, class DownCodec>
+inline constexpr bool kAdapterGroupedCodecs =
+    kWideRows<RoutedCodec, kHidden, 2> && kWideRows<DownCodec, kIntermediate, kD4Rows> &&
+    kWideRows<W8Codec, kHidden, 2> && kWideRows<W8Codec, kIntermediate, kD4Rows> &&
+    kHidden % (kAdapterWarps * kD4Rows) == 0 && kIntermediate % kAdapterWarps == 0 &&
+    kAdapterChunk * kD4Rows <= 32 &&
+    kAdapterChunk * AdapterStaging<RoutedCodec, __nv_bfloat16, kHidden>::kSize * 2 <= 48 * 1024 &&
+    kAdapterChunk * AdapterStaging<W8Codec, __nv_bfloat16, kHidden>::kSize * 2 <= 48 * 1024 &&
+    kAdapterChunk * AdapterStaging<DownCodec, float, kIntermediate>::kSize * 4 <= 48 * 1024 &&
+    kAdapterChunk * AdapterStaging<W8Codec, float, kIntermediate>::kSize * 4 <= 48 * 1024;
+using AdapterGateUpCodec = Nvfp4CodecFor<kHidden / 16>;
+using AdapterDownCodec   = Nvfp4CodecFor<kIntermediate / 16>;
+
+/// sparse_moe_adapter_routed_tiles, as the kernels read it.
+__host__ __device__ constexpr int adapter_routed_tiles(int paths) {
+    return (paths < kExperts ? paths : kExperts) + paths / kSparseMoeAdapterTile;
+}
+static_assert(adapter_routed_tiles(8 * kSparseMoeAdapterSlice) ==
+              sparse_moe_adapter_routed_tiles(8 * kSparseMoeAdapterSlice, kExperts));
+
+// groups: [0] routed tiles n; [1, 1 + 3T) the tiles (expert, begin, end) over the entries,
+// T = adapter_routed_tiles(paths); [1 + 3T, 1 + 3T + paths) the entries sorted by
+// expert, path = token * kTopK + slot. An expert's entries are in no particular order: each is
+// computed on its own.
+__global__ void __launch_bounds__(1024) sparse_moe_adapter_groups_kernel(
+    const int* __restrict__ ids, int paths, int* __restrict__ groups) {
+    __shared__ int count[kExperts];
+    __shared__ int cursor[kExperts];
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int e = tid; e < kExperts; e += 1024) { count[e] = 0; }
+    __syncthreads();
+    for (int p = tid; p < paths; p += 1024) { atomicAdd(&count[ids[p]], 1); }
+    __syncthreads();
+    int* tiles   = groups + 1;
+    int* entries = groups + 1 + 3 * adapter_routed_tiles(paths);
+    if (tid == 0) {
+        int n = 0, running = 0;
+        for (int e = 0; e < kExperts; ++e) {
+            const int c = count[e];
+            if (c == 0) { continue; }
+            cursor[e] = running;
+            for (int b = 0; b < c; b += kSparseMoeAdapterTile) {
+                tiles[3 * n]     = e;
+                tiles[3 * n + 1] = running + b;
+                tiles[3 * n + 2] = running + min(b + kSparseMoeAdapterTile, c);
+                ++n;
+            }
+            running += c;
+        }
+        groups[0] = n;
+    }
+    __syncthreads();
+    for (int p = tid; p < paths; p += 1024) { entries[atomicAdd(&cursor[ids[p]], 1)] = p; }
+}
+
+// A tile's expert and entries: routed tiles from the list, shared ones (Shared) a run of
+// consecutive tokens. False for a routed block past the round's tiles.
+template <bool Shared>
+__device__ __forceinline__ bool adapter_tile(const int* groups, int paths, int tokens, int& expert,
+                                             int& begin, int& end, const int*& entries) {
+    const int tile = static_cast<int>(blockIdx.y);
+    if constexpr (Shared) {
+        expert  = kExperts;
+        begin   = tile * kSparseMoeAdapterTile;
+        end     = min(begin + kSparseMoeAdapterTile, tokens);
+        entries = nullptr;
+        return true;
+    } else {
+        if (tile >= groups[0]) { return false; }
+        expert  = groups[1 + 3 * tile];
+        begin   = groups[2 + 3 * tile];
+        end     = groups[3 + 3 * tile];
+        entries = groups + 1 + 3 * adapter_routed_tiles(paths);
+        return true;
+    }
+}
+
+// Gate/up: block (kAdapterWarps intermediate rows j, tile), a warp a row j and both its rows,
+// the tile's tokens staged kAdapterChunk at a time. The epilogue -- gate/up scale, LoRA expand and
+// adjust, SwiGLU -- is sparse_moe_d3_nine_warp_kernel's lane-0 one, a lane per (token, half).
+template <class Codec, bool Shared>
+__global__ void __launch_bounds__(kAdapterWarps * 32, Shared ? 1 : 2) sparse_moe_d3_adapter_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ groups, int paths, int tokens,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    const float* __restrict__ gate_up_scale, float* __restrict__ act, const LoraBank* adapters,
+    const int* adapter_slot, const float* lora_low, int slot_stride) {
+    using Staging = AdapterStaging<Codec, __nv_bfloat16, kHidden>;
+    __shared__ __align__(16) __nv_bfloat16 x_shared[kAdapterChunk][Staging::kSize];
+    int expert, begin, end;
+    const int* entries;
+    if (!adapter_tile<Shared>(groups, paths, tokens, expert, begin, end, entries)) { return; }
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int j   = static_cast<int>(blockIdx.x) * kAdapterWarps + warp;
+    using Tokens  = WideRowsTokens<Codec, kHidden, 2>;
+    uint4 packed[Tokens::Wide::kLoads];
+    std::uint32_t scale_bits[Tokens::Wide::kLoads];
+    Tokens::Wide::load(codes, scales, (Shared ? 0 : expert * 2 * kIntermediate) + j, kIntermediate,
+                       packed, scale_bits);
+    for (int c0 = begin; c0 < end; c0 += kAdapterChunk) {
+        const int count = min(kAdapterChunk, end - c0);
+        for (int v = tid; v < count * (kHidden / 8); v += kAdapterWarps * 32) {
+            const int c = v / (kHidden / 8), vector = v - c * (kHidden / 8);
+            const int token = Shared ? c0 + c : entries[c0 + c] / kTopK;
+            store_vec(&x_shared[c][Staging::at(vector * 8)],
+                      load_vec<uint4>(x + static_cast<std::int64_t>(token) * kHidden + vector * 8));
+        }
+        __syncthreads();
+        float rows[kAdapterChunk][2];
+        Tokens::template dot<kAdapterChunk>(
+            packed, scale_bits,
+            [&](int t, int k, float (&values)[8]) { SharedBf16Input{x_shared[t] + Staging::at(k) - k}(k, values); },
+            count, rows);
+        // Lane (half * kAdapterChunk + t) takes token t's gate (half 0) or up (half 1).
+        const int t = lane % kAdapterChunk, half = lane / kAdapterChunk;
+        float row0 = 0.0f, row1 = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kAdapterChunk; ++c) {
+            const float r0 = __shfl_sync(kFullWarpMask, rows[c][0], 0);
+            const float r1 = __shfl_sync(kFullWarpMask, rows[c][1], 0);
+            if (t == c) { row0 = r0; row1 = r1; }
+        }
+        int token = 0, path = kTopK;
+        if (t < count) {
+            if constexpr (Shared) {
+                token = c0 + t;
+            } else {
+                const int entry = entries[c0 + t];
+                token = entry / kTopK;
+                path  = entry - token * kTopK;
+            }
+        }
+        float value = 0.0f;
+        if (half < 2 && t < count) {
+            float gate, up;
+            if constexpr (Shared) {
+                gate = row0;
+                up   = row1;
+            } else {
+                if (gate_up_scale != nullptr) {
+                    row0 *= gate_up_scale[expert * 2];
+                    row1 *= gate_up_scale[expert * 2 + 1];
+                }
+                gate = Codec::kGateRowsFirst ? row0 : row1;
+                up   = Codec::kGateRowsFirst ? row1 : row0;
+            }
+            const int* slot = adapter_slot + token * slot_stride;
+            const int bank  = 2 + half + 3 * expert;
+            value = half == 0 ? gate : up;
+            value += moe_lora_expand(adapters, bank, slot, j,
+                                     lora_low + static_cast<std::int64_t>(token) * 2 * kPaths * kMoeLoraMaxRank +
+                                         (path * 2 + half) * kMoeLoraMaxRank);
+            value = moe_lora_adjust(adapters, bank, slot, j, value);
+        }
+        const float up_value = __shfl_down_sync(kFullWarpMask, value, kAdapterChunk);
+        if (half == 0 && t < count) {
+            act[static_cast<std::int64_t>(token) * kDecodeScratch + path * kIntermediate + j] =
+                gated_clamped(value, up_value, kSwigluLimit, kActivation);
+        }
+        __syncthreads();
+    }
+}
+
+// Down: block (kAdapterWarps x kD4Rows output rows, tile), a warp kD4Rows rows, the tile's
+// activations staged kAdapterChunk at a time. The epilogue is sparse_moe_d4_nine_warp_kernel's,
+// a lane per (token, row); each path's value lands in `partials` for the combine.
+template <class Codec, bool Shared>
+__global__ void __launch_bounds__(kAdapterWarps * 32) sparse_moe_d4_adapter_kernel(
+    const int* __restrict__ groups, int paths, int tokens, const float* __restrict__ alpha,
+    const float* __restrict__ shared_scale, const float* __restrict__ act,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    const float* __restrict__ down_scale, float* __restrict__ partials, const LoraBank* adapters,
+    const int* adapter_slot, const float* lora_low, int slot_stride) {
+    using Staging = AdapterStaging<Codec, float, kIntermediate>;
+    __shared__ __align__(16) float act_shared[kAdapterChunk][Staging::kSize];
+    int expert, begin, end;
+    const int* entries;
+    if (!adapter_tile<Shared>(groups, paths, tokens, expert, begin, end, entries)) { return; }
+    const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int row_base = (static_cast<int>(blockIdx.x) * kAdapterWarps + warp) * kD4Rows;
+    using Tokens       = WideRowsTokens<Codec, kIntermediate, kD4Rows>;
+    uint4 packed[Tokens::Wide::kLoads];
+    std::uint32_t scale_bits[Tokens::Wide::kLoads];
+    Tokens::Wide::load(codes, scales, (Shared ? 0 : expert * kHidden) + row_base, 1, packed, scale_bits);
+    for (int c0 = begin; c0 < end; c0 += kAdapterChunk) {
+        const int count = min(kAdapterChunk, end - c0);
+        for (int v = tid; v < count * (kIntermediate / 4); v += kAdapterWarps * 32) {
+            const int c = v / (kIntermediate / 4), vector = v - c * (kIntermediate / 4);
+            int token, path;
+            if constexpr (Shared) {
+                token = c0 + c;
+                path  = kTopK;
+            } else {
+                const int entry = entries[c0 + c];
+                token = entry / kTopK;
+                path  = entry - token * kTopK;
+            }
+            store_vec(&act_shared[c][Staging::at(vector * 4)],
+                      load_vec<float4>(act + static_cast<std::int64_t>(token) * kDecodeScratch +
+                                       path * kIntermediate + vector * 4));
+        }
+        __syncthreads();
+        float rows[kAdapterChunk][kD4Rows];
+        Tokens::template dot<kAdapterChunk>(
+            packed, scale_bits,
+            [&](int t, int k, float (&values)[8]) { GlobalF32Input{act_shared[t] + Staging::at(k) - k}(k, values); },
+            count, rows);
+        // Lane (t * kD4Rows + r) takes token t's row r.
+        const int t = lane / kD4Rows, r = lane % kD4Rows;
+        float dot = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kAdapterChunk; ++c) {
+#pragma unroll
+            for (int q = 0; q < kD4Rows; ++q) {
+                const float value = __shfl_sync(kFullWarpMask, rows[c][q], 0);
+                if (t == c && r == q) { dot = value; }
+            }
+        }
+        if (t < count) {
+            int token, path;
+            if constexpr (Shared) {
+                token = c0 + t;
+                path  = kTopK;
+            } else {
+                const int entry = entries[c0 + t];
+                token = entry / kTopK;
+                path  = entry - token * kTopK;
+                if (down_scale != nullptr) { dot *= down_scale[expert]; }
+            }
+            const int* slot = adapter_slot + token * slot_stride;
+            const int bank  = 4 + 3 * expert;
+            const int row   = row_base + r;
+            dot += moe_lora_expand(adapters, bank, slot, row,
+                                   lora_low + static_cast<std::int64_t>(token) * 2 * kPaths * kMoeLoraMaxRank +
+                                       path * kMoeLoraMaxRank);
+            dot = moe_lora_adjust(adapters, bank, slot, row, dot);
+            const float weight = Shared ? shared_scale[token] : alpha[token * kTopK + path];
+            partials[(static_cast<std::int64_t>(token) * kPaths + path) * kHidden + row] = weight * dot;
+        }
+        __syncthreads();
+    }
+}
+
+// The residual plus every path's partial in path order, as the per-path down kernel adds them.
+__global__ void sparse_moe_adapter_combine_kernel(const float* __restrict__ partials,
+                                                  __nv_bfloat16* __restrict__ destination) {
+    const int token = static_cast<int>(blockIdx.y);
+    const int row   = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= kHidden) { return; }
+    const std::int64_t at = static_cast<std::int64_t>(token) * kHidden + row;
+    float value = __bfloat162float(destination[at]);
+#pragma unroll
+    for (int path = 0; path < kPaths; ++path) {
+        value += partials[(static_cast<std::int64_t>(token) * kPaths + path) * kHidden + row];
+    }
+    destination[at] = __float2bfloat16_rn(value);
+}
+
+// Whether an adapter round takes the expert-major kernels: wide enough and allocated for them,
+// NVFP4 routed experts (the profile whose wide rounds otherwise leave our kernels), every expert
+// resident and the shared expert's weights ours.
+bool adapter_grouped(const Tensor& x, const PreparedSparseMoeWeights& weights,
+                     const SparseMoeDecodeWorkspace& workspace, const LoraBank* adapters) {
+    if (adapters == nullptr || workspace.adapter_groups.data == nullptr ||
+        workspace.adapter_partials.data == nullptr || x.ne[1] < kSparseMoeAdapterGroupedMin ||
+        weights.slot_of_expert != nullptr || weights.routed_gate_up.qtype != QType::NVFP4 ||
+        weights.routed_down.qtype != QType::NVFP4) {
+        return false;
+    }
+    if constexpr (kHasShared) {
+        if (weights.shared_output.data != nullptr || weights.shared_gate_up.qdata == nullptr ||
+            weights.shared_down.qdata == nullptr) {
+            return false;
+        }
+    }
+    return kAdapterGroupedCodecs<AdapterGateUpCodec, AdapterDownCodec>;
+}
+
+std::int32_t adapter_shared_tiles(std::int32_t tokens) {
+    return (tokens + kSparseMoeAdapterTile - 1) / kSparseMoeAdapterTile;
+}
+
+void launch_d3_adapter(const Tensor& x, const PreparedSparseMoeWeights& weights,
+                       const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                       const LoraBank* adapters, const int* adapter_slot) {
+    if constexpr (kAdapterGroupedCodecs<AdapterGateUpCodec, AdapterDownCodec>) {
+        const std::int32_t tokens = x.ne[1];
+        const std::int32_t paths  = tokens * kTopK;
+        auto* groups              = static_cast<int*>(workspace.adapter_groups.data);
+        sparse_moe_adapter_groups_kernel<<<1, 1024, 0, stream>>>(
+            static_cast<const int*>(workspace.ids.data), paths, groups);
+        CUDA_CHECK(cudaGetLastError());
+        const auto* input = static_cast<const __nv_bfloat16*>(x.data);
+        auto* act         = static_cast<float*>(workspace.scratch.data);
+        const auto* low   = static_cast<const float*>(workspace.lora_low.data);
+        sparse_moe_d3_adapter_kernel<AdapterGateUpCodec, false>
+            <<<dim3(kIntermediate / kAdapterWarps, adapter_routed_tiles(paths)),
+               kAdapterWarps * 32, 0, stream>>>(
+                input, groups, paths, tokens,
+                static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
+                static_cast<const std::uint8_t*>(weights.routed_gate_up.scales),
+                weights.routed_gate_up_scale, act, adapters, adapter_slot, low, workspace.slot_stride);
+        CUDA_CHECK(cudaGetLastError());
+        if constexpr (kHasShared) {
+            sparse_moe_d3_adapter_kernel<W8Codec, true>
+                <<<dim3(kIntermediate / kAdapterWarps, adapter_shared_tiles(tokens)), kAdapterWarps * 32,
+                   0, stream>>>(input, groups, paths, tokens,
+                                static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
+                                static_cast<const std::uint8_t*>(weights.shared_gate_up.scales), nullptr,
+                                act, adapters, adapter_slot, low, workspace.slot_stride);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    } else {
+        (void)x; (void)weights; (void)workspace; (void)stream; (void)adapters; (void)adapter_slot;
+        throw std::logic_error("sparse_moe: no expert-major adapter kernels for this geometry");
+    }
+}
+
+void launch_d4_adapter(const PreparedSparseMoeWeights& weights, Tensor& destination,
+                       const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                       const LoraBank* adapters, const int* adapter_slot) {
+    if constexpr (kAdapterGroupedCodecs<AdapterGateUpCodec, AdapterDownCodec>) {
+        const std::int32_t tokens = destination.ne[1];
+        const std::int32_t paths  = tokens * kTopK;
+        const auto* groups        = static_cast<const int*>(workspace.adapter_groups.data);
+        const auto* alpha         = static_cast<const float*>(workspace.alpha.data);
+        const auto* shared_scale  = static_cast<const float*>(workspace.shared_scale.data);
+        const auto* act           = static_cast<const float*>(workspace.scratch.data);
+        const auto* low           = static_cast<const float*>(workspace.lora_low.data);
+        auto* partials            = static_cast<float*>(workspace.adapter_partials.data);
+        constexpr int kRowBlocks  = kHidden / (kAdapterWarps * kD4Rows);
+        sparse_moe_d4_adapter_kernel<AdapterDownCodec, false>
+            <<<dim3(kRowBlocks, adapter_routed_tiles(paths)), kAdapterWarps * 32, 0,
+               stream>>>(groups, paths, tokens, alpha, shared_scale, act,
+                         static_cast<const std::uint8_t*>(weights.routed_down.qdata),
+                         static_cast<const std::uint8_t*>(weights.routed_down.scales),
+                         weights.routed_down_scale, partials, adapters, adapter_slot, low,
+                         workspace.slot_stride);
+        CUDA_CHECK(cudaGetLastError());
+        if constexpr (kHasShared) {
+            sparse_moe_d4_adapter_kernel<W8Codec, true>
+                <<<dim3(kRowBlocks, adapter_shared_tiles(tokens)), kAdapterWarps * 32, 0, stream>>>(
+                    groups, paths, tokens, alpha, shared_scale, act,
+                    static_cast<const std::uint8_t*>(weights.shared_down.qdata),
+                    static_cast<const std::uint8_t*>(weights.shared_down.scales), nullptr, partials,
+                    adapters, adapter_slot, low, workspace.slot_stride);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        sparse_moe_adapter_combine_kernel<<<dim3((kHidden + 255) / 256, tokens), 256, 0, stream>>>(
+            partials, static_cast<__nv_bfloat16*>(destination.data));
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        (void)weights; (void)destination; (void)workspace; (void)stream; (void)adapters; (void)adapter_slot;
+        throw std::logic_error("sparse_moe: no expert-major adapter kernels for this geometry");
+    }
+}
+
 void launch_d1(const Tensor& x, const Weight& router_shared_gate,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     sparse_moe_d1_kernel<<<dim3(kRouterRows, x.ne[1]), kD1Warps * 32, 0, stream>>>(
@@ -1303,7 +1832,8 @@ inline D3Probe& d3_probe() {
 void launch_d2_d3(const Tensor& x, const PreparedSparseMoeWeights& weights, Tensor& destination,
                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                   const SparseMoeRoundHook* hook,
-                  const LoraBank* adapters = nullptr, const int* adapter_slot = nullptr) {
+                  const LoraBank* adapters = nullptr, const int* adapter_slot = nullptr,
+                  bool grouped = false) {
     const auto* scores = static_cast<const float*>(workspace.scratch.data);
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
@@ -1328,6 +1858,10 @@ void launch_d2_d3(const Tensor& x, const PreparedSparseMoeWeights& weights, Tens
             static_cast<const __nv_bfloat16*>(x.data), nullptr, ids, adapters, adapter_slot,
             static_cast<float*>(workspace.lora_low.data), false, workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
+    }
+    if (grouped) {
+        launch_d3_adapter(x, weights, workspace, stream, adapters, adapter_slot);
+        return;
     }
     d3_probe().begin(stream);
     switch (weights.routed_gate_up.qtype) {
@@ -1383,7 +1917,6 @@ void launch_d4_dependent_codec(const PreparedSparseMoeWeights& weights, Tensor& 
     // slice once per row it owns, and a block pays its barrier and epilogue once per block, so
     // short rows want several per warp: four at FFN 512 was 12 % off D4, one at FFN 2048
     // was the best of the three there. Measured on a 5090, cold, over Q4_K/Q5_K/Q6_K.
-    constexpr int kD4Rows = kIntermediate <= 512 ? 4 : kIntermediate <= 1024 ? 2 : 1;
     static_assert(kHidden % kD4Rows == 0);
     CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / kD4Rows, destination.ne[1]), dim3(kPaths * 32), 0, stream},
                                      sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows>, ids, alpha,
@@ -1782,19 +2315,33 @@ void decode_launch(const Tensor& x, const Tensor& router_x, const PreparedSparse
                    cudaStream_t stream, const SparseMoeRoundHook* hook,
                    const LoraBank* adapters, const int* adapter_slot) {
     launch_d1(router_x, weights.router_shared_gate, workspace, stream);
-    if (adapters) {
+    const bool grouped = adapter_grouped(x, weights, workspace, adapters);
+    if (grouped) {
+        moe_lora_router_low_kernel<<<dim3(moe_lora_rank_rows(workspace), 2, x.ne[1]), 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(router_x.data), adapters, adapter_slot,
+            static_cast<float*>(workspace.lora_low.data), workspace.slot_stride);
+        CUDA_CHECK(cudaGetLastError());
+        moe_lora_router_apply_kernel<<<dim3((kRouterRows + 127) / 128, x.ne[1]), 128, 0, stream>>>(
+            adapters, adapter_slot, static_cast<const float*>(workspace.lora_low.data),
+            static_cast<float*>(workspace.scratch.data), workspace.slot_stride);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (adapters) {
         moe_lora_router_kernel<<<dim3(kRouterRows, x.ne[1]), 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(router_x.data), adapters, adapter_slot,
             static_cast<float*>(workspace.scratch.data), workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
     }
-    launch_d2_d3(x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
+    launch_d2_d3(x, weights, destination, workspace, stream, hook, adapters, adapter_slot, grouped);
     if (adapters) {
         moe_lora_low_kernel<<<dim3(moe_lora_rank_rows(workspace), kPaths, x.ne[1]), 32, 0, stream>>>(
             nullptr, static_cast<const float*>(workspace.scratch.data),
             static_cast<const int*>(workspace.ids.data), adapters, adapter_slot,
             static_cast<float*>(workspace.lora_low.data), true, workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
+    }
+    if (grouped) {
+        launch_d4_adapter(weights, destination, workspace, stream, adapters, adapter_slot);
+        return;
     }
     launch_d4_dependent(weights, destination, workspace, stream, adapters, adapter_slot);
 }

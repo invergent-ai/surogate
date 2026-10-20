@@ -5,9 +5,11 @@
 #include "ops/op_tester.h"
 #include "family/impl/moe/expert_cache.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <random>
 #include <vector>
 
 using namespace sinfer;
@@ -354,6 +356,182 @@ static void expert_adapters(bool shared, int tokens = 3, bool cpu = false,
     test::cuda_check(cudaStreamDestroy(stream), "destroy stream");
 }
 
+// The expert-major adapter round (ops::detail::kSparseMoeAdapterGroupedMin tokens and wider,
+// NVFP4 routed experts) against the per-path one it replaces, which every adapter round took
+// before it: random weights, rank-16 adapters on every expert, the shared expert and the router,
+// half the tokens on four hot experts so their entries span several tiles and chunks, and tokens
+// on two adapters and on none (per-token slots), then one adapter for all (a prefill's uniform
+// cell). The outputs and the routing must be the same bits.
+static void grouped_expert_adapters(int tokens) {
+    Context context;
+    const auto g = ops::kSparseMoeQwen36Geometry;
+    const int h = g.hidden, m = g.intermediate, e = g.experts, rank = 16;
+    std::mt19937 rng(20261020u + static_cast<unsigned>(tokens));
+    const auto bytes = [&](std::size_t n, int lo, int hi) {
+        std::vector<std::uint8_t> out(n);
+        std::uniform_int_distribution<int> pick(lo, hi);
+        for (auto& b : out) { b = static_cast<std::uint8_t>(pick(rng)); }
+        return out;
+    };
+    const auto halves = [&](std::size_t n) {   // fp16 bit patterns in [2^-8, 2^-6)
+        std::vector<std::uint16_t> out(n);
+        std::uniform_int_distribution<int> pick(0x1C00, 0x23FF);
+        for (auto& b : out) { b = static_cast<std::uint16_t>(pick(rng)); }
+        return out;
+    };
+    const auto normal = [&](std::size_t n, float sigma) {
+        std::vector<float> out(n);
+        std::normal_distribution<float> pick(0.0F, sigma);
+        for (auto& v : out) { v = pick(rng); }
+        return out;
+    };
+    const auto bf16 = [&](const std::vector<float>& values) {
+        std::vector<std::uint16_t> out(values.size());
+        for (std::size_t i = 0; i < values.size(); ++i) { out[i] = test::f32_to_bf16(values[i]); }
+        return out;
+    };
+    struct Nvfp4 {
+        DeviceBuffer codes, scales;
+        Weight weight;
+    };
+    const auto nvfp4 = [&](int n, int k) {
+        Nvfp4 w{test::to_device(bytes(std::size_t(n) * k / 2, 0, 255)),
+                // e4m3 scales in [2^-3, 2): no NaN, no zero.
+                test::to_device(bytes(std::size_t(n) * k / 16, 0x20, 0x3F)), {}};
+        w.weight.payload = w.weight.qdata = w.codes.p;
+        w.weight.scales = w.scales.p;
+        w.weight.payload_bytes = w.codes.bytes + w.scales.bytes;
+        w.weight.qtype = QType::NVFP4;
+        w.weight.layout = QuantLayout::BlockScaleK16M128x4;
+        w.weight.scale_dtype = DType::FP8_E4M3FN;
+        w.weight.group = w.weight.group_size = 16;
+        w.weight.n = w.weight.shape[0] = w.weight.padded_shape[0] = n;
+        w.weight.k = w.weight.shape[1] = w.weight.padded_shape[1] = k;
+        w.weight.ndim = 2;
+        return w;
+    };
+    struct W8 {
+        DeviceBuffer codes, scales;
+        Weight weight;
+    };
+    const auto w8 = [&](int n, int k) {
+        W8 w{test::to_device(bytes(std::size_t(n) * k, 0, 255)), test::to_device(halves(std::size_t(n) * (k / 32))), {}};
+        w.weight.payload = w.weight.qdata = w.codes.p;
+        w.weight.scales = w.scales.p;
+        w.weight.payload_bytes = w.codes.bytes + w.scales.bytes;
+        w.weight.qtype = QType::W8G32_F16S;
+        w.weight.layout = QuantLayout::RowSplit;
+        w.weight.scale_dtype = DType::FP16;
+        w.weight.group = w.weight.group_size = 32;
+        w.weight.n = w.weight.shape[0] = w.weight.padded_shape[0] = n;
+        w.weight.k = w.weight.shape[1] = w.weight.padded_shape[1] = k;
+        w.weight.ndim = 2;
+        return w;
+    };
+    // Router rows 0..3 lean on the shared direction the first half of the tokens carry.
+    std::vector<float> direction = normal(h, 1.0F), router = normal(std::size_t(e + 1) * h, 0.02F);
+    for (int row = 0; row < 4; ++row) {
+        for (int i = 0; i < h; ++i) { router[std::size_t(row) * h + i] += 0.05F * direction[i]; }
+    }
+    ZeroWeight router_weight(e + 1, h);
+    test::cuda_check(cudaMemcpy(router_weight.codes.p, bf16(router).data(), router.size() * 2, cudaMemcpyHostToDevice), "router");
+    auto gu = nvfp4(e * 2 * m, h), down = nvfp4(e * h, m);
+    auto sgu = w8(2 * m, h), sd = w8(h, m);
+    std::vector<float> gu_scale(2 * e), down_scale(e);
+    for (auto& v : gu_scale) { v = std::uniform_real_distribution<float>(0.5F, 2.0F)(rng); }
+    for (auto& v : down_scale) { v = std::uniform_real_distribution<float>(0.5F, 2.0F)(rng); }
+    auto dgu_scale = test::to_device(gu_scale), ddown_scale = test::to_device(down_scale);
+    ops::SparseMoeWeights weights;
+    weights.router_shared_gate = router_weight.weight;
+    weights.routed_gate_up = gu.weight;
+    weights.routed_down = down.weight;
+    weights.shared_gate_up = sgu.weight;
+    weights.shared_down = sd.weight;
+    weights.experts_per_token = g.experts_per_token;
+    weights.routed_gate_up_scale = static_cast<const float*>(dgu_scale.p);
+    weights.routed_down_scale = static_cast<const float*>(ddown_scale.p);
+    assert(ops::sparse_moe_geometry(weights) == g);
+
+    auto& store = ops::lora_store_for_current_device();
+    store.configure(2, rank, tokens);
+    family::bind_lora_moe(store, 0, weights);
+    store.ensure_banks();
+    store.set_active(true);
+    const auto module = [&](const std::string& name, int slot, int in, int out) {
+        store.set_module_slot(0, name, slot, bf16(normal(std::size_t(rank) * in, 0.02F)),
+                              bf16(normal(std::size_t(out) * rank, 0.02F)), rank, in, out, 2.0F);
+    };
+    for (int slot = 0; slot < 2; ++slot) {
+        module("mlp.gate", slot, h, e);
+        module("mlp.shared_expert_gate", slot, h, 1);
+        module("mlp.shared_expert.gate_proj", slot, h, m);
+        module("mlp.shared_expert.up_proj", slot, h, m);
+        module("mlp.shared_expert.down_proj", slot, m, h);
+        for (int expert = 0; expert < e; ++expert) {
+            const auto prefix = "mlp.experts." + std::to_string(expert) + ".";
+            module(prefix + "gate_proj", slot, h, m);
+            module(prefix + "up_proj", slot, h, m);
+            module(prefix + "down_proj", slot, m, h);
+        }
+    }
+    std::vector<float> input = normal(std::size_t(h) * tokens, 1.0F);
+    for (int t = 0; t < tokens / 2; ++t) {
+        for (int i = 0; i < h; ++i) { input[std::size_t(t) * h + i] += 3.0F * direction[i]; }
+    }
+    auto dx = test::to_device(bf16(input));
+    const auto residual = bf16(normal(std::size_t(h) * tokens, 0.5F));
+    DeviceBuffer out_paths(residual.size() * 2), out_grouped(residual.size() * 2);
+    std::vector<int> selected(tokens);
+    for (int t = 0; t < tokens; ++t) { selected[t] = t % 3 - 1; }
+    auto dslots = test::to_device_i32(selected);
+    auto uniform = test::to_device_i32(std::vector<int>{1});
+    Tensor x(dx.p, DType::BF16, {h, tokens});
+    const auto* banks = store.bank_table(weights.router_shared_gate.qdata);
+    assert(banks != nullptr);
+    for (int uniform_cell = 0; uniform_cell < 2; ++uniform_cell) {
+        std::vector<int> ids[2];
+        std::vector<std::uint16_t> results[2];
+        for (int grouped = 0; grouped < 2; ++grouped) {
+            DeviceBuffer& out = grouped ? out_grouped : out_paths;
+            test::cuda_check(cudaMemcpy(out.p, residual.data(), out.bytes, cudaMemcpyHostToDevice), "residual");
+            Tensor result(out.p, DType::BF16, {h, tokens});
+            DeviceArena arena(ops::detail::sparse_moe_decode_workspace_bytes(g, tokens, grouped != 0));
+            test::cuda_check(cudaMemset(arena.base(), 0, arena.capacity()), "clear workspace");
+            WorkspaceArena workspace(DeviceSpan{arena.base(), arena.capacity()});
+            auto views = ops::detail::allocate_sparse_moe_decode_workspace(workspace, g, tokens, grouped != 0);
+            views.slot_stride = uniform_cell ? 0 : 1;
+            views.lora_rank = store.max_rank();
+            ops::detail::sparse_moe_decode_launch(
+                g, x, x, weights, result, views, nullptr, nullptr, banks,
+                static_cast<const std::int32_t*>(uniform_cell ? uniform.p : dslots.p));
+            test::cuda_synchronize();
+            ids[grouped] = test::from_device<int>(views.ids.data, std::size_t(tokens) * g.experts_per_token);
+            if (grouped) {   // The expert-major kernels ran: their tile list is written.
+                assert(test::from_device<int>(views.adapter_groups.data, 1)[0] > 0);
+            }
+            results[grouped] = test::from_device<std::uint16_t>(out, residual.size());
+        }
+        assert(ids[0] == ids[1]);
+        std::vector<int> per_expert(e, 0);
+        for (int id : ids[0]) { ++per_expert[id]; }
+        // The hot experts carry the first half of the tokens: past one tile at the wider round.
+        assert(*std::max_element(per_expert.begin(), per_expert.end()) >= tokens / 2);
+        assert(tokens / 2 <= ops::detail::kSparseMoeAdapterTile ||
+               *std::max_element(per_expert.begin(), per_expert.end()) > ops::detail::kSparseMoeAdapterTile);
+        std::size_t differ = 0, changed = 0;
+        for (std::size_t i = 0; i < residual.size(); ++i) {
+            differ += results[0][i] != results[1][i];
+            changed += results[0][i] != residual[i];
+        }
+        if (differ != 0 || changed < residual.size() / 2) {
+            std::cerr << "expert-major adapter round (" << tokens << " tokens, uniform " << uniform_cell
+                      << "): " << differ << " values differ from the per-path round, " << changed
+                      << " changed from the residual\n";
+            std::abort();
+        }
+    }
+}
+
 static void gdn_adapters() {
     Context context;
     constexpr int h = 64, k = 128, v = 128, c = 2 * k + v, heads = 8, width = 2, batch = 2, tokens = width * batch;
@@ -485,6 +663,8 @@ int main() {
     expert_adapters(false);
     expert_adapters(true);
     expert_adapters(false, 129);
+    grouped_expert_adapters(ops::detail::kSparseMoeAdapterGroupedMin);
+    grouped_expert_adapters(300);
     expert_adapters(false, 3, true);
     expert_adapters(false, 33, true);
     // Two token columns fit at once. Distinct per-column adapters must retain their

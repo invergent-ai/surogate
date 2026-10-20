@@ -16,6 +16,25 @@ namespace sinfer::ops::detail {
 
 inline constexpr int kMoeLoraMaxRank = 256;
 
+/// Adapter rounds at least this wide take the expert-major kernels (sparse_moe_decode_body.inc,
+/// "Adapter rounds, expert-major") where the routed codec has one: each distinct expert's rows read
+/// once for all of its tokens instead of once per (token, path), with every token's sums in the
+/// per-path kernels' own order. Narrower rounds -- decode -- keep the per-path kernels.
+inline constexpr std::int32_t kSparseMoeAdapterGroupedMin = 64;
+/// The widest adapter round one set of launches carries; a wider call runs in slices, which bounds
+/// the per-(token, path) output partials the expert-major down projection keeps for its combine.
+inline constexpr std::int32_t kSparseMoeAdapterSlice = 1024;
+/// Entries (token, path) one expert-major tile carries at most: a hot expert's tokens spread
+/// over several blocks rather than one block walking all of them.
+inline constexpr std::int32_t kSparseMoeAdapterTile = 64;
+
+/// The routed tiles an expert-major adapter round of `paths` (token, path) entries can need:
+/// every used expert's last tile, plus one per whole tile of entries.
+[[nodiscard]] constexpr std::int32_t sparse_moe_adapter_routed_tiles(std::int32_t paths,
+                                                                     std::int32_t experts) noexcept {
+    return std::min(paths, experts) + paths / kSparseMoeAdapterTile;
+}
+
 enum class SparseMoeSmallTD3Schedule : std::uint8_t;
 enum class SparseMoeSmallTD4Schedule : std::uint8_t;
 
@@ -37,12 +56,18 @@ struct SparseMoeDecodeWorkspace {
     /// rank-16 store, fifteen blocks in sixteen of the two widest launches of every layer.
     /// A caller that does not know the store's rank leaves the stride and loses nothing but time.
     std::int32_t lora_rank = kMoeLoraMaxRank;
+    /// An expert-major adapter round's tile list and sorted entries, and its down projection's
+    /// per-(token, path) partials, which a combine adds to the residual in the per-path order.
+    /// Empty unless the round was allocated `grouped`.
+    Tensor adapter_groups;
+    Tensor adapter_partials;
 };
 
 template <class Arena>
 SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena,
                                                               const SparseMoeGeometry& geometry,
-                                                              std::int32_t tokens = 1) {
+                                                              std::int32_t tokens = 1,
+                                                              bool grouped = false) {
     SparseMoeDecodeWorkspace out;
     out.ids          = arena.alloc(DType::I32, {geometry.experts_per_token, tokens}, 16);
     out.alpha        = arena.alloc(DType::FP32, {geometry.experts_per_token, tokens}, 16);
@@ -54,11 +79,18 @@ SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena,
                                                                        geometry.intermediate);
     out.scratch = arena.alloc(DType::FP32, {scratch_rows * geometry.intermediate, tokens}, 256);
     out.lora_low = arena.alloc(DType::FP32, {2 * geometry.paths() * kMoeLoraMaxRank, tokens}, 256);
+    if (grouped) {
+        const std::int32_t paths = geometry.experts_per_token * tokens;
+        out.adapter_groups = arena.alloc(
+            DType::I32, {1 + 3 * sparse_moe_adapter_routed_tiles(paths, geometry.experts) + paths}, 256);
+        out.adapter_partials = arena.alloc(DType::FP32, {geometry.paths() * geometry.hidden, tokens}, 256);
+    }
     return out;
 }
 
 [[nodiscard]] std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry,
-                                                           std::int32_t tokens = 1);
+                                                           std::int32_t tokens = 1,
+                                                           bool grouped = false);
 [[nodiscard]] SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geometry,
                                                                  QType routed_gate_up,
                                                                  QType routed_down);
