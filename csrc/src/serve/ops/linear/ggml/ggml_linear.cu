@@ -238,6 +238,22 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
             }
             const auto tile = [&]<int Cols>() {
                 const dim3 grid((rows + 15) / 16, (tokens + Cols - 1) / Cols);
+                // The generic formats' tile. Above 48 KiB (128 columns at 32 rows) it lives in
+                // dynamic shared memory, which this sizes and opts in to.
+                const auto affine = [&]<int Rows>(dim3 blocks) {
+                    using Smem = DenseAffineSmem<Type, Cols, Rows>;
+                    static_assert(sizeof(Smem) <= kDynamicSharedLimit,
+                                  "the tile does not fit the shared memory of an sm_89 block");
+                    constexpr std::size_t dynamic = i8_dynamic_smem_bytes<Smem>();
+                    auto* const kernel = dense_affine_mma_kernel<Type, Cols, Rows>;
+                    if constexpr (dynamic > 0) {
+                        CUDA_CHECK(set_func_attribute_per_device(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            static_cast<int>(dynamic)));
+                    }
+                    kernel<<<blocks, (Cols / 8) * 32, dynamic, stream>>>(
+                        bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                };
                 if constexpr (Type == GgmlType::F16) {
                     dense_f16_mma_kernel<Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
                         static_cast<const __half*>(blocks), x, rows, k, tokens, out, beta != 0);
@@ -256,12 +272,9 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
                         }
                     }
                 } else if (Cols >= 64 && affine_rows() == 32) {
-                    const dim3 tall((rows + 31) / 32, (tokens + Cols - 1) / Cols);
-                    dense_affine_mma_kernel<Type, Cols, 32><<<tall, (Cols / 8) * 32, 0, stream>>>(
-                        bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                    affine.template operator()<32>(dim3((rows + 31) / 32, (tokens + Cols - 1) / Cols));
                 } else {
-                    dense_affine_mma_kernel<Type, Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
-                        bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                    affine.template operator()<16>(grid);
                 }
             };
             if (tokens <= 8 && Type == GgmlType::Q8_0) { tile.template operator()<16>(); }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/linear/ggml/ggml_dense_codec.cuh"
+#include "ops/linear/ggml/ggml_i8_tile.cuh"
 #include "ops/linear/ggml/ggml_tile_order.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -112,17 +113,14 @@ __device__ __forceinline__ unsigned dense_ldmatrix_x1(unsigned address) {
 // tiles amortize codebook decoding and metadata loads across the batch. Thirty-
 // two rows (two m16 tiles per warp, 64 accumulators a lane) halve how often the
 // activation tile is re-read per weight row; each output's arithmetic, and so its
-// bits, are the same at either height.
-template <GgmlType Type, int Cols, int Rows = 16>
-__global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
+// bits, are the same at either height. The shared memory is dense_affine_mma_kernel's.
+template <GgmlType Type, int Cols, int Rows>
+__device__ __forceinline__ void dense_affine_mma_tile(
+    std::int8_t* a, std::int8_t* b, float2* scales, float* dx,
     const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
     int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
-    static_assert(Rows == 16 || Rows == 32);
     constexpr int threads = (Cols / 8) * 32, width = DenseFormat<Type>::kWidth;
     constexpr int stride = 272, groups = 256 / width, Tiles = Rows / 16;
-    __shared__ __align__(16) std::int8_t a[Rows * stride], b[Cols * stride];
-    __shared__ float2 scales[groups * Rows];
-    __shared__ float dx[Cols * 8];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int gid = lane >> 2, lid = lane & 3;
     // Bands of 512 weight rows across every column tile (grouped_tile).
@@ -211,6 +209,42 @@ __global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
                 out[i] = __float2bfloat16_rn((p0 + p1) + (accumulate ? __bfloat162float(out[i]) : 0.0f));
             }
         }
+    }
+}
+
+// The tile's shared memory: a 256-value chunk of the weight rows unpacked to int8, the same chunk
+// of every column's activation codes, and both sides' scales. 128 columns at 32 rows (the wide
+// tile TQ1_0 takes) need 48.5 KiB, 50.5 with 16-value scale groups: past the 48 KiB of static
+// shared memory an sm_89 block may declare, so that tile takes the launch's dynamic shared memory
+// (i8_tile_smem), which the launcher sizes with i8_dynamic_smem_bytes and opts in to.
+template <GgmlType Type, int Cols, int Rows>
+struct DenseAffineSmem {
+    static constexpr int kStride = 272, kGroups = 256 / DenseFormat<Type>::kWidth;
+    alignas(16) std::int8_t a[Rows * kStride];
+    alignas(16) std::int8_t b[Cols * kStride];
+    float2 scales[kGroups * Rows];
+    float dx[Cols * 8];
+};
+
+template <GgmlType Type, int Cols, int Rows = 16>
+__global__ __launch_bounds__((Cols / 8) * 32) void dense_affine_mma_kernel(
+    const std::uint8_t* weights, const std::int8_t* codes, const __half2* ds,
+    int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
+    static_assert(Rows == 16 || Rows == 32);
+    using Smem = DenseAffineSmem<Type, Cols, Rows>;
+    if constexpr (sizeof(Smem) <= kI8StaticSmemLimit) {
+        // Four arrays, not one Smem: as distinct objects the compiler knows they do not alias.
+        // Through one struct the 64-column IQ4_NL, MXFP4 and Q4_0 prompt GEMMs ran 9-12% slower
+        // (10240 x 2560 at 4,096 tokens, RTX 5090).
+        __shared__ __align__(16) std::int8_t a[Rows * Smem::kStride], b[Cols * Smem::kStride];
+        __shared__ float2 scales[Smem::kGroups * Rows];
+        __shared__ float dx[Cols * 8];
+        dense_affine_mma_tile<Type, Cols, Rows>(a, b, scales, dx, weights, codes, ds, rows, k,
+                                                tokens, out, accumulate);
+    } else {
+        auto& sm = i8_tile_smem<Smem>();
+        dense_affine_mma_tile<Type, Cols, Rows>(sm.a, sm.b, sm.scales, sm.dx, weights, codes, ds,
+                                                rows, k, tokens, out, accumulate);
     }
 }
 
