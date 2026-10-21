@@ -19,4 +19,11 @@ void marlin_gemm_bf16(const void* a, const void* b_packed, const void* b_scales,
                       void* c_tmp, int* locks, int prob_m, int prob_n, int prob_k,
                       int group_size, bool b_is_fp8, int sm_count, cudaStream_t stream);
 
+// Weight-only NVFP4: B is kFE2M1f Marlin tiles with the S0E5M3-encoded group-16 scales and an
+// FP32 global scale on the device (see marlin_nvfp4.h for how a stored weight becomes those).
+void marlin_gemm_nvfp4_bf16(const void* a, const void* b_packed, const void* b_scales,
+                            const float* global_scale, void* c, void* c_tmp, int* locks,
+                            int prob_m, int prob_n, int prob_k, int sm_count,
+                            cudaStream_t stream);
+
 } // namespace sinfer::ops::detail

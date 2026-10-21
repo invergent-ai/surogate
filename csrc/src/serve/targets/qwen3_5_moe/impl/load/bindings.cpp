@@ -39,6 +39,12 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, artifact::
     const auto routed_of = [&](artifact::TensorPlacement wanted) {
         return placement == artifact::TensorPlacement::Device ? wanted : placement;
     };
+    // The shared expert is W8 unless the export is weight-only NVFP4 throughout the mixture.
+    const auto* stored_shared =
+        std::get_if<artifact::TensorDescriptor>(binder.reader().find(prefix + "shared_gate_up"));
+    const NumericFormat shared_format =
+        stored_shared != nullptr && stored_shared->format == NumericFormat::NVFP4_A16
+            ? NumericFormat::NVFP4_A16 : NumericFormat::W8G32_F16S;
     const auto bind_stored = [&](std::string_view name, std::int32_t rows, std::int32_t columns) {
         const auto* descriptor = std::get_if<artifact::TensorDescriptor>(binder.reader().find(name));
         if (descriptor && descriptor->format == NumericFormat::NVFP4) {
@@ -57,10 +63,11 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, artifact::
         // K-quant superblocks, a converted checkpoint as the groupwise-int or NVFP4 profile.
         .routed_gate_up     = bind_stored(prefix + "routed_gate_up", g.experts * 2 * g.intermediate, g.hidden),
         .routed_down        = bind_stored(prefix + "routed_down", g.experts * g.hidden, g.intermediate),
-        .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S,
+        .shared_gate_up = bind(prefix + "shared_gate_up", shared_format,
                               {2 * g.shared_intermediate, g.hidden}),
-        .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S,
+        .shared_down    = bind(prefix + "shared_down", shared_format,
                               {g.hidden, g.shared_intermediate}),
+        .shared_format  = shared_format,
     };
     // NVFP4 carries a second-level scale per expert per projection; the row block holds gate and
     // up stacked, so gate/up needs two entries per expert and down one.
@@ -73,6 +80,25 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, artifact::
             bind(prefix + "routed_gate_up_alpha", NumericFormat::FP32, {g.experts});
         require_identity_divisor(binder, plan.routed_gate_up.object,
                                  prefix + "routed_gate_up", g.experts * 2 * g.intermediate, g.hidden);
+    }
+    // Weight-only NVFP4 banks carry the second level per expert and nothing for activations:
+    // the format says the activations stay BF16. Both banks are weight-only or neither is.
+    if ((plan.routed_gate_up.format == NumericFormat::NVFP4_A16) !=
+        (plan.routed_down.format == NumericFormat::NVFP4_A16)) {
+        throw artifact::ArtifactError(prefix + "routed_gate_up and routed_down must both be NVFP4_A16 or neither");
+    }
+    if (plan.routed_gate_up.format == NumericFormat::NVFP4_A16) {
+        plan.routed_gate_up_scale =
+            bind(prefix + "routed_gate_up_scale", NumericFormat::FP32, {2 * g.experts});
+        plan.routed_down_scale =
+            bind(prefix + "routed_down_scale", NumericFormat::FP32, {g.experts});
+        require_identity_divisor(binder, plan.routed_gate_up.object, prefix + "routed_gate_up",
+                                 g.experts * 2 * g.intermediate, g.hidden);
+        require_identity_divisor(binder, plan.routed_down.object, prefix + "routed_down",
+                                 g.experts * g.hidden, g.intermediate);
+        if (shared_format != NumericFormat::NVFP4_A16 && g.shared_intermediate > 0) {
+            throw artifact::ArtifactError(prefix + "weight-only NVFP4 experts need an NVFP4_A16 shared expert");
+        }
     }
     if (plan.routed_down.format == NumericFormat::NVFP4) {
         plan.routed_down_scale =
@@ -110,9 +136,9 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
                     : artifact::materialized_linear(materialized, plan.routed_down,
                                                         g.experts * g.hidden, g.intermediate),
             .shared_gate_up = artifact::materialized_weight(materialized, plan.shared_gate_up,
-                                                            NumericFormat::W8G32_F16S, 2 * g.shared_intermediate, g.hidden),
+                                                            plan.shared_format, 2 * g.shared_intermediate, g.hidden),
             .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
-                                                            NumericFormat::W8G32_F16S, g.hidden, g.shared_intermediate),
+                                                            plan.shared_format, g.hidden, g.shared_intermediate),
             .experts_per_token = g.experts_per_token,
         }};
     if (plan.routed_gate_up_scale.has_value()) {
@@ -142,6 +168,18 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
     payload.op.routed_down_act_scale    = per_expert(plan.routed_down_act_scale);
     payload.op.routed_down_alpha        = per_expert(plan.routed_down_alpha);
     return payload;
+}
+
+/// A weight-only NVFP4 mixture is served from Marlin tiles, rewritten in place here, at load. Its
+/// routed banks must be on the device: the host bank streams experts in their stored layout.
+void adopt_mixture(SparseMoePayload& mixture, const family::HostBank* host_bank, std::int32_t layer,
+                   const family::TextGeometry& g) {
+    if (mixture.op.routed_gate_up.qtype != QType::NVFP4_A16) { return; }
+    if (host_bank != nullptr) {
+        throw artifact::ArtifactError("layer " + std::to_string(layer) +
+                                      ": weight-only NVFP4 experts cannot be banked on the host");
+    }
+    family::adopt_weight_only_nvfp4(mixture.op, g.experts, nullptr);
 }
 
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle, const family::TextGeometry& g) {
@@ -391,6 +429,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             target.post_mixer = load_moe(source.moe, backing, g);
+            adopt_mixture(target.post_mixer, host_bank.get(), static_cast<std::int32_t>(layer), g);
             target.post_mixer.banked = family::bind_banked_experts(
                 target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
                 source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
@@ -424,6 +463,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             target.post_mixer = load_moe(source.moe, backing, g);
+            adopt_mixture(target.post_mixer, host_bank.get(), static_cast<std::int32_t>(layer), g);
             target.post_mixer.banked = family::bind_banked_experts(
                 target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
                 source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
@@ -436,6 +476,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {g.hidden});
     output_head = artifact::materialized_linear(backing, plan.output_head, g.output_rows, g.hidden);
+    // A weight-only NVFP4 head is served from Marlin tiles only; rewrite it while the load still
+    // owns the device (its staging is gone before the KV cache is sized).
+    family::adopt_weight_only_nvfp4(output_head, nullptr);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_linear(backing, plan.draft_head, g.draft_vocab, g.hidden);

@@ -11,7 +11,9 @@
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 #include "ops/sparse_moe/fp8_sm90/fp8_moe_sm90.h"
+#include "ops/sparse_moe/marlin/sparse_moe_nvfp4.h"
 #include "ops/sparse_moe/trtllm/trtllm_moe.h"
+#include "ops/linear/marlin/marlin_nvfp4.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -196,8 +198,64 @@ void require_fp8_block(const Weight& weight, std::int32_t n, std::int32_t k, con
     ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
 }
 
+/// A weight-only NVFP4 matrix as the Marlin route reads it: rewritten into Marlin tiles at load
+/// (its code and scale planes keep the stored sizes), with one global scale per row block.
+void require_nvfp4_marlin(const Weight& weight, std::int32_t n, std::int32_t k, const char* name,
+                          std::vector<AddressRange>& ranges) {
+    require_matrix_metadata(weight, n, k, name);
+    if (!detail::nvfp4_marlin_ready(weight) || !aligned_to(weight.qdata, 16) ||
+        !aligned_to(weight.scales, 16)) {
+        throw std::invalid_argument(std::string("sparse_moe: ") + name +
+                                    " is NVFP4_A16 but was not rewritten into Marlin tiles at load");
+    }
+    ranges.push_back(address_range(weight.qdata, static_cast<std::size_t>(n) * k / 2,
+                                   std::string(name) + " code"));
+    ranges.push_back(address_range(weight.scales, static_cast<std::size_t>(n) * k / 16,
+                                   std::string(name) + " scales"));
+}
+
+/// The weight-only NVFP4 profile: both routed banks and the shared expert NVFP4_A16 in Marlin
+/// tiles, served at every width by `sparse_moe_nvfp4`. The stored per-expert multipliers may
+/// ride along (the adoption read them); the W4A4 runner's activation scales may not.
+void validate_nvfp4_marlin_weights(const SparseMoeWeights& weights,
+                                   const SparseMoeGeometry& geometry,
+                                   std::vector<AddressRange>& ranges) {
+    require_router(weights.router_shared_gate, geometry, ranges);
+    if (!detail::sparse_moe_nvfp4_geometry(geometry)) {
+        throw std::invalid_argument(
+            "sparse_moe: the weight-only NVFP4 route serves the softmax top-8 of 256 SiLU experts "
+            "with a gated shared expert, on widths that are multiples of 128");
+    }
+    if (weights.router_bias != nullptr || weights.per_expert_scale != nullptr ||
+        weights.slot_of_expert != nullptr || weights.routed_gate_up_act_scale != nullptr ||
+        weights.routed_gate_up_alpha != nullptr || weights.routed_down_act_scale != nullptr ||
+        weights.routed_down_alpha != nullptr) {
+        throw std::invalid_argument(
+            "sparse_moe: weight-only NVFP4 experts take no router bias, per-expert scale, expert "
+            "slot pool, or activation scales");
+    }
+    require_nvfp4_marlin(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
+                         "routed_gate_up", ranges);
+    require_nvfp4_marlin(weights.routed_down, geometry.routed_down_rows(), geometry.intermediate,
+                         "routed_down", ranges);
+    if (geometry.has_shared()) {
+        require_nvfp4_marlin(weights.shared_gate_up, geometry.shared_rows(), geometry.hidden,
+                             "shared_gate_up", ranges);
+        require_nvfp4_marlin(weights.shared_down, geometry.hidden, geometry.shared_intermediate,
+                             "shared_down", ranges);
+    }
+}
+
 void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& geometry,
                       std::vector<AddressRange>& ranges) {
+    if (detail::sparse_moe_nvfp4_profile(weights.routed_gate_up.qtype, weights.routed_down.qtype)) {
+        validate_nvfp4_marlin_weights(weights, geometry, ranges);
+        return;
+    }
+    if (weights.routed_gate_up.qtype == QType::NVFP4_A16 || weights.routed_down.qtype == QType::NVFP4_A16) {
+        throw std::invalid_argument(
+            "sparse_moe: weight-only NVFP4 routed experts need both gate/up and down NVFP4_A16");
+    }
     require_router(weights.router_shared_gate, geometry, ranges);
     const auto is_ggml_k = [](QType qtype) { return detail::ggml::is_ggml_qtype(qtype); };
     const bool fp8_routed =
@@ -500,6 +558,10 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
     }
+    // The weight-only NVFP4 profile has one route at every width, sliced above its bound.
+    if (detail::sparse_moe_nvfp4_profile(routed_gate_up, routed_down)) {
+        return detail::sparse_moe_nvfp4_workspace_bytes(geometry, max_tokens);
+    }
     (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
     const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
     // The NVFP4 routed profile has no kernel of ours at any width: the prefill family carries it
@@ -650,6 +712,32 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
 
     const QType gate_up = weights.routed_gate_up.qtype;
     const QType down    = weights.routed_down.qtype;
+    if (detail::sparse_moe_nvfp4_profile(gate_up, down)) {
+        // The Marlin route takes every width; nothing has measured the adapter or the expert
+        // cache against it, so both are refused rather than run through kernels that cannot
+        // read Marlin tiles.
+        if (lora_active() && lora_current_round().valid() &&
+            lora_store_for_current_device().bank_table(weights.router_shared_gate.qdata) != nullptr) {
+            throw std::invalid_argument("sparse_moe: adapters on weight-only NVFP4 experts are not supported");
+        }
+        if (hook.resolve != nullptr || hook.resolve_experts != nullptr) {
+            throw std::invalid_argument(
+                "sparse_moe: weight-only NVFP4 experts do not take an expert cache's round hook");
+        }
+        const std::size_t required = detail::sparse_moe_nvfp4_workspace_bytes(geometry, tokens);
+        if (workspace.base() == nullptr || workspace.capacity() < required ||
+            workspace.used() > workspace.capacity() - required) {
+            throw std::invalid_argument("sparse_moe: insufficient workspace capacity");
+        }
+        ranges.push_back(address_range(workspace.base(), workspace.capacity(), "workspace"));
+        require_disjoint(ranges);
+        nvtx::ScopedRange moe_range(tokens > 1 ? nvtx::Name::SparseMoePrefill
+                                               : nvtx::Name::SparseMoeDecode,
+                                    nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
+        detail::sparse_moe_nvfp4(geometry, x, router_x, weights, destination, workspace, stream,
+                                 round_hook);
+        return;
+    }
     // The NVFP4 routed profile has two arms. Wide rounds go to the vendored TRT-LLM runner
     // through the prefill family, which is where its grouped GEMMs pay; narrow ones stay on our
     // decode and small-T kernels, which read the same artifact because the codec carries its

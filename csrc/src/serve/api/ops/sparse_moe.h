@@ -98,6 +98,10 @@ struct SparseMoeGeometry {
 /// plus a shared expert of the same width.
 inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{
     2048, 256, 8, 512, SparseMoeGating::SoftmaxTopK, 1.0F, true, 512};
+/// Qwen3.5-122B-A10B (and its derivatives, Ornith-1.5-122B): 256 experts, top-8, FFN 1024,
+/// hidden 3072, plus a shared expert of the same width.
+inline constexpr SparseMoeGeometry kSparseMoeQwen35_122BGeometry{
+    3072, 256, 8, 1024, SparseMoeGating::SoftmaxTopK, 1.0F, true, 1024};
 /// Qwen3.8-Flash-Next: 512 experts, top-10, FFN 640, hidden 2560, shared expert of the same
 /// width.
 inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{
@@ -136,8 +140,9 @@ inline constexpr SparseMoeGeometry kSparseMoeLfm2Moe64Geometry{
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
-inline constexpr std::array<SparseMoeGeometry, 8> kSparseMoeGeometries{
-    kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry,
+inline constexpr std::array<SparseMoeGeometry, 9> kSparseMoeGeometries{
+    kSparseMoeQwen36Geometry, kSparseMoeQwen35_122BGeometry, kSparseMoeFlashNextGeometry,
+    kSparseMoeQwen3MoeGeometry,
     kSparseMoeQwen3Moe235BGeometry,
     kSparseMoeGlm53Geometry, kSparseMoeGemma4Geometry,
     kSparseMoeLfm2Moe32Geometry, kSparseMoeLfm2Moe64Geometry};

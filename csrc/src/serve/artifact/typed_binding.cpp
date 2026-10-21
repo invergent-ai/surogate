@@ -55,6 +55,7 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::F16:
         return StorageLayout::GgmlBlocksV1;
     case NumericFormat::NVFP4:
+    case NumericFormat::NVFP4_A16:
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
@@ -155,6 +156,35 @@ Weight fp8_block_weight(const MaterializedArtifact& materialized, ObjectHandle h
     out.group           = 128;
     out.scale_dtype     = DType::FP32;
     out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    return out;
+}
+
+// Weight-only NVFP4: the NVFP4 planes as stored. The second level is the payload's trailing
+// word (a multiplier, or the identity for a routed bank whose multipliers are per expert), read
+// on the device by the load-time Marlin adoption; neither divisor applies.
+Weight nvfp4_a16_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                        std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const BlockScaleGeometry geometry = block_scale_geometry(NumericFormat::NVFP4_A16, shape);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
+    Weight out{};
+    out.payload         = bytes;
+    out.payload_bytes   = geometry.encoded_bytes;
+    out.qtype           = QType::NVFP4_A16;
+    out.group_size      = 16;
+    out.ndim            = 2;
+    out.qdata           = bytes;
+    out.scales          = bytes + geometry.scale_plane_offset;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = 16;
+    out.layout          = QuantLayout::BlockScaleK16M128x4;
+    out.scale_dtype     = DType::FP8_E4M3FN;
     out.shape[0]        = rows;
     out.shape[1]        = columns;
     out.padded_shape[0] = rows;
@@ -266,6 +296,8 @@ QType qtype_for(NumericFormat format) {
         return QType::F16;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
+    case NumericFormat::NVFP4_A16:
+        return QType::NVFP4_A16;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
@@ -375,6 +407,9 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
     }
+    if (format == NumericFormat::NVFP4_A16) {
+        return nvfp4_a16_weight(materialized, handle, rows, columns);
+    }
     if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
         return contiguous_weight(materialized, handle, format, rows, columns);
     }
@@ -420,6 +455,7 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::Q6G64_F16S:
     case NumericFormat::W8G32_F16S:
     case NumericFormat::NVFP4:
+    case NumericFormat::NVFP4_A16:
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
     case NumericFormat::FP8_E4M3FN_ROW_F32S:

@@ -1,13 +1,17 @@
 #include "family/impl/load/routed_nvfp4.h"
 
 #include "artifact/reader.h"
+#include "core/device.h"
+#include "ops/linear/marlin/marlin_nvfp4.h"
 
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sinfer::family {
 
@@ -64,6 +68,47 @@ void require_identity_divisor(const artifact::Binder& binder, artifact::ObjectHa
             ": routed NVFP4 must carry a per-tensor divisor of 1.0; the second level belongs in "
             "the per-expert scale object");
     }
+}
+
+void adopt_weight_only_nvfp4(ops::SparseMoeWeights& weights, std::int32_t experts,
+                             cudaStream_t stream) {
+    if (weights.routed_gate_up.qtype != QType::NVFP4_A16 &&
+        weights.shared_gate_up.qtype != QType::NVFP4_A16) {
+        return;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (weights.routed_gate_up.qtype == QType::NVFP4_A16) {
+        if (weights.routed_down.qtype != QType::NVFP4_A16 || weights.routed_gate_up_scale == nullptr ||
+            weights.routed_down_scale == nullptr) {
+            throw std::invalid_argument(
+                "weight-only NVFP4 experts need both banks and their per-expert scales");
+        }
+        std::vector<float> halves(static_cast<std::size_t>(2) * experts);
+        CUDA_CHECK(cudaMemcpy(halves.data(), weights.routed_gate_up_scale,
+                              halves.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (std::int32_t expert = 0; expert < experts; ++expert) {
+            if (std::bit_cast<std::uint32_t>(halves[2 * expert]) !=
+                std::bit_cast<std::uint32_t>(halves[2 * expert + 1])) {
+                throw std::invalid_argument(
+                    "weight-only NVFP4 expert " + std::to_string(expert) +
+                    ": gate and up second levels differ; one GEMM over its rows carries one");
+            }
+        }
+        ops::detail::nvfp4_marlin_adopt(weights.routed_gate_up, experts,
+                                        weights.routed_gate_up_scale, 2, stream);
+        ops::detail::nvfp4_marlin_adopt(weights.routed_down, experts, weights.routed_down_scale, 1,
+                                        stream);
+    }
+    if (weights.shared_gate_up.qtype == QType::NVFP4_A16) {
+        ops::detail::nvfp4_marlin_adopt(weights.shared_gate_up, 1, nullptr, 1, stream);
+        ops::detail::nvfp4_marlin_adopt(weights.shared_down, 1, nullptr, 1, stream);
+    }
+}
+
+void adopt_weight_only_nvfp4(Weight& weight, cudaStream_t stream) {
+    if (weight.qtype != QType::NVFP4_A16) { return; }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ops::detail::nvfp4_marlin_adopt(weight, 1, nullptr, 1, stream);
 }
 
 } // namespace sinfer::family

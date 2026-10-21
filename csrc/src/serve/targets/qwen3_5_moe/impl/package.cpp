@@ -67,6 +67,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.architecture == target_key && identity.weights_id == "fp8-block") {
         return WeightsProfile::Fp8Block;
     }
+    if (identity.architecture == target_key && identity.weights_id == "modelopt") {
+        return WeightsProfile::ModelOpt;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

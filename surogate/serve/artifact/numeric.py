@@ -64,6 +64,11 @@ Q5G64_F16S = QuantFormat("Q5G64_F16S", 5, 64, -16, 15)
 Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
+#: NVFP4 weights served with BF16 activations (W4A16): the same planes as NVFP4, but the
+#: trailing FP32 word is the second level as a *multiplier* (ModelOpt's `weight_scale_2`,
+#: as stored; the identity for a routed bank, whose multipliers are per expert) and there is
+#: no activation divisor, since the activations are never quantised.
+NVFP4_A16 = Nvfp4Format("NVFP4_A16", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
 FP8_E4M3FN_BLK128_F32S = Fp8BlockFormat("FP8_E4M3FN_BLK128_F32S")
 #: E4M3FN weights with one FP32 multiplier per row (compressed-tensors per-channel FP8; the
@@ -129,7 +134,7 @@ QUANT_FORMATS = MappingProxyType(
         for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)
     }
 )
-NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
+NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4, NVFP4_A16.name: NVFP4_A16})
 FP8_ROW_FORMATS = MappingProxyType(
     {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
 )
@@ -259,6 +264,7 @@ __all__ = [
     "I32",
     "NUMERIC_FORMATS",
     "NVFP4",
+    "NVFP4_A16",
     "NVFP4_FORMATS",
     "Nvfp4Format",
     "NumericFormat",

@@ -57,6 +57,16 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         }
         break;
+    // Qwen3.5-122B-A10B's shortlist draft head (hidden 3072), on the same shape-generic kernels
+    // as the 2560 head above and equally unmeasured.
+    case 3072:
+        if (n == 131072) {
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 8) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     case 2048:
         if (n == 131072) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }

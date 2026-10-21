@@ -38,6 +38,9 @@ struct MoePlan {
     artifact::LinearBinding routed_down;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
+    /// W8 everywhere but a weight-only NVFP4 export, whose shared expert is NVFP4_A16 like its
+    /// routed banks (the Marlin route serves the two together).
+    artifact::NumericFormat shared_format = artifact::NumericFormat::W8G32_F16S;
     /// NVFP4 only: the format's second level plus the W4A4 runner's activation scale and
     /// epilogue alpha, per expert and per projection (see `ops::SparseMoeWeights`). All unset for
     /// a groupwise-int artifact, which has no such objects.

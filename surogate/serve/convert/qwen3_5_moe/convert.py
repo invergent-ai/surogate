@@ -26,7 +26,7 @@ from surogate.serve.convert.common import fp8_block_source
 from surogate.serve.convert.common import recipe as family_recipe
 
 from . import draft_head, inventory, recipe
-from .exports import compressed_tensors_source, routed_nvfp4
+from .exports import compressed_tensors_source, modelopt_source, routed_nvfp4
 
 
 RECIPE_ID = "qwen3_5_moe-config-v3"
@@ -60,9 +60,15 @@ class ConversionPreflight:
     #: keep its codes, the shared expert is requantised from them.
     fp8_source: fp8_block_source.Fp8BlockSource | None = None
     fp8_plan: fp8_block_source.SourcePlan | None = None
+    #: Set when the source is a ModelOpt mixed-precision export: weight-only NVFP4 and FP8
+    #: modules keep their stored words, each module in the format its entry declares.
+    modelopt_source: modelopt_source.ModelOptSource | None = None
+    modelopt_plan: modelopt_source.SourcePlan | None = None
 
     @property
     def weights_id(self) -> str:
+        if self.modelopt_plan is not None:
+            return modelopt_source.WEIGHTS_ID
         if self.compressed_plan is not None:
             return compressed_tensors_source.WEIGHTS_ID
         if self.fp8_plan is not None:
@@ -133,6 +139,10 @@ def preflight_conversion(
                   if fp8_block_source.is_fp8_block_export(config) else None)
     if fp8_source is not None and routed_nvfp4_dir is not None:
         raise ValueError("a block-FP8 export already carries its routed experts; drop --routed-nvfp4")
+    modelopt = (modelopt_source.ModelOptSource(model, config, geometry)
+                if modelopt_source.is_modelopt_export(config) else None)
+    if modelopt is not None and routed_nvfp4_dir is not None:
+        raise ValueError("a ModelOpt export already carries its routed experts; drop --routed-nvfp4")
     if compressed_source is not None and routed_nvfp4_dir is None:
         routed_nvfp4_dir = model
     routed = Path(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None
@@ -146,11 +156,17 @@ def preflight_conversion(
         tuple(object_specs) if object_specs is not None
         else tensor_specs(geometry, False, dflash=dflash_geometry), base, geometry.experts)
         if fp8_source is not None else None)
+    modelopt_plan = (modelopt.plan(
+        tuple(object_specs) if object_specs is not None
+        else tensor_specs(geometry, False, dflash=dflash_geometry), base)
+        if modelopt is not None else None)
     excluded = set(covered)
     if compressed_plan is not None:
         excluded.update(compressed_plan.covered)
     if fp8_plan is not None:
         excluded.update(fp8_plan.covered)
+    if modelopt_plan is not None:
+        excluded.update(modelopt_plan.covered)
     if routed is not None:
         excluded.update(name for name in base if routed_nvfp4.is_routed_object(name))
     base_source = family_recipe.preflight_sources(model, tuple(
@@ -159,11 +175,15 @@ def preflight_conversion(
         # Validate the separate expert checkpoint before opening the output artifact.
         with ShardReader.for_directory(routed) as reader:
             routed_nvfp4.preflight_source(reader, geometry)
+    if modelopt is not None:
+        with ShardReader.for_directory(model) as reader:
+            modelopt_source.preflight_routed(reader, geometry)
     dflash_source = recipe.preflight_dflash_sources(dflash_model, recipes) if dflash_model else None
     resources = load_resources(model)
     resource_map = {r.name: r.data for r in resources}
     specs = (compressed_plan.specs if compressed_plan is not None
              else fp8_plan.specs if fp8_plan is not None
+             else modelopt_plan.specs if modelopt_plan is not None
              else tuple(object_specs) if object_specs is not None
              else tensor_specs(geometry, routed is not None, dflash=dflash_geometry))
     object_plan = family_conversion.build_object_plan(inventory.RESOURCE_SPECS + specs, resource_map)
@@ -176,7 +196,8 @@ def preflight_conversion(
         base_source=base_source, dflash_source=dflash_source, resources=resources,
         draft=draft, object_plan=object_plan, routed_nvfp4_dir=routed,
         routed_nvfp4_summary=routed_summary, compressed_source=compressed_source,
-        compressed_plan=compressed_plan, fp8_source=fp8_source, fp8_plan=fp8_plan)
+        compressed_plan=compressed_plan, fp8_source=fp8_source, fp8_plan=fp8_plan,
+        modelopt_source=modelopt, modelopt_plan=modelopt_plan)
 
 
 def materialize_tensor(
@@ -327,6 +348,9 @@ def convert(
     if repack is not None and fp8_block_source.is_fp8_block_export(
             family_conversion.load_json(model / "config.json")):
         raise ValueError("--gguf-repack reads a GGUF; point --model at a BF16 checkpoint, not an FP8 export")
+    if repack is not None and modelopt_source.is_modelopt_export(
+            family_conversion.load_json(model / "config.json")):
+        raise ValueError("--gguf-repack reads a GGUF; point --model at a BF16 checkpoint, not a ModelOpt export")
     geometry = inventory.geometry_from_checkpoint(model, extra_names=repack.sources if repack else ())
     if not mtp:
         geometry = replace(geometry, mtp_layers=0)
@@ -463,9 +487,38 @@ def convert(
         base_specs = tuple(s for s in all_specs if not s.name.startswith("dflash/"))
         routed_reader = ShardReader.for_directory(preflight.routed_nvfp4_dir) if preflight.routed_nvfp4_dir else None
         routed_cache = routed_nvfp4.LayerCache(routed_reader, geometry) if routed_reader else None
+        modelopt_plan = preflight.modelopt_plan
+        modelopt_reader = (ShardReader.for_directory(model) if modelopt_plan is not None else None)
+        modelopt_routed = (modelopt_source.RoutedCache(modelopt_reader, geometry)
+                           if modelopt_reader is not None else None)
         try:
             with ShardReader.for_directory(model) as reader:
                 for spec in base_specs:
+                    if modelopt_plan is not None and spec.name in modelopt_plan.routed:
+                        # A layer's routed banks as stored, stacked gate|up per expert, with
+                        # each expert's second level beside them.
+                        payload = modelopt_routed.payload_for(spec.name)
+                        write_payload(spec, payload)
+                        del payload
+                        continue
+                    if modelopt_plan is not None and spec.name in modelopt_plan.stacked:
+                        # The MTP block's BF16 experts, stored one tensor per expert: stacked
+                        # into the rows the base recipe describes, then encoded as it would.
+                        tensor = modelopt_source.stacked_experts(reader, spec.name, geometry)
+                        payload = encode_tensor_payload(tensor, spec, resolved_device)
+                        del tensor
+                        write_payload(spec, payload)
+                        del payload
+                        continue
+                    if modelopt_plan is not None and spec.name in modelopt_plan.objects:
+                        # Stored words copied as they are: NVFP4 codes and block scales with
+                        # ModelOpt's second level in the payload's trailing word, FP8 codes with
+                        # their multiplier, BF16 rows. No dequantise-requantise round trip.
+                        payload = preflight.modelopt_source.payload_for(
+                            spec.name, modelopt_plan.objects, reader)
+                        write_payload(spec, payload)
+                        del payload
+                        continue
                     if repack is not None and (
                         spec.name in native or spec.name in repacked or spec.name in in_place
                     ):
@@ -527,6 +580,8 @@ def convert(
                         (preflight.compressed_source.dequantizing_reader(reader)
                          if preflight.compressed_plan is not None
                          and spec.name in preflight.compressed_plan.dequantized
+                         else preflight.modelopt_source.dequantizing_reader(reader)
+                         if modelopt_plan is not None and spec.name in modelopt_plan.dequantized
                          else reader),
                         preflight.draft,
                         base_recipes,
@@ -538,6 +593,8 @@ def convert(
         finally:
             if routed_reader is not None:
                 routed_reader.close()
+            if modelopt_reader is not None:
+                modelopt_reader.close()
 
         if dflash_model is not None:
             with ShardReader.for_directory(dflash_model) as reader:
@@ -584,6 +641,12 @@ def convert(
             "shared_expert": preflight.compressed_plan.shared_expert,
             "shared_expert_requested": shared_expert,
             "text_core_objects_from_export": len(preflight.compressed_plan.objects),
+        }
+    if preflight.modelopt_plan is not None:
+        report["quantization"]["modelopt"] = {
+            **preflight.modelopt_source.summary(),
+            "objects_from_export": dict(preflight.modelopt_plan.counts),
+            "dequantized_for_base_recipes": sorted(preflight.modelopt_plan.dequantized),
         }
     if preflight.fp8_plan is not None:
         report["quantization"]["fp8_block"] = {

@@ -43,6 +43,12 @@ enum class QType : std::uint16_t {
     /// E4M3FN codes with one FP32 scale per row (compressed-tensors per-channel FP8); served
     /// by the block route with a [rows][1] scale grid. QuantLayout::Fp8Block128 as well.
     FP8_E4M3FN_ROW_F32S    = 65,
+    /// NVFP4 weights with BF16 activations (W4A16; ModelOpt's W4A16_NVFP4): E2M1 codes, one
+    /// E4M3 block scale per 16 values and a second level that multiplies. Stored as NVFP4 is
+    /// (QuantLayout::BlockScaleK16M128x4, the payload's trailing word the multiplier); served
+    /// only after the load-time rewrite into Marlin tiles (QuantLayout::MarlinTiles), by the
+    /// vendored Marlin kernels -- the same kernels vLLM serves these checkpoints with.
+    NVFP4_A16              = 66,
     // GGML K-quants in their own superblock layout (QuantLayout::GgmlBlocks), bytes as the
     // GGUF stores them: 256 values per block, affine sub-scales, k a multiple of 256.
     Q2_K                 = 9,
@@ -143,6 +149,10 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    /// Device FP32, NVFP4_A16 in Marlin tiles only: the global scale each row block's Marlin
+    /// epilogue multiplies by, in the kernel's convention (ops/linear/marlin/marlin_nvfp4.h) --
+    /// one for a dense matrix, one per expert for a routed bank. Null for every other weight.
+    const float* marlin_global_scale = nullptr;
     /// Typed row runs when the rows are not all one format (GgmlBlocks only); `qtype` and
     /// `qdata` then describe the first run. Null and zero for a homogeneous weight.
     const WeightSegment* segments = nullptr;

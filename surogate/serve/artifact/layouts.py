@@ -125,7 +125,7 @@ ROW_SPLIT_K128_V1 = Layout(
 BLOCKSCALE_K16_M128X4_V1 = Layout(
     "blockscale-k16-m128x4-v1",
     256,
-    frozenset(("NVFP4",)),
+    frozenset(("NVFP4", "NVFP4_A16")),
 )
 ROW_SCALE_V1 = Layout(
     "row-scale-v1",
@@ -677,6 +677,21 @@ def encode_nvfp4(
     return bytes(payload)
 
 
+def encode_nvfp4_a16(
+    packed_codes: torch.Tensor,
+    natural_scales: torch.Tensor,
+    second_level: torch.Tensor | bytes | bytearray | memoryview,
+    shape: Sequence[int],
+) -> bytes:
+    """Encode exact source NVFP4_A16 words without numerical conversion.
+
+    The planes are NVFP4's; the trailing word is the second level as a multiplier (a value is
+    ``e2m1(code) * e4m3(block) * second_level``), copied as the checkpoint stores it.
+    """
+
+    return encode_nvfp4(packed_codes, natural_scales, second_level, shape)
+
+
 def decode_nvfp4_words(
     payload: Payload,
     shape: Sequence[int],
@@ -1223,6 +1238,7 @@ __all__ = [
     "encode_direct",
     "encode_fp8_row_scaled",
     "encode_nvfp4",
+    "encode_nvfp4_a16",
     "encode_row_split",
     "encoded_size",
     "gather_row_planes",

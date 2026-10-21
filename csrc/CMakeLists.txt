@@ -1295,6 +1295,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q1.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_32q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
@@ -1491,6 +1492,8 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_nvfp4.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_nvfp4_kernels_generated.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_plane.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_small_t.cu
@@ -1503,7 +1506,9 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/sparse_moe_nvfp4.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
@@ -1574,9 +1579,12 @@ ${SERVE_ROOT}/ops/wrapper/head_linear.cpp
 set_source_files_properties(
   ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_nvfp4.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_nvfp4_kernels_generated.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
 
@@ -1588,8 +1596,10 @@ set_source_files_properties(
 set_source_files_properties(
   ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_nvfp4_kernels_generated.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
 # Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the

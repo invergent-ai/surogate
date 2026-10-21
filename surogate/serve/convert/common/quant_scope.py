@@ -71,10 +71,18 @@ class DeclaredScope:
     patterns: tuple[str, ...] = ()
     #: Fields present and non-empty that name something unimplemented, as (field, what).
     unhonoured: tuple[tuple[str, str], ...] = ()
+    #: ModelOpt's positive statement, `quantized_layers`: the modules it did quantise (a parent
+    #: such as `mlp.experts` covers the modules below it). Where a declaration has one, that
+    #: list -- not a module's absence from `ignore` -- says which plain weights disagree.
+    quantized: tuple[str, ...] = ()
 
     def ignores(self, module: str) -> bool:
         """Whether the declaration says this module was left alone."""
         return any(_matches(pattern, module) for pattern in self.patterns)
+
+    def claims(self, module: str) -> bool:
+        """Whether the positive list names this module (or a parent of it) as quantised."""
+        return any(module == name or module.startswith(name + ".") for name in self.quantized)
 
 
 @dataclass(frozen=True)
@@ -155,10 +163,12 @@ def declared_scope(config: Mapping[str, Any]) -> DeclaredScope:
     unhonoured = tuple(
         (field_name, what) for field_name, what in _UNHONOURED if quantization.get(field_name)
     )
+    quantized = quantization.get("quantized_layers")
     return DeclaredScope(
         method=str(quantization.get("quant_method", "")),
         patterns=tuple(str(p) for p in patterns),
         unhonoured=unhonoured,
+        quantized=tuple(str(name) for name in quantized) if isinstance(quantized, Mapping) else (),
     )
 
 
@@ -250,6 +260,7 @@ def disagreement(declared: DeclaredScope, observed: ObservedScope) -> ScopeDisag
     named_but_quantised = tuple(sorted(m for m in observed.quantised if declared.ignores(m)))
     unnamed_but_plain = tuple(sorted(
         m for m in observed.plain if not declared.ignores(m) and _looks_projected(m)
+        and (not declared.quantized or declared.claims(m))
     ))
     return ScopeDisagreement(named_but_quantised, unnamed_but_plain)
 

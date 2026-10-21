@@ -1,5 +1,6 @@
 #include "api/ops/lora_store.h"
 #include "ops/linear/marlin/marlin_plane.h"
+#include "ops/linear/marlin/marlin_nvfp4.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_bias.h"
 #include "api/ops/add_bias.h"
@@ -124,6 +125,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::NVFP4_A16:
+        // Weight-only by construction: the activations stay BF16 whatever the policy, and the
+        // weight reduces through the per-device Marlin scratch rather than the caller's.
+        detail::nvfp4_marlin_linear(x, w, out, stream);
+        return;
     case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
@@ -185,6 +191,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
+    case QType::NVFP4_A16:
+        // Marlin takes any N and K its tiles divide, and reduces through its own scratch.
+        if (output_rows % 64 != 0 || input_rows % 128 != 0) {
+            throw std::invalid_argument("linear workspace: NVFP4_A16 needs N % 64 == 0 and K % 128 == 0");
+        }
+        return 0;
     case QType::FP8_E4M3FN_ROW_BF16S:
         // As for W8: a shape the route's table does not serve takes no workspace from it. The
         // profile is sized for what it binds, and a plan also asks for shapes it may never run

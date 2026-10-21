@@ -126,7 +126,39 @@ def load_resources(
         if not data:
             raise ValueError(f"frontend resource {filename} is empty")
         resources.append(ResourcePayload(spec.name, data))
-    return tuple(resources)
+    return _one_chat_template(tuple(resources))
+
+
+def _one_chat_template(resources: tuple[ResourcePayload, ...]) -> tuple[ResourcePayload, ...]:
+    """The chat template the checkpoint serves, stated once.
+
+    A checkpoint may carry its template twice: as `chat_template.jinja` and as the
+    `chat_template` key of `tokenizer_config.json`. Transformers loads the file and lets it
+    overwrite the key ("clobbers any template in the config"), and vLLM serves what transformers
+    loads, so where the two disagree the file is the checkpoint's template and the key is stale
+    (Ornith-1.5-122B-NVFP4 keeps an older variant there). The engine refuses an artifact whose two
+    copies disagree, so the stale key is dropped from the artifact's tokenizer_config.json --
+    the template it then serves is the one the reference serves -- and the conversion says so.
+    """
+    by_name = {r.name: r for r in resources}
+    jinja = by_name.get("frontend/chat_template.jinja")
+    config = by_name.get("frontend/tokenizer_config.json")
+    if jinja is None or config is None:
+        return resources
+    tokenizer_config = json.loads(config.data)
+    stated = tokenizer_config.get("chat_template")
+    if isinstance(stated, list):
+        stated = next((entry.get("template") for entry in stated
+                       if isinstance(entry, dict) and entry.get("name") == "default"), stated)
+    if stated is None or stated == jinja.data.decode("utf-8"):
+        return resources
+    del tokenizer_config["chat_template"]
+    print("frontend: tokenizer_config.json states a chat_template that differs from "
+          "chat_template.jinja; keeping the .jinja, which transformers (and vLLM) load over the key",
+          flush=True)
+    rewritten = ResourcePayload(config.name, json.dumps(tokenizer_config, ensure_ascii=False,
+                                                        indent=2).encode("utf-8"))
+    return tuple(rewritten if r.name == config.name else r for r in resources)
 
 
 def _synthesize_generation_config(root: Path) -> bytes:

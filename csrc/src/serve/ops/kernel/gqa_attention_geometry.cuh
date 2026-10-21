@@ -60,6 +60,10 @@ using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_8q4   = GqaGeometry<256, 8, 4, 1>;  // gemma-3-4b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
 using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
+// DecodeSplitScale 2, the two-KV-head rule the 35B's 16q2 follows: the grid takes some of its
+// parallelism from the heads and the rest from the keys. A group of sixteen leaves the small-T
+// launcher four tokens per lane step, which covers an MTP verify round of up to three drafts.
+using Gqa256_32q2  = GqaGeometry<256, 32, 2, 2>; // qwen3.5-122b-a10b (ornith-1.5-122b)
 using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wide head)
 using Gqa128_16q2  = GqaGeometry<128, 16, 2, 2>; // minicpm5
 // Qwen3-30B-A3B: 32 query heads over 4 KV heads at head dim 128. DecodeSplitScale 1 for the
@@ -139,6 +143,7 @@ using Gqa128_32q16 = GqaGeometry<128, 32, 16, 1>; // gemma-3-27b
     X(Gqa256_8q4)                                                                                  \
     X(Gqa256_16q4)                                                                                 \
     X(Gqa256_24q2)                                                                                 \
+    X(Gqa256_32q2)                                                                                 \
     X(Gqa128_16q8)                                                                                 \
     X(Gqa128_16q2)                                                                                 \
     X(Gqa128_32q4)                                                                                 \

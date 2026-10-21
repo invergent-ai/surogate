@@ -50,6 +50,11 @@ enum class WeightsProfile : std::uint8_t {
     // Hopper's block-FP8 kernels, everything else as GroupwiseInt has it. The routed experts
     // have no kernel off sm_90; the sparse-MoE op refuses them there.
     Fp8Block,
+    // A ModelOpt mixed-precision export (Ornith-1.5-122B-NVFP4): routed experts, shared expert
+    // and output head weight-only NVFP4 (NVFP4_A16, served by Marlin with BF16 activations),
+    // attention and linear-attention projections FP8 with their per-tensor scales, everything
+    // else as the export left it. Like CompressedTensors, every format is read from the artifact.
+    ModelOpt,
 };
 
 /// Do these weights need the sm_120 block-scaled FP4 MMA?
@@ -64,6 +69,8 @@ enum class WeightsProfile : std::uint8_t {
     switch (profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::Fp8Block:
+    // Marlin's weight-only FP4 dequantises to BF16 in registers; no FP4 MMA is involved.
+    case WeightsProfile::ModelOpt:
         return false;
     case WeightsProfile::RoutedNvfp4:
     case WeightsProfile::CompressedTensors:

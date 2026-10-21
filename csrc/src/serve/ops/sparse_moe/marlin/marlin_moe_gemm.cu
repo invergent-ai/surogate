@@ -243,6 +243,7 @@ MarlinFuncPtr get_marlin_kernel(
   auto kernel = MarlinDefault;
 
 #include "ops/sparse_moe/marlin/marlin_moe_selector_generated.h"
+#include "ops/sparse_moe/marlin/marlin_moe_nvfp4_selector_generated.h"
 
   return kernel;
 }
@@ -578,6 +579,34 @@ void marlin_moe_gemm_q4g64_bf16(const void* a, const void* b_tiles, const void* 
         locks, vllm::kBFloat16, vllm::kU4B8, vllm::kBFloat16, vllm::kBFloat16,
         /*has_bias=*/false, /*has_act_order=*/false, /*is_k_full=*/true, /*has_zp=*/false,
         /*num_groups=*/k / 64, /*group_size=*/64, device, stream, /*thread_k=*/-1,
+        /*thread_n=*/-1, sms, /*blocks_per_sm=*/-1, /*use_atomic_add=*/false,
+        /*use_fp32_reduce=*/true, /*is_zp_float=*/false);
+}
+
+void marlin_moe_gemm_nvfp4_bf16(const void* a, const void* b_tiles, const void* scales,
+                                const float* global_scales, void* c, void* c_tmp,
+                                const std::int32_t* sorted_token_ids,
+                                const std::int32_t* expert_ids,
+                                const std::int32_t* num_tokens_past_padded,
+                                const float* topk_weights, std::int32_t size_m,
+                                std::int32_t top_k, bool mul_topk_weights, std::int32_t n,
+                                std::int32_t k, std::int32_t num_experts,
+                                std::int32_t block_size, std::int32_t* locks, int sms,
+                                cudaStream_t stream) {
+    int device = 0;
+    cudaGetDevice(&device);
+    // vLLM's _fused_marlin_moe for a weight-only NVFP4 bank: A is read through the routing
+    // table (row = sorted id / top_k), the global scale is per expert, and the router weight is
+    // applied in the epilogue when asked (the down GEMM), with the same reduce settings.
+    MARLIN_NAMESPACE_NAME::marlin_mm(
+        a, b_tiles, c, c_tmp, /*b_bias=*/nullptr, /*a_s=*/nullptr, const_cast<void*>(scales),
+        const_cast<float*>(global_scales), /*zp=*/nullptr, /*g_idx=*/nullptr, /*perm=*/nullptr,
+        /*a_tmp=*/nullptr, const_cast<std::int32_t*>(sorted_token_ids),
+        const_cast<std::int32_t*>(expert_ids), const_cast<std::int32_t*>(num_tokens_past_padded),
+        const_cast<float*>(topk_weights), block_size, num_experts, top_k, mul_topk_weights,
+        size_m, n, k, locks, vllm::kBFloat16, vllm::kFE2M1f, vllm::kBFloat16, vllm::kFE4M3fn,
+        /*has_bias=*/false, /*has_act_order=*/false, /*is_k_full=*/true, /*has_zp=*/false,
+        /*num_groups=*/k / 16, /*group_size=*/16, device, stream, /*thread_k=*/-1,
         /*thread_n=*/-1, sms, /*blocks_per_sm=*/-1, /*use_atomic_add=*/false,
         /*use_fp32_reduce=*/true, /*is_zp_float=*/false);
 }

@@ -164,6 +164,7 @@ MarlinFuncPtr get_marlin_kernel(
   auto kernel = MarlinDefault;
 
   #include "kernel_selector_generated.h"
+  #include "kernel_selector_nvfp4_generated.h"
 
   return kernel;
 }
@@ -472,6 +473,26 @@ void marlin_gemm_bf16(const void* a, const void* b_packed, const void* b_scales,
         // ceil(M/64)*N <= 2048, which is exactly the small-N projections that
         // corrupted the 0.8B stream when it was on.
         /*use_atomic_add=*/false, /*use_fp32_reduce=*/true, /*is_zp_float=*/false);
+}
+
+void marlin_gemm_nvfp4_bf16(const void* a, const void* b_packed, const void* b_scales,
+                            const float* global_scale, void* c, void* c_tmp, int* locks,
+                            int prob_m, int prob_n, int prob_k, int sm_count,
+                            cudaStream_t stream) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    // vLLM's apply_fp4_marlin_linear, bf16 activations: group 16, the FP32 global scale the
+    // epilogue multiplies by, no zero points, no act-order, and the same reduce settings as the
+    // W8 entry above.
+    MARLIN_NAMESPACE_NAME::marlin_mm(
+        a, b_packed, c, c_tmp, /*b_bias=*/nullptr, /*a_s=*/nullptr,
+        const_cast<void*>(b_scales), const_cast<float*>(global_scale), /*zp=*/nullptr,
+        /*g_idx=*/nullptr, /*perm=*/nullptr, /*a_tmp=*/nullptr, prob_m, prob_n, prob_k,
+        /*lda=*/prob_k, locks, vllm::kBFloat16, vllm::kFE2M1f, vllm::kBFloat16, vllm::kFE4M3fn,
+        /*has_bias=*/false, /*has_act_order=*/false, /*is_k_full=*/true, /*has_zp=*/false,
+        /*num_groups=*/prob_k / 16, /*group_size=*/16, dev, stream, /*thread_k=*/-1,
+        /*thread_n=*/-1, sm_count, /*use_atomic_add=*/false, /*use_fp32_reduce=*/true,
+        /*is_zp_float=*/false);
 }
 
 } // namespace sinfer::ops::detail

@@ -123,6 +123,9 @@ sinfer_add_op_test(sinfer_mixed_attention_workspace_test SOURCES ops/test_mixed_
 sinfer_add_op_test(sinfer_marlin_fp8_wide_test SOURCES ops/test_marlin_fp8_wide.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_fused_parent_test SOURCES ops/test_marlin_fused_parent.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_moe_reduce_test SOURCES ops/test_marlin_moe_reduce.cpp LIBRARIES sinfer_ops)
+# Weight-only NVFP4 (NVFP4_A16): the load-time Marlin rewrite, the dense GEMM at every row-block
+# class and the mixture route, against the values the stored words stand for.
+sinfer_add_op_test(sinfer_nvfp4_marlin_test SOURCES ops/test_nvfp4_marlin.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_fp8_sm90_test SOURCES ops/test_sparse_moe_fp8_sm90.cu LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_segments.cpp LIBRARIES sinfer_ops)
 
@@ -598,6 +601,9 @@ add_test(NAME sinfer_sparse_moe_ggml_prefill_bf16_test
     COMMAND sinfer_sparse_moe_ggml_prefill_test)
 set_tests_properties(sinfer_sparse_moe_ggml_prefill_bf16_test PROPERTIES
     SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_INT8=0")
+# Qwen3.5-122B's mixture through the W8 profile its MTP block's experts are converted to.
+add_test(NAME sinfer_sparse_moe_qwen35_122b_test COMMAND sinfer_sparse_moe_test --qwen35-122b)
+set_tests_properties(sinfer_sparse_moe_qwen35_122b_test PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME sinfer_sparse_moe_nvfp4_small_t_test COMMAND sinfer_sparse_moe_test --nvfp4-small-t)
 set_tests_properties(sinfer_sparse_moe_nvfp4_small_t_test PROPERTIES
     SKIP_RETURN_CODE 77 ENVIRONMENT "SUROGATE_SERVE_MOE_TRTLLM_MIN=16")

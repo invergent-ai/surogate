@@ -73,6 +73,11 @@ SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen36Geometry)
 #include "ops/test_sparse_moe_body.inc"
 } // namespace qwen36
 
+namespace qwen35_122b {
+SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen35_122BGeometry)
+#include "ops/test_sparse_moe_body.inc"
+} // namespace qwen35_122b
+
 namespace qwen3_moe {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen3MoeGeometry)
 #include "ops/test_sparse_moe_body.inc"
@@ -239,6 +244,13 @@ int main(int argc, char** argv) {
         for (const CodecProfile& profile : profiles) { failures += gemma4::run_profile(profile); }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe gemma4\n";
         return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--qwen35-122b") {
+        // The weight-only NVFP4 export's MTP block keeps BF16 experts, which convert to W8.
+        constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 128}};
+        const CodecProfile profile{"qwen35_122b w8+w8", QType::W8G32_F16S,
+                                   QType::W8G32_F16S, tokens, true};
+        return qwen35_122b::run_profile(profile) ? 1 : 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--qwen3-vl-235b") {
         constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 128}};

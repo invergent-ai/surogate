@@ -126,7 +126,7 @@ The family is detected automatically. Available formats and optional features va
 | LFM2-MoE | Hugging Face safetensors and GGUF |
 | LFM2-VL / LFM2.5-VL | Text, images and sampled video frames from safetensors or paired GGUF files; use `--vision` |
 | Qwen3.5/3.6/3.8 | Includes BF16 and NVFP4 exports |
-| Qwen3.5/3.6 MoE | Includes 35B-A3B; optional speculative decoding |
+| Qwen3.5/3.6 MoE | Includes 35B-A3B and 122B-A10B; ModelOpt mixed-precision exports (weight-only NVFP4 experts and head, FP8 attention) such as Ornith-1.5-122B-NVFP4; optional speculative decoding |
 | Qwen3.8 Flash-Next | GGUF; supports CPU offload |
 | GLM-5.3-Flash | GGUF; supports CPU offload, multiple GPUs, and MTP |
 | EmbeddingGemma 300M | Embeddings on GPU or CPU |

@@ -57,6 +57,11 @@ enum class NumericFormat {
     Q1_0,
     Q2_0,
     F16,
+    /// NVFP4 weights served with BF16 activations (W4A16): NVFP4's planes, but the trailing
+    /// FP32 word is the second level as a multiplier (ModelOpt's `weight_scale_2`) rather than
+    /// a divisor, and there is no activation divisor, because the activations are never
+    /// quantised. A routed bank stores the identity there and its multipliers per expert.
+    NVFP4_A16,
 };
 
 enum class StorageLayout {

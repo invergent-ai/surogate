@@ -80,6 +80,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "W8G32_F16S";
     case NumericFormat::NVFP4:
         return "NVFP4";
+    case NumericFormat::NVFP4_A16:
+        return "NVFP4_A16";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
@@ -292,8 +294,8 @@ RowSplitGeometry row_split_geometry(NumericFormat format, std::span<const std::u
 
 BlockScaleGeometry block_scale_geometry(NumericFormat format,
                                         std::span<const std::uint64_t> shape) {
-    if (format != NumericFormat::NVFP4) {
-        throw ArtifactError("blockscale-k16-m128x4-v1 requires NVFP4");
+    if (format != NumericFormat::NVFP4 && format != NumericFormat::NVFP4_A16) {
+        throw ArtifactError("blockscale-k16-m128x4-v1 requires NVFP4 or NVFP4_A16");
     }
     if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
         throw ArtifactError("blockscale-k16-m128x4-v1 requires a positive rank-two shape");

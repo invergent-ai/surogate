@@ -114,6 +114,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
+    if (name == "NVFP4_A16") { return NumericFormat::NVFP4_A16; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
     if (name == "FP8_E4M3FN_BLK128_F32S") { return NumericFormat::FP8_E4M3FN_BLK128_F32S; }
     if (name == "FP8_E4M3FN_ROW_F32S") { return NumericFormat::FP8_E4M3FN_ROW_F32S; }

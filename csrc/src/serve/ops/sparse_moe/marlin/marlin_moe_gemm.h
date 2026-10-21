@@ -52,6 +52,22 @@ void marlin_moe_gemm_q4g64_bf16(const void* a, const void* b_tiles, const void* 
                                 std::int32_t num_experts, std::int32_t block_size,
                                 std::int32_t* locks, cudaStream_t stream);
 
+// One grouped GEMM over a weight-only NVFP4 bank in Marlin tiles (QType::NVFP4_A16,
+// QuantLayout::MarlinTiles): C[row, n] = A[sorted id / top_k, :] . dequant(B[expert(row)]),
+// times the row's router weight when `mul_topk_weights`. A is BF16 [size_m, k], C is BF16
+// [size_m * top_k, n]; `global_scales` is the bank's per-expert Marlin global scale and
+// `c_tmp` holds marlin_moe_c_tmp_bytes(size_m * top_k, n, num_experts, block_size, sms).
+void marlin_moe_gemm_nvfp4_bf16(const void* a, const void* b_tiles, const void* scales,
+                                const float* global_scales, void* c, void* c_tmp,
+                                const std::int32_t* sorted_token_ids,
+                                const std::int32_t* expert_ids,
+                                const std::int32_t* num_tokens_past_padded,
+                                const float* topk_weights, std::int32_t size_m,
+                                std::int32_t top_k, bool mul_topk_weights, std::int32_t n,
+                                std::int32_t k, std::int32_t num_experts,
+                                std::int32_t block_size, std::int32_t* locks, int sms,
+                                cudaStream_t stream);
+
 // silu(gate) * up over Marlin's raw [rows, 2*intermediate] product, into [rows, intermediate].
 void marlin_moe_silu_mul(const void* product, void* out, std::int32_t rows,
                          std::int32_t intermediate, cudaStream_t stream);
