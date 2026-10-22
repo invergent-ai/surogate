@@ -550,6 +550,53 @@ teacher_model:
     base_url: ["http://teacher-server:8000/v1"]
 ```
 
+The orchestrator sends each sample's exact token ids to the teacher's `/v1/chat/completions/tokens` route with
+`prompt_logprobs: 0`, and reads every position's score by the id of the token there, so the teacher must share the
+student's tokenizer. Surogate's server provides that route. vLLM does not, so a vLLM teacher goes behind the small
+proxy in [examples/turnopd](../../examples/turnopd/README.md).
+
+#### A teacher per environment
+
+An `env` entry can carry its own `teacher_model`, which replaces the top-level one for that environment's samples.
+Once any training environment has a teacher, every one must resolve to one (its own or the top-level one): a batch
+packs the samples of all environments together, and a sample without teacher log-probabilities has no neutral value
+to stand in for them. Environments whose teachers share base URLs and model share one connection pool.
+
+```yaml
+teacher_model:              # for every env without its own
+  model:
+    name: "Qwen/Qwen3-8B"
+  client:
+    base_url: ["http://teacher-a:8000/v1"]
+
+env:
+  - id: reverse-text
+  - id: tool-use
+    teacher_model:
+      model:
+        name: "Qwen/Qwen3-32B"
+      client:
+        base_url: ["http://teacher-b:8000/v1"]
+```
+
+#### Rule self-distillation
+
+With `rule`, the frozen model becomes its own teacher: serve the student's base model as the teacher, and give it a
+short rule that the student never sees. The orchestrator tokenizes the rule with the student tokenizer and splices
+it into every sequence it sends to that teacher, at the end of the first system message of a ChatML prompt, or as a
+new system message in front when there is none. It then drops the rule's positions from the returned
+log-probabilities, so they line up with the student's tokens again. The teacher term pulls the student toward what
+the model does when it has read the rule.
+
+```yaml
+teacher_model:
+  model:
+    name: "Qwen/Qwen3-0.6B"   # the student's base model, frozen
+  client:
+    base_url: ["http://teacher-server:8000/v1"]
+  rule: "Before you answer, look up the current state with a tool call."
+```
+
 #### Pure distillation (no reward verification)
 
 For agentic tasks where verification is expensive (code execution, tool use, multi-turn), skip reward scoring entirely and learn only from the teacher signal:
@@ -856,12 +903,21 @@ Key orchestrator settings:
 
 **Environments** (`env[]`):
 
-| Key             | Default    | Description                                              |
-| --------------- | ---------- | -------------------------------------------------------- |
-| `env[].id`      | (required) | Environment ID from the verifiers registry               |
-| `env[].name`    | `null`     | Optional human-readable name                             |
-| `env[].args`    | `{}`       | Environment-specific arguments                           |
-| `env[].address` | `null`     | Address of external env server (null = spawn subprocess) |
+| Key                   | Default    | Description                                                           |
+| --------------------- | ---------- | --------------------------------------------------------------------- |
+| `env[].id`            | (required) | Environment ID from the verifiers registry                            |
+| `env[].name`          | `null`     | Optional human-readable name                                          |
+| `env[].args`          | `{}`       | Environment-specific arguments                                        |
+| `env[].address`       | `null`     | Address of external env server (null = spawn subprocess)              |
+| `env[].teacher_model` | `null`     | Teacher for this environment's samples, in place of the top-level one |
+
+**Teacher** (`teacher_model.*`, also under `env[].teacher_model`) — see [On-Policy Distillation](#on-policy-distillation):
+
+| Key                        | Default       | Description                                                                   |
+| -------------------------- | ------------- | ----------------------------------------------------------------------------- |
+| `teacher_model.model.name` | `null`        | Teacher model name, as its server lists it                                    |
+| `teacher_model.client.*`   | as `client.*` | Teacher server URL(s), timeout, API key variable                              |
+| `teacher_model.rule`       | `null`        | Text only the teacher sees, spliced into its prompts (rule self-distillation) |
 
 **Client** (`client.*`):
 

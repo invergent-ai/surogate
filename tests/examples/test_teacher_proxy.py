@@ -31,8 +31,8 @@ def test_scores_actual_prompt_token_not_first_candidate():
     }
     scores = proxy.scored_prompt([11, 22, 33], response)
     # This is the shape the orchestrator consumes: one entry per prompt ID,
-    # including the null first-token position.
-    actual = [0.0 if item is None else next(iter(item.values()))["logprob"] for item in scores]
+    # including the null first-token position, read by the ID sent there.
+    actual = [0.0 if item is None else item[str(token)]["logprob"] for token, item in zip([11, 22, 33], scores)]
     assert actual == [0.0, -2.0, -3.0]
 
 
@@ -80,7 +80,8 @@ def test_http_translation_and_teacher_auth():
             assert json.loads(response.read()) == {"status": "ok"}
         request = Request(
             base + "/v1/chat/completions/tokens",
-            data=json.dumps({"model": "teacher", "tokens": [11, 22], "prompt_logprobs": True}).encode(),
+            # The orchestrator sends an integer, 0; the proxy asks vLLM for its own count either way.
+            data=json.dumps({"model": "teacher", "tokens": [11, 22], "prompt_logprobs": 0}).encode(),
             headers={"Content-Type": "application/json"},
         )
         with urlopen(request, timeout=5) as response:

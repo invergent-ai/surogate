@@ -49,7 +49,9 @@ from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
 from surogate.grpo.orchestrator.utils import (
-    compute_teacher_logprobs,
+    TeacherRoute,
+    TeacherRule,
+    compute_routed_teacher_logprobs,
     get_sampling_args,
     get_weight_dir,
     print_benchmark,
@@ -69,7 +71,7 @@ from surogate.grpo.orchestrator.vf_utils import (
     task_uses_group_scoring,
     wait_for_env_servers,
 )
-from surogate.grpo.utils.client import setup_inference_pool
+from surogate.grpo.utils.client import InferencePool, setup_inference_pool
 from surogate.rewards.ruler import JudgeClientPool, build_ruler_rubric
 from surogate.grpo.utils.logger import setup_logger
 from surogate.grpo.utils.monitor import setup_monitor
@@ -145,24 +147,32 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
     if inference_pool is None:
         inference_pool = await setup_inference_pool(config.client, model_name=config.model.name, client_type=client_type)
 
-    # Setup teacher inference pool if configured
-    if config.teacher_model:
-        logger.info(
-            f"Initializing teacher inference pool (base_url={', '.join(config.teacher_model.client.base_url)}, "
-            f"model={config.teacher_model.model.name})"
-        )
-        teacher_inference_pool = await setup_inference_pool(
-            config.teacher_model.client, model_name=config.teacher_model.model.name
-        )
-    else:
-        teacher_inference_pool = None
-
     # Check if this is a vision-language model (used throughout for VLM-specific paths)
     is_vlm = is_vlm_model(config.model.name)
 
     # Load tokenizer and processor (processor only for VLM models)
     logger.info(f"Initializing tokenizer for {config.model.name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=True)
+
+    # Setup teacher inference pools if configured. Each training env's samples go to its own teacher_model, else
+    # the top-level one; one pool per distinct (base URLs, model). A rule is tokenized with the student tokenizer.
+    teacher_pools: dict[tuple[tuple[str, ...], str], InferencePool] = {}
+    teacher_routes: dict[str, TeacherRoute] = {}
+    for env in config.env:
+        teacher = config.teacher_for(env)
+        if teacher is None:
+            continue
+        pool_key = (tuple(teacher.client.base_url), teacher.model.name)
+        if pool_key not in teacher_pools:
+            logger.info(
+                f"Initializing teacher inference pool (base_url={', '.join(teacher.client.base_url)}, "
+                f"model={teacher.model.name})"
+            )
+            teacher_pools[pool_key] = await setup_inference_pool(teacher.client, model_name=teacher.model.name)
+        rule = TeacherRule.from_tokenizer(tokenizer, teacher.rule) if teacher.rule is not None else None
+        if rule is not None:
+            logger.info(f"Teacher of env {env.resolved_name} scores with a {len(rule.appended_ids)}-token rule")
+        teacher_routes[env.resolved_name] = TeacherRoute(teacher_pools[pool_key], teacher.model.name, rule)
 
     processor = None
     if is_vlm:
@@ -453,10 +463,10 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         await inference_pool.wait_for_ready(config.model.name)
         logger.success("Inference pool ready")
 
-        # Check health of teacher inference server if configured
-        if config.teacher_model and teacher_inference_pool:
-            logger.info("Waiting for teacher inference pool to be ready")
-            await teacher_inference_pool.wait_for_ready(config.teacher_model.model.name)
+        # Check health of the teacher inference servers if configured
+        for (_, teacher_model_name), teacher_pool in teacher_pools.items():
+            logger.info(f"Waiting for teacher inference pool ({teacher_model_name}) to be ready")
+            await teacher_pool.wait_for_ready(teacher_model_name)
             logger.success("Teacher inference pool ready")
 
         # Block until the RULER judge pool is up. Without this, the first batch's
@@ -709,6 +719,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
 
             # Collect results and assign advantages
             train_examples: list[TrainingSample] = []
+            train_example_envs: list[str | None] = []  # each sample's env, which picks its teacher
             rollout_prefill_lens: list[int] = []
             rollout_decode_lens: list[int] = []
             rollout_samples_per_rollout: list[int] = []
@@ -719,6 +730,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
                 rollout_decode_tokens = 0
                 if samples is not None:
                     rollout_samples_per_rollout.append(len(samples))
+                    rollout_env = get_task(rollout)
                     for sample in samples:
                         sample.advantage = advantage
                         sample.reward = rollout["reward"]
@@ -729,6 +741,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
                         rollout_decode_tokens += sample_decode_tokens
                         rollout_prefill_tokens += sample_prefill_tokens
                         train_examples.append(sample)
+                        train_example_envs.append(rollout_env)
                 else:
                     rollout_samples_per_rollout.append(0)
                 rollout_prefill_lens.append(rollout_prefill_tokens)
@@ -742,15 +755,15 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
                 f"to {len(train_examples)} training examples"
             )
 
-            # Compute teacher logprobs if teacher model is configured
+            # Compute teacher logprobs if teacher model is configured, each sample with its env's teacher
             teacher_logprobs_time = 0
-            if config.teacher_model and teacher_inference_pool:
+            if teacher_routes:
                 logger.info(f"Computing teacher logprobs for {len(train_examples)} training examples")
                 teacher_logprobs_start_time = time.perf_counter()
-                teacher_logprobs_list = await compute_teacher_logprobs(
-                    clients=teacher_inference_pool.clients,
-                    model_name=config.teacher_model.model.name,
+                teacher_logprobs_list = await compute_routed_teacher_logprobs(
                     samples=train_examples,
+                    sample_envs=train_example_envs,
+                    routes=teacher_routes,
                 )
                 for train_example, teacher_logprobs in zip(train_examples, teacher_logprobs_list):
                     train_example.teacher_logprobs = teacher_logprobs
@@ -1049,8 +1062,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         cleanup = [safe_cancel(event_loop_lag_monitor_task), inference_pool.stop()]
         if scheduler is not None:
             cleanup.append(scheduler.stop())
-        if teacher_inference_pool is not None:
-            cleanup.append(teacher_inference_pool.stop())
+        cleanup.extend(teacher_pool.stop() for teacher_pool in teacher_pools.values())
         if ruler_judge_pool is not None:
             cleanup.append(ruler_judge_pool.aclose())
         await asyncio.gather(*cleanup, return_exceptions=True)

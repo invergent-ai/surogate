@@ -60,6 +60,11 @@ class TeacherModelConfig:
     Args:
         model: The model configuration for the teacher model.
         client: The OAI client configuration for the teacher model.
+        rule: Optional text only the teacher sees, for rule self-distillation (the teacher is the
+            frozen model plus a short rule, the student the same model without it). Its tokens
+            (student tokenizer) are spliced into every sequence sent to this teacher: at the end of
+            the first system message of a ChatML prompt, otherwise as a new system message at the
+            start. Their log-probs are dropped again, so the result keeps the student's positions.
 
     NOTE: this deliberately does NOT inherit from GRPOModelConfig/GRPOClientConfig.
     It used to, which made it *declare* all of their dataclass fields (base_url,
@@ -72,11 +77,15 @@ class TeacherModelConfig:
 
     model: GRPOModelConfig | None = None
     client: GRPOClientConfig | None = None
+    rule: str | None = None
 
     def __init__(self, cfg: DictDefault | None = None):
         cfg = cfg or {}
         self.model = GRPOModelConfig(cfg.get("model", {}))
         self.client = GRPOClientConfig(cfg.get("client", {}))
+        self.rule = cfg.get("rule", None)
+        if self.rule is not None and (not isinstance(self.rule, str) or not self.rule.strip()):
+            raise ValueError("teacher_model.rule must be a non-empty string")
 
 
 @dataclass
@@ -193,6 +202,7 @@ class GRPOEnvConfig:
         extra_env_kwargs: Extra kwargs passed to an env (e.g. seq_len, score_rollouts). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server.
         max_retries: Maximum number of times the environment will retry a failed rollout.
         path: Optional directory prepended to sys.path before importing the env module. Useful when the env is checked out locally (e.g. .../my-envs/<id>) and not pip-installed. The directory must contain a Python package named after `id` (with dashes converted to underscores) that exposes a top-level `load_environment` function.
+        teacher_model: Teacher for this training env's samples, in place of the top-level `teacher_model`. If any training env resolves to a teacher, every one must. Not used by eval envs.
     """
 
     id: str | None = None
@@ -202,6 +212,7 @@ class GRPOEnvConfig:
     extra_env_kwargs: dict[str, Any] | None = field(default_factory=dict)
     max_retries: int | None = 0
     path: str | None = None
+    teacher_model: TeacherModelConfig | None = None
 
     @property
     def resolved_name(self) -> str:
@@ -215,6 +226,9 @@ class GRPOEnvConfig:
         self.extra_env_kwargs = cfg.get("extra_env_kwargs", {})
         self.max_retries = cfg.get("max_retries", self.max_retries)
         self.path = cfg.get("path", self.path)
+        # Always assigned: dataclasses.asdict() walks every declared field (see TeacherModelConfig).
+        teacher_cfg = cfg.get("teacher_model")
+        self.teacher_model = TeacherModelConfig(teacher_cfg) if teacher_cfg is not None else None
 
         if self.resolved_name == "all":
             raise ValueError(
@@ -924,7 +938,7 @@ class GRPOOrchestratorConfig:
 
     Args:
         client: The OAI client configuration
-        teacher_model: The teacher model configuration for computing teacher logprobs (e.g. for distillation). If provided, teacher logprobs will be computed using the specified model. If None, no teacher model will be used.
+        teacher_model: The teacher model configuration for computing teacher logprobs (e.g. for distillation). If provided, teacher logprobs will be computed using the specified model. If None, no teacher model will be used. A training env's own `teacher_model` takes its place for that env's samples.
         learning_rate: Per-run learning rate for multi-run training.
         output_dir: Directory to write outputs to. Will be populated with checkpoints, weights, rollouts and logs as subdirectories. Should be set to a persistent directory with enough disk space. This value should be distinct across experiments running on a single node. See the README for more details.
         max_concurrent: Maximum number of concurrent rollouts to generate and score per-environment. If None, will not limit concurrency.
@@ -1131,10 +1145,23 @@ class GRPOOrchestratorConfig:
 
         self.__post_init__()
 
+    def teacher_for(self, env: GRPOEnvConfig) -> TeacherModelConfig | None:
+        """The teacher that scores a training env's samples: its own `teacher_model`, else the top-level one."""
+        return env.teacher_model if env.teacher_model is not None else self.teacher_model
+
     def __post_init__(self):
         types = [f.type for f in self.filters]
         if len(types) != len(set(types)):
             raise ValueError(f"Duplicate filter types: {types}. Each filter type may only appear once.")
+
+        # A batch packs samples of every env together, and the packer neither pads a missing teacher_logprobs
+        # nor has a neutral value for it (0.0 is a teacher certain of the token), so it is all envs or none.
+        without_teacher = [env.resolved_name for env in self.env if self.teacher_for(env) is None]
+        if without_teacher and len(without_teacher) < len(self.env):
+            raise ValueError(
+                f"Training env(s) {without_teacher} have no teacher while others do. Samples with and without "
+                "teacher logprobs cannot share a batch: give those envs a teacher_model, or set a top-level one."
+            )
 
         if self.max_concurrent is not None and self.max_concurrent < self.rollouts_per_example:
             raise ValueError("max_concurrent must be at least the number of rollouts per example")
