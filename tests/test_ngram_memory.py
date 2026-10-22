@@ -1976,13 +1976,14 @@ def test_sft_cli_quick_configs_with_panels_and_resume(cli_model):
         resumed = _run_sft(cfg3, arm + "@resume", cli_model)
         assert [int(p["step"]) for p in resumed["curve"]] == [2, 3], resumed["curve"]
         assert resumed["max_chunk"] == cfg["sequence_chunks"] - 1
-        # fp8-hybrid's delayed scaling keeps an amax history the checkpoint does not hold: after a resume the loss
-        # is exact, the scales after it differ (measured: 3e-4 of the norm, panel rows up to 2.5e-3 nats, mean
-        # 8e-4); the same resume in bf16 is bit for bit (loss, norm, all 24 panel rows). Not the memory's: it has no
-        # FP8 state.
+        # fp8-hybrid's delayed scaling keeps an amax history the checkpoint does not hold: the scales after a resume
+        # differ (measured: 3e-4 of the norm, panel rows up to 2.5e-3 nats, mean 8e-4) and so may the resumed step's
+        # loss (identical on the first measurement; 2e-4 nats = 1.6e-5 relative on an H200 of 2026-10-22); the same
+        # resume in bf16 is bit for bit (loss, norm, all 24 panel rows). Not the memory's: it has no FP8 state.
         exact = cfg["recipe"] == "bf16"
         r2, o2 = resumed["curve"][0], run["curve"][1]
-        assert (r2["step"], r2["lr"], r2["loss"]) == (o2["step"], o2["lr"], o2["loss"]), (r2, o2)
+        assert (r2["step"], r2["lr"]) == (o2["step"], o2["lr"]), (r2, o2)
+        assert r2["loss"] == o2["loss"] if exact else abs(r2["loss"] - o2["loss"]) <= 1e-4 * abs(o2["loss"]), (r2, o2)
         assert r2["grad_norm"] == o2["grad_norm"] if exact else abs(r2["grad_norm"] - o2["grad_norm"]) <= 2e-3 * o2[
             "grad_norm"], (r2, o2)
         rows3 = [json.loads(line) for line in open(run["out"] / "eval_panels.jsonl")][len(rows):]
@@ -2341,50 +2342,76 @@ def test_trainable_table_learns_and_unread_rows_stay_zero(tiny_model):
 @pytest.mark.slow
 def test_trainable_full_step_chunked_equals_unchunked(tiny_model):
     """train_step_graphed (the SFT CLI's step), memory only with the trainable table, 3 rows per optimizer step with
-    document cuts inside a chunk and at a chunk start, 3 optimizer steps: 4 chunks (the two-token carry at every chunk
-    start) agree with 1 chunk in loss, norm, the table gradient and the updated table; at step 1 (zero table) W_k,
-    W_v and the gains get exact zeros in both."""
+    document cuts inside a chunk and at a chunk start; 4 chunks (the two-token carry at every chunk start) against 1.
+    (a) The zero table, step 1: the same loss and norm, exact zero gradients of W_k, W_v and the gains in both, and the
+        table gradient (every read row, through W_v^T dv: first order in the residual gradient) equal to bf16 noise --
+        a row of a chunk's first two tokens read wrongly would show here.
+    (b) A live table (random rows of the size training gives them), 2 steps: loss, norm, every memory gradient and the
+        update agree within the bf16 noise of the residual gradient. The gate's signed square root makes W_k, the
+        gains and the table's W_k path second-order in that noise (as in the file-table tests), and right after one
+        tiny update of a zero table z sits next to the root's infinite slope (measured: W_k / table gradients at
+        cosine 0.85 chunked vs unchunked at that step, while the losses agree to 3e-5), so (b) starts from live rows."""
+    from safetensors.torch import save_file
+
     sg = _gpu()
     seq, ga = 128, 3
     opt = sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.0, grad_clip=1.0)
     x, y, pos = _graphed_rows(seq, ga, seed=41)
     runs = {}
-    for chunks in (4, 1):
-        tr = _trainer(tiny_model, [], seq, ngram=_trainable_option(), chunks=chunks, recipe="bf16", grad_accum=ga)
-        steps = []
-        for s in range(3):
-            r = tr.train_step_graphed(x, y, pos, opt, s + 1)
-            steps.append({"loss": float(r["loss"]), "norm": float(r["norm"]), "grads": _grads(tr)})
-        w = {k: torch.from_dlpack(v).float().cpu().clone() for k, v in tr.get_lora_weights(0).items()}
-        runs[chunks] = {"steps": steps, "w": w}
-        del tr
-        torch.cuda.empty_cache()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for label, chunks, live in (("zero4", 4, False), ("zero1", 1, False), ("live4", 4, True), ("live1", 1, True)):
+            tr = _trainer(tiny_model, [], seq, ngram=_trainable_option(), chunks=chunks, recipe="bf16", grad_accum=ga)
+            init, _ = _adapter(tr, tiny_model, tmp, label)
+            if live:
+                init = dict(init)
+                gen = torch.Generator().manual_seed(77)
+                init[TABLE] = (torch.randn(init[TABLE].shape, generator=gen) * 0.05).to(init[TABLE].dtype)
+                save_file(init, str(tmp / label / "adapter_model.safetensors"))  # beside its adapter_config.json
+                tr.import_adapter(str(tmp / label / "adapter_model.safetensors"))
+            steps = []
+            for s in range(2 if live else 1):
+                r = tr.train_step_graphed(x, y, pos, opt, s + 1)
+                steps.append({"loss": float(r["loss"]), "norm": float(r["norm"]), "grads": _grads(tr)})
+            after = {k: torch.from_dlpack(v).float().cpu().clone() for k, v in tr.get_lora_weights(0).items()}
+            runs[label] = {"steps": steps, "start": {k: v.float() for k, v in init.items()}, "after": after}
+            del tr
+            torch.cuda.empty_cache()
 
     def rel(a, b):
         a, b = a.flatten().double(), b.flatten().double()
         return float((a - b).norm() / b.norm().clamp_min(1e-30)), float(torch.nn.functional.cosine_similarity(a, b, 0))
 
-    c4, c1 = runs[4], runs[1]
-    report = [{"loss": (c4["steps"][s]["loss"], c1["steps"][s]["loss"]),
-               "norm": (c4["steps"][s]["norm"], c1["steps"][s]["norm"]),
-               "grads": {k.split(".")[-2]: rel(c4["steps"][s]["grads"][k], c1["steps"][s]["grads"][k])
-                         for k in MEMORY_T if c1["steps"][s]["grads"][k].any()}} for s in range(3)]
-    report.append({"table_after": rel(c4["w"][TABLE], c1["w"][TABLE])})
+    short = lambda k: k.split(".")[-2]  # noqa: E731
+    report = {}
+    for arm in ("zero", "live"):
+        c4, c1 = runs[arm + "4"], runs[arm + "1"]
+        report[arm] = {"steps": [{"loss": (a["loss"], b["loss"]), "norm": (a["norm"], b["norm"]),
+                                  "grads": {short(k): rel(a["grads"][k], b["grads"][k]) for k in MEMORY_T
+                                            if b["grads"][k].any()}} for a, b in zip(c4["steps"], c1["steps"])],
+                       "update": {short(k): rel(c4["after"][k] - c4["start"][k], c1["after"][k] - c1["start"][k])
+                                  for k in MEMORY_T if (c1["after"][k] - c1["start"][k]).any()}}
     print(json.dumps(report))
-    for k in MEMORY:
-        assert not c4["steps"][0]["grads"][k].any() and not c1["steps"][0]["grads"][k].any(), k
-    for s in range(3):
-        l4, l1 = report[s]["loss"]
-        n4, n1 = report[s]["norm"]
+    z4, z1 = runs["zero4"]["steps"][0], runs["zero1"]["steps"][0]
+    for k in MEMORY:  # (a) e = 0: only the table's gradient lives
+        assert not z4["grads"][k].any() and not z1["grads"][k].any(), k
+    za = report["zero"]["steps"][0]
+    assert abs(za["loss"][0] - za["loss"][1]) <= 2e-4 and abs(za["norm"][0] - za["norm"][1]) <= 5e-3 * za["norm"][1], za
+    err, cos = za["grads"]["ngram_table"]
+    assert set(za["grads"]) == {"ngram_table"} and cos > 0.9995 and err <= 0.03, (err, cos)
+    for s, st in enumerate(report["live"]["steps"]):  # (b)
+        (l4, l1), (n4, n1) = st["loss"], st["norm"]
         assert abs(l4 - l1) <= 2e-4, (s, l4, l1)
-        assert abs(n4 - n1) <= 5e-3 * n1, (s, n4, n1)
-        err, cos = report[s]["grads"]["ngram_table"]
-        assert cos > 0.999 and err <= 0.03, (s, err, cos)
-        for k, (err, cos) in report[s]["grads"].items():
-            assert cos > 0.97 and err <= 0.25, (s, k, err, cos)
-    err, cos = report[3]["table_after"]
-    assert cos > 0.999, (err, cos)
-    assert c4["steps"][2]["loss"] != c4["steps"][0]["loss"]
+        assert abs(n4 - n1) <= 1e-2 * n1, (s, n4, n1)
+        assert set(st["grads"]) == {short(k) for k in MEMORY_T}, st["grads"]
+        for k, (err, cos) in st["grads"].items():
+            if k in ("value_proj", "ngram_table"):
+                assert cos > 0.99 and err <= 0.15, (s, k, err, cos)
+            else:
+                assert cos > 0.97 and err <= 0.25, (s, k, err, cos)
+    for k, (err, cos) in report["live"]["update"].items():  # two Adam steps ~ lr * sign(g)
+        assert cos > (0.99 if k == "value_proj" else 0.97), (k, err, cos)
+    assert runs["live4"]["steps"][1]["loss"] != runs["live4"]["steps"][0]["loss"]
 
 
 @pytest.mark.gpu
@@ -2505,8 +2532,8 @@ def test_sft_cli_poc_configs_mem_and_ctrl_with_panels_and_resume(cli_model):
     """The PoC's MEM and CTRL configs (memory only, the trainable table at its real geometry, 32 chunks, fp8-hybrid,
     7 panels, per-token dumps), 2 steps through the SFT CLI, then a resume of each arm to step 3 from its step-1
     checkpoint: every chunk runs; the adapter holds the 4 dense tensors + the table; step 0's panels are identical
-    in both arms (zero tables = the base model); the resumed step repeats step 2's loss bit for bit; the arms part
-    once an update has made the tables live."""
+    in both arms (zero tables = the base model); the resumed step repeats step 2's loss (up to fp8-hybrid's
+    delayed-scaling history); the arms part once an update has made the tables live."""
     from safetensors.torch import load_file
 
     tmpl = _poc_templates()
@@ -2528,7 +2555,10 @@ def test_sft_cli_poc_configs_mem_and_ctrl_with_panels_and_resume(cli_model):
         cfg3["max_steps"] = 3
         resumed = _run_sft(cfg3, f"poc{arm}@resume", cli_model)
         assert [int(p["step"]) for p in resumed["curve"]] == [2, 3], resumed["curve"]
-        assert resumed["curve"][0]["loss"] == run["curve"][1]["loss"]
+        # the resumed step repeats step 2 (fp8-hybrid: its delayed-scaling history is not in the checkpoint, so the
+        # loss agrees to ~1e-5 relative, not bit for bit; see the quick-config test)
+        r2, o2 = resumed["curve"][0], run["curve"][1]
+        assert r2["lr"] == o2["lr"] and abs(r2["loss"] - o2["loss"]) <= 1e-4 * abs(o2["loss"]), (r2, o2)
         runs[arm] = {"curve": run["curve"] + resumed["curve"][1:], "rows": prow}
     mem, ctrl = runs["mem"], runs["ctrl"]
     print(json.dumps({a: [(p["loss"], p["grad_norm"], p["lr"]) for p in r["curve"]] for a, r in runs.items()}))
