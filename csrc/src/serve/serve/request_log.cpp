@@ -1,6 +1,7 @@
 #include "serve/request_log.h"
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
+#include "serve/thinking_retention.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -226,6 +227,12 @@ Json request_json(const RequestLogContext& context) {
         record["decisions"]["order_averaging"] =
             Json{{"enabled", true}, {"mirrored_questions", context.decision_mirrored_questions}};
     }
+    // --thinking-retention; absent when it is off or the request renders no messages.
+    if (context.thinking_retention) {
+        record["thinking_retention"] = Json{{"restored", context.thinking_restored},
+                                            {"missed", context.thinking_missed},
+                                            {"dropped", context.thinking_dropped}};
+    }
     return record;
 }
 
@@ -367,6 +374,10 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.acquisition_seconds                = prepared.acquisition_seconds;
     context.preparation                        = prepared.preparation;
     context.client_request_id                  = request.client_request_id;
+    context.thinking_retention                 = request.thinking_retention.active;
+    context.thinking_restored                  = prepared.thinking_restored;
+    context.thinking_missed                    = request.thinking_retention.missed;
+    context.thinking_dropped                   = prepared.thinking_dropped;
     return context;
 }
 
@@ -409,8 +420,12 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
         << " thinking=" << (context.enable_thinking ? "on" : "off")
-        << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
-        << " sampler=[" << sampler_str(context.sampling) << ']';
+        << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off");
+    if (context.thinking_retention) {
+        out << " thinking_retention=[restored=" << context.thinking_restored << " missed=" << context.thinking_missed
+            << " dropped=" << context.thinking_dropped << ']';
+    }
+    out << " sampler=[" << sampler_str(context.sampling) << ']';
     if (context.media_item_count != 0) {
         out << " prepare=" << seconds_str(context.preparation.seconds)
             << " acquire=" << seconds_str(context.acquisition_seconds)
@@ -555,6 +570,10 @@ std::string format_server_start_json(
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking ? Json(*options.enable_thinking) : Json("template")},
                               {"default_preserve_thinking", options.preserve_thinking},
+                              {"thinking_retention",
+                               std::string(thinking_retention_mode_name(options.thinking_retention))},
+                              {"thinking_retention_bytes", options.thinking_retention_bytes},
+                              {"thinking_retention_ttl_seconds", options.thinking_retention_ttl_seconds},
                               {"decision_temperature", options.decision_temperature},
                               {"decision_attempts", options.decision_attempts}};
     record["artifact"] = Json{{"path", options.artifact_path},

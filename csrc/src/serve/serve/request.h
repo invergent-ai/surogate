@@ -11,6 +11,7 @@
 // by Engine; media sources remain unresolved until the product service acquires
 // owning bytes.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -175,6 +176,26 @@ parse_requested_reasoning_effort(std::string_view value) noexcept {
     return std::nullopt;
 }
 
+/// --thinking-retention (serve/thinking_retention.h): what the server put back into a request's assistant turns.
+struct ThinkingRetentionState {
+    /// The conversation was looked up: retention is on and the request renders its messages.
+    bool active = false;
+    /// SHA-256 chain over (tenant, model, every message): where the request's own answer is filed.
+    std::array<std::uint8_t, 32> conversation{};
+    struct Restored {
+        /// Index into GenerationRequest::messages.
+        std::size_t message = 0;
+        /// The client sent an empty reasoning string there (kept as sent if the turn is taken back).
+        bool had_reasoning_field = false;
+        /// Before the last user message: a template renders it only with preserve_thinking.
+        bool completed_turn = false;
+    };
+    /// The turns given their reasoning back, oldest first.
+    std::vector<Restored> restored;
+    /// Turns looked up whose reasoning was not stored (expired, evicted, or never generated here).
+    std::size_t missed = 0;
+};
+
 [[nodiscard]] constexpr std::string_view
 requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     switch (effort) {
@@ -272,6 +293,9 @@ struct GenerationRequest {
     /// base model. Resolved by the HTTP layer against the registry, so by the time
     /// the service sees it the name is known to exist.
     std::string lora_adapter;
+
+    /// Reasoning the server restored into `messages` (--thinking-retention); inactive unless it is on.
+    ThinkingRetentionState thinking_retention;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

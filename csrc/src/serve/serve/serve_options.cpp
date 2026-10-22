@@ -3,6 +3,7 @@
 #include "serve/api_key_file.h"
 #include "product/speculative_options.h"
 #include "serve/decisions_schema.h"
+#include "serve/thinking_retention.h"
 
 #include <nlohmann/json.hpp>
 
@@ -173,6 +174,27 @@ std::vector<std::uint32_t> parse_kv_skip_layers(const char* text) {
     return layers;
 }
 
+/// --thinking-retention-ttl: whole seconds, or a whole number of minutes, hours or days (`90s`, `30m`, `6h`, `2d`).
+std::uint64_t parse_duration_seconds(const char* text, const char* label) {
+    std::string value(text);
+    std::uint64_t unit = 1;
+    if (!value.empty()) {
+        switch (value.back()) {
+        case 's': unit = 1; value.pop_back(); break;
+        case 'm': unit = 60; value.pop_back(); break;
+        case 'h': unit = 3600; value.pop_back(); break;
+        case 'd': unit = 86400; value.pop_back(); break;
+        default: break;
+        }
+    }
+    const std::uint64_t count = parse_u64(value.c_str(), label);
+    if (count == 0 || count > std::numeric_limits<std::uint64_t>::max() / unit / 1000) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text +
+                                    " (a positive number of seconds, or with an s, m, h or d suffix)");
+    }
+    return count * unit;
+}
+
 KvCapacityPolicy parse_kv_capacity(const char* text) {
     if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
     const int value = parse_nonnegative_int(text, "kv-capacity");
@@ -213,7 +235,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--capture-routing] "
-           "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] "
+           "[--thinking-retention off|loop|all] [--thinking-retention-mb N] [--thinking-retention-ttl T] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
            "[--decision-attempts N]\n"
@@ -269,6 +292,13 @@ std::string serve_usage_text(const char* argv0) {
            "         has a switch; without either, the template's own default holds (Qwen thinks,\n"
            "         Gemma 4 answers directly). Requests override it.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --thinking-retention loop|all keeps the reasoning of each chat completion in RAM and puts it\n"
+           "         back into a later request of the conversation whose assistant turn comes without it (agent\n"
+           "         harnesses that resend only content and tool calls): loop for the turns after the last user\n"
+           "         message, all for every turn. Off by default. Per tenant (API key) and model; an LRU of\n"
+           "         --thinking-retention-mb (default 512) MiB whose entries expire --thinking-retention-ttl\n"
+           "         (default 6h; seconds or an s/m/h/d suffix) after their last use. Restored reasoning never\n"
+           "         pushes a prompt past the context less the request's max_tokens.\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --reasoning-parser selects how a reasoning span is recognised (default qwen3);\n"
@@ -758,6 +788,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--thinking-retention") {
+            const std::optional<ThinkingRetentionMode> mode =
+                parse_thinking_retention_mode(require_value("--thinking-retention"));
+            if (!mode) { throw std::invalid_argument("--thinking-retention must be off, loop or all"); }
+            options.thinking_retention = *mode;
+        } else if (arg == "--thinking-retention-mb") {
+            const std::uint64_t mib = parse_u64(require_value("--thinking-retention-mb"), "thinking-retention-mb");
+            if (mib == 0 || mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+                throw std::invalid_argument("--thinking-retention-mb must be a positive number of MiB");
+            }
+            options.thinking_retention_bytes = static_cast<std::size_t>(mib) << 20;
+        } else if (arg == "--thinking-retention-ttl") {
+            options.thinking_retention_ttl_seconds =
+                parse_duration_seconds(require_value("--thinking-retention-ttl"), "thinking-retention-ttl");
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

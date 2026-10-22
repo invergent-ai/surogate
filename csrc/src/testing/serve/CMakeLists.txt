@@ -448,6 +448,11 @@ sinfer_add_test(sinfer_replica_router_test
   SOURCES test_replica_router.cpp
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_replica_router_test PRIVATE -UNDEBUG)
+# --thinking-retention: normalization and matching (a tau2-style re-serialized request), LRU / TTL, tenant and model
+# isolation, the context budget. No model or GPU.
+sinfer_add_test(sinfer_thinking_retention_test
+  SOURCES test_thinking_retention.cpp
+  LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_host_offload_test
   SOURCES test_host_offload.cpp
   LIBRARIES sinfer_engine CUDA::cudart)

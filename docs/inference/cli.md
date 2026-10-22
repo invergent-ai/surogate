@@ -488,6 +488,28 @@ the model's chat template.
 | `--tool-call-parser NAME` | `hermes` (`qwen3_coder` for Qwen3.5 / Qwen3.6, `gemma4` for Gemma 4) | Read tool calls; also accepts `qwen3_coder` / `qwen3_xml` (one parser, as in vLLM), `spark25`, `muse_glimmer`, `llama3_json`, `llama4_json`, `gemma4`, or `none`/`off`. `qwen3_coder` reads a finished generation exactly as vLLM 0.31's qwen3_coder parser does, from its token ids: any function name is a call, a call cut off by `max_tokens` or missing its closing tags is still a call, `<tool_call>` inside the reasoning ends it, and text after a call is dropped. A checkpoint whose vocabulary has `<tool_call>` as one token and whose template asks for `<function=...>` calls gets `qwen3_coder`; a Gemma 4 checkpoint gets `gemma4`; either unless the flag names another. `hermes` also reads a JSON body inside `<tool_call>`. The gemma4 parser does not constrain `tool_choice: "required"` or a named function, and refuses them |
 | `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
 | `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
+| `--thinking-retention off\|loop\|all` | `off` | Keep the reasoning of every chat completion in RAM and put it back into a later request of the same conversation whose assistant turn comes without it: `loop` for the turns after the last user message, `all` for every turn |
+| `--thinking-retention-mb N` | 512 | Size of the retention store, in MiB; the least recently used entries go first |
+| `--thinking-retention-ttl T` | `6h` | How long an entry is kept after its last use: seconds, or with an `s`, `m`, `h` or `d` suffix |
+
+Agent harnesses resend the whole conversation every turn, and many rebuild each assistant turn from
+its content and tool calls only (tau2's `to_litellm_messages` does), so a model that relies on its
+earlier reasoning sees an empty think block for each of its own turns. `--thinking-retention`
+restores that reasoning on the server: each answer's reasoning is filed under a key over the
+API key the request presented, the model it named, its messages and the answer's content and tool
+calls, and an assistant turn of a later request whose reasoning is absent or empty is looked up by
+the messages before it and the turn itself. The match survives a client's re-serialization:
+reasoning fields, tool-call ids and `tool_call_id` are not hashed, content is trimmed (`null` is
+`""`), and tool-call arguments are compared as canonical JSON. A turn that carries reasoning of its
+own is never changed, and nothing is restored across API keys or models. With `all`, a restored
+turn before the last user message is rendered with `preserve_thinking` where the template needs it
+and the request did not turn it off. Restored reasoning never grows a prompt past the context less
+the request's `max_tokens` (else `--default-max-tokens`, else 32768 or a quarter of the context):
+restored turns are taken back, oldest first, until it fits. The request log's start line shows
+`thinking_retention=[restored=R missed=M dropped=D]` (also in the JSON record), and `/metrics`
+counts `surogate_thinking_retention_{stored,restored,misses,dropped,evictions,expired}_total`.
+Only `/v1/chat/completions` with messages takes part; token-id prompts, `/v1/completions`, the
+Responses and Messages APIs and `/tokenize` are served as before.
 
 ### Decisions calibration
 

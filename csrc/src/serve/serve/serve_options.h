@@ -24,6 +24,13 @@ inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 /// before.
 enum class OverlongMaxTokens { Reject, Cap };
 
+/// --thinking-retention off|loop|all (serve/thinking_retention.h): the server keeps the reasoning it generated for a
+/// chat completion and puts it back into a later request whose client sent that assistant turn without it -- `loop`
+/// only for the turns after the last user message, `all` for every turn. Off by default.
+enum class ThinkingRetentionMode : std::uint8_t { Off, Loop, All };
+inline constexpr std::size_t kDefaultThinkingRetentionMib           = 512;
+inline constexpr std::uint64_t kDefaultThinkingRetentionTtlSeconds = 6 * 3600;
+
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
@@ -137,6 +144,11 @@ struct ServeOptions {
     // the chat template does when nothing asks (PromptCapabilities::thinking_by_default).
     std::optional<bool> enable_thinking;
     bool preserve_thinking = false;
+    /// --thinking-retention, --thinking-retention-mb (the store's byte cap) and --thinking-retention-ttl (how long an
+    /// entry is kept without being used).
+    ThinkingRetentionMode thinking_retention             = ThinkingRetentionMode::Off;
+    std::size_t thinking_retention_bytes                 = kDefaultThinkingRetentionMib << 20;
+    std::uint64_t thinking_retention_ttl_seconds         = kDefaultThinkingRetentionTtlSeconds;
     int default_max_tokens = kDefaultMaxTokens;
     // --overlong-max-tokens reject|cap: what a max_tokens that does not fit the context next to the prompt gets.
     // reject (default) answers HTTP 400 as vLLM 0.31 does; cap is the earlier silent cap to the rest of the

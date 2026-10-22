@@ -57,6 +57,13 @@ struct RequestLogContext {
     /// nothing below is logged) and how many of its questions were also read mirrored.
     bool decision_order_averaging = false;
     std::size_t decision_mirrored_questions = 0;
+    /// --thinking-retention: whether the conversation was looked up (when not, nothing below is logged); the assistant
+    /// turns its prompt carried restored reasoning for, the turns looked up and not found, and the restored turns
+    /// taken back so the prompt leaves the output budget free.
+    bool thinking_retention         = false;
+    std::size_t thinking_restored   = 0;
+    std::size_t thinking_missed     = 0;
+    std::size_t thinking_dropped    = 0;
     /// The caller's X-Request-Id (see client_request_id()); empty when none was sent.
     std::string client_request_id;
 };

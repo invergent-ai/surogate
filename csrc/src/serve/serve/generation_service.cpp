@@ -12,6 +12,7 @@
 #include "serve/tool_call_parser.h"
 #include "serve/tool_constraints.h"
 #include "serve/translate.h"
+#include "serve/thinking_retention.h"
 #include "serve/parallel_decoding.h"
 #include "serve/decisions_schema.h"
 #include "serve/decisions_thinking.h"
@@ -649,6 +650,16 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
     ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     if (request.parallel_decoding) { semantics.enable_thinking = false; }
+    // --thinking-retention all: reasoning restored into a turn before the last user message reaches the prompt only
+    // where the template renders completed turns' reasoning, which a Qwen3.6 template does under preserve_thinking.
+    // A request that said nothing about it gets it; one that turned it off keeps it off.
+    const bool preserve_as_sent = semantics.preserve_thinking;
+    const auto& restored        = request.thinking_retention.restored;
+    if (!semantics.preserve_thinking && !request.preserve_thinking.has_value() &&
+        std::any_of(restored.begin(), restored.end(), [](const auto& turn) { return turn.completed_turn; }) &&
+        completed_reasoning_needs_preserve()) {
+        semantics.preserve_thinking = true;
+    }
     request_options.execution.structural_tag = make_tool_constraint(request, options_.tool_call_format, semantics.enable_thinking);
     prepared.constrained_tools = !request_options.execution.structural_tag.empty();
     prepared.tool_choice = request.tool_choice;
@@ -714,7 +725,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
             } else if (request.raw_prompt.has_value()) {
                 prompt = engine_->prepare_text(*request.raw_prompt);
             } else {
-                prompt = engine_->prepare(std::move(*input), control);
+                prompt = render_with_retention(std::move(*input), request, preserve_as_sent, control, prepared);
             }
         } catch (const sinfer::RequestError& error) {
             // A prompt longer than the context is refused by the engine as soon as it is measured; vLLM words
@@ -823,6 +834,98 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
     return prepared;
+}
+
+sinfer::PreparedPrompt GenerationService::render_with_retention(sinfer::PromptInput input,
+                                                                const GenerationRequest& request,
+                                                                bool preserve_as_sent,
+                                                                const PreparationControl& control,
+                                                                PreparedRequest& prepared) const {
+    const auto& restored = request.thinking_retention.restored;
+    if (restored.empty()) { return engine_->prepare(std::move(input), control); }
+    const std::int64_t limit =
+        thinking_retention_prompt_limit(static_cast<std::int64_t>(engine_->options().max_context), request.max_tokens);
+    std::vector<std::size_t> reasoning_tokens; // each restored turn's reasoning, measured at the first overflow
+    std::size_t dropped = 0;
+    const auto settle   = [&](sinfer::PreparedPrompt prompt) {
+        prepared.thinking_restored = restored.size() - dropped;
+        prepared.thinking_dropped  = dropped;
+        prepared.preserve_thinking = input.options.preserve_thinking;
+        return prompt;
+    };
+    for (;;) {
+        std::int64_t measured = 0;
+        try {
+            // A copy: the restored reasoning may have to be taken back out and the prompt rendered again.
+            sinfer::PreparedPrompt prompt = engine_->prepare(sinfer::PromptInput(input), control);
+            measured                      = static_cast<std::int64_t>(prompt.summary().prompt_tokens);
+            if (measured <= limit) { return settle(std::move(prompt)); }
+        } catch (const sinfer::RequestError& error) {
+            if (error.kind() != sinfer::RequestErrorKind::ContextLengthExceeded || !error.prompt()) { throw; }
+            measured = static_cast<std::int64_t>(error.prompt()->prompt_tokens);
+        }
+        if (reasoning_tokens.empty()) {
+            for (const auto& turn : restored) {
+                reasoning_tokens.push_back(
+                    engine_->encode_fragment(request.messages.at(turn.message).reasoning_content).size());
+            }
+        }
+        const std::vector<std::size_t> remaining(reasoning_tokens.begin() + static_cast<std::ptrdiff_t>(dropped),
+                                                 reasoning_tokens.end());
+        const std::size_t drop = restored_turns_to_drop(measured, limit, remaining);
+        for (std::size_t k = dropped; k < dropped + drop; ++k) {
+            // Back to what the client sent: no reasoning, or the empty string it gave.
+            sinfer::ChatMessage& message  = input.messages.at(restored[k].message);
+            message.reasoning_content.clear();
+            message.has_reasoning_content = restored[k].had_reasoning_field;
+        }
+        dropped += drop;
+        if (std::none_of(restored.begin() + static_cast<std::ptrdiff_t>(dropped), restored.end(),
+                         [](const auto& turn) { return turn.completed_turn; })) {
+            input.options.preserve_thinking = preserve_as_sent;
+        }
+        if (dropped == restored.size()) {
+            // Every restored turn is back out: the request as it was sent, refused as it would have been.
+            sinfer::PreparedPrompt prompt = engine_->prepare(sinfer::PromptInput(input), control);
+            return settle(std::move(prompt));
+        }
+    }
+}
+
+bool GenerationService::completed_reasoning_needs_preserve() const {
+    std::call_once(completed_reasoning_probe_, [this] {
+        // user, assistant (+ reasoning), user: the assistant turn is a completed one.
+        const auto tokens = [this](bool reasoning, bool preserve) {
+            const auto message = [](ChatRole role, const char* text) {
+                sinfer::ChatMessage result;
+                result.role = role;
+                sinfer::MessagePart part;
+                part.text = text;
+                result.parts.push_back(std::move(part));
+                return result;
+            };
+            sinfer::PromptInput input;
+            input.messages.push_back(message(ChatRole::User, "What is two plus two?"));
+            sinfer::ChatMessage answer = message(ChatRole::Assistant, "Four.");
+            if (reasoning) {
+                answer.reasoning_content     = "The user asks for the sum of two and two, which is four.";
+                answer.has_reasoning_content = true;
+            }
+            input.messages.push_back(std::move(answer));
+            input.messages.push_back(message(ChatRole::User, "And three plus three?"));
+            input.options.preserve_thinking = preserve;
+            return engine_->count_tokens(std::move(input));
+        };
+        try {
+            const bool renders_by_default = tokens(true, false) > tokens(false, false);
+            const bool renders_preserved  = tokens(true, true) > tokens(false, true);
+            completed_reasoning_needs_preserve_ = !renders_by_default && renders_preserved;
+        } catch (const std::exception&) {
+            // The template refuses preserve_thinking: completed turns' reasoning cannot be shown.
+            completed_reasoning_needs_preserve_ = false;
+        }
+    });
+    return completed_reasoning_needs_preserve_;
 }
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,

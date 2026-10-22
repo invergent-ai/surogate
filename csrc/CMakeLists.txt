@@ -1818,6 +1818,7 @@ if(SINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/decisions_thinking.cpp
     ${SERVE_ROOT}/serve/model_scheduler.cpp
     ${SERVE_ROOT}/serve/replica_router.cpp
+    ${SERVE_ROOT}/serve/thinking_retention.cpp
     ${SERVE_ROOT}/serve/request_log.cpp
     ${SERVE_ROOT}/serve/http_server.cpp
     ${SERVE_ROOT}/serve/responses_http.cpp

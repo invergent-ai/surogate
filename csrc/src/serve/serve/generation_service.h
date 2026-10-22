@@ -165,6 +165,10 @@ struct PreparedRequest {
     std::size_t tool_name_max_length       = 64;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
+    /// --thinking-retention: the assistant turns the prompt carries restored reasoning for, and the restored turns
+    /// taken back again, oldest first, so the prompt leaves the request's output budget free.
+    std::size_t thinking_restored          = 0;
+    std::size_t thinking_dropped           = 0;
     /// What the client asked to be given back, and the prompt ids to give it.
     /// Snapshotted before the prompt is submitted, because submitting consumes it.
     int top_logprobs = 0;
@@ -296,6 +300,19 @@ private:
     [[nodiscard]] bool vllm_qwen3_applies(const PreparedRequest& prepared) const;
     [[nodiscard]] vllm_qwen3::Result vllm_qwen3_parse(const PreparedRequest& prepared,
                                                       const sinfer::GenerationResult& result) const;
+    /// Render a chat request's prompt. With reasoning restored into it (--thinking-retention) the prompt must leave
+    /// the request's output budget free: restored turns are taken back, oldest first, until it does, and with every
+    /// one taken back it is the request as sent. `preserve_as_sent` is the request's own preserve_thinking, which
+    /// `input` overrides while a restored completed turn needs it (completed_reasoning_needs_preserve).
+    [[nodiscard]] sinfer::PreparedPrompt render_with_retention(sinfer::PromptInput input,
+                                                               const GenerationRequest& request,
+                                                               bool preserve_as_sent,
+                                                               const PreparationControl& control,
+                                                               PreparedRequest& prepared) const;
+    /// Whether this template renders a completed turn's reasoning only under preserve_thinking: true for Qwen3.6's
+    /// templates, false for one that always renders it (Surogate3.7's) or never can. Asked of the template once, by
+    /// counting a probe conversation's tokens with and without reasoning.
+    [[nodiscard]] bool completed_reasoning_needs_preserve() const;
     GenerationOutcome run_parallel(PreparedRequest& prepared, const StreamSink* sink,
                                     const std::function<bool()>& is_cancelled);
 
@@ -337,6 +354,8 @@ private:
     bool shared_training_ = false; // guarded by request_capacity_->mutex
     std::mutex decision_codes_mutex_;
     std::optional<std::vector<std::string>> decision_codes_;
+    mutable std::once_flag completed_reasoning_probe_;
+    mutable bool completed_reasoning_needs_preserve_ = false;
 };
 
 } // namespace sinfer::serve

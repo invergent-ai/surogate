@@ -226,6 +226,11 @@ keeps earlier assistant reasoning in later prompts; the request's `preserve_thin
 that default. If you supply both a top-level setting and its `chat_template_kwargs` equivalent,
 their values must agree.
 
+`preserve_thinking` renders the reasoning a client sends back. A client that sends its assistant
+turns back as content and tool calls only can be served with `--thinking-retention loop|all`
+([CLI](cli.md#thinking)): the server keeps the reasoning it generated and puts it back into those
+turns itself, per API key and model.
+
 ### Not supported
 
 These are refused with a `400` and a specific error code rather than silently ignored:

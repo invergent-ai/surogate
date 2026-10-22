@@ -299,7 +299,12 @@ HttpServer::HttpServer(ServeOptions options)
       admission_(options_.rate_limit_rps, options_.rate_limit_burst, options_.max_inflight_requests),
       thinking_admission_(0, 1, options_.max_thinking_requests),
       image_admission_(0, 1, options_.max_image_requests),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path),
+      thinking_retention_(options_.thinking_retention == ThinkingRetentionMode::Off
+                              ? nullptr
+                              : std::make_unique<ThinkingRetentionStore>(
+                                    options_.thinking_retention_bytes,
+                                    std::chrono::seconds(options_.thinking_retention_ttl_seconds))) {
     const HttpPoolSizes sizes = http_pool_sizes(options_);
     server_.new_task_queue = [sizes] {
         return new httplib::ThreadPool(sizes.workers, sizes.queued);
@@ -337,6 +342,17 @@ HttpServer::HttpServer(ServeOptions options)
 
 void HttpServer::log_line(const std::string& line) {
     write_console_log(ConsoleLogLevel::Info, line);
+}
+
+void HttpServer::restore_retained_thinking(const httplib::Request& http, GenerationRequest& request) {
+    if (thinking_retention_ == nullptr) { return; }
+    const std::string tenant = thinking_tenant(http.get_header_value("Authorization"), http.get_header_value("x-api-key"));
+    restore_thinking(request, *thinking_retention_, options_.thinking_retention, thinking_scope(tenant, request.model));
+}
+
+void HttpServer::retain_answer_thinking(const ThinkingRetentionState& retention, const GenerationOutcome& outcome) {
+    if (thinking_retention_ == nullptr || outcome.finish_reason == sinfer::FinishReason::Cancelled) { return; }
+    retain_thinking(*thinking_retention_, retention, outcome.text, outcome.tool_calls, outcome.reasoning);
 }
 
 void HttpServer::log_request_start(const RequestLogContext& context) {
@@ -1014,6 +1030,35 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
     help("sleeping", "gauge", "1 while a model's weights are released to host memory.");
     for (const Row& r : rows) { metric("sleeping", r.labels, r.sleeping ? 1U : 0U); }
 
+    // --thinking-retention: one process-wide store, so these carry no model label.
+    if (thinking_retention_ != nullptr) {
+        const ThinkingRetentionCounters retention = thinking_retention_->counters();
+        const auto plain = [&out](std::string_view name, std::uint64_t value) {
+            out += "surogate_";
+            out += name;
+            out += ' ';
+            out += std::to_string(value);
+            out += '\n';
+        };
+        help("thinking_retention_stored_total", "counter", "Answers whose reasoning was kept for the conversation's next request.");
+        plain("thinking_retention_stored_total", retention.stored);
+        help("thinking_retention_restored_total", "counter", "Assistant turns whose prompt carried restored reasoning.");
+        plain("thinking_retention_restored_total", retention.restored);
+        help("thinking_retention_misses_total", "counter", "Assistant turns without reasoning that had none stored.");
+        plain("thinking_retention_misses_total", retention.misses);
+        help("thinking_retention_dropped_total", "counter",
+             "Restored turns taken back so the prompt leaves the request's output budget free.");
+        plain("thinking_retention_dropped_total", retention.dropped);
+        help("thinking_retention_evictions_total", "counter", "Entries dropped for room, least recently used first.");
+        plain("thinking_retention_evictions_total", retention.evictions);
+        help("thinking_retention_expired_total", "counter", "Entries dropped after the TTL without use.");
+        plain("thinking_retention_expired_total", retention.expired);
+        help("thinking_retention_entries", "gauge", "Entries held.");
+        plain("thinking_retention_entries", retention.entries);
+        help("thinking_retention_bytes", "gauge", "Bytes the held entries are charged.");
+        plain("thinking_retention_bytes", retention.bytes);
+    }
+
     res.set_content(out, "text/plain; version=0.0.4; charset=utf-8");
 }
 
@@ -1132,6 +1177,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         limits.vllm_max_tokens    = options_.overlong_max_tokens == OverlongMaxTokens::Reject;
         request                   = parse_chat_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
+        restore_retained_thinking(req, request);
         // `model` selects a served model or one of the primary's adapters.
         t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
                                         conversation_routing_key(request));
@@ -1160,6 +1206,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         write_error(res, error);
         return;
     }
+    if (thinking_retention_ != nullptr && request.thinking_retention.active) {
+        thinking_retention_->count(prepared.thinking_restored, request.thinking_retention.missed,
+                                   prepared.thinking_dropped);
+    }
 
     const std::string id       = new_chat_completion_id();
     const std::int64_t created = unix_time_now();
@@ -1175,6 +1225,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return stopping_.load(std::memory_order_relaxed) ||
                        (req.is_connection_alive && !req.is_connection_alive());
             });
+            retain_answer_thinking(request.thinking_retention, outcome);
             log_request_done(log_context, outcome);
             const CompletionUsage usage = completion_usage(outcome);
             TokenDetail detail;
@@ -1227,8 +1278,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     GenerationService* const routed = &svc();
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable, routed,
-         log_context](std::size_t, httplib::DataSink& sink) -> bool {
+        [this, stream, id, created, model, include_usage, tool_capable, routed, log_context,
+         retention = request.thinking_retention](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
                 return true;
@@ -1279,6 +1330,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 };
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
+                retain_answer_thinking(retention, outcome);
                 log_request_done(log_context, outcome);
                 done_logged = true;
                 // A client that left mid-stream has its usage in that record; nobody is reading.

@@ -5,6 +5,7 @@
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 #include "serve/admission_limit.h"
+#include "serve/thinking_retention.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -138,6 +139,11 @@ private:
     void log_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
+    /// --thinking-retention: give the request's assistant turns their stored reasoning back (before it is routed,
+    /// so the routing key sees the prompt the replica will render). The tenant is the key the request presented.
+    void restore_retained_thinking(const httplib::Request& http, GenerationRequest& request);
+    /// File the reasoning of a finished answer for the conversation's next request; nothing for a cancelled one.
+    void retain_answer_thinking(const ThinkingRetentionState& retention, const GenerationOutcome& outcome);
 
     GenerationService* service_ = nullptr;
     /// The primary model's engines: the primary itself first, then its data-parallel replicas.
@@ -186,6 +192,8 @@ private:
     /// Whether `service` is one of the primary's replicas (the primary included).
     [[nodiscard]] bool is_primary_replica(const GenerationService* service) const;
     JsonlRequestLog request_jsonl_;
+    /// The process-wide reasoning store (--thinking-retention), shared by every replica and model; null when off.
+    std::unique_ptr<ThinkingRetentionStore> thinking_retention_;
     httplib::Server server_;
     /// Set by stop(); every in-flight request's cancellation predicate reads it.
     std::atomic<bool> stopping_{false};

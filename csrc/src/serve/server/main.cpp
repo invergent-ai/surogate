@@ -300,7 +300,14 @@ int main(int argc, char** argv) {
         std::ostringstream listening;
         listening << "listening on http://" << options.host << ':' << options.port
                   << " (model id: " << server.public_model_id()
-                  << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
+                  << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer");
+        if (options.thinking_retention != sinfer::serve::ThinkingRetentionMode::Off) {
+            listening << ", thinking retention: "
+                      << sinfer::serve::thinking_retention_mode_name(options.thinking_retention) << ' '
+                      << (options.thinking_retention_bytes >> 20) << " MiB, TTL "
+                      << options.thinking_retention_ttl_seconds << " s";
+        }
+        listening << ')';
         sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, listening.str());
 
         // A dead engine worker refuses every request for the rest of the process's life, so the
