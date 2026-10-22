@@ -131,6 +131,9 @@ struct ChatTurn {
     /// template, which then renders an empty think block rather than looking for one in the
     /// content -- the difference between "no reasoning" and "reasoning not given".
     bool has_reasoning_content = false;
+    /// One of the reasoning fields the client sent held text, whichever field won (`reasoning`
+    /// takes precedence even when it is empty). --thinking-retention never touches such a turn.
+    bool sent_reasoning_text = false;
 };
 
 // OpenAI sampling fields carried by the protocol adapter.

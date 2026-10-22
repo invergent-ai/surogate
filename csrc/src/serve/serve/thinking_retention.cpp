@@ -341,8 +341,11 @@ void restore_thinking(GenerationRequest& request, ThinkingRetentionStore& store,
     std::vector<ThinkingLookup> lookups;
     for (std::size_t i = first_turn; i < request.messages.size(); ++i) {
         const ChatTurn& turn = request.messages[i];
-        // A message that carries reasoning of its own is the client's to keep.
-        if (turn.role != ChatRole::Assistant || !turn.reasoning_content.empty()) { continue; }
+        // A message that carries reasoning of its own is the client's to keep, also when an empty `reasoning` won
+        // over a `reasoning_content` with text.
+        if (turn.role != ChatRole::Assistant || !turn.reasoning_content.empty() || turn.sent_reasoning_text) {
+            continue;
+        }
         turns.push_back(i);
         lookups.push_back(ThinkingLookup{.key = digests[i + 1], .call_ids = thinking_call_ids(turn.tool_calls)});
     }
@@ -365,8 +368,11 @@ void restore_thinking(GenerationRequest& request, ThinkingRetentionStore& store,
 void retain_thinking(ThinkingRetentionStore& store, const ThinkingRetentionState& retention, std::string_view content,
                      const std::vector<ToolCall>& tool_calls, std::string reasoning) {
     if (!retention.active || reasoning.empty()) { return; }
+    // The reasoning as the client was given it: a generation cut at max_tokens can end inside a character, and the
+    // response replaced those bytes; restored as they were they would not even render (a Jinja template's messages
+    // are JSON).
     store.store(answer_key(retention.conversation, content, tool_calls), thinking_call_ids(tool_calls),
-                std::move(reasoning));
+                as_delivered(reasoning));
 }
 
 } // namespace sinfer::serve

@@ -36,8 +36,9 @@
 // Modes: `loop` restores only the assistant turns after the last user message (the turns a Qwen template renders with
 // their reasoning anyway); `all` restores every turn, and a restored turn before the last user message turns on
 // preserve_thinking where the template shows completed turns' reasoning only under it (Qwen3.6's; Surogate3.7's shows
-// every turn's anyway) and the request did not set it. `off` (the default) neither stores nor restores anything:
-// requests are served byte for byte as before.
+// every turn's anyway) and the request did not set it. A template takes the switch for the whole prompt, so the
+// reasoning a client sent itself for a completed turn is then shown too, as the model was trained to see it. `off`
+// (the default) neither stores nor restores anything: requests are served byte for byte as before.
 //
 // Context: restoration never lets a prompt grow past the context less the request's output budget (its max_tokens, else
 // --default-max-tokens, else min(32768, context / 4)); GenerationService::prepare drops restored reasoning again,
@@ -189,8 +190,8 @@ private:
 void restore_thinking(GenerationRequest& request, ThinkingRetentionStore& store, ThinkingRetentionMode mode,
                       const ThinkingDigest& scope);
 
-/// File the reasoning of the answer to a restored-or-looked-up request (`retention.active`) under the key a later
-/// request will look it up by. Nothing is kept for an empty reasoning.
+/// File the reasoning of the answer to a looked-up request (`retention.active`) under the key a later request will
+/// look it up by, as the response delivered it (invalid UTF-8 replaced). Nothing is kept for an empty reasoning.
 void retain_thinking(ThinkingRetentionStore& store, const ThinkingRetentionState& retention, std::string_view content,
                      const std::vector<ToolCall>& tool_calls, std::string reasoning);
 

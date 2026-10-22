@@ -396,6 +396,7 @@ void parse_messages(const OJson& body, GenerationRequest& out) {
                     turn.reasoning_content     = item.at(key).get<std::string>();
                     turn.has_reasoning_content = true;
                 }
+                if (!item.at(key).get_ref<const std::string&>().empty()) { turn.sent_reasoning_text = true; }
             }
             out.messages.push_back(std::move(turn));
             continue;

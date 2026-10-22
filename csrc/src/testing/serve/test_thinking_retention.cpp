@@ -251,6 +251,29 @@ void client_reasoning_is_kept() {
               with_empty.thinking_retention.restored.at(0).had_reasoning_field &&
               with_empty.messages.at(2).reasoning_content == kReasoning1,
           "an empty reasoning string is restored, and remembered as sent");
+
+    // An empty `reasoning` wins over `reasoning_content` in the parser; the turn still came with reasoning text.
+    OJson both                               = turn2();
+    both["messages"][2]["reasoning"]         = "";
+    both["messages"][2]["reasoning_content"] = "the client's own copy";
+    GenerationRequest with_both              = parse(both);
+    restore_thinking(with_both, store, ThinkingRetentionMode::All, scope);
+    check(with_both.messages.at(2).reasoning_content.empty() && with_both.thinking_retention.restored.empty() &&
+              with_both.thinking_retention.missed == 0,
+          "a turn sent with reasoning text in either field is never restored");
+
+    // A generation cut inside a character: the reasoning is kept as the response delivered it.
+    ThinkingRetentionStore cut_store(1 << 20, std::chrono::hours(6));
+    GenerationRequest cut_first = parse(turn1());
+    restore_thinking(cut_first, cut_store, ThinkingRetentionMode::All, scope);
+    const std::string cut_reasoning = "the plan costs 5 \xE2\x82";
+    retain_thinking(cut_store, cut_first.thinking_retention, "", {kCall1}, cut_reasoning);
+    GenerationRequest cut_second = parse(turn2());
+    restore_thinking(cut_second, cut_store, ThinkingRetentionMode::All, scope);
+    const std::string delivered =
+        Json::parse(Json(cut_reasoning).dump(-1, ' ', false, Json::error_handler_t::replace)).get<std::string>();
+    check(cut_second.messages.at(2).reasoning_content == delivered && delivered != cut_reasoning,
+          "reasoning cut inside a character is restored as the client received it");
 }
 
 void isolation_and_off() {
