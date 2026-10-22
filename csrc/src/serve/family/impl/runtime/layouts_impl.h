@@ -5,6 +5,7 @@
 #include "family/impl/runtime/attention_workspace.h"
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
+#include "api/ops/batch_invariant.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/vision_context.h"
@@ -1126,6 +1127,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     auto impl                 = std::make_unique<SequencePlanImpl>();
     impl->weights_profile     = inputs.weights_profile;
     impl->lora_enabled        = inputs.lora_enabled;
+    // Base rounds on an engine armed for adapters (ProgramImplCore::base_rounds_ says why not
+    // under --batch-invariant, on a pipeline stage or with SUROGATE_SERVE_MARLIN_FP8=1). A stage
+    // is what configure_stage makes one: any layer range but 0/0 and the whole model.
+    const bool pipeline_stage =
+        !(inputs.pipeline_stage_first == 0 && inputs.pipeline_stage_last == 0) &&
+        (inputs.pipeline_stage_first > 0 || inputs.pipeline_stage_last < inputs.geometry.layers);
+    impl->base_rounds = inputs.lora_enabled && !ops::batch_invariant() && !pipeline_stage &&
+                        !ops::detail::marlin_fp8_adoption_opted_in();
     impl->geometry            = inputs.geometry;
     impl->vision_geometry = inputs.vision_geometry;
     impl->capacity            = inputs.capacity;
@@ -1186,10 +1195,18 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes =
+            // The per-lane bound is one flavor's graphs, and with base rounds every ordinary
+            // family is captured twice (prepare_graphs): the adapter-capable routes and their
+            // base twins. Counting one flavor refused a 35B-A3B NVFP4 armed for adapters at 43
+            // lanes: 701 MiB of ordinary graphs (9.9 MiB a lane adapter-capable, 6.3 base -- each
+            // inside its 12) against 516 MiB. MTP's per-class bound below already holds both
+            // flavors (the same engine with MTP 2: 289 MiB against 2.56 GiB at 32 lanes);
+            // DFlash's is larger still.
+            impl->graph_allowance_bytes = checked_mul(
                 checked_mul(ordinary_graph_allowance_per_lane_bytes<Variant>(impl->weights_profile),
                             decode_batch_capacity(impl->max_concurrency, impl->speculative_backend),
-                            "ordinary exact-b graph allowance");
+                            "ordinary exact-b graph allowance"),
+                impl->base_rounds ? 2U : 1U, "ordinary graph allowance for both round flavors");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(

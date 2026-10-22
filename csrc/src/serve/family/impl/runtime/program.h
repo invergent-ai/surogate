@@ -857,7 +857,8 @@ public:
     std::array<DecodeGraphFlavors, 16> dflash_graphs;
     /// Whether this program runs base rounds (ops::ScopedLoraBaseRound): it carries adapters,
     /// so a round that selects none has a cheaper flavor to take. Decided once, before the
-    /// graphs are captured, because it decides which graphs exist.
+    /// graphs are captured, because it decides which graphs exist -- by the sequence plan
+    /// (SequencePlanImpl::base_rounds), whose graph allowance has to hold them.
     ///
     /// Not under --batch-invariant: the two flavors are the same model through different
     /// kernels, so a base request's bits would depend on whether an adapter request shared

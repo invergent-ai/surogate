@@ -263,6 +263,11 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
             install_and_upload(topology, *first_profile);
         }
     }
+    // Instantiation is where a family's executables take their device memory, so the trace
+    // shows what each family (and each round flavor) holds against the plan's allowance.
+    if (memory_trace_enabled()) {
+        trace_memory_phase((std::string(label) + " graphs instantiated").c_str());
+    }
 }
 
 } // namespace
@@ -514,9 +519,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     trace_memory_phase("cuBLASLt prewarmed");
     // Adapters are bound by now (the target binds them with its frontend), so this is the
     // engine's answer for its whole life: which flavors its rounds take and, below, which
-    // graphs it captures for them.
-    base_rounds_ = ops::lora_enabled() && !ops::batch_invariant() && !pipeline_stage() &&
-                   !ops::detail::marlin_fp8_adoption_opted_in();
+    // graphs it captures for them. The plan decided it from the options, and sized the graph
+    // allowance for those graphs; an engine whose store bound nothing has no second flavor.
+    base_rounds_ = plan.base_rounds && ops::lora_enabled();
     // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
     // main-model forward copies each layer's selected expert ids into a fixed buffer, which the
     // graphs captured below record. Allocated before prepare_graphs() so they bake its address.

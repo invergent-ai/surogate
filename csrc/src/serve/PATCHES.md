@@ -3674,6 +3674,16 @@ is unchanged beside it). `sinfer_lora_base_rounds_test` (opt-in, real weights) s
 an adapter request in both orders, and alone again, against the same engine without adapters; on the engine before
 this change its first comparison fails by 0.018 nats.
 
+**Graph allowance for the twins (2026-10-22).** The plan never counted them: an engine without a draft head is
+allowed 12 MiB of decode graphs a lane, one flavor's worth, and the armed engine captured two. Surogate3.7-35B-A3B
+NVFP4 with `--enable-lora` and no `--spec` refused to start (43 lanes: 701 MiB against 516 MiB, 9.9 MiB a lane
+for the adapter-capable families and 6.3 for the base twins, which are the 6.3 an engine without adapters holds;
+32 lanes: 513 MiB against 384); with MTP the per-class bound (82 MiB a lane past 4k context) had held both. The
+sequence plan now decides base rounds (`SequencePlanImpl::base_rounds`, the predicate above) and counts the
+ordinary bound once per flavor; the program takes the plan's answer, so the graphs it captures are the graphs the
+plan paid for. Engines without adapters, and armed engines with MTP or DFlash, plan exactly what they did
+(`sinfer_lora_graph_plan_test`).
+
 
 ## 101
 

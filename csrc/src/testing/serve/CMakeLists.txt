@@ -149,6 +149,10 @@ sinfer_add_test(sinfer_checkpoint_workspace_test SOURCES test_checkpoint_workspa
 target_compile_options(sinfer_checkpoint_workspace_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_qwen4exp_mtp_workspace_test SOURCES test_qwen4exp_mtp_workspace.cpp)
 target_compile_options(sinfer_qwen4exp_mtp_workspace_test PRIVATE -UNDEBUG)
+# The CUDA Graph allowance of a plan armed for adapters: both round flavors without a draft
+# head, MTP's bound unchanged.
+sinfer_add_test(sinfer_lora_graph_plan_test SOURCES test_lora_graph_plan.cpp)
+target_compile_options(sinfer_lora_graph_plan_test PRIVATE -UNDEBUG)
 add_executable(sinfer_radix_prefix_cache_test test_radix_prefix_cache.cpp)
 target_include_directories(sinfer_radix_prefix_cache_test PRIVATE ${SERVE_ROOT})
 target_compile_options(sinfer_radix_prefix_cache_test PRIVATE -UNDEBUG)

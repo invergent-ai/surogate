@@ -131,6 +131,12 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool lora_enabled = false;
+    /// Whether the program runs base rounds (ops::ScopedLoraBaseRound, #262), and so captures
+    /// every decode graph family twice: the adapter-capable routes and the base routes beside
+    /// them. Decided here, before any adapter is bound, because the graph allowance below has
+    /// to hold both; the program takes this answer instead of deciding again
+    /// (ProgramImplCore::base_rounds_).
+    bool base_rounds = false;
     int device          = 0;
     SINFER_FAMILY_RUNTIME_NS::PersistentLayout persistent;
     SINFER_FAMILY_RUNTIME_NS::WorkspacePlan workspace;
