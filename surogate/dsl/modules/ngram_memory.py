@@ -33,6 +33,29 @@ Option (SFT config ``ngram_memory``)::
                                         # (r * a + b) mod R -- the table's capacity and statistics without its
                                         # n-gram knowledge. Recorded in the adapter; the engine export refuses it.
 
+Trainable table (``table: trainable``; rl/ngram-memory-2026-10-18/DESIGN.md (a)-(b), the ngram-poc of
+2026-10-22): no file -- an FP32 table [row_count, head_dim] that is an adapter tensor of its own, ZERO at
+initialisation (so step 0 is the base model bit for bit and a row the training never reads stays an exact no-op),
+trained with ``table_lr`` (default: the memory's lr) and no weight decay; W_v ~ N(0, init_std) like W_k (the zero
+factor is the table). The forward gathers the FP32 rows rounded once to bf16 (the engine's bf16-row table); the
+backward scatters dk W_k + dv W_v into the rows it read, summed per row in sorted order (deterministic)::
+
+    ngram_memory:
+      table: trainable
+      hash:                              # the engine's hash constants and geometry
+        multipliers: [23703573157769, 20109073645365, 8052911324071]
+        head_vocab_sizes: [...]          # one prime per head (heads = (ngram_size - 1) * heads_per_ngram); offsets
+                                         # default to the running sum, row_count to the total
+        ngram_size: 3
+        heads_per_ngram: 8
+        head_dim: 128
+        eos_token_id: 248044
+      layer: 1
+      lr: 1.0e-4                         # the dense memory tensors
+      table_lr: 1.0e-4                   # the table (default: lr)
+
+A control arm without n-gram identity: ``head_vocab_sizes`` all 1 (every n-gram reads the same row of each head).
+
 With no ``ngram_memory`` the compiled IR is unchanged. With it the model's IR config carries
 ``ngram_memory_layer`` and ``ngram_memory_spec`` (the JSON :meth:`NgramMemoryConfig.spec` returns).
 """
@@ -52,6 +75,8 @@ MAX_NGRAM = 3
 DEFAULT_ZERO_TOKEN_IDS = (248056, 248057)
 #: IQ4_NL code values (kvalues_iq4nl).
 IQ4NL_VALUES = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+#: ``table`` value of a trained, zero-initialised table (no file).
+TRAINABLE = "trainable"
 
 
 @dataclass(frozen=True)
@@ -103,6 +128,35 @@ class TableMeta:
                 raise ValueError("ngram_memory: multipliers must be uint64")
 
     @classmethod
+    def from_hash(cls, value: dict[str, Any]) -> "TableMeta":
+        """The geometry of a trainable table from its hash constants (``ngram_memory.hash``): head offsets default to
+        the running sum of ``head_vocab_sizes`` and ``row_count`` to their total."""
+        allowed = {"multipliers", "head_vocab_sizes", "head_offsets", "ngram_size", "heads_per_ngram", "head_dim",
+                   "eos_token_id", "row_count", "layer", "conv_kernel", "image_token_id", "table_offset"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"ngram_memory.hash: unknown keys {sorted(unknown)} (allowed: {sorted(allowed)})")
+        for k in ("multipliers", "head_vocab_sizes", "ngram_size", "heads_per_ngram", "head_dim", "eos_token_id"):
+            if k not in value:
+                raise ValueError(f"ngram_memory.hash: '{k}' is required")
+        sizes = tuple(int(x) for x in value["head_vocab_sizes"])
+        if "head_offsets" in value:
+            offsets = tuple(int(x) for x in value["head_offsets"])
+        else:
+            acc, offs = 0, []
+            for v in sizes:
+                offs.append(acc)
+                acc += v
+            offsets = tuple(offs)
+        rows = int(value.get("row_count", max((o + v for o, v in zip(offsets, sizes)), default=0)))
+        return cls(multipliers=tuple(int(x) for x in value["multipliers"]), head_offsets=offsets,
+                   head_vocab_sizes=sizes, ngram_size=int(value["ngram_size"]),
+                   heads_per_ngram=int(value["heads_per_ngram"]), head_dim=int(value["head_dim"]), row_count=rows,
+                   eos_token_id=int(value["eos_token_id"]), layer=int(value.get("layer", 1)),
+                   conv_kernel=int(value.get("conv_kernel", 4)),
+                   image_token_id=int(value["image_token_id"]) if value.get("image_token_id") is not None else None)
+
+    @classmethod
     def from_manifest(cls, manifest: dict[str, Any]) -> "TableMeta":
         """From a GGUF manifest (``rl/ngram-transplant-2026-10-18/gguf_manifest.py``: ``meta`` with the
         ``qwen4exp.ple.*`` keys, ``tensors[0]`` = ``per_layer_token_embd.weight`` [head_dim, rows]) or a
@@ -152,6 +206,13 @@ class NgramMemoryConfig:
     base_lr: float | None = None
     #: Control arm: (a, b) of the row relabelling r -> (r * a + b) mod row_count, or None.
     row_shuffle: tuple[int, int] | None = None
+    #: The trainable table's learning rate (``table: trainable``; None = the memory's ``lr``).
+    table_lr: float | None = None
+
+    @property
+    def trainable(self) -> bool:
+        """The table is a trained, zero-initialised FP32 adapter tensor (``table: trainable``), not a file."""
+        return self.table == TRAINABLE
 
     @classmethod
     def parse(cls, value: Any) -> "NgramMemoryConfig | None":
@@ -164,14 +225,30 @@ class NgramMemoryConfig:
         if not isinstance(value, dict):
             raise ValueError(f"ngram_memory must be a mapping, got {type(value).__name__}")
         allowed = {"table", "manifest", "meta", "layer", "lr", "only", "init_std", "table_residency",
-                   "zero_token_ids", "seed", "base_lr", "row_shuffle"}
+                   "zero_token_ids", "seed", "base_lr", "row_shuffle", "hash", "table_lr"}
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(f"ngram_memory: unknown keys {sorted(unknown)} (allowed: {sorted(allowed)})")
         if "table" not in value:
-            raise ValueError("ngram_memory: 'table' (the IQ4_NL table file) is required")
-        table = os.path.abspath(str(value["table"]))  # the export and the engine read it from elsewhere
-        if isinstance(value.get("meta"), dict):
+            raise ValueError("ngram_memory: 'table' (the IQ4_NL table file, or 'trainable') is required")
+        trainable = str(value["table"]) == TRAINABLE
+        table = TRAINABLE if trainable else os.path.abspath(str(value["table"]))  # read elsewhere: absolute
+        if trainable:
+            if isinstance(value.get("meta"), dict):
+                meta = TableMeta.from_manifest(value["meta"])
+            elif isinstance(value.get("hash"), dict):
+                meta = TableMeta.from_hash(value["hash"])
+            else:
+                raise ValueError("ngram_memory: a trainable table needs 'hash' (its constants and geometry)")
+            manifest = None
+            if value.get("row_shuffle"):
+                raise ValueError("ngram_memory: row_shuffle is a control of a file table; a trainable table's "
+                                 "control is head_vocab_sizes all 1")
+            if str(value.get("table_residency", "device")) != "device":
+                raise ValueError("ngram_memory: a trainable table lives on the device (table_residency: device)")
+        elif value.get("hash") is not None or value.get("table_lr") is not None:
+            raise ValueError("ngram_memory: 'hash' and 'table_lr' belong to a trainable table (table: trainable)")
+        elif isinstance(value.get("meta"), dict):
             meta = TableMeta.from_manifest(value["meta"])
             manifest = value.get("manifest")
         else:
@@ -181,20 +258,26 @@ class NgramMemoryConfig:
             meta = TableMeta.from_manifest(json.loads(Path(manifest).read_text()))
         meta.validate()
         layer = int(value.get("layer", meta.layer))
-        residency = str(value.get("table_residency", "host"))
+        residency = str(value.get("table_residency", "device" if trainable else "host"))
         if residency not in ("host", "device"):
             raise ValueError(f"ngram_memory: table_residency must be 'host' or 'device', got {residency!r}")
         zero = tuple(int(x) for x in value.get("zero_token_ids", DEFAULT_ZERO_TOKEN_IDS))
         if len(zero) > 4:
             raise ValueError("ngram_memory: at most 4 zero_token_ids")
         lr = value.get("lr")
+        table_lr = value.get("table_lr")
         row_shuffle = parse_row_shuffle(value.get("row_shuffle"), meta.row_count)
         cfg = cls(table=table, meta=meta, layer=layer, lr=float(lr) if lr is not None else None,
                   only=bool(value.get("only", True)), init_std=float(value.get("init_std", 0.02)),
                   table_residency=residency, zero_token_ids=zero, seed=int(value.get("seed", 0)),
                   manifest=manifest,
                   base_lr=float(value["base_lr"]) if value.get("base_lr") is not None else None,
-                  row_shuffle=row_shuffle)
+                  row_shuffle=row_shuffle, table_lr=float(table_lr) if table_lr is not None else None)
+        if cfg.table_lr is not None and not cfg.table_lr > 0:
+            raise ValueError("ngram_memory: table_lr must be positive")
+        if trainable and meta.row_count * meta.head_dim >= 2**31:
+            raise ValueError(f"ngram_memory: a trainable table holds at most 2^31 - 1 values "
+                             f"({meta.row_count} rows x {meta.head_dim})")
         if layer < 0:
             raise ValueError("ngram_memory: layer must be >= 0")
         if cfg.lr is not None and not cfg.lr > 0:
@@ -204,6 +287,8 @@ class NgramMemoryConfig:
         return cfg
 
     def check_table_file(self) -> None:
+        if self.trainable:
+            return  # no file: the table is an adapter tensor
         size = os.path.getsize(self.table)
         need = self.meta.table_offset + self.meta.row_count * self.meta.row_bytes
         if size < need:
@@ -216,6 +301,7 @@ class NgramMemoryConfig:
                 "only": self.only, "init_std": self.init_std, "table_residency": self.table_residency,
                 "zero_token_ids": list(self.zero_token_ids), "seed": self.seed, "base_lr": self.base_lr,
                 "row_shuffle": {"a": self.row_shuffle[0], "b": self.row_shuffle[1]} if self.row_shuffle else None,
+                **({"table_lr": self.table_lr} if self.table_lr is not None else {}),
                 "meta": {"multipliers": list(m.multipliers), "head_offsets": list(m.head_offsets),
                          "head_vocab_sizes": list(m.head_vocab_sizes), "ngram_size": m.ngram_size,
                          "heads_per_ngram": m.heads_per_ngram, "head_dim": m.head_dim, "row_count": m.row_count,
@@ -229,6 +315,14 @@ class NgramMemoryConfig:
         if not self.base_lr:
             raise ValueError("ngram_memory: lr needs the run's learning_rate (base_lr)")
         return self.lr / self.base_lr
+
+    def table_lr_scale(self) -> float:
+        """The trainable table's learning rate relative to the run's (the memory's without ``table_lr``)."""
+        if self.table_lr is None:
+            return self.lr_scale()
+        if not self.base_lr:
+            raise ValueError("ngram_memory: table_lr needs the run's learning_rate (base_lr)")
+        return self.table_lr / self.base_lr
 
     def spec(self) -> dict[str, Any]:
         """The JSON the C++ runtime parses (runtime/ngram/ngram_memory.cpp, ngram_memory::Spec::parse)."""
@@ -244,7 +338,9 @@ class NgramMemoryConfig:
                 "conv_dilation": m.ngram_size,
                 # only when on, so a run without the control arm compiles to the IR it always had
                 **({"row_shuffle_a": self.row_shuffle[0], "row_shuffle_b": self.row_shuffle[1]}
-                   if self.row_shuffle else {})}
+                   if self.row_shuffle else {}),
+                # likewise: a file-table run's spec is unchanged
+                **({"table_mode": "trainable", "table_lr_scale": self.table_lr_scale()} if self.trainable else {})}
 
 
 def parse_row_shuffle(value: Any, row_count: int) -> tuple[int, int] | None:

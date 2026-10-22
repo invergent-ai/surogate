@@ -72,6 +72,9 @@ public:
         /// Hashed n-gram memory: its layer (-1 = none; that block holds the dense grads) and E.
         int ngram_memory_layer = -1;
         int ngram_memory_embed = 0;
+        /// Trainable table rows and values per row (0 rows: the frozen file table, no table gradient).
+        long ngram_table_rows = 0;
+        int ngram_head_dim = 0;
 
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;

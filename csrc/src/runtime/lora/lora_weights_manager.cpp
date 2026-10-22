@@ -182,6 +182,16 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         work.ngram_gain->A = mAllocator->allocate(work_dtype, "lora_ngram_norm_key_work", EAllocationType::ON_DEVICE, {C});
         work.ngram_gain->B =
             mAllocator->allocate(work_dtype, "lora_ngram_norm_query_work", EAllocationType::ON_DEVICE, {C});
+        // Trainable table: the FP32 master only (the gather rounds each value it reads); B stays empty.
+        if (mConfig.ngram_table_rows > 0) {
+            if (master_dtype != ETensorDType::FP32) {
+                throw std::logic_error("ngram memory: a trainable table needs lora_dtype fp32");
+            }
+            master.ngram_table.emplace();
+            master.ngram_table->A = TensorShard(mAllocator->allocate(
+                ETensorDType::FP32, "lora_ngram_table", EAllocationType::ON_DEVICE,
+                {mConfig.ngram_table_rows, static_cast<long>(mConfig.ngram_head_dim)}));
+        }
     }
 
     // Determine block type for this layer (hybrid-aware)
@@ -571,7 +581,17 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
         if (b.ngram_proj.has_value()) {
             fill_normal(b.ngram_proj->A, b.ngram_proj->A.nelem(), 0.0f, mConfig.ngram_init_std, seed,
                         (1ULL << 42) + static_cast<unsigned long long>(l), nullptr);
-            fill_zero(b.ngram_proj->B, nullptr);
+            if (b.ngram_table.has_value()) {
+                // Trainable table: the table is the zero factor (step 0 exact; rows never trained stay exact
+                // no-ops), so W_v is random like W_k (its own subsequence range).
+                fill_normal(b.ngram_proj->B, b.ngram_proj->B.nelem(), 0.0f, mConfig.ngram_init_std, seed,
+                            (1ULL << 43) + static_cast<unsigned long long>(l), nullptr);
+            } else {
+                fill_zero(b.ngram_proj->B, nullptr);
+            }
+        }
+        if (b.ngram_table.has_value()) {
+            fill_zero(b.ngram_table->A, nullptr);
         }
         if (b.ngram_gain.has_value()) {
             fill_constant(b.ngram_gain->A, 1.0f, static_cast<std::size_t>(b.ngram_gain->A.nelem()), nullptr);
@@ -907,6 +927,7 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
     sync_layer(work.router, master.router, "router");
     sync_layer(work.ngram_proj, master.ngram_proj, "ngram_proj");
     sync_layer(work.ngram_gain, master.ngram_gain, "ngram_gain");
+    // (the trainable table has no work copy: the op reads the master)
 
     return work;
 }
@@ -987,7 +1008,10 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
         }
     }
     const std::size_t ngram =
-        mConfig.ngram_memory_layer >= 0 ? 2 * C * static_cast<std::size_t>(mConfig.ngram_memory_embed) + 2 * C : 0;
+        mConfig.ngram_memory_layer >= 0
+            ? 2 * C * static_cast<std::size_t>(mConfig.ngram_memory_embed) + 2 * C +
+                  static_cast<std::size_t>(mConfig.ngram_table_rows) * static_cast<std::size_t>(mConfig.ngram_head_dim)
+            : 0;
     return per_layer * static_cast<std::size_t>(mConfig.num_layers) + linear + masked_experts + ngram;
 }
 
@@ -1057,6 +1081,7 @@ void for_each_lora_tensor(TSet& set, F&& visit) {
         visit_layer(block.router);
         visit_layer(block.ngram_proj);
         visit_layer(block.ngram_gain);
+        visit_layer(block.ngram_table);
     }
 }
 
@@ -1189,6 +1214,10 @@ std::array<std::string, 4> ModularLoRAWeightsManager::ngram_memory_names() const
     const std::string module = layer_prefix(mConfig.ngram_memory_layer) + ".ple.";
     return {module + "key_proj.weight", module + "value_proj.weight", module + "norm_key.weight",
             module + "norm_query.weight"};
+}
+
+std::string ModularLoRAWeightsManager::ngram_table_name() const {
+    return layer_prefix(mConfig.ngram_memory_layer) + ".ple.ngram_table.weight";
 }
 
 std::array<std::string, 4> ModularLoRAWeightsManager::attention_names(int layer) const {
@@ -1361,6 +1390,9 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
             callback(names[1], block.ngram_proj->B);
             callback(names[2], block.ngram_gain->A);
             callback(names[3], block.ngram_gain->B);
+        }
+        if (block.ngram_table.has_value() && block.ngram_table->A.Data) {
+            callback(ngram_table_name(), block.ngram_table->A);
         }
     }
 }

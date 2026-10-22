@@ -665,6 +665,29 @@ knowledge. Off, the compiled spec is unchanged. The adapter records it (`surogat
 trainer with another setting refuses to import it, and the engine export refuses it (`--allow-shuffled` writes an
 analysis export marked `"servable": false`).
 
+**Trainable table** (`table: trainable`): the table is not a file but an FP32 adapter tensor [rows, head_dim] on the
+device, **zero at initialisation** (step 0 is the base model bit for bit, and a row the training never reads stays an
+exact no-op), trained with `table_lr` (default: `lr`) and no weight decay; W_v starts N(0, `init_std`) like W_k. The
+forward gathers the FP32 rows rounded once to bf16; the backward scatters `dk W_k + dv W_v` into the rows it read
+(sorted by row: deterministic). Requires `lora_dtype: fp32`; at most 2^31 - 1 table values.
+
+```yaml
+ngram_memory:
+  table: trainable
+  hash: {multipliers: [23703573157769, 20109073645365, 8052911324071],
+         head_vocab_sizes: [...],   # one size (a prime) per head; offsets = running sum; rows = the total
+         ngram_size: 3, heads_per_ngram: 8, head_dim: 128, eos_token_id: 248044}
+  only: true
+  lr: 1.0e-4                # W_k, W_v, gains
+  table_lr: 1.0e-4          # the table
+  zero_token_ids: [248056, 248057]
+```
+
+A control arm without n-gram identity is the same option with `head_vocab_sizes` all 1 (every n-gram reads one row
+per head). The adapter holds the table as `...layers.L.ple.ngram_table.weight`; the engine export writes it as raw
+bf16 rows (`table.bf16`, `"format": "BF16"` in `ngram_memory.json`) and marks a control-arm table
+`"servable": false`.
+
 ### Evaluation panels (`eval_panels`)
 
 Held-out panels scored by the trainer at step 0 (before any update), every `eval_panels_steps` (default

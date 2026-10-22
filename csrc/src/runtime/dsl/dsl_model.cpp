@@ -1585,6 +1585,10 @@ DslModel::DslModel(const PretrainedConfig& config,
             wm.ngram_init_std = spec.init_std;
             wm.ngram_row_shuffle_a = spec.row_shuffle.a;
             wm.ngram_row_shuffle_b = spec.row_shuffle.b;
+            if (spec.trainable) {
+                wm.ngram_table_rows = static_cast<long>(spec.row_count);
+                wm.ngram_head_dim = spec.head_dim;
+            }
         }
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
 
@@ -1619,6 +1623,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         }
         gm.ngram_memory_layer = wm.ngram_memory_layer;
         gm.ngram_memory_embed = wm.ngram_memory_embed;
+        gm.ngram_table_rows = wm.ngram_table_rows;
+        gm.ngram_head_dim = wm.ngram_head_dim;
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
         std::vector<std::string> lora_grad_hook_schema_ids(
             static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));

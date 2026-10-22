@@ -915,6 +915,8 @@ private:
         Tensor gains;  ///< fp32 [2, C]: g_k, g_q
         Tensor w;      ///< fp32 [N] (backward)
         Tensor partials;  ///< fp32 [gain_grad_parts(N), C] (backward)
+        Tensor d_emb;     ///< fp32 [N, E] (backward, trainable table only)
+        Tensor table_scratch;  ///< sort scratch of the table's row scatter (trainable table only)
     };
     NgramBuffers mNgram;
     std::shared_ptr<const ngram_memory::Spec> mNgramSpec;

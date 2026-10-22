@@ -279,6 +279,10 @@ struct LoRABlockWeights {
     /// (the gate's folded RMSNorm gains). Only the memory's layer carries them.
     std::optional<LoRALayerWeights<TTensor>> ngram_proj;
     std::optional<LoRALayerWeights<TTensor>> ngram_gain;
+    /// The trainable n-gram table (table_mode trainable): A = the table [rows, head_dim] (FP32 master, zero at
+    /// initialisation; the forward reads the master and rounds each gathered value to the working dtype), B unused
+    /// (empty). Masters and gradients only: the work set carries no copy.
+    std::optional<LoRALayerWeights<TTensor>> ngram_table;
 };
 
 /**
@@ -325,6 +329,7 @@ enum class LoRATargetId : std::uint8_t {
     LinOut,  ///< linear-attention out_proj
     NgramProj,  ///< n-gram memory key/value projections (dense; the memory's layer only)
     NgramGain,  ///< n-gram memory gate gains (dense; the memory's layer only)
+    NgramTable, ///< n-gram memory trainable table (dense rows; the memory's layer only)
     Unknown = 255,
 };
 
@@ -372,6 +377,7 @@ inline LoRALayerWeights<TTensor>* get_layer_weight_by_target(LoRABlockWeights<TT
         case LoRATargetId::LinOut: return block.linear_attn.out_proj.has_value() ? &*block.linear_attn.out_proj : nullptr;
         case LoRATargetId::NgramProj: return block.ngram_proj.has_value() ? &*block.ngram_proj : nullptr;
         case LoRATargetId::NgramGain: return block.ngram_gain.has_value() ? &*block.ngram_gain : nullptr;
+        case LoRATargetId::NgramTable: return block.ngram_table.has_value() ? &*block.ngram_table : nullptr;
         case LoRATargetId::SharedUp:
             return (block.moe.shared.has_value() && block.moe.shared->up.has_value()) ? &*block.moe.shared->up
                                                                                       : nullptr;
@@ -484,7 +490,7 @@ inline void for_each_lora_layer_weight(LoRABlockWeights<TTensor>& block, Fn&& fn
     }
 
     // Last, so the order (and every ordinal derived from it) of adapters without a memory is unchanged.
-    for (LoRATargetId id : {LoRATargetId::NgramProj, LoRATargetId::NgramGain}) {
+    for (LoRATargetId id : {LoRATargetId::NgramProj, LoRATargetId::NgramGain, LoRATargetId::NgramTable}) {
         if (auto* layer = get_layer_weight_by_target(block, id)) {
             fn(id, *layer);
         }
@@ -534,6 +540,7 @@ inline void for_each_lora_layer_weight_pair(LoRABlockWeights<TWeightTensor>& wei
     visit_pair(LoRATargetId::Router);
     visit_pair(LoRATargetId::NgramProj);
     visit_pair(LoRATargetId::NgramGain);
+    visit_pair(LoRATargetId::NgramTable);
 }
 
 /// Stable integer key for a LoRA target, used to seed per-projection

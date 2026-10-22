@@ -126,6 +126,19 @@ __global__ void gather_kernel(nv_bfloat16* __restrict__ embedding, const int* __
     }
 }
 
+// Gather of the trainable FP32 table: one block per token, each value rounded once to bf16.
+__global__ void gather_fp32_kernel(nv_bfloat16* __restrict__ embedding, const int* __restrict__ rows,
+                                   const float* __restrict__ table, int head_dim, int heads) {
+    const long t = blockIdx.x;
+    const int values = heads * head_dim;
+    for (int v = static_cast<int>(threadIdx.x); v < values; v += kThreads) {
+        const int head = v / head_dim;
+        const int within = v - head * head_dim;
+        const std::int64_t row = rows[t * heads + head];
+        embedding[t * values + v] = __float2bfloat16_rn(table[row * head_dim + within]);
+    }
+}
+
 __global__ void residual_add_kernel(nv_bfloat16* __restrict__ out, const nv_bfloat16* __restrict__ a,
                                     const nv_bfloat16* __restrict__ b, long n) {
     const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -380,6 +393,13 @@ void gather_iq4nl(nv_bfloat16* emb, const int* rows, const std::uint8_t* table, 
     if (N <= 0) return;
     gather_kernel<<<static_cast<unsigned>(N), kThreads, 0, stream>>>(emb, rows, table, row_bytes, head_dim, heads,
                                                                       shuffle);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gather_fp32(nv_bfloat16* emb, const int* rows, const float* table, int head_dim, int heads, int N,
+                 cudaStream_t stream) {
+    if (N <= 0) return;
+    gather_fp32_kernel<<<static_cast<unsigned>(N), kThreads, 0, stream>>>(emb, rows, table, head_dim, heads);
     CUDA_CHECK(cudaGetLastError());
 }
 

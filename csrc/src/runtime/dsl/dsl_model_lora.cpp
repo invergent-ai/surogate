@@ -93,6 +93,9 @@ void DslModel::export_adapter(const std::string& directory,
             const auto names = mLoRAWeights->ngram_memory_names();
             spec["tensors"] = {{"key_proj", names[0]}, {"value_proj", names[1]}, {"norm_key", names[2]},
                                {"norm_query", names[3]}};
+            if (spec.value("table_mode", std::string("file")) == "trainable") {
+                spec["tensors"]["table"] = mLoRAWeights->ngram_table_name();
+            }
             spec["norm_gain_convention"] = "folded";
             adapter_config["surogate_ngram_memory"] = spec;
         }
@@ -572,24 +575,29 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     const float ngram_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
                                      ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).lr_scale
                                      : 1.0f;
-    auto collect_tensor = [&](Tensor& param, bool ngram) {
+    // The trainable table has its own multiplier (default: the memory's).
+    const float ngram_table_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
+                                           ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).table_lr_scale
+                                           : 1.0f;
+    auto collect_tensor = [&](Tensor& param, bool ngram, bool table) {
         if (!param.Data) return;
         h_param_ptrs.push_back(param.Data);
         int n = static_cast<int>(param.nelem());
         h_sizes.push_back(n);
         h_state_offsets.push_back(static_cast<int>(total_params));
         total_params += n;
-        h_hparams.push_back(ngram ? ngram_lr_scale : 1.0f);
-        h_hparams.push_back(ngram ? 0.0f : 1.0f);
-        any_hparams = any_hparams || ngram;
+        h_hparams.push_back(table ? ngram_table_lr_scale : ngram ? ngram_lr_scale : 1.0f);
+        h_hparams.push_back(ngram || table ? 0.0f : 1.0f);
+        any_hparams = any_hparams || ngram || table;
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
         modules::for_each_lora_layer_weight(lora_w, [&](modules::LoRATargetId id, auto& layer) {
             const bool ngram = id == modules::LoRATargetId::NgramProj || id == modules::LoRATargetId::NgramGain;
-            collect_tensor(layer.A, ngram);
-            collect_tensor(layer.B, ngram);
+            const bool table = id == modules::LoRATargetId::NgramTable;
+            collect_tensor(layer.A, ngram, table);
+            collect_tensor(layer.B, ngram, table);
         });
     }
 
@@ -732,24 +740,29 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
     const float ngram_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
                                      ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).lr_scale
                                      : 1.0f;
-    auto collect_tensor = [&](Tensor& param, bool ngram) {
+    // The trainable table has its own multiplier (default: the memory's).
+    const float ngram_table_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
+                                           ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).table_lr_scale
+                                           : 1.0f;
+    auto collect_tensor = [&](Tensor& param, bool ngram, bool table) {
         if (!param.Data) return;
         h_param_ptrs.push_back(param.Data);
         int n = static_cast<int>(param.nelem());
         h_sizes.push_back(n);
         h_state_offsets.push_back(static_cast<int>(total_params));
         total_params += n;
-        h_hparams.push_back(ngram ? ngram_lr_scale : 1.0f);
-        h_hparams.push_back(ngram ? 0.0f : 1.0f);
-        any_hparams = any_hparams || ngram;
+        h_hparams.push_back(table ? ngram_table_lr_scale : ngram ? ngram_lr_scale : 1.0f);
+        h_hparams.push_back(ngram || table ? 0.0f : 1.0f);
+        any_hparams = any_hparams || ngram || table;
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
         modules::for_each_lora_layer_weight(lora_w, [&](modules::LoRATargetId id, auto& layer) {
             const bool ngram = id == modules::LoRATargetId::NgramProj || id == modules::LoRATargetId::NgramGain;
-            collect_tensor(layer.A, ngram);
-            collect_tensor(layer.B, ngram);
+            const bool table = id == modules::LoRATargetId::NgramTable;
+            collect_tensor(layer.A, ngram, table);
+            collect_tensor(layer.B, ngram, table);
         });
     }
 

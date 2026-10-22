@@ -292,9 +292,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Hashed n-gram memory on one layer's input (qwen3_5_moe family; LoRA training): a frozen IQ4_NL
             n-gram table read through trained projections W_k, W_v [C, E] and gate gains [C] (the engine's
             single-stream ``ngram_ple`` prologue), e.g. ``{table: .../table.iq4nl, manifest: .../manifest.json,
-            lr: 1e-4}``. W_v starts at 0: the model at step 0 is the base model bit for bit. ``only: true``
-            (default) trains the memory alone (no LoRA adapters). Off when absent. See
-            surogate/dsl/modules/ngram_memory.py and rl/ngram-transplant-2026-10-18/INTERFACE.md.
+            lr: 1e-4}``. W_v starts at 0: the model at step 0 is the base model bit for bit. ``table: trainable``
+            (with ``hash: {...}`` and optional ``table_lr``) trains a zero-initialised FP32 table instead (W_v
+            random; step 0 exact through the zero table). ``only: true`` (default) trains the memory alone (no
+            LoRA adapters). Off when absent. See surogate/dsl/modules/ngram_memory.py and
+            rl/ngram-transplant-2026-10-18/INTERFACE.md.
         train_router (Optional[bool], defaults to False):
             Add a router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`: lora_A [r, hidden],
             lora_B [num_experts, r]) and train it with the other adapters; it is exported in the adapter as
@@ -1190,6 +1192,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 logger.info("[ngram_memory]: disabling CUDA graphs.")
                 self.use_cuda_graphs = False
             if self.lora_dtype != "fp32":
+                if str((self.ngram_memory or {}).get("table")) == "trainable":
+                    raise ValueError("ngram_memory: a trainable table needs lora_dtype: fp32 (its master is FP32)")
                 logger.warning(f"[ngram_memory]: lora_dtype {self.lora_dtype} keeps the memory's masters in that "
                                "dtype; fp32 is recommended (W_v starts at 0)")
 

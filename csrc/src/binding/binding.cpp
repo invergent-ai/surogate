@@ -4327,9 +4327,10 @@ NB_MODULE(_surogate, m) {
               [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
                  const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results, const std::string& spec_json) {
                   // arrays: r, emb, k, v, stats, g_k, g_q, ids; results: d_res (in: dL/d(r+u), out: dL/dr),
-                  // dW_k, dW_v, dg_k, dg_q (accumulated: pass zeros)
-                  if (arrays.size() != 8 || results.size() != 5)
-                      throw std::invalid_argument("_ngram_memory_backward: 8 inputs, 5 outputs");
+                  // dW_k, dW_v, dg_k, dg_q (accumulated: pass zeros) [, dk, dv: dL/dk and dL/dv [N, C] out, the
+                  // inputs of the trainable table's row gradient]
+                  if (arrays.size() != 8 || (results.size() != 5 && results.size() != 7))
+                      throw std::invalid_argument("_ngram_memory_backward: 8 inputs, 5 or 7 outputs");
                   const auto spec = ngram_memory::Spec::parse(spec_json);
                   std::vector<Tensor> in, out;
                   for (const auto& a : arrays) in.push_back(ngram_view2(a));
@@ -4338,8 +4339,12 @@ NB_MODULE(_surogate, m) {
                   TensorAllocator allocator;
                   auto ws = allocator.allocate(ETensorDType::BYTE, "ngram_fixture_ws", EAllocationType::ON_DEVICE,
                                                {32L << 20});
-                  auto dk = allocator.allocate(in[0].DType, "ngram_fixture_dk", EAllocationType::ON_DEVICE, {N, C});
-                  auto dv = allocator.allocate(in[0].DType, "ngram_fixture_dv", EAllocationType::ON_DEVICE, {N, C});
+                  Tensor dk = out.size() == 7 ? out[5]
+                                              : allocator.allocate(in[0].DType, "ngram_fixture_dk",
+                                                                   EAllocationType::ON_DEVICE, {N, C});
+                  Tensor dv = out.size() == 7 ? out[6]
+                                              : allocator.allocate(in[0].DType, "ngram_fixture_dv",
+                                                                   EAllocationType::ON_DEVICE, {N, C});
                   auto w = allocator.allocate(ETensorDType::FP32, "ngram_fixture_w", EAllocationType::ON_DEVICE, {N});
                   auto partials = allocator.allocate(ETensorDType::FP32, "ngram_fixture_partials",
                                                      EAllocationType::ON_DEVICE,
@@ -4349,6 +4354,49 @@ NB_MODULE(_surogate, m) {
                                               in[0], in[1], in[2], in[3], in[4], in[5].get<float>(),
                                               in[6].get<float>(), in[7].get<std::int32_t>(), spec.zero_tokens, handle,
                                               ws, nullptr);
+                  CUDA_CHECK(cudaDeviceSynchronize());
+              });
+        m.def("_ngram_memory_gather_fp32",
+              [](nb::ndarray<nb::device::cuda, nb::c_contig> rows, nb::ndarray<nb::device::cuda, nb::c_contig> table,
+                 nb::ndarray<nb::device::cuda, nb::c_contig> emb, const std::string& spec_json) {
+                  // The trainable table's gather: rows int32 [N, heads], table fp32 [row_count, head_dim],
+                  // emb bf16 [N, heads * head_dim] (out).
+                  const auto spec = ngram_memory::Spec::parse(spec_json);
+                  const Tensor r = glm_kernel_tensor(rows), t = glm_kernel_tensor(table);
+                  Tensor e = glm_kernel_tensor(emb);
+                  const int N = static_cast<int>(r.nelem() / static_cast<std::size_t>(spec.hash.heads));
+                  if (t.DType != ETensorDType::FP32 ||
+                      t.nelem() != static_cast<std::size_t>(spec.row_count) * static_cast<std::size_t>(spec.head_dim) ||
+                      e.DType != ETensorDType::BF16 || e.nelem() != static_cast<std::size_t>(N) * spec.embed_dim())
+                      throw std::invalid_argument(
+                          "_ngram_memory_gather_fp32: table fp32 [row_count, head_dim], emb bf16 [N, E]");
+                  ngram_memory::gather_fp32(e.get<nv_bfloat16>(), r.get<std::int32_t>(), t.get<float>(),
+                                            spec.head_dim, spec.hash.heads, N, nullptr);
+                  CUDA_CHECK(cudaDeviceSynchronize());
+              });
+        m.def("_ngram_memory_table_backward",
+              [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                 nb::ndarray<nb::device::cuda, nb::c_contig> dtable, const std::string& spec_json) {
+                  // arrays: dk [N,C], dv [N,C], W_k [C,E], W_v [C,E] (one dtype), rows int32 [N, heads];
+                  // dtable fp32 [row_count, head_dim] (accumulated: pass zeros).
+                  if (arrays.size() != 5) throw std::invalid_argument("_ngram_memory_table_backward: 5 inputs");
+                  const auto spec = ngram_memory::Spec::parse(spec_json);
+                  std::vector<Tensor> in;
+                  for (const auto& a : arrays) in.push_back(ngram_view2(a));
+                  Tensor dt = ngram_view2(dtable);
+                  const long N = in[0].Sizes[0];
+                  TensorAllocator allocator;
+                  auto ws = allocator.allocate(ETensorDType::BYTE, "ngram_fixture_ws", EAllocationType::ON_DEVICE,
+                                               {32L << 20});
+                  auto de = allocator.allocate(ETensorDType::FP32, "ngram_fixture_de", EAllocationType::ON_DEVICE,
+                                               {N, static_cast<long>(spec.embed_dim())});
+                  auto scratch = allocator.allocate(
+                      ETensorDType::BYTE, "ngram_fixture_scratch", EAllocationType::ON_DEVICE,
+                      {std::max<long>(256, static_cast<long>(ngram_memory::table_backward_scratch_bytes(
+                                               N * spec.hash.heads)))});
+                  static cublasLtHandle_t handle = ngram_handle();
+                  ngram_memory::table_backward(dt, de, scratch, in[0], in[1], in[2], in[3], in[4].get<std::int32_t>(),
+                                               spec.hash.heads, spec.head_dim, handle, ws, nullptr);
                   CUDA_CHECK(cudaDeviceSynchronize());
               });
         m.def("_ngram_memory_residual3_rmsnorm",

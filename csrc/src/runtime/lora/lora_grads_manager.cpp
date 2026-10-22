@@ -164,6 +164,14 @@ void ModularLoRAGradsManager::allocate_gradients() {
             gain.A = Tensor::empty(mConfig.grad_dtype, {static_cast<long>(C)});
             gain.B = Tensor::empty(mConfig.grad_dtype, {static_cast<long>(C)});
             full.ngram_gain = gain;
+            // Trainable table: a dense [rows, head_dim] gradient (only the rows the batch read are non-zero),
+            // filled by the memory's sorted row scatter; B stays empty.
+            if (mConfig.ngram_table_rows > 0) {
+                LoRALayerWeights<Tensor> table;
+                table.A = Tensor::empty(mConfig.grad_dtype,
+                                        {mConfig.ngram_table_rows, static_cast<long>(mConfig.ngram_head_dim)});
+                full.ngram_table = table;
+            }
         }
 
         // Determine block type for this layer (hybrid-aware)

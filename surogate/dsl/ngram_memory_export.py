@@ -4,7 +4,10 @@ Reads a trainer adapter directory (``adapter_model.safetensors`` + ``adapter_con
 ``surogate_ngram_memory``) and writes ``OUT_DIR/ngram_memory.safetensors`` (Flash-Next layout for the
 memory's layer: projections BF16, gains FP32 folded, a zero convolution, ones for its norm, the hash constants
 as I64) and ``OUT_DIR/ngram_memory.json`` (geometry and the frozen table it reads). The table itself is not
-copied: the engine maps the referenced file.
+copied: the engine maps the referenced file. A trainable table (``table_mode: trainable``) is written as raw
+BF16 rows (``OUT_DIR/table.bf16``: row r at byte r * head_dim * 2, each value bf16_rn of the FP32 master = what
+the trainer's gather read); its json table section says ``"format": "BF16"``. A control-arm table (every
+head one row) is marked ``"servable": false``.
 
     python -m surogate.dsl.ngram_memory_export ADAPTER_DIR OUT_DIR [--table-sha256 HEX | --hash-table]
 """
@@ -105,9 +108,29 @@ def export_ngram_memory(adapter_dir: str | os.PathLike, out_dir: str | os.PathLi
         module + "ple_embedding.ngram_heads_offsets": torch.tensor(spec["head_offsets"], dtype=torch.int64),
         module + "ple_embedding.ngram_heads_vocab_sizes": torch.tensor(spec["head_vocab_sizes"], dtype=torch.int64),
     }
-    table = spec["table"]
-    row_bytes = int(spec["row_bytes"])
+    trainable = spec.get("table_mode") == "trainable"
+    control = trainable and all(int(v) == 1 for v in spec["head_vocab_sizes"])
     rows = int(spec["row_count"])
+    if trainable:
+        tname = names.get("table")
+        if not tname or tname not in tensors:
+            raise ValueError(f"adapter lacks the trainable table {tname}")
+        tab = tensors[tname]
+        if tuple(tab.shape) != (rows, int(spec["head_dim"])):
+            raise ValueError(f"table shape {tuple(tab.shape)} != ({rows}, {spec['head_dim']})")
+        if not torch.isfinite(tab).all():
+            raise ValueError("the trainable table holds non-finite values")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        table = str((out_dir / "table.bf16").resolve())
+        with open(table, "wb") as f:
+            step = 1 << 20
+            for i in range(0, rows, step):
+                f.write(tab[i:i + step].to(torch.bfloat16).contiguous().view(torch.int16).numpy().tobytes())
+        row_bytes = int(spec["head_dim"]) * 2
+        table_sha256 = _sha256(table)
+    else:
+        table = spec["table"]
+        row_bytes = int(spec["row_bytes"])
     size = os.path.getsize(table) if os.path.exists(table) else None
     if hash_table and table_sha256 is None:
         table_sha256 = _sha256(table)
@@ -123,12 +146,15 @@ def export_ngram_memory(adapter_dir: str | os.PathLike, out_dir: str | os.PathLi
         "conv_kernel": kernel, "conv_dilation": int(spec.get("conv_dilation", spec["ngram_size"])),
         "conv_frozen_zero": True, "eps": float(spec.get("eps", 1e-6)), "gate_clamp": 1e-6,
         "norm_gain_convention": "folded",
-        "servable": not shuffled,
+        "servable": not shuffled and not control,
+        "control_arm": "one row per head (no n-gram identity)" if control else None,
         "row_shuffle": {"a": int(spec["row_shuffle_a"]), "b": int(spec.get("row_shuffle_b", 0))} if shuffled else None,
-        "table": {"path": table, "format": "IQ4_NL", "row_count": rows, "row_bytes": row_bytes,
-                  "head_dim": int(spec["head_dim"]), "offset": int(spec.get("table_offset", 0)),
+        "table": {"path": table, "format": "BF16" if trainable else "IQ4_NL", "row_count": rows,
+                  "row_bytes": row_bytes, "head_dim": int(spec["head_dim"]),
+                  "offset": 0 if trainable else int(spec.get("table_offset", 0)),
                   "bytes": rows * row_bytes, "file_bytes": size, "sha256": table_sha256,
-                  "source": spec.get("table_source", "frozen IQ4_NL table (unmodified)")},
+                  "source": "trained table (zero-initialised; bf16_rn of the FP32 master)" if trainable
+                  else spec.get("table_source", "frozen IQ4_NL table (unmodified)")},
         "tensors": {k: {"dtype": str(v.dtype).replace("torch.", ""), "shape": list(v.shape)} for k, v in out.items()},
         "trainer_commit": _commit(),
         "adapter": str(adapter_dir.resolve()),

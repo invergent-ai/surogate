@@ -3415,6 +3415,9 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     result.emplace_back(ngram[1], block.ngram_proj->B);
                     result.emplace_back(ngram[2], block.ngram_gain->A);
                     result.emplace_back(ngram[3], block.ngram_gain->B);
+                    if (block.ngram_table.has_value() && block.ngram_table->A.Data) {
+                        result.emplace_back(names_from.ngram_table_name(), block.ngram_table->A);
+                    }
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -3561,6 +3564,9 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                     result.emplace_back(ngram[1], master.ngram_proj->B);
                     result.emplace_back(ngram[2], master.ngram_gain->A);
                     result.emplace_back(ngram[3], master.ngram_gain->B);
+                    if (master.ngram_table.has_value() && master.ngram_table->A.Data) {
+                        result.emplace_back(names_from.ngram_table_name(), master.ngram_table->A);
+                    }
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());

@@ -75,6 +75,11 @@ struct RowShuffle {
 void gather_iq4nl(nv_bfloat16* emb, const int* rows, const std::uint8_t* table, int row_bytes, int head_dim,
                   int heads, int N, cudaStream_t stream, RowShuffle shuffle = {});
 
+/// emb[t, h*head_dim + i] = bf16_rn(table[rows[t, h] * head_dim + i]) for the trainable FP32 table
+/// [row_count, head_dim] in device memory (the engine's bf16-row table holds exactly these bf16 values).
+void gather_fp32(nv_bfloat16* emb, const int* rows, const float* table, int head_dim, int heads, int N,
+                 cudaStream_t stream);
+
 /// out = bf16(float(a) + float(b)), element-wise (the residual the memory reads).
 void residual_add(nv_bfloat16* out, const nv_bfloat16* a, const nv_bfloat16* b, long n, cudaStream_t stream);
 

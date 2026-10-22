@@ -36,14 +36,27 @@ Spec Spec::parse(const std::string& text) {
     s.hash.eos_token = j.at("eos_token_id").get<int>();
     s.head_dim = j.at("head_dim").get<int>();
     s.row_count = j.at("row_count").get<std::int64_t>();
-    s.row_bytes = j.at("row_bytes").get<int>();
-    s.table_path = j.at("table").get<std::string>();
-    s.table_offset = j.value("table_offset", static_cast<std::int64_t>(0));
-    s.host_table = j.value("table_residency", std::string("host")) != "device";
+    const std::string mode = j.value("table_mode", std::string("file"));
+    if (mode != "file" && mode != "trainable") {
+        throw std::invalid_argument("ngram_memory: table_mode must be 'file' or 'trainable'");
+    }
+    s.trainable = mode == "trainable";
+    if (s.trainable) {
+        // No file: an FP32 adapter tensor on the device (W_v random, the table zero).
+        s.row_bytes = 0;
+        s.table_path.clear();
+        s.host_table = false;
+    } else {
+        s.row_bytes = j.at("row_bytes").get<int>();
+        s.table_path = j.at("table").get<std::string>();
+        s.table_offset = j.value("table_offset", static_cast<std::int64_t>(0));
+        s.host_table = j.value("table_residency", std::string("host")) != "device";
+    }
     s.eps = j.value("eps", 1e-6F);
     s.init_std = j.value("init_std", 0.02F);
     s.seed = j.value("seed", static_cast<std::uint64_t>(0));
     s.lr_scale = j.value("lr_scale", 1.0F);
+    s.table_lr_scale = j.value("table_lr_scale", s.lr_scale);
     const auto mult = j.at("multipliers").get<std::vector<std::uint64_t>>();
     const auto offsets = j.at("head_offsets").get<std::vector<std::int64_t>>();
     const auto sizes = j.at("head_vocab_sizes").get<std::vector<std::int64_t>>();
@@ -56,10 +69,16 @@ Spec Spec::parse(const std::string& text) {
     if (static_cast<int>(mult.size()) < s.hash.ngram) throw std::invalid_argument("ngram_memory: too few multipliers");
     if (static_cast<int>(offsets.size()) != s.hash.heads || static_cast<int>(sizes.size()) != s.hash.heads)
         throw std::invalid_argument("ngram_memory: head_offsets / head_vocab_sizes must have one entry per head");
-    if (s.head_dim <= 0 || s.head_dim % 32 != 0 || s.row_bytes != s.head_dim / 32 * 18)
+    if (s.head_dim <= 0 || s.head_dim % 32 != 0 || (!s.trainable && s.row_bytes != s.head_dim / 32 * 18))
         throw std::invalid_argument("ngram_memory: head_dim must be a multiple of 32 and row_bytes head_dim/32*18");
     if (s.row_count <= 0 || s.row_count > (std::int64_t{1} << 31) - 1)
         throw std::invalid_argument("ngram_memory: row_count out of range");
+    // The trainable table is one adapter tensor: the optimisers index its elements with int.
+    if (s.trainable && s.row_count * static_cast<std::int64_t>(s.head_dim) > (std::int64_t{1} << 31) - 1)
+        throw std::invalid_argument("ngram_memory: a trainable table holds at most 2^31 - 1 values");
+    if (s.trainable && j.contains("row_shuffle_a"))
+        throw std::invalid_argument("ngram_memory: row_shuffle is a control of the file table, not of a trainable one");
+    if (!(s.table_lr_scale > 0.0F)) throw std::invalid_argument("ngram_memory: table_lr_scale must be positive");
     for (int i = 0; i < s.hash.ngram; ++i) s.hash.multipliers[i] = mult[static_cast<std::size_t>(i)];
     for (int h = 0; h < s.hash.heads; ++h) {
         const auto off = offsets[static_cast<std::size_t>(h)];
@@ -226,6 +245,40 @@ void forward_core(Tensor& k, Tensor& v, Tensor& stats, Tensor& u, float* global_
     } else {
         throw std::invalid_argument("ngram_memory: r must be BF16 or FP32");
     }
+}
+
+std::size_t table_backward_scratch_bytes(long entries) { return encoder_backward_scratch_bytes(entries); }
+
+void table_backward(Tensor& dtable, Tensor& d_emb, Tensor& scratch, const Tensor& dk, const Tensor& dv,
+                    const Tensor& Wk, const Tensor& Wv, const int* rows, int heads, int head_dim,
+                    cublasLtHandle_t handle, Tensor& workspace, cudaStream_t stream) {
+    const int N = static_cast<int>(dk.Sizes[0]);
+    const int C = static_cast<int>(Wk.Sizes[0]);
+    const int E = static_cast<int>(Wk.Sizes[1]);
+    require(E == heads * head_dim, "W_k must be [C, heads * head_dim]");
+    require(Wv.Sizes[0] == C && Wv.Sizes[1] == E, "W_v must be [C, E]");
+    require(dk.DType == Wk.DType && dv.DType == Wk.DType && Wv.DType == Wk.DType,
+            "dk, dv, W_k and W_v must share a dtype");
+    require(static_cast<long>(dk.nelem()) == static_cast<long>(N) * C && dv.nelem() == dk.nelem(),
+            "dk / dv must be [N, C]");
+    require(d_emb.DType == ETensorDType::FP32 && static_cast<long>(d_emb.nelem()) >= static_cast<long>(N) * E,
+            "d_emb must be FP32 [N, E]");
+    require(dtable.DType == ETensorDType::FP32 && dtable.Rank == 2 && dtable.Sizes[1] == head_dim,
+            "the table gradient must be FP32 [rows, head_dim]");
+    if (N <= 0) return;
+    // d_emb = dk W_k + dv W_v   (row-major [N, E]: column-major d_emb^T [E, N] = W^T [E, C] d^T [C, N])
+    Tensor de = d_emb;
+    de.Rank = 2;
+    de.Sizes[0] = N;
+    de.Sizes[1] = E;
+    matmul(de, Wk, dk, std::nullopt, nullptr, nullptr, handle, workspace, E, N, C, EMMTranspose::NN, false, stream);
+    matmul(de, Wv, dv, std::nullopt, nullptr, nullptr, handle, workspace, E, N, C, EMMTranspose::NN, true, stream);
+    // dtable[row] += d_emb row slices, in row order: the N * heads (row, slice) pairs of the gather.
+    const long entries = static_cast<long>(N) * heads;
+    const std::size_t need = encoder_backward_scratch_bytes(entries);
+    require(scratch.bytes() >= need, "table scratch too small");
+    encoder_backward(dtable.get<float>(), reinterpret_cast<std::byte*>(scratch.Data), scratch.bytes(),
+                     de.get<float>(), rows, 1, static_cast<int>(entries), head_dim, 0U, stream);
 }
 
 void backward_core(Tensor& d_res, Tensor& dWk, Tensor& dWv, Tensor& dgk, Tensor& dgq, Tensor& dk, Tensor& dv,

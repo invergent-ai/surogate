@@ -34,6 +34,11 @@ struct Spec {
     float lr_scale = 1.0F;     ///< learning-rate multiplier of the memory parameters
     ZeroTokens zero_tokens;
     RowShuffle row_shuffle;    ///< control arm: rows relabelled (never served)
+    /// Trainable table (table_mode "trainable"): no file; an FP32 adapter tensor [row_count, head_dim] that starts
+    /// at zero and trains with its own learning-rate multiplier, W_v ~ N(0, init_std) (the transplant arm keeps the
+    /// frozen IQ4_NL file table and W_v = 0).
+    bool trainable = false;
+    float table_lr_scale = 1.0F;
 
     [[nodiscard]] bool enabled() const { return layer >= 0; }
     [[nodiscard]] int embed_dim() const { return hash.heads * head_dim; }
@@ -53,6 +58,16 @@ void forward_core(Tensor& k, Tensor& v, Tensor& stats, Tensor& u, float* global_
                   const Tensor& emb, const Tensor& Wk, const Tensor& Wv, const float* gk, const float* gq,
                   const int* ids, const ZeroTokens& zero, float eps, cublasLtHandle_t handle, Tensor& workspace,
                   cudaStream_t stream);
+
+/// Trainable table backward on N tokens: d_emb [N, E] (FP32) = dk W_k + dv W_v (the gradient of the gathered
+/// rows), then dtable[rows[t, h]] += d_emb[t, h * head_dim : (h + 1) * head_dim] for every token and head, summed
+/// per row in sorted order (deterministic: kernels/encoder.cu's embedding gradient on the N * heads rows).
+/// dk, dv [N, C] and W_k, W_v [C, E] share a dtype (BF16 or FP32); dtable FP32 [row_count, head_dim]; scratch holds
+/// table_backward_scratch_bytes(N * heads) bytes.
+void table_backward(Tensor& dtable, Tensor& d_emb, Tensor& scratch, const Tensor& dk, const Tensor& dv,
+                    const Tensor& Wk, const Tensor& Wv, const int* rows, int heads, int head_dim,
+                    cublasLtHandle_t handle, Tensor& workspace, cudaStream_t stream);
+std::size_t table_backward_scratch_bytes(long entries);
 
 /// Memory backward on N tokens. d_res [N, C]: dL/d(r + u) in, dL/dr out. Accumulates into dWk, dWv
 /// [C, E] and dgk, dgq [C] (FP32 or BF16). Scratch: dk, dv [N, C] (dtype of r), w FP32 [N],

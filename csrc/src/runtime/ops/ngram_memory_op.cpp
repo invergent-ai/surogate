@@ -72,7 +72,8 @@ const ngram_memory::Spec& CompiledExecutor::ngram_spec() {
 
 void CompiledExecutor::free_ngram_buffers() {
     for (Tensor* t : {&mNgram.r, &mNgram.emb, &mNgram.k, &mNgram.v, &mNgram.u, &mNgram.stats, &mNgram.rows,
-                      &mNgram.carry, &mNgram.gains, &mNgram.w, &mNgram.partials}) {
+                      &mNgram.carry, &mNgram.gains, &mNgram.w, &mNgram.partials, &mNgram.d_emb,
+                      &mNgram.table_scratch}) {
         free_buffer(*t);
     }
     mNgram.tokens = 0;
@@ -103,6 +104,11 @@ void CompiledExecutor::ensure_ngram_buffers() {
     mNgram.w = device_buffer(ETensorDType::FP32, {tokens}, dev);
     mNgram.partials =
         device_buffer(ETensorDType::FP32, {ngram_memory::gain_grad_parts(static_cast<int>(tokens)), C}, dev);
+    if (spec.trainable) {
+        mNgram.d_emb = device_buffer(ETensorDType::FP32, {tokens, E}, dev);
+        const auto scratch = static_cast<long>(ngram_memory::table_backward_scratch_bytes(tokens * spec.hash.heads));
+        mNgram.table_scratch = device_buffer(ETensorDType::BYTE, {std::max<long>(scratch, 256)}, dev);
+    }
     mNgram.tokens = tokens;
     mNgram.hidden = C;
     mNgram.embed = E;
@@ -123,7 +129,7 @@ void CompiledExecutor::ngram_memory_forward(Tensor& residual_out, Tensor& y, Ten
     const int L = spec.layer;
     const long N = mB * mT;
     const int C = static_cast<int>(mConfig.HiddenSize);
-    if (!mNgramTable) mNgramTable = ngram_memory::acquire_table(spec, mRunState.DeviceId);
+    if (!spec.trainable && !mNgramTable) mNgramTable = ngram_memory::acquire_table(spec, mRunState.DeviceId);
 
     // Token ids and positions of this (chunk of the) micro-batch.
     const Tensor& ids_t = mRunState.Inputs;
@@ -149,19 +155,33 @@ void CompiledExecutor::ngram_memory_forward(Tensor& residual_out, Tensor& y, Ten
         carry = mNgram.carry.get<std::int32_t>();
     }
 
-    ngram_memory::rows(mNgram.rows.get<std::int32_t>(), ids, positions, carry, static_cast<int>(mB),
-                       static_cast<int>(mT), spec.hash, stream);
-    ngram_memory::gather_iq4nl(mNgram.emb.get<nv_bfloat16>(), mNgram.rows.get<std::int32_t>(), mNgramTable,
-                               spec.row_bytes, spec.head_dim, spec.hash.heads, static_cast<int>(N), stream,
-                               spec.row_shuffle);
-    ngram_memory::residual_add(mNgram.r.get<nv_bfloat16>(), residual_in.get<nv_bfloat16>(), input.get<nv_bfloat16>(),
-                               N * C, stream);
-
     auto& work = mLoRAWeights->get_block(L, stream);
     auto& master = mLoRAWeights->get_master_block(L, stream);
     if (!work.ngram_proj.has_value() || !master.ngram_gain.has_value()) {
         throw std::logic_error("ngram_memory: the adapter holds no memory parameters for layer " + std::to_string(L));
     }
+
+    ngram_memory::rows(mNgram.rows.get<std::int32_t>(), ids, positions, carry, static_cast<int>(mB),
+                       static_cast<int>(mT), spec.hash, stream);
+    if (spec.trainable) {
+        // The trainable table: its FP32 master, each gathered value rounded once to bf16.
+        if (!master.ngram_table.has_value() || !master.ngram_table->A.Data ||
+            master.ngram_table->A.DType != ETensorDType::FP32 ||
+            master.ngram_table->A.nelem() !=
+                static_cast<std::size_t>(spec.row_count) * static_cast<std::size_t>(spec.head_dim)) {
+            throw std::logic_error("ngram_memory: the adapter holds no FP32 [rows, head_dim] trainable table");
+        }
+        ngram_memory::gather_fp32(mNgram.emb.get<nv_bfloat16>(), mNgram.rows.get<std::int32_t>(),
+                                  master.ngram_table->A.get<float>(), spec.head_dim, spec.hash.heads,
+                                  static_cast<int>(N), stream);
+    } else {
+        ngram_memory::gather_iq4nl(mNgram.emb.get<nv_bfloat16>(), mNgram.rows.get<std::int32_t>(), mNgramTable,
+                                   spec.row_bytes, spec.head_dim, spec.hash.heads, static_cast<int>(N), stream,
+                                   spec.row_shuffle);
+    }
+    ngram_memory::residual_add(mNgram.r.get<nv_bfloat16>(), residual_in.get<nv_bfloat16>(), input.get<nv_bfloat16>(),
+                               N * C, stream);
+
     const Tensor& Wk = work.ngram_proj->A;
     const Tensor& Wv = work.ngram_proj->B;
     if (Wk.DType != ETensorDType::BF16 || Wv.DType != ETensorDType::BF16) {
@@ -215,6 +235,17 @@ void CompiledExecutor::ngram_memory_backward(Tensor& d_input, float* abs_max) {
                                 mNgram.k, mNgram.v, mNgram.stats, gains, gains + C,
                                 mRunState.Inputs.get<std::int32_t>(), spec.zero_tokens, mRunState.CublasLtHandle,
                                 mRunState.CuBlasWorkspace, stream);
+    if (spec.trainable) {
+        // The rows' gradient (dk W_k + dv W_v, 0 at the zero tokens), scattered into the table gradient in row order.
+        if (!grads.ngram_table.has_value() || !grads.ngram_table->A.Data) {
+            throw std::logic_error("ngram_memory: the trainable table's gradient is not allocated");
+        }
+        auto& work = mLoRAWeights->get_block(spec.layer, stream);
+        ngram_memory::table_backward(grads.ngram_table->A, mNgram.d_emb, mNgram.table_scratch, dk, dv,
+                                     work.ngram_proj->A, work.ngram_proj->B, mNgram.rows.get<std::int32_t>(),
+                                     spec.hash.heads, spec.head_dim, mRunState.CublasLtHandle,
+                                     mRunState.CuBlasWorkspace, stream);
+    }
 }
 
 }  // namespace dsl
