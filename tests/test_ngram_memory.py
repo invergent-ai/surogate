@@ -2007,3 +2007,534 @@ def test_sft_cli_quick_configs_with_panels_and_resume(cli_model):
         assert panel(real, step) == panel(shuf, step) and len(panel(real, step)) == 3 * 8, step
     for step in range(live - 1, 4):
         assert panel(real, step) != panel(shuf, step), step
+
+
+# ---------------------------------------------------------------------------------------------- trainable table
+# table: trainable (rl/distill-2026-10-20/ngram-poc, rl/ngram-memory-2026-10-18/DESIGN.md (a)-(b)): the table is an FP32
+# adapter tensor, ZERO at initialisation (step 0 = the base model bit for bit; rows never read stay exact no-ops),
+# trained with its own learning rate and no weight decay; W_v ~ N(0, init_std). The control arm reads one row per head.
+
+TABLE = "base_model.model.model.layers.1.ple.ngram_table.weight"
+MEMORY_T = MEMORY + (TABLE,)
+
+
+def _trainable_hash(meta: TableMeta):
+    return {"multipliers": list(meta.multipliers), "head_vocab_sizes": list(meta.head_vocab_sizes),
+            "ngram_size": meta.ngram_size, "heads_per_ngram": meta.heads_per_ngram, "head_dim": meta.head_dim,
+            "eos_token_id": meta.eos_token_id}
+
+
+def _trainable_option(meta=None, control=False, **kw):
+    """The trainable-table option (the tiny model's geometry by default); control: every head one row."""
+    meta = meta or _small_meta(vocab=1009, head_dim=32, eos=500)
+    h = _trainable_hash(meta)
+    if control:
+        h["head_vocab_sizes"] = [1] * meta.heads
+    return {"table": "trainable", "hash": h, "zero_token_ids": [], **kw}
+
+
+class TestTrainableConfig:
+    def test_parse_spec_round_trip_and_the_file_spec_unchanged(self):
+        meta = _small_meta(vocab=211)
+        cfg = NgramMemoryConfig.parse({**_trainable_option(meta), "lr": 1e-4, "table_lr": 4e-4, "base_lr": 2e-4})
+        assert cfg.trainable and cfg.table == "trainable" and cfg.table_residency == "device" and cfg.manifest is None
+        assert cfg.meta.head_offsets == meta.head_offsets and cfg.meta.row_count == meta.row_count  # running sum
+        spec = cfg.spec()
+        assert spec["table_mode"] == "trainable" and spec["table_lr_scale"] == 2.0 and spec["lr_scale"] == 0.5
+        assert NgramMemoryConfig.parse(cfg.to_dict()).spec() == spec
+        cfg.check_table_file()  # no file to check
+        dflt = NgramMemoryConfig.parse({**_trainable_option(meta), "lr": 1e-4, "base_lr": 2e-4}).spec()
+        assert dflt["table_lr_scale"] == dflt["lr_scale"] == 0.5  # table_lr defaults to the memory's lr
+        file_spec = NgramMemoryConfig.parse({"table": "/x", "meta": _meta_dict(meta)}).spec()
+        assert "table_mode" not in file_spec and "table_lr_scale" not in file_spec  # file-table IR unchanged
+        # the G2 scorer rebuilds the option from an adapter's spec
+        from surogate.dsl.ngram_memory_score import memory_option_from_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "adapter_config.json").write_text(json.dumps({"surogate_ngram_memory": spec}))
+            option, _ = memory_option_from_adapter(tmp)
+        rebuilt = NgramMemoryConfig.parse({**option, "lr": 1e-4, "table_lr": 4e-4, "base_lr": 2e-4}).spec()
+        assert rebuilt == spec
+
+    def test_validation(self):
+        meta = _small_meta(vocab=211)
+        for bad, match in (({"row_shuffle": SHUFFLE}, "row_shuffle"), ({"table_residency": "host"}, "device"),
+                           ({"table_lr": 0.0}, "table_lr")):
+            with pytest.raises(ValueError, match=match):
+                NgramMemoryConfig.parse({**_trainable_option(meta), **bad})
+        with pytest.raises(ValueError, match="trainable"):
+            NgramMemoryConfig.parse({"table": "/x", "meta": _meta_dict(meta), "table_lr": 1e-4})
+        with pytest.raises(ValueError, match="hash"):
+            NgramMemoryConfig.parse({"table": "trainable"})
+        with pytest.raises(ValueError, match="unknown"):
+            NgramMemoryConfig.parse({"table": "trainable", "hash": {**_trainable_hash(meta), "rows_per_head": 1}})
+        big = _trainable_hash(meta)
+        big["head_vocab_sizes"] = [4194305] * 16  # 67.1M rows (< 2^31) x 32 values > 2^31 - 1
+        with pytest.raises(ValueError, match="2\\^31"):
+            NgramMemoryConfig.parse({"table": "trainable", "hash": big})
+
+    def test_control_reads_one_row_per_head(self):
+        meta = _small_meta(vocab=211)
+        cfg = NgramMemoryConfig.parse(_trainable_option(meta, control=True))
+        assert cfg.meta.row_count == 16 and cfg.meta.head_offsets == tuple(range(16))
+        rng = np.random.default_rng(2)
+        ids = rng.integers(0, VOCAB, size=(2, 300))
+        ids[0, ::7] = EOS
+        pos = np.tile(np.arange(300), (2, 1))
+        pos[1, 150:] = np.arange(150)
+        rows = ngram_rows_reference(ids, pos, cfg.meta)
+        assert (rows == np.arange(16)[None, :]).all()
+
+    def test_ir_carries_the_trainable_spec(self):
+        cfg = _config()
+        off, on = _ir(cfg), _ir(cfg, ngram_memory=_trainable_option(_small_meta(vocab=211)))
+        off_cfg, on_cfg = off["modules"][0]["config"], on["modules"][0]["config"]
+        assert set(on_cfg) - set(off_cfg) == {"ngram_memory", "ngram_memory_layer", "ngram_memory_spec"}
+        spec = json.loads(on_cfg["ngram_memory_spec"])
+        assert spec["table_mode"] == "trainable" and spec["row_count"] == _small_meta(vocab=211).row_count
+        assert spec["table"] == "trainable" and on_cfg["ngram_memory_layer"] == 1
+
+
+@pytest.mark.gpu
+def test_gather_fp32_is_the_rounded_rows():
+    sg = _gpu()
+    meta = _small_meta(vocab=211, head_dim=64)
+    spec = json.dumps(NgramMemoryConfig.parse(_trainable_option(meta)).spec())
+    rng = np.random.default_rng(1)
+    table = (rng.standard_normal((meta.row_count, meta.head_dim)) * 0.05).astype(np.float32)
+    N = 777
+    rows = rng.integers(0, meta.row_count, size=(N, meta.heads)).astype(np.int32)
+    emb = torch.empty((N, meta.embed_dim), dtype=torch.bfloat16, device="cuda")
+    sg._ngram_memory_gather_fp32(torch.from_numpy(rows).cuda(), torch.from_numpy(table).cuda(), emb, spec)
+    want = torch.from_numpy(table[rows.reshape(-1)].reshape(N, -1)).to(torch.bfloat16)  # round to nearest even
+    assert torch.equal(emb.cpu(), want)
+
+
+@pytest.mark.gpu
+def test_table_gradient_matches_fp64_finite_differences():
+    """fp32 path, C = 32, 16 heads x 32 values (E = 512), 48 tokens on a 352-row table (rows read by several tokens,
+    image-pad tokens included): the table gradient (dk W_k + dv W_v scattered by row) against central differences of
+    the FP64 reference through gather -> projections -> gate -> u; rows never read get exactly 0; the scatter is
+    deterministic (two runs bit for bit)."""
+    sg = _gpu()
+    meta = _small_meta(vocab=7, head_dim=32)
+    spec = json.dumps(NgramMemoryConfig.parse(_trainable_option(meta, zero_token_ids=[248056, 248057])).spec())
+    N, C, E, R, D = 48, 32, meta.embed_dim, meta.row_count, meta.head_dim
+    rng = np.random.default_rng(31)
+    rows = rng.integers(0, R, size=(N, meta.heads)).astype(np.int32)
+    rows[:, 0] = rows[0, 0]  # one row read by every token
+    table = rng.standard_normal((R, D)) * 0.05
+    table = table.astype(np.float32).astype(np.float64)
+    r = (rng.standard_normal((N, C)) * 0.7).astype(np.float32).astype(np.float64)
+    Wk = (rng.standard_normal((C, E)) * 0.08).astype(np.float32).astype(np.float64)
+    Wv = (rng.standard_normal((C, E)) * 0.02).astype(np.float32).astype(np.float64)
+    gk = (1.0 + 0.2 * rng.standard_normal(C)).astype(np.float32).astype(np.float64)
+    gq = (1.0 + 0.2 * rng.standard_normal(C)).astype(np.float32).astype(np.float64)
+    ids = rng.integers(0, 1000, size=N).astype(np.int32)
+    ids[::11] = 248056
+    zero = ids == 248056
+    G = rng.standard_normal((N, C))
+    f32 = lambda a: torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).cuda()  # noqa: E731
+
+    def emb_of(t):
+        return t[rows.reshape(-1)].reshape(N, E)
+
+    vals = {"r": f32(r), "e": f32(emb_of(table)), "Wk": f32(Wk), "Wv": f32(Wv), "gk": f32(gk), "gq": f32(gq)}
+    k = torch.empty((N, C), dtype=torch.float32, device="cuda")
+    v, u = torch.empty_like(k), torch.empty_like(k)
+    stats = torch.empty((N, 4), dtype=torch.float32, device="cuda")
+    ins = [vals[n] for n in ("r", "e", "Wk", "Wv", "gk", "gq")] + [torch.from_numpy(ids).cuda()]
+    sg._ngram_memory_forward(ins, [k, v, stats, u], spec)
+    d_res = f32(G)
+    dWk = torch.zeros((C, E), dtype=torch.float32, device="cuda")
+    dWv, dgk, dgq = torch.zeros_like(dWk), torch.zeros(C, device="cuda"), torch.zeros(C, device="cuda")
+    dk, dv = torch.empty_like(k), torch.empty_like(k)
+    sg._ngram_memory_backward([ins[0], ins[1], k, v, stats, ins[4], ins[5], ins[6]],
+                              [d_res, dWk, dWv, dgk, dgq, dk, dv], spec)
+    rows_t = torch.from_numpy(rows).cuda()
+    dtab = torch.zeros((R, D), dtype=torch.float32, device="cuda")
+    sg._ngram_memory_table_backward([dk, dv, vals["Wk"], vals["Wv"], rows_t], dtab, spec)
+    again = torch.zeros_like(dtab)
+    sg._ngram_memory_table_backward([dk, dv, vals["Wk"], vals["Wv"], rows_t], again, spec)
+    assert torch.equal(dtab.view(torch.int32), again.view(torch.int32))  # deterministic
+    g = dtab.double().cpu().numpy()
+    read = np.zeros(R, dtype=bool)
+    read[rows.reshape(-1)] = True
+    assert not g[~read].any() and (~read).sum() > 0  # unread rows: exactly zero
+
+    def loss(t):
+        uu, _, _ = _ref_forward(r, emb_of(t), Wk, Wv, gk, gq, zero)
+        return float((G * uu).sum())
+
+    read_rows = np.flatnonzero(read)
+    coords = [(int(rng.choice(read_rows)), int(rng.integers(0, D))) for _ in range(60)] + [(int(rows[0, 0]), 3)]
+    scale = np.abs(g).max()
+    errs = []
+    for c in coords:
+        tp, tm = table.copy(), table.copy()
+        tp[c] += 1e-6
+        tm[c] -= 1e-6
+        fd = (loss(tp) - loss(tm)) / 2e-6
+        errs.append(abs(fd - g[c]) / max(abs(fd), 1e-3 * scale))
+    print(json.dumps({"table_fd_max_rel": max(errs), "shared_row_grad": float(np.abs(g[rows[0, 0]]).max())}))
+    assert max(errs) < 2e-3, max(errs)
+
+
+def _keep_memory_randomize_lora(adapter, seed):
+    """Nonzero LoRA tensors (per-tensor generators); the memory's tensors exactly as initialised."""
+    out = {}
+    for k, v in adapter.items():
+        if ".ple." in k:
+            out[k] = v.clone()
+            continue
+        g = torch.Generator().manual_seed(seed * 1_000_003 + zlib.crc32(k.encode()))
+        out[k] = (torch.randn(v.shape, generator=g) * (0.05 if "lora_A" in k else 0.02)).to(v.dtype)
+    return out
+
+
+def _rows_read(xs, meta):
+    read = np.zeros(meta.row_count, dtype=bool)
+    for x in xs:
+        read[ngram_rows_reference(np.asarray(x, dtype=np.int64), np.arange(x.shape[1])[None, :], meta).reshape(-1)] = 1
+    return read
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.parametrize("chunks,recipe", [(1, "bf16"), (4, "bf16"), (4, "fp8-hybrid")])
+def test_trainable_zero_table_is_the_base_model_bit_for_bit(tiny_model, chunks, recipe):
+    """The zero table with W_v ~ N(0, 0.02) and LoRA on the attention / GDN projections: loss, per-token log-probs and
+    every LoRA gradient equal the memory-off run bit for bit; the only live memory gradient is the table's, on exactly
+    the rows the batch read (W_k, W_v and the gains get exact zeros: e = 0)."""
+    from safetensors.torch import save_file
+
+    seq = 128
+    x, y = _tokens(seq)
+    meta = _small_meta(vocab=1009, head_dim=32, eos=500)
+    results = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for label, ngram in (("base", None), ("memory", _trainable_option(only=False))):
+            tr = _trainer(tiny_model, NON_EXPERT_TARGETS, seq, ngram=ngram, chunks=chunks, lora_dtype="fp32",
+                          recipe=recipe)
+            init, cfg = _adapter(tr, tiny_model, tmp, label)
+            if ngram:
+                assert init[TABLE].shape == (meta.row_count, 32) and init[TABLE].dtype == torch.float32
+                assert not init[TABLE].any()
+                assert 0.015 < init[VALUE].float().std() < 0.025 and 0.015 < init[KEY].float().std() < 0.025
+                assert not torch.equal(init[KEY], init[VALUE])  # their own streams
+                sp = cfg["surogate_ngram_memory"]
+                assert sp["table_mode"] == "trainable" and sp["tensors"]["table"] == TABLE
+            live = _keep_memory_randomize_lora(init, seed=11)
+            save_file(live, str(tmp / f"{label}.safetensors"))
+            tr.import_adapter(str(tmp / f"{label}.safetensors"))
+            res = {"loss": tr.validate(x, y)}
+            if chunks == 1:
+                res["lp"] = tr.compute_logprobs(x, y, use_lora=True)[0].copy()
+            tr.step(x, y)
+            res["grads"] = _grads(tr)
+            if ngram:
+                res["stats"] = tr.get_ngram_memory_stats(0, True)
+            results[label] = res
+            del tr
+            torch.cuda.empty_cache()
+    base, on = results["base"], results["memory"]
+    assert np.float32(base["loss"]).tobytes() == np.float32(on["loss"]).tobytes(), (base["loss"], on["loss"])
+    if chunks == 1:
+        assert np.array_equal(base["lp"], on["lp"])
+    common = set(base["grads"]) & set(on["grads"])
+    assert common == set(base["grads"]) and set(on["grads"]) - common == set(MEMORY_T)
+    for k in sorted(common):
+        assert torch.equal(base["grads"][k], on["grads"][k]), k
+    g = on["grads"]
+    for k in MEMORY:
+        assert not g[k].any(), k
+    read = _rows_read([x], meta)
+    gt = g[TABLE]
+    assert not gt[torch.from_numpy(~read)].any()
+    assert (gt[torch.from_numpy(read)].abs().sum(1) > 0).float().mean() > 0.99
+    st = on["stats"]
+    assert st["tokens"] > 0 and st["out_rms_over_residual_rms"] == 0.0
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_trainable_lr_scale_and_no_weight_decay(tiny_model):
+    """LoRA + trainable memory, AdamW, lr 1e-3, weight decay 0.1, table_lr 5e-4, memory lr 2.5e-4: one update moves
+    every table value with a non-negligible gradient by 0.744 x 5e-4 (Adam's step 2, see the file-table test), leaves
+    the rows the batch never read exactly zero (no decay), and leaves W_k, W_v and the gains exactly unchanged (their
+    gradients are exact zeros at the zero table)."""
+    from surogate import _surogate as sg
+
+    seq = 64
+    x, y = _tokens(seq, seed=9)
+    meta = _small_meta(vocab=1009, head_dim=32, eos=500)
+    opt = _trainable_option(only=False, lr=2.5e-4, table_lr=5e-4, base_lr=1e-3)
+    tr = _trainer(tiny_model, NON_EXPERT_TARGETS, seq, ngram=opt)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        before = {k: v.float() for k, v in _adapter(tr, tiny_model, tmp, "before")[0].items()}
+        tr.step(x, y)
+        grads = _grads(tr)
+        tr.update_with_config(sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.1), 1)
+        after = {k: v.float() for k, v in _adapter(tr, tiny_model, tmp, "after")[0].items()}
+    del tr
+    torch.cuda.empty_cache()
+    for k in MEMORY:
+        assert torch.equal(before[k], after[k]), k
+    dt = (after[TABLE] - before[TABLE]).abs()
+    big = grads[TABLE].abs() > 1e-3 * grads[TABLE].abs().max()
+    assert big.sum() > 100
+    assert torch.allclose(dt[big], torch.full_like(dt[big], 0.7441 * 5e-4), rtol=2e-2), (dt[big].min(), dt[big].max())
+    unread = torch.from_numpy(~_rows_read([x], meta))
+    assert not after[TABLE][unread].any()
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_trainable_table_learns_and_unread_rows_stay_zero(tiny_model):
+    """Frozen random backbone, memory only, a synthetic trigram language (x[t+1] = f(x[t-1], x[t]) over 12 tokens):
+    the zero-initialised table cuts the held-out loss below half; after 300 updates every row the training never read
+    is still exactly zero; the control arm (one row per head: no n-gram identity) on the same data, steps and lr ends
+    far higher."""
+    from surogate import _surogate as sg
+
+    seq = 64
+    rng = np.random.default_rng(13)
+    alphabet = list(rng.choice(np.arange(10, 499), size=12, replace=False))
+    X, Y = _trigram_language(rng, 64, seq, alphabet)
+    Y[:, :1] = -100
+    held_x, held_y = X[-8:], Y[-8:]
+    meta = _small_meta(vocab=1009, head_dim=32, eos=500)
+    out = {}
+    for arm, control in (("mem", False), ("ctrl", True)):
+        tr = _trainer(tiny_model, [], seq, ngram=_trainable_option(control=control))
+
+        def held():
+            return float(np.mean([tr.validate(held_x[i:i + 1], held_y[i:i + 1]) for i in range(len(held_x))]))
+
+        start = held()
+        for step in range(300):
+            i = step % 56
+            tr.step(X[i:i + 1], Y[i:i + 1])
+            tr.update_with_config(sg.OptimizerConfig(optimizer="adamw", learning_rate=3e-3, weight_decay=0.0,
+                                                     grad_clip=1.0), step + 1)
+        end = held()
+        table = torch.from_dlpack(tr.get_lora_weights(0)[TABLE]).float().cpu().clone()
+        out[arm] = {"start": start, "end": end, "table": table, "stats": tr.get_ngram_memory_stats(0, True)}
+        del tr
+        torch.cuda.empty_cache()
+    mem, ctrl = out["mem"], out["ctrl"]
+    print(json.dumps({a: {"start": o["start"], "end": o["end"], "ratio": o["stats"]["out_rms_over_residual_rms"]}
+                      for a, o in out.items()}))
+    assert abs(mem["start"] - ctrl["start"]) < 1e-6  # step 0: both are the base model
+    assert mem["end"] < 0.5 * mem["start"], (mem["start"], mem["end"])
+    assert mem["end"] < 0.75 * ctrl["end"], (mem["end"], ctrl["end"])
+    read = _rows_read([X[i:i + 1] for i in range(56)], meta)
+    assert (~read).sum() > 0.5 * meta.row_count
+    assert not mem["table"][torch.from_numpy(~read)].any()
+    assert (mem["table"][torch.from_numpy(read)].abs().sum(1) > 0).float().mean() > 0.99
+    assert ctrl["table"].shape == (16, 32) and ctrl["table"].abs().sum() > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_trainable_full_step_chunked_equals_unchunked(tiny_model):
+    """train_step_graphed (the SFT CLI's step), memory only with the trainable table, 3 rows per optimizer step with
+    document cuts inside a chunk and at a chunk start, 3 optimizer steps: 4 chunks (the two-token carry at every chunk
+    start) agree with 1 chunk in loss, norm, the table gradient and the updated table; at step 1 (zero table) W_k,
+    W_v and the gains get exact zeros in both."""
+    sg = _gpu()
+    seq, ga = 128, 3
+    opt = sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.0, grad_clip=1.0)
+    x, y, pos = _graphed_rows(seq, ga, seed=41)
+    runs = {}
+    for chunks in (4, 1):
+        tr = _trainer(tiny_model, [], seq, ngram=_trainable_option(), chunks=chunks, recipe="bf16", grad_accum=ga)
+        steps = []
+        for s in range(3):
+            r = tr.train_step_graphed(x, y, pos, opt, s + 1)
+            steps.append({"loss": float(r["loss"]), "norm": float(r["norm"]), "grads": _grads(tr)})
+        w = {k: torch.from_dlpack(v).float().cpu().clone() for k, v in tr.get_lora_weights(0).items()}
+        runs[chunks] = {"steps": steps, "w": w}
+        del tr
+        torch.cuda.empty_cache()
+
+    def rel(a, b):
+        a, b = a.flatten().double(), b.flatten().double()
+        return float((a - b).norm() / b.norm().clamp_min(1e-30)), float(torch.nn.functional.cosine_similarity(a, b, 0))
+
+    c4, c1 = runs[4], runs[1]
+    report = [{"loss": (c4["steps"][s]["loss"], c1["steps"][s]["loss"]),
+               "norm": (c4["steps"][s]["norm"], c1["steps"][s]["norm"]),
+               "grads": {k.split(".")[-2]: rel(c4["steps"][s]["grads"][k], c1["steps"][s]["grads"][k])
+                         for k in MEMORY_T if c1["steps"][s]["grads"][k].any()}} for s in range(3)]
+    report.append({"table_after": rel(c4["w"][TABLE], c1["w"][TABLE])})
+    print(json.dumps(report))
+    for k in MEMORY:
+        assert not c4["steps"][0]["grads"][k].any() and not c1["steps"][0]["grads"][k].any(), k
+    for s in range(3):
+        l4, l1 = report[s]["loss"]
+        n4, n1 = report[s]["norm"]
+        assert abs(l4 - l1) <= 2e-4, (s, l4, l1)
+        assert abs(n4 - n1) <= 5e-3 * n1, (s, n4, n1)
+        err, cos = report[s]["grads"]["ngram_table"]
+        assert cos > 0.999 and err <= 0.03, (s, err, cos)
+        for k, (err, cos) in report[s]["grads"].items():
+            assert cos > 0.97 and err <= 0.25, (s, k, err, cos)
+    err, cos = report[3]["table_after"]
+    assert cos > 0.999, (err, cos)
+    assert c4["steps"][2]["loss"] != c4["steps"][0]["loss"]
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_trainable_checkpoint_resume_is_exact(tiny_model):
+    """Memory only with the trainable table, AdamW: two steps, a checkpoint, a third step; a fresh trainer resumed from
+    the checkpoint gives the same loss before the third step and the same memory tensors (the table included) after
+    it, bit for bit (the preemptible run resumes from such checkpoints)."""
+    from surogate import _surogate as sg
+
+    seq = 64
+    xs = [_tokens(seq, seed=s) for s in (31, 32, 33)]
+    opt = sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3, weight_decay=0.0, grad_clip=1.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tr = _trainer(tiny_model, [], seq, ngram=_trainable_option())
+        for step in (1, 2):
+            tr.step(*xs[step - 1])
+            tr.update_with_config(opt, step)
+        tr.save_checkpoint(str(tmp / "ckpt"), 2)
+        loss_a = tr.validate(*xs[2])
+        tr.step(*xs[2])
+        tr.update_with_config(opt, 3)
+        after_a, _ = _adapter(tr, tiny_model, tmp, "a")
+        del tr
+        torch.cuda.empty_cache()
+
+        tr = _trainer(tiny_model, [], seq, ngram=_trainable_option())
+        tr.load_checkpoint(str(tmp / "ckpt"), 2)
+        loss_b = tr.validate(*xs[2])
+        tr.step(*xs[2])
+        tr.update_with_config(opt, 3)
+        after_b, _ = _adapter(tr, tiny_model, tmp, "b")
+        del tr
+        torch.cuda.empty_cache()
+    assert np.float32(loss_a).tobytes() == np.float32(loss_b).tobytes(), (loss_a, loss_b)
+    assert set(after_a) == set(MEMORY_T)
+    for k in MEMORY_T:
+        assert torch.equal(after_a[k], after_b[k]), k
+    assert after_a[TABLE].abs().sum() > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_trainable_export_round_trip(tiny_model):
+    """One trained step: the engine export writes the table as raw bf16 rows (= the masters rounded, what the gather
+    read) with its geometry; a fresh trainer re-imports the adapter exactly; the control arm's export is marked
+    servable: false."""
+    from safetensors.torch import load_file
+
+    from surogate import _surogate as sg
+    from surogate.dsl.ngram_memory_export import export_ngram_memory
+
+    seq = 64
+    x, y = _tokens(seq, seed=17)
+    meta = _small_meta(vocab=1009, head_dim=32, eos=500)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for arm, control in (("mem", False), ("ctrl", True)):
+            tr = _trainer(tiny_model, [], seq, ngram=_trainable_option(control=control))
+            for s in (1, 2):
+                tr.step(x, y)
+                tr.update_with_config(sg.OptimizerConfig(optimizer="adamw", learning_rate=1e-3), s)
+            lp = tr.compute_logprobs(x, y, use_lora=True)[0].copy()
+            adapter, _ = _adapter(tr, tiny_model, tmp, arm)
+            del tr
+            torch.cuda.empty_cache()
+            jm = export_ngram_memory(tmp / arm, tmp / f"{arm}_engine", hidden_size=HIDDEN)
+            rows = 16 if control else meta.row_count
+            raw = np.fromfile(jm["table"]["path"], dtype=np.uint16)
+            assert jm["table"]["format"] == "BF16" and jm["table"]["row_bytes"] == 64 and raw.size == rows * 32
+            want = adapter[TABLE].to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16).reshape(-1)
+            assert np.array_equal(raw, want)
+            assert jm["servable"] is (not control) and (jm["control_arm"] is not None) is control
+            out = load_file(str(tmp / f"{arm}_engine" / "ngram_memory.safetensors"))
+            p = "model.language_model.layers.1.ple."
+            assert out[p + "ple_embedding.ngram_heads_vocab_sizes"].tolist() == ([1] * 16 if control else
+                                                                                 list(meta.head_vocab_sizes))
+            fresh = _trainer(tiny_model, [], seq, ngram=_trainable_option(control=control))
+            fresh.import_adapter(str(tmp / arm / "adapter_model.safetensors"))
+            assert np.array_equal(fresh.compute_logprobs(x, y, use_lora=True)[0], lp)
+            del fresh
+            torch.cuda.empty_cache()
+
+
+# The PoC configs (rl/distill-2026-10-20/ngram-poc/train/{mem,ctrl}.yaml.tmpl: @MODEL@ / @TDIR@ placeholders) through
+# the SFT CLI on the tiny full-vocabulary model, with their real table geometry (6.16M rows x 128 for MEM).
+# NGRAM_POC_TEMPLATES=<dir> reads them from that directory (default: the PoC's train/ directory when it exists).
+
+
+def _poc_templates():
+    import yaml
+
+    src = Path(os.environ.get("NGRAM_POC_TEMPLATES", "/mnt/data/work/rl/distill-2026-10-20/ngram-poc/train"))
+    if not (src / "mem.yaml.tmpl").exists():
+        pytest.skip(f"no PoC templates in {src} (NGRAM_POC_TEMPLATES)")
+    out = {}
+    for arm in ("mem", "ctrl"):
+        text = (src / f"{arm}.yaml.tmpl").read_text().replace("@MODEL@", "/m").replace("@TDIR@", "/t")
+        out[arm] = yaml.safe_load(text)
+    return out
+
+
+def _tiny_poc_config(template, root, name, max_steps):
+    cfg = json.loads(json.dumps(template))
+    tmp = json.loads(json.dumps(template))
+    tmp["ngram_memory"] = dict(tmp["ngram_memory"])
+    # _tiny_cli_config expects a file table: give it one to overwrite, then restore the trainable option
+    tmp["ngram_memory"]["table"] = "/unused"
+    out = _tiny_cli_config(tmp, root, name, max_steps)
+    out["ngram_memory"] = dict(cfg["ngram_memory"])
+    return out
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sft_cli_poc_configs_mem_and_ctrl_with_panels_and_resume(cli_model):
+    """The PoC's MEM and CTRL configs (memory only, the trainable table at its real geometry, 32 chunks, fp8-hybrid,
+    7 panels, per-token dumps), 2 steps through the SFT CLI, then a resume of each arm to step 3 from its step-1
+    checkpoint: every chunk runs; the adapter holds the 4 dense tensors + the table; step 0's panels are identical
+    in both arms (zero tables = the base model); the resumed step repeats step 2's loss bit for bit; the arms part
+    once an update has made the tables live."""
+    from safetensors.torch import load_file
+
+    tmpl = _poc_templates()
+    runs = {}
+    for arm in ("mem", "ctrl"):
+        cfg = _tiny_poc_config(tmpl[arm], cli_model, f"poc{arm}", max_steps=2)
+        run = _run_sft(cfg, f"poc{arm}", cli_model)
+        assert [int(p["step"]) for p in run["curve"]] == [1, 2], run["curve"]
+        assert run["max_chunk"] == cfg["sequence_chunks"] - 1 and "Traceback" not in run["log"]
+        adapter = load_file(str(run["out"] / "adapter_model.safetensors"))
+        assert set(adapter) == set(MEMORY_T), sorted(adapter)
+        rows = 16 if arm == "ctrl" else sum(cfg["ngram_memory"]["hash"]["head_vocab_sizes"])
+        assert adapter[TABLE].shape == (rows, 128) and adapter[KEY].shape == (256, 2048)
+        acfg = json.loads((run["out"] / "adapter_config.json").read_text())["surogate_ngram_memory"]
+        assert acfg["table_mode"] == "trainable"
+        prow = [json.loads(line) for line in open(run["out"] / "eval_panels.jsonl")]
+        assert sorted({r["step"] for r in prow}) == [0, 1, 2]
+        cfg3 = json.loads(json.dumps(cfg))
+        cfg3["max_steps"] = 3
+        resumed = _run_sft(cfg3, f"poc{arm}@resume", cli_model)
+        assert [int(p["step"]) for p in resumed["curve"]] == [2, 3], resumed["curve"]
+        assert resumed["curve"][0]["loss"] == run["curve"][1]["loss"]
+        runs[arm] = {"curve": run["curve"] + resumed["curve"][1:], "rows": prow}
+    mem, ctrl = runs["mem"], runs["ctrl"]
+    print(json.dumps({a: [(p["loss"], p["grad_norm"], p["lr"]) for p in r["curve"]] for a, r in runs.items()}))
+    p0 = lambda r: {(x["panel"], x["id"]): x["nll"] for x in r["rows"] if x["step"] == 0}  # noqa: E731
+    assert p0(mem) == p0(ctrl) and len(p0(mem)) == 3 * 7
+    live = _first_live(mem["curve"])
+    for k in range(live - 1):
+        assert mem["curve"][k]["loss"] == ctrl["curve"][k]["loss"], k
+    assert mem["curve"][live - 1]["loss"] != ctrl["curve"][live - 1]["loss"]
