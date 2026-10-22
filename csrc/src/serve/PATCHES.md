@@ -5475,3 +5475,18 @@ pre-tokenizer regex instead of the checkpoint's (5.18 agrees with the engine on 
 not send its own was sampled with one. vLLM's default is 0 and these models' generation configs set none: the same
 request was sampled differently here. Every family default is now 0. A request's `presence_penalty`, `--presence-penalty`
 and a generation config's value still apply, in that order (`test_sampling_defaults`).
+
+## 153
+
+**An automatic KV capacity counts the adapter banks (2026-10-22).** `--enable-lora` allocates every `--max-loras` slot
+at `--max-lora-rank` on every adaptable module when the frontend is built (2.7 GiB for one rank-16 slot on the experts
+of Surogate3.7-35B-A3B). That happened after the automatic capacity had been sized against free memory, so the pool
+spent the banks a second time: without a draft head the 1 GiB of headroom could not hold them, and the engine refused to
+start where the shortfall surfaced (43 lanes: the conversation checkpoints' elastic region, 1,376 MiB against 900 free).
+The frontend is now built before the final resolution and free memory is read on both sides of it;
+`runtime::kv_sizing_free_bytes` sizes an automatic capacity without a draft head after the banks (43 lanes: refused ->
+315,328 tokens) and everything else before them, as it always was. An explicit capacity is the operator's own; a
+speculative plan's graph allowance (MTP: 82 MiB a lane per topology class, 2.56 GiB at 32 lanes against 289-301 MiB of
+graphs on the 35B) has held the banks, and counting them on top refused plans that serve (explicit 300k with MTP 2).
+`SUROGATE_SERVE_MEM_TRACE` prints the banks and whether they were counted (`test_kv_capacity`, opt-in
+`test_lora_kv_auto`).

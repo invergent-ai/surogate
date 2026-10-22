@@ -204,6 +204,9 @@ public:
     [[nodiscard]] std::int32_t max_rank() const noexcept { return max_rank_; }
     /// The device this store's memory lives on, or -1 before anything is built.
     [[nodiscard]] int device() const noexcept { return device_; }
+    /// Device bytes ensure_banks has allocated so far: every bank at every slot and the
+    /// maximum rank, plus the round state.
+    [[nodiscard]] std::size_t device_bytes() const noexcept;
     /// The calling thread's current CUDA device.
     [[nodiscard]] static int current_device();
 

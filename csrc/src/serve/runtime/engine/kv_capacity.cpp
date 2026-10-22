@@ -151,4 +151,12 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     };
 }
 
+std::size_t kv_sizing_free_bytes(const KvCapacityPolicy& policy, SpeculativeBackend speculative,
+                                 std::size_t free_before_adapter_banks,
+                                 std::size_t free_after_adapter_banks) noexcept {
+    return policy.mode == KvCapacityMode::Automatic && speculative == SpeculativeBackend::None
+               ? free_after_adapter_banks
+               : free_before_adapter_banks;
+}
+
 } // namespace sinfer::runtime

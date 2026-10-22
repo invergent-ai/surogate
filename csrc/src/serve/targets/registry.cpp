@@ -483,19 +483,33 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
+    // The frontend's construction binds the adapter directory (make_frontend -> bind_lora) and
+    // allocates its banks: every --max-loras slot at --max-lora-rank on every adaptable module,
+    // 2.7 GiB for one rank-16 slot on the experts of a 35B-A3B. They are built here, before the
+    // KV is sized, and free memory is read on both sides of them; kv_sizing_free_bytes says which
+    // reading the capacity is sized against (runtime/engine/kv_capacity.h).
+    const std::size_t free_before_adapter_banks = current_free_device_bytes();
+    auto loaded = std::make_unique<Loaded>(std::move(model), effective);
+    device.synchronize();
+    const std::size_t free_after_adapter_banks = current_free_device_bytes();
+    const std::size_t sizing_free_bytes = runtime::kv_sizing_free_bytes(
+        kv_policy, effective.speculative.backend, free_before_adapter_banks, free_after_adapter_banks);
     if (memory_trace_enabled()) {
         std::fprintf(stderr,
-                     "mem-trace sizing: derived planes projected %zu MiB, elastic KV unmapped "
-                     "elsewhere %zu MiB\n",
-                     derived_residency_bytes >> 20, elastic_kv_unmapped_commitment(device.device) >> 20);
-        trace_memory_phase("weights loaded, KV sized against this");
+                     "mem-trace sizing: derived planes projected %zu MiB, adapter banks %zu MiB "
+                     "(%s), elastic KV unmapped elsewhere %zu MiB\n",
+                     derived_residency_bytes >> 20,
+                     subtract_saturating(free_before_adapter_banks, free_after_adapter_banks) >> 20,
+                     sizing_free_bytes == free_after_adapter_banks ? "counted" : "not counted",
+                     elastic_kv_unmapped_commitment(device.device) >> 20);
+        trace_memory_phase("weights and adapter banks loaded");
     }
     // Elastic pools on this device have mapped only what they use so far; what they may still
     // map is not free for this engine's cap, or two engines would fill against each other.
     runtime::KvCapacityResolution capacity_resolution = resolve_kv_capacity_within_limit(
         device.device, kv_policy, curve,
         subtract_saturating(
-            subtract_saturating(current_free_device_bytes(), derived_residency_bytes + startup_host_bytes),
+            subtract_saturating(sizing_free_bytes, derived_residency_bytes + startup_host_bytes),
             elastic_kv_unmapped_commitment(device.device)));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
@@ -509,7 +523,6 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     if (options.load_progress.callback) {
         options.load_progress.callback("runtime reservation", 0, reserved);
     }
-    auto loaded   = std::make_unique<Loaded>(std::move(model), effective);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     // Closed after the synchronise, not before it: the barrier drains the uploads and the

@@ -101,6 +101,40 @@ int main() {
         failures += check(refused, "metadata-only stage ignored its fixed memory requirement");
     }
 
+    {
+        // Adapter banks: an automatic capacity without a draft head is sized after them, every
+        // other policy before them (as it was before they were allocated first).
+        using sinfer::SpeculativeBackend;
+        const auto automatic_policy = sinfer::KvCapacityPolicy::automatic(50);
+        const auto explicit_policy  = sinfer::KvCapacityPolicy::explicit_capacity(129);
+        failures += check(sinfer::runtime::kv_sizing_free_bytes(automatic_policy, SpeculativeBackend::None,
+                                                                1360, 1000) == 1000,
+                          "automatic KV capacity without a draft head must count the adapter banks");
+        failures += check(sinfer::runtime::kv_sizing_free_bytes(automatic_policy, SpeculativeBackend::Mtp,
+                                                                1360, 1000) == 1360 &&
+                              sinfer::runtime::kv_sizing_free_bytes(automatic_policy,
+                                                                    SpeculativeBackend::DFlash, 1360,
+                                                                    1000) == 1360,
+                          "speculative automatic KV capacity must be sized as before the banks");
+        failures += check(sinfer::runtime::kv_sizing_free_bytes(explicit_policy, SpeculativeBackend::None,
+                                                                1360, 1000) == 1360,
+                          "explicit KV capacity must be checked as before the banks");
+        failures += check(sinfer::runtime::kv_sizing_free_bytes(automatic_policy, SpeculativeBackend::None,
+                                                                1360, 1360) == 1360,
+                          "an engine without adapters must size as it always did");
+        // The regression in miniature: the curve above, 1600 bytes free after weights, 300 bytes
+        // of banks. Sized before them the automatic pool takes all 6 page groups (1512 bytes) and
+        // leaves 88, less than the banks; sized after them it takes the 3 that fit beside them.
+        const auto before = sinfer::runtime::resolve_kv_capacity(automatic_policy, curve, 1600);
+        const auto after  = sinfer::runtime::resolve_kv_capacity(
+            automatic_policy, curve,
+            sinfer::runtime::kv_sizing_free_bytes(automatic_policy, SpeculativeBackend::None, 1600, 1300));
+        failures += check(before.main_page_groups == 6 && before.planned_slack_bytes == 88 &&
+                              after.main_page_groups == 3 &&
+                              after.runtime_reservation_bytes + 50 <= 1300,
+                          "automatic KV capacity sized after the banks must leave them and the headroom");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

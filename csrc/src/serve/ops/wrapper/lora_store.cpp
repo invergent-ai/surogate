@@ -59,6 +59,12 @@ int LoraStore::current_device() {
     return device;
 }
 
+std::size_t LoraStore::device_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& arena : storage_) { bytes += arena->capacity(); }
+    return bytes;
+}
+
 LoraStore::~LoraStore() {
     // A destructor cannot throw, so the device is bound bare here rather than
     // through ScopedDevice. Freeing an allocation while another device is current
