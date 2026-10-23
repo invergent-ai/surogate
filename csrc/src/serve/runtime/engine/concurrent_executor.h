@@ -1461,9 +1461,16 @@ private:
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
+        // At equal reuse a lane that resumes in place beats a host-tier restore elsewhere (a copy
+        // and a second set of pages for a conversation that is still here), then the cheaper lane.
+        const auto restores = [&](std::uint32_t lane) {
+            return request->lane_plans[lane] && request->lane_plans[lane]->summary().host_restore;
+        };
         const auto better = [&](std::uint32_t lane, std::uint32_t reuse) {
-            return !selected || reuse > selected_reuse ||
-                   (reuse == selected_reuse && cheaper_lane_to_take(lane, selected->lane));
+            if (!selected || reuse > selected_reuse) { return true; }
+            if (reuse < selected_reuse) { return false; }
+            if (restores(lane) != restores(selected->lane)) { return !restores(lane); }
+            return cheaper_lane_to_take(lane, selected->lane);
         };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }

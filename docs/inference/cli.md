@@ -120,13 +120,20 @@ surogate serve surogate/Surogate3.7-35B-A3B-NVFP4 --devices 0,1,2,3 --data-paral
   its earlier ones.
 - The memory is one pool for the whole process: data-parallel replicas and pipeline stages
   each add N GiB to it, and the least recently used conversations go first when it is full.
-- The memory is page-locked at startup (a few seconds per 16 GiB) and is not available to other
+- The memory is page-locked at startup (about a second per 8 GiB) and is not available to other
   programs. Keep the total (N times the GPUs) well inside the host's free memory.
+- A conversation the KV cache could not keep, and that does not fit in the pool either, is
+  dropped as before; `surogate_host_prefix_cache_dropped_lanes_total` counts them.
 - A restored conversation continues exactly as one still on the GPU would: the same tokens and
   log-probabilities.
 - `/metrics` reports the pool (`surogate_host_prefix_cache_*`), the prompt tokens reused by where
   they were (`surogate_prefix_cache_hit_tokens_total{tier="gpu|shared_prefix|host"}`), copy
   times, and request TTFT and queue-wait histograms; `/kv_stats` has the same per replica.
+
+How much to give it: enough for the conversations that wait while others hold the GPU. With 24
+agents replaying recorded tool-calling conversations of up to 100k tokens on four GPUs (FP8 cache
+of 300k tokens each, 262,144 context), 2 GiB per GPU still let 18 % of the long turns prefill
+again and 8 GiB per GPU none.
 
 `0` keeps nothing on the host, not even the 512 MiB archive.
 

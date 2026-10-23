@@ -103,6 +103,13 @@ void exercise(Instance& instance, bool tier, bool mtp) {
         turn.scores = result.completion_logprobs;
         return turn;
     };
+    const auto planned = [&](std::uint32_t lane, const std::vector<sinfer::TokenId>& ids) {
+        auto prompt = frontend.prepare_tokens(std::vector<sinfer::TokenId>(ids));
+        sinfer::runtime::ResolvedExecutionOptions options;
+        options.requested_output_tokens = generate;
+        auto base = program.plan_request_base(prompt, options);
+        return program.plan_request_for_lane(lane, prompt, base).summary();
+    };
     const auto same_bits = [](float a, float b) {
         return std::memcmp(&a, &b, sizeof(float)) == 0 || (std::isnan(a) && std::isnan(b));
     };
@@ -181,6 +188,13 @@ void exercise(Instance& instance, bool tier, bool mtp) {
     const auto offloaded = program.host_kv_stats();
     require(offloaded.offloads == before.offloads + 1 && offloaded.entries == 1,
             "a retained conversation must be copied to the host in the background");
+    // While the lane still holds the conversation another lane can restore its copy for the same
+    // reuse; the plan says it is a restore, so the executor resumes it in place first.
+    const auto here = planned(0, second), elsewhere = planned(1, second);
+    require(here.reusable_prompt_tokens == gpu.reused && !here.host_restore,
+            "the lane holding the conversation must resume it in place");
+    require(elsewhere.reusable_prompt_tokens == gpu.reused && elsewhere.host_restore,
+            "another lane must see the host copy as a restore");
     program.spill_retained_lane(0);
     require(!program.has_retained_lane(0), "a spilled lane must give its pages back");
     require(program.kv_occupancy().entitled_pages == 0, "a spilled lane must release its entitlement");

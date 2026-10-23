@@ -358,7 +358,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
         if (saved) {
             auto cached = plan_request_for_sequence(lane, saved->state, prompt, base_plan, true);
-            if (cached.summary().reusable_prompt_tokens > resident.summary().reusable_prompt_tokens) {
+            if (saved && cached.summary().reusable_prompt_tokens > resident.summary().reusable_prompt_tokens) {
+                cached.impl_->summary.host_restore = static_cast<bool>(saved->tier);
                 cached.impl_->archived = std::move(saved);
                 cached.impl_->host_lease = std::move(host_lease);
                 resident = std::move(cached);

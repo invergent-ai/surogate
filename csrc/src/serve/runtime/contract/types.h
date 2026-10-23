@@ -99,6 +99,9 @@ struct RequestPlanSummary {
     /// Admitted with only its prompt and headroom entitled; it grows by rounds, and may be
     /// preempted and recomputed when the pool runs short (--kv-admission ondemand).
     bool on_demand_kv = false;
+    /// Resumes from a host-tier snapshot (--prefix-cache-host-gb): a copy and a fresh set of pages,
+    /// so at equal reuse a lane that resumes in place goes first.
+    bool host_restore = false;
     std::uint64_t service_work_quanta = 0;
 };
 

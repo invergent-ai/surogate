@@ -87,7 +87,15 @@ stage of a model adds its `--prefix-cache-host-gb` to it (mmap, parallel first t
     reads is reused or evicted first (`fence_lane_copies`).
   - A restore's copies are waited for before the lane's next GPU work, with no host
     synchronisation. The legacy restore ended in `device.synchronize()`.
-- **Supersede.** A longer snapshot of a conversation replaces its shorter ones.
+- **Supersede.** A longer snapshot of a conversation replaces its shorter ones. A lane's next
+  snapshot also replaces the one the lane continued, once it has moved past that snapshot's
+  rewrite checkpoint (the client resent its own rendering of the answer). Parallel attempts that
+  share a prompt keep their own.
+- **In-place first.** Every lane may plan a host restore. The plan says it is one
+  (`RequestPlanSummary::host_restore`), and at equal reuse the executor resumes a conversation on
+  the lane that still holds it. An earlier version kept the host copy away from other lanes while
+  the conversation's own lane held it. That brought back the turns the base engine admits on
+  another lane with only a shared GPU prefix: 40 of 950 long calls with 10 agents.
 - **Invalidation.** An adapter update or idle shrink calls `evict_archived_prefixes`, which drops
   the program's entries at once.
 - **Default unchanged.** Without the flag, the 512 MiB archive behaves as before, except that an

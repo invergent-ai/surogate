@@ -5490,3 +5490,24 @@ speculative plan's graph allowance (MTP: 82 MiB a lane per topology class, 2.56 
 graphs on the 35B) has held the banks, and counting them on top refused plans that serve (explicit 300k with MTP 2).
 `SUROGATE_SERVE_MEM_TRACE` prints the banks and whether they were counted (`test_kv_capacity`, opt-in
 `test_lora_kv_auto`).
+
+## 154
+
+**A host KV tier: conversations the KV cache gives back go to host RAM (2026-10-23).** Under KV pressure the executor
+took retained lanes back with `evict_retained_lane`, which dropped the conversation and also cleared the whole 512 MiB
+host archive, so the next turn of an agent conversation prefilled its whole context again. On 72 recorded agent
+conversations (Surogate3.7-35B-A3B NVFP4, 262,144 context, FP8 KV of 300k tokens on each of 4 replicas, MTP 2, 24
+agents) 64 % of the calls over 50k tokens re-prefilled more than 20k tokens the engine had already seen.
+`--prefix-cache-host-gb N` keeps them in N GiB per GPU of page-locked host RAM, one pool for the process: a finished turn
+is copied there in the background on a copy stream of its own (only the 1,024-token KV chunks the pool lacks, then the
+recurrent state and the pages past the last chunk at the turn's frontiers), an eviction then costs nothing, and a later
+turn restores with host-to-device copies the compute stream waits for by event. Chunks are keyed by a chained SHA-256
+over their tokens in a namespace of weights, KV layout, draft head, stage and the adapter's content digest, and shared
+across conversations and turns; the pool drops whole snapshots, least recently used first, across replicas
+(`api/kv_tier.h`, `family/impl/kv_tier/`, `family/impl/runtime/host_tier_impl.h`, DESIGN-host-kv-tier.md). At 8 GiB per
+GPU the replay's re-prefills went from 64 % of the long calls to 0.2 % and their TTFT p50/p90 from 6.8/19.6 s to
+1.3/6.1 s; with 10 agents from 5 % to none (p90 0.58 -> 0.41 s). A host copy of a conversation still on its lane is a
+restore like any other (`RequestPlanSummary::host_restore`), and the executor resumes in place first at equal reuse. A restored
+turn is bit-identical to the same turn resumed from the GPU lane (`test_host_kv_tier`). Without the flag nothing
+changes except that an eviction no longer clears the archive. `/metrics` gains the pool, reuse by tier, copy times and
+request TTFT and queue-wait histograms.
