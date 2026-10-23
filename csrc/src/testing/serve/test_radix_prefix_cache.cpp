@@ -85,4 +85,19 @@ int main() {
     held.reset();
     assert(order.evict_oldest() && order.empty());
     assert(!order.evict_oldest());
+    assert(order.evictions() == 3);
+
+    // erase_if drops what it selects, held or not (the holder keeps its value), and the bounds
+    // of an empty cache can change (the host tier sizes its index at startup).
+    Cache selective(100);
+    assert(selective.insert(first, two, std::make_shared<Value>(2, 1), 10));
+    assert(selective.insert(second, two, std::make_shared<Value>(2, 2), 10));
+    auto kept = selective.match(first, [](const Value& v) { return v.frontier; });
+    assert(selective.erase_if([](const Value& v) { return v.identity == 1; }) == 1);
+    assert(kept && kept->identity == 1 && selective.size() == 1 && selective.bytes() == 10);
+    assert(!selective.match(first, [](const Value& v) { return v.frontier; }));
+    assert(selective.match(second, [](const Value& v) { return v.frontier; }));
+    selective.clear();
+    selective.configure(1000, 2);
+    assert(selective.capacity() == 1000);
 }

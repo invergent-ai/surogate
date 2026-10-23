@@ -606,6 +606,8 @@ std::string format_server_start_json(
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
+          {"prefix_cache_host_bytes",
+           options.prefix_cache_host_bytes ? Json(*options.prefix_cache_host_bytes) : Json(nullptr)},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative)}};

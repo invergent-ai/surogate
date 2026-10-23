@@ -132,6 +132,9 @@ struct ServeOptions {
     bool elastic_kv          = true;  // default; --no-elastic-kv puts the Main KV planes in the arena
     bool elastic_kv_overcommit = false; // --elastic-kv-overcommit: floor + device gate
     std::size_t gpu_memory_limit_bytes = 0; // --gpu-memory-limit-mib: per-device process budget
+    // --prefix-cache-host-gb N: page-locked host memory per GPU for conversations the KV pool
+    // takes back (EngineOptions::prefix_cache_host_bytes); unset keeps the 512 MiB archive.
+    std::optional<std::size_t> prefix_cache_host_bytes;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

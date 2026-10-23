@@ -150,6 +150,25 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
     return true;
 }
 
+bool ResidentPrefixIdentity::is_prefix_of(const ResidentPrefixIdentity& longer) const {
+    const std::size_t count = size();
+    if (lora_slot_ != longer.lora_slot_ || count > longer.size()) { return false; }
+    if (!std::equal(token_types_.begin(), token_types_.end(), longer.token_types_.begin())) { return false; }
+    for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
+        if (!std::equal(positions_[axis].begin(), positions_[axis].end(), longer.positions_[axis].begin())) {
+            return false;
+        }
+    }
+    std::size_t covered = 0;
+    if (!prefix_item_count(longer.vision_items_, count, &covered) || covered != vision_items_.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < covered; ++i) {
+        if (!same_item(vision_items_[i], longer.vision_items_[i])) { return false; }
+    }
+    return true;
+}
+
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count,
                     std::int32_t requester_lora_slot) {

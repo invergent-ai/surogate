@@ -21,6 +21,8 @@
 #include "family/impl/runtime/prefix_identity.h"
 #include "family/impl/runtime/routing_rows.h"
 #include "family/impl/archive_storage.h"
+#include "family/impl/kv_tier/host_pool.h"
+#include "family/impl/kv_tier/keys.h"
 #include "family/impl/radix_prefix_cache.h"
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/vision_context.h"
@@ -29,9 +31,12 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -133,6 +138,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     std::shared_ptr<const SINFER_FAMILY_RUNTIME_NS::GpuPrefix> device_prefix;
     std::shared_ptr<SINFER_FAMILY_RUNTIME_NS::SharedPrefix> shared_prefix;
     std::shared_ptr<const std::vector<std::uint64_t>> page_hashes;
+    /// A host-tier restore: keeps the snapshot's objects in the pool while the plan exists.
+    std::shared_ptr<family::detail::HostKvPool::Lease> host_lease;
     std::optional<SINFER_FAMILY_RUNTIME_NS::VisionPrefillPlan> vision;
     SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -347,14 +354,42 @@ struct SharedPrefix {
     ~SharedPrefix() { if (storage) storage->free.push_back(slot); }
 };
 
-/// A finished lane's prefix kept in host memory after its lane went to another request. Every
-/// byte lives in `storage`; the views below are its tensors and KV planes.
+/// Where one host-tier snapshot's bytes are (--prefix-cache-host-gb; api/kv_tier.h): whole
+/// 1,024-token chunks, each one pool block holding every KV plane of its 16 pages, then a boundary
+/// object with the pages past the last chunk and the state at the append frontier, and a second
+/// boundary with the state at the rewrite checkpoint when there is one.
+struct HostSnapshot {
+    /// A range of bytes inside one object: block `block` of it, at `offset`.
+    struct Piece {
+        std::uint32_t block  = 0;
+        std::size_t offset   = 0;
+        std::size_t bytes    = 0;
+    };
+    std::shared_ptr<family::detail::HostKvPool> pool;
+    family::detail::HostKvPool::EntryId entry = 0;
+    std::uint32_t chunks = 0, text_pages = 0, backend_pages = 0;
+    std::vector<family::detail::HostKvPool::ObjectId> chunk_objects;
+    family::detail::HostKvPool::ObjectId boundary = 0, checkpoint = 0;
+    bool has_checkpoint = false;
+    std::vector<Piece> tail_text, tail_backend; ///< one per plane: the tail pages' image
+    std::vector<Piece> state, checkpoint_state; ///< one per state tensor
+    std::uint64_t bytes = 0;                    ///< bytes this snapshot wrote (new objects only)
+    ~HostSnapshot() {
+        if (pool && entry != 0) { pool->drop_entry(entry); }
+    }
+};
+
+/// A finished lane's prefix kept in host memory after its lane went to another request or, with
+/// the host tier, after the KV pool took the lane back. The legacy archive keeps every byte in
+/// `storage` (the views below are its tensors and KV planes); a host-tier snapshot keeps them in
+/// the pool (`tier`).
 struct ArchivedSequence {
     SequenceState state;
     family::detail::ArchiveBlock storage;
     std::uint32_t text_pages = 0, backend_pages = 0;
     std::vector<std::byte*> text, backend;
     std::vector<std::span<std::byte>> current, checkpoint;
+    std::unique_ptr<HostSnapshot> tier;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -504,7 +539,12 @@ public:
     void flush_deferred_fold_counts();
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    /// The KV pool needs a retained lane's pages back. With the host tier its conversation goes
+    /// to host memory first (when it fits) and the other snapshots stay; without it this is
+    /// `evict_retained_lane`. Counted either way (HostKvStats::spills / dropped_lanes).
+    void spill_retained_lane(std::uint32_t lane) noexcept;
     void evict_archived_prefixes() noexcept;
+    [[nodiscard]] HostKvStats host_kv_stats() const noexcept;
     TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const;
     void cache_logprobs(std::uint32_t lane, const GenerationResult& result);
     void collect_logprobs(std::uint32_t lane, GenerationResult& result);
@@ -741,6 +781,31 @@ public:
     /// refused it (`archive_arena_refused`), and images then use the heap.
     std::shared_ptr<family::detail::PinnedArchiveArena> archive_arena;
     bool archive_arena_refused = false;
+    // The host tier (--prefix-cache-host-gb, family/impl/runtime/host_tier_impl.h). Set at
+    // startup, everything above still indexes snapshots, but their bytes live in the process's
+    // host pool, a retained lane taken back under pressure goes there instead of being dropped,
+    // finished conversations are copied there in the background, and every copy runs on a
+    // stream of its own. Off (no flag), the archive behaves as it always has.
+    struct HostTier;
+    std::unique_ptr<HostTier> host_tier_state;
+    bool host_tier = false;
+    void configure_host_tier(const std::optional<std::size_t>& budget, std::uint64_t weights_identity);
+    /// Round boundary: completes finished copies, unindexes what the pool dropped, and copies one
+    /// finished conversation to the host when the copy stream is free.
+    void background_offload() noexcept;
+    /// Copies a retained lane's conversation to the host tier; false when it did not fit.
+    bool snapshot_lane(std::uint32_t lane, int reason);
+    [[nodiscard]] bool lane_has_current_snapshot(std::uint32_t lane) const noexcept;
+    void restore_host_snapshot(SequenceState& sequence, const RequestPlanImpl& plan);
+    /// The compute stream waits for a copy still reading or writing this lane's pages or state.
+    void fence_lane_copies(std::uint32_t lane) noexcept;
+    void poll_host_copies() noexcept;
+    void drain_host_losses();
+    [[nodiscard]] std::shared_ptr<family::detail::HostKvPool::Lease> lease_host_snapshot(const ArchivedSequence& image);
+    /// Prompt tokens requests reused, by where they came from (HostKvStats).
+    std::uint64_t reuse_tokens_gpu = 0, reuse_tokens_shared = 0, reuse_tokens_host = 0;
+    std::uint64_t reuse_requests_gpu = 0, reuse_requests_shared = 0, reuse_requests_host = 0, reuse_requests_none = 0;
+    std::uint64_t host_dropped_lanes = 0, host_archived = 0, host_refused = 0, host_superseded = 0;
     std::unordered_map<const GpuPrefixKey*, std::shared_ptr<GpuPrefix>> gpu_prefixes;
     void prune_gpu_prefixes();
     void capture_gpu_prefix(SequenceState& sequence, const std::shared_ptr<const GpuPrefixKey>& key,
@@ -978,6 +1043,49 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] family::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] family::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+};
+
+/// The host tier of one program (configure_host_tier).
+struct ProgramImplCore::HostTier {
+    std::shared_ptr<family::detail::HostKvPool> pool;
+    family::detail::HostKvPool::OwnerId owner = 0;
+    std::size_t budget = 0;
+    /// Every archive and restore copy runs here, ordered after the compute stream's work by an
+    /// event, so a copy never holds up the lanes that are decoding.
+    cudaStream_t copy_stream = nullptr;
+    /// What makes this program's KV bytes its own (kvkeys::namespace_root).
+    std::vector<std::uint8_t> model;
+    /// Bumped by every invalidation; names an adapter whose content digest is unknown.
+    std::uint64_t epoch = 0;
+    std::size_t block_bytes = 0;
+    /// Byte offset of each plane's 16 pages inside a chunk block.
+    std::vector<std::size_t> text_offset, backend_offset;
+    struct Copy {
+        cudaEvent_t start = nullptr, done = nullptr;
+        int reason        = 0;
+        std::uint32_t lane = 0;
+        std::vector<family::detail::HostKvPool::ObjectId> created;
+        std::shared_ptr<family::detail::HostKvPool::Lease> lease;
+        std::uint64_t bytes = 0;
+    };
+    std::deque<Copy> copies;
+    /// Per lane: the last copy that reads or writes its pages or state, null once it has run.
+    std::vector<cudaEvent_t> lane_copy;
+    /// Per lane: the snapshot of its retained conversation as it is now, if one was taken.
+    std::vector<std::weak_ptr<const ArchivedSequence>> lane_snapshot;
+    /// Per lane: the snapshot its sequence continues (restored from, or taken of it on the GPU
+    /// before this turn); its next snapshot supersedes that one.
+    std::vector<std::weak_ptr<const ArchivedSequence>> lane_parent;
+    /// Per lane: when its sequence last started a request (background copies go oldest first).
+    std::vector<std::uint64_t> lane_started;
+    std::uint64_t clock = 0;
+    std::vector<cudaEvent_t> spare_events;
+    std::uint64_t spills = 0, spills_free = 0, offloads = 0, restores = 0, restored_tokens = 0;
+    std::uint64_t offload_bytes = 0, restore_bytes = 0;
+    LatencyHistogram offload_ms, restore_ms;
+    [[nodiscard]] cudaEvent_t event();
+    void recycle(cudaEvent_t event) noexcept;
+    ~HostTier();
 };
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS

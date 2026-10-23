@@ -71,6 +71,16 @@ public:
         };
     using Clock    = std::chrono::steady_clock;
 
+    /// The KV pool takes a retained lane back: its conversation goes to the host prefix tier
+    /// where the program has one (--prefix-cache-host-gb), else it is evicted.
+    void take_back_retained_lane(std::uint32_t lane) noexcept {
+        if constexpr (requires(typename Package::Program& p) { p.spill_retained_lane(std::uint32_t{}); }) {
+            instance_.program->spill_retained_lane(lane);
+        } else {
+            instance_.program->evict_retained_lane(lane);
+        }
+    }
+
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_round_rows_(decode_batch_capacity(options.max_concurrency, options.speculative.backend)),
@@ -485,6 +495,9 @@ private:
         if constexpr (kOnDemandCapable) {
             snapshot.kv_growth_refusals = instance_.program->kv_growth_refusals();
         }
+        if constexpr (requires(const typename Package::Program& p) { p.host_kv_stats(); }) {
+            snapshot.host_kv = instance_.program->host_kv_stats();
+        }
         {
             std::lock_guard lock(queue_mutex_);
             for (const auto& waiting : pending_) {
@@ -581,6 +594,7 @@ private:
         ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
+        std::optional<Clock::time_point> admitted; ///< first given a lane
         std::shared_ptr<void> lifetime;
         std::optional<Clock::time_point> first_token;
         std::optional<GenerationBudget> budget;
@@ -856,6 +870,10 @@ private:
                 request->prepare_seconds +
                 std::chrono::duration<double>(*request->first_token - request->submitted).count();
         }
+        if (request->admitted) {
+            result.timings.queue_seconds =
+                std::chrono::duration<double>(*request->admitted - request->submitted).count();
+        }
         result.timings.total_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(Clock::now() - request->submitted).count();
@@ -953,7 +971,8 @@ private:
     // ---- --kv-admission ondemand (DESIGN-kv-admission.md) ------------------------------------
 
     /// Gives back one piece of idle KV for a lane that cannot grow: the retained prefix-cache lane
-    /// released longest ago (evicting it drops the shared prefixes and the host archive too), or,
+    /// released longest ago (evicting it drops the shared prefixes, and the host archive too unless
+    /// a host tier keeps the conversation), or,
     /// with no lane retained, the shared prefixes alone, once per pass.
     bool release_idle_kv(bool& prefixes_dropped) {
         std::optional<std::uint32_t> oldest;
@@ -964,7 +983,7 @@ private:
             }
         }
         if (oldest) {
-            instance_.program->evict_retained_lane(*oldest);
+            take_back_retained_lane(*oldest);
             invalidate_lane_plans(*oldest);
             prefixes_dropped = true;
             return true;
@@ -1527,7 +1546,7 @@ private:
                 const std::uint32_t retained_lane = eviction_order[order];
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
-                    instance_.program->evict_retained_lane(retained_lane);
+                    take_back_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                     evicted = true;
                 }
@@ -1568,6 +1587,7 @@ private:
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
         if (!erase_pending(request)) { return AdmissionProgress::None; }
+        if (!request->admitted) { request->admitted = Clock::now(); }
         release_planning_state(request);
 
         const RequestPlanSummary summary = selected_plan.summary();
@@ -2607,6 +2627,11 @@ private:
                 }
                 cancel_active_requests(cancelled_at_boundary);
                 inject_worker_fault();
+                // Host prefix tier: finished copies complete, and one finished conversation goes
+                // to host memory while the copy stream is free, so evicting it later is free.
+                if constexpr (requires(typename Package::Program& p) { p.background_offload(); }) {
+                    instance_.program->background_offload();
+                }
                 if constexpr (kPipelined) {
                     seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
                     seg_timer_.maybe_report();
@@ -2618,7 +2643,7 @@ private:
                 if (instance_.program->kv_service_pressure()) {
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane)) {
-                            instance_.program->evict_retained_lane(lane);
+                            take_back_retained_lane(lane);
                             invalidate_lane_plans(lane);
                         }
                     }

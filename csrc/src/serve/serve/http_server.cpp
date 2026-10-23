@@ -237,6 +237,33 @@ sinfer::RuntimeStats sum_runtime_stats(const std::vector<GenerationService*>& se
         total.kv_growth_refusals += s.kv_growth_refusals;
         total.kv_preempted_waiting += s.kv_preempted_waiting;
         total.kv_capacity_pages += s.kv_capacity_pages;
+        // The pool is the process's: every replica reports the same one.
+        total.host_kv.capacity_bytes = std::max(total.host_kv.capacity_bytes, s.host_kv.capacity_bytes);
+        total.host_kv.used_bytes     = std::max(total.host_kv.used_bytes, s.host_kv.used_bytes);
+        total.host_kv.evictions      = std::max(total.host_kv.evictions, s.host_kv.evictions);
+        total.host_kv.shared_objects = std::max(total.host_kv.shared_objects, s.host_kv.shared_objects);
+        total.host_kv.budget_bytes += s.host_kv.budget_bytes;
+        total.host_kv.entries += s.host_kv.entries;
+        total.host_kv.spills_free += s.host_kv.spills_free;
+        total.host_kv.spills += s.host_kv.spills;
+        total.host_kv.dropped_lanes += s.host_kv.dropped_lanes;
+        total.host_kv.archived += s.host_kv.archived;
+        total.host_kv.offloads += s.host_kv.offloads;
+        total.host_kv.refused += s.host_kv.refused;
+        total.host_kv.offload_bytes += s.host_kv.offload_bytes;
+        total.host_kv.restore_bytes += s.host_kv.restore_bytes;
+        total.host_kv.restores += s.host_kv.restores;
+        total.host_kv.restored_tokens += s.host_kv.restored_tokens;
+        total.host_kv.superseded += s.host_kv.superseded;
+        total.host_kv.gpu_hit_requests += s.host_kv.gpu_hit_requests;
+        total.host_kv.shared_hit_requests += s.host_kv.shared_hit_requests;
+        total.host_kv.host_hit_requests += s.host_kv.host_hit_requests;
+        total.host_kv.miss_requests += s.host_kv.miss_requests;
+        total.host_kv.gpu_hit_tokens += s.host_kv.gpu_hit_tokens;
+        total.host_kv.shared_hit_tokens += s.host_kv.shared_hit_tokens;
+        total.host_kv.host_hit_tokens += s.host_kv.host_hit_tokens;
+        total.host_kv.offload_ms.merge(s.host_kv.offload_ms);
+        total.host_kv.restore_ms.merge(s.host_kv.restore_ms);
     }
     return total;
 }
@@ -369,6 +396,9 @@ void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
     log_line(format_request_done(context, outcome));
     request_jsonl_.write_request_done(context, outcome);
+    std::lock_guard lock(latency_mutex_);
+    ttft_histogram_.add(outcome.metrics.ttft_seconds);
+    queue_histogram_.add(outcome.metrics.queue_seconds);
 }
 
 void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
@@ -842,6 +872,35 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
             {"recomputed_tokens", stats.kv_recomputed_tokens},
             {"growth_refusals", stats.kv_growth_refusals},
             {"preempted_waiting", stats.kv_preempted_waiting},
+            {"host_cache",
+             nlohmann::json{
+                 {"pool_capacity_bytes", stats.host_kv.capacity_bytes},
+                 {"pool_used_bytes", stats.host_kv.used_bytes},
+                 {"budget_bytes", stats.host_kv.budget_bytes},
+                 {"entries", stats.host_kv.entries},
+                 {"spills_free", stats.host_kv.spills_free},
+                 {"spills", stats.host_kv.spills},
+                 {"dropped_lanes", stats.host_kv.dropped_lanes},
+                 {"archived", stats.host_kv.archived},
+                 {"offloads", stats.host_kv.offloads},
+                 {"refused", stats.host_kv.refused},
+                 {"offload_bytes", stats.host_kv.offload_bytes},
+                 {"restore_bytes", stats.host_kv.restore_bytes},
+                 {"restores", stats.host_kv.restores},
+                 {"restored_tokens", stats.host_kv.restored_tokens},
+                 {"evictions", stats.host_kv.evictions},
+                 {"superseded", stats.host_kv.superseded},
+                 {"shared_objects", stats.host_kv.shared_objects},
+                 {"hit_requests",
+                  nlohmann::json{{"gpu", stats.host_kv.gpu_hit_requests},
+                                 {"shared_prefix", stats.host_kv.shared_hit_requests},
+                                 {"host", stats.host_kv.host_hit_requests},
+                                 {"none", stats.host_kv.miss_requests}}},
+                 {"hit_tokens",
+                  nlohmann::json{{"gpu", stats.host_kv.gpu_hit_tokens},
+                                 {"shared_prefix", stats.host_kv.shared_hit_tokens},
+                                 {"host", stats.host_kv.host_hit_tokens}}},
+             }},
             {"pool_bytes", bytes(stats.kv_pages)},
             {"in_use_bytes", bytes(stats.kv_pages_in_use)},
             {"resident_at_granule_bytes", bytes(stats.kv_pages_resident_at_granule)},
@@ -974,6 +1033,103 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
     for (const Row& r : rows) { metric("kv_growth_refusals_total", r.labels, r.stats.kv_growth_refusals); }
     help("kv_on_demand", "gauge", "1 when requests are admitted with their prompt only and grow on demand.");
     for (const Row& r : rows) { metric("kv_on_demand", r.labels, r.stats.kv_on_demand); }
+
+    help("host_prefix_cache_capacity_bytes", "gauge",
+         "Host memory for conversation snapshots: the process pool (--prefix-cache-host-gb per GPU), or the "
+         "512 MiB archive without it.");
+    for (const Row& r : rows) { metric("host_prefix_cache_capacity_bytes", r.labels, r.stats.host_kv.capacity_bytes); }
+    help("host_prefix_cache_used_bytes", "gauge", "Host pool bytes conversation snapshots hold now.");
+    for (const Row& r : rows) { metric("host_prefix_cache_used_bytes", r.labels, r.stats.host_kv.used_bytes); }
+    help("host_prefix_cache_entries", "gauge", "Conversation snapshots this engine indexes now.");
+    for (const Row& r : rows) { metric("host_prefix_cache_entries", r.labels, r.stats.host_kv.entries); }
+    const auto counter = [&](const char* name, const char* what, auto field) {
+        help(name, "counter", what);
+        for (const Row& r : rows) { metric(name, r.labels, field(r.stats.host_kv)); }
+    };
+    counter("host_prefix_cache_spills_free_total",
+            "Retained conversations the KV cache took back that were already in host memory.",
+            [](const sinfer::HostKvStats& h) { return h.spills_free; });
+    counter("host_prefix_cache_spills_total",
+            "Retained conversations the KV cache took back that were copied to host memory then.",
+            [](const sinfer::HostKvStats& h) { return h.spills; });
+    counter("host_prefix_cache_dropped_lanes_total",
+            "Retained conversations the KV cache took back with no host copy (no tier, or no room).",
+            [](const sinfer::HostKvStats& h) { return h.dropped_lanes; });
+    counter("host_prefix_cache_archived_total", "Conversation snapshots written to host memory.",
+            [](const sinfer::HostKvStats& h) { return h.archived; });
+    counter("host_prefix_cache_offloads_total",
+            "Finished conversations copied to host memory in the background.",
+            [](const sinfer::HostKvStats& h) { return h.offloads; });
+    counter("host_prefix_cache_refused_total", "Conversation snapshots that found no room.",
+            [](const sinfer::HostKvStats& h) { return h.refused; });
+    counter("host_prefix_cache_offload_bytes_total", "Bytes copied from the GPU into host snapshots.",
+            [](const sinfer::HostKvStats& h) { return h.offload_bytes; });
+    counter("host_prefix_cache_restore_bytes_total", "Bytes copied from host snapshots back to the GPU.",
+            [](const sinfer::HostKvStats& h) { return h.restore_bytes; });
+    counter("host_prefix_cache_restores_total", "Requests that resumed from a host snapshot.",
+            [](const sinfer::HostKvStats& h) { return h.restores; });
+    counter("host_prefix_cache_restored_tokens_total",
+            "Prompt tokens requests resumed from host snapshots instead of prefilling them.",
+            [](const sinfer::HostKvStats& h) { return h.restored_tokens; });
+    counter("host_prefix_cache_evictions_total",
+            "Host snapshots the process pool dropped to make room, least recently used first.",
+            [](const sinfer::HostKvStats& h) { return h.evictions; });
+    counter("host_prefix_cache_superseded_total",
+            "Host snapshots replaced by a longer snapshot of the same conversation.",
+            [](const sinfer::HostKvStats& h) { return h.superseded; });
+    counter("host_prefix_cache_shared_objects_total",
+            "Host KV chunks a snapshot found already stored (a shared prefix, an earlier turn).",
+            [](const sinfer::HostKvStats& h) { return h.shared_objects; });
+    help("prefix_cache_hit_requests_total", "counter",
+         "Admitted requests by where the prompt prefix they reused was: gpu (a retained lane), shared_prefix, "
+         "host, or none.");
+    help("prefix_cache_hit_tokens_total", "counter",
+         "Prompt tokens admitted requests reused instead of prefilling, by where they were.");
+    for (const Row& r : rows) {
+        const auto& h = r.stats.host_kv;
+        metric("prefix_cache_hit_requests_total", r.labels + ",tier=\"gpu\"", h.gpu_hit_requests);
+        metric("prefix_cache_hit_requests_total", r.labels + ",tier=\"shared_prefix\"", h.shared_hit_requests);
+        metric("prefix_cache_hit_requests_total", r.labels + ",tier=\"host\"", h.host_hit_requests);
+        metric("prefix_cache_hit_requests_total", r.labels + ",tier=\"none\"", h.miss_requests);
+        metric("prefix_cache_hit_tokens_total", r.labels + ",tier=\"gpu\"", h.gpu_hit_tokens);
+        metric("prefix_cache_hit_tokens_total", r.labels + ",tier=\"shared_prefix\"", h.shared_hit_tokens);
+        metric("prefix_cache_hit_tokens_total", r.labels + ",tier=\"host\"", h.host_hit_tokens);
+    }
+    const auto histogram = [&](const char* name, const char* what, const std::string& labels,
+                               std::span<const double> bounds_seconds, std::span<const std::uint64_t> counts,
+                               double sum_seconds, std::uint64_t count, bool with_help) {
+        if (with_help) { help(name, "histogram", what); }
+        std::uint64_t cumulative = 0;
+        const std::string bucket = std::string(name) + "_bucket";
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            cumulative += counts[i];
+            std::ostringstream le;
+            if (i < bounds_seconds.size()) { le << bounds_seconds[i]; } else { le << "+Inf"; }
+            metric(bucket, labels + (labels.empty() ? "" : ",") + "le=\"" + le.str() + '"', cumulative);
+        }
+        std::ostringstream sum;
+        sum << sum_seconds;
+        out += "surogate_" + std::string(name) + "_sum{" + labels + "} " + sum.str() + "\n";
+        metric(std::string(name) + "_count", labels, count);
+    };
+    std::array<double, sinfer::LatencyHistogram::kBoundsMs.size()> copy_bounds{};
+    for (std::size_t i = 0; i < copy_bounds.size(); ++i) { copy_bounds[i] = sinfer::LatencyHistogram::kBoundsMs[i] / 1000.0; }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto& h = rows[i].stats.host_kv;
+        histogram("host_prefix_cache_offload_seconds", "Device-to-host copy time of one conversation snapshot.",
+                  rows[i].labels, copy_bounds, h.offload_ms.counts, h.offload_ms.sum_ms / 1000.0, h.offload_ms.count,
+                  i == 0);
+        histogram("host_prefix_cache_restore_seconds", "Host-to-device copy time of one restored conversation.",
+                  rows[i].labels, copy_bounds, h.restore_ms.counts, h.restore_ms.sum_ms / 1000.0, h.restore_ms.count,
+                  i == 0);
+    }
+    {
+        std::lock_guard lock(latency_mutex_);
+        histogram("request_ttft_seconds", "Time to first token of finished requests, preparation included.", "",
+                  RequestLatency::kBounds, ttft_histogram_.counts, ttft_histogram_.sum, ttft_histogram_.count, true);
+        histogram("request_queue_seconds", "Time finished requests waited for a lane after they were submitted.", "",
+                  RequestLatency::kBounds, queue_histogram_.counts, queue_histogram_.sum, queue_histogram_.count, true);
+    }
 
     help("requests", "gauge", "Requests in each scheduler state.");
     for (const Row& r : rows) {

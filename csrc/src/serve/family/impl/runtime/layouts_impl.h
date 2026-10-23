@@ -1,3 +1,4 @@
+#include <filesystem>
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/layouts.h"
 #include "family/impl/runtime/kv_precision.h"
@@ -1172,6 +1173,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_skip_layers      = inputs.kv_skip_layers;
     impl->elastic_kv          = inputs.elastic_kv;
     impl->elastic_kv_overcommit = inputs.elastic_kv_overcommit;
+    impl->prefix_cache_host_bytes = inputs.prefix_cache_host_bytes;
+    impl->weights_identity        = inputs.weights_identity;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -1334,6 +1337,17 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .pipeline_stage_last       = options.pipeline_stage_last,
         .pipeline_import_pinned    = options.pipeline_import_pinned,
         .pipeline_boundary_columns = options.pipeline_boundary_columns,
+        .prefix_cache_host_bytes   = options.prefix_cache_host_bytes,
+        .weights_identity          = [&] {
+            std::uint64_t h = 0xcbf29ce484222325ULL;
+            const auto mix = [&](std::uint64_t v) { h = (h ^ v) * 0x100000001b3ULL; };
+            for (const char c : options.artifact_path.string()) { mix(static_cast<unsigned char>(c)); }
+            std::error_code error;
+            mix(static_cast<std::uint64_t>(std::filesystem::file_size(options.artifact_path, error)));
+            const auto written = std::filesystem::last_write_time(options.artifact_path, error);
+            if (!error) { mix(static_cast<std::uint64_t>(written.time_since_epoch().count())); }
+            return h;
+        }(),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

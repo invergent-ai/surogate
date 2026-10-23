@@ -4,6 +4,7 @@
 
 #include <api/family/prepared_prompt.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,15 @@ public:
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count,
                                std::int32_t requester_lora_slot) const;
+    /// Whether every input this identity licenses is also the first `size()` of `longer`'s:
+    /// the same adapter, token types, positions and the media items it covers.
+    [[nodiscard]] bool is_prefix_of(const ResidentPrefixIdentity& longer) const;
+    [[nodiscard]] std::int32_t lora_slot() const noexcept { return lora_slot_; }
+    /// Text tokens only, at their plain positions' token types: no media items.
+    [[nodiscard]] bool text_only() const noexcept {
+        return vision_items_.empty() &&
+               std::all_of(token_types_.begin(), token_types_.end(), [](std::uint8_t type) { return type == 0; });
+    }
 
 private:
     // The adapter the resident values were computed under (-1 for the base

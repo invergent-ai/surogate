@@ -70,6 +70,11 @@ void upload_prefix_state(std::span<const std::span<std::byte>> image,
 
 void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
     if (sequence.target_only || !sequence.retained || !sequence.cacheable || !sequence.kv || sequence.ledger.empty()) { return; }
+    if (host_tier) {
+        // The host tier may hold it already (a background copy of the finished turn).
+        if (!lane_has_current_snapshot(sequence.lane)) { (void)snapshot_lane(sequence.lane, 2); }
+        return;
+    }
     try {
         std::vector<std::uint32_t> boundaries;
         const auto append = reusable_append_frontier(sequence);
@@ -107,7 +112,10 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
             payload += family::detail::archive_aligned(backend_pool->image_plane_bytes(plane, backend_ids.size()));
         }
         auto step_started = std::chrono::steady_clock::now();
-        if (!archived_prefixes.reserve(bytes)) { return; }
+        if (!archived_prefixes.reserve(bytes)) {
+            ++host_refused;
+            return;
+        }
         admit_trace_step("archive: make room", sequence.lane, step_started);
 
         // Evicting above may have returned the range this image fits in.
@@ -173,7 +181,8 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         if (!image->storage.pinned) { CUDA_CHECK(cudaStreamSynchronize(device.stream)); }
         admit_trace_step("archive: copy image", sequence.lane, step_started);
         step_started = std::chrono::steady_clock::now();
-        (void)archived_prefixes.insert(image->state.ledger, boundaries, image, bytes);
+        if (archived_prefixes.insert(image->state.ledger, boundaries, image, bytes)) { ++host_archived; }
+        else { ++host_refused; }
         admit_trace_step("archive: index image", sequence.lane, step_started);
     } catch (const std::bad_alloc&) {
         // Retention is opportunistic. An unavailable host allocation must not
@@ -182,6 +191,10 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
 }
 
 void ProgramImplCore::restore_archived_sequence(SequenceState& sequence, const RequestPlanImpl& plan) {
+    if (plan.archived->tier) {
+        restore_host_snapshot(sequence, plan);
+        return;
+    }
     const auto& image = *plan.archived;
     clear_lane(sequence, requests[sequence.lane]);
     sequence.copy_metadata(image.state);

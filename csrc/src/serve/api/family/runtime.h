@@ -210,7 +210,14 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    /// The KV pool needs this retained lane's pages: keep its conversation in the host prefix
+    /// tier when there is one (--prefix-cache-host-gb), else evict it as above.
+    void spill_retained_lane(std::uint32_t lane) noexcept;
+    /// Round boundary, host tier only: completes finished host copies and copies one finished
+    /// conversation to the host while the copy stream is free.
+    void background_offload() noexcept;
     void evict_archived_prefixes() noexcept;
+    [[nodiscard]] HostKvStats host_kv_stats() const noexcept;
     TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const;
     void cache_logprobs(std::uint32_t lane, const GenerationResult& result);
     void collect_logprobs(std::uint32_t lane, GenerationResult& result) const;

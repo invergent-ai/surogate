@@ -173,6 +173,12 @@ public:
     /// The caller must first drain every request that can select this slot.
     void clear_slot(std::int32_t slot);
 
+    /// A digest of the adapter's content in `slot` (zero when none is known), set by whoever
+    /// loads it. The KV tier keys a conversation's host snapshots by it: a slot number names a
+    /// different adapter after a swap, its content does not.
+    void set_slot_identity(std::int32_t slot, const std::array<std::uint8_t, 16>& digest);
+    [[nodiscard]] std::array<std::uint8_t, 16> slot_identity(std::int32_t slot) const;
+
     /// The bank for a projection, or nullptr when it has none. Hot path.
     [[nodiscard]] const LoraBank* find(const void* base_key, std::int32_t port) const noexcept {
         const auto found = banks_.find(Key{base_key, port});
@@ -290,6 +296,8 @@ private:
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
     std::atomic<bool> active_{false};
+    mutable std::mutex identity_mutex_;
+    std::map<std::int32_t, std::array<std::uint8_t, 16>> identities_;
     void ensure_raw_round_state();
 };
 

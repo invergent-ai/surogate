@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +25,13 @@ public:
     using Pointer = std::shared_ptr<const Value>;
     explicit RadixPrefixCache(std::size_t capacity, std::size_t max_entries = 64)
         : capacity_(capacity), max_entries_(max_entries) {}
+
+    /// New bounds for an empty cache (a program sizing its host tier at startup).
+    void configure(std::size_t capacity, std::size_t max_entries) {
+        if (!values_.empty()) { throw std::logic_error("radix prefix cache bounds change while it holds values"); }
+        capacity_    = capacity;
+        max_entries_ = max_entries;
+    }
 
     bool reserve(std::size_t bytes) {
         if (!bytes || bytes > capacity_) { return false; }
@@ -47,8 +55,29 @@ public:
         used_ -= oldest->second.bytes;
         values_.erase(oldest);
         ++revision_;
+        ++evictions_;
         prune(root_);
         return true;
+    }
+
+    /// Drops every value `drop` selects, held by a plan or not (a plan keeps its own reference).
+    /// Returns how many went.
+    template<class Drop> std::size_t erase_if(Drop&& drop) {
+        std::size_t erased = 0;
+        for (auto it = values_.begin(); it != values_.end();) {
+            if (drop(*it->second.value)) {
+                used_ -= it->second.bytes;
+                it = values_.erase(it);
+                ++erased;
+            } else {
+                ++it;
+            }
+        }
+        if (erased != 0) {
+            ++revision_;
+            prune(root_);
+        }
+        return erased;
     }
 
     bool insert(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> boundaries,
@@ -113,6 +142,10 @@ public:
     [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
     [[nodiscard]] std::size_t bytes() const noexcept { return used_; }
     [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
+    [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+    /// Values dropped to make room (least recently used first), over the cache's life.
+    [[nodiscard]] std::uint64_t evictions() const noexcept { return evictions_; }
 
 private:
     struct Node {
@@ -175,7 +208,7 @@ private:
     Node root_;
     std::unordered_map<std::uint64_t, Entry> values_;
     std::size_t capacity_, max_entries_, used_ = 0;
-    std::uint64_t clock_ = 0, revision_ = 0;
+    std::uint64_t clock_ = 0, revision_ = 0, evictions_ = 0;
 };
 
 } // namespace sinfer::family::detail

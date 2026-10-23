@@ -231,7 +231,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
            "[--enforce-eager] [--no-prefix-reuse] [--batch-invariant] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
-           "[--gpu-memory-limit-mib N] "
+           "[--gpu-memory-limit-mib N] [--prefix-cache-host-gb N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--capture-routing] "
@@ -277,6 +277,10 @@ std::string serve_usage_text(const char* argv0) {
            "         tokens independent of what else is batched with it (BF16 text models), at a\n"
            "         throughput cost. Implies --enforce-eager and --no-prefix-reuse; refuses --spec.\n"
            "       --no-elastic-kv reserves the full cache; --elastic-kv grows it with demand.\n"
+           "       --prefix-cache-host-gb N keeps up to N GiB per GPU of conversations the KV cache\n"
+           "                    has to give back in page-locked host RAM (allocated at startup), and\n"
+           "                    resumes them with a host-to-device copy instead of a prefill; 0 keeps\n"
+           "                    none. Unset: a 512 MiB archive of conversations another request displaced.\n"
            "       --gpu-memory-limit-mib N caps everything this server holds on each of its GPUs\n"
            "                    (weights, cache, workspaces, CUDA context); auto sizing fits in it\n"
            "       --elastic-kv-overcommit guarantees each model only its\n"
@@ -604,6 +608,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                                   "gpu-memory-limit-mib");
             if (mib == 0) { throw std::invalid_argument("--gpu-memory-limit-mib must be positive"); }
             options.gpu_memory_limit_bytes = static_cast<std::size_t>(mib) << 20;
+        } else if (arg == "--prefix-cache-host-gb") {
+            const char* text = require_value("--prefix-cache-host-gb");
+            char* end = nullptr;
+            const double gib = std::strtod(text, &end);
+            // A budget past 16 TiB is a typo, not a machine.
+            if (end == text || *end != '\0' || !(gib >= 0.0) || !(gib <= 16384.0)) {
+                throw std::invalid_argument(std::string("--prefix-cache-host-gb must be a number of GiB in [0, 16384], got ") + text);
+            }
+            options.prefix_cache_host_bytes = static_cast<std::size_t>(gib * static_cast<double>(1ULL << 30));
         } else if (arg == "--enforce-eager") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

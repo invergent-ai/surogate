@@ -14,6 +14,8 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/resources.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tokenizer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/prefix_identity.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/kv_tier/host_pool.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/kv_tier/keys.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/target_support.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/decoder_state.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/round_state.cpp

@@ -330,6 +330,12 @@ struct EngineOptions {
     // which never maps past its cap, then keeps the process inside it. Shared by every engine
     // in the process on a device (--gpu-memory-limit-mib).
     std::size_t gpu_memory_limit_bytes = 0;
+    // --prefix-cache-host-gb: the host prefix tier's budget per GPU (per data-parallel replica,
+    // per pipeline stage). Set, a retained conversation the KV pool takes back under pressure is
+    // kept in that much page-locked host memory (allocated at startup) instead of being dropped,
+    // and comes back with a host-to-device copy; 0 keeps nothing on the host. Unset keeps the
+    // 512 MiB archive of conversations whose lane another request took.
+    std::optional<std::size_t> prefix_cache_host_bytes;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -833,6 +839,7 @@ struct PreparationControl {
 struct GenerationTimings {
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
+    double queue_seconds       = 0.0; ///< submitted to admitted on a lane (the first admission)
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
@@ -924,6 +931,65 @@ struct MemorySummary {
     // memory reserved for them (mapped only while a lane holds one).
     std::uint32_t conversation_checkpoints        = 0;
     std::size_t conversation_checkpoint_bytes     = 0;
+    // Host prefix tier (--prefix-cache-host-gb): page-locked host memory this program holds for
+    // conversation snapshots, allocated at startup (0 without the flag: the legacy 512 MiB
+    // archive is allocated on first use).
+    std::size_t host_prefix_cache_bytes           = 0;
+};
+
+/// Copy latencies of the host prefix tier, as a fixed-bucket histogram (milliseconds).
+struct LatencyHistogram {
+    static constexpr std::array<double, 12> kBoundsMs{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000};
+    std::array<std::uint64_t, kBoundsMs.size() + 1> counts{}; ///< the last bucket is +Inf
+    double sum_ms       = 0.0;
+    std::uint64_t count = 0;
+    void add(double ms) noexcept {
+        std::size_t bucket = 0;
+        while (bucket < kBoundsMs.size() && ms > kBoundsMs[bucket]) { ++bucket; }
+        ++counts[bucket];
+        sum_ms += ms;
+        ++count;
+    }
+    void merge(const LatencyHistogram& other) noexcept {
+        for (std::size_t i = 0; i < counts.size(); ++i) { counts[i] += other.counts[i]; }
+        sum_ms += other.sum_ms;
+        count += other.count;
+    }
+};
+
+/// The prefix cache of one program (one GPU), host tier included. Counters are over the
+/// program's life; the pool figures are the process's (one pool serves every replica).
+struct HostKvStats {
+    std::size_t capacity_bytes = 0;  ///< process pool (or the 512 MiB legacy archive of this program)
+    std::size_t used_bytes     = 0;  ///< process pool bytes in use
+    std::size_t budget_bytes   = 0;  ///< what this program added to the pool
+    std::uint32_t entries      = 0;  ///< snapshots this program indexes now
+    /// Retained lanes the KV pool took back under pressure: already on the host (free), copied
+    /// at that moment, or dropped with no copy (no tier, no room).
+    std::uint64_t spills_free   = 0;
+    std::uint64_t spills        = 0;
+    std::uint64_t dropped_lanes = 0;
+    /// Snapshots written (any reason) and those of finished conversations copied in the
+    /// background; snapshots that did not fit; bytes copied each way.
+    std::uint64_t archived      = 0;
+    std::uint64_t offloads      = 0;
+    std::uint64_t refused       = 0;
+    std::uint64_t offload_bytes = 0;
+    std::uint64_t restore_bytes = 0;
+    /// Requests that resumed from a host snapshot, and the prompt tokens they did not prefill.
+    std::uint64_t restores        = 0;
+    std::uint64_t restored_tokens = 0;
+    /// Pool entries dropped for room (process-wide), snapshots a longer one of the same
+    /// conversation replaced, and objects a snapshot found already stored (process-wide).
+    std::uint64_t evictions      = 0;
+    std::uint64_t superseded     = 0;
+    std::uint64_t shared_objects = 0;
+    /// Admitted requests and the prompt tokens they reused, by where the reused state was: a
+    /// retained GPU lane, a shared GPU prefix, the host tier; and requests that reused nothing.
+    std::uint64_t gpu_hit_requests = 0, shared_hit_requests = 0, host_hit_requests = 0, miss_requests = 0;
+    std::uint64_t gpu_hit_tokens = 0, shared_hit_tokens = 0, host_hit_tokens = 0;
+    LatencyHistogram offload_ms; ///< device-to-host, per snapshot
+    LatencyHistogram restore_ms; ///< host-to-device, per restore
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
@@ -980,6 +1046,7 @@ struct RuntimeStats {
     // engine admits on demand (1) or reserves prompt + max_tokens (0).
     std::uint32_t kv_capacity_pages            = 0;
     std::uint32_t kv_on_demand                 = 0;
+    HostKvStats host_kv;
 };
 
 struct LoadSummary {

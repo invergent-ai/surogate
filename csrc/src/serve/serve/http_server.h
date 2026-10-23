@@ -10,6 +10,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
@@ -22,6 +23,21 @@
 #include <vector>
 
 namespace sinfer::serve {
+
+/// Request latencies on /metrics (time to first token, queue wait), in seconds.
+struct RequestLatency {
+    static constexpr std::array<double, 13> kBounds{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300};
+    std::array<std::uint64_t, kBounds.size() + 1> counts{}; ///< the last bucket is +Inf
+    double sum          = 0.0;
+    std::uint64_t count = 0;
+    void add(double seconds) noexcept {
+        std::size_t bucket = 0;
+        while (bucket < kBounds.size() && seconds > kBounds[bucket]) { ++bucket; }
+        ++counts[bucket];
+        sum += seconds;
+        ++count;
+    }
+};
 
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
@@ -192,6 +208,9 @@ private:
     /// Whether `service` is one of the primary's replicas (the primary included).
     [[nodiscard]] bool is_primary_replica(const GenerationService* service) const;
     JsonlRequestLog request_jsonl_;
+    mutable std::mutex latency_mutex_;
+    RequestLatency ttft_histogram_;
+    RequestLatency queue_histogram_;
     /// The process-wide reasoning store (--thinking-retention), shared by every replica and model; null when off.
     std::unique_ptr<ThinkingRetentionStore> thinking_retention_;
     httplib::Server server_;

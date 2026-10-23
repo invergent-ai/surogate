@@ -577,6 +577,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         shared_prefix_slots = raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 4U;
         shared_prefix_page_budget = decoder->text_kv.pool().capacity_pages() / 8;
     }
+    configure_host_tier(plan.prefix_cache_host_bytes, plan.weights_identity);
 }
 
 bool ProgramImplCore::base_round_for(std::span<const std::uint32_t> lanes,
@@ -799,11 +800,29 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         archive_sequence(sequence);
         admit_trace_step("archive previous", lane, archive_started);
     }
+    // This request is about to rewrite the lane's pages and state; a host-tier copy of what they
+    // held (just taken, or a background one) runs first.
+    fence_lane_copies(lane);
     const auto restore_started = std::chrono::steady_clock::now();
     if (request_plan.device_prefix) { restore_gpu_prefix(sequence, request_plan); }
     else if (request_plan.shared_prefix) { restore_shared_prefix(sequence, request_plan); }
     else if (request_plan.archived) { restore_archived_sequence(sequence, request_plan); }
     admit_trace_step("restore prefix", lane, restore_started);
+    if (request_plan.reuse == ReusePath::FullReset) { ++reuse_requests_none; }
+    else if (request_plan.archived) { ++reuse_requests_host; reuse_tokens_host += request_plan.reuse_base; }
+    else if (request_plan.shared_prefix) { ++reuse_requests_shared; reuse_tokens_shared += request_plan.reuse_base; }
+    else { ++reuse_requests_gpu; reuse_tokens_gpu += request_plan.reuse_base; }
+    if (host_tier_state) {
+        auto& tier = *host_tier_state;
+        if (request_plan.archived) { tier.lane_parent[lane] = request_plan.archived; }
+        else if (request_plan.reuse != ReusePath::FullReset && !request_plan.shared_prefix && !request_plan.device_prefix) {
+            tier.lane_parent[lane] = tier.lane_snapshot[lane];
+        } else {
+            tier.lane_parent[lane].reset();
+        }
+        tier.lane_snapshot[lane].reset();
+        tier.lane_started[lane] = ++tier.clock;
+    }
     sequence.target_only = request_plan.target_only;
     request.target_only = request_plan.target_only;
     request.gpu_prefix = request_plan.gpu_prefix;
@@ -1464,6 +1483,18 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 void ProgramImplCore::evict_archived_prefixes() noexcept {
+    if (host_tier_state) {
+        // Invalidation (an adapter update, an idle shrink): a plan made before it must not restore
+        // these either, so the pool drops them now rather than when the last plan lets go.
+        for (auto& snapshot : host_tier_state->lane_snapshot) { snapshot.reset(); }
+        ++host_tier_state->epoch;
+        try {
+            (void)archived_prefixes.erase_if([](const ArchivedSequence& value) {
+                if (value.tier && value.tier->pool) { value.tier->pool->drop_entry(value.tier->entry); }
+                return true;
+            });
+        } catch (...) {}
+    }
     archived_prefixes.clear();
     prune_gpu_prefixes();
     drop_shared_prefixes();
@@ -1471,10 +1502,13 @@ void ProgramImplCore::evict_archived_prefixes() noexcept {
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     const auto started = std::chrono::steady_clock::now();
-    archived_prefixes.clear();
+    // Host snapshots hold no device memory, so a lane going does not touch them: only an
+    // explicit invalidation (evict_archived_prefixes: adapter updates, idle shrink) drops them.
+    // This used to clear the whole archive on every eviction, so a conversation archived when
+    // another request took its lane was lost at the next sign of KV pressure.
     // Retained lanes go only when the pool is short; so do the shared prefixes' pages.
     drop_shared_prefixes();
-    admit_trace_step("evict: drop archived and shared prefixes", lane, started);
+    admit_trace_step("evict: drop shared prefixes", lane, started);
     if (!has_retained_lane(lane)) { return; }
     const auto cleared = std::chrono::steady_clock::now();
     clear_lane(sequences[lane], requests[lane]);
@@ -1727,6 +1761,12 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    // A host-tier copy may still read this lane's pages and state: whatever reuses them comes
+    // after it.
+    fence_lane_copies(sequence.lane);
+    if (host_tier_state && sequence.lane < host_tier_state->lane_snapshot.size()) {
+        host_tier_state->lane_snapshot[sequence.lane].reset();
+    }
     // A deferred fold belongs to the request: the lane's next one starts from its own state.
     if (sequence.lane < deferred_fold_columns.size() && deferred_fold_columns[sequence.lane] != 0) {
         deferred_fold_columns[sequence.lane] = 0;
@@ -5350,6 +5390,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
 
     out.conversation_checkpoints      = decoder->checkpoint_capacity();
     out.conversation_checkpoint_bytes = decoder->checkpoint_reservation_bytes();
+    out.host_prefix_cache_bytes       = host_tier_state && host_tier_state->pool ? host_tier_state->budget : 0;
     return out;
 }
 

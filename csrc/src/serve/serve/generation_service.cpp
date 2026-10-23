@@ -7,6 +7,7 @@
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
 #include "api/ops/lora_store.h"
+#include "family/impl/frontend/digest.h"
 #include "serve/lora_registry.h"
 #include "serve/output_parsers.h"
 #include "serve/tool_call_parser.h"
@@ -107,6 +108,40 @@ ApiError request_error_to_api_error(const sinfer::RequestError& exception) {
 }
 
 namespace {
+
+/// The content identity of an adapter for KV tier keys (api/kv_tier.h): SHA-256 over every
+/// module's geometry and tensors, so the same weights in any slot get the same keys and a slot
+/// reloaded with other weights does not.
+std::array<std::uint8_t, 16> adapter_kv_identity(const std::vector<sinfer::EngineOptions::LoraModulePayload>& payloads) {
+    std::vector<std::uint8_t> summary;
+    const auto add = [&](const void* data, std::size_t bytes) {
+        const auto* p = static_cast<const std::uint8_t*>(data);
+        summary.insert(summary.end(), p, p + bytes);
+    };
+    const auto add_digest = [&](const void* data, std::size_t bytes) {
+        const auto digest = sinfer::family::frontend_internal::sha256(
+            std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(data), bytes));
+        summary.insert(summary.end(), digest.begin(), digest.end());
+    };
+    for (const auto& payload : payloads) {
+        add(&payload.layer, sizeof(payload.layer));
+        add(payload.module.data(), payload.module.size());
+        add(&payload.rank, sizeof(payload.rank));
+        add(&payload.in_dim, sizeof(payload.in_dim));
+        add(&payload.out_dim, sizeof(payload.out_dim));
+        add(&payload.scale, sizeof(payload.scale));
+        add_digest(payload.a.data(), payload.a.size() * sizeof(std::uint16_t));
+        add_digest(payload.b.data(), payload.b.size() * sizeof(std::uint16_t));
+        add_digest(payload.base_weight.data(), payload.base_weight.size() * sizeof(std::uint16_t));
+        add_digest(payload.magnitude.data(), payload.magnitude.size() * sizeof(float));
+        add_digest(payload.bias.data(), payload.bias.size() * sizeof(float));
+        add_digest(payload.lora_bias.data(), payload.lora_bias.size() * sizeof(float));
+    }
+    const auto digest = sinfer::family::frontend_internal::sha256(std::span<const std::uint8_t>(summary));
+    std::array<std::uint8_t, 16> out{};
+    std::copy_n(digest.begin(), out.size(), out.begin());
+    return out;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -433,6 +468,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.elastic_kv               = options_.elastic_kv;
     engine_options.elastic_kv_overcommit    = options_.elastic_kv_overcommit;
     engine_options.gpu_memory_limit_bytes   = options_.gpu_memory_limit_bytes;
+    engine_options.prefix_cache_host_bytes  = options_.prefix_cache_host_bytes;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
@@ -445,6 +481,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     // The adapter's tensors, decoded on the host. The target binds them to its own
     // weights; a module the target cannot place is refused there rather than
     // dropped, because a partly applied adapter is worse than none.
+    std::vector<std::pair<std::int32_t, std::array<std::uint8_t, 16>>> startup_adapter_identities;
     if (options_.enable_lora) {
         // The engine prepares the adapter machinery even with no adapters named:
         // banks preallocated and the delta kernels captured, so adapters loaded
@@ -473,6 +510,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                         "' is unsupported for serving adapters. Merge the adapter into its base checkpoint "
                         "with `surogate merge`, then convert and serve the merged checkpoint.");
                 }
+                startup_adapter_identities.emplace_back(update.slot(), adapter_kv_identity(payloads));
                 for (auto& payload : payloads) {
                     payload.slot = update.slot();
                     engine_options.lora_payloads.push_back(std::move(payload));
@@ -488,6 +526,12 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         startup_adapter_modules.emplace_back(payload.layer, payload.module);
     }
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
+    for (const auto& [slot, identity] : startup_adapter_identities) {
+        auto& stores = engine_->lora_stores();
+        for (int device : stores.devices()) {
+            if (ops::LoraStore* store = stores.peek(device)) { store->set_slot_identity(slot, identity); }
+        }
+    }
     // Only a target that binds adapters to its own weights can apply them, and most
     // do not yet. Without this check a request naming an adapter would be answered
     // by the base model on those targets -- served confidently, and wrong. The
@@ -1082,6 +1126,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
+    outcome.metrics.queue_seconds   = result.timings.queue_seconds;
     outcome.metrics.vision_seconds  = result.timings.vision_seconds;
     outcome.metrics.prefill_seconds = result.timings.prefill_seconds;
     outcome.metrics.decode_seconds  = result.timings.decode_seconds;
@@ -2003,6 +2048,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     }
     std::vector<std::string> skipped;
     auto payloads = LoraRegistry::read_payloads(found->second, skipped);
+    const auto kv_identity = adapter_kv_identity(payloads);
     if (!skipped.empty()) {
         throw std::invalid_argument("module '" + skipped.front() +
                                     "' is unsupported for serving adapters. Merge the adapter into its base checkpoint "
@@ -2053,7 +2099,10 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             }
         }
         for (int device : devices) {
-            if (ops::LoraStore* store = stores.peek(device)) { store->set_active(true); }
+            if (ops::LoraStore* store = stores.peek(device)) {
+                store->set_slot_identity(slot, kv_identity);
+                store->set_active(true);
+            }
         }
         // A recycled slot can have retained prefixes even when its old adapter
         // name differs. Invalidate before reopening admission for the new bytes.

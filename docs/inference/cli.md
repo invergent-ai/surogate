@@ -54,6 +54,7 @@ from earlier tokens; its capacity affects how many requests can run together.
 | `--no-elastic-kv` | off | Reserve the full cache in GPU memory instead of growing memory use with demand |
 | `--elastic-kv-overcommit` | off | Let several models share unused GPU memory for their caches |
 | `--gpu-memory-limit-mib N` | whole card | Cap everything the server holds on each GPU; automatic sizing fits in it (see [Sharing a GPU](#sharing-a-gpu)) |
+| `--prefix-cache-host-gb N` | off | Keep up to N GiB per GPU of conversations the cache gives back in host RAM, and resume them from there (see [Host prefix cache](#host-prefix-cache)) |
 | `--no-cache` | off | Rebuild the prepared model cache on disk |
 | `--no-prefix-reuse` | off | Disable reuse of compatible earlier prompts |
 | `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
@@ -91,11 +92,43 @@ million-token prompt takes about 16 minutes on a DGX Spark; later turns reuse th
 
 Compatible conversation context is cached automatically, including after a response
 ends on EOS or a stop string. Completed conversations can also be reused after an
-unrelated request. Each model has a 512 MiB host cache budget per GPU; conversations
-that exceed that budget are not retained there. Older entries
-can be released as new requests arrive. Changing earlier messages, requesting additional prompt
-logprobs, or a cache miss can require some or all of the prompt to be processed again.
-Use `--no-prefix-reuse` to disable reuse.
+unrelated request. Without `--prefix-cache-host-gb`, each model has a 512 MiB host cache
+budget per GPU for conversations whose lane another request took; conversations that exceed
+that budget are not retained there, and one the KV cache needs back under pressure is dropped.
+Older entries can be released as new requests arrive. Changing earlier messages, requesting
+additional prompt logprobs, or a cache miss can require some or all of the prompt to be
+processed again. Use `--no-prefix-reuse` to disable reuse.
+
+#### Host prefix cache
+
+An agent's conversation waits on the GPU between its turns. When the KV cache needs the room
+for other requests, a waiting conversation is dropped, and its next turn prefills the whole
+context again: tens of seconds for a 100k-token agent prompt. `--prefix-cache-host-gb N` keeps
+those conversations in N GiB of page-locked host RAM per GPU instead, and resumes them with a
+host-to-device copy:
+
+```bash
+surogate serve surogate/Surogate3.7-35B-A3B-NVFP4 --devices 0,1,2,3 --data-parallel \
+  --max-model-len 262144 --kv-cache-dtype fp8 --prefix-cache-host-gb 16
+```
+
+- A finished turn is copied to host memory in the background, on a copy stream of its own, so
+  evicting it later costs nothing; one not copied yet is copied when it is evicted.
+- Conversations are stored as 1,024-token chunks of KV and the state at their turn boundaries
+  (the recurrent state of a hybrid model, the draft head's columns under MTP). Conversations that
+  open the same way share their chunks, and a longer turn of a conversation reuses the chunks of
+  its earlier ones.
+- The memory is one pool for the whole process: data-parallel replicas and pipeline stages
+  each add N GiB to it, and the least recently used conversations go first when it is full.
+- The memory is page-locked at startup (a few seconds per 16 GiB) and is not available to other
+  programs. Keep the total (N times the GPUs) well inside the host's free memory.
+- A restored conversation continues exactly as one still on the GPU would: the same tokens and
+  log-probabilities.
+- `/metrics` reports the pool (`surogate_host_prefix_cache_*`), the prompt tokens reused by where
+  they were (`surogate_prefix_cache_hit_tokens_total{tier="gpu|shared_prefix|host"}`), copy
+  times, and request TTFT and queue-wait histograms; `/kv_stats` has the same per replica.
+
+`0` keeps nothing on the host, not even the 512 MiB archive.
 
 Cache precision `auto` selects BF16 for models such as Qwen3 and Llama, and FP8 for hybrid
 models such as Qwen3.5/3.6/3.8, including with DFlash. FP8 uses half the cache storage of BF16.

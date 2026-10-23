@@ -231,6 +231,21 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::spill_retained_lane(std::uint32_t lane) noexcept {
+    impl_->spill_retained_lane(lane);
+}
+
+template <>
+void Program<Variant>::background_offload() noexcept {
+    impl_->background_offload();
+}
+
+template <>
+HostKvStats Program<Variant>::host_kv_stats() const noexcept {
+    return impl_->host_kv_stats();
+}
+
+template <>
 TokenScoreDelta Program<Variant>::logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
     return impl_->logprob_delta(lane, first, end, prompt);
 }

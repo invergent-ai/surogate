@@ -669,7 +669,22 @@ void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& 
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
+void LoraStore::set_slot_identity(std::int32_t slot, const std::array<std::uint8_t, 16>& digest) {
+    std::lock_guard lock(identity_mutex_);
+    identities_[slot] = digest;
+}
+
+std::array<std::uint8_t, 16> LoraStore::slot_identity(std::int32_t slot) const {
+    std::lock_guard lock(identity_mutex_);
+    const auto found = identities_.find(slot);
+    return found == identities_.end() ? std::array<std::uint8_t, 16>{} : found->second;
+}
+
 void LoraStore::clear_slot(std::int32_t slot) {
+    {
+        std::lock_guard lock(identity_mutex_);
+        identities_.erase(slot);
+    }
     if (slot < 0 || slot >= slots_) { return; }
     const ScopedDevice on_store(device_);
     for (auto& [key, replacement] : replacements_) {

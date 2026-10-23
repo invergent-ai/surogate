@@ -175,6 +175,8 @@ public:
             out.stages.clear();
             for (std::size_t s = 0; s < stages_.size(); ++s) {
                 select(s);
+                // A host tier keeps its archives through a lane eviction; here they disagree.
+                stages_[s]->program->evict_archived_prefixes();
                 stages_[s]->program->evict_retained_lane(lane);
                 out.stages.push_back(stages_[s]->program->plan_request_for_lane(lane, prompt, base.stages[s]));
             }
@@ -343,6 +345,29 @@ public:
             select(s);
             stages_[s]->program->evict_retained_lane(lane);
         }
+    }
+    /// Every stage keeps its own part of the conversation; a stage that could not keep it makes
+    /// the next plan disagree, which drops the archives everywhere (plan_request_for_lane).
+    void spill_retained_lane(std::uint32_t lane) noexcept {
+        for (std::size_t s = 0; s < stages_.size(); ++s) {
+            select(s);
+            stages_[s]->program->spill_retained_lane(lane);
+        }
+    }
+    void background_offload() noexcept {
+        for (std::size_t s = 0; s < stages_.size(); ++s) {
+            select(s);
+            stages_[s]->program->background_offload();
+        }
+    }
+    /// The first stage's tier (every stage holds its own layers of the same conversations),
+    /// with the bytes of all of them.
+    [[nodiscard]] HostKvStats host_kv_stats() const noexcept {
+        HostKvStats out = stages_.front()->program->host_kv_stats();
+        for (std::size_t s = 1; s < stages_.size(); ++s) {
+            out.budget_bytes += stages_[s]->program->host_kv_stats().budget_bytes;
+        }
+        return out;
     }
     TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
         return stages_.back()->program->logprob_delta(lane, first, end, prompt);

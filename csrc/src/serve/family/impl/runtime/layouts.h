@@ -94,6 +94,10 @@ struct SequencePlanningInputs {
     int pipeline_stage_last                = 0;
     const void* pipeline_import_pinned     = nullptr;
     std::uint32_t pipeline_boundary_columns = 0;
+    std::optional<std::size_t> prefix_cache_host_bytes; ///< EngineOptions::prefix_cache_host_bytes
+    /// Which weights these are (artifact path, size and modification time): part of the host KV
+    /// tier's key namespace, the same for every replica of one artifact.
+    std::uint64_t weights_identity = 0;
 };
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS
@@ -143,6 +147,8 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     std::size_t request_transient_capacity_bytes = 0;
     std::size_t graph_allowance_bytes            = 0;
     std::size_t device_reservation_bytes         = 0;
+    std::optional<std::size_t> prefix_cache_host_bytes; ///< EngineOptions::prefix_cache_host_bytes
+    std::uint64_t weights_identity = 0;                 ///< SequencePlanningInputs::weights_identity
 };
 
 template <>

@@ -35,6 +35,7 @@ using PreparationGate = std::function<void(const PreparationControl&)>;
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
     double ttft_seconds    = 0.0;
+    double queue_seconds   = 0.0; ///< submitted to admitted on a lane
     double vision_seconds  = 0.0;
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;

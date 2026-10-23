@@ -343,15 +343,24 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     auto resident = plan_request_for_sequence(lane, sequences[lane], prompt, base_plan);
     if (base_plan.impl_->target_only) return resident;
     if (base_plan.impl_->allow_prefix_reuse && prompt.identity.reusable) {
+        if (host_tier) { drain_host_losses(); }
         auto saved = archived_prefixes.match(prompt.token_ids, [&](const ArchivedSequence& value) {
             return plan_request_for_sequence(lane, value.state, prompt, base_plan, true)
                 .summary().reusable_prompt_tokens;
         }, speculative_backend == SpeculativeBackend::None &&
            decoder->linear_attention.layer_count() == 0 && decoder->ple.empty());
+        // A host-tier snapshot is usable only while the pool still holds every object of it (another
+        // replica may have needed the room) and they are complete; the plan keeps them until done.
+        std::shared_ptr<family::detail::HostKvPool::Lease> host_lease;
+        if (saved && saved->tier) {
+            host_lease = lease_host_snapshot(*saved);
+            if (!host_lease) { saved.reset(); }
+        }
         if (saved) {
             auto cached = plan_request_for_sequence(lane, saved->state, prompt, base_plan, true);
             if (cached.summary().reusable_prompt_tokens > resident.summary().reusable_prompt_tokens) {
                 cached.impl_->archived = std::move(saved);
+                cached.impl_->host_lease = std::move(host_lease);
                 resident = std::move(cached);
             }
         }

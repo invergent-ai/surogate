@@ -358,6 +358,14 @@ set_tests_properties(sinfer_lora_kv_auto_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_burst_prefix_test SOURCES test_burst_prefix.cpp LIBRARIES sinfer_serve)
 target_compile_options(sinfer_burst_prefix_test PRIVATE -UNDEBUG -fno-fast-math)
 sinfer_add_test(sinfer_completed_kv_test SOURCES test_completed_kv.cpp LIBRARIES sinfer_engine)
+# The host KV tier (--prefix-cache-host-gb): its pool, keys and C back-end table without a GPU, and
+# (opt-in, SUROGATE_HOST_KV_TEST_ARTIFACT) spill, background copy and restore on a real model,
+# bit-identical to a GPU-resident hit.
+sinfer_add_test(sinfer_host_kv_pool_test SOURCES test_host_kv_pool.cpp LIBRARIES sinfer_engine)
+target_compile_options(sinfer_host_kv_pool_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_host_kv_tier_test SOURCES test_host_kv_tier.cpp LIBRARIES sinfer_engine CUDA::cudart)
+target_compile_options(sinfer_host_kv_tier_test PRIVATE -UNDEBUG)
+set_tests_properties(sinfer_host_kv_tier_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_conversation_checkpoints_test SOURCES test_conversation_checkpoints.cpp
   LIBRARIES sinfer_engine CUDA::cudart)
 target_compile_options(sinfer_conversation_checkpoints_test PRIVATE -UNDEBUG)
