@@ -22,6 +22,7 @@ from ..hf import build_norm_mappings, expand_module_mapping, gate_first_experts
 from ..models.qwen3_5 import _parse_qwen3_5_layer_types
 from ..blocks.qwen3_5 import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
+from ..modules.ngram_memory import setup_ngram_memory
 
 
 #: Everything outside the layer stack. The vision tower's head and merger objects
@@ -217,6 +218,7 @@ class Qwen3_5MoECausalModel(nn.Model):
         full_attention_interval: int = 4,
         chunk_size: int = 64,
         ep_size: int = 1,
+        ngram_memory: dict | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -267,6 +269,10 @@ class Qwen3_5MoECausalModel(nn.Model):
         # Use mamba_blocks / attn_blocks naming for HybridBlockStack
         self.n_mamba_blocks = self.n_linear_blocks
         self.n_attention_blocks = self.n_attn_blocks
+
+        # Hashed n-gram memory on one layer's input (surogate/dsl/modules/ngram_memory.py): records the
+        # IR config attributes the runtime reads; off (no option) records nothing, so the IR is unchanged.
+        setup_ngram_memory(self, ngram_memory, n_layers)
 
         # Build block configs for HybridBlockStack
         block_configs = []
@@ -483,6 +489,7 @@ class Qwen3_5MoEConditionalModel(nn.Model):
         chunk_size: int = 64,
         ep_size: int = 1,
         use_visual_inputs: bool | dict | None = False,
+        ngram_memory: dict | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -535,6 +542,10 @@ class Qwen3_5MoEConditionalModel(nn.Model):
 
         self.n_mamba_blocks = self.n_linear_blocks
         self.n_attention_blocks = self.n_attn_blocks
+
+        # Hashed n-gram memory on one layer's input (surogate/dsl/modules/ngram_memory.py): records the
+        # IR config attributes the runtime reads; off (no option) records nothing, so the IR is unchanged.
+        setup_ngram_memory(self, ngram_memory, n_layers)
 
         block_configs = []
         if self.n_linear_blocks > 0:

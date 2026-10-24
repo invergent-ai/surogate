@@ -661,6 +661,18 @@ void copy_chunk_inputs_for_ctx(IModel& model,
         std::memcpy(ib + static_cast<long>(b) * T, inputs + src_off, T * sizeof(std::int32_t));
         std::memcpy(tb + static_cast<long>(b) * T, targets + src_off, T * sizeof(std::int32_t));
     }
+    // The two tokens before the chunk, per row (hashed n-gram memory; a no-op for other models).
+    {
+        std::vector<std::int32_t> carry(2 * static_cast<std::size_t>(B), -1);
+        for (int b = 0; b < B; ++b) {
+            const long row_off = (static_cast<long>(src_row) * B + b) * T_full;
+            for (int j = 0; j < 2; ++j) {
+                const long p = base_pos - 2 + j;
+                if (p >= 0) carry[static_cast<std::size_t>(b) * 2 + j] = inputs[row_off + p];
+            }
+        }
+        model.set_ngram_carry(carry.data(), B, T > 0 ? static_cast<int>(base_pos / T) : 0);
+    }
     for (int p = 0; p < pos_planes; ++p) {
         for (int b = 0; b < B; ++b) {
             std::int32_t* dst = pb + (static_cast<long>(p) * B + b) * T;
@@ -938,7 +950,26 @@ float MultiGPUPyTrainer::validate_chunked(const std::int32_t* inputs,
     double weighted = 0.0;
     long total_valid = 0;
 
-    for (int c = 0; c < seq_chunks; ++c) {
+    // Chunks after the last one holding a valid target add nothing (they score no token, and causality keeps
+    // them from changing earlier chunks): stop there. Every rank reads the same host targets, so all run the
+    // same chunks. Exact; it makes short rows in long windows cost one chunk instead of seq_chunks.
+    int last_chunk = 0;
+    {
+        int max_src = 0;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            max_src = std::max(max_src, host_batch_row_for_local_rank(i, ep_size));
+        }
+        const long total = (static_cast<long>(max_src) + 1) * B * T_full;
+        for (long k = total - 1; k >= 0; --k) {
+            if (targets[k] >= 0) {
+                last_chunk = std::max(last_chunk, static_cast<int>((k % T_full) / T));
+                if (last_chunk == seq_chunks - 1) break;
+            }
+        }
+    }
+    const int run_chunks = last_chunk + 1;
+
+    for (int c = 0; c < run_chunks; ++c) {
         const long base_pos = static_cast<long>(c) * T;
         for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
             auto& ctx = mContexts.at(i);
@@ -1342,6 +1373,18 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     return gs.chunk_pos_scratch;
                 };
                 const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
+                // The two tokens before chunk c of the step's row (the hashed n-gram memory's context across
+                // chunks; a no-op for other models). This schedule is eager -- chunked training never captures
+                // a graph -- so the model takes host values per chunk, as in step_chunked.
+                auto set_ngram_carry = [&](const Tensor& full_inputs, int c) {
+                    std::int32_t carry[2] = {-1, -1};
+                    const auto* row = reinterpret_cast<const std::int32_t*>(full_inputs.Data);
+                    for (int k = 0; k < 2; ++k) {
+                        const long p = static_cast<long>(c) * T - 2 + k;
+                        if (p >= 0) carry[k] = row[p];
+                    }
+                    ctx.Model->set_ngram_carry(carry, 1, c);
+                };
                 // Per-chunk document geometry from position ids: packed rows
                 // restart positions at each document, so a chunk's segments
                 // and its contiguous KV window fall out of one linear scan.
@@ -1401,6 +1444,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
                         pack.kv_sweep = true;  // loss ops skipped in the KV sweep
                         ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
+                        set_ngram_carry(gs.inputs[j], c);
                         // The loss op lives in the forward graph — stage the
                         // chunk's real targets so phase A's loss terms are
                         // sane (they are wiped by the micro-0 zeroing before
@@ -1423,6 +1467,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
                         pack.reuse_ep = true;  // phase A cached this chunk's plan+splits
                         ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
+                        set_ngram_carry(gs.inputs[j], c);
                         rs.Targets_CPU = tgt_v;
                         if (chunk_trace && ctx.Communicator->rank() == 0) {
                             fprintf(stderr, "[chunk] phaseB j=%d c=%d micro_eff=%d\n", j, c, micro_eff);
@@ -2125,6 +2170,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         mod_lora.init_a_kaiming = mLoRAConfig->InitAKaimingUniform;
         mod_lora.use_rs_lora = mLoRAConfig->UseRSLoRA;
         mod_lora.train_router = mLoRAConfig->TrainRouter;
+        mod_lora.expert_mask = mLoRAConfig->ExpertMask;
         mod_lora.targets.clear();
         if (mLoRAConfig->TargetModules.count("all") > 0) {
             mod_lora.all_targets = true;
@@ -3361,11 +3407,35 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     }
                     add_layer(prefix + ".mlp.gate", block.router);
                 }
+                // Hashed n-gram memory (its layer only): the dense tensors, by their export names.
+                if (block.ngram_proj.has_value() && block.ngram_gain.has_value() &&
+                    l == names_from.ngram_memory_layer()) {
+                    const auto ngram = names_from.ngram_memory_names();
+                    result.emplace_back(ngram[0], block.ngram_proj->A);
+                    result.emplace_back(ngram[1], block.ngram_proj->B);
+                    result.emplace_back(ngram[2], block.ngram_gain->A);
+                    result.emplace_back(ngram[3], block.ngram_gain->B);
+                    if (block.ngram_table.has_value() && block.ngram_table->A.Data) {
+                        result.emplace_back(names_from.ngram_table_name(), block.ngram_table->A);
+                    }
+                }
             }
             CUDA_CHECK(cudaDeviceSynchronize());
         },
         gpu_id);
     return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::get_ngram_memory_stats(int gpu_id, bool reset) {
+    std::vector<float> out;
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+                out = dsl_model->ngram_memory_stats(reset);
+            }
+        },
+        gpu_id);
+    return out;
 }
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(int gpu_id) {
@@ -3484,6 +3554,19 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                         add_layer(prefix + ".mlp.shared_experts.down_proj", block.moe.shared->down);
                     }
                     add_layer(prefix + ".mlp.gate", block.router);
+                }
+                // Hashed n-gram memory: the master tensors (fp32 with lora_dtype fp32; the op reads
+                // the projections' bf16 work copies and the gains' masters).
+                if (block.ngram_proj.has_value() && l == names_from.ngram_memory_layer()) {
+                    auto& master = dsl_model->lora_weights().get_master_block(l, /*stream=*/nullptr);
+                    const auto ngram = names_from.ngram_memory_names();
+                    result.emplace_back(ngram[0], master.ngram_proj->A);
+                    result.emplace_back(ngram[1], master.ngram_proj->B);
+                    result.emplace_back(ngram[2], master.ngram_gain->A);
+                    result.emplace_back(ngram[3], master.ngram_gain->B);
+                    if (master.ngram_table.has_value() && master.ngram_table->A.Data) {
+                        result.emplace_back(names_from.ngram_table_name(), master.ngram_table->A);
+                    }
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -3775,6 +3858,54 @@ std::vector<float> MultiGPUPyTrainer::next_token_logits(const std::int32_t* inpu
     return result;
 }
 
+std::vector<float> MultiGPUPyTrainer::compute_logprobs_chunked(const std::int32_t* input_ids,
+                                                               const std::int32_t* targets,
+                                                               int B_rows,
+                                                               bool use_lora) {
+    const int seq_chunks = std::max(1, mOptions.SequenceChunks);
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    if (B_rows != B) {
+        throw std::runtime_error(fmt::format("compute_logprobs (chunked): {} rows, the trainer runs batches of {}", B_rows, B));
+    }
+    std::vector<float> result(static_cast<std::size_t>(B) * static_cast<std::size_t>(T_full), 0.0f);
+    int last_chunk = 0;
+    for (long k = static_cast<long>(B) * T_full - 1; k >= 0; --k) {
+        if (targets[k] >= 0) {
+            last_chunk = std::max(last_chunk, static_cast<int>((k % T_full) / T));
+            if (last_chunk == seq_chunks - 1) break;
+        }
+    }
+    for (int c = 0; c <= last_chunk; ++c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            if (src_row != 0) throw std::runtime_error("compute_logprobs (chunked): one data-parallel row only");
+            copy_chunk_inputs_for_ctx(*ctx.Model, input_ids, targets, nullptr, src_row, B, T, T_full, base_pos);
+        }
+        run_work([&, c, seq_chunks, base_pos](sThreadContext& ctx) {
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) throw std::runtime_error("compute_logprobs: model is not a DslModel");
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(), static_cast<int>(T), base_pos);
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
+            auto lp = dsl_model->compute_logprobs(in.get<std::int32_t>(), tgt.get<std::int32_t>(), B, T, use_lora,
+                                                  *ctx.Communicator, pos.get<std::int32_t>(), nullptr);
+            if (ctx.Communicator->local_rank() == 0) {
+                for (int b = 0; b < B; ++b) {
+                    std::copy(lp.begin() + static_cast<long>(b) * T, lp.begin() + static_cast<long>(b + 1) * T,
+                              result.begin() + static_cast<long>(b) * T_full + base_pos);
+                }
+            }
+        });
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
+    return result;
+}
+
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
                                                        const std::int32_t* targets,
                                                        int B,
@@ -3782,6 +3913,12 @@ std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input
                                                        bool use_lora,
                                                        const std::int32_t* position_ids,
                                                        const float* temperatures) {
+    if (mOptions.SequenceChunks > 1 && T == this->T * mOptions.SequenceChunks) {
+        if (position_ids || temperatures) {
+            throw std::runtime_error("compute_logprobs over sequence chunks: positions are sequential, no temperatures");
+        }
+        return compute_logprobs_chunked(input_ids, targets, B, use_lora);
+    }
     std::vector<float> result;
     run_work([&result, input_ids, targets, B, T, use_lora, position_ids, temperatures](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());

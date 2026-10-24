@@ -119,6 +119,81 @@ inline void apply_lora_slices_forward(const std::vector<dsl::LoRASlice>& slices,
     }
 }
 
+/// @brief Accumulate LoRA forward contributions into FP32 MoE router logits.
+///
+/// The router matmul computes its logits in FP32 and returns before the
+/// generic LoRA epilogue (``apply_lora_slices_forward``), so the router LoRA
+/// of ``train_router`` is added here, onto the FP32 logits, before they are
+/// rounded to the output dtype. Without it the forward ignored the router
+/// adapter while the backward still trained it. ``input_2d`` is the router
+/// input in the adapter's work dtype (``[BT, C]``); ``output_2d`` the FP32
+/// logits (``[BT, E]``).
+inline void apply_lora_slices_forward_fp32(const std::vector<dsl::LoRASlice>& slices,
+                                           int layer_idx,
+                                           Tensor input_2d,
+                                           Tensor output_2d,
+                                           int BT,
+                                           ModularLoRAWeightsManager* weights,
+                                           const ModularLoRAConfig* config,
+                                           LoRARunState* run_state,
+                                           cublasLtHandle_t handle,
+                                           Tensor& workspace,
+                                           cudaStream_t stream) {
+    if (slices.empty() || weights == nullptr || config == nullptr || run_state == nullptr) return;
+    if (!config->enabled()) return;
+    if (output_2d.DType != ETensorDType::FP32) {
+        throw std::logic_error("apply_lora_slices_forward_fp32: router logits must be FP32 at layer " +
+                               std::to_string(layer_idx));
+    }
+
+    auto& block = weights->get_block(layer_idx, stream);
+
+    const int rank = config->rank;
+    const float scaling = config->scaling();
+    const bool is_training = run_state->is_training;
+    const float dropout = is_training ? config->dropout : 0.0f;
+    const int in_features = static_cast<int>(input_2d.Sizes[input_2d.Rank - 1]);
+    const int total_out = static_cast<int>(output_2d.Sizes[output_2d.Rank - 1]);
+
+    for (const auto& slice : slices) {
+        if (slice.grouped) continue;
+        const int size =
+            resolve_and_validate_slice_size(slice, total_out, layer_idx, "apply_lora_slices_forward_fp32");
+        auto* lora = get_layer_weight_by_target(block, slice.id);
+        if (!lora || !lora->has_value()) continue;
+        if (lora->A.Sizes[1] != in_features || lora->B.Sizes[0] != size)
+            throw std::invalid_argument("LoRA projection shape mismatch at layer " + std::to_string(layer_idx) + ": " +
+                                        slice_label(slice));
+        if (input_2d.DType != lora->A.DType) {
+            throw std::invalid_argument("router LoRA at layer " + std::to_string(layer_idx) +
+                                        ": the router input dtype differs from the adapter's work dtype");
+        }
+        if (run_state->slice.nelem() < static_cast<long>(BT) * std::max(size, in_features)) {
+            throw std::logic_error("router LoRA at layer " + std::to_string(layer_idx) +
+                                   ": the LoRA slice scratch is smaller than [BT, max(E, C)]");
+        }
+
+        const unsigned seed = compute_dropout_seed(*run_state, layer_idx, slice);
+        apply_lora_contribution_fp32(output_2d,
+                                     slice.offset,
+                                     input_2d,
+                                     *lora,
+                                     run_state->intermediate,
+                                     run_state->slice,
+                                     scaling,
+                                     dropout,
+                                     seed,
+                                     is_training,
+                                     BT,
+                                     in_features,
+                                     size,
+                                     rank,
+                                     handle,
+                                     workspace,
+                                     stream);
+    }
+}
+
 /// @brief Accumulate LoRA dA/dB gradients and (optionally) LoRA's
 /// contribution to dx. Mirrors ``apply_lora_slices_forward``'s layout.
 inline void apply_lora_slices_backward(const std::vector<dsl::LoRASlice>& slices,

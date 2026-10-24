@@ -10,8 +10,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 #include "kernels/kernels.h"
 #include "runtime/core/model_config.h"
 #include "utilities/allocator.h"
@@ -20,6 +23,52 @@
 #include "utilities/utils.h"
 
 namespace modules {
+
+namespace {
+
+/// A routed-expert adapter tensor: `...mlp.experts.<id>.<proj>.lora_{A,B}.weight`.
+bool is_routed_expert_lora_name(const std::string& name) {
+    constexpr std::string_view kExperts = ".mlp.experts.";
+    const auto at = name.find(kExperts);
+    if (at == std::string::npos) return false;
+    const auto id = at + kExperts.size();
+    return id < name.size() && std::isdigit(static_cast<unsigned char>(name[id])) &&
+           name.find(".lora_", id) != std::string::npos;
+}
+
+/// The routed experts an adapter file covers, from the adapter_config.json beside it.
+struct AdapterExpertMask {
+    bool has_config = false;  ///< an adapter_config.json was read
+    bool masked = false;      ///< it records a surogate_expert_mask
+    std::string source;
+
+    [[nodiscard]] std::string describe() const {
+        if (masked) return fmt::format("the experts of its surogate_expert_mask '{}'", source);
+        if (has_config) return "every routed expert (its adapter_config.json records no surogate_expert_mask)";
+        return "other experts";
+    }
+};
+
+AdapterExpertMask read_adapter_expert_mask(const std::string& adapter_file) {
+    namespace fs = std::filesystem;
+    AdapterExpertMask info;
+    std::ifstream in(fs::path(adapter_file).parent_path() / "adapter_config.json");
+    if (!in) return info;
+    try {
+        const nlohmann::json j = nlohmann::json::parse(in);
+        info.has_config = true;
+        if (j.contains("surogate_expert_mask")) {
+            const auto& m = j.at("surogate_expert_mask");
+            info.masked = true;
+            info.source = m.is_object() ? m.value("source", std::string("?")) : std::string("?");
+        }
+    } catch (const std::exception&) {
+        info.has_config = false;
+    }
+    return info;
+}
+
+}  // namespace
 
 ModularLoRAWeightsManager::ModularLoRAWeightsManager(const Config& config, TensorAllocator& allocator)
     : mConfig(config),
@@ -106,6 +155,44 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     auto& work = mWork.blocks[layer_idx];
 
     const std::string prefix = fmt::format("lora_layer_{}", layer_idx);
+
+    // Hashed n-gram memory: dense [C, E] projections and [C] gate gains on the memory's layer,
+    // allocated whatever the LoRA targets (an empty target set trains the memory alone).
+    if (layer_idx == mConfig.ngram_memory_layer) {
+        const long E = mConfig.ngram_memory_embed;
+        if (E <= 0) throw std::logic_error("ngram memory: embed width must be positive");
+        const ETensorDType master_dtype = mConfig.lora_config.dtype;
+        const ETensorDType work_dtype = mConfig.work_dtype;
+        master.ngram_proj.emplace();
+        work.ngram_proj.emplace();
+        master.ngram_gain.emplace();
+        work.ngram_gain.emplace();
+        master.ngram_proj->A = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_key_proj", EAllocationType::ON_DEVICE, {C, E}));
+        master.ngram_proj->B = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_value_proj", EAllocationType::ON_DEVICE, {C, E}));
+        master.ngram_gain->A = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_norm_key", EAllocationType::ON_DEVICE, {C}));
+        master.ngram_gain->B = TensorShard(
+            mAllocator->allocate(master_dtype, "lora_ngram_norm_query", EAllocationType::ON_DEVICE, {C}));
+        work.ngram_proj->A =
+            mAllocator->allocate(work_dtype, "lora_ngram_key_proj_work", EAllocationType::ON_DEVICE, {C, E});
+        work.ngram_proj->B =
+            mAllocator->allocate(work_dtype, "lora_ngram_value_proj_work", EAllocationType::ON_DEVICE, {C, E});
+        work.ngram_gain->A = mAllocator->allocate(work_dtype, "lora_ngram_norm_key_work", EAllocationType::ON_DEVICE, {C});
+        work.ngram_gain->B =
+            mAllocator->allocate(work_dtype, "lora_ngram_norm_query_work", EAllocationType::ON_DEVICE, {C});
+        // Trainable table: the FP32 master only (the gather rounds each value it reads); B stays empty.
+        if (mConfig.ngram_table_rows > 0) {
+            if (master_dtype != ETensorDType::FP32) {
+                throw std::logic_error("ngram memory: a trainable table needs lora_dtype fp32");
+            }
+            master.ngram_table.emplace();
+            master.ngram_table->A = TensorShard(mAllocator->allocate(
+                ETensorDType::FP32, "lora_ngram_table", EAllocationType::ON_DEVICE,
+                {mConfig.ngram_table_rows, static_cast<long>(mConfig.ngram_head_dim)}));
+        }
+    }
 
     // Determine block type for this layer (hybrid-aware)
     BlockType bt = BlockType::Dense;  // default: allocate everything
@@ -292,7 +379,17 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(LoRAGroupedExpertWe
     const int gate_up_out = 2 * D;
     // EP: only this rank's expert shard gets adapters (kernels accept
     // local-sized grouped LoRA tensors; grads reduce is already DP-only).
-    const int num_experts = mConfig.effective_grouped_experts();
+    int num_experts = mConfig.effective_grouped_experts();
+    // lora_expert_mask: one row per selected expert (compact), none for a layer without any. A layer that
+    // selects every expert keeps the full layout, so it runs exactly as without a mask.
+    std::vector<int> expert_ids;
+    if (const auto* ids = mConfig.lora_config.masked_experts(layer_idx)) {
+        if (ids->empty()) return;
+        if (static_cast<int>(ids->size()) != mConfig.num_experts) {
+            expert_ids = *ids;
+            num_experts = static_cast<int>(ids->size());
+        }
+    }
     const int r = mConfig.lora_config.rank;
     const ETensorDType master_dtype = mConfig.lora_config.dtype;
     const ETensorDType work_dtype = mConfig.work_dtype;
@@ -301,6 +398,8 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(LoRAGroupedExpertWe
     auto allocate_grouped = [&](auto& m_layer, auto& w_layer, int in, int out, const std::string& name) {
         m_layer.emplace();
         w_layer.emplace();
+        m_layer->expert_ids = expert_ids;
+        w_layer->expert_ids = expert_ids;
 
         m_layer->A = TensorShard(mAllocator->allocate(master_dtype,
                                                       (name + "_A").c_str(),
@@ -385,7 +484,29 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
                             unsigned long long subsequence) {
         if (!layer.has_value()) return;
         float std_a = 1.0f / std::sqrt(3.0f * static_cast<float>(in_features));
-        fill_normal(layer->A, layer->A.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
+        if (!layer->is_compact()) {
+            fill_normal(layer->A, layer->A.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
+        } else {
+            // Draw A for every expert of the layer, exactly as the full layout does (same seed, subsequence
+            // and element count), then keep the selected rows: a selected expert starts from the same A as
+            // without a mask.
+            const long rows = mConfig.num_experts;
+            const std::size_t row_bytes = static_cast<std::size_t>(layer->A.Sizes[1]) *
+                                          static_cast<std::size_t>(layer->A.Sizes[2]) * get_dtype_size(layer->A.DType);
+            void* full_ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&full_ptr, row_bytes * static_cast<std::size_t>(rows)));
+            Tensor full = Tensor::from_pointer(static_cast<std::byte*>(full_ptr), layer->A.Device, layer->A.DType,
+                                               std::vector<long>{rows, layer->A.Sizes[1], layer->A.Sizes[2]});
+            fill_normal(full, full.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
+            for (std::size_t s = 0; s < layer->expert_ids.size(); ++s) {
+                CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(layer->A.Data) + s * row_bytes,
+                                      static_cast<const std::byte*>(full_ptr) +
+                                          static_cast<std::size_t>(layer->expert_ids[s]) * row_bytes,
+                                      row_bytes,
+                                      cudaMemcpyDeviceToDevice));
+            }
+            CUDA_CHECK(cudaFree(full_ptr));
+        }
         fill_zero(layer->B, nullptr);
     };
 
@@ -447,6 +568,35 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
             init_layer(b.moe.shared->up, C, base + 100);
             init_layer(b.moe.shared->down, shared_D, base + 101);
         }
+
+        // Router LoRA (train_router): A like every other target, B = 0. Left out, A kept its allocation's
+        // contents (zeros in practice), and with A = B = 0 both gradients vanish, so the router LoRA never
+        // moved. Its own subsequence range, above the linear-attention one.
+        if (b.router.has_value()) {
+            init_layer(b.router, C, (1ULL << 41) + static_cast<unsigned long long>(l));
+        }
+
+        // N-gram memory: W_k ~ N(0, init_std) (its own subsequence range), W_v = 0 so the memory's output
+        // is exactly zero, gate gains 1 (folded multipliers). No other adapter's stream is touched.
+        if (b.ngram_proj.has_value()) {
+            fill_normal(b.ngram_proj->A, b.ngram_proj->A.nelem(), 0.0f, mConfig.ngram_init_std, seed,
+                        (1ULL << 42) + static_cast<unsigned long long>(l), nullptr);
+            if (b.ngram_table.has_value()) {
+                // Trainable table: the table is the zero factor (step 0 exact; rows never trained stay exact
+                // no-ops), so W_v is random like W_k (its own subsequence range).
+                fill_normal(b.ngram_proj->B, b.ngram_proj->B.nelem(), 0.0f, mConfig.ngram_init_std, seed,
+                            (1ULL << 43) + static_cast<unsigned long long>(l), nullptr);
+            } else {
+                fill_zero(b.ngram_proj->B, nullptr);
+            }
+        }
+        if (b.ngram_table.has_value()) {
+            fill_zero(b.ngram_table->A, nullptr);
+        }
+        if (b.ngram_gain.has_value()) {
+            fill_constant(b.ngram_gain->A, 1.0f, static_cast<std::size_t>(b.ngram_gain->A.nelem()), nullptr);
+            fill_constant(b.ngram_gain->B, 1.0f, static_cast<std::size_t>(b.ngram_gain->B.nelem()), nullptr);
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -468,26 +618,91 @@ void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, N
         } catch (std::exception& e) {
             throw std::runtime_error(fmt::format("Error reading adapter file '{}': {}", file_name, e.what()));
         }
+        // A memory trained on shuffled rows (the control arm) and one trained on the real rows are different
+        // models with identically shaped tensors: the adapter_config.json beside the file says which.
+        if (mConfig.ngram_memory_layer >= 0) {
+            namespace fs = std::filesystem;
+            std::ifstream in(fs::path(file_name).parent_path() / "adapter_config.json");
+            if (in) {
+                nlohmann::json j;
+                try {
+                    j = nlohmann::json::parse(in);
+                } catch (const std::exception&) {
+                    j = nlohmann::json::object();
+                }
+                if (j.contains("surogate_ngram_memory")) {
+                    const auto& s = j.at("surogate_ngram_memory");
+                    const std::uint64_t a = s.value("row_shuffle_a", static_cast<std::uint64_t>(0));
+                    const std::uint64_t b = s.value("row_shuffle_b", static_cast<std::uint64_t>(0));
+                    if (a != mConfig.ngram_row_shuffle_a || (a != 0 && b != mConfig.ngram_row_shuffle_b)) {
+                        throw std::runtime_error(fmt::format(
+                            "adapter '{}' was trained with ngram_memory row_shuffle a={} b={}, this trainer runs a={} "
+                            "b={}: configure the trainer with the adapter's row_shuffle",
+                            file_name, a, b, mConfig.ngram_row_shuffle_a, mConfig.ngram_row_shuffle_b));
+                    }
+                }
+            }
+        }
+        // An adapter with an n-gram memory is part of the model it was trained as: dropping the memory
+        // would load another model.
+        if (mConfig.ngram_memory_layer < 0) {
+            for (const auto& name : present) {
+                if (name.find(".ple.") != std::string::npos) {
+                    throw std::runtime_error(fmt::format(
+                        "adapter '{}' carries an n-gram memory ({}); configure the trainer with the adapter's "
+                        "ngram_memory option", file_name, name));
+                }
+            }
+        }
         std::vector<std::string> missing;
+        std::unordered_set<std::string> allocated_names;
         std::size_t allocated = 0;
         iterate_tensors([&](std::string name, const TensorShard&) {
             ++allocated;
+            allocated_names.insert(name);
             if (!present.contains(name)) missing.push_back(std::move(name));
         });
+        // lora_expert_mask: the adapter must hold exactly the selected experts' adapters.
+        const auto& mask = mConfig.lora_config.expert_mask;
+        const AdapterExpertMask adapter_mask = read_adapter_expert_mask(file_name);
+        const std::string trainer_mask = mask.Enabled ? fmt::format("the experts of lora_expert_mask '{}'", mask.Source)
+                                                      : std::string("every routed expert (no lora_expert_mask)");
+        auto mask_note = [&]() {
+            if (!mask.Enabled && !adapter_mask.masked) return std::string();
+            return fmt::format(". The trainer adapts {}; the adapter covers {}. Train or resume with the adapter's "
+                               "own lora_expert_mask", trainer_mask, adapter_mask.describe());
+        };
         if (!missing.empty()) {
             std::string examples;
             for (std::size_t i = 0; i < missing.size() && i < 4; ++i) examples += (i ? ", " : "") + missing[i];
             const bool linear = std::any_of(missing.begin(), missing.end(), [](const std::string& n) {
                 return n.find(".linear_attn.") != std::string::npos;
             });
+            const bool experts = std::any_of(missing.begin(), missing.end(), is_routed_expert_lora_name);
             throw std::runtime_error(fmt::format(
                 "adapter '{}' lacks {} of the {} LoRA tensors this trainer's lora_target_modules allocate (e.g. {}). "
-                "Configure the trainer with the adapter's own target modules{}",
+                "Configure the trainer with the adapter's own target modules{}{}",
                 file_name, missing.size(), allocated, examples,
                 linear ? ": an adapter trained before linear-attention LoRA on a Qwen3.5-family model covers only "
                          "[q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj] (`all` now also adapts "
                          "linear_attn.in_proj_qkv/in_proj_z/in_proj_a/in_proj_b/out_proj)"
-                       : ""));
+                       : "",
+                experts ? mask_note() : std::string()));
+        }
+        if (mask.Enabled) {
+            std::vector<std::string> extra;
+            for (const auto& name : present) {
+                if (is_routed_expert_lora_name(name) && !allocated_names.contains(name)) extra.push_back(name);
+            }
+            if (!extra.empty()) {
+                std::sort(extra.begin(), extra.end());
+                std::string examples;
+                for (std::size_t i = 0; i < extra.size() && i < 4; ++i) examples += (i ? ", " : "") + extra[i];
+                throw std::runtime_error(fmt::format(
+                    "adapter '{}' holds {} routed-expert LoRA tensors outside this trainer's lora_expert_mask '{}' "
+                    "(e.g. {}){}",
+                    file_name, extra.size(), mask.Source, examples, mask_note()));
+            }
         }
     }
     load_safetensors(file_name, *this, /*allow_cast=*/true);
@@ -710,6 +925,9 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
 
     // Sync router LoRA (when train_router is enabled)
     sync_layer(work.router, master.router, "router");
+    sync_layer(work.ngram_proj, master.ngram_proj, "ngram_proj");
+    sync_layer(work.ngram_gain, master.ngram_gain, "ngram_gain");
+    // (the trainable table has no work copy: the op reads the master)
 
     return work;
 }
@@ -739,6 +957,7 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
                                      : D_moe;
 
     std::size_t per_layer = 0;
+    std::size_t masked_experts = 0;  // lora_expert_mask: the selected experts over all layers
 
     // Attention LoRA parameters
     if (mConfig.lora_config.applies_to_q()) per_layer += r * C + q_out * r;
@@ -754,7 +973,13 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
         if (mConfig.lora_config.applies_to_gate_up()) per_expert += r * C + (2 * D_moe) * r;
         if (mConfig.lora_config.applies_to_up()) per_expert += r * C + D_moe * r;
         if (mConfig.lora_config.applies_to_down()) per_expert += r * D_moe + C * r;
-        per_layer += per_expert * E;
+        if (mConfig.lora_config.expert_mask.Enabled) {
+            for (int l = 0; l < mConfig.num_layers; ++l) {
+                masked_experts += per_expert * mConfig.lora_config.masked_experts(l)->size();
+            }
+        } else {
+            per_layer += per_expert * E;
+        }
 
         if (use_shared_expert) {
             if (mConfig.lora_config.applies_to_up()) per_layer += r * C + shared_D * r;
@@ -782,7 +1007,12 @@ std::size_t ModularLoRAWeightsManager::num_parameters() const {
                 linear += r * static_cast<std::size_t>(shape.input) + static_cast<std::size_t>(shape.output) * r;
         }
     }
-    return per_layer * static_cast<std::size_t>(mConfig.num_layers) + linear;
+    const std::size_t ngram =
+        mConfig.ngram_memory_layer >= 0
+            ? 2 * C * static_cast<std::size_t>(mConfig.ngram_memory_embed) + 2 * C +
+                  static_cast<std::size_t>(mConfig.ngram_table_rows) * static_cast<std::size_t>(mConfig.ngram_head_dim)
+            : 0;
+    return per_layer * static_cast<std::size_t>(mConfig.num_layers) + linear + masked_experts + ngram;
 }
 
 namespace {
@@ -849,6 +1079,9 @@ void for_each_lora_tensor(TSet& set, F&& visit) {
         }
 
         visit_layer(block.router);
+        visit_layer(block.ngram_proj);
+        visit_layer(block.ngram_gain);
+        visit_layer(block.ngram_table);
     }
 }
 
@@ -977,6 +1210,16 @@ std::string ModularLoRAWeightsManager::layer_prefix(int layer) const {
     return fmt::format("{}.{}", mConfig.tensor_prefix, layer);
 }
 
+std::array<std::string, 4> ModularLoRAWeightsManager::ngram_memory_names() const {
+    const std::string module = layer_prefix(mConfig.ngram_memory_layer) + ".ple.";
+    return {module + "key_proj.weight", module + "value_proj.weight", module + "norm_key.weight",
+            module + "norm_query.weight"};
+}
+
+std::string ModularLoRAWeightsManager::ngram_table_name() const {
+    return layer_prefix(mConfig.ngram_memory_layer) + ".ple.ngram_table.weight";
+}
+
 std::array<std::string, 4> ModularLoRAWeightsManager::attention_names(int layer) const {
     if (layer >= 0 && static_cast<std::size_t>(layer) < mConfig.attention_names.size()) {
         return mConfig.attention_names[static_cast<std::size_t>(layer)];
@@ -1068,8 +1311,12 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
                     A_src = TensorShard(a_it->second);
                     B_src = TensorShard(b_it->second);
                 }
-                for (int e = 0; e < num_experts; ++e) {
-                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, expert_base + e);
+                // lora_expert_mask: row e is global expert expert_ids[e] (no EP with a mask).
+                const bool compact = layer->is_compact();
+                const int rows = compact ? static_cast<int>(layer->expert_ids.size()) : num_experts;
+                for (int e = 0; e < rows; ++e) {
+                    const int expert = compact ? layer->expert_ids[static_cast<std::size_t>(e)] : expert_base + e;
+                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, expert);
                     // Slice out expert e from dim 0: A[e,:,:] and B[e,:,:]
                     TensorShard A_slice = TensorShard(slice(A_src, 0, e, e + 1));
                     TensorShard B_slice = TensorShard(slice(B_src, 0, e, e + 1));
@@ -1134,6 +1381,18 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
         if (block.router.has_value() && block.router->has_value()) {
             callback(prefix + ".mlp.gate.lora_A.weight", block.router->A);
             callback(prefix + ".mlp.gate.lora_B.weight", block.router->B);
+        }
+
+        // N-gram memory: dense tensors in the Flash-Next layout (<layer>.ple.*), not LoRA pairs.
+        if (block.ngram_proj.has_value() && block.ngram_gain.has_value()) {
+            const auto names = ngram_memory_names();
+            callback(names[0], block.ngram_proj->A);
+            callback(names[1], block.ngram_proj->B);
+            callback(names[2], block.ngram_gain->A);
+            callback(names[3], block.ngram_gain->B);
+        }
+        if (block.ngram_table.has_value() && block.ngram_table->A.Data) {
+            callback(ngram_table_name(), block.ngram_table->A);
         }
     }
 }

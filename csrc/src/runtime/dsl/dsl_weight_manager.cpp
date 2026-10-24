@@ -44,10 +44,6 @@ bool is_rope_param(const std::string& name) {
     return tensor_role_is_rope_name(name);
 }
 
-bool is_router_param(const std::string& name) {
-    return tensor_role_is_router_name(name);
-}
-
 std::string_view trim_optional(std::string_view name) {
     if (!name.empty() && name.back() == '?') {
         return name.substr(0, name.size() - 1);
@@ -284,7 +280,6 @@ void DslWeightManager::allocate_weights(const Module& module,
     augment_shape_env(env, module.config);
 
     const bool freeze_base = lora_config && lora_config->enabled();
-    const bool train_router = freeze_base && lora_config->train_router;
 
     // Prepare per-layer param name lists
     mBlockParamNames.resize(mConfig.num_layers);
@@ -314,7 +309,11 @@ void DslWeightManager::allocate_weights(const Module& module,
         entry.trainable = !info.frozen && !is_rope_param(name);
         entry.work_dtype = param_dtype;
         if (freeze_base) {
-            entry.trainable = !info.frozen && train_router && is_router_param(name);
+            // LoRA mode freezes every base weight, the MoE router included. train_router adds a router
+            // LoRA of rank r (mlp.gate lora_A/lora_B) to the adapter, which the LoRA optimizer trains;
+            // flagging the full router weight trainable as well only allocated a gradient that no
+            // optimizer applies and computed it in every backward.
+            entry.trainable = false;
         }
 
         // Parse layer index for block weights

@@ -80,6 +80,20 @@ public:
         std::vector<std::uint8_t> layer_has_dense_mlp;
         std::vector<std::uint8_t> layer_has_moe;
 
+        /// Hashed n-gram memory (runtime/ngram/ngram_memory.h): the layer holding its dense
+        /// parameters (-1 = no memory), the table embedding width E, and the W_k init std.
+        int ngram_memory_layer = -1;
+        int ngram_memory_embed = 0;
+        float ngram_init_std = 0.02f;
+        /// The memory's row shuffle (control arm; a = 0: none). An adapter records its own in
+        /// adapter_config.json; import refuses a mismatch.
+        std::uint64_t ngram_row_shuffle_a = 0;
+        std::uint64_t ngram_row_shuffle_b = 0;
+        /// Trainable table (table_mode trainable; 0 rows = the frozen file table): [rows, head_dim] FP32 master,
+        /// zero at initialisation, with W_v ~ N(0, init_std) instead of 0 (the zero table makes step 0 exact).
+        long ngram_table_rows = 0;
+        int ngram_head_dim = 0;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }
@@ -210,6 +224,15 @@ public:
     /// get_lora_weights / get_lora_gradients -- takes them from here so it agrees with the export.
     [[nodiscard]] std::string layer_prefix(int layer) const;
     [[nodiscard]] std::array<std::string, 4> attention_names(int layer) const;
+
+    /// The n-gram memory's layer (-1 = none) and the adapter names of its four tensors, in the
+    /// Flash-Next layout: `<layer>.ple.{key_proj,value_proj,norm_key,norm_query}.weight`.
+    [[nodiscard]] int ngram_memory_layer() const {
+        return mConfig.ngram_memory_layer;
+    }
+    [[nodiscard]] std::array<std::string, 4> ngram_memory_names() const;
+    /// The adapter name of the trainable table: `<layer>.ple.ngram_table.weight` ([rows, head_dim]).
+    [[nodiscard]] std::string ngram_table_name() const;
 
 private:
     Config mConfig;

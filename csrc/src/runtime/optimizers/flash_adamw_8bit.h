@@ -122,7 +122,8 @@ void flash_adamw_update_8bit_multi_tensor(float** params,
                                           const float* gnorm_scale,
                                           const float* opt_params,
                                           const int* opt_step,
-                                          cudaStream_t stream);
+                                          cudaStream_t stream,
+                                          const float* tensor_hparams = nullptr);
 
 void flash_adamw_update_8bit_multi_tensor(nv_bfloat16** params,
                                           nv_bfloat16** grads,
@@ -143,7 +144,8 @@ void flash_adamw_update_8bit_multi_tensor(nv_bfloat16** params,
                                           const float* gnorm_scale,
                                           const float* opt_params,
                                           const int* opt_step,
-                                          cudaStream_t stream);
+                                          cudaStream_t stream,
+                                          const float* tensor_hparams = nullptr);
 
 /**
  * @brief Returns the number of scale elements needed for a given parameter count.

@@ -22,6 +22,7 @@
 #include "runtime/dsl/dsl_run_state.h"
 #include "runtime/lora/lora_utils.h"
 #include "runtime/lora/lora_model_utils.h"
+#include "runtime/ngram/ngram_memory.h"
 #include "runtime/optimizers/adamw.h"
 #include "runtime/optimizers/flash_adamw_8bit.h"
 #include "runtime/optimizers/normuon.h"
@@ -69,6 +70,34 @@ void DslModel::export_adapter(const std::string& directory,
                     targets.insert(name.substr(prefix.size(), end - prefix.size()));
             });
             adapter_config["target_modules"] = targets;
+        }
+        // lora_expert_mask: the routed experts the adapter covers (the mask file's format, so it can be fed
+        // back as lora_expert_mask). Absent = every expert.
+        if (mLoRAConfig->expert_mask.Enabled) {
+            nlohmann::json layers = nlohmann::json::object();
+            for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+                layers[std::to_string(l)] = *mLoRAConfig->masked_experts(l);
+            }
+            adapter_config["surogate_expert_mask"] = {
+                {"format", "surogate-expert-mask-v1"},
+                {"source", mLoRAConfig->expert_mask.Source},
+                {"num_layers", mModelConfig.NumLayers},
+                {"num_experts", mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->num_experts : 0},
+                {"layers", layers}};
+        }
+        // Hashed n-gram memory: the spec the model was trained with (hash, table, layer) and the names of
+        // its dense tensors. surogate/dsl/ngram_memory_export.py turns adapter + spec into the engine's
+        // serve inputs (rl/ngram-transplant-2026-10-18/INTERFACE.md).
+        if (mLoRAWeights->ngram_memory_layer() >= 0) {
+            nlohmann::json spec = nlohmann::json::parse(mRuntimeConfig.ngram_memory_spec);
+            const auto names = mLoRAWeights->ngram_memory_names();
+            spec["tensors"] = {{"key_proj", names[0]}, {"value_proj", names[1]}, {"norm_key", names[2]},
+                               {"norm_query", names[3]}};
+            if (spec.value("table_mode", std::string("file")) == "trainable") {
+                spec["tensors"]["table"] = mLoRAWeights->ngram_table_name();
+            }
+            spec["norm_gain_convention"] = "folded";
+            adapter_config["surogate_ngram_memory"] = spec;
         }
         std::ofstream config_file(dir / "adapter_config.json");
         config_file << adapter_config.dump(2);
@@ -160,7 +189,7 @@ void require_optimizer_geometry(const char* optimizer, std::size_t saved_params,
     throw std::runtime_error(fmt::format(
         "LoRA {} checkpoint geometry does not match the adapter: the checkpoint's optimizer state covers {} "
         "parameters in {} tensors, this trainer's adapter has {} in {}. Resume with the lora_target_modules "
-        "(and rank) the checkpoint was trained with",
+        "(and rank, and lora_expert_mask) the checkpoint was trained with",
         optimizer, saved_params, saved_tensors, current.first, current.second));
 }
 }  // namespace
@@ -539,20 +568,36 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     std::vector<int> h_state_offsets;
     size_t total_params = 0;
 
-    auto collect_tensor = [&](Tensor& param) {
+    // Per-tensor [lr, weight decay] multipliers: the n-gram memory's dense tensors train at their own
+    // learning rate without weight decay; everything else at 1 and 1.
+    std::vector<float> h_hparams;
+    bool any_hparams = false;
+    const float ngram_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
+                                     ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).lr_scale
+                                     : 1.0f;
+    // The trainable table has its own multiplier (default: the memory's).
+    const float ngram_table_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
+                                           ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).table_lr_scale
+                                           : 1.0f;
+    auto collect_tensor = [&](Tensor& param, bool ngram, bool table) {
         if (!param.Data) return;
         h_param_ptrs.push_back(param.Data);
         int n = static_cast<int>(param.nelem());
         h_sizes.push_back(n);
         h_state_offsets.push_back(static_cast<int>(total_params));
         total_params += n;
+        h_hparams.push_back(table ? ngram_table_lr_scale : ngram ? ngram_lr_scale : 1.0f);
+        h_hparams.push_back(ngram || table ? 0.0f : 1.0f);
+        any_hparams = any_hparams || ngram || table;
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
-        modules::for_each_lora_layer_weight(lora_w, [&](auto, auto& layer) {
-            collect_tensor(layer.A);
-            collect_tensor(layer.B);
+        modules::for_each_lora_layer_weight(lora_w, [&](modules::LoRATargetId id, auto& layer) {
+            const bool ngram = id == modules::LoRATargetId::NgramProj || id == modules::LoRATargetId::NgramGain;
+            const bool table = id == modules::LoRATargetId::NgramTable;
+            collect_tensor(layer.A, ngram, table);
+            collect_tensor(layer.B, ngram, table);
         });
     }
 
@@ -595,6 +640,17 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
                                h_state_offsets.size() * sizeof(int),
                                cudaMemcpyHostToDevice,
                                stream));
+    if (any_hparams) {
+        state.tensor_hparams = mAllocator->allocate(ETensorDType::FP32,
+                                                    "lora_mt_tensor_hparams",
+                                                    EAllocationType::ON_DEVICE,
+                                                    {(long)h_hparams.size()});
+        CUDA_CHECK(cudaMemcpyAsync(state.tensor_hparams.Data,
+                                   h_hparams.data(),
+                                   h_hparams.size() * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+    }
 
     if (!state.state1.Data) {
         state.state1 = mAllocator->allocate(ETensorDType::BYTE,
@@ -677,20 +733,36 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
     std::vector<int> h_state_offsets;
     size_t total_params = 0;
 
-    auto collect_tensor = [&](Tensor& param) {
+    // Per-tensor [lr, weight decay] multipliers: the n-gram memory's dense tensors train at their own
+    // learning rate without weight decay; everything else at 1 and 1.
+    std::vector<float> h_hparams;
+    bool any_hparams = false;
+    const float ngram_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
+                                     ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).lr_scale
+                                     : 1.0f;
+    // The trainable table has its own multiplier (default: the memory's).
+    const float ngram_table_lr_scale = mRuntimeConfig.ngram_memory_layer >= 0
+                                           ? ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec).table_lr_scale
+                                           : 1.0f;
+    auto collect_tensor = [&](Tensor& param, bool ngram, bool table) {
         if (!param.Data) return;
         h_param_ptrs.push_back(param.Data);
         int n = static_cast<int>(param.nelem());
         h_sizes.push_back(n);
         h_state_offsets.push_back(static_cast<int>(total_params));
         total_params += n;
+        h_hparams.push_back(table ? ngram_table_lr_scale : ngram ? ngram_lr_scale : 1.0f);
+        h_hparams.push_back(ngram || table ? 0.0f : 1.0f);
+        any_hparams = any_hparams || ngram || table;
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
-        modules::for_each_lora_layer_weight(lora_w, [&](auto, auto& layer) {
-            collect_tensor(layer.A);
-            collect_tensor(layer.B);
+        modules::for_each_lora_layer_weight(lora_w, [&](modules::LoRATargetId id, auto& layer) {
+            const bool ngram = id == modules::LoRATargetId::NgramProj || id == modules::LoRATargetId::NgramGain;
+            const bool table = id == modules::LoRATargetId::NgramTable;
+            collect_tensor(layer.A, ngram, table);
+            collect_tensor(layer.B, ngram, table);
         });
     }
 
@@ -732,6 +804,17 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
                                h_state_offsets.size() * sizeof(int),
                                cudaMemcpyHostToDevice,
                                stream));
+    if (any_hparams) {
+        state.tensor_hparams = mAllocator->allocate(ETensorDType::FP32,
+                                                    "lora_mt_tensor_hparams",
+                                                    EAllocationType::ON_DEVICE,
+                                                    {(long)h_hparams.size()});
+        CUDA_CHECK(cudaMemcpyAsync(state.tensor_hparams.Data,
+                                   h_hparams.data(),
+                                   h_hparams.size() * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+    }
 
     if (!state.state1.Data) {
         state.state1 =
@@ -838,7 +921,8 @@ void DslModel::update_lora_adamw(NCCLCommunicator& comm,
                                               grad_scale,
                                               nullptr,
                                               nullptr,
-                                              stream);
+                                              stream,
+                                              reinterpret_cast<const float*>(state.tensor_hparams.Data));
     } else if (lora_dtype == ETensorDType::BF16) {
         optimizers::adamw_update_multi_tensor(reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
                                               reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
@@ -857,7 +941,8 @@ void DslModel::update_lora_adamw(NCCLCommunicator& comm,
                                               grad_scale,
                                               nullptr,
                                               nullptr,
-                                              stream);
+                                              stream,
+                                              reinterpret_cast<const float*>(state.tensor_hparams.Data));
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for full-precision AdamW");
     }
@@ -928,7 +1013,8 @@ void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm,
                                               grad_scale,
                                               opt_params,
                                               opt_step,
-                                              stream);
+                                              stream,
+                                              reinterpret_cast<const float*>(state.tensor_hparams.Data));
     } else if (lora_dtype == ETensorDType::BF16) {
         optimizers::adamw_update_multi_tensor(reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
                                               reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
@@ -947,7 +1033,8 @@ void DslModel::update_lora_adamw_graph(NCCLCommunicator& comm,
                                               grad_scale,
                                               opt_params,
                                               opt_step,
-                                              stream);
+                                              stream,
+                                              reinterpret_cast<const float*>(state.tensor_hparams.Data));
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for full-precision AdamW");
     }
@@ -1019,7 +1106,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
             grad_scale,
             nullptr,
             nullptr,
-            stream);
+            stream,
+            reinterpret_cast<const float*>(mLoRAAdamW8BitState->tensor_hparams.Data));
     } else if (lora_dtype == ETensorDType::BF16) {
         optimizers::flash_adamw_update_8bit_multi_tensor(
             reinterpret_cast<nv_bfloat16**>(mLoRAAdamW8BitState->param_ptrs.Data),
@@ -1041,7 +1129,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
             grad_scale,
             nullptr,
             nullptr,
-            stream);
+            stream,
+            reinterpret_cast<const float*>(mLoRAAdamW8BitState->tensor_hparams.Data));
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
@@ -1114,7 +1203,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
                                                          grad_scale,
                                                          opt_params,
                                                          opt_step,
-                                                         stream);
+                                                         stream,
+                                                         reinterpret_cast<const float*>(state.tensor_hparams.Data));
     } else if (lora_dtype == ETensorDType::BF16) {
         optimizers::flash_adamw_update_8bit_multi_tensor(reinterpret_cast<nv_bfloat16**>(state.param_ptrs.Data),
                                                          reinterpret_cast<nv_bfloat16**>(state.grad_ptrs.Data),
@@ -1135,7 +1225,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
                                                          grad_scale,
                                                          opt_params,
                                                          opt_step,
-                                                         stream);
+                                                         stream,
+                                                         reinterpret_cast<const float*>(state.tensor_hparams.Data));
     } else {
         throw std::runtime_error("DslModel: unsupported LoRA dtype for AdamW 8-bit");
     }
@@ -1154,6 +1245,12 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
 void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
+
+    if (mLoRAWeights && mLoRAWeights->ngram_memory_layer() >= 0) {
+        // NorMuon orthogonalizes every adapter matrix; the n-gram memory's projections and gains are
+        // dense parameters with their own learning rate.
+        throw std::runtime_error("ngram_memory: use optimizer adamw or adamw_8bit (NorMuon is not supported)");
+    }
 
     if (!mLoRANorMuonState) {
         mLoRANorMuonState = std::make_unique<modules::LoRANorMuonState>();

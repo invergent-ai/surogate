@@ -426,7 +426,7 @@ inline void apply_lora_contribution_fp32(Tensor& output,
                                          int output_offset,
                                          const Tensor& input,
                                          const LoRALayerWeights<Tensor>& lora,
-                                         Tensor& intermediate,
+                                         Tensor& intermediate_buffer,
                                          Tensor& slice_buffer,
                                          float scaling,
                                          float dropout_prob,
@@ -441,6 +441,8 @@ inline void apply_lora_contribution_fp32(Tensor& output,
                                          cudaStream_t stream) {
     if (!lora.has_value()) return;
     if (out_features <= 0 || BT <= 0) return;
+    // A [BT, rank] view: the buffer is sized for the full micro-batch, BT may be one sequence chunk.
+    Tensor intermediate = lora_intermediate_view(intermediate_buffer, BT, rank);
     Tensor input_mat = materialize_lora_dropout_input(input,
                                                       slice_buffer,
                                                       BT,

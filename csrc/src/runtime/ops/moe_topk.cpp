@@ -240,6 +240,15 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
         d_weights_ptr = &d_weights_scaled;
     }
 
+    // Router aux/z-loss weight per backward. The regularization kernel takes the token mean over the
+    // tokens it is given; with sequence_chunks = N this backward runs once per chunk, so N chunk means
+    // would weigh N times the micro-step's single unchunked mean. Each chunk carries 1/N of it: the
+    // z-loss gradient is then the unchunked one, and the aux loss differs only in balancing each
+    // chunk's expert fractions rather than the whole sequence's.
+    const float reg_share = sequence_chunk_active() ? 1.0f / static_cast<float>(mChunkCount) : 1.0f;
+    const float aux_coef = mRunState.moe_aux_loss_coef() * reg_share;
+    const float z_coef = mRunState.moe_z_loss_coef() * reg_share;
+
     // Allocate output with correct shape derived from probs (not from compile-time inference)
     // d_probs must have shape [num_tokens, num_experts] matching probs
     std::vector<long> d_probs_shape = {static_cast<long>(num_tokens), static_cast<long>(num_experts)};
@@ -281,7 +290,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           full_softmax,
                           mRunState.MainStream);
 
-        if (softmax && (mRunState.moe_aux_loss_coef() != 0.0f || mRunState.moe_z_loss_coef() != 0.0f)) {
+        if (softmax && (aux_coef != 0.0f || z_coef != 0.0f)) {
             Tensor expert_fractions =
                 mRunState.Stack.allocate(ETensorDType::FP32, {static_cast<long>(num_experts)}, "moe_aux_fractions");
             moe_compute_expert_fractions(expert_fractions.get<float>(),
@@ -295,8 +304,8 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                                                       expert_fractions.get<float>(),
                                                       num_tokens,
                                                       num_experts,
-                                                      mRunState.moe_aux_loss_coef(),
-                                                      mRunState.moe_z_loss_coef(),
+                                                      aux_coef,
+                                                      z_coef,
                                                       mRunState.MainStream);
         }
 
@@ -317,7 +326,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           full_softmax,
                           mRunState.MainStream);
 
-        if (softmax && (mRunState.moe_aux_loss_coef() != 0.0f || mRunState.moe_z_loss_coef() != 0.0f)) {
+        if (softmax && (aux_coef != 0.0f || z_coef != 0.0f)) {
             Tensor expert_fractions =
                 mRunState.Stack.allocate(ETensorDType::FP32, {static_cast<long>(num_experts)}, "moe_aux_fractions");
             moe_compute_expert_fractions(expert_fractions.get<float>(),
@@ -331,8 +340,8 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                                                       expert_fractions.get<float>(),
                                                       num_tokens,
                                                       num_experts,
-                                                      mRunState.moe_aux_loss_coef(),
-                                                      mRunState.moe_z_loss_coef(),
+                                                      aux_coef,
+                                                      z_coef,
                                                       mRunState.MainStream);
         }
     }

@@ -448,6 +448,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/zeros.cpp
     src/runtime/ops/ones.cpp
     src/runtime/ops/fused_residual_rmsnorm.cpp
+    src/runtime/ops/ngram_memory_op.cpp
     src/runtime/ops/view.cpp
     src/runtime/ops/transpose.cpp
     src/runtime/ops/concat_split.cpp
@@ -535,6 +536,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/lora/lora_grads_manager.cpp
     src/runtime/lora/lora_optimizer_state.cpp
     src/runtime/lora/lora_utils.cpp
+    src/runtime/ngram/ngram_memory.cpp
 
     # Tokenizer (native C++ BPE, loads HuggingFace tokenizer.json)
     src/tokenizer/tokenizer.cpp
@@ -586,6 +588,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu
     src/kernels/rmsnorm.cu
+    src/kernels/ngram_memory.cu
     src/kernels/qk_norm.cu
     src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu

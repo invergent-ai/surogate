@@ -63,8 +63,21 @@ struct ModularLoRAConfig {
     /// Use RSLoRA scaling (alpha / sqrt(rank) instead of alpha / rank)
     bool use_rs_lora = false;
 
-    /// Train MoE router gate weights during LoRA fine-tuning
+    /// Router LoRA (rank `rank` on the MoE router mlp.gate) during LoRA fine-tuning. The full router
+    /// weight stays frozen, like every other base weight in LoRA mode.
     bool train_router = false;
+
+    /// `lora_expert_mask`: which routed experts get expert LoRA, per layer (disabled = all experts).
+    LoRAExpertMask expert_mask;
+
+    /// The routed experts layer `layer` adapts: nullptr = every expert (no mask), otherwise the sorted
+    /// global ids (possibly none).
+    [[nodiscard]] const std::vector<int>* masked_experts(int layer) const {
+        static const std::vector<int> kNone;
+        if (!expert_mask.Enabled) return nullptr;
+        if (layer < 0 || static_cast<std::size_t>(layer) >= expert_mask.Layers.size()) return &kNone;
+        return &expert_mask.Layers[static_cast<std::size_t>(layer)];
+    }
 
     /// Native fused QKV uses the Q adapter storage for all three projections.
     bool fused_qkv = false;

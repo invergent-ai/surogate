@@ -37,7 +37,7 @@ Recomputation trades compute for memory by recomputing activations during the ba
 
 ## Chunked-Sequence Training (long sequences)
 
-Train sequences far longer than activation memory would normally allow by processing the layer stack in fixed-size chunks with attention KV carried across chunks. Memory stays at the single-chunk footprint plus a small KV/state budget (KV is `2 * kv_heads * head_dim` bytes per token per attention layer), while gradients remain exact: backward walks chunks in reverse and accumulates dK/dV in FP32. Trailing all-padding chunks are skipped automatically (nothing attends to them). Works with `sample_packing` (per-document attention across chunk boundaries is preserved, including documents split across rows) and with GDN hybrid models (Qwen3.5/3.6 — the delta-rule recurrent state and causal-conv tail are carried across chunks exactly). Requires `per_device_train_batch_size: 1`, BF16 attention, and `lora_dropout: 0`; CUDA graphs are disabled automatically. Applies to GRPO as well as SFT: when `sequence_chunks > 1`, the native GRPO step dispatches to the chunked path, which windows the GRPO dloss per chunk and skips all-padding tail chunks.
+Train sequences far longer than activation memory would normally allow by processing the layer stack in fixed-size chunks with attention KV carried across chunks. Memory stays at the single-chunk footprint plus a small KV/state budget (KV is `2 * kv_heads * head_dim` bytes per token per attention layer), while gradients remain exact: backward walks chunks in reverse and accumulates dK/dV in FP32. Trailing all-padding chunks are skipped automatically (nothing attends to them). Works with `sample_packing` (per-document attention across chunk boundaries is preserved, including documents split across rows) and with GDN hybrid models (Qwen3.5/3.6 — the delta-rule recurrent state and causal-conv tail are carried across chunks exactly). Exact means up to bf16 rounding: the chunked step's LoRA gradients differ from the unchunked step's as much as two bf16 implementations of the same step do (a few percent relative L2 on tiny MoE models, where a near-tie token can change experts). MoE router regularizers keep their unchunked weight, each chunk carrying 1/N of the micro-step's token mean: the z-loss is exact, the load-balancing aux loss balances each chunk's expert fractions rather than the whole sequence's. Requires `per_device_train_batch_size: 1`, BF16 attention, and `lora_dropout: 0`; CUDA graphs are disabled automatically. Applies to GRPO as well as SFT: when `sequence_chunks > 1`, the native GRPO step dispatches to the chunked path, which windows the GRPO dloss per chunk and skips all-padding tail chunks.
 
 | Option            | Type | Default | Description                                                                                                        |
 | ----------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -592,7 +592,8 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | `lora_dropout`        | float  | `0.05`    | Dropout rate for LoRA adapters.                                            |
 | `lora_dtype`          | string | `"fp32"`  | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                         |
 | `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
-| `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
+| `train_router`        | bool   | `false`   | Router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`), trained with the other adapters and exported as `mlp.gate.lora_{A,B}`. The full router weight stays frozen. Only applies to MoE models. |
+| `lora_expert_mask`    | string | `"all"`   | Which routed experts get expert LoRA: `all`, `none` or a JSON mask file (below). Only applies to MoE models. |
 | `adapter_path`        | string | `null`    | Path to a PEFT adapter directory to merge into base weights before training. Requires `lora: true`. Not supported with pre-quantized models. |
 | `adapter_init_mode`   | string | `"merge"`  | How `adapter_path` is applied: `merge` folds it into the base weights and trains a fresh adapter; `trainable` loads it as the initial trainable adapter and continues training it. Honored by SFT, DPO, and GRPO. |
 | `merge_adapter`       | bool   | `false`   | Whether to merge LoRA adapters into the base model after training.         |
@@ -607,6 +608,114 @@ projection; the attention output stays `o_proj`. Adapters trained with `all` bef
 them with that explicit list, since an import that lacks any adapter tensor the trainer allocates is refused
 (as is optimizer state of another geometry). Serving stacks without linear-attention LoRA support need such
 adapters merged into the weights.
+
+On an MoE model `gate_proj`, `up_proj` and `down_proj` adapt the routed experts, the shared expert (`up_proj`
+and `down_proj` only) and any dense MLP together. `lora_expert_mask` narrows the routed-expert part per layer
+without touching the others:
+
+- `all` (the default): every routed expert of every MoE layer.
+- `none`: no routed expert; the shared-expert, attention, linear-attention and router adapters stay.
+- a path to a JSON mask file, e.g. one selected by expert routing statistics (ESFT):
+
+  ```json
+  {"format": "surogate-expert-mask-v1", "num_layers": 40, "num_experts": 256,
+   "layers": {"0": [3, 17, 102], "1": [9, 44], "2": []}}
+  ```
+
+  `layers` maps a layer index to the global ids of its selected experts; a layer that is not listed gets
+  none. `num_layers` and `num_experts` are optional and must match the model when given.
+
+Only the selected experts' adapters are allocated, trained and exported (`...layers.N.mlp.experts.<id>.<proj>`,
+global ids), so memory and optimizer state shrink with the selection; a selected expert starts from the same
+initial `lora_A` as without a mask. The exported `adapter_config.json` records the mask as
+`surogate_expert_mask` (the mask file format), and an adapter or checkpoint imports only into a trainer with the
+same mask. Not supported with `ep_size > 1`, `qlora_selective_expert_dequant`, rollout parity (GRPO native
+colocate on MoE models) or `gate_up_proj` targets.
+
+### Hashed n-gram memory (`ngram_memory`)
+
+A frozen, already trained n-gram embedding table (IQ4_NL rows, e.g. a Qwen3.8-Flash-Next-style
+`per_layer_token_embd.weight`) read by the residual stream entering one decoder layer, through trained dense
+projections: the trainer side of the serving engine's single-stream `ngram_ple` layer prologue (Qwen3.5 MoE
+family, LoRA training). Per token the 16 hashed bigram/trigram rows of the current token and its two
+predecessors in the same conversation are gathered (`e`, E = heads x head_dim values), and the residual r
+gets `sigmoid(sign(z) sqrt|z|) * W_v e` with `z = <RMSNorm(W_k e) g_k, RMSNorm(r) g_q> / sqrt(C)`. W_v starts
+at zero, so step 0 is the base model bit for bit; only W_k, W_v [C, E] and the gains g_k, g_q [C] train
+(their own learning rate, no weight decay); the table stays frozen in pinned host memory.
+
+```yaml
+lora: true
+lora_dtype: fp32            # memory masters in fp32 (bf16 when expert LoRA is combined with it)
+optimizer: adamw
+ngram_memory:
+  table: /path/table.iq4nl  # raw IQ4_NL rows (the GGUF tensor payload)
+  manifest: /path/manifest.json   # GGUF manifest with the qwen4exp.ple.* hash metadata (default: next to table)
+  only: true                # memory-only PEFT: no LoRA adapters (false: combine with lora_target_modules)
+  lr: 1.0e-4                # default: learning_rate
+  layer: 1                  # default: the manifest's layer
+  init_std: 0.02            # W_k init; W_v = 0, gains = 1
+  table_residency: host     # host (pinned, mapped; default) or device
+  zero_token_ids: [248056, 248057]   # memory output 0 at these ids (image/video pads; the engine's rule)
+  row_shuffle: {a: 2654435761, b: 97531}   # CONTROL ARM only (default off): read row r as (r*a + b) mod R
+```
+
+`row_shuffle` is a control for A/B tests: the gather reads every table row r as `(r * a + b) mod R` (a odd and
+coprime with the row count, so a bijection), keeping the table's capacity and statistics without its n-gram
+knowledge. Off, the compiled spec is unchanged. The adapter records it (`surogate_ngram_memory.row_shuffle_a/b`), a
+trainer with another setting refuses to import it, and the engine export refuses it (`--allow-shuffled` writes an
+analysis export marked `"servable": false`).
+
+**Trainable table** (`table: trainable`): the table is not a file but an FP32 adapter tensor [rows, head_dim] on the
+device, **zero at initialisation** (step 0 is the base model bit for bit, and a row the training never reads stays an
+exact no-op), trained with `table_lr` (default: `lr`) and no weight decay; W_v starts N(0, `init_std`) like W_k. The
+forward gathers the FP32 rows rounded once to bf16; the backward scatters `dk W_k + dv W_v` into the rows it read
+(sorted by row: deterministic). Requires `lora_dtype: fp32`; at most 2^31 - 1 table values.
+
+```yaml
+ngram_memory:
+  table: trainable
+  hash: {multipliers: [23703573157769, 20109073645365, 8052911324071],
+         head_vocab_sizes: [...],   # one size (a prime) per head; offsets = running sum; rows = the total
+         ngram_size: 3, heads_per_ngram: 8, head_dim: 128, eos_token_id: 248044}
+  only: true
+  lr: 1.0e-4                # W_k, W_v, gains
+  table_lr: 1.0e-4          # the table
+  zero_token_ids: [248056, 248057]
+```
+
+A control arm without n-gram identity is the same option with `head_vocab_sizes` all 1 (every n-gram reads one row
+per head). The adapter holds the table as `...layers.L.ple.ngram_table.weight`; the engine export writes it as raw
+bf16 rows (`table.bf16`, `"format": "BF16"` in `ngram_memory.json`) and marks a control-arm table
+`"servable": false`.
+
+### Evaluation panels (`eval_panels`)
+
+Held-out panels scored by the trainer at step 0 (before any update), every `eval_panels_steps` (default
+`eval_steps`) and after the last step, each row as its own window with the trainer's per-token log-probs (chunk by
+chunk under `sequence_chunks`; chunks after the last scored token are skipped). Unlike `validation_datasets` (one
+merged, shuffled loss) every panel and every row keeps its identity, for paired comparisons of two runs:
+
+```yaml
+eval_panels:
+  - {name: P_in, path: /path/pin.jsonl, per_token: true}      # conversations (the training format)
+  - {name: P_ret, path: /path/rows.tok.jsonl}                  # or pre-tokenized {"id", "ids", "spans"} rows
+eval_panels_steps: 4
+```
+
+Outputs in `output_dir`: `eval_panels.jsonl` (step, panel, row id, scored tokens, NLL),
+`eval_panels_summary.jsonl` (per panel and step) and, for `per_token` panels at step 0 and the final eval,
+`eval_tokens_step<S>.jsonl.gz` (per scored position: log-probability and the training-split counts of the bigram and
+trigram ending there, under the n-gram memory's context rule, counted over the `train-*.bin` windows). Requires
+`gpus: 1` and `per_device_train_batch_size: 1`.
+
+A conversation starts where the position id is 0; under `sequence_chunks` each chunk receives the two tokens
+before it. The PEFT export holds the memory as `...layers.L.ple.{key_proj,value_proj,norm_key,norm_query}.weight`
+with its spec in `adapter_config.json` (`surogate_ngram_memory`); `python -m surogate.dsl.ngram_memory_export
+ADAPTER OUT` writes the engine's inputs (`ngram_memory.safetensors` in the Flash-Next layout +
+`ngram_memory.json`). An adapter with a memory is never merged into base weights. Memory statistics (gate
+distribution, output RMS over residual RMS) are logged at every logging step and appended to
+`<output_dir>/ngram_memory_stats.jsonl`. CUDA graphs are switched off; not supported with `ep_size > 1`,
+dispatch-PP, NorMuon or an FP32 residual stream.
 
 ## MoE Settings
 

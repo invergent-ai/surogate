@@ -33,6 +33,7 @@
 #include "runtime/dsl/per_layer_dims.h"
 #include "runtime/lora/lora_attention_geometry.h"
 #include "kernels/kernels.h"
+#include "runtime/ngram/ngram_memory.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/lora/lora_utils.h"
@@ -359,6 +360,11 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     runtime.mamba_head_dim = static_cast<int>(view.mamba_head_dim.value_or(0));
     runtime.ssm_state_size = static_cast<int>(view.ssm_state_size.value_or(0));
     runtime.n_groups = static_cast<int>(view.n_groups.value_or(0));
+    runtime.ngram_memory_layer = static_cast<int>(get_long_attr(module.config, "ngram_memory_layer").value_or(-1));
+    runtime.ngram_memory_spec = get_string_attr(module.config, "ngram_memory_spec").value_or(std::string());
+    if ((runtime.ngram_memory_layer >= 0) != !runtime.ngram_memory_spec.empty()) {
+        throw std::invalid_argument("ngram_memory: the IR carries ngram_memory_layer and ngram_memory_spec together");
+    }
 
     if (view.moe_intermediate_size.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
@@ -654,6 +660,7 @@ build_model_config(const Module& module, const PretrainedConfig& base, const Dsl
     cfg.UseQKNorm = base.UseQKNorm;
     cfg.SlidingWindow = base.SlidingWindow;
     cfg.LayerTypes = base.LayerTypes;
+    cfg.LayerTypeNames = base.LayerTypeNames;  // what export_model / checkpoints write back as layer_types
     cfg.UseVisualInputs = base.UseVisualInputs;
     cfg.DeepstackVisualLayers = base.DeepstackVisualLayers;
     cfg.DType = base.DType;
@@ -961,6 +968,73 @@ int count_router_fp_weights(const Module& module) {
         ++count;
     }
     return count;
+}
+
+/// `lora_expert_mask` against the model and the run's options; refused at startup. The compact expert
+/// adapters index experts by their global id through the active-expert list of the grouped GEMMs, which
+/// expert parallelism / LLEP, selective expert dequantization and rollout parity use for other meanings.
+void validate_lora_expert_mask(const modules::ModularLoRAConfig& lora,
+                               const modules::ModelConfig& model,
+                               bool is_moe,
+                               const RuntimeOptions& options,
+                               bool qlora_quantized,
+                               const std::vector<std::uint8_t>& layer_has_moe,
+                               bool log) {
+    const auto& mask = lora.expert_mask;
+    if (!mask.Enabled) return;
+    const std::string what = fmt::format("lora_expert_mask ({})", mask.Source.empty() ? "set" : mask.Source);
+    const int E = model.moe_config.has_value() ? model.moe_config->num_experts : 0;
+    if (!is_moe || E <= 0) {
+        throw std::invalid_argument(fmt::format("{}: the model ({}) has no routed experts", what, model.ModelTypeName));
+    }
+    if (options.EPSize > 1) {
+        throw std::invalid_argument(fmt::format("{} is not supported with ep_size > 1 (expert parallelism / LLEP)", what));
+    }
+    if (options.rollout_parity()) {
+        throw std::invalid_argument(fmt::format("{} is not supported with rollout parity", what));
+    }
+    if (qlora_quantized && options.SelectiveExpertDequant) {
+        throw std::invalid_argument(
+            fmt::format("{} is not supported with qlora_selective_expert_dequant; set it to false", what));
+    }
+    if (lora.applies_to_gate_up()) {
+        throw std::invalid_argument(fmt::format("{} is not supported with gate_up_proj LoRA targets", what));
+    }
+    if (mask.Layers.size() > static_cast<std::size_t>(std::max(model.NumLayers, 0))) {
+        throw std::invalid_argument(fmt::format("{} lists layer {}, but the model has {} layers", what,
+                                                mask.Layers.size() - 1, model.NumLayers));
+    }
+    std::size_t selected = 0;
+    std::string per_layer;
+    for (std::size_t l = 0; l < mask.Layers.size(); ++l) {
+        const auto& ids = mask.Layers[l];
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] < 0 || ids[i] >= E) {
+                throw std::invalid_argument(fmt::format("{}: layer {} lists expert {}, but the model has {} experts "
+                                                        "per layer (ids 0..{})", what, l, ids[i], E, E - 1));
+            }
+            if (i > 0 && ids[i] <= ids[i - 1]) {
+                throw std::invalid_argument(
+                    fmt::format("{}: layer {} must list sorted, unique expert ids (expert {} repeats or is out of "
+                                "order)", what, l, ids[i]));
+            }
+        }
+        if (!ids.empty() && l < layer_has_moe.size() && layer_has_moe[l] == 0) {
+            throw std::invalid_argument(fmt::format("{}: layer {} lists experts, but it has no routed experts", what, l));
+        }
+        selected += ids.size();
+    }
+    if (log) {
+        int moe_layers = 0;
+        for (int l = 0; l < model.NumLayers; ++l) {
+            const auto* ids = lora.masked_experts(l);
+            per_layer += (l ? "," : "") + std::to_string(ids ? ids->size() : 0);
+            moe_layers += (static_cast<std::size_t>(l) >= layer_has_moe.size() || layer_has_moe[l] != 0) ? 1 : 0;
+        }
+        std::fprintf(stderr,
+                     "[LoRA] lora_expert_mask (%s): expert LoRA on %zu of %d routed experts (K per layer: %s)\n",
+                     mask.Source.c_str(), selected, E * moe_layers, per_layer.c_str());
+    }
 }
 
 }  // namespace
@@ -1406,6 +1480,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         mIsMoEModel = (mModelConfig.architecture == modules::ArchitectureType::MoE) ||
                       (mModelConfig.architecture == modules::ArchitectureType::Hybrid) ||
                       mModelConfig.moe_config.has_value();
+        validate_lora_expert_mask(*mLoRAConfig, mModelConfig, mIsMoEModel, options, mQLoRAConfig.is_quantized(),
+                                  mRuntimeConfig.layer_has_moe, /*log=*/mShardIdx == 0);
 
         modules::ModularLoRAWeightsManager::Config wm{};
         wm.num_layers = mModelConfig.NumLayers;
@@ -1494,6 +1570,26 @@ DslModel::DslModel(const PretrainedConfig& config,
                 wm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * wm.num_grouped_experts;
             }
         }
+        if (mRuntimeConfig.ngram_memory_layer >= 0) {
+            const auto spec = ngram_memory::Spec::parse(mRuntimeConfig.ngram_memory_spec);
+            if (spec.layer != mRuntimeConfig.ngram_memory_layer || spec.layer >= mModelConfig.NumLayers) {
+                throw std::invalid_argument(fmt::format("ngram_memory: layer {} is not a layer of this {}-layer model",
+                                                        spec.layer, mModelConfig.NumLayers));
+            }
+            if (mOptions.EPSize > 1) throw std::invalid_argument("ngram_memory: not supported with ep_size > 1");
+            if (mRuntimeConfig.residual_fp32) {
+                throw std::invalid_argument("ngram_memory: not supported with an FP32 residual stream");
+            }
+            wm.ngram_memory_layer = spec.layer;
+            wm.ngram_memory_embed = spec.embed_dim();
+            wm.ngram_init_std = spec.init_std;
+            wm.ngram_row_shuffle_a = spec.row_shuffle.a;
+            wm.ngram_row_shuffle_b = spec.row_shuffle.b;
+            if (spec.trainable) {
+                wm.ngram_table_rows = static_cast<long>(spec.row_count);
+                wm.ngram_head_dim = spec.head_dim;
+            }
+        }
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
 
         modules::ModularLoRAGradsManager::Config gm{};
@@ -1525,6 +1621,10 @@ DslModel::DslModel(const PretrainedConfig& config,
                 gm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * gm.num_grouped_experts;
             }
         }
+        gm.ngram_memory_layer = wm.ngram_memory_layer;
+        gm.ngram_memory_embed = wm.ngram_memory_embed;
+        gm.ngram_table_rows = wm.ngram_table_rows;
+        gm.ngram_head_dim = wm.ngram_head_dim;
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
         std::vector<std::string> lora_grad_hook_schema_ids(
             static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));
@@ -1533,6 +1633,9 @@ DslModel::DslModel(const PretrainedConfig& config,
             lora_grad_hook_schema_ids[static_cast<std::size_t>(record.layer)] = schema_id_for_hook_target(record);
         }
         mLoRAGrads->set_schema_hook_registry(&mHookRegistry, std::move(lora_grad_hook_schema_ids));
+    } else if (mRuntimeConfig.ngram_memory_layer >= 0) {
+        // The memory's parameters are adapter tensors: without LoRA nothing would hold or train them.
+        throw std::invalid_argument("ngram_memory requires LoRA training (lora: true)");
     }
 
     for (const auto& kv : mModule->hf_mapping) {

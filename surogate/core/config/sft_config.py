@@ -283,9 +283,33 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Dropout rate for LoRA adapters.
         lora_target_modules (Optional[str], default to 'all'):
             List of comma-separated module names to apply LoRA adapters to.
+        eval_panels (Optional[list], defaults to None):
+            Held-out panels scored at step 0, every ``eval_panels_steps`` (default ``eval_steps``) and after the
+            last step: ``[{name, path[, max_rows]}]``, conversations (training format) or pre-tokenized
+            ``{"id", "ids", "spans"}`` rows. Per-row NLL -> <output_dir>/eval_panels.jsonl, per-panel NLL ->
+            eval_panels_summary.jsonl. See surogate/train/eval_panels.py.
+        ngram_memory (Optional[dict], defaults to None):
+            Hashed n-gram memory on one layer's input (qwen3_5_moe family; LoRA training): a frozen IQ4_NL
+            n-gram table read through trained projections W_k, W_v [C, E] and gate gains [C] (the engine's
+            single-stream ``ngram_ple`` prologue), e.g. ``{table: .../table.iq4nl, manifest: .../manifest.json,
+            lr: 1e-4}``. W_v starts at 0: the model at step 0 is the base model bit for bit. ``table: trainable``
+            (with ``hash: {...}`` and optional ``table_lr``) trains a zero-initialised FP32 table instead (W_v
+            random; step 0 exact through the zero table). ``only: true`` (default) trains the memory alone (no
+            LoRA adapters). Off when absent. See surogate/dsl/modules/ngram_memory.py and
+            rl/ngram-transplant-2026-10-18/INTERFACE.md.
         train_router (Optional[bool], defaults to False):
-            Train the MoE router gate weights during LoRA fine-tuning.
-            When enabled, the router weights are unfrozen and included in the adapter.
+            Add a router LoRA of rank `lora_rank` on each MoE router (`mlp.gate`: lora_A [r, hidden],
+            lora_B [num_experts, r]) and train it with the other adapters; it is exported in the adapter as
+            `mlp.gate.lora_{A,B}`. The full router weight stays frozen, like every base weight in LoRA mode.
+        lora_expert_mask (Optional[str], defaults to 'all'):
+            Which routed experts of each MoE layer get expert LoRA (the gate_proj/up_proj/down_proj targets):
+            'all' (every expert, the default), 'none' (no routed expert; shared-expert, attention,
+            linear-attention and router adapters are kept) or the path of a JSON mask file
+            {"format": "surogate-expert-mask-v1", "num_layers": L, "num_experts": E,
+            "layers": {"0": [ids...], ...}} (unlisted layers get none). Only the selected experts' adapters are
+            allocated and exported, under their global ids; adapter_config.json records the mask as
+            `surogate_expert_mask`. Not supported with ep_size > 1, qlora_selective_expert_dequant, rollout
+            parity or gate_up_proj targets.
         router_aux_loss_coef (Optional[float], defaults to None):
             MoE auxiliary (load balancing) loss coefficient. None uses the model config default.
         router_z_loss_coef (Optional[float], defaults to None):
@@ -446,6 +470,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
+    ngram_memory: dict | None = None
+    eval_panels: list | None = None
+    eval_panels_steps: int | None = None
+    # Routed experts with expert LoRA: None/'all' = every expert, 'none', or a mask file (lora_expert_mask.py).
+    lora_expert_mask: str | dict | None = None
     router_aux_loss_coef: float | None = None
     router_z_loss_coef: float | None = None
     qlora_fp4: bool | None = False
@@ -604,6 +633,34 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
         self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
         self.train_router = cfg.get("train_router", self.train_router)
+        self.eval_panels = cfg.get("eval_panels", self.eval_panels)
+        if self.eval_panels:
+            _names = []
+            for _p in self.eval_panels:
+                if not isinstance(_p, dict) or "name" not in _p or "path" not in _p:
+                    raise ValueError("eval_panels: each panel is {name, path[, max_rows]}")
+                if not os.path.exists(str(_p["path"])):
+                    raise ValueError(f"eval_panels: {_p['path']} not found")
+                _names.append(str(_p["name"]))
+            if len(set(_names)) != len(_names):
+                raise ValueError(f"eval_panels: duplicate panel names {_names}")
+        self.eval_panels_steps = cfg.get("eval_panels_steps", self.eval_panels_steps)
+        self.ngram_memory = cfg.get("ngram_memory", self.ngram_memory)
+        if self.ngram_memory:
+            from surogate.dsl.modules.ngram_memory import NgramMemoryConfig
+
+            _ngram = NgramMemoryConfig.parse({**dict(self.ngram_memory), "base_lr": self.learning_rate})
+            _ngram.check_table_file()
+            if _ngram.only:
+                # Memory-only PEFT: no LoRA adapters; the memory's dense tensors are the only trainable ones.
+                if "lora_target_modules" in cfg and list(cfg["lora_target_modules"] or []):
+                    raise ValueError("ngram_memory.only: true trains the memory alone; remove lora_target_modules "
+                                     "or set ngram_memory.only: false to combine it with LoRA")
+                if self.train_router:
+                    raise ValueError("ngram_memory.only: true trains the memory alone; train_router must be false")
+                self.lora_target_modules = []
+            self.ngram_memory = _ngram.to_dict()
+        self.lora_expert_mask = cfg.get("lora_expert_mask", self.lora_expert_mask)
         self.router_aux_loss_coef = cfg.get("router_aux_loss_coef", self.router_aux_loss_coef)
         self.router_z_loss_coef = cfg.get("router_z_loss_coef", self.router_z_loss_coef)
         self.qlora_fp4 = cfg.get("qlora_fp4", self.qlora_fp4)
@@ -1117,6 +1174,29 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture)."
             )
 
+        # Hashed n-gram memory: its parameters are adapter tensors (LoRA only); its buffers are sized on
+        # first use and its chunk carry is host-side, which a captured graph cannot do.
+        if self.ngram_memory:
+            if not self.lora:
+                raise ValueError("ngram_memory requires lora: true (its parameters train as adapter tensors)")
+            if (self.ep_size or 1) > 1:
+                raise ValueError("ngram_memory does not support ep_size > 1")
+            if self.parallelism == "dispatch_pp":
+                raise ValueError("ngram_memory does not support parallelism: dispatch_pp")
+            if self.optimizer == "normuon":
+                raise ValueError("ngram_memory requires optimizer adamw or adamw_8bit")
+            if self.adapter_path and self.adapter_init_mode == "merge":
+                raise ValueError("ngram_memory: an adapter_path is loaded as a trainable adapter "
+                                 "(adapter_init_mode: trainable); the memory cannot be merged into base weights")
+            if self.use_cuda_graphs:
+                logger.info("[ngram_memory]: disabling CUDA graphs.")
+                self.use_cuda_graphs = False
+            if self.lora_dtype != "fp32":
+                if str((self.ngram_memory or {}).get("table")) == "trainable":
+                    raise ValueError("ngram_memory: a trainable table needs lora_dtype: fp32 (its master is FP32)")
+                logger.warning(f"[ngram_memory]: lora_dtype {self.lora_dtype} keeps the memory's masters in that "
+                               "dtype; fp32 is recommended (W_v starts at 0)")
+
         # Chunked-sequence training (KV-checkpointed chunks): validate and
         # adjust flags before RuntimeOptions is constructed below.
         seq_chunks = int(self.sequence_chunks or 1)
@@ -1253,10 +1333,39 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if self.router_z_loss_coef is not None:
             self.runtime_config.router_z_loss_coef = float(self.router_z_loss_coef)
 
+    def resolve_lora_expert_mask(self):
+        """The parsed `lora_expert_mask` checked against the model and the run options (None = every expert)."""
+        from surogate.core.config.lora_expert_mask import (
+            check_lora_expert_mask_options,
+            parse_lora_expert_mask,
+            validate_lora_expert_mask,
+        )
+        from surogate.core.model.hf_config import HfConfigFactory
+
+        mask = parse_lora_expert_mask(self.lora_expert_mask)
+        if mask is None:
+            return None
+        check_lora_expert_mask_options(mask, lora=bool(self.lora), target_modules=self.lora_target_modules,
+                                       ep_size=self.ep_size, selective_expert_dequant=bool(
+                                           self.qlora_selective_expert_dequant))
+        config = self.model_info.config
+        num_experts = (HfConfigFactory.get_config_attr(config, "num_experts")
+                       or HfConfigFactory.get_config_attr(config, "n_routed_experts")
+                       or HfConfigFactory.get_config_attr(config, "num_local_experts") or 0)
+        num_layers = HfConfigFactory.get_config_attr(config, "num_hidden_layers") or 0
+        if not self.model_info.is_moe_model:
+            num_experts = 0
+        validate_lora_expert_mask(mask, num_layers=int(num_layers), num_experts=int(num_experts))
+        get_logger().info(f"lora_expert_mask ({mask.source}): expert LoRA on {mask.total()} of "
+                          f"{int(num_layers) * int(num_experts)} routed experts")
+        return mask
+
     def create_lora_config(self):
         # Only create LoRA config when lora is enabled
         # When lora=False, lora_config must be None so C++ uses full fine-tuning path
         if not self.lora:
+            if self.lora_expert_mask is not None and str(self.lora_expert_mask).strip().lower() != "all":
+                raise ValueError("lora_expert_mask requires lora: true")
             self.lora_config = None
             return
         self.lora_config = _surogate.LoRAAdapterConfig(
@@ -1268,6 +1377,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             use_rslora=False,
             train_router=self.train_router,
         )
+        mask = self.resolve_lora_expert_mask()
+        if mask is not None:
+            self.lora_config.set_expert_mask(mask.per_layer(), mask.source)
 
     def create_qlora_config(self):
         logger = get_logger()

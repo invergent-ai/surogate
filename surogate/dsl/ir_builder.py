@@ -112,3 +112,16 @@ def build_dsl_ir_for_model(
     config_json = load_hf_config(model_dir)
     architecture = resolve_architecture(config_json)
     return build_dsl_ir_from_python(architecture, config_json, extra_config=extra_config)
+
+
+def training_dsl_extra(config: Any) -> dict[str, Any] | None:
+    """Training-time options that shape the compiled graph (``extra_config`` of build_dsl_ir_for_model):
+    ``ep_size`` when expert parallelism is on; ``ngram_memory`` (the hashed n-gram memory, resolved by the
+    config: surogate/dsl/modules/ngram_memory.py)."""
+    extra: dict[str, Any] = {}
+    if (getattr(config, "ep_size", 1) or 1) > 1:
+        extra["ep_size"] = config.ep_size
+    ngram_memory = getattr(config, "ngram_memory", None)
+    if ngram_memory:
+        extra["ngram_memory"] = dict(ngram_memory)
+    return extra or None

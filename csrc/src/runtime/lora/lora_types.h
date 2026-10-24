@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -145,9 +146,15 @@ template <typename TTensor>
 struct LoRAGroupedLayerWeights {
     TTensor A;  ///< (num_experts, rank, in_features)
     TTensor B;  ///< (num_experts, out_features, rank)
+    /// Compact layout (`lora_expert_mask`): row s of A/B is the adapter of global expert expert_ids[s]
+    /// (sorted, fewer than the layer's experts). Empty = one row per expert (the EP-local shard under EP).
+    std::vector<int> expert_ids;
 
     [[nodiscard]] bool has_value() const {
         return A.Data != nullptr;
+    }
+    [[nodiscard]] bool is_compact() const {
+        return !expert_ids.empty();
     }
 };
 
@@ -165,7 +172,60 @@ struct LoRAGroupedExpertWeights {
         return (gate.has_value() && gate->has_value()) || (gate_up.has_value() && gate_up->has_value()) ||
                (up.has_value() && up->has_value()) || (down.has_value() && down->has_value());
     }
+
+    /// The compact layout's global expert ids (shared by every projection of the layer), or nullptr when
+    /// the adapters hold one row per expert.
+    [[nodiscard]] const std::vector<int>* compact_expert_ids() const {
+        for (const auto* p : {&gate, &gate_up, &up, &down}) {
+            if (p->has_value() && (*p)->is_compact()) return &(*p)->expert_ids;
+        }
+        return nullptr;
+    }
 };
+
+/// Active-expert arguments of one grouped expert-LoRA GEMM (moe_grouped_gemm and its weight gradient):
+/// the experts to visit, how many, and whether the LoRA tensor is compact (row e = active[e]).
+struct GroupedLoRAExperts {
+    const int* active = nullptr;
+    int num_active = -1;
+    bool compact = false;
+    std::vector<int> fallback;  ///< Storage for `active` when it is synthesised
+};
+
+/// Resolve the active-expert arguments for a grouped LoRA tensor with `weight_rows` rows. `mask_ids` are the
+/// layer's compact (`lora_expert_mask`) expert ids or nullptr; `base_active`/`base_num_active` are those of
+/// the base expert GEMM. Without a mask this is the long-standing rule: a LoRA tensor with fewer rows than
+/// experts is compact over the base GEMM's active experts, or over rows 0..rows-1 when it has none. With a
+/// mask, row s is expert mask_ids[s], so only the selected experts' tokens are visited.
+inline void resolve_grouped_lora_experts(GroupedLoRAExperts& out,
+                                         const std::vector<int>* mask_ids,
+                                         int weight_rows,
+                                         int num_experts,
+                                         const int* base_active,
+                                         int base_num_active) {
+    out.fallback.clear();
+    if (mask_ids && !mask_ids->empty()) {
+        if (weight_rows != static_cast<int>(mask_ids->size())) {
+            throw std::logic_error("grouped expert LoRA: compact tensor rows do not match lora_expert_mask ids");
+        }
+        out.active = mask_ids->data();
+        out.num_active = static_cast<int>(mask_ids->size());
+        out.compact = true;
+        return;
+    }
+    out.compact = (weight_rows != num_experts);
+    out.active = base_active;
+    out.num_active = base_num_active;
+    if (out.compact && (out.active == nullptr || out.num_active <= 0 || out.num_active > weight_rows)) {
+        const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
+        out.fallback.resize(static_cast<std::size_t>(fallback_count));
+        for (int i = 0; i < fallback_count; ++i) {
+            out.fallback[static_cast<std::size_t>(i)] = i;
+        }
+        out.active = out.fallback.empty() ? nullptr : out.fallback.data();
+        out.num_active = fallback_count;
+    }
+}
 
 template <typename TTensor>
 struct LoRAMoEWeights {
@@ -214,6 +274,15 @@ struct LoRABlockWeights {
     LoRAMoEWeights<TTensor> moe;  ///< For MoE models (per-expert LoRA)
     std::optional<LoRALayerWeights<TTensor>>
         router;  ///< Router gate LoRA for MoE (when train_router enabled) - PEFT-compatible
+    /// Hashed n-gram memory of this layer (runtime/ngram/ngram_memory.h): dense adapter tensors, not
+    /// low-rank pairs. ngram_proj: A = W_k [C, E], B = W_v [C, E]; ngram_gain: A = g_k [C], B = g_q [C]
+    /// (the gate's folded RMSNorm gains). Only the memory's layer carries them.
+    std::optional<LoRALayerWeights<TTensor>> ngram_proj;
+    std::optional<LoRALayerWeights<TTensor>> ngram_gain;
+    /// The trainable n-gram table (table_mode trainable): A = the table [rows, head_dim] (FP32 master, zero at
+    /// initialisation; the forward reads the master and rounds each gathered value to the working dtype), B unused
+    /// (empty). Masters and gradients only: the work set carries no copy.
+    std::optional<LoRALayerWeights<TTensor>> ngram_table;
 };
 
 /**
@@ -258,6 +327,9 @@ enum class LoRATargetId : std::uint8_t {
     LinA,    ///< linear-attention in_proj_a
     LinB,    ///< linear-attention in_proj_b
     LinOut,  ///< linear-attention out_proj
+    NgramProj,  ///< n-gram memory key/value projections (dense; the memory's layer only)
+    NgramGain,  ///< n-gram memory gate gains (dense; the memory's layer only)
+    NgramTable, ///< n-gram memory trainable table (dense rows; the memory's layer only)
     Unknown = 255,
 };
 
@@ -303,6 +375,9 @@ inline LoRALayerWeights<TTensor>* get_layer_weight_by_target(LoRABlockWeights<TT
         case LoRATargetId::LinA: return block.linear_attn.in_proj_a.has_value() ? &*block.linear_attn.in_proj_a : nullptr;
         case LoRATargetId::LinB: return block.linear_attn.in_proj_b.has_value() ? &*block.linear_attn.in_proj_b : nullptr;
         case LoRATargetId::LinOut: return block.linear_attn.out_proj.has_value() ? &*block.linear_attn.out_proj : nullptr;
+        case LoRATargetId::NgramProj: return block.ngram_proj.has_value() ? &*block.ngram_proj : nullptr;
+        case LoRATargetId::NgramGain: return block.ngram_gain.has_value() ? &*block.ngram_gain : nullptr;
+        case LoRATargetId::NgramTable: return block.ngram_table.has_value() ? &*block.ngram_table : nullptr;
         case LoRATargetId::SharedUp:
             return (block.moe.shared.has_value() && block.moe.shared->up.has_value()) ? &*block.moe.shared->up
                                                                                       : nullptr;
@@ -413,6 +488,13 @@ inline void for_each_lora_layer_weight(LoRABlockWeights<TTensor>& block, Fn&& fn
     if (auto* layer = get_layer_weight_by_target(block, LoRATargetId::Router)) {
         fn(LoRATargetId::Router, *layer);
     }
+
+    // Last, so the order (and every ordinal derived from it) of adapters without a memory is unchanged.
+    for (LoRATargetId id : {LoRATargetId::NgramProj, LoRATargetId::NgramGain, LoRATargetId::NgramTable}) {
+        if (auto* layer = get_layer_weight_by_target(block, id)) {
+            fn(id, *layer);
+        }
+    }
 }
 
 template <typename TWeightTensor, typename TGradTensor, typename Fn>
@@ -456,6 +538,9 @@ inline void for_each_lora_layer_weight_pair(LoRABlockWeights<TWeightTensor>& wei
         visit_pair(id);
     }
     visit_pair(LoRATargetId::Router);
+    visit_pair(LoRATargetId::NgramProj);
+    visit_pair(LoRATargetId::NgramGain);
+    visit_pair(LoRATargetId::NgramTable);
 }
 
 /// Stable integer key for a LoRA target, used to seed per-projection

@@ -236,6 +236,14 @@ public:
     const DslRuntimeConfig& runtime_config() const {
         return mRuntimeConfig;
     }
+
+    /// Hashed n-gram memory (runtime/ngram/ngram_memory.h). `NgramCarry` [B, 2]: the two tokens
+    /// before sequence chunk `NgramCarryChunk` (oldest first, -1 = none), set by the chunked step
+    /// before each chunk. `NgramStats`: device FP32 running statistics (kGlobalStats), allocated
+    /// by the memory's first forward.
+    std::vector<std::int32_t> NgramCarry;
+    int NgramCarryChunk = -1;
+    Tensor NgramStats;
     bool is_prequantized() const {
         return mPrequantized;
     }

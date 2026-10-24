@@ -140,6 +140,10 @@ public:
     // ---- Chunked-sequence training (KV-checkpointed chunks) ----
     void set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack = nullptr) override;
     void zero_sequence_chunk_dkv() override;
+    void set_ngram_carry(const std::int32_t* carry, int B, int chunk) override;
+    /// Hashed n-gram memory running statistics (ngram_memory::kGlobalStats floats; empty without
+    /// a memory); `reset` zeroes them after the read.
+    std::vector<float> ngram_memory_stats(bool reset);
     void forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
 
     // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) --

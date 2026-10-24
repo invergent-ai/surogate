@@ -392,6 +392,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
             }
             if (up_ptr && up_ptr->has_value()) {
                 const auto& lora_up = *up_ptr;
+                // lora_expert_mask: a compact adapter (row s = expert lora_mask_ids[s]); its GEMMs visit only
+                // the selected experts' tokens and accumulate into their own rows.
+                const std::vector<int>* lora_mask_ids = lora_up.is_compact() ? &lora_up.expert_ids : nullptr;
                 const int rank = mLoRAConfig->rank;
                 const float scaling = mLoRAConfig->scaling();
                 const float dropout = mLoRAConfig->dropout;
@@ -454,20 +457,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                             }
                         }
                     }
-                    const bool lora_weight_is_compact = (weight_rows != num_experts);
-                    const int* lora_active_ptr = active_ptr;
-                    int lora_num_active = num_active;
-                    std::vector<int> fallback_active;
-                    if (lora_weight_is_compact &&
-                        (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
-                        const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
-                        fallback_active.resize(static_cast<std::size_t>(fallback_count));
-                        for (int i = 0; i < fallback_count; ++i) {
-                            fallback_active[static_cast<std::size_t>(i)] = i;
-                        }
-                        lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
-                        lora_num_active = fallback_count;
-                    }
+                    modules::GroupedLoRAExperts lora_experts;
+                    modules::resolve_grouped_lora_experts(lora_experts, lora_mask_ids, weight_rows, num_experts,
+                                                          active_ptr, num_active);
+                    const bool lora_weight_is_compact = lora_experts.compact;
+                    const int* lora_active_ptr = lora_experts.active;
+                    const int lora_num_active = lora_experts.num_active;
                     if (in_t.DType == ETensorDType::BF16) {
                         moe_grouped_gemm(out_t.get<nv_bfloat16>(),
                                          in_t.get<nv_bfloat16>(),
@@ -917,6 +912,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             }
             if (up_ptr && up_ptr->has_value()) {
                 const auto& lora_up = *up_ptr;
+                // lora_expert_mask: a compact adapter (row s = expert lora_mask_ids[s]); its GEMMs visit only
+                // the selected experts' tokens and accumulate into their own rows.
+                const std::vector<int>* lora_mask_ids = lora_up.is_compact() ? &lora_up.expert_ids : nullptr;
                 const int rank = mLoRAConfig->rank;
                 const float scaling = mLoRAConfig->scaling();
                 const float dropout = mLoRAConfig->dropout;
@@ -979,20 +977,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                             }
                         }
                     }
-                    const bool lora_weight_is_compact = (weight_rows != num_experts);
-                    const int* lora_active_ptr = active_ptr;
-                    int lora_num_active = num_active;
-                    std::vector<int> fallback_active;
-                    if (lora_weight_is_compact &&
-                        (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
-                        const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
-                        fallback_active.resize(static_cast<std::size_t>(fallback_count));
-                        for (int i = 0; i < fallback_count; ++i) {
-                            fallback_active[static_cast<std::size_t>(i)] = i;
-                        }
-                        lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
-                        lora_num_active = fallback_count;
-                    }
+                    modules::GroupedLoRAExperts lora_experts;
+                    modules::resolve_grouped_lora_experts(lora_experts, lora_mask_ids, weight_rows, num_experts,
+                                                          active_ptr, num_active);
+                    const bool lora_weight_is_compact = lora_experts.compact;
+                    const int* lora_active_ptr = lora_experts.active;
+                    const int lora_num_active = lora_experts.num_active;
                     if (in_t.DType == ETensorDType::BF16) {
                         moe_grouped_gemm(out_t.get<nv_bfloat16>(),
                                          in_t.get<nv_bfloat16>(),
@@ -1056,20 +1046,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                                 }
                             }
                         }
-                        const bool lora_weight_is_compact = (weight_rows != num_experts);
-                        const int* lora_active_ptr = active_ptr;
-                        int lora_num_active = num_active;
-                        std::vector<int> fallback_active;
-                        if (lora_weight_is_compact &&
-                            (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
-                            const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
-                            fallback_active.resize(static_cast<std::size_t>(fallback_count));
-                            for (int i = 0; i < fallback_count; ++i) {
-                                fallback_active[static_cast<std::size_t>(i)] = i;
-                            }
-                            lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
-                            lora_num_active = fallback_count;
-                        }
+                        modules::GroupedLoRAExperts lora_experts;
+                        modules::resolve_grouped_lora_experts(lora_experts, lora_mask_ids, weight_rows, num_experts,
+                                                              active_ptr, num_active);
+                        const bool lora_weight_is_compact = lora_experts.compact;
+                        const int* lora_active_ptr = lora_experts.active;
+                        const int lora_num_active = lora_experts.num_active;
                         if (grad_output.DType == ETensorDType::BF16) {
                             if (d_weight_view.DType != ETensorDType::BF16) {
                                 throw std::runtime_error(

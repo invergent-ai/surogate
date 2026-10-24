@@ -8,8 +8,20 @@
 #include <cmath>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "utilities/dtype.h"
+
+//! Which routed experts of each MoE layer get expert LoRA (`lora_expert_mask`).
+//! Disabled (the default) = every expert of every MoE layer, today's behaviour. Enabled: layer `l`
+//! adapts exactly `Layers[l]` (sorted, unique global expert ids); a layer past the end of `Layers`
+//! adapts none, so `none` is an enabled mask with no layers. Shared-expert, attention, linear-attention
+//! and router adapters do not depend on it.
+struct LoRAExpertMask {
+    bool Enabled = false;
+    std::vector<std::vector<int>> Layers;
+    std::string Source;  ///< "none", or the mask file's path: names the mask in messages and adapter_config.json
+};
 
 //! LoRA (Low-Rank Adaptation) adapter hyperparameters.
 //! This is the user-facing configuration (CLI/python) for adapter training.
@@ -22,7 +34,8 @@ struct LoRAAdapterConfig {
     bool InitAKaimingUniform = true;
     bool UseRSLoRA = false;
     std::string FanInFanOut = "fan_in";
-    bool TrainRouter = false;  ///< Train MoE router gate during LoRA fine-tuning
+    bool TrainRouter = false;  ///< Router LoRA (rank Rank on mlp.gate) during LoRA fine-tuning
+    LoRAExpertMask ExpertMask;  ///< Per-layer routed-expert selection for expert LoRA (default: all experts)
 
     [[nodiscard]] float scaling() const {
         if (UseRSLoRA) {
