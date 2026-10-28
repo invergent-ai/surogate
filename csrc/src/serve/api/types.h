@@ -413,11 +413,23 @@ struct StopString {
     bool include_in_output = false;
 };
 
+/// Ends a thought that runs away (FinishReason::ThinkingGuard): once it is `token_limit` tokens
+/// long (0: no limit), and, with `loop`, once it goes round in circles (ThinkingLoopDetector).
+/// The round that trips it is accepted whole; the caller then closes the thought itself and asks
+/// for the answer. A thought that closes in the same round is not ended.
+struct ThinkingGuard {
+    std::uint32_t token_limit = 0;
+    bool loop                 = false;
+
+    [[nodiscard]] bool active() const noexcept { return token_limit != 0 || loop; }
+};
+
 struct StopPolicy {
     std::vector<TokenId> token_ids;
     std::vector<StopString> strings;
     bool include_model_defaults = true;
     bool publish_stop_token     = false;
+    ThinkingGuard thinking_guard;
 };
 
 class CompiledTokenConstraint;
@@ -774,6 +786,8 @@ enum class FinishReason : std::uint8_t {
     StopToken,
     StopString,
     Cancelled,
+    /// StopPolicy::thinking_guard ended the thought; the request has not answered yet.
+    ThinkingGuard,
 };
 
 struct TokenLogprob {

@@ -231,6 +231,13 @@ turns back as content and tool calls only can be served with `--thinking-retenti
 ([CLI](cli.md#thinking)): the server keeps the reasoning it generated and puts it back into those
 turns itself, per API key and model.
 
+A server started with `--thinking-loop-guard` or `--thinking-answer-reserve N` ([CLI](cli.md#thinking-guard))
+closes a thought that loops, or that would leave no room for the answer, instead of returning an empty answer.
+- The reasoning then ends with the sentence "Considering the limited time by the user, I have to give the
+  solution based on the thinking directly now."
+- The answer follows in the same response, and `usage` and `finish_reason` describe the whole reply.
+- Nothing changes for a request whose thought ends by itself.
+
 ### Not supported
 
 These are refused with a `400` and a specific error code rather than silently ignored:

@@ -75,6 +75,8 @@ const char* finish_reason_name(sinfer::FinishReason reason) {
         return "stop_string";
     case sinfer::FinishReason::Cancelled:
         return "cancelled";
+    case sinfer::FinishReason::ThinkingGuard:
+        return "thinking_guard";
     }
     return "unknown";
 }

@@ -142,6 +142,16 @@ void finalize_output_text(GenerationOutcome& outcome, ReasoningFormat format,
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
 ApiError request_error_to_api_error(const sinfer::RequestError& exception);
 
+/// What answering after a thought the guard ended takes (--thinking-loop-guard, --thinking-answer-reserve;
+/// StopPolicy::thinking_guard): the prompt as it was submitted, the request's options with the guard off, and its
+/// adapter's lease, so the answer runs on the same adapter. `guard` is what the request was armed with.
+struct ThinkingGuardContinuation {
+    sinfer::PreparedPrompt prompt;
+    sinfer::RequestOptions options;
+    std::shared_ptr<void> adapter;
+    sinfer::ThinkingGuard guard;
+};
+
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
@@ -178,6 +188,8 @@ struct PreparedRequest {
     bool return_token_ids = false;
     bool return_routed_experts = false;
     std::vector<sinfer::TokenId> prompt_token_ids;
+    /// Set when the thinking guard is armed for this request (GenerationService::prepare says when).
+    std::shared_ptr<ThinkingGuardContinuation> thinking_guard;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -316,6 +328,11 @@ private:
     [[nodiscard]] bool completed_reasoning_needs_preserve() const;
     GenerationOutcome run_parallel(PreparedRequest& prepared, const StreamSink* sink,
                                     const std::function<bool()>& is_cancelled);
+    /// A thought the guard ended (FinishReason::ThinkingGuard): close it with thinking_guard_close_ and generate the
+    /// answer in what is left of the output budget, on the same stream; `result` becomes the whole reply. With no
+    /// room left, or with the answer refused a queue place, the reply ends as the output limit would have ended it.
+    void answer_after_thinking_guard(PreparedRequest& prepared, sinfer::GenerationResult& result,
+                                     sinfer::OutputSink* sink, const sinfer::CancellationView& cancellation);
 
     /// One candidate-logit row per query, read at the first generated position.
     struct CandidateReadout {
@@ -351,6 +368,13 @@ private:
     sinfer::PromptCapabilities prompt_capabilities_;
     /// --tool-call-parser qwen3_coder (serve/vllm_qwen3_parser.h): the tokenizer facts the parser needs.
     std::optional<vllm_qwen3::Vocabulary> qwen3_vocabulary_;
+    /// --thinking-loop-guard / --thinking-answer-reserve: the tokens that close a thought the guard ended -- a line
+    /// saying the answer follows (thinking_guard_note_, which the stream shows as reasoning), the model's reasoning
+    /// close marker and the answer separator -- and how many of them are still thought (all but the separator).
+    /// Empty when the guard is off or the model has no single close token, which leaves the guard unarmed.
+    std::vector<sinfer::TokenId> thinking_guard_close_;
+    std::size_t thinking_guard_close_thought_ = 0;
+    std::string thinking_guard_note_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     bool shared_training_ = false; // guarded by request_capacity_->mutex
     std::mutex decision_codes_mutex_;

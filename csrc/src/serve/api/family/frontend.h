@@ -64,6 +64,9 @@ public:
     /// rewrite checkpoint) kept. A request preempted under --kv-admission ondemand resumes
     /// from this.
     [[nodiscard]] PreparedPrompt with_continuation(std::span<const TokenId> generated) const;
+    /// with_continuation, for tokens that also close the prompt's thought: what is generated after
+    /// them is read as the answer (StopPolicy::thinking_guard's continuation).
+    [[nodiscard]] PreparedPrompt with_answer_continuation(std::span<const TokenId> tokens) const;
 
 private:
     explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;

@@ -7,6 +7,7 @@
 #include "family/impl/frontend/media_cache.h"
 #include "family/impl/frontend/processor.h"
 #include "family/impl/frontend/test_access.h"
+#include "family/impl/frontend/thinking_loop.h"
 #include "family/impl/frontend/tokenizer.h"
 #include "text/unicode.h"
 #include "runtime/contract/constraint.h"
@@ -717,6 +718,7 @@ VisionItem convert_vision_item(fi::VisionItem item) {
 StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& caller) {
     StopPolicy result;
     result.publish_stop_token = caller.publish_stop_token;
+    result.thinking_guard     = caller.thinking_guard;
     const auto append_token   = [&](TokenId token) {
         if (!tokenizer.is_valid_token(token)) {
             throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
@@ -1369,6 +1371,8 @@ public:
     DecoderState preview_state;
     PublishedOutput preview_output;
     bool preview_ready = false;
+    /// policy.thinking_guard.loop: fed every thought token as it is previewed (thinking_loop.h).
+    ThinkingLoopDetector thinking_loop;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1425,6 +1429,12 @@ PreparedPrompt PreparedPrompt::with_continuation(std::span<const TokenId> genera
     // Unlike a raw suffix, generated tokens are exactly what the request's own sequence holds
     // after its prompt (ResidentPrefixIdentity::append_generated), so its identity still holds.
     out.data_->identity = data_->identity;
+    return out;
+}
+
+PreparedPrompt PreparedPrompt::with_answer_continuation(std::span<const TokenId> tokens) const {
+    PreparedPrompt out              = with_continuation(tokens);
+    out.data_->starts_in_reasoning = false;
     return out;
 }
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
@@ -1523,6 +1533,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };
 
+    const ThinkingGuard& guard = impl_->policy.thinking_guard;
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
         const TokenId token       = tokens[index];
@@ -1531,7 +1542,10 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                     std::to_string(token));
         }
 
-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->preview_state.in_reasoning) {
+            ++impl_->preview_state.reasoning_tokens;
+            if (guard.loop) { (void)impl_->thinking_loop.push(token); }
+        }
 
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
@@ -1571,6 +1585,18 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
+    // The guard takes the round whole and ends a thought that is still open at its end; one that
+    // closed in this round goes on to answer by itself. A round that ends inside a code point or
+    // on what may be the start of the close marker waits for the next, so the thought is cut
+    // cleanly and is not cut while the model is closing it.
+    const DecoderState& end = impl_->preview_state;
+    const bool guard_trips  = end.in_reasoning && end.utf8_pending.empty() && end.think_marker_pending.empty() &&
+                             ((guard.token_limit != 0 && end.reasoning_tokens >= guard.token_limit) ||
+                              (guard.loop && impl_->thinking_loop.looping()));
+    if (guard_trips) {
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        return complete(count, FinishReason::ThinkingGuard);
+    }
     if (tokens.size() == budget_remaining) {
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);

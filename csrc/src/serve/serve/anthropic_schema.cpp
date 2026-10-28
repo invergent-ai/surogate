@@ -581,6 +581,7 @@ const char* messages_stop_reason(sinfer::FinishReason reason, bool has_tool_call
     switch (reason) {
     case sinfer::FinishReason::OutputLimit:
     case sinfer::FinishReason::ContextCapacity:
+    case sinfer::FinishReason::ThinkingGuard: // a thought ended with no room left to answer
         return "max_tokens";
     case sinfer::FinishReason::StopString:
         return "stop_sequence";

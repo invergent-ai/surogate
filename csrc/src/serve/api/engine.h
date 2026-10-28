@@ -91,6 +91,12 @@ public:
     /// Continue an already prepared prompt without losing image payloads or mRoPE positions.
     [[nodiscard]] PreparedPrompt continue_prompt(const PreparedPrompt& prompt,
                                                  std::span<const TokenId> suffix = {}) const;
+    /// Continue a prompt by what its request generated and the tokens that close the thought, to
+    /// be answered (FinishReason::ThinkingGuard): as continue_prompt, but the prompt keeps its
+    /// prefix identity, so the request's own resident state is reused, and its output starts in
+    /// the answer.
+    [[nodiscard]] PreparedPrompt continue_answer(const PreparedPrompt& prompt,
+                                                 std::span<const TokenId> continuation) const;
 
     /// A prompt served exactly as written, with no chat template: what `/v1/completions` sends,
     /// and the only shape a base model can be asked anything in.

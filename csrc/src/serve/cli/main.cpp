@@ -89,6 +89,8 @@ std::string format_finish(sinfer::FinishReason reason) {
         return "stop-string";
     case sinfer::FinishReason::Cancelled:
         return "cancelled";
+    case sinfer::FinishReason::ThinkingGuard:
+        return "thinking-guard";
     }
     return "unknown";
 }
