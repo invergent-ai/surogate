@@ -776,6 +776,7 @@ std::string response_status(sinfer::FinishReason reason) {
     switch (reason) {
     case sinfer::FinishReason::OutputLimit:
     case sinfer::FinishReason::ContextCapacity:
+    case sinfer::FinishReason::ThinkingGuard: // a thought ended with no room left to answer
         return "incomplete";
     case sinfer::FinishReason::Cancelled:
         return "cancelled";

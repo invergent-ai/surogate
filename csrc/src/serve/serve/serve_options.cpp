@@ -236,7 +236,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--capture-routing] "
            "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] "
-           "[--thinking-retention off|loop|all] [--thinking-retention-mb N] [--thinking-retention-ttl T] [--cors] "
+           "[--thinking-retention off|loop|all] [--thinking-retention-mb N] [--thinking-retention-ttl T] "
+           "[--thinking-loop-guard] [--thinking-answer-reserve N] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
            "[--decision-attempts N]\n"
@@ -303,6 +304,12 @@ std::string serve_usage_text(const char* argv0) {
            "         --thinking-retention-mb (default 512) MiB whose entries expire --thinking-retention-ttl\n"
            "         (default 6h; seconds or an s/m/h/d suffix) after their last use. Restored reasoning never\n"
            "         pushes a prompt past the context less the request's max_tokens.\n"
+           "       --thinking-loop-guard closes a thought that goes round in circles (90% of its last 2,048\n"
+           "         tokens repeat 32-token runs it has written twice before), and --thinking-answer-reserve N one\n"
+           "         that reaches the request's output budget less min(N, budget/4) tokens; the request then\n"
+           "         answers in what is left of its budget, so a runaway thought does not end in an empty answer.\n"
+           "         Off by default. Not applied to requests for logprobs, token ids or routed experts, to the\n"
+           "         tool grammar (tool_choice required or named, strict tools) or to parallel decoding.\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --reasoning-parser selects how a reasoning span is recognised (default qwen3);\n"
@@ -815,6 +822,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--thinking-retention-ttl") {
             options.thinking_retention_ttl_seconds =
                 parse_duration_seconds(require_value("--thinking-retention-ttl"), "thinking-retention-ttl");
+        } else if (arg == "--thinking-loop-guard") {
+            options.thinking_loop_guard = true;
+        } else if (arg == "--thinking-answer-reserve") {
+            options.thinking_answer_reserve = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--thinking-answer-reserve"), "thinking-answer-reserve"));
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

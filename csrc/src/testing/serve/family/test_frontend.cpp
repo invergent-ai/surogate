@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1603,6 +1604,122 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+sinfer::family::PreparedPrompt thinking_prompt(const Frontend& frontend) {
+    sinfer::ChatMessage message;
+    message.role = sinfer::ChatRole::User;
+    message.parts.push_back(
+        sinfer::MessagePart{.kind = sinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    sinfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    return frontend.prepare(std::move(input));
+}
+
+// Feeds a thought three tokens a round, `next()` choosing each, until the session finishes or
+// `limit` tokens went in; returns the finish reason, the last round's accepted count and the
+// tokens fed.
+template <typename Next>
+std::tuple<sinfer::FinishReason, std::uint32_t, std::size_t> feed_thought(
+    sinfer::family::OutputSession& session, Next next, std::size_t limit) {
+    sinfer::FinishReason reason = sinfer::FinishReason::None;
+    std::uint32_t accepted      = 0;
+    std::size_t fed             = 0;
+    while (reason == sinfer::FinishReason::None && fed < limit) {
+        std::array<sinfer::TokenId, 3> round{};
+        for (sinfer::TokenId& token : round) { token = next(fed++); }
+        const auto decision = session.preview(round, 1U << 20, sinfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        reason   = decision.finish_reason;
+        accepted = decision.accepted_tokens;
+    }
+    return {reason, accepted, fed};
+}
+
+// StopPolicy::thinking_guard (--thinking-loop-guard, --thinking-answer-reserve; thinking_loop.h).
+int test_thinking_guard(const Frontend& frontend) {
+    int failures = 0;
+    // Tokens that decode inside the thought without closing it or holding back a marker prefix.
+    constexpr std::array<sinfer::TokenId, 7> plain{0, 1, 2, 7, 30, 31, 32};
+    sinfer::StopPolicy loop;
+    loop.thinking_guard.loop = true;
+    {
+        // A thought that cycles (period 5) repeats every position from its 42nd token on, so the
+        // first round past 2,048 tokens ends it, taken whole.
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(prompt, loop);
+        const auto [reason, accepted, fed] =
+            feed_thought(session, [&](std::size_t i) { return plain[i % 5]; }, 20000);
+        failures += check(reason == sinfer::FinishReason::ThinkingGuard && accepted == 3 && fed == 2049,
+                          "the loop guard did not end a cycling thought at the first round past 2,048 tokens");
+        failures += check(session.reasoning_tokens() == fed, "a guarded thought miscounted its tokens");
+    }
+    {
+        // A thought that does not repeat itself is never ended.
+        auto prompt          = thinking_prompt(frontend);
+        auto session         = frontend.make_output_session(prompt, loop);
+        std::uint64_t state  = 20261028;
+        const auto random    = [&](std::size_t) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            return plain[(state >> 33U) % plain.size()];
+        };
+        const auto [reason, accepted, fed] = feed_thought(session, random, 9000);
+        (void)accepted;
+        failures += check(reason == sinfer::FinishReason::None && fed == 9000,
+                          "the loop guard ended a thought that does not repeat itself");
+    }
+    {
+        // The token limit ends the thought at the round that reaches it, taken whole.
+        sinfer::StopPolicy limit;
+        limit.thinking_guard.token_limit = 10;
+        auto prompt  = thinking_prompt(frontend);
+        auto session = frontend.make_output_session(prompt, limit);
+        const auto [reason, accepted, fed] =
+            feed_thought(session, [&](std::size_t i) { return plain[i % plain.size()]; }, 100);
+        failures += check(reason == sinfer::FinishReason::ThinkingGuard && accepted == 3 && fed == 12 &&
+                              session.reasoning_tokens() == 12,
+                          "the thinking token limit did not end the thought at the round reaching it");
+    }
+    {
+        // A round that ends on a close marker in progress waits for the next, and a thought that
+        // closes is left to answer: the guard never cuts the model's own close.
+        sinfer::StopPolicy limit;
+        limit.thinking_guard.token_limit = 1;
+        auto prompt          = thinking_prompt(frontend);
+        auto session         = frontend.make_output_session(prompt, limit);
+        const auto opening   = session.preview(std::array<sinfer::TokenId, 1>{3}, 8, sinfer::FinishReason::OutputLimit);
+        const auto thought   = session.commit_preview();
+        const auto closing   = session.preview(std::array<sinfer::TokenId, 1>{4}, 7, sinfer::FinishReason::OutputLimit);
+        const auto answer    = session.commit_preview();
+        failures += check(opening.finish_reason == sinfer::FinishReason::None &&
+                              closing.finish_reason == sinfer::FinishReason::None,
+                          "the guard cut a thought while it was being closed");
+        failures += check(channel_text(thought, sinfer::OutputChannel::Reasoning) +
+                                      channel_text(answer, sinfer::OutputChannel::Reasoning) == "thought" &&
+                              channel_text(answer, sinfer::OutputChannel::Content) == "answer",
+                          "a thought closing under the guard's limit lost its answer");
+    }
+    {
+        // The continuation after a guarded thought: the prompt keeps its identity and the output
+        // starts in the answer.
+        auto prompt         = thinking_prompt(frontend);
+        const auto continued = prompt.with_answer_continuation(std::array<sinfer::TokenId, 2>{0, 248069});
+        const auto& before   = FrontendFactory::inspect(prompt);
+        const auto& after    = FrontendFactory::inspect(continued);
+        failures += check(before.starts_in_reasoning && !after.starts_in_reasoning &&
+                              after.identity.reusable == before.identity.reusable &&
+                              after.token_ids.size() == before.token_ids.size() + 2,
+                          "an answer continuation did not keep the prompt's identity or start in the answer");
+        auto session         = frontend.make_output_session(continued, {});
+        (void)session.preview(std::array<sinfer::TokenId, 1>{2}, 8, sinfer::FinishReason::OutputLimit);
+        const auto output    = session.commit_preview();
+        failures += check(channel_text(output, sinfer::OutputChannel::Content) == "OPtail" &&
+                              channel_text(output, sinfer::OutputChannel::Reasoning).empty(),
+                          "an answer continuation's output was read as a thought");
+    }
+    return failures;
+}
+
 // #102: a round may cross the model-opened reasoning boundary repeatedly,
 // including several markers inside one decoded token. Stops snapshot this output.
 int test_muse_output_headers() {
@@ -2203,6 +2320,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_thinking_guard(frontend);
     failures += test_interleaved_reasoning_round();
     failures += test_muse_output_headers();
     failures += test_terminal_reasoning_preserves_content_stop_prefix();

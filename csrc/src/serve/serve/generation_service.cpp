@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <cstddef>
@@ -415,6 +418,18 @@ private:
     std::string streamed_;
 };
 
+/// The answer after a thought the guard ended goes on the request's own stream, whose prompt was reported ready
+/// already (a stream hears that once).
+class ContinuationOutputSink final : public sinfer::OutputSink {
+public:
+    explicit ContinuationOutputSink(sinfer::OutputSink& stream) : stream_(&stream) {}
+    void publish(sinfer::OutputDelta delta) override { stream_->publish(std::move(delta)); }
+    void publish_scores(TokenScoreDelta delta) override { stream_->publish_scores(std::move(delta)); }
+
+private:
+    sinfer::OutputSink* stream_ = nullptr;
+};
+
 } // namespace
 
 void finalize_output_text(GenerationOutcome& outcome, ReasoningFormat format,
@@ -570,6 +585,27 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         vllm_qwen3::Vocabulary vocabulary;
         for (const auto& special : engine_->named_special_tokens()) { vocabulary.special_tokens.push_back(special.second); }
         qwen3_vocabulary_ = std::move(vocabulary);
+    }
+    // --thinking-loop-guard / --thinking-answer-reserve: a thought the guard ends is closed the way Qwen3's thinking
+    // budget closes one (Qwen3 Technical Report, 2025, "thinking budget"), with the model's own close token and, for
+    // </think>, the blank line its answers start after. A model with no single close token is served without it.
+    if (options_.thinking_loop_guard || options_.thinking_answer_reserve != 0) {
+        const std::string close_text = engine_->reasoning_close();
+        const std::optional<sinfer::TokenId> close =
+            close_text.empty() ? std::nullopt : engine_->token_id(close_text);
+        if (close) {
+            thinking_guard_note_ = "\n\nConsidering the limited time by the user, I have to give the solution "
+                                   "based on the thinking directly now.\n";
+            thinking_guard_close_ = engine_->encode_fragment(thinking_guard_note_);
+            thinking_guard_close_.push_back(*close);
+            thinking_guard_close_thought_ = thinking_guard_close_.size();
+            if (close_text == "</think>") {
+                const std::vector<sinfer::TokenId> separator = engine_->encode_fragment("\n\n");
+                thinking_guard_close_.insert(thinking_guard_close_.end(), separator.begin(), separator.end());
+            }
+        } else {
+            std::fprintf(stderr, "thinking-guard: this model has no single reasoning close token; the guard is off\n");
+        }
     }
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -871,6 +907,30 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
             state->options.execution.allow_prefix_reuse = true;
             prepared.parallel_decoding = std::move(state);
         }
+        // --thinking-loop-guard / --thinking-answer-reserve: armed for a chat request that thinks and whose reply
+        // the answer's continuation reproduces as one generation would. Not for one asking for logprobs, token ids
+        // or routed experts, whose numbers would span two generations, nor where the answer would have to resume
+        // something mid-way (the tool grammar, a JSON schema, a minimum length, media), nor for parallel decoding.
+        if (!thinking_guard_close_.empty() && prepared.enable_thinking && request.prompt_token_ids.empty() &&
+            !request.raw_prompt.has_value() && !request.parallel_decoding && !prepared.constrained_tools &&
+            request_options.execution.json_schema.empty() && request.min_tokens <= 0 && !request_has_media &&
+            !request.want_logprobs && request.prompt_logprobs < 0 && !request.return_token_ids &&
+            !request.return_routed_experts && prepared.output_budget > 0) {
+            const auto budget = static_cast<std::uint32_t>(prepared.output_budget);
+            sinfer::ThinkingGuard guard;
+            guard.loop = options_.thinking_loop_guard;
+            if (options_.thinking_answer_reserve != 0) {
+                guard.token_limit = budget - std::min(options_.thinking_answer_reserve, budget / 4);
+            }
+            request_options.stop.thinking_guard = guard;
+            auto continuation     = std::make_shared<ThinkingGuardContinuation>();
+            continuation->prompt  = engine_->continue_prompt(prompt); // a copy: the submit takes `prompt`
+            continuation->options = request_options;
+            continuation->options.stop.thinking_guard = {};
+            continuation->adapter   = adapter.lifetime;
+            continuation->guard     = guard;
+            prepared.thinking_guard = std::move(continuation);
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               prepared.lifetime->deadline, std::move(adapter.lifetime));
         prepared.sampling   = prepared.generation.resolved_sampling();
@@ -1085,6 +1145,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     sinfer::GenerationResult result;
     try {
         result = prepared.generation.wait(public_sink, cancellation);
+        if (result.finish_reason == sinfer::FinishReason::ThinkingGuard) {
+            answer_after_thinking_guard(prepared, result, public_sink, cancellation);
+        }
     } catch (const sinfer::RequestError& exception) { throw_request_error(exception); }
     GenerationOutcome outcome;
     outcome.text              = std::move(result.content);
@@ -1225,6 +1288,85 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     finalize_output_text(outcome, options_.reasoning_format,
         output_sink ? std::optional(output_sink->finish(is_tool_call_response)) : std::nullopt);
     return outcome;
+}
+
+void GenerationService::answer_after_thinking_guard(PreparedRequest& prepared, sinfer::GenerationResult& result,
+                                                    sinfer::OutputSink* sink,
+                                                    const sinfer::CancellationView& cancellation) {
+    const std::shared_ptr<ThinkingGuardContinuation> context = prepared.thinking_guard;
+    const std::size_t thought = result.generated_token_ids.size();
+    const std::size_t used    = thought + thinking_guard_close_.size();
+    // Until the answer is under way the reply is what the output limit would have left: the thought alone.
+    result.finish_reason = sinfer::FinishReason::OutputLimit;
+    if (context == nullptr || used >= static_cast<std::size_t>(std::max(0, prepared.output_budget))) { return; }
+    const char* guard_reason =
+        context->guard.token_limit != 0 && result.reasoning_tokens >= context->guard.token_limit ? "limit" : "loop";
+
+    std::vector<sinfer::TokenId> tokens = result.generated_token_ids;
+    tokens.insert(tokens.end(), thinking_guard_close_.begin(), thinking_guard_close_.end());
+    const std::size_t tokens_in_prompt = context->prompt.summary().prompt_tokens + tokens.size();
+    sinfer::RequestOptions options             = context->options;
+    options.execution.requested_output_tokens = static_cast<std::uint32_t>(prepared.output_budget - used);
+    sinfer::GenerationHandle answer;
+    try {
+        answer = engine_->submit(engine_->continue_answer(context->prompt, tokens), std::move(options),
+                                 Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms),
+                                 context->adapter);
+    } catch (const sinfer::RequestError& error) {
+        std::fprintf(stderr, "thinking-guard: the answer after a %zu-token thought was refused (%s); the reply "
+                             "ends with the thought\n", thought, error.what());
+        return;
+    }
+    if (sink != nullptr) {
+        sink->publish(sinfer::OutputDelta{.channel = sinfer::OutputChannel::Reasoning, .text = thinking_guard_note_});
+    }
+    std::optional<ContinuationOutputSink> stream;
+    if (sink != nullptr) { stream.emplace(*sink); }
+    sinfer::GenerationResult answered = answer.wait(stream ? &*stream : nullptr, cancellation);
+
+    // One reply: the thought, the close and the answer, as one generation would have reported them.
+    const std::size_t answer_tokens = answered.generated_token_ids.size();
+    if (!result.token_logprobs.empty() || !answered.token_logprobs.empty()) {
+        const float none = std::numeric_limits<float>::quiet_NaN();
+        result.token_logprobs.resize(thought, none);
+        result.token_logprobs.insert(result.token_logprobs.end(), thinking_guard_close_.size(), none);
+        if (answered.token_logprobs.size() == answer_tokens) {
+            result.token_logprobs.insert(result.token_logprobs.end(), answered.token_logprobs.begin(),
+                                         answered.token_logprobs.end());
+        } else {
+            result.token_logprobs.insert(result.token_logprobs.end(), answer_tokens, none);
+        }
+    }
+    result.generated_token_ids = std::move(tokens);
+    result.generated_token_ids.insert(result.generated_token_ids.end(), answered.generated_token_ids.begin(),
+                                      answered.generated_token_ids.end());
+    result.reasoning += thinking_guard_note_;
+    result.reasoning += answered.reasoning;
+    result.content += answered.content;
+    result.tool_content += answered.tool_content;
+    result.reasoning_tokens += static_cast<std::uint32_t>(thinking_guard_close_thought_) + answered.reasoning_tokens;
+    result.finish_reason = answered.finish_reason;
+    result.stop_sequence = std::move(answered.stop_sequence);
+    result.timings.queue_seconds += answered.timings.queue_seconds;
+    result.timings.vision_seconds += answered.timings.vision_seconds;
+    result.timings.prefill_seconds += answered.timings.prefill_seconds;
+    result.timings.decode_seconds += answered.timings.decode_seconds;
+    result.timings.total_seconds += std::max(0.0, answered.timings.total_seconds - answered.timings.prepare_seconds);
+    result.speculative.rounds += answered.speculative.rounds;
+    result.speculative.drafted_tokens += answered.speculative.drafted_tokens;
+    result.speculative.accepted_tokens += answered.speculative.accepted_tokens;
+    result.speculative.fallback_steps += answered.speculative.fallback_steps;
+    const auto add = [](std::vector<std::uint64_t>& to, const std::vector<std::uint64_t>& from) {
+        if (to.size() < from.size()) { to.resize(from.size(), 0); }
+        for (std::size_t i = 0; i < from.size(); ++i) { to[i] += from[i]; }
+    };
+    add(result.speculative.accepted_per_position, answered.speculative.accepted_per_position);
+    add(result.speculative.rounds_per_draft_window, answered.speculative.rounds_per_draft_window);
+    std::fprintf(stderr,
+                 "thinking-guard: closed a %zu-token thought (%s); answer %zu tokens, finish %s, %u of %zu prompt "
+                 "tokens reused\n",
+                 thought, guard_reason, answer_tokens, finish_reason_wire(result.finish_reason),
+                 answered.reused_prompt_tokens, tokens_in_prompt);
 }
 
 GenerationOutcome GenerationService::run_parallel(PreparedRequest& prepared, const StreamSink* sink,

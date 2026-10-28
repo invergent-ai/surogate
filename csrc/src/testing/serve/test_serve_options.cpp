@@ -43,6 +43,19 @@ int main() {
         try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "empty provider catalog path accepted");
     }
+    {
+        // --thinking-loop-guard / --thinking-answer-reserve: both off unless asked for.
+        const auto guarded =
+            parse({"sinfer-serve", "model.sinfer", "--thinking-loop-guard", "--thinking-answer-reserve", "4096"});
+        failures += check(!defaults.thinking_loop_guard && defaults.thinking_answer_reserve == 0,
+                          "the thinking guard should be opt-in");
+        failures += check(guarded.thinking_loop_guard && guarded.thinking_answer_reserve == 4096,
+                          "thinking guard options were not parsed");
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", "--thinking-answer-reserve", "-1"}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "a negative answer reserve was accepted");
+    }
     for (const auto* tokens : {"280", "560", "1120"}) {
         const auto options = parse({"sinfer-serve", "model.sinfer", "--vision", "--gemma-image-tokens", tokens});
         failures += check(options.gemma_image_tokens == std::stoul(tokens), "image budget was not parsed");

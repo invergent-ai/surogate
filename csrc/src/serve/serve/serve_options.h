@@ -152,6 +152,11 @@ struct ServeOptions {
     ThinkingRetentionMode thinking_retention             = ThinkingRetentionMode::Off;
     std::size_t thinking_retention_bytes                 = kDefaultThinkingRetentionMib << 20;
     std::uint64_t thinking_retention_ttl_seconds         = kDefaultThinkingRetentionTtlSeconds;
+    /// --thinking-loop-guard and --thinking-answer-reserve N (StopPolicy::thinking_guard): a thought that goes round
+    /// in circles, or that reaches the request's output budget less min(N, budget / 4) tokens, is closed and the
+    /// request answers in what is left of its budget. Both off by default.
+    bool thinking_loop_guard            = false;
+    std::uint32_t thinking_answer_reserve = 0;
     int default_max_tokens = kDefaultMaxTokens;
     // --overlong-max-tokens reject|cap: what a max_tokens that does not fit the context next to the prompt gets.
     // reject (default) answers HTTP 400 as vLLM 0.31 does; cap is the earlier silent cap to the rest of the
