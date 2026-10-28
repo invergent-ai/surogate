@@ -531,6 +531,8 @@ the model's chat template.
 | `--thinking-retention off\|loop\|all` | `off` | Keep the reasoning of every chat completion in RAM and put it back into a later request of the same conversation whose assistant turn comes without it: `loop` for the turns after the last user message, `all` for every turn |
 | `--thinking-retention-mb N` | 512 | Size of the retention store, in MiB; the least recently used entries go first |
 | `--thinking-retention-ttl T` | `6h` | How long an entry is kept after its last use: seconds, or with an `s`, `m`, `h` or `d` suffix |
+| `--thinking-loop-guard` | off | Close a thought that goes round in circles and answer instead (see [Thinking guard](#thinking-guard)) |
+| `--thinking-answer-reserve N` | off | Close a thought that reaches the request's output budget less `min(N, budget/4)` tokens, so the answer keeps that room; `4096` is a good value |
 
 Agent harnesses resend the whole conversation every turn, and many rebuild each assistant turn from
 its content and tool calls only (tau2's `to_litellm_messages` does), so a model that relies on its
@@ -550,6 +552,47 @@ restored turns are taken back, oldest first, until it fits. The request log's st
 counts `surogate_thinking_retention_{stored,restored,misses,dropped,evictions,expired}_total`.
 Only `/v1/chat/completions` with messages takes part; token-id prompts, `/v1/completions`, the
 Responses and Messages APIs and `/tokenize` are served as before.
+
+#### Thinking guard
+
+A thinking request whose thought runs until `max_tokens` ends with an empty answer, after the longest possible
+wait. The two guard flags turn that into an answer. They are off by default.
+
+- **`--thinking-loop-guard`** watches the thought for a loop. A thought position repeats when the 32 tokens
+  ending there have already appeared at least twice earlier in the same thought. The guard fires once 90% of the
+  last 2,048 positions repeat. On Surogate3.7 replies it ended every looping thought 5,500 to 25,000 tokens in. It
+  never fired on 7,200 ordinary chat replies and long agent turns, whose highest window share was 0.55.
+- **`--thinking-answer-reserve N`** closes a thought that reaches the request's output budget (its `max_tokens`,
+  else `--default-max-tokens`, else the rest of the context) less `min(N, budget/4)` tokens.
+
+When either fires, the engine closes the thought with Qwen3's thinking-budget sentence:
+
+> Considering the limited time by the user, I have to give the solution based on the thinking directly now.
+
+It then adds the model's close marker (`</think>`) and the request answers in what is left of its budget, on the
+same response:
+
+- The sentence is streamed as reasoning, and the answer as content.
+- `usage` counts the whole reply.
+- `finish_reason` is the answer's own.
+- The answer runs on the same GPU state as the thought, so only the closing tokens are processed again.
+- With no room left, the reply ends as the output limit would have ended it (`"length"`).
+
+The engine prints each event to stderr, for example:
+
+```
+thinking-guard: closed a 7804-token thought (loop); answer 999 tokens, finish stop, 7831 of 7857 prompt tokens reused
+```
+
+The guard applies to `/v1/chat/completions`, Responses and Messages requests built from messages, with thinking
+on. These requests are served exactly as without it:
+- token-id and raw-text prompts;
+- requests for logprobs, prompt logprobs, token ids or routed experts;
+- the tool grammar (`tool_choice` `"required"` or a named function, strict tools);
+- a JSON schema, `min_tokens`, images or video, and parallel decoding.
+
+The guard only cuts a thought that would have run to the limit. The answer after it is the model's best guess at
+that point, and a hard problem may still be answered wrongly.
 
 ### Decisions calibration
 
