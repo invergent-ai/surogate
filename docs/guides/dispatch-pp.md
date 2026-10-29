@@ -69,6 +69,7 @@ lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_p
 | `recipe` | `bf16` or `fp8_hybrid` (see below). NVFP4 stage streaming is deferred. |
 | `gradient_accumulation_steps` | Microbatch count — see [Effective batch](#effective-batch-and-throughput). |
 | `SUROGATE_DISPATCH_STAGE_BLOCKS` | Env var; blocks per stage (default `4`). Larger stages mean fewer cross-stage handoffs but more resident VRAM per stage. |
+| `SUROGATE_DISPATCH_STAGE_PLAN` | Env var; explicit stage sizes, comma-separated, summing to the layer count (e.g. `6,5,5,5,5,5,5,4`). Overrides `SUROGATE_DISPATCH_STAGE_BLOCKS`, for example to give the stage that also runs the lm-head fewer blocks. |
 
 ### FP8 weight streaming (`recipe: fp8_hybrid`)
 

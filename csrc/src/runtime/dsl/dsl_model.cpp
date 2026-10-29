@@ -4,6 +4,7 @@
 // DSL model wrapper (IR validation + execution).
 
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dispatch_pp_plan.h"
 
 #include <algorithm>
 #include <array>
@@ -54,23 +55,54 @@
 #include "serve/core/unified_memory.h"
 
 namespace dsl {
+
+std::vector<int> dispatch_pp_layer_stages(int num_layers) {
+    std::vector<int> stage_of;
+    if (num_layers <= 0) return stage_of;
+    if (const char* plan = std::getenv("SUROGATE_DISPATCH_STAGE_PLAN"); plan && *plan) {
+        std::string_view rest(plan);
+        for (int stage = 0; !rest.empty(); ++stage) {
+            const std::size_t comma = rest.find(',');
+            const int size = std::atoi(std::string(rest.substr(0, comma)).c_str());
+            if (size <= 0) {
+                throw std::runtime_error(
+                    fmt::format("SUROGATE_DISPATCH_STAGE_PLAN={}: stage sizes must be positive", plan));
+            }
+            stage_of.insert(stage_of.end(), static_cast<std::size_t>(size), stage);
+            if (comma == std::string_view::npos) break;
+            rest.remove_prefix(comma + 1);
+        }
+        if (static_cast<int>(stage_of.size()) != num_layers) {
+            throw std::runtime_error(fmt::format("SUROGATE_DISPATCH_STAGE_PLAN={} covers {} layers, the model has {}",
+                                                 plan, stage_of.size(), num_layers));
+        }
+        return stage_of;
+    }
+    const char* sb_env = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS");
+    const int sb = sb_env ? std::atoi(sb_env) : 0;
+    if (sb <= 0) return stage_of;
+    stage_of.resize(static_cast<std::size_t>(num_layers));
+    for (int l = 0; l < num_layers; ++l)
+        stage_of[static_cast<std::size_t>(l)] = l / sb;
+    return stage_of;
+}
+
 namespace {
 
-/// dispatch-PP stage-local LoRA (SUROGATE_DISPATCH_LORA_LOCAL=1, set by the trainers beside the stage size): stage s
-/// holds layers [s*sb, (s+1)*sb) and runs on GPU s % gpus (MultiGPUPyTrainer's dispatch loop), so rank `rank` keeps
-/// adapters, gradients and optimizer state for its own stages' layers only. Empty: replicated on every rank.
+/// dispatch-PP stage-local LoRA (SUROGATE_DISPATCH_LORA_LOCAL=1, set by the trainers beside the stage plan): stage s
+/// runs on GPU s % gpus (MultiGPUPyTrainer's dispatch loop), so rank `rank` keeps adapters, gradients and optimizer
+/// state for its own stages' layers only. Empty: replicated on every rank.
 std::vector<std::uint8_t> dispatch_pp_lora_local_layers(int num_layers, int rank, int gpus) {
     const char* on = std::getenv("SUROGATE_DISPATCH_LORA_LOCAL");
     if (!on || std::string_view(on) != "1" || gpus <= 1 || num_layers <= 0) return {};
-    const char* sb_env = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS");
-    const int sb = sb_env ? std::atoi(sb_env) : 0;
-    if (sb <= 0) {
-        throw std::runtime_error("SUROGATE_DISPATCH_LORA_LOCAL=1 needs SUROGATE_DISPATCH_STAGE_BLOCKS, the dispatch-PP "
-                                 "stage size");
+    const std::vector<int> stage_of = dispatch_pp_layer_stages(num_layers);
+    if (stage_of.empty()) {
+        throw std::runtime_error("SUROGATE_DISPATCH_LORA_LOCAL=1 needs the dispatch-PP stage plan "
+                                 "(SUROGATE_DISPATCH_STAGE_BLOCKS or SUROGATE_DISPATCH_STAGE_PLAN)");
     }
     std::vector<std::uint8_t> local(static_cast<std::size_t>(num_layers), 0);
     for (int l = 0; l < num_layers; ++l)
-        local[static_cast<std::size_t>(l)] = ((l / sb) % gpus) == rank ? 1 : 0;
+        local[static_cast<std::size_t>(l)] = (stage_of[static_cast<std::size_t>(l)] % gpus) == rank ? 1 : 0;
     return local;
 }
 

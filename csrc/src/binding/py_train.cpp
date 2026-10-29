@@ -36,6 +36,7 @@
 #include "runtime/core/model_factory.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dispatch_pp_plan.h"
 #include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_grad_store.h"
@@ -3541,18 +3542,19 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
 void MultiGPUPyTrainer::check_lora_stage_plan(const std::vector<int>& los,
                                               const std::vector<int>& his,
                                               const char* caller) {
-    if (!dispatch_pp_lora_stage_local()) return;
-    const char* sb_env = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS");
-    const int sb = sb_env ? std::atoi(sb_env) : 0;
+    if (!dispatch_pp_lora_stage_local() || his.empty()) return;
+    const std::vector<int> stage_of = dsl::dispatch_pp_layer_stages(his.back() + 1);
     const int ngpu = static_cast<int>(mContexts.size());
     for (std::size_t si = 0; si < los.size(); ++si) {
         const int gpu = static_cast<int>(si) % ngpu;
         for (int L = los[si]; L <= his[si]; ++L) {
-            if (sb <= 0 || (L / sb) % ngpu != gpu) {
+            const std::size_t l = static_cast<std::size_t>(L);
+            const int owner = l < stage_of.size() ? stage_of[l] % ngpu : -1;
+            if (owner != gpu) {
                 throw std::runtime_error(fmt::format(
                     "{}: stage {} (layers {}-{}) runs on GPU {}, but stage-local LoRA put layer {}'s adapters on GPU {} "
-                    "(SUROGATE_DISPATCH_STAGE_BLOCKS={}); plan the stages with the same stage size",
-                    caller, si, los[si], his[si], gpu, L, sb > 0 ? (L / sb) % ngpu : -1, sb));
+                    "(SUROGATE_DISPATCH_STAGE_PLAN or SUROGATE_DISPATCH_STAGE_BLOCKS); plan the stages with it",
+                    caller, si, los[si], his[si], gpu, L, owner));
             }
         }
     }

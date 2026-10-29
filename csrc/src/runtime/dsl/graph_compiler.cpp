@@ -3119,9 +3119,9 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     // ever populated one resident stage at a time per GPU (stages on a GPU run sequentially;
     // concurrent stages are on separate GPUs/arenas). So color cyclically -- layer L uses
     // section (L % stage_blocks) -- bounding the arena to stage_blocks sections instead of
-    // num_layers. Correct only because the planner emits stages ALIGNED to stage_blocks, so
-    // L % stage_blocks == L - stage_lo within a stage. Env is set only by the dispatch
-    // trainer; 0 (unset) keeps the standard per-layer (L * stride) coloring unchanged.
+    // num_layers. Correct because the planner gives no stage more than stage_blocks layers,
+    // so the consecutive layers of one stage get distinct sections. Env is set only by the
+    // dispatch trainer; 0 (unset) keeps the standard per-layer (L * stride) coloring unchanged.
     int dispatch_sections = 0;
     if (const char* e = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS")) dispatch_sections = std::atoi(e);
 
@@ -3783,8 +3783,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.save_for_bwd_block_bases.assign(static_cast<std::size_t>(num_layers), 0);
     // dispatch-PP: cyclic block bases (block L -> section L % stage_blocks) bound the
     // SaveForBwd arena to stage_blocks blocks instead of num_layers -- same reasoning as
-    // the FwdStack cyclic coloring (one resident stage per GPU at a time; planner emits
-    // stages aligned to stage_blocks). 0 (env unset) keeps the cumulative whole-model layout.
+    // the FwdStack cyclic coloring (one resident stage per GPU at a time; no stage holds
+    // more than stage_blocks blocks). 0 (env unset) keeps the cumulative whole-model layout.
     int dispatch_sections = 0;
     if (const char* e = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS")) dispatch_sections = std::atoi(e);
     auto block_bytes_at = [&](int L) -> std::size_t {
