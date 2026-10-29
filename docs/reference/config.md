@@ -34,6 +34,7 @@ Recomputation trades compute for memory by recomputing activations during the ba
 | Option      | Type | Default | Description                                                                                                                                                                   |
 | ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead). |
+| `qlora_recompute` | bool | `true` | QLoRA and pre-quantized bases recompute whatever `recompute` says. Set `false` together with `recompute: false` to save their activations instead (verified with `parallelism: dispatch_pp` on a pre-quantized NVFP4 base). |
 
 ## Chunked-Sequence Training (long sequences)
 

@@ -107,7 +107,9 @@ and the throughput knob.
 - **Recipes:** `bf16` or `fp8_hybrid`. NVFP4 stage streaming is deferred (the 4-bit base degrades
   convergence on this architecture and the block-scaled transpose negates the byte savings).
 - `recompute: true` (the dispatch default) bounds activation memory by replaying each stage's forward
-  during the backward pass.
+  during the backward pass. `recompute: false` keeps the stage re-forward's activations instead, which saves
+  one block forward per backward window; with a QLoRA or pre-quantized base it also needs
+  `qlora_recompute: false`.
 
 ## Example
 
