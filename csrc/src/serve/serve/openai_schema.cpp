@@ -878,6 +878,7 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
         choice["logprobs"] = Json{{"content", std::move(entries)}};
     }
     if (detail.include_token_ids) { choice["token_ids"] = detail.completion_token_ids; }
+    if (!detail.lora_versions.empty()) { choice["lora_versions"] = detail.lora_versions; }
     if (detail.include_routed_experts) {
         // Rollout Routing Replay: little-endian int16 rows, C order [tokens, layers, top_k].
         const std::size_t row_len = static_cast<std::size_t>(detail.routed_layers) * detail.routed_top_k;
@@ -1144,6 +1145,7 @@ std::string make_completion_response(const std::string& id, const std::string& m
         payload["prompt_token_ids"] = detail.prompt_token_ids;
         payload["choices"][0]["token_ids"] = detail.completion_token_ids;
     }
+    if (!detail.lora_versions.empty()) { payload["choices"][0]["lora_versions"] = detail.lora_versions; }
     if (detail.include_logprobs) {
         Json tokens = Json::array(), probabilities = Json::array(), top = Json::array(), offsets = Json::array();
         std::size_t offset = detail.text_offset;

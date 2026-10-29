@@ -18,6 +18,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -72,6 +73,8 @@ struct GenerationOutcome {
     std::vector<TokenScore> completion_scores;
     std::map<TokenId, std::string> score_texts;
     std::vector<float> token_logprobs;
+    /// {first completion token index, adapter version} runs (GenerationResult::lora_versions).
+    std::vector<std::array<std::uint32_t, 2>> lora_versions;
     /// Rollout Routing Replay (return_routed_experts): rows for sequence positions
     /// [routed_start, routed_start + n) -- prompt then completion -- of routed_layers x routed_top_k
     /// expert ids. Positions before routed_start came from the prefix cache and are not covered;
@@ -221,10 +224,22 @@ public:
     /// Scrub a drained adapter slot on every store.
     void clear_lora_slot_everywhere(std::int32_t slot);
 
-    /// Load or replace a PEFT adapter. Replacement drains admitted requests;
-    /// new requests for that adapter wait. Invalid payloads preserve the old
-    /// adapter; RequestError reports a timeout before any bytes are changed.
-    void load_lora_adapter(const std::string& name, const std::string& path);
+    /// How a load treats an adapter name that is already loaded.
+    struct LoraLoadOptions {
+        /// In place: the new bytes are staged on the host while the engine serves, then copied in
+        /// at a round boundary; requests running on the adapter continue on the new one and new
+        /// requests are never held (PipelineRL-style). Drained: admitted requests on the adapter
+        /// finish first and new ones wait. Unset follows --lora-swap.
+        std::optional<bool> in_place;
+        /// The version the adapter's tokens report from now on (choice.lora_versions); unset is
+        /// the previous version plus one.
+        std::optional<std::uint32_t> version;
+    };
+    /// Load or replace a PEFT adapter (see LoraLoadOptions). Invalid payloads preserve the old
+    /// adapter; RequestError reports a timeout before any bytes are changed. Returns a one-line
+    /// account of what happened (the version, and for a swap how long the engine paused).
+    std::string load_lora_adapter(const std::string& name, const std::string& path,
+                                  const LoraLoadOptions& load = {});
     /// Drain admitted requests before removing the adapter and recycling its slot.
     void unload_lora_adapter(const std::string& name);
 

@@ -215,7 +215,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--kv-admission reserve|ondemand] [--kv-admission-headroom N] "
            "[--kv-admission-watermark F] "
-           "[--adapter-update-timeout-ms N] "
+           "[--adapter-update-timeout-ms N] [--lora-swap in-place|drain] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices "
            "A,B,...] [--data-parallel] "
            "[--reasoning-parser NAME] [--tool-call-parser NAME] [--enable-auto-tool-choice] "
@@ -336,6 +336,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --enable-lora enables adapters; --lora-modules loads named adapters at "
            "startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
+           "       --lora-swap in-place makes POST /v1/load_lora_adapter of a loaded name swap the\n"
+           "         bytes at a round boundary: running requests continue on the new adapter and\n"
+           "         none are held (the body's \"in_place\" overrides; drain is the default). Each\n"
+           "         choice reports [[first token, version], ...] as lora_versions (\"version\" in\n"
+           "         the load body sets it; default +1).\n"
            "       --capture-routing records every token's MoE expert ids for RL routing replay; a "
            "request asks\n"
            "         for them with \"return_routed_experts\": true. Works with --spec mtp (the\n"
@@ -495,6 +500,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--lora-swap") {
+            const std::string mode = require_value("--lora-swap");
+            if (mode == "in-place") {
+                options.lora_swap_in_place = true;
+            } else if (mode == "drain") {
+                options.lora_swap_in_place = false;
+            } else {
+                throw std::invalid_argument("--lora-swap must be in-place or drain");
+            }
         } else if (arg == "--adapter-update-timeout-ms") {
             options.adapter_update_timeout_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--adapter-update-timeout-ms"), "adapter-update-timeout-ms"));

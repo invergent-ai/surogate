@@ -175,23 +175,26 @@ void on_every_engine(const std::vector<GenerationService*>& targets, const Actio
 /// go of the adapter, and those waits overlap instead of adding up. If any engine fails, an
 /// adapter that was new is unloaded again from the engines that took it, so the replicas never
 /// disagree about whether it exists, and the first failure is rethrown as it was raised.
-void load_lora_adapter_everywhere(const std::vector<GenerationService*>& targets,
-                                  const std::string& name, const std::string& path) {
-    if (targets.size() == 1) {
-        targets.front()->load_lora_adapter(name, path);
-        return;
-    }
+std::string load_lora_adapter_everywhere(const std::vector<GenerationService*>& targets,
+                                         const std::string& name, const std::string& path,
+                                         const GenerationService::LoraLoadOptions& load) {
+    if (targets.size() == 1) { return targets.front()->load_lora_adapter(name, path, load); }
     std::vector<bool> existed(targets.size());
     for (std::size_t i = 0; i < targets.size(); ++i) { existed[i] = targets[i]->lora_slot(name) >= 0; }
     std::vector<std::atomic<bool>> loaded(targets.size());
+    std::vector<std::string> reports(targets.size());
     std::exception_ptr failure;
     try {
         on_every_engine(targets, [&](GenerationService& target) {
-            target.load_lora_adapter(name, path);
-            const auto at = std::find(targets.begin(), targets.end(), &target) - targets.begin();
-            loaded[static_cast<std::size_t>(at)].store(true);
+            const auto at = static_cast<std::size_t>(std::find(targets.begin(), targets.end(), &target) - targets.begin());
+            reports[at] = target.load_lora_adapter(name, path, load);
+            loaded[at].store(true);
         });
-        return;
+        std::string joined;
+        for (std::size_t i = 0; i < reports.size(); ++i) {
+            joined += (i ? "; replica " : "replica ") + std::to_string(i) + ": " + reports[i];
+        }
+        return joined;
     } catch (...) { failure = std::current_exception(); }
     for (std::size_t i = 0; i < targets.size(); ++i) {
         if (loaded[i] && !existed[i]) {
@@ -729,6 +732,27 @@ void HttpServer::register_routes() {
             res.set_content("both lora_name and lora_path must be strings", "text/plain");
             return;
         }
+        // "in_place": replace a loaded adapter at a round boundary without draining its requests
+        // (default: --lora-swap); "version": what its tokens report from now on (default: +1).
+        GenerationService::LoraLoadOptions load;
+        if (body.contains("in_place") && !body.at("in_place").is_null()) {
+            if (!body.at("in_place").is_boolean()) {
+                res.status = 400;
+                res.set_content("in_place must be a boolean", "text/plain");
+                return;
+            }
+            load.in_place = body.at("in_place").get<bool>();
+        }
+        if (body.contains("version") && !body.at("version").is_null()) {
+            const auto& value = body.at("version");
+            if (!value.is_number_integer() || value.get<std::int64_t>() < 0 ||
+                value.get<std::int64_t>() > std::numeric_limits<std::uint32_t>::max()) {
+                res.status = 400;
+                res.set_content("version must be a non-negative 32-bit integer", "text/plain");
+                return;
+            }
+            load.version = static_cast<std::uint32_t>(value.get<std::int64_t>());
+        }
         const std::string name = body.value("lora_name", "");
         const std::string path = body.value("lora_path", "");
         if (name.empty() || path.empty()) {
@@ -736,6 +760,7 @@ void HttpServer::register_routes() {
             res.set_content("both lora_name and lora_path are required", "text/plain");
             return;
         }
+        std::string report;
         try {
             const std::vector<GenerationService*> targets = routed_management_services(req);
             GenerationService& target = *targets.front();
@@ -754,7 +779,7 @@ void HttpServer::register_routes() {
                                                 id + "'");
                 }
             }
-            load_lora_adapter_everywhere(targets, name, path);
+            report = load_lora_adapter_everywhere(targets, name, path, load);
         } catch (const sinfer::RequestError& e) {
             write_error(res, request_error_to_api_error(e));
             return;
@@ -765,8 +790,8 @@ void HttpServer::register_routes() {
             res.set_content(message, "text/plain");
             return;
         }
-        log_line("lora: loaded adapter '" + name + "' from " + path);
-        res.set_content("Success: LoRA adapter '" + name + "' added successfully", "text/plain");
+        log_line("lora: adapter '" + name + "' from " + path + ": " + report);
+        res.set_content("Success: LoRA adapter '" + name + "' added successfully (" + report + ")", "text/plain");
     };
     server_.Post("/v1/load_lora_adapter", load_lora_adapter_handler);
     server_.Post("/load_lora_adapter", load_lora_adapter_handler);
@@ -1390,6 +1415,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             detail.prompt_token_ids = outcome.prompt_token_ids;
             detail.completion_token_ids = outcome.completion_token_ids;
             detail.logprobs = outcome.token_logprobs;
+            detail.lora_versions = outcome.lora_versions;
             detail.texts = outcome.token_texts;
             detail.prompt_scores = outcome.prompt_scores;
             detail.completion_scores = outcome.completion_scores;
@@ -1499,6 +1525,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     detail.prompt_token_ids = outcome.prompt_token_ids;
                     detail.completion_token_ids = outcome.completion_token_ids;
                     detail.logprobs = outcome.token_logprobs;
+                    detail.lora_versions = outcome.lora_versions;
+            detail.lora_versions = outcome.lora_versions;
                     detail.texts = outcome.token_texts;
 
                     detail.completion_scores = outcome.completion_scores;
@@ -1594,6 +1622,7 @@ static TokenDetail completion_detail(const GenerationOutcome& outcome, const Pre
     detail.prompt_token_ids = outcome.prompt_token_ids;
     detail.completion_token_ids = outcome.completion_token_ids;
     detail.logprobs = outcome.token_logprobs;
+    detail.lora_versions = outcome.lora_versions;
     detail.texts = outcome.token_texts;
     detail.prompt_scores = outcome.prompt_scores;
     detail.completion_scores = outcome.completion_scores;

@@ -893,6 +893,10 @@ struct GenerationResult {
     /// it. Same length as `generated_token_ids`, or empty when nothing produced
     /// them; an individual entry is NaN when its route could not.
     std::vector<float> token_logprobs;
+    /// The adapter version that ran the generated tokens, as runs {first token index, version}:
+    /// an in-place adapter swap lands between rounds, so a request that straddles one has two runs.
+    /// Empty for a request that selected no adapter.
+    std::vector<std::array<std::uint32_t, 2>> lora_versions;
     std::string content;
     std::string reasoning;
     std::string tool_content;

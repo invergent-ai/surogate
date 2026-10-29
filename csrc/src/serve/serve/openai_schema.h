@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <array>
 #include <map>
 #include <optional>
 #include <string>
@@ -48,6 +49,9 @@ struct TokenDetail {
     std::vector<TokenScore> completion_scores;
     std::map<TokenId, std::string> score_texts;
     std::vector<float> logprobs;      ///< as long as `completion_token_ids`, or empty
+    /// choice.lora_versions: [[first completion token index, adapter version], ...], written when
+    /// the request ran on an adapter (one run, or more when it straddled an in-place swap).
+    std::vector<std::array<std::uint32_t, 2>> lora_versions;
     std::vector<std::string> texts;   ///< the text of each completion token, or empty
     bool include_token_ids = false;
     bool include_logprobs  = false;
