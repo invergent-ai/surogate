@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "runtime/dsl/stage_boundary.h"
+
 #include "config/pretrained_config.h"
 #include "runtime/training/runtime_options.h"
 #include "config/lora_adapter_config.h"
@@ -587,7 +589,7 @@ private:
     void check_lora_stage_plan(const std::vector<int>& los, const std::vector<int>& his, const char* caller);
     // Boundaries kept by the last log-prob pass (keep_boundaries): [stage][microbatch] output of
     // each stage but the last, valid for the rows/stages/weights summarized by mDppKeptKey.
-    std::vector<std::vector<std::vector<std::pair<std::string, std::vector<std::byte>>>>> mDppKeptBoundaries;
+    std::vector<std::vector<dsl::StageBoundary>> mDppKeptBoundaries;
     std::uint64_t mDppKeptKey = 0;
     // Bumped by every dispatch-PP weight update, so kept boundaries never outlive their weights.
     std::uint64_t mDppWeightVersion = 0;

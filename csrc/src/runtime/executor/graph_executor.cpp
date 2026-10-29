@@ -2551,20 +2551,20 @@ void GraphExecutor::set_skip_grad_reduce(bool skip) {
     if (mCompiledExecutor) mCompiledExecutor->set_skip_grad_reduce(skip);
 }
 
-std::vector<std::byte> GraphExecutor::read_named_bytes(const std::string& name) {
-    std::vector<std::byte> host;
+surogate::PinnedBytes GraphExecutor::read_named_bytes(const std::string& name) {
+    surogate::PinnedBytes host;
     if (!mCompiledExecutor) return host;
     const Tensor* t = mCompiledExecutor->try_get_tensor(name);
     if (!t || !t->Data || t->bytes() == 0) {
         return host;
     }
-    host.resize(t->bytes());
+    host.resize(t->bytes());  // pooled pinned block, not zero-filled: the copy below is one DMA
     CUDA_CHECK(cudaMemcpyAsync(host.data(), t->Data, t->bytes(), cudaMemcpyDeviceToHost, mRunState.MainStream));
     CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     return host;
 }
 
-void GraphExecutor::set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+void GraphExecutor::set_inject_named(StageBoundary items) {
     if (mCompiledExecutor) mCompiledExecutor->set_inject_named(std::move(items));
 }
 

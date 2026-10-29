@@ -2026,7 +2026,7 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
                                          NCCLCommunicator& comm,
                                          int lo,
                                          int hi,
-                                         std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                         StageBoundary inject_named,
                                          bool preserve_output,
                                          bool include_head) {
     GraphExecutor* ge = graph_executor();
@@ -2084,8 +2084,8 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
                                           int lo,
                                           int hi,
                                           bool is_loss_stage,
-                                          std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                          StageBoundary fwd_inject,
+                                          StageBoundary inject_named,
                                           int micro_step,
                                           int total_micro,
                                           const float* custom_dloss_cpu) {
@@ -2560,7 +2560,7 @@ std::vector<float> DslModel::dispatch_pp_forward_loss_stage(
     NCCLCommunicator& comm,
     int lo,
     int hi,
-    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject) {
+    StageBoundary fwd_inject) {
     // Forward of the loss-owning stage, returning per-token logprobs.
     //
     // Deliberately mirrors the forward half of dispatch_pp_backward_stage rather

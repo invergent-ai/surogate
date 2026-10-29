@@ -19,6 +19,7 @@
 #include <cublas_v2.h>
 
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/stage_boundary.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_runtime_config.h"
 #include "runtime/dsl/hook_registry.h"
@@ -160,7 +161,7 @@ public:
                                    NCCLCommunicator& comm,
                                    int lo,
                                    int hi,
-                                   std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                   StageBoundary inject_named,
                                    bool preserve_output,
                                    bool include_head = true);
     // Run one backward stage (blocks [lo..hi]) on this GPU. Forward only this
@@ -185,8 +186,8 @@ public:
                                     int lo,
                                     int hi,
                                     bool is_loss_stage,
-                                    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-                                    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                    StageBoundary fwd_inject,
+                                    StageBoundary inject_named,
                                     int micro_step = 0,
                                     int total_micro = 1,
                                     const float* custom_dloss_cpu = nullptr);
@@ -238,7 +239,7 @@ public:
         NCCLCommunicator& comm,
         int lo,
         int hi,
-        std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject);
+        StageBoundary fwd_inject);
     // Per-token logprobs (B*T, = -losses) from the last forward that ran the loss
     // ops. GRPO computes its per-token gradients from these, then feeds them back
     // through dispatch_pp_backward_stage's custom_dloss_cpu.

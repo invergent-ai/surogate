@@ -2678,15 +2678,15 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden_multigpu(const 
     // first op reads blocks[hi].res_att (the residual accumulator after attention)
     // and blocks[hi].mlp_down (x = the previous block's MLP output), folding x in.
     // Hand both over by name through host memory between stage GPUs.
-    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+    dsl::StageBoundary boundary;
 
     for (int si = 0; si < num_stages; ++si) {
         const int gpu = si % ngpu;
         const int lo = los[static_cast<std::size_t>(si)];
         const int hi = his[static_cast<std::size_t>(si)];
         const bool is_last = (si == num_stages - 1);
-        std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named = boundary;
-        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        dsl::StageBoundary inject_named = boundary;
+        dsl::StageBoundary next_boundary;
         std::vector<float> final_hidden;
 
         run_work(
@@ -2739,7 +2739,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(const std:
     std::vector<float> result(static_cast<std::size_t>(num_layers), 0.0f);
     // Backward boundary gradients (d_blocks[lo-1].res_att / .mlp_down) handed from
     // a higher stage's GPU to the next lower stage's GPU through host memory.
-    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+    dsl::StageBoundary boundary;
 
     // Backward visits stages in reverse forward order: the stage owning the last
     // block (and the loss) runs first.
@@ -2748,8 +2748,8 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(const std:
         const int lo = los[static_cast<std::size_t>(si)];
         const int hi = his[static_cast<std::size_t>(si)];
         const bool is_loss_stage = (si == num_stages - 1);
-        std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named = boundary;
-        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        dsl::StageBoundary inject_named = boundary;
+        dsl::StageBoundary next_boundary;
         std::vector<float> stage_norms;
 
         run_work(
@@ -2963,7 +2963,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
     const std::vector<int> occupied = dpp_occupied_chunks(targets, M, row_tokens, T, C);
     const std::vector<int>* occ = &occupied;
 
-    using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
+    using Boundary = dsl::StageBoundary;
 
     // Same stage pipeline as the fused training step, with one difference: it runs
     // through the LAST stage too. The training step deliberately stops at N-2 (the
@@ -3122,7 +3122,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     float loss = 0.0f;
     DppPhaseTimer timer;
 
-    using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
+    using Boundary = dsl::StageBoundary;
 
     // 0. Reset each GPU's compute stack to its clean per-step base. The dispatch
     //    sub-range forwards/backwards run with skip_finalize (so boundary tensors and

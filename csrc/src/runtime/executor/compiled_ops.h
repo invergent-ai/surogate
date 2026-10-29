@@ -34,6 +34,7 @@
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
+#include "runtime/dsl/stage_boundary.h"
 #include "kernels/kernels.h"
 #include "runtime/lora/lora_types.h"
 #include "utilities/stack.h"
@@ -312,7 +313,7 @@ public:
     // graph tids the resumed stage's first block reads (blocks[hi].res_ffn = the
     // residual, blocks[hi].mlp_down = x). Buffers are owned here and freed on the
     // next inject / clear.
-    void set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+    void set_inject_named(StageBoundary items) {
         mInjectNamed = std::move(items);
     }
     void clear_inject_named();  // frees the device buffers
@@ -387,7 +388,7 @@ public:
     int mBwdLayerHi = -1;
     bool mBwdLayerLoss = false;
     bool mBwdLayerEmbed = false;
-    std::vector<std::pair<std::string, std::vector<std::byte>>> mInjectNamed;
+    StageBoundary mInjectNamed;
     std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds (active)
     std::vector<void*> mInjectPool;     // recycled inject buffers -> no per-call cudaMalloc/cudaFree
     std::size_t mInjectBufBytes = 0;    // size of the pooled inject buffers (all boundaries are equal)

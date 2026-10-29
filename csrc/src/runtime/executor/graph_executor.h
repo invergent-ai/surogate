@@ -21,6 +21,7 @@
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/dsl/stage_boundary.h"
 #include "runtime/executor/execution_request.h"
 #include "runtime/executor/glm_decode_state.h"
 #include "runtime/core/forward_hooks.h"
@@ -335,8 +336,8 @@ public:
     // Read a named graph tensor's raw device bytes to host (empty if absent), and
     // stage/clear named boundary tensors to bind on the next forward (cross-GPU
     // handoff). restore_stage_base drops a preserved stage's allocations.
-    std::vector<std::byte> read_named_bytes(const std::string& name);
-    void set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items);
+    surogate::PinnedBytes read_named_bytes(const std::string& name);
+    void set_inject_named(StageBoundary items);
     void clear_inject_named();
     void restore_stage_base();
     // dispatch-PP: reset the compute stack to a clean per-step base (reclaims the
