@@ -38,6 +38,10 @@ inline bool round_trace_enabled() {
     static const bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
     return enabled;
 }
+inline bool mtp_trace_enabled() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_MTP_TRACE") != nullptr;
+    return enabled;
+}
 /// SUROGATE_SERVE_ADMIT_TRACE=1: where a slow admission spends its time (archive, restore,
 /// eviction), one line per step that takes 5 ms or more.
 inline bool admit_trace_enabled() {
@@ -1302,6 +1306,12 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             deferred_fold_columns.at(lanes[row]) = fold_later[row].commit_columns;
             deferred_fold_counts_dirty           = true;
         }
+        if (mtp_trace_enabled()) {
+            std::fprintf(stderr, "mtp-trace: resolve stage=%d lane=%u base=%u committed=%u now=%d later=%d inplace=%d terminal=%d cancelled=%d\n",
+                         stage.first, lanes[row], requests[lanes[row]].pending.base_E, accepted_tokens[row],
+                         fold_now[row].commit_columns, fold_later[row].commit_columns,
+                         int(requests[lanes[row]].pending.in_place_state), int(terminal[row]), int(cancelled[row]));
+        }
     }
     const auto tail_started = Clock::now();
     try {
@@ -1808,6 +1818,10 @@ void ProgramImplCore::settle_deferred_folds(std::span<const std::uint32_t> lanes
     std::vector<ops::GdnReplayFoldRow> rows;
     for (const std::uint32_t lane : lanes) {
         if (lane < deferred_fold_columns.size() && deferred_fold_columns[lane] > 0) {
+            if (mtp_trace_enabled()) {
+                std::fprintf(stderr, "mtp-trace: settle stage=%d lane=%u columns=%d\n", stage.first, lane,
+                             deferred_fold_columns[lane]);
+            }
             rows.push_back({LinearStateSlots::current_state_slot(lane, max_concurrency),
                             deferred_fold_columns[lane]});
             deferred_fold_columns[lane] = 0;
@@ -3701,6 +3715,17 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
     // deferred folds land first; verifying ones apply them in the record (launch_mtp_round
     // and launch_dflash_round brought the counts up to date). A DFlash round drafting nothing
     // verifies one column, which updates the state in place too.
+    if (mtp_trace_enabled()) {
+        for (const std::uint32_t lane : lanes) {
+            if (lane >= max_concurrency) { continue; }
+            const SequenceState& sequence = sequences[lane];
+            std::fprintf(stderr, "mtp-trace: mixed stage=%d lane=%u frontier=%u token=%d pending=%d verify=%d width=%u prefills=%zu\n",
+                         stage.first, lane, sequence.execution_frontier,
+                         sequence.ledger.empty() ? -1 : sequence.ledger.back(),
+                         lane < deferred_fold_columns.size() ? deferred_fold_columns[lane] : -1,
+                         int(verify != nullptr), verify_width, prefill_lanes.size());
+        }
+    }
     if (!(speculative_decode && verify != nullptr && verify_width > 1)) {
         settle_deferred_folds(lanes);
     }
@@ -4301,6 +4326,10 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                                 &outcome, sizeof(SpeculativeOutcome));
                     request.speculative_stats.fallback_steps += 1;
                     produced = 1;
+                    if (mtp_trace_enabled()) {
+                        std::fprintf(stderr, "mtp-trace: decide-mixed stage=%d lane=%u base=%u token=%d\n",
+                                     stage.first, sequence.lane, sequence.execution_frontier, token);
+                    }
                     if (round_trace_enabled()) {
                         std::fprintf(stderr, "round-trace: sampled mixed lane=%u pos=%zu token=%d (head)\n",
                                      sequence.lane, sequence.ledger.size(), token);
@@ -4597,6 +4626,14 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                         checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
                 }
             }
+            if (mtp_trace_enabled()) {
+                std::fprintf(stderr, "mtp-trace: verify stage=%d lane=%u frontier=%u extent=%u anchor=%d drafts=%d,%d pending=%d narrow=%d prefills=%zu round=%llu\n",
+                             stage.first, sequence.lane, frontier, extent, sequence.ledger.back(),
+                             mtp_host_ingress->current_drafts[row * draft_window],
+                             draft_window > 1 ? mtp_host_ingress->current_drafts[row * draft_window + 1] : -1,
+                             sequence.lane < deferred_fold_columns.size() ? deferred_fold_columns[sequence.lane] : -1,
+                             int(narrow), prefill_lanes.size(), static_cast<unsigned long long>(in_flight_counter_ + 1));
+            }
             mtp_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
@@ -4754,6 +4791,13 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
             }
             std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome), &outcome,
                         sizeof(SpeculativeOutcome));
+            if (mtp_trace_enabled()) {
+                std::fprintf(stderr, "mtp-trace: decide stage=%d lane=%u base=%u count=%d accepted=%d next=%d tokens=%d,%d,%d drafts=%d,%d\n",
+                             stage.first, lanes[row], base_E, count_i, accepted_i, next_i,
+                             outcome.licensed_tokens[0], count_i > 1 ? outcome.licensed_tokens[1] : -1,
+                             count_i > 2 ? outcome.licensed_tokens[2] : -1,
+                             next_i > 0 ? outcome.next_drafts[0] : -1, next_i > 1 ? outcome.next_drafts[1] : -1);
+            }
 
             const std::uint32_t pcur =
                 narrow ? 0U : static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
@@ -4842,6 +4886,14 @@ void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> l
                                                           static_cast<std::size_t>(count_i)));
         request.outcome          = adopted;
         request.pending.produced = static_cast<std::uint32_t>(count_i);
+        if (mtp_trace_enabled()) {
+            std::fprintf(stderr, "mtp-trace: adopt stage=%d lane=%u base=%u count=%d next=%d tokens=%d,%d,%d drafts=%d,%d inplace=%d\n",
+                         stage.first, lane, sequence.execution_frontier, count_i, adopted.next_extent,
+                         adopted.licensed_tokens[0], count_i > 1 ? adopted.licensed_tokens[1] : -1,
+                         count_i > 2 ? adopted.licensed_tokens[2] : -1,
+                         adopted.next_extent > 0 ? adopted.next_drafts[0] : -1,
+                         adopted.next_extent > 1 ? adopted.next_drafts[1] : -1, int(request.pending.in_place_state));
+        }
     }
 }
 

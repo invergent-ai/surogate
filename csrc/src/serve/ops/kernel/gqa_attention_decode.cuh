@@ -281,6 +281,12 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const int active_split_count = Int8
         ? gqa_small_t_active_splits<Geometry, true>(window, split_count, tokens)
         : min(split_count, gqa_key_partition(last_pos) + 1 - gqa_key_partition(key_lo));
+    if (!Int8 && q_head == 0 && d_start == 0 && tid == 0 && token == tokens - 1 &&
+        gqa_key_partition(last_pos) + 1 - gqa_key_partition(key_lo) > split_count) {
+        printf("gqa-envelope: reducer short of partitions: width %d batch %d first %d last %d splits %d needed %d\n",
+               tokens, batch, first_pos, last_pos, split_count,
+               gqa_key_partition(last_pos) + 1 - gqa_key_partition(key_lo));
+    }
 
     __shared__ float reduce[256];
 

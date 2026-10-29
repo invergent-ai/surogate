@@ -28,6 +28,24 @@ std::int32_t probe_columns() {
     return columns;
 }
 
+// SUROGATE_SERVE_DUMP_ARM=<path>: probes count and write nothing until that file exists, so a
+// dump can start at a chosen request instead of at the warmup's rounds.
+bool probe_armed() {
+    static const char* arm = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_ARM");
+        return (raw != nullptr && *raw != '\0') ? raw : nullptr;
+    }();
+    if (arm == nullptr) { return true; }
+    static std::atomic<bool> armed{false};
+    if (armed.load(std::memory_order_relaxed)) { return true; }
+    if (FILE* probe = std::fopen(arm, "rb")) {
+        std::fclose(probe);
+        armed.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
 std::map<std::string, int>& probe_counts() {
     static std::map<std::string, int> counts;
     return counts;
@@ -55,7 +73,7 @@ bool debug_probes_armed() noexcept { return probe_directory() != nullptr; }
 void debug_probe_dump(std::int32_t magic, const char* tag, const Tensor& tensor,
                       std::int32_t layer_count, cudaStream_t stream) {
     const char* dir = probe_directory();
-    if (dir == nullptr || tensor.data == nullptr) { return; }
+    if (dir == nullptr || tensor.data == nullptr || !probe_armed()) { return; }
     if (tensor.ne[1] > 64) { return; }
     if (probe_columns() > 0 && tensor.ne[1] != probe_columns()) { return; }
     const std::string key = std::string(tag) + "@" + std::to_string(tensor.ne[1]);

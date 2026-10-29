@@ -38,11 +38,14 @@ constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::AllowA4;
 constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::AllowA8;
 
 ops::LinearPolicy text_policy(QType format) {
+    // Diagnostic: SUROGATE_SERVE_TEXT_A16=1 keeps every NVFP4 and per-row FP8 text projection on
+    // BF16 activations at every width.
+    static const bool a16 = std::getenv("SUROGATE_SERVE_TEXT_A16") != nullptr;
     switch (format) {
     case QType::NVFP4:
-        return kNvfp4TextPolicy;
+        return a16 ? ops::LinearPolicy::A16Only : kNvfp4TextPolicy;
     case QType::FP8_E4M3FN_ROW_BF16S:
-        return kFp8TextPolicy;
+        return a16 ? ops::LinearPolicy::A16Only : kFp8TextPolicy;
     case QType::FP8_E4M3FN_BLK128_F32S:
     case QType::FP8_E4M3FN_ROW_F32S:
         return kFp8TextPolicy; // informational: the route quantises per token per 128 regardless

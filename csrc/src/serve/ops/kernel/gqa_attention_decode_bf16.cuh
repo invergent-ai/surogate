@@ -298,8 +298,18 @@ __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const std::int32_t first_pos = pos[0];
     const std::int32_t last_pos  = pos[tokens - 1];
     if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) {
+        if (last_pos >= logical_capacity && blockIdx.y == 0 && kv_head == 0 && row_base == 0 && tid == 0) {
+            printf("gqa-envelope: positions past the launch: width %d batch %d valid %d first %d last %d capacity %d splits %d\n",
+                   tokens, batch, valid_tokens, first_pos, last_pos, logical_capacity, split_count);
+        }
         write_neutral();
         return;
+    }
+    if (blockIdx.y == 0 && kv_head == 0 && row_base == 0 && tid == 0 &&
+        gqa_key_partition(last_pos) + 1 - gqa_key_partition(gqa_small_t_key_lo(first_pos, sliding_window)) > split_count) {
+        printf("gqa-envelope: split kernel short of partitions: width %d batch %d valid %d first %d last %d capacity %d splits %d needed %d\n",
+               tokens, batch, valid_tokens, first_pos, last_pos, logical_capacity, split_count,
+               gqa_key_partition(last_pos) + 1 - gqa_key_partition(gqa_small_t_key_lo(first_pos, sliding_window)));
     }
 
     // Partition the keys this tile can actually see, not every key ever written.
