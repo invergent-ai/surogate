@@ -506,7 +506,10 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
-        long needed = required_stack_bytes(mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions);
+        // The runtime skips a frozen param's weight gradient; the sizer leaves it out too.
+        const auto is_trainable = [this](const std::string& param) { return mParams && mParams->is_trainable(param); };
+        long needed = required_stack_bytes(
+            mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions, is_trainable);
         // dispatch-PP runs sub-range stages with skip_finalize, which keeps the boundary
         // saves (res_att/mlp_down) live on the stack on top of the normal backward peak --
         // the auto-sizer doesn't model that, so add headroom (env, MB). There is ample free
@@ -516,7 +519,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             if (mb > 0) needed += mb * 1024L * 1024L;
         }
         if (options.DebugMemoryBreakdown && comm.rank() == 0) {
-            const long graph_peak = graph_backward_stack_peak(exec->compiled_backward(), mRunState->buffer_plan());
+            const long graph_peak =
+                graph_backward_stack_peak(exec->compiled_backward(), mRunState->buffer_plan(), is_trainable);
             std::cerr << "[DEBUG-STACK] graph_peak=" << graph_peak / (1024 * 1024) << " MiB"
                       << ", final_required=" << needed / (1024 * 1024) << " MiB"
                       << ", currently_allocated=" << required_size / (1024 * 1024) << " MiB" << std::endl;

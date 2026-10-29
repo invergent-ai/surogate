@@ -1599,7 +1599,9 @@ long GraphExecutor::estimate_backward_stack_peak(long B, long T) {
     // flags (`large_bwd_temps_on_stack`, `ffn_temps_on_stack`) that used to
     // be queried via `mRunState`.
     compile_graphs(B, T);
-    return graph_backward_stack_peak(mCompiledBackward.get(), mRunState.buffer_plan());
+    return graph_backward_stack_peak(mCompiledBackward.get(), mRunState.buffer_plan(), [this](const std::string& param) {
+        return mWeights.is_trainable(param);
+    });
 }
 
 void GraphExecutor::set_internal_graphs_enabled(bool enabled) {
