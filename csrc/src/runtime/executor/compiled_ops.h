@@ -871,10 +871,11 @@ private:
 
     // Document masking context for Flash Attention varlen (null = disabled)
     /// Chunked-sequence carry for a GDN (gated delta rule) layer: per-chunk
-    /// initial states (slot c = state BEFORE chunk c, BF16 as the kernel
-    /// expects; slot 0 stays zero) and the FP32 reverse d-state carry.
+    /// initial states (slot c = state BEFORE chunk c, FP32 as the kernel takes
+    /// it -- a BF16 carry rounded the state at every window boundary; slot 0
+    /// stays zero) and the FP32 reverse d-state carry.
     struct ChunkGdnState {
-        nv_bfloat16* states = nullptr;  ///< [(num_chunks+1) * elems]
+        float* states = nullptr;        ///< [(num_chunks+1) * elems]
         float* d_state = nullptr;       ///< [elems] — d_final for the previous chunk
         std::size_t elems = 0;          ///< B*H*K*V
     };

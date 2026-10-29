@@ -153,13 +153,16 @@ public:
     // When inject_layer >= 0, inject ``inject_host`` into get_residual(inject_layer)
     // first (the cross-GPU activation handoff). Read the result via the executor's
     // debug readers (debug_read_residual_bytes / last_block_hidden_f32).
+    // include_head=false stops the last stage at its last block (no final norm, lm-head or
+    // loss), for a chunked backward's KV sweep, which only rebuilds the blocks' chunk state.
     void dispatch_pp_forward_stage(Tensor inputs,
                                    Tensor position_ids,
                                    NCCLCommunicator& comm,
                                    int lo,
                                    int hi,
                                    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
-                                   bool preserve_output);
+                                   bool preserve_output,
+                                   bool include_head = true);
     // Run one backward stage (blocks [lo..hi]) on this GPU. Forward only this
     // stage's blocks from fwd_inject (block lo-1's residual, captured in the
     // forward pass; empty for lo==0, which forwards from the embedding), then run

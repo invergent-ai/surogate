@@ -354,10 +354,10 @@ CompiledExecutor::ChunkGdnState& CompiledExecutor::chunk_gdn_state(long elems, i
         if (st.states) CUDA_CHECK(cudaFreeAsync(st.states, stream));
         if (st.d_state) CUDA_CHECK(cudaFreeAsync(st.d_state, stream));
         const std::size_t slots = static_cast<std::size_t>(mChunkCount) + 1;
-        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.states), slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.states), slots * need * sizeof(float), stream));
         CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.d_state), need * sizeof(float), stream));
         // Slot 0 (state before chunk 0) stays zero forever; zero it all once.
-        CUDA_CHECK(cudaMemsetAsync(st.states, 0, slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.states, 0, slots * need * sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, need * sizeof(float), stream));
         st.elems = need;
     }

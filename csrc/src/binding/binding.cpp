@@ -1650,8 +1650,8 @@ NB_MODULE(_surogate, m) {
                std::vector<int> his,
                int num_microbatches,
                bool keep_boundaries) {
-                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 auto lp = trainer->dispatch_pp_forward_logprobs_multigpu(inputs.data(),
                                                                         targets.data(),
                                                                         los,
@@ -1665,7 +1665,7 @@ NB_MODULE(_surogate, m) {
                 const std::size_t rows = static_cast<std::size_t>(num_microbatches) *
                                          static_cast<std::size_t>(trainer->batch_size());
                 return nb::ndarray<nb::numpy, float, nb::ndim<2>>(
-                    data, {rows, static_cast<std::size_t>(trainer->seq_length())}, owner);
+                    data, {rows, static_cast<std::size_t>(trainer->step_seq_length())}, owner);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1691,13 +1691,13 @@ NB_MODULE(_surogate, m) {
                nb::object custom_dloss_obj,
                bool reuse_forward) {
                 // inputs/targets carry num_microbatches microbatches of [batch_size, seq] each.
-                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 const float* custom_dloss_ptr = nullptr;
                 if (!custom_dloss_obj.is_none()) {
                     auto custom_dloss =
                         nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(custom_dloss_obj);
-                    CHECK_SHAPE(custom_dloss, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                    CHECK_SHAPE(custom_dloss, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                     custom_dloss_ptr = custom_dloss.data();
                 }
                 return trainer->dispatch_pp_train_step_multigpu(inputs.data(),
