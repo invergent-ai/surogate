@@ -261,16 +261,22 @@ public:
     // forward pipeline at stage N-2 (the backward recomputes the last stage), so
     // logprobs are never materialized there. GRPO needs them to form its
     // per-token gradients, which then come back in via custom_dloss below.
+    // keep_boundaries: hold on to every stage's output boundary so the next
+    // dispatch_pp_train_step_multigpu(reuse_forward=true) over the same rows can take
+    // them as its stage inputs instead of running the same forward again.
     std::vector<float> dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
                                                              const std::int32_t* targets,
                                                              const std::vector<int>& los,
                                                              const std::vector<int>& his,
-                                                             int num_microbatches = 1);
+                                                             int num_microbatches = 1,
+                                                             bool keep_boundaries = false);
     // custom_dloss (optional, host [num_microbatches * B * T]): per-token gradient
     // seeds for the loss stage, replacing the built-in cross-entropy. This is how
     // GRPO/DPO-style objectives run under dispatch-PP — the caller computes the
     // per-token gradients from logprobs and hands them in, exactly as the
     // non-dispatch path does via backward_grpo(). nullptr keeps the CE behaviour.
+    // reuse_forward: skip the step's forward when the last log-prob pass kept its
+    // boundaries for these exact rows, stages and weights (it recomputes nothing else).
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                           const std::int32_t* targets,
                                           const std::vector<int>& los,
@@ -279,7 +285,8 @@ public:
                                           int step_idx,
                                           bool stale,
                                           int num_microbatches = 1,
-                                          const float* custom_dloss = nullptr);
+                                          const float* custom_dloss = nullptr,
+                                          bool reuse_forward = false);
     // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
     float dispatch_pp_last_grad_norm() const {
         return mDispatchPpLastGradNorm;
@@ -571,6 +578,12 @@ private:
     int mDispatchPpAppliedStep = 0;
     int mDispatchPpPendingValidTokens = 0;  // valid-token count for the deferred (stale) grads
     float mDispatchPpLastGradNorm = 0.0f;
+    // Boundaries kept by the last log-prob pass (keep_boundaries): [stage][microbatch] output of
+    // each stage but the last, valid for the rows/stages/weights summarized by mDppKeptKey.
+    std::vector<std::vector<std::vector<std::pair<std::string, std::vector<std::byte>>>>> mDppKeptBoundaries;
+    std::uint64_t mDppKeptKey = 0;
+    // Bumped by every dispatch-PP weight update, so kept boundaries never outlive their weights.
+    std::uint64_t mDppWeightVersion = 0;
 };
 
 #endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

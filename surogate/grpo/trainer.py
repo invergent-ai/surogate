@@ -510,8 +510,13 @@ class GRPOTrainer:
         inputs = np.ascontiguousarray(np.concatenate([p["input"] for p in prepared], axis=0))
         targets = np.ascontiguousarray(np.concatenate([p["targets"] for p in prepared], axis=0))
 
+        # The log-prob pass keeps every stage's output so the training step below,
+        # over the same rows and weights, takes them as its stage inputs instead of
+        # running the same forward pipeline a second time (SUROGATE_DPP_REUSE_FORWARD=0
+        # turns this off).
+        reuse_forward = os.environ.get("SUROGATE_DPP_REUSE_FORWARD", "1") != "0"
         logprob_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
-            inputs, targets, self._dpp_los, self._dpp_his, M
+            inputs, targets, self._dpp_los, self._dpp_his, M, keep_boundaries=reuse_forward
         )
 
         custom_dloss = np.zeros((M, seq_len), dtype=np.float32)
@@ -548,7 +553,16 @@ class GRPOTrainer:
 
         loss = float(
             self.trainer.dispatch_pp_train_step_multigpu(
-                inputs, targets, self._dpp_los, self._dpp_his, opt_config, step, False, M, custom_dloss
+                inputs,
+                targets,
+                self._dpp_los,
+                self._dpp_his,
+                opt_config,
+                step,
+                False,
+                M,
+                custom_dloss,
+                reuse_forward=reuse_forward,
             )
         )
         self._diag_metrics = metrics

@@ -2804,14 +2804,74 @@ float MultiGPUPyTrainer::dispatch_pp_train_step(const std::int32_t* inputs,
     return loss;
 }
 
+namespace {
+
+// SUROGATE_DPP_TIMING=1: host wall time of each phase of the dispatch-PP passes (each mark
+// follows the phase's barrier, so it is the time until every GPU of the phase is done).
+bool dpp_timing_enabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SUROGATE_DPP_TIMING");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return on;
+}
+
+struct DppPhaseTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last = start;
+    std::string phases;
+
+    void mark(const char* phase) {
+        if (!dpp_timing_enabled()) return;
+        const auto now = std::chrono::steady_clock::now();
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " %s=%.3f", phase, std::chrono::duration<double>(now - last).count());
+        phases += buf;
+        last = now;
+    }
+    void print(const char* pass) const {
+        if (!dpp_timing_enabled()) return;
+        const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::fprintf(stderr, "[dpp-time] %s total=%.3f s:%s\n", pass, total, phases.c_str());
+    }
+};
+
+// FNV-1a over what a dispatch-PP pass ran on: the token rows, the stage layout, the
+// microbatch count and the weight version. Kept boundaries are reused only on a match.
+std::uint64_t dpp_rows_key(const std::int32_t* inputs,
+                           std::size_t num_tokens,
+                           const std::vector<int>& los,
+                           const std::vector<int>& his,
+                           int num_microbatches,
+                           std::uint64_t weight_version) {
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void* p, std::size_t bytes) {
+        const auto* b = static_cast<const unsigned char*>(p);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(inputs, num_tokens * sizeof(std::int32_t));
+    mix(los.data(), los.size() * sizeof(int));
+    mix(his.data(), his.size() * sizeof(int));
+    mix(&num_microbatches, sizeof(num_microbatches));
+    mix(&weight_version, sizeof(weight_version));
+    return h;
+}
+
+}  // namespace
+
 std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
                                                                            const std::int32_t* targets,
                                                                            const std::vector<int>& los,
                                                                            const std::vector<int>& his,
-                                                                           int num_microbatches) {
+                                                                           int num_microbatches,
+                                                                           bool keep_boundaries) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: bad stage ranges");
     }
+    DppPhaseTimer timer;
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
     const int M = std::max(1, num_microbatches);
@@ -2828,6 +2888,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
             if (auto* ge = m->graph_executor()) ge->dispatch_reset_stack();
         }
     });
+    timer.mark("reset");
 
     std::vector<float> logprobs(static_cast<std::size_t>(M) * static_cast<std::size_t>(mb_stride), 0.0f);
     std::vector<std::vector<Boundary>> fwd_out(static_cast<std::size_t>(num_stages),
@@ -2900,6 +2961,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
     }
     for (int g = 0; g < ngpu; ++g)
         wait_gpu(g);
+    timer.mark("pipeline");
 
     // Leave the executor clean. Intermediate stages ran with set_preserve_layer(hi)
     // and skip_finalize, which is per-step dispatch state; the fused training step
@@ -2914,6 +2976,21 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
             }
         }
     });
+    // The boundaries are exactly the stage inputs the training step's forward would
+    // recompute (same rows, same weights), so a GRPO step can hand them over.
+    if (keep_boundaries) {
+        mDppKeptBoundaries = std::move(fwd_out);
+        mDppKeptKey = dpp_rows_key(inputs,
+                                   static_cast<std::size_t>(M) * static_cast<std::size_t>(mb_stride),
+                                   los,
+                                   his,
+                                   M,
+                                   mDppWeightVersion);
+    } else {
+        mDppKeptBoundaries.clear();
+    }
+    timer.mark("cleanup");
+    timer.print("logprob_pass");
     return logprobs;
 }
 
@@ -2925,7 +3002,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                          int step_idx,
                                                          bool stale,
                                                          int num_microbatches,
-                                                         const float* custom_dloss) {
+                                                         const float* custom_dloss,
+                                                         bool reuse_forward) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
     }
@@ -2934,6 +3012,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     const int M = std::max(1, num_microbatches);
     const long mb_stride = static_cast<long>(B) * static_cast<long>(T);  // tokens per microbatch
     float loss = 0.0f;
+    DppPhaseTimer timer;
 
     using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
 
@@ -2947,6 +3026,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             if (model && model->graph_executor()) model->graph_executor()->dispatch_reset_stack();
         },
         -1);
+    timer.mark("reset");
 
     // 1. Forward-dispatch stages in order with cross-GPU boundary handoff. Capture
     //    each stage's INPUT boundary (block lo-1's residual) so the backward pass can
@@ -2968,7 +3048,35 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     // backward; the last stage's forward is recomputed in the backward pass.
     std::vector<std::vector<Boundary>> stage_inputs(static_cast<std::size_t>(num_stages),
                                                     std::vector<Boundary>(static_cast<std::size_t>(M)));
-    {
+    // A log-prob pass over these rows with these weights already produced every stage's
+    // input (keep_boundaries): take them instead of running the same forward again.
+    // Stage 0 starts from the embeddings, so its input boundary stays empty.
+    bool reused = false;
+    if (reuse_forward) {
+        reused = mDppKeptBoundaries.size() == static_cast<std::size_t>(num_stages) &&
+                 mDppKeptKey == dpp_rows_key(inputs,
+                                             static_cast<std::size_t>(M) * static_cast<std::size_t>(mb_stride),
+                                             los,
+                                             his,
+                                             M,
+                                             mDppWeightVersion);
+        if (reused) {
+            for (int s = 1; s < num_stages; ++s)
+                for (int m = 0; m < M; ++m)
+                    stage_inputs[static_cast<std::size_t>(s)][static_cast<std::size_t>(m)] =
+                        std::move(mDppKeptBoundaries[static_cast<std::size_t>(s - 1)][static_cast<std::size_t>(m)]);
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "[dispatch_pp] reuse_forward: no kept boundaries for these rows/weights; "
+                             "running the forward (reported once)\n");
+            }
+        }
+    }
+    mDppKeptBoundaries.clear();
+    if (!reused) {
         const int last_fwd = num_stages - 2;
         std::vector<std::vector<Boundary>> fwd_out(static_cast<std::size_t>(num_stages),
                                                    std::vector<Boundary>(static_cast<std::size_t>(M)));
@@ -3024,6 +3132,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             stage_inputs[static_cast<std::size_t>(num_stages - 1)][static_cast<std::size_t>(m)] =
                 (last_fwd >= 0) ? fwd_out[static_cast<std::size_t>(last_fwd)][static_cast<std::size_t>(m)] : Boundary{};
     }
+    timer.mark(reused ? "forward_reused" : "forward");
 
     // 2. Backward WAVEFRONT (mirror of the forward). Grads are pre-zeroed on every GPU,
     //    then each backward_stage accumulates (micro_step=1, no per-task zero) -- the
@@ -3038,6 +3147,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             if (model) model->dispatch_pp_zero_grads();
         },
         -1);
+    timer.mark("zero_grads");
 
     std::vector<double> loss_per_mb(static_cast<std::size_t>(M), 0.0);
     // Valid (non-pad) tokens per microbatch, counted by the loss stage on its GPU. Summed
@@ -3127,6 +3237,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         for (int g = 0; g < ngpu; ++g)
             wait_gpu(g);
     }
+    timer.mark("backward");
     {
         double ls = 0.0;
         for (double x : loss_per_mb)
@@ -3159,6 +3270,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         for (auto& g : stage_grads)
             collected.push_back(std::move(g));
     }
+    timer.mark("collect_grads");
 
     // 2. Optimizer + broadcast. In synchronous mode, apply this step's grads now.
     //    In one-step-stale mode, defer: apply the *previous* step's grads (so the
@@ -3177,6 +3289,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     } else {
         dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1, step_valid_tokens);
     }
+    timer.mark("apply");
+    timer.print("train_step");
     return loss;
 }
 
@@ -3196,6 +3310,7 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
     int valid_tokens) {
     // GPU 0 holds the master replica: write the collected grads into its store and
     // run the optimizer there.
+    DppPhaseTimer timer;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
@@ -3208,6 +3323,7 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
                 model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
         },
         0);
+    timer.mark("write_grads+optimizer");
     // Broadcast GPU 0's updated weights to every replica so the pool is consistent
     // for the next step's stages (which run on any GPU).
     std::vector<std::pair<std::string, std::vector<std::byte>>> master;
@@ -3217,12 +3333,23 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
             if (model) master = model->dispatch_pp_read_weights();
         },
         0);
+    timer.mark("read_weights");
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
             if (model) model->dispatch_pp_write_weights(master);
         },
         -1);
+    timer.mark("write_weights");
+    ++mDppWeightVersion;
+    if (dpp_timing_enabled()) {
+        std::size_t bytes = 0;
+        for (const auto& kv : collected)
+            bytes += kv.second.size();
+        std::fprintf(stderr, "[dpp-time] apply: %zu grad tensors, %.0f MiB of grads, %zu weight tensors\n",
+                     collected.size(), static_cast<double>(bytes) / (1024.0 * 1024.0), master.size());
+    }
+    timer.print("apply");
 }
 #undef DISPATCH_PP_DBG_STAGE
 

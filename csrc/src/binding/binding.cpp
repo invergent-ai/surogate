@@ -1648,14 +1648,16 @@ NB_MODULE(_surogate, m) {
                TokenArray targets,
                std::vector<int> los,
                std::vector<int> his,
-               int num_microbatches) {
+               int num_microbatches,
+               bool keep_boundaries) {
                 CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
                 auto lp = trainer->dispatch_pp_forward_logprobs_multigpu(inputs.data(),
                                                                         targets.data(),
                                                                         los,
                                                                         his,
-                                                                        num_microbatches);
+                                                                        num_microbatches,
+                                                                        keep_boundaries);
                 const std::size_t n = lp.size();
                 float* data = new float[n];
                 std::copy(lp.begin(), lp.end(), data);
@@ -1670,9 +1672,11 @@ NB_MODULE(_surogate, m) {
             nb::arg("los"),
             nb::arg("his"),
             nb::arg("num_microbatches") = 1,
+            nb::arg("keep_boundaries") = false,
             "dispatch-PP staged forward through the loss stage; returns per-token logprobs "
             "[num_microbatches*batch_size, seq]. Pair with dispatch_pp_train_step_multigpu(custom_dloss=...) "
-            "to run GRPO-style objectives under dispatch-PP.")
+            "to run GRPO-style objectives under dispatch-PP. keep_boundaries=True keeps every stage's "
+            "output for the next train step over the same rows (reuse_forward=True skips its forward).")
         .def(
             "dispatch_pp_train_step_multigpu",
             [](MultiGPUPyTrainer* trainer,
@@ -1684,7 +1688,8 @@ NB_MODULE(_surogate, m) {
                int step_idx,
                bool stale,
                int num_microbatches,
-               nb::object custom_dloss_obj) {
+               nb::object custom_dloss_obj,
+               bool reuse_forward) {
                 // inputs/targets carry num_microbatches microbatches of [batch_size, seq] each.
                 CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
@@ -1703,7 +1708,8 @@ NB_MODULE(_surogate, m) {
                                                                 step_idx,
                                                                 stale,
                                                                 num_microbatches,
-                                                                custom_dloss_ptr);
+                                                                custom_dloss_ptr,
+                                                                reuse_forward);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1714,6 +1720,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("stale") = false,
             nb::arg("num_microbatches") = 1,
             nb::arg("custom_dloss") = nb::none(),
+            nb::arg("reuse_forward") = false,
             "Debug-only dispatch-PP: one full multi-GPU training step (round-robin backward dispatch + "
             "cross-GPU grad handoff -> collect grads -> optimizer on the master -> broadcast weights to "
             "all GPUs); returns the (raw) step loss. stale=true defers the optimizer update by one step "
