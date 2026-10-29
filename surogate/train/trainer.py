@@ -420,7 +420,10 @@ class SurogateTrainerWrapper:
             os.environ["SUROGATE_DISPATCH_STAGE_BLOCKS"] = str(_sb)
             # Stage-local LoRA: each GPU allocates and trains only its own stages' adapters (set 0 to replicate).
             os.environ.setdefault("SUROGATE_DISPATCH_LORA_LOCAL", "1")
-            prefetch = _max_stage + 2  # whole stage resident + double-buffer margin
+            from surogate.train.dispatch_pp import layers_per_gpu
+
+            # Every stage of a GPU resident + double-buffer margin.
+            prefetch = layers_per_gpu(self._dpp_los, self._dpp_his, config.gpus) + 2
             os.environ["SUROGATE_DISPATCH_PREFETCH_BLOCKS"] = str(prefetch)
             # Headroom for the boundary saves kept live by sub-range skip_finalize (the
             # stack auto-sizer doesn't model them). Plenty of free VRAM since the base

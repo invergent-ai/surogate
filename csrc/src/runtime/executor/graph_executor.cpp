@@ -2065,6 +2065,10 @@ void GraphExecutor::zero_sequence_chunk_dkv() {
     if (mCompiledExecutor) mCompiledExecutor->zero_sequence_chunk_dkv();
 }
 
+void GraphExecutor::zero_sequence_chunk_dkv(int lo, int hi) {
+    if (mCompiledExecutor) mCompiledExecutor->zero_sequence_chunk_dkv(lo, hi);
+}
+
 void GraphExecutor::save_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
     if (mCompiledExecutor) mCompiledExecutor->save_sequence_chunk_state(lo, hi, slot, chunks);
 }

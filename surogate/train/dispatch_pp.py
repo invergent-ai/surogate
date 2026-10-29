@@ -72,3 +72,12 @@ def plan_stages(model_config, gpus: int) -> tuple[list[int], list[int], int, int
     nst = len(los)
     max_stage = max(h - l + 1 for l, h in zip(los, his))
     return los, his, n_layers, nst, max_stage, sb
+
+
+def layers_per_gpu(los: list[int], his: list[int], gpus: int) -> int:
+    """Most layers any GPU runs (stage s runs on GPU s % gpus): the resident weight window has to hold all of a GPU's
+    stages, which with more stages than GPUs alternate on it unit by unit."""
+    per_gpu = [0] * max(1, min(gpus, len(los)))
+    for s, (lo, hi) in enumerate(zip(los, his)):
+        per_gpu[s % len(per_gpu)] += hi - lo + 1
+    return max(per_gpu)

@@ -132,7 +132,7 @@ class GRPOTrainer:
         self._dpp_los: list[int] | None = None
         self._dpp_his: list[int] | None = None
         if self._dispatch_pp:
-            from surogate.train.dispatch_pp import plan_stages
+            from surogate.train.dispatch_pp import layers_per_gpu, plan_stages
 
             self._dpp_los, self._dpp_his, n_layers, n_stages, max_stage, sb = plan_stages(
                 config.model_info.config, config.gpus
@@ -141,8 +141,10 @@ class GRPOTrainer:
             # Stage-local LoRA: each GPU allocates and trains only the adapters of the stages it runs (stage s on
             # GPU s % gpus) instead of all of them replicated; set 0 to replicate.
             os.environ.setdefault("SUROGATE_DISPATCH_LORA_LOCAL", "1")
-            # Whole stage resident + double-buffer margin (an explicit setting wins).
-            os.environ.setdefault("SUROGATE_DISPATCH_PREFETCH_BLOCKS", str(max_stage + 2))
+            # Every stage of a GPU resident + double-buffer margin (an explicit setting wins).
+            os.environ.setdefault(
+                "SUROGATE_DISPATCH_PREFETCH_BLOCKS", str(layers_per_gpu(self._dpp_los, self._dpp_his, config.gpus) + 2)
+            )
             logger.info(
                 f"[dispatch_pp] GRPO: {n_stages} stages over {n_layers} layers "
                 f"(max {max_stage} blocks/stage, stage_blocks={sb}, "

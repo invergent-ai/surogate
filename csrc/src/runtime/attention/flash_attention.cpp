@@ -334,14 +334,21 @@ void CompiledExecutor::ensure_chunk_cu_uploaded() {
 }
 
 void CompiledExecutor::zero_sequence_chunk_dkv() {
+    zero_sequence_chunk_dkv(0, std::numeric_limits<int>::max());
+}
+
+void CompiledExecutor::zero_sequence_chunk_dkv(int lo, int hi) {
     for (auto& [layer, st] : mChunkAttn) {
+        if (layer < lo || layer > hi) continue;
         if (st.dk) CUDA_CHECK(cudaMemsetAsync(st.dk, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
         if (st.dv) CUDA_CHECK(cudaMemsetAsync(st.dv, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
     }
     for (auto& [layer, st] : mChunkGdn) {
+        if (layer < lo || layer > hi) continue;
         if (st.d_state) CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, st.elems * sizeof(float), mRunState.MainStream));
     }
     for (auto& [layer, st] : mChunkConv) {
+        if (layer < lo || layer > hi) continue;
         if (st.d_tail)
             CUDA_CHECK(cudaMemsetAsync(st.d_tail, 0, st.elems * get_dtype_size(st.dtype), mRunState.MainStream));
     }

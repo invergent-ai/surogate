@@ -201,6 +201,9 @@ public:
     /// Zero all layers' dKV accumulators — call once before each reverse
     /// backward sweep.
     void zero_sequence_chunk_dkv();
+    /// The same for layers [lo, hi] only: a GPU running several stages starts
+    /// one stage's row while another stage is still inside its own.
+    void zero_sequence_chunk_dkv(int lo, int hi);
     /// Host copy of one row's chunk state (KV caches, GDN state slots, conv
     /// tails) of layers [lo, hi] after its forward over `chunks` windows, kept
     /// per slot (microbatch): the backward of the same rows restores it instead

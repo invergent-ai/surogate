@@ -202,6 +202,7 @@ class GraphExecutor final : public IGraphExecutor {
 public:
     void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr) override;
     void zero_sequence_chunk_dkv() override;
+    void zero_sequence_chunk_dkv(int lo, int hi);
     /// Chunk-state snapshots of a stage's layers (CompiledExecutor::save_sequence_chunk_state).
     void save_sequence_chunk_state(int lo, int hi, int slot, int chunks);
     bool restore_sequence_chunk_state(int lo, int hi, int slot, int chunks);

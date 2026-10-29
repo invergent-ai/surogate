@@ -2892,6 +2892,39 @@ bool dpp_kv_sweep_forced() {
     return forced;
 }
 
+// One task per GPU runs every unit of all the stages it holds (stage s on GPU s % gpus). Each turn takes, among its
+// stages whose input for their next unit is ready, the one furthest behind (ties: the one further along the flow).
+// With more stages than GPUs (virtual stages), a unit that reaches a GPU's later stage is then not held behind its
+// earlier stage's remaining units, which shortens the pipeline's fill and drain. Every stage still runs the units of
+// `order` in that order, so the arithmetic is the same as one task per stage.
+template <class Ready, class Run>
+void dpp_run_stages_interleaved(const std::vector<int>& mine, const std::vector<int>& order, bool forward,
+                                Ready ready, Run run) {
+    std::vector<std::size_t> cur(mine.size(), 0);
+    for (;;) {
+        int pick = -1;
+        bool left = false;
+        for (std::size_t i = 0; i < mine.size(); ++i) {
+            if (cur[i] >= order.size()) continue;
+            left = true;
+            if (!ready(mine[i], order[cur[i]])) continue;
+            const auto p = static_cast<std::size_t>(pick);
+            if (pick < 0 || cur[i] < cur[p] ||
+                (cur[i] == cur[p] && (forward ? mine[i] > mine[p] : mine[i] < mine[p]))) {
+                pick = static_cast<int>(i);
+            }
+        }
+        if (!left) return;
+        if (pick < 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        const auto p = static_cast<std::size_t>(pick);
+        run(mine[p], cur[p]);
+        ++cur[p];
+    }
+}
+
 // Stage one window into a GPU's input buffers: B rows of T tokens from `inputs` (and `targets`
 // when given), rows row_tokens apart, absolute positions pos0 .. pos0 + T - 1.
 template <class Ctx>
@@ -2990,31 +3023,43 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
         ready[i].store(0, std::memory_order_relaxed);
     std::atomic<int>* readyp = ready.get();
 
-    for (int s = 0; s < num_stages; ++s) {
-        const int lo = los[static_cast<std::size_t>(s)];
-        const int hi = his[static_cast<std::size_t>(s)];
-        const bool is_loss = (s == num_stages - 1);
-        std::vector<Boundary>* my_out = &fwd_out[static_cast<std::size_t>(s)];
-        std::vector<Boundary>* up_out = (s > 0) ? &fwd_out[static_cast<std::size_t>(s - 1)] : nullptr;
+    // Units in the order every stage runs them: rows in turn, each row's windows first to last.
+    std::vector<int> fwd_order;
+    for (int m = 0; m < M; ++m)
+        for (int c = 0; c < occupied[static_cast<std::size_t>(m)]; ++c)
+            fwd_order.push_back(m * C + c);
+    for (int g = 0; g < std::min(ngpu, num_stages); ++g) {
+        std::vector<int> mine;
+        for (int s = g; s < num_stages; s += ngpu)
+            mine.push_back(s);
         float* lp_out = logprobs.data();
+        std::vector<std::vector<Boundary>>* fwd_outp = &fwd_out;
+        const std::vector<int>* orderp = &fwd_order;
         dispatch_async(
-            [this, inputs, targets, mb_stride, row_tokens, M, C, units, occ, s, lo, hi, is_loss, my_out, up_out,
-             readyp, lp_out, keep_chunk_state](sThreadContext& ctx) {
+            [this, inputs, targets, mb_stride, row_tokens, C, units, occ, num_stages, mine, orderp, fwd_outp, &los,
+             &his, readyp, lp_out, keep_chunk_state](sThreadContext& ctx) {
                 auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                 if (!model) throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: DSL model required");
                 auto* ge = model->graph_executor();
-                const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
-                const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
-                for (int m = 0; m < M; ++m) {
-                    for (int c = 0; c < (*occ)[static_cast<std::size_t>(m)]; ++c) {
-                        const int u = m * C + c;
-                        const std::size_t window = static_cast<std::size_t>(m) * mb_stride + static_cast<std::size_t>(c) * T;
+                auto ready = [&](int s, int u) {
+                    return s == 0 || readyp[(s - 1) * units + u].load(std::memory_order_acquire) != 0;
+                };
+                auto run = [&](int s, std::size_t k) {
+                    const int lo = los[static_cast<std::size_t>(s)];
+                    const int hi = his[static_cast<std::size_t>(s)];
+                    const bool is_loss = (s == num_stages - 1);
+                    std::vector<Boundary>* my_out = &(*fwd_outp)[static_cast<std::size_t>(s)];
+                    std::vector<Boundary>* up_out = (s > 0) ? &(*fwd_outp)[static_cast<std::size_t>(s - 1)] : nullptr;
+                    const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
+                    const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
+                    const int u = (*orderp)[k];
+                    const int m = u / C;
+                    const int c = u % C;
+                    {
+                        const std::size_t window =
+                            static_cast<std::size_t>(m) * mb_stride + static_cast<std::size_t>(c) * T;
                         Boundary inj;
-                        if (up_out) {
-                            while (readyp[(s - 1) * units + u].load(std::memory_order_acquire) == 0)
-                                std::this_thread::yield();
-                            inj = (*up_out)[static_cast<std::size_t>(u)];
-                        }
+                        if (up_out) inj = (*up_out)[static_cast<std::size_t>(u)];  // shares the kept bytes
                         // The loss stage needs targets in the model's target buffer for
                         // cross_entropy_forward to write the per-token losses.
                         dpp_stage_window(ctx, inputs + window, is_loss ? targets + window : nullptr, B, T, row_tokens,
@@ -3051,11 +3096,13 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
                         readyp[s * units + u].store(1, std::memory_order_release);
                     }
                     const int chunks = (*occ)[static_cast<std::size_t>(m)];
-                    if (keep_chunk_state && chunks > 1) ge->save_sequence_chunk_state(lo, hi, m, chunks);
-                }
+                    if (keep_chunk_state && chunks > 1 && c == chunks - 1)
+                        ge->save_sequence_chunk_state(lo, hi, m, chunks);
+                };
+                dpp_run_stages_interleaved(mine, *orderp, /*forward=*/true, ready, run);
                 if (C > 1) ctx.Model->set_sequence_chunk(-1, 0);
             },
-            s % ngpu);
+            g);
     }
     for (int g = 0; g < ngpu; ++g)
         wait_gpu(g);
@@ -3290,44 +3337,63 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         std::atomic<int>* readyp = ready.get();
         std::vector<double>* lpm = &loss_per_mb;
         std::vector<int>* vtpm = &valid_per_mb;
-        for (int s = num_stages - 1; s >= 0; --s) {
-            const int lo = los[static_cast<std::size_t>(s)];
-            const int hi = his[static_cast<std::size_t>(s)];
-            const bool is_loss = (s == num_stages - 1);
-            std::vector<Boundary>* my_g = &grad_out[static_cast<std::size_t>(s)];
-            std::vector<Boundary>* up_g = (s < num_stages - 1) ? &grad_out[static_cast<std::size_t>(s + 1)] : nullptr;
-            std::vector<Boundary>* sin = &stage_inputs[static_cast<std::size_t>(s)];
+        // Units in the order every stage runs them: rows in turn, each row's windows last to first (the order the
+        // dK/dV and GDN/conv state-gradient carries need).
+        std::vector<int> bwd_order;
+        for (int m = 0; m < M; ++m)
+            for (int c = occupied[static_cast<std::size_t>(m)] - 1; c >= 0; --c)
+                bwd_order.push_back(m * C + c);
+        for (int g = 0; g < std::min(ngpu, num_stages); ++g) {
+            std::vector<int> mine;
+            for (int s = g; s < num_stages; s += ngpu)
+                mine.push_back(s);
+            std::vector<std::vector<Boundary>>* grad_outp = &grad_out;
+            std::vector<std::vector<Boundary>>* stage_inputsp = &stage_inputs;
+            const std::vector<int>* orderp = &bwd_order;
             dispatch_async(
-                [this, inputs, targets, custom_dloss, mb_stride, row_tokens, M, C, units, occ, s, lo, hi, is_loss,
-                 my_g, up_g, sin, readyp, lpm, vtpm, reused](sThreadContext& ctx) {
+                [this, inputs, targets, custom_dloss, mb_stride, row_tokens, M, C, units, occ, num_stages, mine, orderp,
+                 grad_outp, stage_inputsp, &los, &his, readyp, lpm, vtpm, reused](sThreadContext& ctx) {
                     auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                     if (!model) throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
                     auto* ge = model->graph_executor();
-                    const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
-                    const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
-                    for (int m = 0; m < M; ++m) {
+                    auto ready = [&](int s, int u) {
+                        return s == num_stages - 1 || readyp[(s + 1) * units + u].load(std::memory_order_acquire) != 0;
+                    };
+                    auto run = [&](int s, std::size_t k) {
+                        const int lo = los[static_cast<std::size_t>(s)];
+                        const int hi = his[static_cast<std::size_t>(s)];
+                        const bool is_loss = (s == num_stages - 1);
+                        std::vector<Boundary>* my_g = &(*grad_outp)[static_cast<std::size_t>(s)];
+                        std::vector<Boundary>* up_g =
+                            (s < num_stages - 1) ? &(*grad_outp)[static_cast<std::size_t>(s + 1)] : nullptr;
+                        std::vector<Boundary>* sin = &(*stage_inputsp)[static_cast<std::size_t>(s)];
+                        const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
+                        const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
+                        const int u = (*orderp)[k];
+                        const int m = u / C;
+                        const int c = u % C;
                         const int chunks = (*occ)[static_cast<std::size_t>(m)];
                         const std::size_t row = static_cast<std::size_t>(m) * mb_stride;
-                        if (C > 1) {
-                            // Chunked: this microbatch's chunk state on this GPU was overwritten by
-                            // the later microbatches of the forward. The log-prob pass whose stage
-                            // inputs this step reuses saved it after the row's last window: restore
-                            // that. Otherwise rebuild it for windows 0 .. chunks-2 (a forward of the
-                            // stage's blocks only: no head, no loss). Then run the windows last to
-                            // first, the order the dK/dV and GDN/conv state-gradient carries need.
-                            model->zero_sequence_chunk_dkv();
-                            // The sweep keeps no block output for a boundary read, so no stage
-                            // base is captured; reset to the step base after each window instead
-                            // (the chunk state lives outside the stack).
-                            ge->set_preserve_layer(-1);
+                        // The sweep keeps no block output for a boundary read, so no stage base is captured; the
+                        // stack is reset to the step base after each window instead (the chunk state lives
+                        // outside the stack).
+                        ge->set_preserve_layer(-1);
+                        if (C > 1 && c == chunks - 1) {
+                            // Chunked, first window of this row on this stage: its chunk state on this GPU was
+                            // overwritten by the later rows of the forward. The log-prob pass whose stage inputs
+                            // this step reuses saved it after the row's last window: restore that. Otherwise
+                            // rebuild it for windows 0 .. chunks-2 (a forward of the stage's blocks only: no head,
+                            // no loss). Only the stage's own layers: the GPU may be inside another stage's row.
+                            ge->zero_sequence_chunk_dkv(lo, hi);
                             const bool restored =
                                 reused && chunks > 1 && ge->restore_sequence_chunk_state(lo, hi, m, chunks);
-                            for (int c = 0; !restored && c + 1 < chunks; ++c) {
-                                const int u = m * C + c;
-                                Boundary finj = (*sin)[static_cast<std::size_t>(u)];  // copy: the backward needs it too
-                                dpp_stage_window(ctx, inputs + row + static_cast<std::size_t>(c) * T, nullptr, B, T,
-                                                 row_tokens, static_cast<long>(c) * T);
-                                dpp_set_chunk(ctx, c, C, T, /*kv_sweep=*/true);
+                            for (int w = 0; !restored && w + 1 < chunks; ++w) {
+                                const int uw = m * C + w;
+                                // Shared bytes: the window's own backward needs them too.
+                                Boundary finj = (*sin)[static_cast<std::size_t>(uw)];
+                                dpp_stage_window(ctx, inputs + row + static_cast<std::size_t>(w) * T, nullptr, B, T,
+                                                 row_tokens, static_cast<long>(w) * T);
+                                dpp_set_chunk(ctx, w, C, T, /*kv_sweep=*/true);
                                 model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
                                                                  ctx.Model->get_position_ids_buffer(),
                                                                  *ctx.Communicator,
@@ -3340,62 +3406,53 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                 ge->retire_saved_layers(lo, hi, "sweep", s);
                             }
                         }
-                        for (int c = chunks - 1; c >= 0; --c) {
-                            const int u = m * C + c;
-                            const std::size_t window = row + static_cast<std::size_t>(c) * T;
-                            Boundary ginj;
-                            if (up_g) {
-                                while (readyp[(s + 1) * units + u].load(std::memory_order_acquire) == 0)
-                                    std::this_thread::yield();
-                                ginj = std::move((*up_g)[static_cast<std::size_t>(u)]);
-                            }
-                            Boundary finj = std::move((*sin)[static_cast<std::size_t>(u)]);
-                            dpp_stage_window(ctx, inputs + window, targets + window, B, T, row_tokens,
-                                             static_cast<long>(c) * T);
-                            dpp_set_chunk(ctx, c, C, T, /*kv_sweep=*/false);
-                            model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
-                                                              ctx.Model->get_target_buffer(),
-                                                              ctx.Model->get_position_ids_buffer(),
-                                                              *ctx.Communicator,
-                                                              lo,
-                                                              hi,
-                                                              is_loss,
-                                                              std::move(finj),
-                                                              std::move(ginj),
-                                                              /*micro_step=*/1,  // pre-zeroed -> always accumulate
-                                                              /*total_micro=*/M * C,
-                                                              // This window's slice of the custom per-token
-                                                              // gradients (GRPO/DPO); nullptr => built-in CE.
-                                                              custom_dloss ? custom_dloss + window : nullptr);
-                            if (is_loss) {
-                                // Sum over the windows; per valid token at the end of the step.
-                                const int valid = model->dispatch_pp_loss_valid_tokens();
-                                (*lpm)[static_cast<std::size_t>(m)] +=
-                                    static_cast<double>(model->dispatch_pp_raw_loss()) * std::max(1, valid);
-                                (*vtpm)[static_cast<std::size_t>(m)] += valid;
-                            }
-                            if (lo > 0) {
-                                Boundary g;
-                                g.emplace_back(rn, ge->read_named_bytes(rn));
-                                g.emplace_back(xn, ge->read_named_bytes(xn));
-                                (*my_g)[static_cast<std::size_t>(u)] = std::move(g);
-                            }
-                            // Reclaim this window's backward activations before the next.
-                            // Grads persist in the grad store and the grad boundary is already
-                            // read out above; one GPU runs all windows of this stage, so
-                            // without this the compute stack accumulates them all.
-                            // restore_stage_base is a no-op here (the stage base is only
-                            // checkpointed in the forward), so reset to the per-step base.
-                            ge->dispatch_reset_stack();
-                            // The stage's backward consumed its saves; the GPU's next (lower) stage
-                            // reuses the buffers.
-                            ge->retire_saved_layers(lo, hi, "bwd", s);
-                            readyp[s * units + u].store(1, std::memory_order_release);
+                        const std::size_t window = row + static_cast<std::size_t>(c) * T;
+                        Boundary ginj;
+                        if (up_g) ginj = std::move((*up_g)[static_cast<std::size_t>(u)]);
+                        Boundary finj = std::move((*sin)[static_cast<std::size_t>(u)]);
+                        dpp_stage_window(ctx, inputs + window, targets + window, B, T, row_tokens,
+                                         static_cast<long>(c) * T);
+                        dpp_set_chunk(ctx, c, C, T, /*kv_sweep=*/false);
+                        model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
+                                                          ctx.Model->get_target_buffer(),
+                                                          ctx.Model->get_position_ids_buffer(),
+                                                          *ctx.Communicator,
+                                                          lo,
+                                                          hi,
+                                                          is_loss,
+                                                          std::move(finj),
+                                                          std::move(ginj),
+                                                          /*micro_step=*/1,  // pre-zeroed -> always accumulate
+                                                          /*total_micro=*/M * C,
+                                                          // This window's slice of the custom per-token
+                                                          // gradients (GRPO/DPO); nullptr => built-in CE.
+                                                          custom_dloss ? custom_dloss + window : nullptr);
+                        if (is_loss) {
+                            // Sum over the windows; per valid token at the end of the step.
+                            const int valid = model->dispatch_pp_loss_valid_tokens();
+                            (*lpm)[static_cast<std::size_t>(m)] +=
+                                static_cast<double>(model->dispatch_pp_raw_loss()) * std::max(1, valid);
+                            (*vtpm)[static_cast<std::size_t>(m)] += valid;
                         }
-                    }
+                        if (lo > 0) {
+                            Boundary gb;
+                            gb.emplace_back(rn, ge->read_named_bytes(rn));
+                            gb.emplace_back(xn, ge->read_named_bytes(xn));
+                            (*my_g)[static_cast<std::size_t>(u)] = std::move(gb);
+                        }
+                        // Reclaim this window's backward activations before the next. Grads persist in the grad
+                        // store and the grad boundary is already read out above; without this the compute stack
+                        // accumulates every window. restore_stage_base is a no-op here (the stage base is only
+                        // checkpointed in the forward), so reset to the per-step base.
+                        ge->dispatch_reset_stack();
+                        // The stage's backward consumed its saves; the GPU's next unit reuses the buffers.
+                        ge->retire_saved_layers(lo, hi, "bwd", s);
+                        readyp[s * units + u].store(1, std::memory_order_release);
+                    };
+                    dpp_run_stages_interleaved(mine, *orderp, /*forward=*/false, ready, run);
                     if (C > 1) ctx.Model->set_sequence_chunk(-1, 0);
                 },
-                s % ngpu);
+                g);
         }
         for (int g = 0; g < ngpu; ++g)
             wait_gpu(g);
