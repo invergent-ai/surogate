@@ -1328,6 +1328,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 self.qlora_config = _surogate.QLoRAConfig.prequant_fp8()
             elif prequant_method == "prequant_nvfp4":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_nvfp4()
+                if self.model_info.quant_info.get("nvfp4_format") == "compressed-tensors":
+                    self.qlora_config.prequant_compressed_tensors = True
             elif prequant_method == "prequant_mxfp4":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
             elif prequant_method == "prequant_bnb_nf4":

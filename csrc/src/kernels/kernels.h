@@ -2321,6 +2321,17 @@ void dequantize_per_block(nv_bfloat16* out,
                           int block_size,
                           const cudaDeviceProp& dp,
                           cudaStream_t stream);
+
+// Row-wise (per-channel) FP8 dequantization: out[r, c] = in[r, c] * row_scales[r], row_scales BF16 or FP32
+// (compressed-tensors' per-channel FP8 Linears: weight_scale [M, 1]).
+void dequantize_fp8_rowwise(nv_bfloat16* out,
+                            const __nv_fp8_e4m3* in,
+                            const void* row_scales,
+                            ETensorDType scale_dtype,
+                            int M,
+                            int K,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream);
 void dequantize_per_block(Tensor& out,
                           const Tensor& in,
                           const Tensor& block_scales,
@@ -2426,6 +2437,18 @@ void dequantize_fp4_block(nv_bfloat16* out,
                           int K,
                           const cudaDeviceProp& dp,
                           cudaStream_t stream);
+
+/// @brief FP4 block dequantization with a global decode scale per group of rows_per_group rows
+/// (row_group_scales: device FP32, M / rows_per_group entries), e.g. one per stacked expert.
+void dequantize_fp4_block_grouped(nv_bfloat16* out,
+                                  const uint8_t* in_fp4,
+                                  const __nv_fp8_e4m3* block_scales,
+                                  const float* row_group_scales,
+                                  int rows_per_group,
+                                  int M,
+                                  int K,
+                                  const cudaDeviceProp& dp,
+                                  cudaStream_t stream);
 
 /// @brief Swizzle FP8 block scales from row-major to F8_128x4 layout (in-place).
 ///

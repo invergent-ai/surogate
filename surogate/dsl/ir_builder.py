@@ -111,4 +111,68 @@ def build_dsl_ir_for_model(
     """
     config_json = load_hf_config(model_dir)
     architecture = resolve_architecture(config_json)
-    return build_dsl_ir_from_python(architecture, config_json, extra_config=extra_config)
+    ir_json = build_dsl_ir_from_python(architecture, config_json, extra_config=extra_config)
+    names = _checkpoint_tensor_names(model_dir)
+    if names is None:
+        return ir_json
+    result = json.loads(ir_json)
+    if not _stack_per_expert_checkpoint(result, names):
+        return ir_json
+    return json.dumps(result)
+
+
+def _checkpoint_tensor_names(model_dir: str) -> set[str] | None:
+    """Tensor names of a local safetensors checkpoint (sharded index or single file); None if there is none."""
+    root = Path(model_dir)
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        return set(json.loads(index.read_text()).get("weight_map", {}))
+    single = root / "model.safetensors"
+    if single.is_file():
+        with single.open("rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            return {k for k in json.loads(f.read(header_len)) if k != "__metadata__"}
+    return None
+
+
+#: Fused routed-expert tensors (the layout of HF's own Qwen3.5 / Qwen3.6 MoE checkpoints) and the per-expert tensors
+#: an exporter may write instead: (fused suffix, per-expert pattern suffix, fuse_gate_up).
+_PER_EXPERT_LAYOUTS = (
+    ("experts.gate_up_proj", "experts.{expert}.gate_proj.weight", True),
+    ("experts.down_proj", "experts.{expert}.down_proj.weight", False),
+)
+
+
+def _stack_per_expert_checkpoint(ir: dict[str, Any], names: set[str]) -> bool:
+    """Map fused routed experts to per-expert tensors when the checkpoint stores them one by one.
+
+    The DSL maps Qwen3.5 / Qwen3.6 MoE experts as one fused tensor per layer (experts.gate_up_proj, gate first, and
+    experts.down_proj). An llm-compressor export such as our NVFP4 release writes one tensor per expert and projection
+    (experts.{e}.gate_proj.weight_packed, ...), so those mappings become stack_experts, gate and up fused in the
+    runtime's [up | gate] order. Returns whether anything changed.
+    """
+    changed = False
+    for module in ir.get("modules", []):
+        mapping = module.get("hf_mapping") or {}
+        for key, spec in list(mapping.items()):
+            if isinstance(spec, str):
+                source = spec
+            elif isinstance(spec, dict) and spec.get("type") == "direct":
+                source = spec.get("source") or ""
+            else:
+                continue
+            for fused, per_expert, fuse_gate_up in _PER_EXPERT_LAYOUTS:
+                if not source.endswith(fused):
+                    continue
+                if source.replace("{layer}", "0") in names:
+                    break
+                pattern = source[: -len(fused)] + per_expert
+                probe = pattern.replace("{layer}", "0").replace("{expert}", "0")
+                if probe not in names and f"{probe}_packed" not in names:
+                    break
+                mapping[key] = {"type": "stack_experts", "pattern": pattern}
+                if fuse_gate_up:
+                    mapping[key]["fuse_gate_up"] = True
+                changed = True
+                break
+    return changed

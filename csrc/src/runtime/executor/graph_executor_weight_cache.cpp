@@ -615,7 +615,7 @@ GraphExecutor::get_fp4_cached_weight(const std::string& name, Tensor& weight, cu
             if (auto* wm = provider->weight_manager()) {
                 if (auto* qt = wm->get_quantized(name)) {
                     if (qt->format == qlora::QuantFormat::FP4_BLOCK_2D && !qt->data.is_null() &&
-                        !qt->scales.is_null() && !qt->is_on_host()) {
+                        !qt->scales.is_null() && !qt->is_on_host() && qt->component_rows == 0) {
                         const int N = qt->M;
                         const int K = qt->K;
                         if (N <= 0 || K <= 0 || K % 2 != 0) {

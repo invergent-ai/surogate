@@ -1047,6 +1047,10 @@ NB_MODULE(_surogate, m) {
         .def_rw("bnb_double_quant",
                 &modules::QLoRAConfig::bnb_double_quant,
                 "Enable double quantization for BnB (quantize absmax values to INT8).")
+        .def_rw("prequant_compressed_tensors",
+                &modules::QLoRAConfig::prequant_compressed_tensors,
+                "Pre-quantized NVFP4 from a compressed-tensors export (weight_packed / weight_scale / "
+                "weight_global_scale, encode convention) instead of ModelOpt.")
         .def_rw("bnb_double_quant_group_size",
                 &modules::QLoRAConfig::bnb_double_quant_group_size,
                 "Group size for double quantization (number of absmax values per group).")

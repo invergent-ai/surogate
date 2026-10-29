@@ -1023,7 +1023,14 @@ create_dsl_qlora_provider(const Module& module,
             case modules::QLoRAQuantStrategy::PrequantFP8: config.scale_suffix = "_scale_inv"; break;
             case modules::QLoRAQuantStrategy::PrequantNVFP4:
                 config.scale_suffix = "_scale";
-                config.scale2_suffix = "_scale_2";
+                if (qlora_cfg.prequant_compressed_tensors) {
+                    // compressed-tensors: <weight>_packed, <weight>_scale, <weight>_global_scale (encode)
+                    config.data_suffix = "_packed";
+                    config.scale2_suffix = "_global_scale";
+                    config.scale2_is_encode = true;
+                } else {
+                    config.scale2_suffix = "_scale_2";
+                }
                 break;
             case modules::QLoRAQuantStrategy::PrequantMXFP4:
                 config.data_suffix = "_blocks";
