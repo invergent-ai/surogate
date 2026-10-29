@@ -4,6 +4,7 @@
 #include "api/types.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -181,6 +182,11 @@ public:
     /// Drop the prefix cache and let an elastic KV pool return its idle granules; the
     /// footprint `sleepable_bytes` reports shrinks accordingly. A no-op for arena pools.
     void shrink_kv();
+    /// Runs `fn` at the next round boundary: the worker finishes its round, every device of the
+    /// engine is idle, and no round starts until `fn` returns (in-flight requests stay where they
+    /// are). Returns how long execution was held, in seconds. On a pipeline a round may be
+    /// between stages: its later stages run after `fn`.
+    double with_execution_paused(const std::function<void()>& fn);
 
     /// VRAM this engine's sleepable regions occupy while awake -- its cost in
     /// a resident set. Zero when built without sleep_enable.

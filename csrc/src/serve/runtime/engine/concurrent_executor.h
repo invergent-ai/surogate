@@ -5,6 +5,7 @@
 #include "core/device_memory_error.h"
 #include "core/engine_context.h"
 #include "api/types.h"
+#include "api/ops/lora_store.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/kv_admission_policy.h"
@@ -149,6 +150,15 @@ public:
     }
     [[nodiscard]] std::unique_lock<std::mutex> pause_execution() {
         return std::unique_lock<std::mutex>(execution_mutex_);
+    }
+    /// pause_execution for a caller that must get in at the next round boundary even while the
+    /// engine is busy (an in-place adapter swap): a worker that just let the lock go would
+    /// otherwise take it again at once, round after round. The worker yields while one waits.
+    [[nodiscard]] std::unique_lock<std::mutex> pause_execution_promptly() {
+        pause_waiters_.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(execution_mutex_);
+        pause_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+        return lock;
     }
 
     /// While a group is open on this thread, this executor's submissions are held back and join
@@ -605,6 +615,8 @@ private:
         /// or exactly as long as `generated` -- never partly filled, which would
         /// silently misalign a client reading the two together.
         std::vector<float> generated_logprobs;
+        /// Runs of {first index into `generated`, adapter version}; see GenerationResult.
+        std::vector<std::array<std::uint32_t, 2>> lora_versions;
         std::size_t scores_published = 0;
         bool prompt_scores_published = false;
         std::string content;
@@ -838,6 +850,7 @@ private:
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
         result.token_logprobs          = std::move(request->generated_logprobs);
+        result.lora_versions           = std::move(request->lora_versions);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_content            = std::move(request->tool_content);
@@ -893,6 +906,18 @@ private:
         complete_success(request, FinishReason::Cancelled);
     }
 
+    /// Opens a version run at the request's next token when its adapter's version moved. Called
+    /// in the worker iteration that appends the tokens of the round that just ran, which an
+    /// in-place swap (it holds the execution lock) cannot split.
+    static void note_lora_version(Request& request) {
+        const std::int32_t slot = request.options.execution.lora_slot;
+        if (slot < 0) { return; }
+        const std::uint32_t version = ::sinfer::ops::lora_store_for_current_device().slot_version(slot);
+        if (request.lora_versions.empty() || request.lora_versions.back()[1] != version) {
+            request.lora_versions.push_back({static_cast<std::uint32_t>(request.generated.size()), version});
+        }
+    }
+
     bool resolve_round(const std::shared_ptr<Request>& request, TokenId token, float logprob,
                        bool cancel_at_boundary) {
         const std::uint32_t lane = *request->lane;
@@ -910,6 +935,7 @@ private:
         if (decision.accepted_tokens != 1) {
             throw std::logic_error("prefill output policy did not accept its licensed token");
         }
+        note_lora_version(*request);
         request->generated.push_back(token);
         request->generated_logprobs.push_back(logprob);
         instance_.program->resolve_prefill_lane(lane, decision.finished());
@@ -2344,6 +2370,7 @@ private:
             if (!cancelled[row]) {
                 const auto row_tokens = round.tokens.subspan(
                     row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                note_lora_version(*request);
                 request->generated.insert(request->generated.end(), row_tokens.begin(),
                                           row_tokens.end());
                 // A route without probabilities contributes NaN rather than nothing,
@@ -2389,6 +2416,7 @@ private:
     }
 
     std::unique_lock<std::mutex> lock_awake_execution() {
+        while (pause_waiters_.load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
         auto lock = pause_execution();
         // Sleep may have won the execution lock after this worker left the queue
         // wait. Recheck before touching program state or unmapped device memory.
@@ -3021,6 +3049,7 @@ private:
     const AdmissionResources admission_capacity_;
 
     mutable std::mutex execution_mutex_;
+    std::atomic<int> pause_waiters_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

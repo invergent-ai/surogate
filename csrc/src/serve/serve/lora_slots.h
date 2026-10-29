@@ -170,6 +170,32 @@ public:
         return Update(state_, name, deadline, must_exist);
     }
 
+    /// An in-place swap's claim on a loaded name: serialised with every other update (the writer
+    /// lock), but the slot stays open -- requests keep acquiring it and keep running on it, and
+    /// the bytes change between two rounds under them.
+    class Swap {
+    public:
+        [[nodiscard]] std::int32_t slot() const noexcept { return slot_; }
+
+    private:
+        friend class LoraSlots;
+        Swap(const std::shared_ptr<State>& state, const std::string& name, Clock::time_point deadline)
+            : writer_(state->writer, std::defer_lock) {
+            if (!writer_.try_lock_until(deadline)) {
+                throw RequestError(RequestErrorKind::QueueTimeout, "timed out waiting for an adapter update");
+            }
+            std::lock_guard lock(state->mutex);
+            const auto found = state->names.find(name);
+            if (found == state->names.end()) { throw std::invalid_argument("adapter '" + name + "' is not loaded"); }
+            slot_ = found->second->slot;
+        }
+        std::unique_lock<std::timed_mutex> writer_;
+        std::int32_t slot_ = -1;
+    };
+    [[nodiscard]] Swap swap(const std::string& name, Clock::time_point deadline) {
+        return Swap(state_, name, deadline);
+    }
+
     // Shared GRPO publishes slot zero only after draining the entire service.
     void reset_to(const std::string& name, std::int32_t slot) {
         std::lock_guard writer(state_->writer);
