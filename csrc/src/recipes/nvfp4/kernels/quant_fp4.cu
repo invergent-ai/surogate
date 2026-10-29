@@ -742,6 +742,46 @@ __global__ void dequantize_fp4_block_kernel(nv_bfloat16* __restrict__ out,
 }
 
 /**
+ * @brief Per-block FP4 dequantization, one thread per 16-value block (dequantize_fp4_block_kernel's arithmetic).
+ *
+ * The element-per-thread kernel above reaches about a third of the memory bandwidth: byte loads, 2-byte stores and
+ * a 64-bit division per element. Here a thread loads its block's 8 code bytes and its scale once, decodes the 16
+ * values with the same float math and BF16 conversion, and stores 32 bytes. Needs K % 16 == 0.
+ */
+__global__ void dequantize_fp4_block16_kernel(nv_bfloat16* __restrict__ out,
+                                              const uint8_t* __restrict__ in_fp4,
+                                              const __nv_fp8_e4m3* __restrict__ block_scales,
+                                              int M,
+                                              int K,
+                                              int scale_cols,
+                                              float global_decode_scale,
+                                              const float* __restrict__ row_group_scales,
+                                              int rows_per_group) {
+    const int blocks_per_row = K / FP4_BLOCK_SIZE;
+    const long total_blocks = (long)M * blocks_per_row;
+    for (long b = blockIdx.x * (long)blockDim.x + threadIdx.x; b < total_blocks; b += (long)gridDim.x * blockDim.x) {
+        const int row = static_cast<int>(b / blocks_per_row);
+        const int kb = static_cast<int>(b - (long)row * blocks_per_row);
+        const __nv_fp8_e4m3 scale_fp8 = block_scales[scale_swizzled_offset(row, kb, scale_cols)];
+        float decode_scale = __half2float(__nv_cvt_fp8_to_halfraw(scale_fp8.__x, __nv_fp8_interpretation_t::__NV_E4M3));
+        decode_scale *= row_group_scales ? row_group_scales[row / rows_per_group] : global_decode_scale;
+        const uint2 codes = *reinterpret_cast<const uint2*>(in_fp4 + (long)row * (K / 2) + (long)kb * 8);
+        alignas(16) nv_bfloat16 vals[FP4_BLOCK_SIZE];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t packed = static_cast<uint8_t>(((i < 4 ? codes.x : codes.y) >> (8 * (i & 3))) & 0xFF);
+            uint8_t fp4_0, fp4_1;
+            unpack_fp4(packed, fp4_0, fp4_1);
+            vals[2 * i] = (nv_bfloat16)(dequantize_fp4_e2m1(fp4_0) * decode_scale);
+            vals[2 * i + 1] = (nv_bfloat16)(dequantize_fp4_e2m1(fp4_1) * decode_scale);
+        }
+        uint4* dst = reinterpret_cast<uint4*>(out + (long)row * K + (long)kb * FP4_BLOCK_SIZE);
+        dst[0] = reinterpret_cast<const uint4*>(vals)[0];
+        dst[1] = reinterpret_cast<const uint4*>(vals)[1];
+    }
+}
+
+/**
  * @brief FP4 quantization kernel with stochastic rounding (for backward pass).
  *
  * Uses Philox RNG for stochastic rounding to reduce quantization bias
@@ -1500,6 +1540,14 @@ void dequantize_fp4_block(nv_bfloat16* out,
     const int num_blocks =
         std::max(2 * dp.multiProcessorCount, (int)((M * (long)K + threads_per_block - 1) / threads_per_block));
 
+    if (K % FP4_BLOCK_SIZE == 0) {
+        const long blocks = (long)M * (K / FP4_BLOCK_SIZE);
+        const int grid = (int)std::min<long>((blocks + threads_per_block - 1) / threads_per_block, 1L << 30);
+        dequantize_fp4_block16_kernel<<<grid, threads_per_block, 0, stream>>>(
+            out, in_fp4, block_scales, M, K, scale_cols, global_decode_scale, nullptr, 0);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     dequantize_fp4_block_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(out,
                                                                                    in_fp4,
                                                                                    block_scales,
@@ -1536,6 +1584,14 @@ void dequantize_fp4_block_grouped(nv_bfloat16* out,
     const int num_blocks =
         std::max(2 * dp.multiProcessorCount, (int)((M * (long)K + threads_per_block - 1) / threads_per_block));
 
+    if (K % FP4_BLOCK_SIZE == 0) {
+        const long blocks = (long)M * (K / FP4_BLOCK_SIZE);
+        const int grid = (int)std::min<long>((blocks + threads_per_block - 1) / threads_per_block, 1L << 30);
+        dequantize_fp4_block16_kernel<<<grid, threads_per_block, 0, stream>>>(
+            out, in_fp4, block_scales, M, K, scale_cols, 1.0f, row_group_scales, rows_per_group);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     dequantize_fp4_block_kernel<128><<<num_blocks, threads_per_block, 0, stream>>>(out,
                                                                                    in_fp4,
                                                                                    block_scales,
