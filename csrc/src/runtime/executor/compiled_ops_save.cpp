@@ -20,6 +20,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -665,7 +666,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         return ls < mFwdOpLo || ls >= mFwdOpHi;
     };
     // Op-id-keyed saves (e.g. mamba_gated_rmsnorm "<op_id>.normed"/".rstd") carry the
-    // producing op index as the name prefix; out-of-range if that op wasn't run.
+    // producing op's op_id as the name prefix; out-of-range if that op wasn't run.
+    // The op_id is not the op's index (Qwen3.5-35B-A3B: op_id 1345 sits at index 1319),
+    // so the producer is looked up. Reading the id as an index threw "cannot save tensor
+    // 1345.normed" in the 2-block dispatch stage that starts between the two.
+    std::unordered_map<std::string_view, std::size_t> op_index_of_id;
     auto opkeyed_out_of_range = [&](const std::string& nm) -> bool {
         if (!sub_range_forward) return false;
         const std::size_t dot = nm.find('.');
@@ -673,8 +678,14 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         for (std::size_t i = 0; i < dot; ++i) {
             if (nm[i] < '0' || nm[i] > '9') return false;
         }
-        const std::size_t op = static_cast<std::size_t>(std::stoul(nm.substr(0, dot)));
-        return op < mFwdOpLo || op >= mFwdOpHi;
+        if (op_index_of_id.empty()) {
+            for (std::size_t i = 0; i < mCurrentGraph->ops.size(); ++i) {
+                op_index_of_id.emplace(mCurrentGraph->ops[i].op_id, i);
+            }
+        }
+        const auto it = op_index_of_id.find(std::string_view(nm).substr(0, dot));
+        if (it == op_index_of_id.end()) return false;  // unknown producer: keep the hard failure
+        return it->second < mFwdOpLo || it->second >= mFwdOpHi;
     };
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);

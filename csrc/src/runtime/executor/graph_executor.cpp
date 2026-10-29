@@ -2570,6 +2570,39 @@ void GraphExecutor::reset_saved_cache() {
     if (mCompiledExecutor) mCompiledExecutor->reset_saved_cache();
 }
 
+std::size_t GraphExecutor::retire_saved_layers(int lo, int hi, const char* phase, int stage) {
+    if (!mCompiledExecutor) return 0;
+    const std::size_t retired =
+        mCompiledExecutor->retire_saved_layers(mCompiledForward.get(), mCompiledBackward.get(), lo, hi);
+    static const bool trace = [] {
+        const char* env = std::getenv("SUROGATE_DPP_MEM_TRACE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (trace) {
+        const auto& cache = mCompiledExecutor->saved_cache();
+        std::size_t free_b = 0, total_b = 0;
+        (void)sinfer::device_mem_get_info(&free_b, &total_b);
+        constexpr double MiB = 1024.0 * 1024.0;
+        std::fprintf(stderr,
+                     "[dpp-mem] device=%d phase=%s stage=%d blocks=%d-%d retired=%.0fMiB saved=%d/%.0fMiB "
+                     "pool=%.0fMiB stack_used=%.0fMiB stack_peak=%.0fMiB stack_cap=%.0fMiB free=%.0fMiB\n",
+                     mRunState.DeviceId,
+                     phase ? phase : "-",
+                     stage,
+                     lo,
+                     hi,
+                     retired / MiB,
+                     cache.count(),
+                     cache.total_plain_bytes() / MiB,
+                     cache.pool_bytes() / MiB,
+                     mRunState.Stack.bytes_used() / MiB,
+                     mRunState.Stack.max_utilization() / MiB,
+                     mRunState.Stack.capacity() / MiB,
+                     free_b / MiB);
+    }
+    return retired;
+}
+
 std::vector<float> GraphExecutor::last_block_hidden_f32() {
     // The last block's output residual is the dispatch-PP boundary hidden. It is
     // a resident block slot while execution state is live (read before finalize),

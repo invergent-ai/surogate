@@ -343,6 +343,22 @@ public:
         mSavedCache.reset_to_pool();
     }
 
+    // dispatch-PP: recycle the saved buffers of blocks [lo..hi] into the cache's pool once
+    // nothing reads them. Call it after a stage's first-pass forward (the log-prob pass and
+    // the train step's boundary forward), since dispatch_pp_backward_stage re-forwards the
+    // stage before its backward. Call it again after the stage's backward.
+    // Without it a GPU keeps every block of every stage it ran: W FP8 on 4 x RTX 5090 at
+    // 8k tokens held 7.3 GB by block 33. The next stage's acquire pops the same-size
+    // buffers back, so a GPU holds about one stage's worth.
+    // A buffer belongs to the range when its key is "blocks[L]." / "d_blocks[L]." with L in
+    // [lo..hi], or "<op_id>." of an op of those blocks in either graph (op-keyed saves:
+    // gated rmsnorm, attention, qk-norm). Its mSaved entry goes with it, and the stage's
+    // re-forward rebinds both. Returns the recycled bytes.
+    std::size_t retire_saved_layers(const CompiledGraph* fwd, const CompiledGraph* bwd, int lo, int hi);
+    const SavedTensorCache& saved_cache() const {
+        return mSavedCache;
+    }
+
     std::size_t mFwdOpLo = 0;
     std::size_t mFwdOpHi = SIZE_MAX;
     bool mFwdSkipInit = false;

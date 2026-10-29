@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/core.h>
@@ -1218,6 +1219,62 @@ void CompiledExecutor::resize_segment_graphs(const CompiledGraph& fwd_graph, con
     resize(mFwdSegGraphs, fwd_graph.layer_segments);
     resize(mBwdSegGraphs[0], bwd_graph.layer_segments);
     resize(mBwdSegGraphs[1], bwd_graph.layer_segments);
+}
+
+std::size_t
+CompiledExecutor::retire_saved_layers(const CompiledGraph* fwd, const CompiledGraph* bwd, int lo, int hi) {
+    if (lo > hi) return 0;
+    // Op ids of the range's ops, from the per-layer op spans of both graphs.
+    std::unordered_set<std::string> op_ids;
+    auto collect = [&](const CompiledGraph* g) {
+        if (!g) return;
+        for (int L = lo; L <= hi; ++L) {
+            const auto l = static_cast<std::size_t>(L);
+            if (l >= g->layer_start_indices.size() || l >= g->layer_end_indices.size()) continue;
+            const std::size_t begin = g->layer_start_indices[l];
+            const std::size_t end = std::min(g->layer_end_indices[l], g->ops.size());
+            for (std::size_t i = begin; i < end; ++i) {
+                if (!g->ops[i].op_id.empty()) op_ids.insert(g->ops[i].op_id);
+            }
+        }
+    };
+    collect(fwd);
+    collect(bwd);
+    auto block_of = [](const std::string& key) -> int {
+        std::size_t p = 0;
+        if (key.rfind("blocks[", 0) == 0) {
+            p = 7;
+        } else if (key.rfind("d_blocks[", 0) == 0) {
+            p = 9;
+        } else {
+            return -1;
+        }
+        const std::size_t close = key.find(']', p);
+        if (close == std::string::npos || close == p) return -1;
+        int L = 0;
+        for (std::size_t i = p; i < close; ++i) {
+            if (key[i] < '0' || key[i] > '9') return -1;
+            L = L * 10 + (key[i] - '0');
+        }
+        return L;
+    };
+    std::vector<std::string> keys;
+    for (const auto& [key, buffer] : mSavedCache.buffers()) {
+        if (buffer == nullptr || mSavedCache.is_arena_backed(key)) continue;
+        const int L = block_of(key);
+        bool in_range = L >= lo && L <= hi;
+        if (!in_range && L < 0) {
+            const std::size_t dot = key.find('.');
+            in_range = dot != std::string::npos && op_ids.count(key.substr(0, dot)) > 0;
+        }
+        if (in_range) keys.push_back(key);
+    }
+    std::size_t bytes = 0;
+    for (const auto& key : keys) {
+        bytes += mSavedCache.retire_key(key);
+        if (mSaved) mSaved->erase(key);
+    }
+    return bytes;
 }
 
 }  // namespace dsl

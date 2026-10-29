@@ -2890,6 +2890,9 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
                         (*my_out)[static_cast<std::size_t>(m)] = std::move(o);
                     }
                     ge->restore_stage_base();
+                    // Nothing reads this pass's saves (the train step's backward re-forwards the
+                    // stage), so the GPU's next stage reuses them instead of adding its own.
+                    ge->retire_saved_layers(lo, hi, "logprob_fwd", s);
                     readyp[s * M + m].store(1, std::memory_order_release);
                 }
             },
@@ -3007,6 +3010,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                         o.emplace_back(rn, ge->read_named_bytes(rn));
                         o.emplace_back(xn, ge->read_named_bytes(xn));
                         ge->restore_stage_base();  // reclaim this microbatch's preserved activations
+                        // The saves too: dispatch_pp_backward_stage re-forwards this stage.
+                        ge->retire_saved_layers(lo, hi, "fwd", s);
                         (*my_out)[static_cast<std::size_t>(m)] = std::move(o);
                         readyp[s * M + m].store(1, std::memory_order_release);
                     }
@@ -3111,6 +3116,9 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                         // restore_stage_base is a no-op here (the stage base is only
                         // checkpointed in the forward), so reset to the per-step base.
                         ge->dispatch_reset_stack();
+                        // The stage's backward consumed its saves; the GPU's next (lower) stage
+                        // reuses the buffers.
+                        ge->retire_saved_layers(lo, hi, "bwd", s);
                         readyp[s * M + m].store(1, std::memory_order_release);
                     }
                 },

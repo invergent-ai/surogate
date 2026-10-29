@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <cuda_bf16.h>
 #include <fmt/format.h>
@@ -352,25 +355,136 @@ GpuTempAlloc allocate_qt_gpu_temp(int M, int K, QuantizedTensor& qt, const Quant
     return alloc;
 }
 
+/// Pinned host copies of offloaded quantized weights, shared by the ranks (threads) of the
+/// process. Every GPU's provider imports the checkpoint, so each rank used to pin its own copy:
+/// 8 RTX 5090 workers on W's FP8 export pinned ~25 GB each (228 of 251 GB host RAM). The
+/// first rank to relocate a tensor stages it; the others wait for it and reuse the pages.
+/// The key holds the checkpoint, the adapter merged at import, the EP shard and the component,
+/// so ranks holding different experts never share. The weights are frozen (no write-back on
+/// eviction), and the pages live as long as the process, like the per-rank copies did.
+class SharedPinnedWeights {
+public:
+    static SharedPinnedWeights& instance() {
+        static SharedPinnedWeights store;
+        return store;
+    }
+
+    /// The host copy of the `bytes` at device pointer `src` under `key`, staged by the first
+    /// caller. Throws if another rank's staging failed or staged a different size.
+    std::byte* get_or_stage(const std::string& key, const void* src, std::size_t bytes) {
+        std::unique_lock<std::mutex> lock(mMutex);
+        auto [it, inserted] = mEntries.try_emplace(key);
+        Entry& entry = it->second;  // node-based map: stable across rehash
+        if (!inserted) {
+            mReady.wait(lock, [&] { return entry.state != State::Staging; });
+            if (entry.state == State::Failed) {
+                throw std::runtime_error("shared pinned weight '" + key + "': staging failed on another rank");
+            }
+            if (entry.bytes != bytes) {
+                throw std::runtime_error(
+                    fmt::format("shared pinned weight '{}': {} bytes here, {} staged", key, bytes, entry.bytes));
+            }
+            return entry.ptr;
+        }
+        entry.bytes = bytes;
+        lock.unlock();
+        void* pinned = nullptr;
+        cudaError_t err = cudaMallocHost(&pinned, bytes);
+        if (err == cudaSuccess) {
+            err = cudaMemcpy(pinned, src, bytes, cudaMemcpyDeviceToHost);
+        }
+        lock.lock();
+        if (err != cudaSuccess) {
+            if (pinned) cudaFreeHost(pinned);
+            entry.state = State::Failed;
+            mReady.notify_all();
+            lock.unlock();
+            CUDA_CHECK(err);
+        }
+        entry.ptr = static_cast<std::byte*>(pinned);
+        entry.state = State::Ready;
+        mReady.notify_all();
+        return entry.ptr;
+    }
+
+private:
+    enum class State { Staging, Ready, Failed };
+    struct Entry {
+        std::byte* ptr = nullptr;
+        std::size_t bytes = 0;
+        State state = State::Staging;
+    };
+    std::mutex mMutex;
+    std::condition_variable mReady;
+    std::unordered_map<std::string, Entry> mEntries;
+};
+
+/// Gate-first fused experts (gate_first_experts(): Qwen3.5 / Qwen3.6 MoE) are stored [gate | up] per expert, while the
+/// runtime's SwiGLU reads [up | gate]. The BF16 import swaps the halves before quantizing (import_and_quantize_weights);
+/// a pre-quantized tensor needs the same order. For block-FP8 the swap is exact on the stored data: each half is a whole
+/// number of 128-row blocks, so the code rows and their scale-block rows move together.
+/// Without it every routed expert computed gate * silu(up). W's FP8 export scored -14.6 nats per token, uncorrelated
+/// with the engine. Other pre-quantized formats keep their own scale layouts, so they are refused rather than misread.
+void swap_gate_up_halves_prequant(QuantizedTensor& qt, int E, int per_M, int K, const std::string& name,
+                                  cudaStream_t stream) {
+    const int half = per_M / 2;
+    if (qt.format != QuantFormat::FP8_PER_BLOCK) {
+        throw std::runtime_error("import_prequantized_weights: gate-first fused experts are supported pre-quantized in "
+                                 "block-FP8 only; '" + name + "' would be read as gate * silu(up)");
+    }
+    const int block = qt.block_size;
+    if (per_M % 2 != 0 || block <= 0 || half % block != 0 || K % block != 0) {
+        throw std::runtime_error(fmt::format("import_prequantized_weights: gate-first experts '{}' [{} x {} x {}] do "
+                                             "not split into whole {}-row FP8 blocks",
+                                             name, E, per_M, K, block));
+    }
+    auto swap_rows = [&](Tensor& t, std::size_t rows_per_expert, std::size_t row_bytes) {
+        const std::size_t half_bytes = rows_per_expert / 2 * row_bytes;
+        if (static_cast<std::size_t>(t.bytes()) < static_cast<std::size_t>(E) * rows_per_expert * row_bytes) {
+            throw std::runtime_error("import_prequantized_weights: '" + name + "' is smaller than its expert layout");
+        }
+        void* tmp = nullptr;
+        CUDA_CHECK(cudaMallocAsync(&tmp, half_bytes, stream));
+        auto* base = static_cast<std::byte*>(t.Data);
+        for (int e = 0; e < E; ++e) {
+            std::byte* a = base + static_cast<std::size_t>(e) * rows_per_expert * row_bytes;
+            std::byte* b = a + half_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(tmp, a, half_bytes, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(a, b, half_bytes, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(b, tmp, half_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+        CUDA_CHECK(cudaFreeAsync(tmp, stream));
+    };
+    swap_rows(qt.data, static_cast<std::size_t>(per_M), static_cast<std::size_t>(K) * get_dtype_size(qt.data.DType));
+    swap_rows(qt.scales,
+              static_cast<std::size_t>(per_M / block),
+              static_cast<std::size_t>(K / block) * get_dtype_size(qt.scales.DType));
+}
+
+/// Share key of one weight's pinned copy (see SharedPinnedWeights).
+std::string pinned_share_key(const std::string& file_name,
+                             const DslQLoRAPipelineConfig& config,
+                             const WeightLoadSpec& spec) {
+    return fmt::format("{}|{}|ep{}/{}|{}", file_name, config.adapter_path, config.ep_rank, config.ep_size, spec.name);
+}
+
 /// Relocate a QuantizedTensor from GPU to pinned host memory and free
 /// the GPU temp buffers. After this call, qt's data/scales/meta point
-/// to pinned host memory suitable for the OffloadManager.
-void relocate_qt_to_pinned(QuantizedTensor& qt, GpuTempAlloc& gpu, cudaStream_t stream) {
+/// to pinned host memory suitable for the OffloadManager. The pinned
+/// copy is shared with the process's other ranks under `share_key`.
+void relocate_qt_to_pinned(QuantizedTensor& qt, GpuTempAlloc& gpu, cudaStream_t stream, const std::string& share_key) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    auto relocate_tensor = [](Tensor& t, void*& gpu_ptr) {
+    auto relocate_tensor = [&](Tensor& t, void*& gpu_ptr, const char* component) {
         if (!gpu_ptr || t.is_null() || t.bytes() == 0) return;
-        void* pinned = nullptr;
-        CUDA_CHECK(cudaMallocHost(&pinned, t.bytes()));
-        CUDA_CHECK(cudaMemcpy(pinned, gpu_ptr, t.bytes(), cudaMemcpyDeviceToHost));
-        t.Data = static_cast<std::byte*>(pinned);
+        t.Data = SharedPinnedWeights::instance().get_or_stage(share_key + "|" + component, gpu_ptr, t.bytes());
         t.Device = -1;
     };
 
-    relocate_tensor(qt.data, gpu.data);
-    relocate_tensor(qt.scales, gpu.scales);
-    relocate_tensor(qt.meta, gpu.meta);
-    relocate_tensor(qt.meta2, gpu.meta2);
+    relocate_tensor(qt.data, gpu.data, "data");
+    relocate_tensor(qt.scales, gpu.scales, "scales");
+    relocate_tensor(qt.meta, gpu.meta, "meta");
+    relocate_tensor(qt.meta2, gpu.meta2, "meta2");
 
     gpu.free_all();
 }
@@ -1197,6 +1311,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                                                                   std::shared_ptr<TensorAllocator> allocator,
                                                                   cudaStream_t stream) {
     auto t_start = std::chrono::steady_clock::now();
+    bool logged_prequant_gate_up_swap = false;
 
     // ---- Step 1: Create quantizer and weight manager ----
 
@@ -1226,6 +1341,53 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
 
     dsl::DslWeightLoader loader(reader, config.mapping, pt_config, *allocator, shard_config, moe_config);
 
+    // A full-precision param the checkpoint stores block-FP8. An FP8 export quantizes Linears the DSL keeps in BF16,
+    // e.g. the shared expert (quantizable=False: the runtime forces its matmuls down the BF16 path). Casting the codes
+    // to BF16 drops the 128x128 scales. W FP8's shared expert came out 100-1000x too large: block 0's MLP output was
+    // ~1e11 and every log-prob ~-14.5. Dequantize code x scale instead (Direct mappings).
+    auto load_fp8_stored_full_precision = [&](const WeightLoadSpec& spec, Tensor& tensor) -> bool {
+        if (config.quantizer_config.format != QuantFormat::FP8_PER_BLOCK || tensor.DType != ETensorDType::BF16 ||
+            spec.sharded) {
+            return false;
+        }
+        int layer_idx = -1;
+        const auto* mspec = resolve_mapping_spec(config.mapping, spec.name, layer_idx);
+        if (!mspec || mspec->kind != dsl::MappingSpec::Kind::Direct) return false;
+        const std::string hf = resolve_hf_name(mspec->source.empty() ? spec.name : mspec->source, layer_idx);
+        const std::string data_hf = config.data_suffix.empty() ? hf : hf + config.data_suffix;
+        const auto* data = try_find_entry(reader, data_hf);
+        if (!data || data->dtype() != ETensorDType::FP8_E4M3) return false;
+        const auto* scale = try_find_entry(reader, hf + config.scale_suffix);
+        if (!scale) {
+            throw std::runtime_error("import_prequantized_weights: '" + data_hf + "' is FP8 without its scales '" + hf +
+                                     config.scale_suffix + "'");
+        }
+        const auto& shp = data->shape();
+        if (shp.size() != 2 || static_cast<long>(shp[0]) * static_cast<long>(shp[1]) != tensor.nelem()) {
+            throw std::runtime_error("import_prequantized_weights: FP8 '" + data_hf + "' does not match the shape of " +
+                                     spec.name);
+        }
+        const int M = static_cast<int>(shp[0]);
+        const int K = static_cast<int>(shp[1]);
+        QuantizedTensor qt;
+        GpuTempAlloc tmp = allocate_qt_gpu_temp(M, K, qt, config.quantizer_config);
+        try {
+            data->read_raw(qt.data, 0, static_cast<std::ptrdiff_t>(M) * K, false);
+            scale->read_raw(qt.scales, 0, qt.scales.nelem(), true);
+            Tensor out = Tensor::from_pointer(tensor.Data,
+                                              tensor.Device,
+                                              ETensorDType::BF16,
+                                              std::vector<long>{static_cast<long>(M), static_cast<long>(K)});
+            quantizer->dequantize(qt, out, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        } catch (...) {
+            tmp.free_all();
+            throw;
+        }
+        tmp.free_all();
+        return true;
+    };
+
     auto load_full_precision = [&](const WeightLoadSpec& spec, const char* reason) -> bool {
         std::vector<long> shape;
         if (!spec.shape.empty()) {
@@ -1238,7 +1400,8 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
 
         Tensor tensor = allocator->allocate(spec.target_dtype, spec.name.c_str(), EAllocationType::ON_DEVICE, shape);
 
-        bool success = loader.load_param(spec.name, tensor, true, spec.sharded, nullptr, stream);
+        bool success = load_fp8_stored_full_precision(spec, tensor) ||
+                       loader.load_param(spec.name, tensor, true, spec.sharded, nullptr, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         if (success) {
             weight_mgr->register_full_precision(spec.name, tensor);
@@ -1570,7 +1733,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 CUDA_CHECK(cudaStreamSynchronize(stream));
 
                 if (offload_this) {
-                    relocate_qt_to_pinned(qt, gpu_temp, stream);
+                    relocate_qt_to_pinned(qt, gpu_temp, stream, pinned_share_key(file_name, config, spec));
                 }
                 weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
                 loaded++;
@@ -1655,7 +1818,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                     quantizer->quantize(bf16_buf, qt, stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     if (offload_this) {
-                        relocate_qt_to_pinned(qt, gpu_temp, stream);
+                        relocate_qt_to_pinned(qt, gpu_temp, stream, pinned_share_key(file_name, config, spec));
                     }
                     weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
                     loaded++;
@@ -1689,7 +1852,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 }
 
                 if (offload_this) {
-                    relocate_qt_to_pinned(qt, gpu_temp, stream);
+                    relocate_qt_to_pinned(qt, gpu_temp, stream, pinned_share_key(file_name, config, spec));
                 }
                 weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
                 loaded++;
@@ -1743,7 +1906,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
             // data in the GEMM-ready layout (matching DSL parameter shape), so the
             // Transform("transpose") mapping only applies to BF16 weight import.
             if (offload_this) {
-                relocate_qt_to_pinned(qt, gpu_temp, stream);
+                relocate_qt_to_pinned(qt, gpu_temp, stream, pinned_share_key(file_name, config, spec));
             }
             weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
             loaded++;
@@ -1761,7 +1924,8 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
             Tensor tensor =
                 allocator->allocate(spec.target_dtype, spec.name.c_str(), EAllocationType::ON_DEVICE, shape);
 
-            bool success = loader.load_param(spec.name, tensor, true, spec.sharded, nullptr, stream);
+            bool success = load_fp8_stored_full_precision(spec, tensor) ||
+                           loader.load_param(spec.name, tensor, true, spec.sharded, nullptr, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaGetLastError());
             if (success) {
@@ -1894,6 +2058,16 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 throw std::runtime_error("import_prequantized_weights: unsupported mapping kind for expert param '" +
                                          spec.name + "' (expected Direct, Transform, or StackExperts)");
             }
+            // Fused experts the model's DSL declares gate-first: [gate | up] -> [up | gate], as the BF16 import does.
+            if (mspec->gate_first && mspec->kind != dsl::MappingSpec::Kind::StackExperts) {
+                if (!logged_prequant_gate_up_swap) {
+                    fmt::print(stderr,
+                               "[Prequant Import] gate-first fused experts.gate_up_proj: "
+                               "reordering [gate|up] -> [up|gate] (codes and scale blocks).\n");
+                    logged_prequant_gate_up_swap = true;
+                }
+                swap_gate_up_halves_prequant(qt, E, per_M, K, spec.name, stream);
+            }
 
             CUDA_CHECK(cudaStreamSynchronize(stream));
         } catch (...) {
@@ -1948,7 +2122,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
         // After this, qt's data/scales/meta are on pinned host memory
         // and the GPU temp buffers are freed.
         if (offload_this) {
-            relocate_qt_to_pinned(qt, gpu_temp, stream);
+            relocate_qt_to_pinned(qt, gpu_temp, stream, pinned_share_key(file_name, config, spec));
         }
 
         // Do NOT pass transform_fn: pre-quantized data is already in DSL layout

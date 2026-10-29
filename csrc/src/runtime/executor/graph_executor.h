@@ -340,6 +340,11 @@ public:
     void dispatch_reset_stack();
     // dispatch-PP recompute:false: release the saved-tensor cache between resident stages.
     void reset_saved_cache();
+    // dispatch-PP: recycle blocks [lo..hi]'s saved buffers once nothing reads them: after a
+    // stage's first-pass forward and after its backward (CompiledExecutor::retire_saved_layers).
+    // SUROGATE_DPP_MEM_TRACE=1 prints one line per call: saved-cache and pool bytes, stack use
+    // and high-water mark, device free. Returns the recycled bytes.
+    std::size_t retire_saved_layers(int lo, int hi, const char* phase = nullptr, int stage = -1);
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
