@@ -2669,6 +2669,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden_multigpu(const 
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_forward_hidden_multigpu: bad stage ranges");
     }
+    check_lora_stage_plan(los, his, "dispatch_pp_forward_hidden_multigpu");
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
     std::vector<float> result;
@@ -2730,6 +2731,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(const std:
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_grad_norms_multigpu: bad stage ranges");
     }
+    check_lora_stage_plan(los, his, "dispatch_pp_grad_norms_multigpu");
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
     const int num_layers = his.back() + 1;
@@ -2936,6 +2938,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: bad stage ranges");
     }
+    check_lora_stage_plan(los, his, "dispatch_pp_forward_logprobs_multigpu");
     DppPhaseTimer timer;
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
@@ -3087,6 +3090,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
     }
+    check_lora_stage_plan(los, his, "dispatch_pp_train_step_multigpu");
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
     const int M = std::max(1, num_microbatches);
@@ -3390,9 +3394,11 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         step_valid_tokens += v;
 
     // Collect each stage's accumulated grads from its GPU (grads stay resident on the
-    // stage's GPU until read here, after the whole backward wavefront).
+    // stage's GPU until read here, after the whole backward wavefront). Stage-local LoRA
+    // keeps them there: every GPU updates its own stages' adapters in place.
+    const bool lora_stage_local = dispatch_pp_lora_stage_local();
     std::vector<std::pair<std::string, std::vector<std::byte>>> collected;
-    for (int si = 0; si < num_stages; ++si) {
+    for (int si = 0; si < num_stages && !lora_stage_local; ++si) {
         const int gpu = si % ngpu;
         const int lo = los[static_cast<std::size_t>(si)];
         const int hi = his[static_cast<std::size_t>(si)];
@@ -3417,6 +3423,10 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     //    In one-step-stale mode, defer: apply the *previous* step's grads (so the
     //    weights this step just trained on are one update behind — the RoundPipe v1
     //    staleness), then stash this step's grads for the next call.
+    if (stale && lora_stage_local) {
+        throw std::runtime_error("dispatch-PP: one-step-stale updates need replicated LoRA; stage-local adapters "
+                                 "apply their gradients in place (unset SUROGATE_DISPATCH_LORA_LOCAL)");
+    }
     if (stale) {
         if (!mDispatchPpPendingGrads.empty()) {
             // The deferred grads belong to the previous step — scale by its valid-token count.
@@ -3449,9 +3459,26 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
     const optimizers::OptimizerConfig& opt_config,
     int opt_step_1based,
     int valid_tokens) {
+    DppPhaseTimer timer;
+    if (dispatch_pp_lora_stage_local()) {
+        // Stage-local adapters: every GPU updates its own stages' adapters where their gradients are. The LoRA norm
+        // is summed over the GPUs inside the step (calculate_lora_gradient_norm), so they all run it at once.
+        std::vector<float> norms(mContexts.size(), 0.0f);
+        run_work([&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model) throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
+            model->set_dispatch_pp_valid_tokens(valid_tokens);
+            norms[static_cast<std::size_t>(ctx.Communicator->rank())] =
+                model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
+        });
+        mDispatchPpLastGradNorm = norms[0];
+        timer.mark("optimizer");
+        ++mDppWeightVersion;
+        timer.print("apply");
+        return;
+    }
     // GPU 0 holds the master replica: write the collected grads into its store and
     // run the optimizer there.
-    DppPhaseTimer timer;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
@@ -3493,6 +3520,40 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
     timer.print("apply");
 }
 #undef DISPATCH_PP_DBG_STAGE
+
+void MultiGPUPyTrainer::check_lora_stage_plan(const std::vector<int>& los,
+                                              const std::vector<int>& his,
+                                              const char* caller) {
+    if (!dispatch_pp_lora_stage_local()) return;
+    const char* sb_env = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS");
+    const int sb = sb_env ? std::atoi(sb_env) : 0;
+    const int ngpu = static_cast<int>(mContexts.size());
+    for (std::size_t si = 0; si < los.size(); ++si) {
+        const int gpu = static_cast<int>(si) % ngpu;
+        for (int L = los[si]; L <= his[si]; ++L) {
+            if (sb <= 0 || (L / sb) % ngpu != gpu) {
+                throw std::runtime_error(fmt::format(
+                    "{}: stage {} (layers {}-{}) runs on GPU {}, but stage-local LoRA put layer {}'s adapters on GPU {} "
+                    "(SUROGATE_DISPATCH_STAGE_BLOCKS={}); plan the stages with the same stage size",
+                    caller, si, los[si], his[si], gpu, L, sb > 0 ? (L / sb) % ngpu : -1, sb));
+            }
+        }
+    }
+}
+
+bool MultiGPUPyTrainer::dispatch_pp_lora_stage_local() {
+    if (mDispatchPpLoraStageLocal < 0) {
+        bool local = false;
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                local = model && model->lora_enabled() && model->lora_weights().stage_local();
+            },
+            0);
+        mDispatchPpLoraStageLocal = local ? 1 : 0;
+    }
+    return mDispatchPpLoraStageLocal == 1;
+}
 
 std::unordered_map<std::string, std::size_t> MultiGPUPyTrainer::dispatch_pp_weight_residency() {
     std::unordered_map<std::string, std::size_t> out;

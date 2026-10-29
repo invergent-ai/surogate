@@ -138,6 +138,9 @@ class GRPOTrainer:
                 config.model_info.config, config.gpus
             )
             os.environ["SUROGATE_DISPATCH_STAGE_BLOCKS"] = str(sb)
+            # Stage-local LoRA: each GPU allocates and trains only the adapters of the stages it runs (stage s on
+            # GPU s % gpus) instead of all of them replicated; set 0 to replicate.
+            os.environ.setdefault("SUROGATE_DISPATCH_LORA_LOCAL", "1")
             # Whole stage resident + double-buffer margin (an explicit setting wins).
             os.environ.setdefault("SUROGATE_DISPATCH_PREFETCH_BLOCKS", str(max_stage + 2))
             logger.info(

@@ -56,6 +56,24 @@
 namespace dsl {
 namespace {
 
+/// dispatch-PP stage-local LoRA (SUROGATE_DISPATCH_LORA_LOCAL=1, set by the trainers beside the stage size): stage s
+/// holds layers [s*sb, (s+1)*sb) and runs on GPU s % gpus (MultiGPUPyTrainer's dispatch loop), so rank `rank` keeps
+/// adapters, gradients and optimizer state for its own stages' layers only. Empty: replicated on every rank.
+std::vector<std::uint8_t> dispatch_pp_lora_local_layers(int num_layers, int rank, int gpus) {
+    const char* on = std::getenv("SUROGATE_DISPATCH_LORA_LOCAL");
+    if (!on || std::string_view(on) != "1" || gpus <= 1 || num_layers <= 0) return {};
+    const char* sb_env = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS");
+    const int sb = sb_env ? std::atoi(sb_env) : 0;
+    if (sb <= 0) {
+        throw std::runtime_error("SUROGATE_DISPATCH_LORA_LOCAL=1 needs SUROGATE_DISPATCH_STAGE_BLOCKS, the dispatch-PP "
+                                 "stage size");
+    }
+    std::vector<std::uint8_t> local(static_cast<std::size_t>(num_layers), 0);
+    for (int l = 0; l < num_layers; ++l)
+        local[static_cast<std::size_t>(l)] = ((l / sb) % gpus) == rank ? 1 : 0;
+    return local;
+}
+
 std::string_view trim_optional(std::string_view name) {
     if (!name.empty() && name.back() == '?') {
         return name.substr(0, name.size() - 1);
@@ -1510,6 +1528,7 @@ DslModel::DslModel(const PretrainedConfig& config,
                 wm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * wm.num_grouped_experts;
             }
         }
+        wm.layer_local = dispatch_pp_lora_local_layers(mModelConfig.NumLayers, mShardIdx, mNumShards);
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
 
         modules::ModularLoRAGradsManager::Config gm{};
@@ -1541,6 +1560,7 @@ DslModel::DslModel(const PretrainedConfig& config,
                 gm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * gm.num_grouped_experts;
             }
         }
+        gm.layer_local = wm.layer_local;
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
         std::vector<std::string> lora_grad_hook_schema_ids(
             static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));

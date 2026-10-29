@@ -418,6 +418,8 @@ class SurogateTrainerWrapper:
             # Pin the section count to the actual stage size so the recompute:false cyclic
             # activation coloring (graph compiler) matches the planner's aligned stages.
             os.environ["SUROGATE_DISPATCH_STAGE_BLOCKS"] = str(_sb)
+            # Stage-local LoRA: each GPU allocates and trains only its own stages' adapters (set 0 to replicate).
+            os.environ.setdefault("SUROGATE_DISPATCH_LORA_LOCAL", "1")
             prefetch = _max_stage + 2  # whole stage resident + double-buffer margin
             os.environ["SUROGATE_DISPATCH_PREFETCH_BLOCKS"] = str(prefetch)
             # Headroom for the boundary saves kept live by sub-range skip_finalize (the

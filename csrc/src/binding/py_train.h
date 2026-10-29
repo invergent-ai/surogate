@@ -578,6 +578,13 @@ private:
     int mDispatchPpAppliedStep = 0;
     int mDispatchPpPendingValidTokens = 0;  // valid-token count for the deferred (stale) grads
     float mDispatchPpLastGradNorm = 0.0f;
+    /// dispatch-PP stage-local LoRA (each GPU holds and trains only its own stages' adapters): asked of GPU 0's model
+    /// once (-1 = not yet asked).
+    int mDispatchPpLoraStageLocal = -1;
+    bool dispatch_pp_lora_stage_local();
+    /// Stage-local LoRA: every layer of stage s must belong to GPU s % gpus under the plan the adapters were
+    /// allocated with (SUROGATE_DISPATCH_STAGE_BLOCKS); a layer run elsewhere would skip its adapters.
+    void check_lora_stage_plan(const std::vector<int>& los, const std::vector<int>& his, const char* caller);
     // Boundaries kept by the last log-prob pass (keep_boundaries): [stage][microbatch] output of
     // each stage but the last, valid for the rows/stages/weights summarized by mDppKeptKey.
     std::vector<std::vector<std::vector<std::pair<std::string, std::vector<std::byte>>>>> mDppKeptBoundaries;

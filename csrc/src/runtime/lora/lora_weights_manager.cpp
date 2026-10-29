@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <fmt/format.h>
 #include "kernels/kernels.h"
 #include "runtime/core/model_config.h"
@@ -36,6 +38,7 @@ ModularLoRAWeightsManager::ModularLoRAWeightsManager(const Config& config, Tenso
     mWork.blocks.resize(config.num_layers);
     mBlockSyncGen.resize(config.num_layers, 0);
     for (int l = 0; l < config.num_layers; ++l) {
+        if (!layer_is_local(l)) continue;  // stage-local: another GPU runs (and trains) this layer
         allocate_block_weights(l);
     }
 }
@@ -594,8 +597,56 @@ void ModularLoRAWeightsManager::release_export_gathered() const {
     mExportHostBuffers.clear();
 }
 
+void ModularLoRAWeightsManager::export_stage_local(const std::string& file_name, NCCLCommunicator& comm) const {
+    // The ranks (one worker thread each, one process) deposit host copies of their own layers' tensors, under the
+    // names and per-expert slices export writes, keyed by the output file; rank 0 takes them all and writes it.
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::vector<StagedTensor>> table;
+    std::vector<StagedTensor> mine;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const_cast<ModularLoRAWeightsManager&>(*this).iterate_tensors([&](std::string name, const TensorShard& t) {
+        StagedTensor s;
+        s.name = std::move(name);
+        const std::size_t bytes = t.bytes();
+        s.bytes = std::make_unique<std::byte[]>(bytes);
+        CUDA_CHECK(cudaMemcpy(s.bytes.get(), t.Data, bytes, cudaMemcpyDefault));
+        s.host = Tensor::from_pointer(s.bytes.get(),
+                                      -1,
+                                      t.DType,
+                                      std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank));
+        mine.push_back(std::move(s));
+    });
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto& slot = table[file_name];
+        for (auto& s : mine)
+            slot.push_back(std::move(s));
+    }
+    comm.barrier();
+    if (comm.rank() == 0) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            mExportStaged = std::move(table[file_name]);
+            table.erase(file_name);
+        }
+        try {
+            write_safetensors(file_name, const_cast<ModularLoRAWeightsManager&>(*this));
+        } catch (...) {
+            mExportStaged.clear();
+            throw;
+        }
+        mExportStaged.clear();
+    }
+    comm.barrier();
+}
+
 void ModularLoRAWeightsManager::export_to_file(const std::string& file_name, NCCLCommunicator& comm) const {
     if (!enabled()) return;
+    if (stage_local()) {
+        // dispatch-PP stage-local: each rank holds only its own stages' layers.
+        export_stage_local(file_name, comm);
+        return;
+    }
     if (has_ep_local_grouped()) {
         // Each rank owns a shard of the experts; assemble the full adapter on
         // every rank (all_gather), then rank 0 writes it.
@@ -986,6 +1037,12 @@ std::array<std::string, 4> ModularLoRAWeightsManager::attention_names(int layer)
 
 void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
     if (!enabled()) return;
+    if (!mExportStaged.empty()) {
+        // Rank 0 writing a stage-local export: every rank's staged tensors, this rank's own included.
+        for (const auto& s : mExportStaged)
+            callback(s.name, TensorShard(s.host));
+        return;
+    }
     mContentsValid = true;  // the callback may write (a checkpoint load)
 
     for (int l = 0; l < (int)mMaster.blocks.size(); ++l) {
