@@ -1072,7 +1072,16 @@ create_dsl_qlora_provider(const Module& module,
     // stream them layer-by-layer. Reuses the same OffloadManager infrastructure.
     if (options.OffloadMaster) {
         config.weight_manager_config.enable_offloading = true;
-        config.weight_manager_config.offload_config.max_resident_groups = 2;
+        // Two layers resident (current + prefetch) by default. Dispatch-PP widens the window to a
+        // whole stage (+2) through SUROGATE_DISPATCH_PREFETCH_BLOCKS, so a stage's weights stay on
+        // its GPU across all of its microbatches: the post-step-0 auto-tune that would widen it
+        // never runs there (the dispatch stage calls bypass invalidate_cache), and with two slots a
+        // 4-block stage re-streamed its weights for every microbatch.
+        int resident = 2;
+        if (const char* env = std::getenv("SUROGATE_DISPATCH_PREFETCH_BLOCKS")) {
+            resident = std::max(resident, std::atoi(env));
+        }
+        config.weight_manager_config.offload_config.max_resident_groups = resident;
         config.weight_manager_config.offload_config.device_id = config.quantizer_config.device_id;
 
         // Assign per-layer offload groups to all quantizable block weights

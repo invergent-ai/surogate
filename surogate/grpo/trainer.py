@@ -12,6 +12,7 @@ prevent cross-sample attention in packed sequences.
 """
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -117,6 +118,33 @@ class GRPOTrainer:
         jit_manifests = compile_jit_kernels(ir_json, rollout_parity=getattr(config.runtime_config, "moe_rollout_parity", False))
         if jit_manifests:
             config.runtime_config.jit_kernel_manifests = jit_manifests
+
+        # dispatch-PP: stage the forward/backward across the GPU pool so a model
+        # whose weights do not fit resident can still train. GRPO drives the
+        # two halves itself (staged forward -> Python per-token grads -> staged
+        # backward seeded with them), because its gradients do not come from
+        # cross-entropy. The stages are planned BEFORE the native trainer exists,
+        # as the SFT trainer does: the weight managers read the residency window
+        # from the env at construction, and with the default two-layer window every
+        # stage re-streams its weights for every microbatch (8 microbatches x 3
+        # passes = 24 copies of the base per step, measured 2026-10-29).
+        self._dispatch_pp = getattr(config, "parallelism", None) == "dispatch_pp"
+        self._dpp_los: list[int] | None = None
+        self._dpp_his: list[int] | None = None
+        if self._dispatch_pp:
+            from surogate.train.dispatch_pp import plan_stages
+
+            self._dpp_los, self._dpp_his, n_layers, n_stages, max_stage, sb = plan_stages(
+                config.model_info.config, config.gpus
+            )
+            os.environ["SUROGATE_DISPATCH_STAGE_BLOCKS"] = str(sb)
+            # Whole stage resident + double-buffer margin (an explicit setting wins).
+            os.environ.setdefault("SUROGATE_DISPATCH_PREFETCH_BLOCKS", str(max_stage + 2))
+            logger.info(
+                f"[dispatch_pp] GRPO: {n_stages} stages over {n_layers} layers "
+                f"(max {max_stage} blocks/stage, stage_blocks={sb}, "
+                f"resident window {os.environ['SUROGATE_DISPATCH_PREFETCH_BLOCKS']} layers)"
+            )
 
         # Create C++ trainer using inherited config objects
         logger.info(f"Creating GRPO trainer for {config.model} ({config.gpus} GPUs)")
@@ -254,25 +282,6 @@ class GRPOTrainer:
         # Metrics from the Python loss path (turn_diagnostics mode only)
         self._diag_metrics: dict[str, float] | None = None
         self._turn_rows_path = Path(config.output_dir) / "turn_stats.jsonl"
-
-        # dispatch-PP: stage the forward/backward across the GPU pool so a model
-        # whose weights do not fit resident can still train. GRPO drives the
-        # two halves itself (staged forward -> Python per-token grads -> staged
-        # backward seeded with them), because its gradients do not come from
-        # cross-entropy.
-        self._dispatch_pp = getattr(config, "parallelism", None) == "dispatch_pp"
-        self._dpp_los: list[int] | None = None
-        self._dpp_his: list[int] | None = None
-        if self._dispatch_pp:
-            from surogate.train.dispatch_pp import plan_stages
-
-            self._dpp_los, self._dpp_his, n_layers, n_stages, max_stage, sb = plan_stages(
-                config.model_info.config, config.gpus
-            )
-            logger.info(
-                f"[dispatch_pp] GRPO: {n_stages} stages over {n_layers} layers "
-                f"(max {max_stage} blocks/stage, stage_blocks={sb})"
-            )
 
         # Optional metrics writers (driven by config.report_to)
         self.metrics_writer: MetricsWriter | None = None
