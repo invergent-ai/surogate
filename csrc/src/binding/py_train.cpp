@@ -2883,6 +2883,14 @@ std::vector<int> dpp_occupied_chunks(const std::int32_t* targets, int M, long ro
     return occupied;
 }
 
+// A log-prob pass that keeps its boundaries also saves each row's chunk state per stage (host copies), and
+// the train step's backward restores it instead of re-running the stage over the row's earlier windows (the
+// KV sweep). SUROGATE_DISPATCH_KV_SWEEP=1 always sweeps (bisection escape).
+bool dpp_kv_sweep_forced() {
+    static const bool forced = std::getenv("SUROGATE_DISPATCH_KV_SWEEP") != nullptr;
+    return forced;
+}
+
 // Stage one window into a GPU's input buffers: B rows of T tokens from `inputs` (and `targets`
 // when given), rows row_tokens apart, absolute positions pos0 .. pos0 + T - 1.
 template <class Ctx>
@@ -2962,10 +2970,14 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
     // ops produce *before* it can form its per-token gradients.
     run_work([](sThreadContext& ctx) {
         if (auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
-            if (auto* ge = m->graph_executor()) ge->dispatch_reset_stack();
+            if (auto* ge = m->graph_executor()) {
+                ge->dispatch_reset_stack();
+                ge->invalidate_sequence_chunk_snapshots();
+            }
         }
     });
     timer.mark("reset");
+    const bool keep_chunk_state = keep_boundaries && C > 1 && !dpp_kv_sweep_forced();
 
     std::vector<float> logprobs(static_cast<std::size_t>(M) * static_cast<std::size_t>(mb_stride), 0.0f);
     const int units = M * C;
@@ -2986,7 +2998,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
         float* lp_out = logprobs.data();
         dispatch_async(
             [this, inputs, targets, mb_stride, row_tokens, M, C, units, occ, s, lo, hi, is_loss, my_out, up_out,
-             readyp, lp_out](sThreadContext& ctx) {
+             readyp, lp_out, keep_chunk_state](sThreadContext& ctx) {
                 auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                 if (!model) throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: DSL model required");
                 auto* ge = model->graph_executor();
@@ -3037,6 +3049,8 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
                         ge->retire_saved_layers(lo, hi, "logprob_fwd", s);
                         readyp[s * units + u].store(1, std::memory_order_release);
                     }
+                    const int chunks = (*occ)[static_cast<std::size_t>(m)];
+                    if (keep_chunk_state && chunks > 1) ge->save_sequence_chunk_state(lo, hi, m, chunks);
                 }
                 if (C > 1) ctx.Model->set_sequence_chunk(-1, 0);
             },
@@ -3284,7 +3298,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             std::vector<Boundary>* sin = &stage_inputs[static_cast<std::size_t>(s)];
             dispatch_async(
                 [this, inputs, targets, custom_dloss, mb_stride, row_tokens, M, C, units, occ, s, lo, hi, is_loss,
-                 my_g, up_g, sin, readyp, lpm, vtpm](sThreadContext& ctx) {
+                 my_g, up_g, sin, readyp, lpm, vtpm, reused](sThreadContext& ctx) {
                     auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                     if (!model) throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
                     auto* ge = model->graph_executor();
@@ -3295,16 +3309,19 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                         const std::size_t row = static_cast<std::size_t>(m) * mb_stride;
                         if (C > 1) {
                             // Chunked: this microbatch's chunk state on this GPU was overwritten by
-                            // the later microbatches of the forward. Rebuild it for windows
-                            // 0 .. chunks-2 (a forward of the stage's blocks only: no head, no
-                            // loss), then run the windows last to first, the order the dK/dV and
-                            // GDN/conv state-gradient carries need.
+                            // the later microbatches of the forward. The log-prob pass whose stage
+                            // inputs this step reuses saved it after the row's last window: restore
+                            // that. Otherwise rebuild it for windows 0 .. chunks-2 (a forward of the
+                            // stage's blocks only: no head, no loss). Then run the windows last to
+                            // first, the order the dK/dV and GDN/conv state-gradient carries need.
                             model->zero_sequence_chunk_dkv();
                             // The sweep keeps no block output for a boundary read, so no stage
                             // base is captured; reset to the step base after each window instead
                             // (the chunk state lives outside the stack).
                             ge->set_preserve_layer(-1);
-                            for (int c = 0; c + 1 < chunks; ++c) {
+                            const bool restored =
+                                reused && chunks > 1 && ge->restore_sequence_chunk_state(lo, hi, m, chunks);
+                            for (int c = 0; !restored && c + 1 < chunks; ++c) {
                                 const int u = m * C + c;
                                 Boundary finj = (*sin)[static_cast<std::size_t>(u)];  // copy: the backward needs it too
                                 dpp_stage_window(ctx, inputs + row + static_cast<std::size_t>(c) * T, nullptr, B, T,

@@ -200,6 +200,18 @@ public:
     /// Zero all layers' dKV accumulators — call once before each reverse
     /// backward sweep.
     void zero_sequence_chunk_dkv();
+    /// Host copy of one row's chunk state (KV caches, GDN state slots, conv
+    /// tails) of layers [lo, hi] after its forward over `chunks` windows, kept
+    /// per slot (microbatch): the backward of the same rows restores it instead
+    /// of re-running the forward over windows 0 .. chunks-2. Pinned memory, at
+    /// most SUROGATE_DISPATCH_CHUNK_SNAPSHOT_GIB (default 4) per executor; a
+    /// slot past the budget is not saved, and its backward re-runs the forward.
+    void save_sequence_chunk_state(int lo, int hi, int slot, int chunks);
+    /// Copies the first `chunks` windows of slot's saved state of layers
+    /// [lo, hi] back; false (nothing copied) when no save covers them.
+    bool restore_sequence_chunk_state(int lo, int hi, int slot, int chunks);
+    /// Mark every saved slot stale (the pinned buffers stay for the next save).
+    void invalidate_sequence_chunk_snapshots();
     /// Free all chunked-sequence state (KV caches, accumulators, scratch).
     void free_sequence_chunk_state();
 
@@ -900,8 +912,20 @@ private:
         float* dk = nullptr;
         float* dv = nullptr;
         std::size_t kv_elems = 0;
+        std::size_t window_elems = 0;  ///< T * Hkv * Hs: one window's rows
     };
     std::unordered_map<int, ChunkAttnState> mChunkAttn;  ///< by layer_idx
+    /// save_sequence_chunk_state's host copies, by (slot, layer, part); part 0
+    /// K, 1 V, 2 GDN state slots, 3 conv tails.
+    struct ChunkSnapshot {
+        void* host = nullptr;    ///< pinned
+        std::size_t cap = 0;     ///< bytes allocated
+        std::size_t bytes = 0;   ///< bytes of the last save
+    };
+    std::unordered_map<std::uint64_t, ChunkSnapshot> mChunkSnapshots;
+    /// Saved (slot, lo, hi) -> windows covered.
+    std::unordered_map<std::uint64_t, int> mChunkSnapshotSaved;
+    std::size_t mChunkSnapshotBytes = 0;  ///< pinned bytes over all snapshots
     int mChunkIdx = -1;
     int mChunkCount = 0;
     std::int32_t* mChunkCuDev = nullptr;   ///< device: cu_q then cu_k

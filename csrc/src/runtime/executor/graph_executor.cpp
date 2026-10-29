@@ -2065,6 +2065,18 @@ void GraphExecutor::zero_sequence_chunk_dkv() {
     if (mCompiledExecutor) mCompiledExecutor->zero_sequence_chunk_dkv();
 }
 
+void GraphExecutor::save_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
+    if (mCompiledExecutor) mCompiledExecutor->save_sequence_chunk_state(lo, hi, slot, chunks);
+}
+
+bool GraphExecutor::restore_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
+    return mCompiledExecutor && mCompiledExecutor->restore_sequence_chunk_state(lo, hi, slot, chunks);
+}
+
+void GraphExecutor::invalidate_sequence_chunk_snapshots() {
+    if (mCompiledExecutor) mCompiledExecutor->invalidate_sequence_chunk_snapshots();
+}
+
 ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) {
     mDumpRank = comm.world_size() > 1 ? comm.rank() : 0;
     ExecutionRequest fwd = request;
