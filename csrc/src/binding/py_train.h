@@ -570,15 +570,19 @@ private:
 
     // dispatch-PP: apply collected grads on the master GPU (optimizer) and broadcast
     // the updated weights to every replica. opt_step_1based is the Adam step index.
+    // token_scale: divide by valid_tokens (built-in CE); off for custom_dloss gradients,
+    // which the caller normalized already.
     void dispatch_pp_apply_grads_(const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
                                   const optimizers::OptimizerConfig& opt_config,
                                   int opt_step_1based,
-                                  int valid_tokens);
+                                  int valid_tokens,
+                                  bool token_scale);
     // dispatch-PP one-step-stale state: gradients deferred from the previous step,
     // and the count of optimizer updates applied so far (1-based Adam step).
     std::vector<std::pair<std::string, std::vector<std::byte>>> mDispatchPpPendingGrads;
     int mDispatchPpAppliedStep = 0;
     int mDispatchPpPendingValidTokens = 0;  // valid-token count for the deferred (stale) grads
+    bool mDispatchPpPendingTokenScale = true;
     float mDispatchPpLastGradNorm = 0.0f;
     /// dispatch-PP stage-local LoRA (each GPU holds and trains only its own stages' adapters): asked of GPU 0's model
     /// once (-1 = not yet asked).

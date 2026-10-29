@@ -2642,10 +2642,13 @@ float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
     // stage counted valid (non-pad) tokens locally over the step's microbatches. Publish
     // that into ValidTokenCount and use per-valid-token normalization so the grad norm (and
     // the optimizer's grad scale) match the standard path -- not the inflated total-token
-    // (incl padding x world_size) fallback. step_idx is already 1-based.
+    // (incl padding x world_size) fallback. step_idx is already 1-based. Custom per-token
+    // gradients (GRPO/DPO, mDispatchPpTokenScale off) arrive normalized by the caller's
+    // loss_scale, so -- like step_grpo_native_window -- no token scale: dividing by the count
+    // again shrank them by the step's token count, below AdamW's epsilon at RL step sizes.
     auto& rs = *mRunState;
     const int vc = std::max(1, mDispatchPpValidTokens);
-    if (rs.ValidTokenCount.Data) {
+    if (mDispatchPpTokenScale && rs.ValidTokenCount.Data) {
         CUDA_CHECK(cudaMemcpyAsync(rs.ValidTokenCount.Data, &vc, sizeof(int), cudaMemcpyHostToDevice, rs.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
         mUseTokenScale = true;
@@ -2658,6 +2661,7 @@ float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
     update_with_config(comm, opt_config, step_idx);
     mDispatchPpLocalGrads = false;
     mDispatchPpValidTokens = 0;  // reset for the next step
+    mDispatchPpTokenScale = true;
     return get_norm();
 }
 

@@ -3502,18 +3502,23 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         throw std::runtime_error("dispatch-PP: one-step-stale updates need replicated LoRA; stage-local adapters "
                                  "apply their gradients in place (unset SUROGATE_DISPATCH_LORA_LOCAL)");
     }
+    // Custom per-token gradients come normalized by the caller (GRPO's loss_scale); only the
+    // built-in CE sums are divided by the valid tokens.
+    const bool token_scale = custom_dloss == nullptr;
     if (stale) {
         if (!mDispatchPpPendingGrads.empty()) {
             // The deferred grads belong to the previous step — scale by its valid-token count.
             dispatch_pp_apply_grads_(mDispatchPpPendingGrads,
                                      opt_config,
                                      ++mDispatchPpAppliedStep,
-                                     mDispatchPpPendingValidTokens);
+                                     mDispatchPpPendingValidTokens,
+                                     mDispatchPpPendingTokenScale);
         }
         mDispatchPpPendingGrads = std::move(collected);
         mDispatchPpPendingValidTokens = step_valid_tokens;
+        mDispatchPpPendingTokenScale = token_scale;
     } else {
-        dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1, step_valid_tokens);
+        dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1, step_valid_tokens, token_scale);
     }
     timer.mark("apply");
     timer.print("train_step");
@@ -3525,7 +3530,8 @@ void MultiGPUPyTrainer::dispatch_pp_flush_pending(const optimizers::OptimizerCon
     dispatch_pp_apply_grads_(mDispatchPpPendingGrads,
                              opt_config,
                              ++mDispatchPpAppliedStep,
-                             mDispatchPpPendingValidTokens);
+                             mDispatchPpPendingValidTokens,
+                             mDispatchPpPendingTokenScale);
     mDispatchPpPendingGrads.clear();
 }
 
@@ -3533,7 +3539,8 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
     const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
     const optimizers::OptimizerConfig& opt_config,
     int opt_step_1based,
-    int valid_tokens) {
+    int valid_tokens,
+    bool token_scale) {
     DppPhaseTimer timer;
     if (dispatch_pp_lora_stage_local()) {
         // Stage-local adapters: every GPU updates its own stages' adapters where their gradients are. The LoRA norm
@@ -3542,7 +3549,7 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
         run_work([&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
             if (!model) throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
-            model->set_dispatch_pp_valid_tokens(valid_tokens);
+            model->set_dispatch_pp_valid_tokens(valid_tokens, token_scale);
             norms[static_cast<std::size_t>(ctx.Communicator->rank())] =
                 model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
         });
@@ -3560,7 +3567,7 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
             if (!model) throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
             // The loss GPU counted valid tokens; publish the step total here so the optimizer
             // (on this master GPU) scales the grad norm per valid token, not per padded token.
-            model->set_dispatch_pp_valid_tokens(valid_tokens);
+            model->set_dispatch_pp_valid_tokens(valid_tokens, token_scale);
             model->dispatch_pp_write_grads(collected);
             mDispatchPpLastGradNorm =
                 model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);

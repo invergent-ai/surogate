@@ -219,9 +219,10 @@ public:
     // Read / write every parameter weight to / from host (the master broadcast).
     std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_weights();
     void dispatch_pp_write_weights(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
-    // Run the optimizer over the (collected) grad store on this GPU. Uses
-    // total-token normalization (ValidTokenCount is not populated on the collecting
-    // GPU since the dispatch backward skips the DP loss reduce). step_idx is 1-based.
+    // Run the optimizer over the (collected) grad store on this GPU, normalized per valid
+    // token by the count published with set_dispatch_pp_valid_tokens (ValidTokenCount is not
+    // populated on the collecting GPU since the dispatch backward skips the DP loss reduce),
+    // or not at all for custom gradients. step_idx is 1-based.
     float
     dispatch_pp_apply_optimizer(NCCLCommunicator& comm, const optimizers::OptimizerConfig& opt_config, int step_idx);
     // Raw (summed) loss from the last forward — readable without ValidTokenCount,
@@ -248,11 +249,15 @@ public:
     // trainer sums these across microbatches and publishes the total via the setter below so
     // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale
     // the grad norm per valid token instead of per total (padded) token.
+    // token_scale=false: the step's gradients came from custom per-token seeds (GRPO/DPO)
+    // the caller already normalized (its loss_scale is folded into custom_dloss), so the
+    // optimizer must not divide by the count as well -- as step_grpo_native_window.
     [[nodiscard]] int dispatch_pp_loss_valid_tokens() const {
         return mDispatchPpLossValidTokens;
     }
-    void set_dispatch_pp_valid_tokens(int n) {
+    void set_dispatch_pp_valid_tokens(int n, bool token_scale = true) {
         mDispatchPpValidTokens = n;
+        mDispatchPpTokenScale = token_scale;
     }
     // Backward as two contiguous block sub-ranges (high range first, boundary
     // grad round-tripped through host); returns per-block grad norms.
@@ -728,6 +733,7 @@ private:
     int mDispatchPpValidTokens = 0;           // valid tokens summed over the step's microbatches,
                                               // published onto the optimizer GPU for valid-token
                                               // grad-norm scaling (the dispatch path skips reduce_loss)
+    bool mDispatchPpTokenScale = true;        // false: custom (pre-normalized) gradients, no 1/valid
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     bool mSequenceChunkActive = false;        // chunked-sequence mode (doc masking handled per chunk)
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
