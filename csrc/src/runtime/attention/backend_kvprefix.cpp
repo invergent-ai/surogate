@@ -11,6 +11,8 @@
 // expanded dK/dV into FP32 accumulators, and emits the chunk's now-complete
 // rows back into dqkv — exact as long as chunks run last-to-first.
 
+#include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 
@@ -114,10 +116,17 @@ public:
 
         const int HS_rounded = p.Hs <= 128 ? ((p.Hs + 31) / 32) * 32 : ((p.Hs + 63) / 64) * 64;
         const long padded_q = static_cast<long>(p.T) + 128L * std::max(1, p.chunk_num_segs);
-        // The deterministic backward keeps one dQ accumulator per split; the split count is
-        // passed down explicitly (FlashAttention's own heuristic would size past this scratch).
+        // Deterministic dQ is ordered (cmake/patch_flash_attn.sh): one fp32 dQ that key blocks add to in order. The
+        // split accumulators (one fp32 dQ per split, passed down explicitly) stay for SUROGATE_FLASH_ATTN_DQ_SPLITS
+        // comparisons: their read-modify-write per key block ran from DRAM here (T queries, a prefix up to 131k
+        // keys, ~50 TFLOPS backward) where the ordered and the atomic dQ stay in L2 (~160).
+        // A sliding window keeps the splits: the key blocks reaching a query block are then a range that does not
+        // start at block 0, which the order chain assumes.
+        const bool split_dq = p.deterministic_bwd &&
+                              (std::getenv("SUROGATE_FLASH_ATTN_DQ_SPLITS") != nullptr || p.window_size > 0);
+        const bool ordered_dq = p.deterministic_bwd && !split_dq;
         const int dq_splits =
-            p.deterministic_bwd ? flash_varlen_dq_splits(1, p.T, p.Hq, p.Hs, rs.DeviceProp.multiProcessorCount) : 1;
+            split_dq ? flash_varlen_dq_splits(1, p.T, p.Hq, p.Hs, rs.DeviceProp.multiProcessorCount) : 1;
         Tensor dq_accum = rs.temp_alloc(
             ETensorDType::FP32, {static_cast<long>(dq_splits) * padded_q * p.Hq * HS_rounded}, "kvprefix_dq_accum");
         Tensor dsoftmax = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(p.Hq) * padded_q}, "kvprefix_dsoftmax");
@@ -131,6 +140,16 @@ public:
         temps.push_back(dv_exp);
         CUDA_CHECK(cudaMemsetAsync(dq_accum.Data, 0, dq_accum.bytes(), p.stream));
         CUDA_CHECK(cudaMemsetAsync(dsoftmax.Data, 0, dsoftmax.bytes(), p.stream));
+        // One counter per (segment, query head, query block); 32 rows bounds every backward kernel's block height.
+        const int sem_stride = (std::max(p.chunk_max_q > 0 ? p.chunk_max_q : p.T, 1) + 31) / 32;
+        Tensor dq_semaphore;
+        if (ordered_dq) {
+            dq_semaphore = rs.temp_alloc(ETensorDType::INT32,
+                                         {static_cast<long>(std::max(1, p.chunk_num_segs)) * p.Hq * sem_stride},
+                                         "kvprefix_dq_semaphore");
+            temps.push_back(dq_semaphore);
+            CUDA_CHECK(cudaMemsetAsync(dq_semaphore.Data, 0, dq_semaphore.bytes(), p.stream));
+        }
 
         attention_backward_flash_kvprefix(p.d_qkv.get<nv_bfloat16>(),
                                           p.chunk_dk_accum,
@@ -160,7 +179,9 @@ public:
                                           p.chunk_num_segs,
                                           p.chunk_max_q,
                                           p.chunk_max_k,
-                                          dq_splits);
+                                          dq_splits,
+                                          ordered_dq ? dq_semaphore.get<int>() : nullptr,
+                                          sem_stride);
     }
 };
 

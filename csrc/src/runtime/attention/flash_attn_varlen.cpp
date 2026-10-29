@@ -493,7 +493,9 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                                        int num_segs,
                                        int max_seqlen_q,
                                        int max_seqlen_k,
-                                       int dq_splits) {
+                                       int dq_splits,
+                                       int* dq_semaphore,
+                                       int dq_semaphore_m_stride) {
     if (num_segs <= 0) num_segs = 1;
     if (max_seqlen_q <= 0) max_seqlen_q = T;
     if (max_seqlen_k <= 0) max_seqlen_k = kv_len;
@@ -547,7 +549,13 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
     params.deterministic = deterministic;
 
     const int HS_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
-    if (deterministic) {
+    if (deterministic && dq_semaphore != nullptr) {
+        // Ordered dQ: the atomic path's launch (one CTA per key block, one fp32 dQ, which stays in L2) with every key
+        // block adding after the one before it, so the result is reproducible without per-split accumulators.
+        params.deterministic = false;
+        params.dq_semaphore = dq_semaphore;
+        params.dq_semaphore_m_stride = dq_semaphore_m_stride;
+    } else if (deterministic) {
         params.dq_accum_split_stride = static_cast<int64_t>(T + 128 * num_segs) * Hq * HS_rounded;
         params.num_splits = dq_splits > 0 ? dq_splits : 0;  // see attention_backward_flash_varlen
     }
