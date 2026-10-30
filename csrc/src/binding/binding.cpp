@@ -1693,7 +1693,9 @@ NB_MODULE(_surogate, m) {
                bool stale,
                int num_microbatches,
                nb::object custom_dloss_obj,
-               bool reuse_forward) {
+               bool reuse_forward,
+               bool zero_grads,
+               bool apply_update) {
                 // inputs/targets carry num_microbatches microbatches of [batch_size, seq] each.
                 CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
@@ -1713,7 +1715,9 @@ NB_MODULE(_surogate, m) {
                                                                 stale,
                                                                 num_microbatches,
                                                                 custom_dloss_ptr,
-                                                                reuse_forward);
+                                                                reuse_forward,
+                                                                zero_grads,
+                                                                apply_update);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1725,10 +1729,15 @@ NB_MODULE(_surogate, m) {
             nb::arg("num_microbatches") = 1,
             nb::arg("custom_dloss") = nb::none(),
             nb::arg("reuse_forward") = false,
+            nb::arg("zero_grads") = true,
+            nb::arg("apply_update") = true,
             "Debug-only dispatch-PP: one full multi-GPU training step (round-robin backward dispatch + "
             "cross-GPU grad handoff -> collect grads -> optimizer on the master -> broadcast weights to "
             "all GPUs); returns the (raw) step loss. stale=true defers the optimizer update by one step "
-            "(RoundPipe one-step staleness); call dispatch_pp_flush_pending at the end.")
+            "(RoundPipe one-step staleness); call dispatch_pp_flush_pending at the end. One optimizer step "
+            "can span several calls (gradient accumulation): zero_grads=False adds to the gradients the "
+            "previous calls left, apply_update=False leaves them for the next call; the call that applies "
+            "normalizes over the valid tokens of all of them.")
         .def(
             "dispatch_pp_flush_pending",
             [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& opt_config) {

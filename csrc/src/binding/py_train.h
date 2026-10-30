@@ -279,6 +279,10 @@ public:
     // non-dispatch path does via backward_grpo(). nullptr keeps the CE behaviour.
     // reuse_forward: skip the step's forward when the last log-prob pass kept its
     // boundaries for these exact rows, stages and weights (it recomputes nothing else).
+    // zero_grads / apply_update: one optimizer step over several calls (gradient
+    // accumulation), so the rows' host state (stage boundaries) is held one call at a time.
+    // The first call zeroes the gradients, every call adds its rows' gradients on the
+    // stages' GPUs, the last applies them once, normalized by the valid tokens of all calls.
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                           const std::int32_t* targets,
                                           const std::vector<int>& los,
@@ -288,7 +292,9 @@ public:
                                           bool stale,
                                           int num_microbatches = 1,
                                           const float* custom_dloss = nullptr,
-                                          bool reuse_forward = false);
+                                          bool reuse_forward = false,
+                                          bool zero_grads = true,
+                                          bool apply_update = true);
     // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
     float dispatch_pp_last_grad_norm() const {
         return mDispatchPpLastGradNorm;
@@ -597,6 +603,13 @@ private:
     std::uint64_t mDppKeptKey = 0;
     // Bumped by every dispatch-PP weight update, so kept boundaries never outlive their weights.
     std::uint64_t mDppWeightVersion = 0;
+    // An optimizer step open over several train-step calls (apply_update=false so far): the valid tokens of its
+    // calls, and what the remaining calls must share with them.
+    bool mDppAccumOpen = false;
+    long mDppAccumValidTokens = 0;
+    bool mDppAccumTokenScale = true;
+    std::vector<int> mDppAccumLos, mDppAccumHis;
+    std::uint64_t mDppAccumWeightVersion = 0;
 };
 
 #endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

@@ -3148,11 +3148,36 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                          bool stale,
                                                          int num_microbatches,
                                                          const float* custom_dloss,
-                                                         bool reuse_forward) {
+                                                         bool reuse_forward,
+                                                         bool zero_grads,
+                                                         bool apply_update) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
     }
     check_lora_stage_plan(los, his, "dispatch_pp_train_step_multigpu");
+    // Custom per-token gradients come normalized by the caller (GRPO's loss_scale); only the
+    // built-in CE sums are divided by the valid tokens.
+    const bool token_scale = custom_dloss == nullptr;
+    // An optimizer step over several calls: the first zeroes the gradients, every call adds its rows' gradients on
+    // the stages' GPUs, the last applies them once. In between the weights must not change, and every call must run
+    // the same stages (a stage's gradients stay on its GPU) with the same normalization.
+    if (zero_grads) {
+        mDppAccumOpen = false;
+        mDppAccumValidTokens = 0;
+    } else {
+        if (!mDppAccumOpen) {
+            throw std::runtime_error("dispatch_pp_train_step_multigpu: zero_grads=false continues an optimizer step, "
+                                     "but no earlier call left one open (apply_update=false)");
+        }
+        if (los != mDppAccumLos || his != mDppAccumHis || token_scale != mDppAccumTokenScale ||
+            mDppWeightVersion != mDppAccumWeightVersion) {
+            throw std::runtime_error("dispatch_pp_train_step_multigpu: the calls of one optimizer step need the same "
+                                     "stages, the same loss kind (custom_dloss or not) and unchanged weights");
+        }
+    }
+    if (stale && !(zero_grads && apply_update)) {
+        throw std::runtime_error("dispatch_pp_train_step_multigpu: one-step-stale updates take one call per step");
+    }
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
     const int M = std::max(1, num_microbatches);
@@ -3310,13 +3335,16 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     //    accumulation is required. In diagonal wave w, microbatch m runs backward step
     //    t=w-m -> stage s=num_stages-1-t on GPU s%N; the grad boundary d_blocks[lo-1].*
     //    is handed down per microbatch. After the wavefront, each stage's accumulated
-    //    grads are collected once from its GPU.
-    run_work(
-        [&](sThreadContext& ctx) {
-            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-            if (model) model->dispatch_pp_zero_grads();
-        },
-        -1);
+    //    grads are collected once from its GPU. A later call of the same optimizer step
+    //    (zero_grads=false) adds onto what the earlier calls left there.
+    if (zero_grads) {
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (model) model->dispatch_pp_zero_grads();
+            },
+            -1);
+    }
     timer.mark("zero_grads");
 
     std::vector<double> loss_per_mb(static_cast<std::size_t>(M), 0.0);
@@ -3467,6 +3495,21 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     int step_valid_tokens = 0;
     for (int v : valid_per_mb)
         step_valid_tokens += v;
+    if (!apply_update) {
+        // Not the step's last call: the gradients stay accumulated on their stages' GPUs for the next call, and the
+        // valid tokens carry over to the call that applies them. These rows' stage boundaries are released here.
+        mDppAccumOpen = true;
+        mDppAccumValidTokens += step_valid_tokens;
+        mDppAccumTokenScale = token_scale;
+        mDppAccumLos = los;
+        mDppAccumHis = his;
+        mDppAccumWeightVersion = mDppWeightVersion;
+        timer.print("train_step");
+        return loss;
+    }
+    step_valid_tokens += static_cast<int>(mDppAccumValidTokens);
+    mDppAccumOpen = false;
+    mDppAccumValidTokens = 0;
 
     // Collect each stage's accumulated grads from its GPU (grads stay resident on the
     // stage's GPU until read here, after the whole backward wavefront). Stage-local LoRA
@@ -3502,9 +3545,6 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         throw std::runtime_error("dispatch-PP: one-step-stale updates need replicated LoRA; stage-local adapters "
                                  "apply their gradients in place (unset SUROGATE_DISPATCH_LORA_LOCAL)");
     }
-    // Custom per-token gradients come normalized by the caller (GRPO's loss_scale); only the
-    // built-in CE sums are divided by the valid tokens.
-    const bool token_scale = custom_dloss == nullptr;
     if (stale) {
         if (!mDispatchPpPendingGrads.empty()) {
             // The deferred grads belong to the previous step — scale by its valid-token count.

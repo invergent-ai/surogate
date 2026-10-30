@@ -34,6 +34,22 @@ from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
 
+# Host memory a dispatch-PP call holds per token of its rows until its training step ends (stage boundaries and
+# chunk states), for sizing the calls of a step (GRPOTrainer._dispatch_pp_call_groups).
+_DPP_HOST_BYTES_PER_TOKEN = 120_000
+
+
+def _host_available_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo, or None where there is none."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
 
 def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
     """Flatten config into JSON-serializable scalars for metrics_writer.log_config()."""
@@ -507,71 +523,130 @@ class GRPOTrainer:
         GRPO's micro-batches map onto dispatch-PP's M microbatches directly: each is
         already [1, seq_len], and GRPO takes exactly one optimizer step per
         orchestrator step, which is what the fused call does.
+
+        A call holds its rows' stage boundaries in host memory from the log-prob pass
+        to the end of its training step. A step whose rows do not fit runs as several
+        calls (_dispatch_pp_call_groups), each with its own log-prob pass and staged
+        backward: the gradients accumulate on the stages' GPUs, and one optimizer
+        update follows the last call. The per-token gradients are normalized by the
+        whole step's loss_scale either way.
         """
         seq_len = self.config.sequence_len
-        M = len(micro_batches)
-
         prepared = [self._prepare_micro_batch(mb, seq_len) for mb in micro_batches]
-        inputs = np.ascontiguousarray(np.concatenate([p["input"] for p in prepared], axis=0))
-        targets = np.ascontiguousarray(np.concatenate([p["targets"] for p in prepared], axis=0))
+        groups = self._dispatch_pp_call_groups(prepared, step)
 
         # The log-prob pass keeps every stage's output so the training step below,
         # over the same rows and weights, takes them as its stage inputs instead of
         # running the same forward pipeline a second time (SUROGATE_DPP_REUSE_FORWARD=0
         # turns this off).
         reuse_forward = os.environ.get("SUROGATE_DPP_REUSE_FORWARD", "1") != "0"
-        logprob_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
-            inputs, targets, self._dpp_los, self._dpp_his, M, keep_boundaries=reuse_forward
-        )
-
-        custom_dloss = np.zeros((M, seq_len), dtype=np.float32)
         metrics: dict = {}
-        for i, p in enumerate(prepared):
-            # Un-shift from target-slot layout to logical layout (see
-            # _diagnostic_micro_step for why this is required).
-            trainer_lp = unshift_to_logical(
-                np.asarray(logprob_rows[i, :seq_len], dtype=np.float32), p["sample_ranges"]
+        loss_sum = 0.0
+        for g, rows in enumerate(groups):
+            M = len(rows)
+            inputs = np.ascontiguousarray(np.concatenate([prepared[i]["input"] for i in rows], axis=0))
+            targets = np.ascontiguousarray(np.concatenate([prepared[i]["targets"] for i in rows], axis=0))
+            logprob_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
+                inputs, targets, self._dpp_los, self._dpp_his, M, keep_boundaries=reuse_forward
             )
 
-            grads, metrics = compute_grpo_per_token_grads(
-                trainer_logprobs=trainer_lp,
-                inference_logprobs=p["inference"],
-                advantages=p["advantages"],
-                loss_mask=p["loss_mask"].astype(bool),
-                loss_config=self.config.loss,
-                sample_ranges=p["sample_ranges"],
-                teacher_logprobs=p["teacher"],
-            )
-
-            if turn_acc is not None and p["turn_ids"] is not None:
-                reference_lp = p["teacher"] if p["teacher"] is not None else p["inference"]
-                turn_acc.update(
-                    turn_ids=p["turn_ids"],
-                    loss_mask=p["loss_mask"].astype(bool),
-                    per_token_kl=trainer_lp - reference_lp,
-                    per_token_loss=grads,
-                    sample_ranges=p["sample_ranges"],
+            custom_dloss = np.zeros((M, seq_len), dtype=np.float32)
+            for j, i in enumerate(rows):
+                p = prepared[i]
+                # Un-shift from target-slot layout to logical layout (see
+                # _diagnostic_micro_step for why this is required).
+                trainer_lp = unshift_to_logical(
+                    np.asarray(logprob_rows[j, :seq_len], dtype=np.float32), p["sample_ranges"]
                 )
 
-            custom_dloss[i] = shift_to_target(grads, p["sample_ranges"])
-        custom_dloss /= loss_scale
+                grads, metrics = compute_grpo_per_token_grads(
+                    trainer_logprobs=trainer_lp,
+                    inference_logprobs=p["inference"],
+                    advantages=p["advantages"],
+                    loss_mask=p["loss_mask"].astype(bool),
+                    loss_config=self.config.loss,
+                    sample_ranges=p["sample_ranges"],
+                    teacher_logprobs=p["teacher"],
+                )
 
-        loss = float(
-            self.trainer.dispatch_pp_train_step_multigpu(
-                inputs,
-                targets,
-                self._dpp_los,
-                self._dpp_his,
-                opt_config,
-                step,
-                False,
-                M,
-                custom_dloss,
-                reuse_forward=reuse_forward,
+                if turn_acc is not None and p["turn_ids"] is not None:
+                    reference_lp = p["teacher"] if p["teacher"] is not None else p["inference"]
+                    turn_acc.update(
+                        turn_ids=p["turn_ids"],
+                        loss_mask=p["loss_mask"].astype(bool),
+                        per_token_kl=trainer_lp - reference_lp,
+                        per_token_loss=grads,
+                        sample_ranges=p["sample_ranges"],
+                    )
+
+                custom_dloss[j] = shift_to_target(grads, p["sample_ranges"])
+            custom_dloss /= loss_scale
+
+            loss_sum += M * float(
+                self.trainer.dispatch_pp_train_step_multigpu(
+                    inputs,
+                    targets,
+                    self._dpp_los,
+                    self._dpp_his,
+                    opt_config,
+                    step,
+                    False,
+                    M,
+                    custom_dloss,
+                    reuse_forward=reuse_forward,
+                    zero_grads=g == 0,
+                    apply_update=g == len(groups) - 1,
+                )
             )
-        )
         self._diag_metrics = metrics
-        return {"loss": loss, "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
+        return {"loss": loss_sum / len(prepared), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
+
+    def _dispatch_pp_call_groups(self, prepared, step: int) -> list[list[int]]:
+        """Split a step's rows into dispatch calls that fit host memory.
+
+        A call holds its rows' stage boundaries (and the log-prob pass's chunk states) on the host until its
+        training step ends. So the calls take consecutive rows, about equal in tokens, each at most a budget:
+        SUROGATE_DPP_CALL_TOKENS, or else half the host's available memory at
+        SUROGATE_DPP_HOST_BYTES_PER_TOKEN bytes per token. A row counts the windows up to its last target, as the
+        staged passes run them.
+        """
+        seq_len = self.config.sequence_len
+        window = self.config.trainer_seq_len
+        tokens = []
+        for p in prepared:
+            if window >= seq_len:
+                tokens.append(seq_len)
+                continue
+            valid = np.flatnonzero(p["targets"][0] >= 0)
+            tokens.append((int(valid[-1]) // window + 1 if valid.size else 1) * window)
+        env = os.environ.get("SUROGATE_DPP_CALL_TOKENS")
+        if env:
+            budget = max(1, int(env))
+        else:
+            available = _host_available_bytes()
+            per_token = float(os.environ.get("SUROGATE_DPP_HOST_BYTES_PER_TOKEN", _DPP_HOST_BYTES_PER_TOKEN))
+            budget = max(1, int(0.5 * available / per_token)) if available else sum(tokens)
+        total = sum(tokens)
+        calls = max(1, -(-total // budget))
+        target = total / calls
+        groups, cur, cur_tokens = [], [], 0
+        for i, n in enumerate(tokens):
+            if cur and cur_tokens + n > budget:
+                groups.append(cur)
+                cur, cur_tokens = [], 0
+            cur.append(i)
+            cur_tokens += n
+            if cur_tokens >= target and len(groups) < calls - 1:
+                groups.append(cur)
+                cur, cur_tokens = [], 0
+        if cur:
+            groups.append(cur)
+        if len(groups) > 1:
+            logger.info(
+                f"dispatch-PP step {step}: {len(prepared)} rows, {total} tokens in {len(groups)} calls "
+                f"(at most {budget} tokens each): " + ", ".join(str(sum(tokens[i] for i in g)) for g in groups)
+            )
+        return groups
 
     def _write_turn_rows(self, step: int, orch_step: int, turn_acc) -> None:
         """Append per-turn detail for this step to turn_stats.jsonl (for plotting)."""

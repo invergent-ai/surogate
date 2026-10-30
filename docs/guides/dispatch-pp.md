@@ -98,6 +98,25 @@ reuse it), raising `gradient_accumulation_steps` amortizes the stream over more 
 pipeline fuller (fewer bubbles) at **no extra peak memory** — so treat it as both the effective-batch
 and the throughput knob.
 
+### GRPO steps
+
+GRPO drives the two halves of a dispatch-PP step itself. A staged forward through the loss stage returns
+the per-token log-probs, Python forms the GRPO per-token gradients from them, and the staged backward is
+seeded with those gradients. They are normalized by the step's loss tokens (`loss_scale`), as on the
+standard path; the optimizer applies no second token scale.
+
+The log-prob pass keeps every stage's output boundary in host memory, so the training step over the same
+rows skips its own forward (`SUROGATE_DPP_REUSE_FORWARD=0` turns this off). A call holds these boundaries
+until its training step ends: about 77 KB per token of its rows on the 35B-A3B at 131k (57 KB of
+boundaries over 8 stages, ~20 KB of chunk states). Freed blocks stay in a pinned pool for the next call
+(`SUROGATE_PINNED_POOL_GIB`, default 32). A step with more tokens than fit runs as several calls, each with
+its own log-prob pass and staged backward. The gradients accumulate on the stages' GPUs and one optimizer
+update follows the last call, so the step trains exactly as one call would.
+
+| Env var | Meaning |
+| --- | --- |
+| `SUROGATE_DPP_CALL_TOKENS` | Tokens per call; a row counts the windows up to its last target. Unset: half of the host's available memory (`MemAvailable`) at the start of the step, at `SUROGATE_DPP_HOST_BYTES_PER_TOKEN` bytes per token (default `120000`). |
+
 ## Constraints
 
 - **LoRA only (frozen base)** is the supported training mode. Full fine-tuning runs with `M = 1`
