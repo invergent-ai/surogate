@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <functional>
@@ -111,8 +112,13 @@ public:
 
     /**
      * @brief Export LoRA adapter to safetensors file
+     *
+     * dtype: the dtype the tensors are written in. Unset keeps the master dtype (checkpoints resume from it);
+     * BF16 rounds FP32 masters to nearest-even, the copy a BF16 serving engine loads.
      */
-    void export_to_file(const std::string& file_name, NCCLCommunicator& comm) const;
+    void export_to_file(const std::string& file_name,
+                        NCCLCommunicator& comm,
+                        std::optional<ETensorDType> dtype = std::nullopt) const;
 
     /// True when grouped expert-LoRA holds only an EP-local shard of the experts
     /// (num_grouped_experts < num_experts and grouped buffers exist).
@@ -247,7 +253,13 @@ private:
     };
     mutable std::vector<StagedTensor> mExportStaged;
 
-    void export_stage_local(const std::string& file_name, NCCLCommunicator& comm) const;
+    /// A host copy of `t` under `name`, an FP32 tensor rounded to BF16 when dtype asks for it.
+    static StagedTensor stage_tensor(std::string name, const TensorShard& t, std::optional<ETensorDType> dtype);
+    /// Writes the staged tensors (rank 0 only), then drops them.
+    void write_staged(const std::string& file_name, std::vector<StagedTensor> staged) const;
+    void export_stage_local(const std::string& file_name,
+                            NCCLCommunicator& comm,
+                            std::optional<ETensorDType> dtype) const;
 
     // Master weights (sharded for multi-GPU)
     LoRAWeightsSet<TensorShard> mMaster;

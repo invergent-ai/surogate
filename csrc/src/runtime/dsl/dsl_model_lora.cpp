@@ -39,7 +39,8 @@ namespace dsl {
 
 void DslModel::export_adapter(const std::string& directory,
                               NCCLCommunicator& comm,
-                              const std::string& base_model_path) {
+                              const std::string& base_model_path,
+                              std::optional<ETensorDType> dtype) {
     if (!lora_enabled()) return;
     namespace fs = std::filesystem;
     fs::path dir(directory);
@@ -47,7 +48,7 @@ void DslModel::export_adapter(const std::string& directory,
         fs::create_directories(dir);
     }
     comm.barrier();
-    mLoRAWeights->export_to_file((dir / "adapter_model.safetensors").string(), comm);
+    mLoRAWeights->export_to_file((dir / "adapter_model.safetensors").string(), comm, dtype);
     if (comm.rank() == 0) {
         nlohmann::json adapter_config;
         adapter_config["base_model_name_or_path"] = base_model_path;

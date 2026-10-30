@@ -100,7 +100,9 @@ public:
     void import_weights_from_external(std::string safetensors_path,
                                       std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
     void export_model(std::string path);
-    void export_adapter(std::string path, std::string base_model_path = "");
+    // dtype "" keeps the adapter's master dtype (checkpoints); "bf16" rounds FP32 masters to BF16 (broadcasts to a
+    // BF16 serving engine).
+    void export_adapter(std::string path, std::string base_model_path = "", std::string dtype = "");
     void import_adapter(std::string path);
     void init_weights();
     // `loader` (optional) has its position saved with / restored from the checkpoint

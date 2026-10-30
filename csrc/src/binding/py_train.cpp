@@ -490,10 +490,18 @@ void MultiGPUPyTrainer::export_model(std::string path) {
  *
  * @param path Output directory path.
  * @param base_model_path Optional path/name of base model for adapter_config.json.
+ * @param dtype "" writes the master dtype; "bf16" rounds FP32 masters to BF16.
  * @throws std::runtime_error If the model is not a LoRAModel.
  */
-void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_path) {
-    run_work([path, base_model_path](sThreadContext& ctx) {
+void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_path, std::string dtype) {
+    std::optional<ETensorDType> out;
+    if (dtype == "bf16") {
+        out = ETensorDType::BF16;
+    } else if (!dtype.empty()) {
+        throw std::invalid_argument("export_adapter: dtype must be \"\" (the master dtype) or \"bf16\", got \"" + dtype +
+                                    "\"");
+    }
+    run_work([path, base_model_path, out](sThreadContext& ctx) {
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("export_adapter: DSL model required");
@@ -501,7 +509,7 @@ void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_
         if (!dsl_model->lora_enabled()) {
             throw std::runtime_error("export_adapter: DSL model is not configured for LoRA");
         }
-        dsl_model->export_adapter(path, *ctx.Communicator, base_model_path);
+        dsl_model->export_adapter(path, *ctx.Communicator, base_model_path, out);
     });
 }
 

@@ -317,7 +317,11 @@ public:
     ITensorContainer& opt_variance_scales() override;
 
     // LoRA adapter API (no-op for non-LoRA models).
-    void export_adapter(const std::string& directory, NCCLCommunicator& comm, const std::string& base_model_path = "");
+    // dtype: as ModularLoRAWeightsManager::export_to_file (unset keeps the master dtype, BF16 rounds FP32 masters).
+    void export_adapter(const std::string& directory,
+                        NCCLCommunicator& comm,
+                        const std::string& base_model_path = "",
+                        std::optional<ETensorDType> dtype = std::nullopt);
     void import_adapter(const std::string& file_name, NCCLCommunicator& comm);
     void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
     void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;

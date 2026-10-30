@@ -1432,11 +1432,14 @@ NB_MODULE(_surogate, m) {
              &MultiGPUPyTrainer::export_adapter,
              nb::arg("path"),
              nb::arg("base_model_path") = "",
+             nb::arg("dtype") = "",
              "Export LoRA adapter weights to a directory (PEFT-compatible format).\n\n"
              "Only works if the model was created with a LoRA configuration.\n"
              "Creates adapter_model.safetensors and adapter_config.json.\n\n"
              "Parameters:\n- path: Output directory path.\n"
-             "- base_model_path: Optional path/name of base model for adapter_config.json.")
+             "- base_model_path: Optional path/name of base model for adapter_config.json.\n"
+             "- dtype: \"\" writes the adapter's master dtype (what a checkpoint resumes from); \"bf16\" rounds "
+             "FP32 masters to BF16 (round to nearest even), the copy a BF16 serving engine loads.")
         .def_static(
             "from_pretrained",
             [](const std::string& name,

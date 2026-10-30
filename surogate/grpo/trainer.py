@@ -298,6 +298,7 @@ class GRPOTrainer:
             base_model_dir=config.model_dir,
             max_steps=config.max_steps,
             broadcast_dir=broadcast_dir,
+            adapter_dtype=config.broadcast_dtype,
         )
 
         # Data loader setup is deferred to train() since packer must run first

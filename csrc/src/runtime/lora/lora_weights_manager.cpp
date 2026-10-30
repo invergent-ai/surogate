@@ -597,7 +597,48 @@ void ModularLoRAWeightsManager::release_export_gathered() const {
     mExportHostBuffers.clear();
 }
 
-void ModularLoRAWeightsManager::export_stage_local(const std::string& file_name, NCCLCommunicator& comm) const {
+ModularLoRAWeightsManager::StagedTensor
+ModularLoRAWeightsManager::stage_tensor(std::string name, const TensorShard& t, std::optional<ETensorDType> dtype) {
+    StagedTensor s;
+    s.name = std::move(name);
+    const std::size_t bytes = t.bytes();
+    std::vector<long> shape(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
+    if (dtype == ETensorDType::BF16 && t.DType == ETensorDType::FP32) {
+        // Round to nearest even, as the device's float -> bf16 conversion of the work copies does.
+        const std::size_t n = t.nelem();
+        std::vector<std::uint32_t> f32(n);
+        CUDA_CHECK(cudaMemcpy(f32.data(), t.Data, bytes, cudaMemcpyDefault));
+        s.bytes = std::make_unique<std::byte[]>(n * sizeof(std::uint16_t));
+        auto* out = reinterpret_cast<std::uint16_t*>(s.bytes.get());
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t x = f32[i];
+            out[i] = ((x & 0x7fffffffu) > 0x7f800000u)
+                         ? static_cast<std::uint16_t>((x >> 16) | 0x40u)  // NaN stays a (quiet) NaN
+                         : static_cast<std::uint16_t>((x + 0x7fffu + ((x >> 16) & 1u)) >> 16);
+        }
+        s.host = Tensor::from_pointer(s.bytes.get(), -1, ETensorDType::BF16, shape);
+        return s;
+    }
+    s.bytes = std::make_unique<std::byte[]>(bytes);
+    CUDA_CHECK(cudaMemcpy(s.bytes.get(), t.Data, bytes, cudaMemcpyDefault));
+    s.host = Tensor::from_pointer(s.bytes.get(), -1, t.DType, shape);
+    return s;
+}
+
+void ModularLoRAWeightsManager::write_staged(const std::string& file_name, std::vector<StagedTensor> staged) const {
+    mExportStaged = std::move(staged);
+    try {
+        write_safetensors(file_name, const_cast<ModularLoRAWeightsManager&>(*this));
+    } catch (...) {
+        mExportStaged.clear();
+        throw;
+    }
+    mExportStaged.clear();
+}
+
+void ModularLoRAWeightsManager::export_stage_local(const std::string& file_name,
+                                                   NCCLCommunicator& comm,
+                                                   std::optional<ETensorDType> dtype) const {
     // The ranks (one worker thread each, one process) deposit host copies of their own layers' tensors, under the
     // names and per-expert slices export writes, keyed by the output file; rank 0 takes them all and writes it.
     static std::mutex mutex;
@@ -605,16 +646,7 @@ void ModularLoRAWeightsManager::export_stage_local(const std::string& file_name,
     std::vector<StagedTensor> mine;
     CUDA_CHECK(cudaDeviceSynchronize());
     const_cast<ModularLoRAWeightsManager&>(*this).iterate_tensors([&](std::string name, const TensorShard& t) {
-        StagedTensor s;
-        s.name = std::move(name);
-        const std::size_t bytes = t.bytes();
-        s.bytes = std::make_unique<std::byte[]>(bytes);
-        CUDA_CHECK(cudaMemcpy(s.bytes.get(), t.Data, bytes, cudaMemcpyDefault));
-        s.host = Tensor::from_pointer(s.bytes.get(),
-                                      -1,
-                                      t.DType,
-                                      std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank));
-        mine.push_back(std::move(s));
+        mine.push_back(stage_tensor(std::move(name), t, dtype));
     });
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -624,27 +656,24 @@ void ModularLoRAWeightsManager::export_stage_local(const std::string& file_name,
     }
     comm.barrier();
     if (comm.rank() == 0) {
+        std::vector<StagedTensor> all;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            mExportStaged = std::move(table[file_name]);
+            all = std::move(table[file_name]);
             table.erase(file_name);
         }
-        try {
-            write_safetensors(file_name, const_cast<ModularLoRAWeightsManager&>(*this));
-        } catch (...) {
-            mExportStaged.clear();
-            throw;
-        }
-        mExportStaged.clear();
+        write_staged(file_name, std::move(all));
     }
     comm.barrier();
 }
 
-void ModularLoRAWeightsManager::export_to_file(const std::string& file_name, NCCLCommunicator& comm) const {
+void ModularLoRAWeightsManager::export_to_file(const std::string& file_name,
+                                               NCCLCommunicator& comm,
+                                               std::optional<ETensorDType> dtype) const {
     if (!enabled()) return;
     if (stage_local()) {
         // dispatch-PP stage-local: each rank holds only its own stages' layers.
-        export_stage_local(file_name, comm);
+        export_stage_local(file_name, comm, dtype);
         return;
     }
     if (has_ep_local_grouped()) {
@@ -653,7 +682,17 @@ void ModularLoRAWeightsManager::export_to_file(const std::string& file_name, NCC
         gather_grouped_for_export(comm);
     }
     if (comm.rank() == 0) {
-        write_safetensors(file_name, const_cast<ModularLoRAWeightsManager&>(*this));
+        if (dtype) {
+            // Converted host copies, written as a stage-local export writes its tensors.
+            std::vector<StagedTensor> staged;
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const_cast<ModularLoRAWeightsManager&>(*this).iterate_tensors([&](std::string name, const TensorShard& t) {
+                staged.push_back(stage_tensor(std::move(name), t, dtype));
+            });
+            write_staged(file_name, std::move(staged));
+        } else {
+            write_safetensors(file_name, const_cast<ModularLoRAWeightsManager&>(*this));
+        }
     }
     comm.barrier();
     release_export_gathered();
