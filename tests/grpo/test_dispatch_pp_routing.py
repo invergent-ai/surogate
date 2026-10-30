@@ -26,7 +26,9 @@ class _Cfg:
         from surogate.grpo.config import GRPOLossConfig
 
         self.sequence_len = seq_len
+        self.trainer_seq_len = seq_len
         self.gpus = gpus
+        self.teacher_from_base = False
         self.loss = GRPOLossConfig()
 
 
@@ -138,11 +140,11 @@ class TestDispatchStep:
 
         captured = {}
 
-        def fake_forward(inputs, targets, los, his, m):
+        def fake_forward(inputs, targets, los, his, m, **kwargs):
             captured["shape"] = (inputs.shape, targets.shape, m)
             return rows
 
-        def fake_step(inputs, targets, los, his, opt, step, stale, m, custom_dloss):
+        def fake_step(inputs, targets, los, his, opt, step, stale, m, custom_dloss, **kwargs):
             captured["custom_dloss"] = np.array(custom_dloss, copy=True)
             captured["M"] = m
             return 0.5
@@ -203,3 +205,123 @@ class TestDispatchStep:
 
         assert acc.token_count, "turn diagnostics must work under dispatch-PP too"
         assert set(acc.token_count) <= {0, 1}
+
+
+def _row_metrics(p, trainer_lp, loss_config):
+    from surogate.grpo.loss import compute_grpo_per_token_grads
+
+    return compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_lp,
+        inference_logprobs=p["inference"],
+        advantages=p["advantages"],
+        loss_mask=p["loss_mask"].astype(bool),
+        loss_config=loss_config,
+        sample_ranges=p["sample_ranges"],
+        teacher_logprobs=p["teacher"],
+    )[1]
+
+
+def _one_call_metrics(prepared, logical, loss_config):
+    """The step's metrics as one packed sequence of all its rows: what the native path reports for the same samples."""
+    from surogate.grpo.loss import compute_grpo_per_token_grads
+
+    seq_len = len(logical[0])
+    ranges = [(i * seq_len + s, i * seq_len + e) for i, p in enumerate(prepared) for s, e in p["sample_ranges"]]
+    teacher = None
+    if prepared[0]["teacher"] is not None:
+        teacher = np.concatenate([p["teacher"] for p in prepared])
+    return compute_grpo_per_token_grads(
+        trainer_logprobs=np.concatenate(logical),
+        inference_logprobs=np.concatenate([p["inference"] for p in prepared]),
+        advantages=np.concatenate([p["advantages"] for p in prepared]),
+        loss_mask=np.concatenate([p["loss_mask"].astype(bool) for p in prepared]),
+        loss_config=loss_config,
+        sample_ranges=ranges,
+        teacher_logprobs=teacher,
+    )[1]
+
+
+class TestStepMetrics:
+    """A dispatch-PP step reports its metrics over all of its rows, as the native path does."""
+
+    def test_mocked_rows_weight_by_samples_and_sum_the_counts(self):
+        from surogate.grpo.trainer import _combine_row_metrics
+
+        rows = [
+            {"mismatch_kl": 0.0014, "is_masked": 0.0, "teacher_kl": 0.02, "total_tokens": 3701, "keep_tokens": 3700,
+             "policy_sample_count": 1, "opd_loss": 0.0, "opd_tokens": 0},
+            {"mismatch_kl": 0.0060, "is_masked": 0.5, "total_tokens": 430, "keep_tokens": 215,
+             "policy_sample_count": 3, "opd_loss": 2.0, "opd_tokens": 10},
+            {"mismatch_kl": 0.0, "is_masked": 0.0, "total_tokens": 0, "keep_tokens": 0, "policy_sample_count": 0,
+             "opd_loss": 0.0, "opd_tokens": 0},
+        ]
+        out = _combine_row_metrics(rows)
+
+        assert out["mismatch_kl"] == pytest.approx((0.0014 + 3 * 0.0060) / 4)
+        assert out["is_masked"] == pytest.approx(1.5 / 4)
+        assert out["teacher_kl"] == pytest.approx(0.02), "only rows that have a teacher term count for it"
+        assert out["opd_loss"] == pytest.approx(2.0)
+        assert (out["total_tokens"], out["keep_tokens"], out["policy_sample_count"]) == (4131, 3915, 4)
+        assert _combine_row_metrics([rows[0]]) == rows[0]
+
+    def test_rows_combine_to_one_call_over_all_samples(self):
+        from surogate.grpo.trainer import _combine_row_metrics
+
+        seq_len = 16
+        t = _trainer(seq_len=seq_len)
+        prepared = [t._prepare_micro_batch(_micro_batch(seq_len, n), seq_len) for n in (13, 7, 16, 3, 11)]
+        prepared[3]["loss_mask"][:] = 0  # a row without loss tokens counts for nothing
+        rng = np.random.default_rng(3)
+        logical = [rng.normal(-0.5, 0.6, seq_len).astype(np.float32) for _ in prepared]
+
+        rows = [_row_metrics(p, lp, t.config.loss) for p, lp in zip(prepared, logical)]
+        out = _combine_row_metrics(rows)
+        expected = _one_call_metrics(prepared, logical, t.config.loss)
+
+        assert set(out) == set(expected)
+        for key, value in expected.items():
+            assert out[key] == pytest.approx(value, rel=1e-6, abs=1e-9), key
+        assert out["total_tokens"] == sum(int(p["loss_mask"].sum()) for p in prepared)
+        assert out["mismatch_kl"] != pytest.approx(rows[-1]["mismatch_kl"]), "not the last row's"
+
+    def test_a_step_of_several_calls_reports_all_its_rows(self, monkeypatch):
+        seq_len, M = 16, 5
+        t = _trainer(seq_len=seq_len)
+        mbs = []
+        for i in range(M):
+            mb = _micro_batch(seq_len, 13)
+            mb["advantages"] = mb["advantages"] + i  # rows differ, so the last row alone would not match
+            mbs.append(mb)
+        prepared = [t._prepare_micro_batch(mb, seq_len) for mb in mbs]
+        rng = np.random.default_rng(11)
+        logical = [rng.normal(-1.0, 0.4, seq_len).astype(np.float32) for _ in range(M)]
+        slots = np.zeros((M, seq_len), dtype=np.float32)
+        for i, p in enumerate(prepared):
+            for start, end in p["sample_ranges"]:
+                slots[i, start : end - 1] = logical[i][start + 1 : end]
+
+        calls = []
+
+        def fake_forward(inputs, targets, los, his, m, **kwargs):
+            first = sum(len(c) for c in calls)
+            calls.append(range(first, first + m))
+            return slots[first : first + m]
+
+        t.trainer = type(
+            "T",
+            (),
+            {
+                "dispatch_pp_forward_logprobs_multigpu": staticmethod(fake_forward),
+                "dispatch_pp_train_step_multigpu": staticmethod(lambda *a, **k: 0.0),
+                "dispatch_pp_last_grad_norm": staticmethod(lambda: 0.0),
+            },
+        )()
+        t._dpp_los, t._dpp_his = [0], [3]
+        monkeypatch.setenv("SUROGATE_DPP_CALL_TOKENS", str(2 * seq_len))
+
+        t._dispatch_pp_step(mbs, 10.0, object(), step=0, turn_acc=None)
+
+        assert len(calls) == 3
+        expected = _one_call_metrics(prepared, logical, t.config.loss)
+        for key in ("policy_loss", "mismatch_kl", "is_masked", "teacher_kl", "total_tokens", "keep_tokens"):
+            assert t._diag_metrics[key] == pytest.approx(expected[key], rel=1e-6, abs=1e-9), key

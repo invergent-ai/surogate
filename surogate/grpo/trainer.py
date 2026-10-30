@@ -51,6 +51,46 @@ def _host_available_bytes() -> int | None:
     return None
 
 
+# Step metrics that are per-sample means (compute_grpo_per_token_grads averages them over a row's policy samples), and
+# the token counts the OPD / replay means are taken over.
+_SAMPLE_MEAN_METRICS = (
+    "policy_loss",
+    "mismatch_kl",
+    "masked_mismatch_kl",
+    "unmasked_mismatch_kl",
+    "is_masked",
+    "is_masked_low",
+    "is_masked_high",
+    "ratio_clipped",
+    "teacher_kl",
+)
+_TOKEN_MEAN_METRICS = {"opd_loss": "opd_tokens", "opd_gate": "opd_tokens", "opd_shift": "opd_tokens",
+                       "replay_loss": "replay_tokens"}
+
+
+def _combine_row_metrics(rows: list[dict]) -> dict:
+    """A step's GRPO metrics from its rows' compute_grpo_per_token_grads metrics, as the native path reports them.
+
+    The native step reports per-sample means averaged over all of the step's samples, and sums the token counts
+    (DslModel::consume_grpo_native_metrics). A row's metrics are already means over its own policy samples, so the
+    step weights each row by that count. The dispatch-PP step passes no replay rows, so every sample with loss tokens
+    is a policy sample, policy_loss's included. The OPD and replay means weight by their own token counts.
+    """
+    out: dict = {}
+    for key in dict.fromkeys(k for r in rows for k in r):
+        if key in _SAMPLE_MEAN_METRICS:
+            have = [r for r in rows if key in r]
+            n = sum(r["policy_sample_count"] for r in have)
+            out[key] = sum(r[key] * r["policy_sample_count"] for r in have) / n if n else 0.0
+        elif key in _TOKEN_MEAN_METRICS:
+            weight = _TOKEN_MEAN_METRICS[key]
+            n = sum(r[weight] for r in rows)
+            out[key] = sum(r[key] * r[weight] for r in rows) / n if n else 0.0
+        else:
+            out[key] = sum(r[key] for r in rows)
+    return out
+
+
 def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
     """Flatten config into JSON-serializable scalars for metrics_writer.log_config()."""
     raw = dict(vars(config))
@@ -545,7 +585,7 @@ class GRPOTrainer:
         # running the same forward pipeline a second time (SUROGATE_DPP_REUSE_FORWARD=0
         # turns this off).
         reuse_forward = os.environ.get("SUROGATE_DPP_REUSE_FORWARD", "1") != "0"
-        metrics: dict = {}
+        row_metrics: list[dict] = []
         loss_sum = 0.0
         for g, rows in enumerate(groups):
             M = len(rows)
@@ -583,6 +623,7 @@ class GRPOTrainer:
                     sample_ranges=p["sample_ranges"],
                     teacher_logprobs=p["teacher"],
                 )
+                row_metrics.append(metrics)
 
                 if turn_acc is not None and p["turn_ids"] is not None:
                     reference_lp = p["teacher"] if p["teacher"] is not None else p["inference"]
@@ -613,7 +654,8 @@ class GRPOTrainer:
                     apply_update=g == len(groups) - 1,
                 )
             )
-        self._diag_metrics = metrics
+        # Over all of the step's rows, not the last one's.
+        self._diag_metrics = _combine_row_metrics(row_metrics)
         return {"loss": loss_sum / len(prepared), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
 
     def _dispatch_pp_call_groups(self, prepared, step: int) -> list[list[int]]:
