@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "serve/generation_service.h"
+#include "api/ops/sparse_moe.h"
 #include "serve/vllm_max_tokens.h"
 #include "serve/vllm_qwen3_parser.h"
 #include <set>
@@ -2206,6 +2207,17 @@ std::string GenerationService::load_lora_adapter(const std::string& name, const 
                         "with `surogate merge`, then convert and serve the merged checkpoint.");
     }
 
+    // The Marlin MoE route (--moe-route marlin) applies routed and shared expert deltas only.
+    if (ops::sparse_moe_route() == ops::SparseMoeRoute::Marlin) {
+        for (const auto& payload : payloads) {
+            const std::string& m = payload.module;
+            if (m == "mlp.gate" || m == "mlp.shared_expert_gate" || m == "router.proj" ||
+                m == "feed_forward.router" || m == "feed_forward.gate") {
+                throw std::invalid_argument("adapter '" + name + "': module '" + m +
+                                            "' adapts the router, which --moe-route marlin does not serve");
+            }
+        }
+    }
     // Validate every module before draining requests or changing a live adapter.
     // An incompatible replacement leaves the current policy untouched.
     for (const auto& payload : payloads) {

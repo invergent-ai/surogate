@@ -181,6 +181,10 @@ struct SparseMoeWeights {
     Weight routed_down;
     Weight shared_gate_up;
     Weight shared_down;
+    /// Weight-only NVFP4 (Marlin tiles) only: an expert's gate/up rows are [up; gate] -- an NVFP4
+    /// W4A4 checkpoint rewritten at load (--moe-route marlin) keeps the TRT-LLM runner's order --
+    /// rather than [gate; up].
+    bool routed_up_first = false;
     /// Routed experts selected per token; with the weight shapes this fixes the geometry.
     std::int32_t experts_per_token = 0;
     /// Optional per-layer device table I32 [experts] mapping an expert id to the row block the
@@ -237,7 +241,12 @@ inline constexpr std::int32_t kSparseMoeTrtllmMinTokens = 2;
 ///            agree, as adapter rounds always have (2026-10-29, W's NVFP4 on an RTX 5090: k3 to the
 ///            trainer 0.0036-0.0047 against Auto's 0.0089-0.0098). Wide rounds are slower until
 ///            they get a grouped W4A16 GEMM.
-enum class SparseMoeRoute : std::uint8_t { Auto, W4A16 };
+///   Marlin -- the routed experts are rewritten into Marlin tiles at load (in place) and every
+///            width runs the weight-only NVFP4 route (sparse_moe_nvfp4: BF16 activations, FP4 codes
+///            dequantised in registers, grouped GEMMs per expert), so wide rounds keep tensor-core
+///            speed and every width shares one kernel family. The draft head's mixture is left
+///            as stored.
+enum class SparseMoeRoute : std::uint8_t { Auto, W4A16, Marlin };
 void set_sparse_moe_route(SparseMoeRoute route) noexcept;
 [[nodiscard]] SparseMoeRoute sparse_moe_route() noexcept;
 

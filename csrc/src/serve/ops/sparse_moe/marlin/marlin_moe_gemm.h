@@ -68,9 +68,10 @@ void marlin_moe_gemm_nvfp4_bf16(const void* a, const void* b_tiles, const void* 
                                 std::int32_t block_size, std::int32_t* locks, int sms,
                                 cudaStream_t stream);
 
-// silu(gate) * up over Marlin's raw [rows, 2*intermediate] product, into [rows, intermediate].
+// silu(gate) * up over Marlin's raw [rows, 2*intermediate] product, into [rows, intermediate];
+// `up_first` reads a product whose halves are [up; gate].
 void marlin_moe_silu_mul(const void* product, void* out, std::int32_t rows,
-                         std::int32_t intermediate, cudaStream_t stream);
+                         std::int32_t intermediate, cudaStream_t stream, bool up_first = false);
 
 // Workspace the GEMM needs beside its operands: fp32 reduce buffer and lock words.
 [[nodiscard]] std::size_t marlin_moe_c_tmp_bytes(std::int32_t assignments,
