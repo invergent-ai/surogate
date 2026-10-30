@@ -40,6 +40,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -450,9 +451,11 @@ __global__ void __launch_bounds__(kThreads) moe_lora_grouped_backward_kernel(nv_
 }
 
 // dW_e (+)= s · Σ_{tiles of e, in order} partial_tile. Experts without tokens
-// are left untouched, matching the cuBLAS grouped path which skips them.
-__global__ void __launch_bounds__(kThreads) moe_lora_grouped_reduce_kernel(nv_bfloat16* __restrict__ dA,
-                                                                           nv_bfloat16* __restrict__ dB,
+// are left untouched, matching the cuBLAS grouped path which skips them. The
+// gradients are bf16, or fp32 for FP32 LoRA masters.
+template <typename GradT>
+__global__ void __launch_bounds__(kThreads) moe_lora_grouped_reduce_kernel(GradT* __restrict__ dA,
+                                                                           GradT* __restrict__ dB,
                                                                            const float* __restrict__ partials,
                                                                            const int* __restrict__ expert_offsets,
                                                                            int num_experts,
@@ -479,17 +482,27 @@ __global__ void __launch_bounds__(kThreads) moe_lora_grouped_reduce_kernel(nv_bf
         sum.z += v.z;
         sum.w += v.w;
     }
-    nv_bfloat16* dst = (j < a_elems) ? dA + static_cast<size_t>(e) * a_elems + j
-                                     : dB + static_cast<size_t>(e) * b_elems + (j - a_elems);
-    __nv_bfloat162* d2 = reinterpret_cast<__nv_bfloat162*>(dst);
-    float2 c0 = accumulate ? __bfloat1622float2(d2[0]) : make_float2(0.f, 0.f);
-    float2 c1 = accumulate ? __bfloat1622float2(d2[1]) : make_float2(0.f, 0.f);
-    c0.x = fmaf(scaling, sum.x, c0.x);
-    c0.y = fmaf(scaling, sum.y, c0.y);
-    c1.x = fmaf(scaling, sum.z, c1.x);
-    c1.y = fmaf(scaling, sum.w, c1.y);
-    d2[0] = __float22bfloat162_rn(c0);
-    d2[1] = __float22bfloat162_rn(c1);
+    GradT* dst = (j < a_elems) ? dA + static_cast<size_t>(e) * a_elems + j
+                               : dB + static_cast<size_t>(e) * b_elems + (j - a_elems);
+    if constexpr (std::is_same_v<GradT, float>) {
+        float4* d4 = reinterpret_cast<float4*>(dst);
+        float4 c = accumulate ? *d4 : make_float4(0.f, 0.f, 0.f, 0.f);
+        c.x = fmaf(scaling, sum.x, c.x);
+        c.y = fmaf(scaling, sum.y, c.y);
+        c.z = fmaf(scaling, sum.z, c.z);
+        c.w = fmaf(scaling, sum.w, c.w);
+        *d4 = c;
+    } else {
+        __nv_bfloat162* d2 = reinterpret_cast<__nv_bfloat162*>(dst);
+        float2 c0 = accumulate ? __bfloat1622float2(d2[0]) : make_float2(0.f, 0.f);
+        float2 c1 = accumulate ? __bfloat1622float2(d2[1]) : make_float2(0.f, 0.f);
+        c0.x = fmaf(scaling, sum.x, c0.x);
+        c0.y = fmaf(scaling, sum.y, c0.y);
+        c1.x = fmaf(scaling, sum.z, c1.x);
+        c1.y = fmaf(scaling, sum.w, c1.y);
+        d2[0] = __float22bfloat162_rn(c0);
+        d2[1] = __float22bfloat162_rn(c1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -597,10 +610,10 @@ void launch_forward(nv_bfloat16* out,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int R, bool kWgrad>
+template <int R, bool kWgrad, typename GradT>
 void launch_backward(nv_bfloat16* dx,
-                     nv_bfloat16* dA,
-                     nv_bfloat16* dB,
+                     GradT* dA,
+                     GradT* dB,
                      const nv_bfloat16* d_out,
                      const nv_bfloat16* x,
                      const nv_bfloat16* A,
@@ -637,7 +650,7 @@ void launch_backward(nv_bfloat16* dx,
         const int b_elems = out_features * R;
         const int slab = a_elems + b_elems;
         const dim3 grid((slab / 4 + kThreads - 1) / kThreads, static_cast<unsigned>(num_experts));
-        moe_lora_grouped_reduce_kernel<<<grid, kThreads, 0, stream>>>(dA,
+        moe_lora_grouped_reduce_kernel<GradT><<<grid, kThreads, 0, stream>>>(dA,
                                                                       dB,
                                                                       workspace,
                                                                       expert_offsets,
@@ -742,9 +755,12 @@ std::size_t moe_lora_grouped_backward_workspace_floats(const int* host_offsets,
            (static_cast<std::size_t>(in_features) + static_cast<std::size_t>(out_features));
 }
 
-bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
-                                    nv_bfloat16* dA,
-                                    nv_bfloat16* dB,
+namespace {
+
+template <typename GradT>
+bool backward_impl(nv_bfloat16* dx,
+                                    GradT* dA,
+                                    GradT* dB,
                                     const nv_bfloat16* d_out,
                                     const nv_bfloat16* x,
                                     const nv_bfloat16* A,
@@ -777,7 +793,7 @@ bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
         if (!workspace || !aligned16(workspace) || workspace_floats < need) return false;
     }
 #define SUROGATE_MOE_LORA_LAUNCH_BWD(R, W) \
-    launch_backward<R, W>(dx,              \
+    launch_backward<R, W, GradT>(dx,       \
                           dA,              \
                           dB,              \
                           d_out,           \
@@ -819,4 +835,58 @@ bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
         default: return false;
     }
 #undef SUROGATE_MOE_LORA_LAUNCH_BWD
+}
+
+}  // namespace
+
+bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
+                                    nv_bfloat16* dA,
+                                    nv_bfloat16* dB,
+                                    const nv_bfloat16* d_out,
+                                    const nv_bfloat16* x,
+                                    const nv_bfloat16* A,
+                                    const nv_bfloat16* B,
+                                    const int* expert_offsets,
+                                    const int* host_offsets,
+                                    int num_experts,
+                                    int total_tokens,
+                                    int in_features,
+                                    int out_features,
+                                    int rank,
+                                    float scaling,
+                                    bool dx_accumulate,
+                                    bool grad_accumulate,
+                                    float* workspace,
+                                    std::size_t workspace_floats,
+                                    cudaStream_t stream,
+                                    int tile_tokens) {
+    return backward_impl(dx, dA, dB, d_out, x, A, B, expert_offsets, host_offsets, num_experts, total_tokens,
+                         in_features, out_features, rank, scaling, dx_accumulate, grad_accumulate, workspace,
+                         workspace_floats, stream, tile_tokens);
+}
+
+bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
+                                    float* dA,
+                                    float* dB,
+                                    const nv_bfloat16* d_out,
+                                    const nv_bfloat16* x,
+                                    const nv_bfloat16* A,
+                                    const nv_bfloat16* B,
+                                    const int* expert_offsets,
+                                    const int* host_offsets,
+                                    int num_experts,
+                                    int total_tokens,
+                                    int in_features,
+                                    int out_features,
+                                    int rank,
+                                    float scaling,
+                                    bool dx_accumulate,
+                                    bool grad_accumulate,
+                                    float* workspace,
+                                    std::size_t workspace_floats,
+                                    cudaStream_t stream,
+                                    int tile_tokens) {
+    return backward_impl(dx, dA, dB, d_out, x, A, B, expert_offsets, host_offsets, num_experts, total_tokens,
+                         in_features, out_features, rank, scaling, dx_accumulate, grad_accumulate, workspace,
+                         workspace_floats, stream, tile_tokens);
 }
