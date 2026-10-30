@@ -334,7 +334,7 @@ weight offload.
 
 ### Weight broadcast
 
-In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; the orchestrator watches for the `STABLE` marker and asks the server to hot-load it.
+In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; the orchestrator watches for the `STABLE` marker and asks the server to hot-load it. The adapter is written in BF16 (`broadcast_dtype: bf16`, the default): FP32 masters are rounded to nearest even, and checkpoints keep FP32.
 
 ### Long sequences: chunked GRPO
 
@@ -363,6 +363,15 @@ sequence_chunks: 4        # 1536-token chunks
 single_sample_bins: true
 per_device_train_batch_size: 1
 ```
+
+### Adapter precision
+
+Keep `lora_dtype: fp32`, the GRPO default, also for MoE expert LoRA. A GRPO step sums the adapter's
+gradients over many micro-batches or chunks whose advantages partly cancel. In BF16 that sum is rounded
+after each one, and on a 1.04M-token step the result was 41 % off the FP32 sum. BF16 masters also round
+away the small updates RL learning rates make. See
+[Precision: LoRA dtype](precision-and-recipes.md#lora-dtype); for runs under `parallelism: dispatch_pp`,
+see [Dispatch-PP: GRPO steps](dispatch-pp.md#grpo-steps).
 
 ### Bounding the importance ratio
 
