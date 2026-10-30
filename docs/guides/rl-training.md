@@ -435,6 +435,40 @@ loss:
   clipped (`clip_neg`, `clip_pos`), `trials` and `grad_norm`. `train/engine_mismatch_kl` keeps the k3 gap between the
   rollout engine and the trainer's π_old.
 
+#### Precision: the LoRA forward from the fp32 masters
+
+With `lora_dtype: fp32` the optimizer updates FP32 masters, but by default the forward computes the LoRA products from
+their BF16 work copies. A work copy changes only where an update crosses a BF16 rounding step, and then by a whole
+step, so the policy moves in rounding jumps rather than with the learning rate.
+
+On Qwen3.5-35B-A3B's NVFP4 base at 131k (expert LoRA r16, a real on-policy GSPO batch), the spread of log s_i over a
+mini-batch's sequences after one update was about ±0.0012-0.0020 at every lr from 1.25e-6 to 5e-5. That is the size of
+rounding the whole adapter once (truncated vs. to nearest: ±0.0012, token k3 0.0025).
+
+`lora_fp32_forward: true` (needs `lora_dtype: fp32`) computes the forward's LoRA products from the masters themselves:
+the expert kernel for gate_up and down, and dense LoRA (the shared expert) through the same kernel as a one-expert
+group. The backward keeps the BF16 copies, and broadcasts stay BF16. On the same batch:
+
+- **The spread grows with lr.** About ±0.002 after one update at 1.25e-5 and ±0.008 at 5e-5.
+- **A floor remains.** After any update, even at lr 1.25e-6, the spread stays near ±0.0012, probably from MoE
+  routing flips and the activations' own BF16 rounding. It is above the paper's clips, so several mini-batches per
+  rollout batch clip 25-80 % of this model's sequences at any lr. With `minibatches: 1` on on-policy batches the
+  ratio is exactly 1 and nothing is clipped.
+- **The same nominal lr moves the policy further,** since the BF16 copies used to drop most updates to lora_A.
+  Probe: a fresh adapter (B = 0) and fresh Adam, 5 updates on one batch, token k3 / mean |log s| against the start
+  on a held batch of the start's samples:
+
+  | lr | after update 1 | 3 | 5 |
+  | --- | --- | --- | --- |
+  | 5e-5 | 0.0019 / 0.0008 | 0.0080 / 0.0056 | 0.0233 / 0.0210 |
+  | 2.5e-5 | 0.0018 / 0.0007 | 0.0026 / 0.0009 | 0.0067 / 0.0043 |
+  | 1.25e-5 | 0.0018 / 0.0006 | 0.0019 / 0.0006 | 0.0025 / 0.0009 |
+
+  A run with the BF16 forward at lr warming up to 5e-5 reached a per-step drift from its start of 0.004-0.005 after
+  five steps (`teacher_kl`), about the 2.5e-5 row.
+- **Cost and agreement.** The step time did not change measurably (+2 %). The engine/trainer k3 at lag 0 against the
+  BF16 broadcast was 0.0043, against 0.0044 with the BF16 forward.
+
 ### Reading progress from a log file
 
 The orchestrator's rollout progress bar is `tqdm`, which needs a TTY. Under
