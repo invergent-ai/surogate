@@ -555,3 +555,44 @@ class TestPolicyVersionPlumbing:
         cfg.minibatches = 1
         with pytest.raises(ValueError, match="max_policy_lag needs parallelism"):
             _check_loss_options(cfg, dispatch_pp=False)
+
+
+class TestGroupMinibatches:
+    @staticmethod
+    def _rows(groups, per_group, split_every=5):
+        """Rows of `groups` GRPO groups with `per_group` trials each; every `split_every`-th trial has two rows."""
+        rows, n = [], 8
+        for g in range(groups):
+            for a in range(per_group):
+                trial = g * per_group + a
+                for _ in range(2 if trial % split_every == 0 else 1):
+                    mask = np.zeros(n, np.uint8)
+                    mask[3:] = 1
+                    rows.append({"loss_mask": mask, "trial_idx": np.full(n, trial, np.int32),
+                                 "group_idx": np.full(n, g, np.int32)})
+        return rows
+
+    @pytest.mark.parametrize("groups, per_group, parts, trials_each", [(16, 8, 4, 32), (8, 8, 4, 16), (8, 8, 2, 32)])
+    def test_whole_groups_and_sizes_follow_the_batch(self, groups, per_group, parts, trials_each):
+        from surogate.grpo.trainer import GRPOTrainer
+
+        t = GRPOTrainer.__new__(GRPOTrainer)
+        t.config = SimpleNamespace(train_seed=1234)
+        prepared = self._rows(groups, per_group)
+        out = t._minibatch_parts(prepared, list(range(len(prepared))), parts, step=7)
+        assert sorted(i for p in out for i in p) == list(range(len(prepared)))
+        for p in out:
+            gs = {int(prepared[i]["group_idx"][3]) for i in p}
+            assert len(gs) == groups // parts
+            assert len({int(prepared[i]["trial_idx"][3]) for i in p}) == trials_each
+        group_part = {}
+        for k, p in enumerate(out):
+            for i in p:
+                assert group_part.setdefault(int(prepared[i]["group_idx"][3]), k) == k, "a group stays whole"
+
+    def test_group_idx_reaches_the_trainer(self):
+        s = _sample(3, 5, 0, 0.1)
+        s.group_idx = 3
+        (row,) = _wire_rows([s, _sample(2, 4, 1, 0.1)], 32, False)
+        g = row["group_idx"].flatten()
+        assert list(g[:8]) == [3] * 8 and (g[8:] == -1).all()

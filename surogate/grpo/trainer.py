@@ -623,10 +623,13 @@ class GRPOTrainer:
             turn_ids_padded = np.full(seq_len, -1, dtype=np.int32)
             turn_ids_padded[:T_actual] = mb["turn_ids"].flatten()[:T_actual]
 
-        trial_idx_padded = None
+        trial_idx_padded = group_idx_padded = None
         if mb.get("trial_idx") is not None:
             trial_idx_padded = np.full(seq_len, -1, dtype=np.int32)
             trial_idx_padded[:T_actual] = mb["trial_idx"].flatten()[:T_actual]
+        if mb.get("group_idx") is not None:
+            group_idx_padded = np.full(seq_len, -1, dtype=np.int32)
+            group_idx_padded[:T_actual] = mb["group_idx"].flatten()[:T_actual]
 
         return {
             "input": input_padded,
@@ -639,6 +642,7 @@ class GRPOTrainer:
             "teacher": teacher_padded,
             "turn_ids": turn_ids_padded,
             "trial_idx": trial_idx_padded,
+            "group_idx": group_idx_padded,
             "sample_ranges": sample_ranges,
             "T_actual": T_actual,
         }
@@ -873,19 +877,25 @@ class GRPOTrainer:
         return counts
 
     def _minibatch_parts(self, prepared, rows, n_parts: int, step: int) -> list[list[int]]:
-        """Rows into n_parts mini-batches of whole trials (a row's trial is its first loss token's trial_idx; rows
-        without one are trials of their own), the trials shuffled with a seed per step and dealt round-robin."""
-        trials: dict[object, list[int]] = {}
+        """Rows into n_parts mini-batches of whole GRPO groups, or of whole trials where rows carry no group_idx.
+        A row's group and trial are those of its first loss token; a row without a trial_idx is a trial of its own.
+        The units are shuffled with a seed per step and dealt round-robin, so the mini-batch size follows the batch."""
+        units: dict[object, list[int]] = {}
         for i in rows:
-            tids = prepared[i].get("trial_idx")
             first = int(np.flatnonzero(prepared[i]["loss_mask"])[0])
-            tid = int(tids[first]) if tids is not None and int(tids[first]) >= 0 else ("row", i)
-            trials.setdefault(tid, []).append(i)
-        keys = list(trials)
+            gids, tids = prepared[i].get("group_idx"), prepared[i].get("trial_idx")
+            if gids is not None and int(gids[first]) >= 0:
+                key = ("group", int(gids[first]))
+            elif tids is not None and int(tids[first]) >= 0:
+                key = ("trial", int(tids[first]))
+            else:
+                key = ("row", i)
+            units.setdefault(key, []).append(i)
+        keys = list(units)
         random.Random(f"{getattr(self.config, 'train_seed', 0)}:{step}").shuffle(keys)
         parts: list[list[int]] = [[] for _ in range(n_parts)]
         for q, key in enumerate(keys):
-            parts[q % n_parts] += trials[key]
+            parts[q % n_parts] += units[key]
         return [sorted(p) for p in parts]
 
     def _dispatch_pp_call_groups(self, prepared, step: int) -> list[list[int]]:

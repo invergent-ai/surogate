@@ -412,7 +412,7 @@ The paper's own procedure recomputes π_old with the training engine and takes s
 batch. That is these settings together:
 
 ```yaml
-minibatches: 4            # four updates per rollout batch, each over whole trials
+minibatches: 4            # four updates per rollout batch, each over whole groups (group_idx) or trials
 max_policy_lag: 0         # on-policy batches: drop samples sampled by any other policy version
 learning_rate: 1.25e-5    # per update
 lr_scheduler_type: constant
@@ -424,6 +424,8 @@ loss:
   teacher_tau: 0.0
 ```
 
+- **Groups.** With `TrainingSample.group_idx` each mini-batch holds whole GRPO groups, so its advantages still sum to
+  zero per group; the mini-batch size is the batch's groups divided by `minibatches`.
 - **Versions.** The producer sends `TrainingSample.completion_versions`, the policy version that sampled each
   completion token; samples sampled by another version, or by several, are dropped and counted
   (`train/offpolicy_dropped_samples`).

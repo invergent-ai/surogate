@@ -39,6 +39,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     trial_idx = None
     if training_example.trial_idx is not None:
         trial_idx = [int(training_example.trial_idx)] * len(input_ids)
+    group_idx = None
+    if training_example.group_idx is not None:
+        group_idx = [int(training_example.group_idx)] * len(input_ids)
     policy_version = None
     if training_example.completion_versions is not None:
         if len(training_example.completion_versions) != len(training_example.completion_ids):
@@ -71,6 +74,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             trial_idx = trial_idx[:seq_len]
         if policy_version is not None:
             policy_version = policy_version[:seq_len]
+        if group_idx is not None:
+            group_idx = group_idx[:seq_len]
         if routed is not None:
             routed = routed[: seq_len * 2 * int(dims[0]) * int(dims[1])]
 
@@ -107,6 +112,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         routed_experts_dims=dims,
         trial_idx=trial_idx,
         policy_version=policy_version,
+        group_idx=group_idx,
     )
 
 
@@ -186,6 +192,10 @@ def packed_samples_into_micro_bs(
                     if bin_content.policy_version is None:
                         bin_content.policy_version = [-1] * bin_len_before
                     bin_content.policy_version.extend(sample.policy_version or [-1] * len(sample.input_ids))
+                if bin_content.group_idx is not None or sample.group_idx is not None:
+                    if bin_content.group_idx is None:
+                        bin_content.group_idx = [-1] * bin_len_before
+                    bin_content.group_idx.extend(sample.group_idx or [-1] * len(sample.input_ids))
                 _extend_routing(bin_content, bin_len_before, sample)
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
@@ -219,6 +229,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
         micro_batch.trial_idx.extend([-1] * padding_size)
     if micro_batch.policy_version is not None:
         micro_batch.policy_version.extend([-1] * padding_size)
+    if micro_batch.group_idx is not None:
+        micro_batch.group_idx.extend([-1] * padding_size)
     if micro_batch.routed_experts is not None and micro_batch.routed_experts_dims:
         micro_batch.routed_experts += no_route_bytes(padding_size, micro_batch.routed_experts_dims)
     # Send padding to the last lora so tokens have ascending lora idx

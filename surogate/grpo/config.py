@@ -144,8 +144,9 @@ class GRPOTrainConfig(SFTConfig):
     # the bytes; "master" writes them as stored. Checkpoints keep full precision.
     broadcast_dtype: Literal["bf16", "master"] = "bf16"
     # dispatch-PP only: optimizer updates per rollout batch. The step's rows are partitioned into this many mini-batches
-    # of whole trials (seeded per step); each gets its own log-prob pass, backward and update, normalized by its own
-    # trial count (gspo) or loss tokens. The Adam step index of update k is minibatches * step + k.
+    # of whole GRPO groups (TrainingSample.group_idx), or whole trials without one, seeded per step; each gets its own
+    # log-prob pass, backward and update, normalized by its own trial count (gspo) or loss tokens. The Adam step index
+    # of update k is minibatches * step + k. Mini-batch sizes follow the batch.
     minibatches: int = 1
     # Drop the samples whose trained tokens were sampled by a policy version older than the step's by more than this,
     # or by several versions (TrainingSample.completion_versions); 0 = on-policy batches only. None = no check.

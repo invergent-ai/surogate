@@ -28,6 +28,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         routed_experts: int16 [T, layers, top_k] or None  (Rollout Routing Replay rows; -1 = no replay)
         trial_idx: int32 [1, T] or None  (the sample's trial; -1 = padding or a sample without one)
         policy_version: int32 [1, T] or None  (the policy version that sampled the token; -1 = not sampled or unknown)
+        group_idx: int32 [1, T] or None  (the sample's GRPO group; -1 = padding or a sample without one)
     """
     T = len(micro_batch.input_ids)
 
@@ -61,6 +62,9 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
     policy_version = None
     if getattr(micro_batch, "policy_version", None) is not None:
         policy_version = np.array(micro_batch.policy_version, dtype=np.int32).reshape(1, T)
+    group_idx = None
+    if getattr(micro_batch, "group_idx", None) is not None:
+        group_idx = np.array(micro_batch.group_idx, dtype=np.int32).reshape(1, T)
 
     return {
         "input_ids": input_ids,
@@ -75,6 +79,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         "routed_experts": routed_experts,
         "trial_idx": trial_idx,
         "policy_version": policy_version,
+        "group_idx": group_idx,
     }
 
 

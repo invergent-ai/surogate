@@ -33,6 +33,9 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # -1 for tokens the model did not sample (completion_mask False). With max_policy_lag set, the trainer drops a
     # sample whose sampled tokens carry several versions, or one older than the lag allows. None = not collected.
     completion_versions: list[int] | None = None
+    # The GRPO group (one prompt's attempts) of this sample's trial, unique per group within the step's batch. With
+    # minibatches > 1 the trainer keeps a group's samples in one mini-batch. None = no group (its trial alone).
+    group_idx: int | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -67,3 +70,5 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # Per-token TrainingSample.completion_versions; -1 for prompt tokens, padding and samples without versions. None
     # when no sample has versions.
     policy_version: list[int] | None = None
+    # Per-token TrainingSample.group_idx; -1 for padding and samples without one. None when no sample has one.
+    group_idx: list[int] | None = None
