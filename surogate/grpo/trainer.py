@@ -115,17 +115,17 @@ def _step_trial_count(micro_batches) -> int:
     trials: set[int] = set()
     single = 0
     for mb in micro_batches:
-        mask = mb["loss_mask"].flatten()
+        pos = mb["position_ids"].flatten()
+        if not len(pos):
+            continue
+        # The sample starts of _find_sample_boundaries (every position that does not advance its predecessor by one),
+        # vectorized: a step holds millions of tokens.
+        starts = np.concatenate([[0], np.flatnonzero(np.diff(pos) != 1) + 1])
+        trained = np.add.reduceat(mb["loss_mask"].flatten().astype(np.int64), starts) > 0
         ids = mb.get("trial_idx")
-        ids = ids.flatten() if ids is not None else None
-        for start, end in _find_sample_boundaries(mb["position_ids"].flatten()):
-            if not mask[start:end].any():
-                continue
-            tid = int(ids[start]) if ids is not None else -1
-            if tid >= 0:
-                trials.add(tid)
-            else:
-                single += 1
+        tids = ids.flatten()[starts] if ids is not None else np.full(len(starts), -1)
+        trials.update(int(t) for t in tids[trained & (tids >= 0)])
+        single += int(np.count_nonzero(trained & (tids < 0)))
     return len(trials) + single
 
 
