@@ -20,6 +20,7 @@
 #include <thread>
 #include <tuple>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace sinfer::ops {
@@ -30,6 +31,24 @@ struct StoreContextScope {
     explicit StoreContextScope(const void* owner) { bind_ops_context(static_cast<EngineOpsContext*>(const_cast<void*>(owner))); }
     ~StoreContextScope() { bind_ops_context(static_cast<EngineOpsContext*>(const_cast<void*>(previous))); }
 };
+
+// SUROGATE_SERVE_LORA_MODULES="fragment,...": the layer modules whose name contains none of the fragments get no
+// bank and are refused on their layer (globals and the sparse-MoE bank tables keep theirs). A projection without a
+// bank keeps its fused base route and launches no delta, so adapter rounds stop paying for projections no served
+// adapter covers -- e.g. "experts.,shared_expert" for adapters on the MoE experts only. Unset: every module.
+const std::vector<std::string>& served_module_fragments() {
+    static const std::vector<std::string> fragments = [] {
+        std::vector<std::string> out;
+        const char* raw = std::getenv("SUROGATE_SERVE_LORA_MODULES");
+        for (std::string rest = raw != nullptr ? raw : ""; !rest.empty();) {
+            const std::size_t comma = rest.find(',');
+            if (comma != 0) { out.push_back(rest.substr(0, comma)); }
+            rest = comma == std::string::npos ? std::string{} : rest.substr(comma + 1);
+        }
+        return out;
+    }();
+    return fragments;
+}
 
 float bf16_to_float(std::uint16_t bits) {
     const std::uint32_t word = static_cast<std::uint32_t>(bits) << 16U;
@@ -392,6 +411,26 @@ void LoraStore::ensure_banks() {
     // banks are already pointed at by the directory and by captured graphs.
     if (device_ < 0) { device_ = current_device(); }
     const bool need_round_state = scratch_ == nullptr;
+    if (const auto& fragments = served_module_fragments(); !fragments.empty()) {
+        std::unordered_set<Key, KeyHash> tabled;
+        for (const auto& [key, bindings] : table_bindings_) {
+            for (const auto& binding : bindings) {
+                if (binding.key) { tabled.insert(Key{binding.key, binding.port}); }
+            }
+        }
+        for (auto it = directory_.begin(); it != directory_.end();) {
+            const auto& [where, parts] = *it;
+            const bool served = where.first < 0 ||
+                std::any_of(fragments.begin(), fragments.end(),
+                            [&](const std::string& f) { return where.second.find(f) != std::string::npos; }) ||
+                std::any_of(parts.begin(), parts.end(), [&](const ModuleBinding& b) {
+                    return tabled.contains(Key{b.key, b.port}) || banks_.contains(Key{b.key, b.port});
+                });
+            if (served) { ++it; continue; }
+            layer_refusals_.emplace(where, "not served by this engine (SUROGATE_SERVE_LORA_MODULES)");
+            it = directory_.erase(it);
+        }
+    }
 
     std::size_t total = 0;
     if (need_round_state) {
