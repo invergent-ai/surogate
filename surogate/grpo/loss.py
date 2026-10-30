@@ -109,7 +109,8 @@ def _compute_sample_grads(
         n_policy = int(policy_token_mask.sum())
         seq_log_ratio = float(log_importance_ratio[policy_token_mask].mean()) if n_policy else 0.0
         # seq_ratio_old "trainer": pi_old = sg[pi_theta], so s_i = 1 (the metric keeps the engine-based log-ratio).
-        seq_ratio = float(np.exp(seq_log_ratio)) if loss_config.seq_ratio_old == "inference" else 1.0
+        # "step_start" arrives as inference_logprobs: the trainer put its step-start scores there.
+        seq_ratio = float(np.exp(seq_log_ratio)) if loss_config.seq_ratio_old != "trainer" else 1.0
         ipo_mask_high = policy_token_mask & (scaled_advantages > 0) & (seq_ratio > 1.0 + loss_config.seq_clip_high)
         ipo_mask_low = policy_token_mask & (scaled_advantages < 0) & (seq_ratio < 1.0 - loss_config.seq_clip_low)
         is_masked = ipo_mask_high | ipo_mask_low
@@ -157,7 +158,7 @@ def _compute_sample_grads(
     if seq_log_ratio is None:
         pg_loss[keep_mask] = scaled_advantages[keep_mask] * capped_ratio[keep_mask]
     else:  # GSPO: the sequence's objective, the min of the unclipped and the clipped term, per token
-        s = float(np.exp(seq_log_ratio)) if loss_config.seq_ratio_old == "inference" else 1.0
+        s = float(np.exp(seq_log_ratio)) if loss_config.seq_ratio_old != "trainer" else 1.0
         s_clip = min(max(s, 1.0 - loss_config.seq_clip_low), 1.0 + loss_config.seq_clip_high)
         adv = scaled_advantages[policy_token_mask]
         pg_loss[policy_token_mask] = np.minimum(s * adv, s_clip * adv)

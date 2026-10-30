@@ -29,6 +29,10 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # advantage by its trial's sample count, and loss.variant=gspo divides the step by the number of distinct trials,
     # so each trial counts once. None = a trial of its own.
     trial_idx: int | None = None
+    # Per completion token: the policy version (the weight broadcast, one per trainer step) whose adapter sampled it;
+    # -1 for tokens the model did not sample (completion_mask False). With max_policy_lag set, the trainer drops a
+    # sample whose sampled tokens carry several versions, or one older than the lag allows. None = not collected.
+    completion_versions: list[int] | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -60,3 +64,6 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     routed_experts_dims: list[int] | None = None  # [layers, top_k]
     # Per-token TrainingSample.trial_idx; -1 for padding and for samples without one. None when no sample has one.
     trial_idx: list[int] | None = None
+    # Per-token TrainingSample.completion_versions; -1 for prompt tokens, padding and samples without versions. None
+    # when no sample has versions.
+    policy_version: list[int] | None = None

@@ -375,3 +375,183 @@ class TestAnchorGuards:
         t._check_teacher_rows(rows)
         t._check_teacher_rows(rows)
         assert len(said) == (1 if warns else 0)
+
+
+class _Engine:
+    """A fake dispatch-PP trainer whose log-probs move by `drift` per applied update; it records every call."""
+
+    def __init__(self, logical, ranges, row_of_first_token, drift=0.0):
+        self.logical, self.ranges, self.row_of, self.drift = logical, ranges, row_of_first_token, drift
+        self.updates, self.forwards, self.steps = 0, [], []
+
+    def _rows(self, inputs):
+        return [self.row_of[int(r[0])] for r in inputs]
+
+    def dispatch_pp_forward_logprobs_multigpu(self, inputs, targets, los, his, m, **kwargs):
+        rows = self._rows(inputs)
+        self.forwards.append((rows, kwargs.get("keep_boundaries"), self.updates))
+        return np.stack([shift_to_target(self.logical[i] + self.drift * self.updates, self.ranges[i]) for i in rows])
+
+    def dispatch_pp_train_step_multigpu(self, inputs, targets, los, his, opt, step_idx, stale, m, custom_dloss,
+                                        **kwargs):
+        self.steps.append({"rows": self._rows(inputs), "step_idx": step_idx, "zero": kwargs["zero_grads"],
+                           "apply": kwargs["apply_update"], "dloss": np.array(custom_dloss, copy=True)})
+        if kwargs["apply_update"]:
+            self.updates += 1
+        return 0.0
+
+    def dispatch_pp_last_grad_norm(self):
+        return 0.5 + self.updates
+
+
+def _versioned_sample(first_token, n_target, trial, advantage, versions):
+    """versions: the policy versions of the sampled tokens, spread over them in order (None = not collected)."""
+    s = _sample(3, n_target, trial, advantage)
+    s.prompt_ids = [first_token, 1, 1]
+    if versions is not None:
+        s.completion_versions = [versions[min(t * len(versions) // n_target, len(versions) - 1)] for t in range(n_target)]
+    return s
+
+
+class TestMinibatches:
+    """minibatches: 4 with on-policy batches (max_policy_lag: 0) and pi_old from the step's starting weights."""
+
+    SEQ = 32
+
+    def _setup(self, monkeypatch, drift=0.0, minibatches=4, lag=0, ratio_old="step_start"):
+        from surogate.grpo.trainer import GRPOTrainer
+
+        # 8 trials; trials 0 and 3 have two rows each. Row 10 was sampled by version 6 (lag 1), row 11 by 6 and 7
+        # (several), row 12 has no versions (kept, counted as unversioned). The step's version is 7.
+        spec = [(0, 9, 0.4), (0, 7, 0.4), (1, 8, -0.3), (2, 6, 0.2), (3, 10, -0.5), (3, 5, -0.5), (4, 9, 0.6),
+                (5, 7, -0.2), (6, 11, 0.3), (7, 6, -0.4)]
+        samples = [_versioned_sample(100 + r, n, trial, adv, [7]) for r, (trial, n, adv) in enumerate(spec)]
+        samples.append(_versioned_sample(110, 8, 8, 0.5, [6]))
+        samples.append(_versioned_sample(111, 8, 9, -0.5, [6, 7]))
+        samples.append(_versioned_sample(112, 6, 10, 0.7, None))
+        rows = _wire_rows(samples, self.SEQ, True)
+        t = GRPOTrainer.__new__(GRPOTrainer)
+        t.config = _Cfg(self.SEQ, _cfg(low=3e-4, high=4e-4, seq_ratio_old=ratio_old))
+        t.config.minibatches, t.config.max_policy_lag, t.config.train_seed = minibatches, lag, 1234
+        t._dispatch_pp = True
+        t._diag_metrics = None
+        prepared = [t._prepare_micro_batch(r, self.SEQ) for r in rows]
+        rng = np.random.default_rng(8)
+        logical = [(p["inference"] + rng.normal(0.0, 0.01, self.SEQ)).astype(np.float32) for p in prepared]
+        row_of = {int(r["input_ids"][0, 0]): i for i, r in enumerate(rows)}
+        t.trainer = _Engine(logical, [p["sample_ranges"] for p in prepared], row_of, drift)
+        t._dpp_los, t._dpp_his = [0], [3]
+        monkeypatch.setenv("SUROGATE_DPP_CALL_TOKENS", str(2 * self.SEQ))  # at most two rows per dispatch call
+        first_token = [int(r["input_ids"][0, 0]) for r in rows]
+        return t, rows, prepared, logical, first_token
+
+    def test_mini_batches_hold_whole_trials_and_are_seeded(self, monkeypatch):
+        t, rows, prepared, _, first = self._setup(monkeypatch)
+        idx = list(range(len(rows)))
+        parts = t._minibatch_parts(prepared, idx, 4, step=3)
+        assert sorted(i for p in parts for i in p) == idx
+        trial_of = [int(p["trial_idx"][np.flatnonzero(p["loss_mask"])[0]]) for p in prepared]
+        for p in parts:
+            for q in parts:
+                if p is not q:
+                    assert not {trial_of[i] for i in p} & {trial_of[i] for i in q}, "a trial stays in one mini-batch"
+        counts = [len({trial_of[i] for i in p}) for p in parts]
+        assert max(counts) - min(counts) <= 1
+        assert parts == t._minibatch_parts(prepared, idx, 4, step=3), "seeded"
+        assert any(t._minibatch_parts(prepared, idx, 4, step=s) != parts for s in range(4, 9)), "reseeded per step"
+
+    def test_four_updates_with_pi_old_from_the_step_start(self, monkeypatch):
+        from surogate.grpo.loss import compute_grpo_per_token_grads
+
+        drift = -0.002  # per update: past the paper's 3e-4, so later mini-batches clip their A < 0 rows
+        t, rows, prepared, logical, first = self._setup(monkeypatch, drift=drift)
+        engine = t.trainer
+        t._dispatch_pp_step(rows, 1.0, object(), step=3, turn_acc=None, version=7)
+
+        kept = [i for i in range(len(rows)) if first[i] not in (110, 111)]
+        # pi_old: one scoring pass over the kept rows at the step's starting weights, keeping no boundaries.
+        scored = [f for f in engine.forwards if f[1] is False]
+        assert sorted(i for f in scored for i in f[0]) == sorted(kept) and all(f[2] == 0 for f in scored)
+        dropped = {i for i in range(len(rows)) if first[i] in (110, 111)}
+        assert all(not set(s["rows"]) & dropped for s in engine.steps), "dropped rows are not trained"
+        # Four updates, Adam step indices 4 * 3 + k, each zeroing at its first call and applying at its last.
+        by_update = {}
+        for s in engine.steps:
+            by_update.setdefault(s["step_idx"], []).append(s)
+        assert sorted(by_update) == [12, 13, 14, 15]
+        for calls in by_update.values():
+            assert calls[0]["zero"] and not any(c["zero"] for c in calls[1:])
+            assert calls[-1]["apply"] and not any(c["apply"] for c in calls[:-1])
+        m = t._diag_metrics
+        assert (m["offpolicy_dropped_samples"], m["unversioned_samples"]) == (2, 1)
+        # The engine/trainer mismatch survives as its own metric: step-start trainer vs the rows' engine log-probs.
+        assert m["engine_mismatch_kl"] > 0 and abs(m["engine_log_ratio"]) < 0.01
+        # Each row's seed: GSPO against the step-start log-probs, normalized by its mini-batch's trial count.
+        for k, idx in enumerate(sorted(by_update)):
+            calls = by_update[idx]
+            part = [i for c in calls for i in c["rows"]]
+            trials = int(m[f"mb{k + 1}/trials"])
+            for c in calls:
+                for j, i in enumerate(c["rows"]):
+                    p = prepared[i]
+                    cur = logical[i] + drift * k
+                    g, _ = compute_grpo_per_token_grads(cur, logical[i], p["advantages"], p["loss_mask"].astype(bool),
+                                                        t.config.loss, p["sample_ranges"])
+                    np.testing.assert_allclose(c["dloss"][j], shift_to_target(g, p["sample_ranges"]) / trials,
+                                               rtol=1e-5, atol=1e-9)
+            negs = [i for i in part if p_adv(prepared[i]) < 0]
+            if k == 0:
+                assert m["mb1/clip_neg"] == 0.0 and abs(m["mb1/log_s_p50"]) < 1e-6, "s = 1 before any update"
+            elif negs:
+                assert m[f"mb{k + 1}/clip_neg"] == 1.0 and m[f"mb{k + 1}/clip_pos"] == 0.0
+                assert m[f"mb{k + 1}/log_s_p50"] == pytest.approx(drift * k, abs=1e-5)
+        assert sum(int(m[f"mb{k}/trials"]) for k in range(1, 5)) == 9  # trials 0-7 and the unversioned one
+
+    def test_one_update_without_a_lag_check_is_the_plain_step(self, monkeypatch):
+        t, rows, prepared, logical, first = self._setup(monkeypatch, minibatches=1, lag=None, ratio_old="inference")
+        t._dispatch_pp_step(rows, 5.0, object(), step=3, turn_acc=None, version=7)
+        engine = t.trainer
+        assert {s["step_idx"] for s in engine.steps} == {3}
+        assert sorted(i for s in engine.steps for i in s["rows"]) == list(range(len(rows)))
+        assert all(f[1] is not False for f in engine.forwards), "no pi_old scoring pass"
+        assert not any(k.startswith(("mb", "offpolicy_")) for k in t._diag_metrics)
+
+
+def p_adv(p):
+    return float(p["advantages"][p["loss_mask"].astype(bool)].mean())
+
+
+class TestPolicyVersionPlumbing:
+    def test_versions_reach_the_trainer_per_token(self):
+        samples = [_versioned_sample(100, 5, 0, 0.1, [7]), _versioned_sample(101, 4, 1, 0.1, [6, 7]),
+                   _versioned_sample(102, 3, 2, 0.1, None)]
+        rows = _wire_rows(samples, 64, False)  # packed into one row, padded; FFD puts the longest sample first
+        (row,) = rows
+        v = row["policy_version"].flatten()
+        assert list(v[:8]) == [-1] * 3 + [7] * 5, "prompt tokens carry no version"
+        assert list(v[8:15]) == [-1] * 3 + [6, 6, 7, 7] and list(v[15:21]) == [-1] * 6
+        assert (v[21:] == -1).all(), "padding"
+
+    def test_a_length_mismatch_is_refused(self):
+        from surogate.grpo.batch import prepare_sample
+
+        s = _versioned_sample(100, 5, 0, 0.1, [7])
+        s.completion_versions = s.completion_versions[:-1]
+        with pytest.raises(ValueError, match="completion_versions"):
+            prepare_sample(s, 64)
+
+    def test_options_that_need_on_policy_batches(self):
+        from surogate.grpo.trainer import _check_loss_options
+
+        cfg = SimpleNamespace(teacher_from_base=False, minibatches=4, max_policy_lag=None,
+                              loss=GRPOLossConfig(variant="gspo", seq_ratio_old="step_start"))
+        with pytest.raises(ValueError, match="max_policy_lag: 0"):
+            _check_loss_options(cfg, dispatch_pp=True)
+        cfg.max_policy_lag = 0
+        _check_loss_options(cfg, dispatch_pp=True)
+        cfg.loss = GRPOLossConfig(variant="cispo")
+        with pytest.raises(ValueError, match="minibatches > 1 needs parallelism"):
+            _check_loss_options(cfg, dispatch_pp=False)
+        cfg.minibatches = 1
+        with pytest.raises(ValueError, match="max_policy_lag needs parallelism"):
+            _check_loss_options(cfg, dispatch_pp=False)

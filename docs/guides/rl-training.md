@@ -408,6 +408,31 @@ divides by its number of trials (sequences), not by its tokens, so every sequenc
 - **Constraint.** `parallelism: dispatch_pp` only: the sequence ratio needs a whole sequence's log-probs before its
   backward, which the native step does not have.
 
+The paper's own procedure recomputes π_old with the training engine and takes several mini-batch updates per rollout
+batch. That is these settings together:
+
+```yaml
+minibatches: 4            # four updates per rollout batch, each over whole trials
+max_policy_lag: 0         # on-policy batches: drop samples sampled by any other policy version
+learning_rate: 1.25e-5    # per update
+lr_scheduler_type: constant
+loss:
+  variant: gspo
+  seq_ratio_old: step_start   # pi_old = the trainer's log-probs at the weights the step starts from
+  seq_clip_low: 3.0e-4
+  seq_clip_high: 4.0e-4
+  teacher_tau: 0.0
+```
+
+- **Versions.** The producer sends `TrainingSample.completion_versions`, the policy version that sampled each
+  completion token; samples sampled by another version, or by several, are dropped and counted
+  (`train/offpolicy_dropped_samples`).
+- **π_old.** One scoring pass over the step's rows before its first update gives π_old, so mini-batch 1 has
+  $s_i = 1$. Later mini-batches see the drift of the updates before them.
+- **Metrics.** Per mini-batch: `train/mb<k>/log_s_p05`, `_p50`, `_p95`, the shares of A < 0 and A > 0 sequences
+  clipped (`clip_neg`, `clip_pos`), `trials` and `grad_norm`. `train/engine_mismatch_kl` keeps the k3 gap between the
+  rollout engine and the trainer's π_old.
+
 ### Reading progress from a log file
 
 The orchestrator's rollout progress bar is `tqdm`, which needs a TTY. Under

@@ -523,6 +523,8 @@ than from `datasets`, which is forced empty. See the
 | `single_sample_bins`    | bool   | `false`        | Pack one sample per row instead of filling each row. Chunked-training attention has no packed-doc isolation, so multi-sample rows would let samples attend across each other. |
 | `turn_diagnostics`      | bool   | `false`        | Route the micro-step through the Python loss instead of the fused native step so per-token logprobs are visible. Same gradients, slower — measurement only. |
 | `broadcast_dtype`       | string | `"bf16"`       | dtype of the LoRA adapter in weight broadcasts: `bf16` rounds FP32 masters (`lora_dtype: fp32`) to BF16, the copy a BF16 serving engine loads, at half the bytes; `master` writes them as stored. Checkpoints keep full precision. |
+| `minibatches`           | int    | `1`            | dispatch-PP only: optimizer updates per rollout batch. The rows are partitioned into this many mini-batches of whole trials (seeded per step); each gets its own log-prob pass, backward and update, normalized by its own trial count (`gspo`) or loss tokens. Adam's step index of update k is `minibatches * step + k`. |
+| `max_policy_lag`        | int    | `null`         | dispatch-PP only: drop the samples whose trained tokens were sampled (`TrainingSample.completion_versions`) by several policy versions or by one older than the step's by more than this. `0` = on-policy batches only. |
 | `teacher_from_base`     | bool   | `false`        | dispatch-PP only: the trainer scores each row with its own base model (the LoRA delta off) and uses those log-probs as the rows' `teacher_logprobs`, a KL anchor to the base weighted by `loss.teacher_tau` that needs no teacher server. One more log-prob pass per dispatch call. Needs `loss.teacher_tau > 0`. |
 
 `gradient_dtype` defaults to `fp32` for GRPO (the per-token gradient is 10-100x
@@ -542,7 +544,7 @@ where it matters comes from `lora_dtype`, which stays `fp32`.
 | `variant`       | string | `"ipo"` | `ipo` (token-level, the masks above), `cispo` (token-level, no mask, ratio truncated at `ratio_clip`) or `gspo` (one ratio per sequence, every sequence weighted equally; `parallelism: dispatch_pp` only). See [GSPO](../guides/rl-training.md#gspo-one-ratio-per-sequence). |
 | `seq_clip_low`  | float | `3e-4`  | `gspo`: the sequence ratio's clip below 1, `1 - seq_clip_low` (the paper's value). |
 | `seq_clip_high` | float | `4e-4`  | `gspo`: the sequence ratio's clip above 1, `1 + seq_clip_high` (the paper's value). |
-| `seq_ratio_old` | string | `"inference"` | `gspo`: the ratio's π_old. `inference` = the rollout engine's log-probs; `trainer` = the trainer's own at the current parameters, so the ratio is 1 and nothing is clipped. |
+| `seq_ratio_old` | string | `"inference"` | `gspo`: the ratio's π_old. `inference` = the rollout engine's log-probs; `step_start` = the trainer's own, scored once at the weights the step starts from (the paper's recomputation; needs `max_policy_lag: 0`); `trainer` = the trainer's own at the current parameters, so the ratio is 1 and nothing is clipped. |
 
 ### QeRL noise scheduler (`noise_scheduler:` block)
 
