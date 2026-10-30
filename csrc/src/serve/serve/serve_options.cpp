@@ -215,7 +215,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--kv-admission reserve|ondemand] [--kv-admission-headroom N] "
            "[--kv-admission-watermark F] "
-           "[--adapter-update-timeout-ms N] [--lora-swap in-place|drain] "
+           "[--adapter-update-timeout-ms N] [--lora-swap in-place|drain] [--moe-route auto|w4a16] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices "
            "A,B,...] [--data-parallel] "
            "[--reasoning-parser NAME] [--tool-call-parser NAME] [--enable-auto-tool-choice] "
@@ -345,6 +345,9 @@ std::string serve_usage_text(const char* argv0) {
            "request asks\n"
            "         for them with \"return_routed_experts\": true. Works with --spec mtp (the\n"
            "         main model's routing for every accepted token); refuses DFlash.\n"
+           "       --moe-route w4a16 runs routed NVFP4 experts on BF16-activation kernels at every\n"
+           "         round width, so decode, verify and prefill log-probs agree (RL rollouts); auto\n"
+           "         (default) takes the faster FP4-activation runner for rounds of 2+ columns.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
            "       --decision-temperature T calibrates the decisions endpoint: every answer is read\n"
            "         from softmax(option logits / T). Default 1 (the model's own distribution);\n"
@@ -642,6 +645,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--moe-route") {
+            const std::string route = require_value("--moe-route");
+            if (route == "w4a16") {
+                options.moe_route_w4a16 = true;
+            } else if (route == "auto") {
+                options.moe_route_w4a16 = false;
+            } else {
+                throw std::invalid_argument("--moe-route must be auto or w4a16");
+            }
         } else if (arg == "--batch-invariant") {
             options.batch_invariant = true;
         } else if (arg == "--enable-prefix-caching") {
