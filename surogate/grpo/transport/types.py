@@ -24,6 +24,11 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # [len(prompt_ids) + len(completion_ids), layers, top_k]; -1 rows = no replay. None when not collected.
     routed_experts: bytes | None = None
     routed_experts_dims: list[int] | None = None  # [layers, top_k]
+    # The trajectory (trial) this sample was cut from, unique per trial within the step's batch: a trial whose turns
+    # do not merge into one sequence becomes several samples with the same index. The producer divides each sample's
+    # advantage by its trial's sample count, and loss.variant=gspo divides the step by the number of distinct trials,
+    # so each trial counts once. None = a trial of its own.
+    trial_idx: int | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -53,3 +58,5 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # [len(input_ids), layers, top_k], -1 = no replay (padding, cache-served prompt tokens).
     routed_experts: bytes | None = None
     routed_experts_dims: list[int] | None = None  # [layers, top_k]
+    # Per-token TrainingSample.trial_idx; -1 for padding and for samples without one. None when no sample has one.
+    trial_idx: list[int] | None = None

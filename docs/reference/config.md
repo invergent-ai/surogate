@@ -523,7 +523,7 @@ than from `datasets`, which is forced empty. See the
 | `single_sample_bins`    | bool   | `false`        | Pack one sample per row instead of filling each row. Chunked-training attention has no packed-doc isolation, so multi-sample rows would let samples attend across each other. |
 | `turn_diagnostics`      | bool   | `false`        | Route the micro-step through the Python loss instead of the fused native step so per-token logprobs are visible. Same gradients, slower — measurement only. |
 | `broadcast_dtype`       | string | `"bf16"`       | dtype of the LoRA adapter in weight broadcasts: `bf16` rounds FP32 masters (`lora_dtype: fp32`) to BF16, the copy a BF16 serving engine loads, at half the bytes; `master` writes them as stored. Checkpoints keep full precision. |
-| `teacher_from_base`     | bool   | `false`        | dispatch-PP only: the trainer scores each row with its own base model (the LoRA delta off) and uses those log-probs as the rows' `teacher_logprobs`, a KL anchor to the base weighted by `loss.teacher_tau` that needs no teacher server. One more log-prob pass per dispatch call. |
+| `teacher_from_base`     | bool   | `false`        | dispatch-PP only: the trainer scores each row with its own base model (the LoRA delta off) and uses those log-probs as the rows' `teacher_logprobs`, a KL anchor to the base weighted by `loss.teacher_tau` that needs no teacher server. One more log-prob pass per dispatch call. Needs `loss.teacher_tau > 0`. |
 
 `gradient_dtype` defaults to `fp32` for GRPO (the per-token gradient is 10-100x
 smaller than in SFT), while master weights follow the model dtype; precision
@@ -539,6 +539,10 @@ where it matters comes from `lora_dtype`, which stays `fp32`.
 | `teacher_tau`   | float | `0.0`   | Weight on the teacher term for on-policy distillation. `0.0` disables it.         |
 | `kl_tau`        | float | `1e-3`  | KL penalty coefficient. Raise if the policy diverges from the reference too fast. |
 | `ratio_clip`    | float | `7.389056` | Hard ceiling on the importance ratio (default e²). Bounds the update when the sampling policy and the trainer policy drift apart — e.g. under periodic merged-weight reloads, where the baseline mismatch is larger than the IPO mask alone can absorb. |
+| `variant`       | string | `"ipo"` | `ipo` (token-level, the masks above), `cispo` (token-level, no mask, ratio truncated at `ratio_clip`) or `gspo` (one ratio per sequence, every sequence weighted equally; `parallelism: dispatch_pp` only). See [GSPO](../guides/rl-training.md#gspo-one-ratio-per-sequence). |
+| `seq_clip_low`  | float | `3e-4`  | `gspo`: the sequence ratio's clip below 1, `1 - seq_clip_low` (the paper's value). |
+| `seq_clip_high` | float | `4e-4`  | `gspo`: the sequence ratio's clip above 1, `1 + seq_clip_high` (the paper's value). |
+| `seq_ratio_old` | string | `"inference"` | `gspo`: the ratio's π_old. `inference` = the rollout engine's log-probs; `trainer` = the trainer's own at the current parameters, so the ratio is 1 and nothing is clipped. |
 
 ### QeRL noise scheduler (`noise_scheduler:` block)
 

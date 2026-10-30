@@ -63,6 +63,7 @@ _SAMPLE_MEAN_METRICS = (
     "is_masked_high",
     "ratio_clipped",
     "teacher_kl",
+    "seq_log_ratio",
 )
 _TOKEN_MEAN_METRICS = {"opd_loss": "opd_tokens", "opd_gate": "opd_tokens", "opd_shift": "opd_tokens",
                        "replay_loss": "replay_tokens"}
@@ -89,6 +90,43 @@ def _combine_row_metrics(rows: list[dict]) -> dict:
         else:
             out[key] = sum(r[key] for r in rows)
     return out
+
+
+def _check_loss_options(config, dispatch_pp: bool) -> None:
+    """Refuse loss settings this trainer would run differently from what they say."""
+    if config.teacher_from_base and not dispatch_pp:
+        raise ValueError("teacher_from_base needs parallelism: dispatch_pp (its log-prob pass scores the base)")
+    if config.teacher_from_base and config.loss.teacher_tau == 0.0:
+        # A run without the anchor must not pay for the base pass (one more forward per call, ~18 % of a step).
+        raise ValueError("teacher_from_base with loss.teacher_tau = 0 runs a base-model pass that only feeds the "
+                         "teacher_kl metric; set teacher_from_base: false for a run without the KL anchor")
+    if config.loss.variant == "gspo" and not dispatch_pp:
+        raise ValueError("loss.variant gspo needs parallelism: dispatch_pp (its sequence ratio needs each "
+                         "sequence's log-probs before its backward; the native step seeds window by window)")
+
+
+def _step_trial_count(micro_batches) -> int:
+    """GSPO's step normalizer: the number of trials whose samples the step trains on.
+
+    Samples with the same trial_idx are one trial (the producer divides their advantages by their count, so each
+    trial counts once); a sample without one (-1, or no trial_idx at all) is a trial of its own. Samples without loss
+    tokens, padding included, do not count.
+    """
+    trials: set[int] = set()
+    single = 0
+    for mb in micro_batches:
+        mask = mb["loss_mask"].flatten()
+        ids = mb.get("trial_idx")
+        ids = ids.flatten() if ids is not None else None
+        for start, end in _find_sample_boundaries(mb["position_ids"].flatten()):
+            if not mask[start:end].any():
+                continue
+            tid = int(ids[start]) if ids is not None else -1
+            if tid >= 0:
+                trials.add(tid)
+            else:
+                single += 1
+    return len(trials) + single
 
 
 def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
@@ -185,10 +223,8 @@ class GRPOTrainer:
         # stage re-streams its weights for every microbatch (8 microbatches x 3
         # passes = 24 copies of the base per step, measured 2026-10-29).
         self._dispatch_pp = getattr(config, "parallelism", None) == "dispatch_pp"
-        if config.teacher_from_base and not self._dispatch_pp:
-            raise ValueError("teacher_from_base needs parallelism: dispatch_pp (its log-prob pass scores the base)")
-        if config.teacher_from_base and config.loss.teacher_tau == 0.0:
-            logger.warning("teacher_from_base with loss.teacher_tau = 0: the base pass only feeds the teacher_kl metric")
+        _check_loss_options(config, self._dispatch_pp)
+        self._teacher_warned = False
         self._dpp_los: list[int] | None = None
         self._dpp_his: list[int] | None = None
         if self._dispatch_pp:
@@ -441,6 +477,9 @@ class GRPOTrainer:
                         "train/duration_ms": duration_ms,
                         "train/tokens_per_second": tps,
                         "train/orch_step": float(orch_step),
+                        # GSPO: the mean over the step's sequences of log s_i (is_masked* are its clip shares).
+                        **({"train/seq_log_ratio": float(step_metrics["seq_log_ratio"])}
+                           if "seq_log_ratio" in step_metrics else {}),
                         **turn_summary,
                         **self._r3_step_summary,
                     },
@@ -553,6 +592,22 @@ class GRPOTrainer:
             "sample_ranges": sample_ranges,
             "T_actual": T_actual,
         }
+
+    def _check_teacher_rows(self, micro_batches) -> None:
+        """Warn once when the KL anchor and the rows' teacher log-probs disagree, which would otherwise pass silently:
+        teacher_tau > 0 with rows that have no teacher (no anchor on them), or teacher log-probs nobody uses."""
+        if getattr(self, "_teacher_warned", False) or self.config.teacher_from_base:
+            return
+        tau = self.config.loss.teacher_tau
+        without = sum(mb["teacher_logprobs"] is None for mb in micro_batches)
+        if tau != 0.0 and without:
+            logger.warning(f"loss.teacher_tau = {tau} but {without} of {len(micro_batches)} rows have no teacher "
+                           "log-probs and teacher_from_base is off: the KL anchor is off for those rows")
+            self._teacher_warned = True
+        elif tau == 0.0 and without < len(micro_batches):
+            logger.warning("rows carry teacher log-probs but loss.teacher_tau = 0: they only feed the teacher_kl "
+                           "metric (turn the producer's teacher scorer off for a run without the anchor)")
+            self._teacher_warned = True
 
     def _dispatch_pp_step(self, micro_batches, loss_scale: float, opt_config, step: int, turn_acc) -> dict:
         """One optimizer step under dispatch-PP.
@@ -939,6 +994,11 @@ class GRPOTrainer:
             # across all micro-batches in this optimizer step.
             loss_tokens = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))
             loss_scale = max(loss_tokens, 1)
+            if config.loss.variant == "gspo":
+                # GSPO weighs sequences, not tokens: its per-token gradients already carry 1 / |y_i|, so the step
+                # divides by its trial count (the mean over the G responses of a group, over all of the step's).
+                loss_scale = max(_step_trial_count(micro_batches), 1)
+            self._check_teacher_rows(micro_batches)
 
             step_start = time.time()
 
