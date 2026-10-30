@@ -1047,6 +1047,10 @@ NB_MODULE(_surogate, m) {
         .def_rw("bnb_double_quant",
                 &modules::QLoRAConfig::bnb_double_quant,
                 "Enable double quantization for BnB (quantize absmax values to INT8).")
+        .def_rw("prequant_compressed_tensors",
+                &modules::QLoRAConfig::prequant_compressed_tensors,
+                "Pre-quantized NVFP4 from a compressed-tensors export (weight_packed / weight_scale / "
+                "weight_global_scale, encode convention) instead of ModelOpt.")
         .def_rw("bnb_double_quant_group_size",
                 &modules::QLoRAConfig::bnb_double_quant_group_size,
                 "Group size for double quantization (number of absmax values per group).")
@@ -1428,11 +1432,14 @@ NB_MODULE(_surogate, m) {
              &MultiGPUPyTrainer::export_adapter,
              nb::arg("path"),
              nb::arg("base_model_path") = "",
+             nb::arg("dtype") = "",
              "Export LoRA adapter weights to a directory (PEFT-compatible format).\n\n"
              "Only works if the model was created with a LoRA configuration.\n"
              "Creates adapter_model.safetensors and adapter_config.json.\n\n"
              "Parameters:\n- path: Output directory path.\n"
-             "- base_model_path: Optional path/name of base model for adapter_config.json.")
+             "- base_model_path: Optional path/name of base model for adapter_config.json.\n"
+             "- dtype: \"\" writes the adapter's master dtype (what a checkpoint resumes from); \"bf16\" rounds "
+             "FP32 masters to BF16 (round to nearest even), the copy a BF16 serving engine loads.")
         .def_static(
             "from_pretrained",
             [](const std::string& name,
@@ -1648,14 +1655,18 @@ NB_MODULE(_surogate, m) {
                TokenArray targets,
                std::vector<int> los,
                std::vector<int> his,
-               int num_microbatches) {
-                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
+               int num_microbatches,
+               bool keep_boundaries,
+               bool base_model) {
+                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 auto lp = trainer->dispatch_pp_forward_logprobs_multigpu(inputs.data(),
                                                                         targets.data(),
                                                                         los,
                                                                         his,
-                                                                        num_microbatches);
+                                                                        num_microbatches,
+                                                                        keep_boundaries,
+                                                                        base_model);
                 const std::size_t n = lp.size();
                 float* data = new float[n];
                 std::copy(lp.begin(), lp.end(), data);
@@ -1663,16 +1674,21 @@ NB_MODULE(_surogate, m) {
                 const std::size_t rows = static_cast<std::size_t>(num_microbatches) *
                                          static_cast<std::size_t>(trainer->batch_size());
                 return nb::ndarray<nb::numpy, float, nb::ndim<2>>(
-                    data, {rows, static_cast<std::size_t>(trainer->seq_length())}, owner);
+                    data, {rows, static_cast<std::size_t>(trainer->step_seq_length())}, owner);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
             nb::arg("los"),
             nb::arg("his"),
             nb::arg("num_microbatches") = 1,
+            nb::arg("keep_boundaries") = false,
+            nb::arg("base_model") = false,
             "dispatch-PP staged forward through the loss stage; returns per-token logprobs "
             "[num_microbatches*batch_size, seq]. Pair with dispatch_pp_train_step_multigpu(custom_dloss=...) "
-            "to run GRPO-style objectives under dispatch-PP.")
+            "to run GRPO-style objectives under dispatch-PP. keep_boundaries=True keeps every stage's "
+            "output for the next train step over the same rows (reuse_forward=True skips its forward). "
+            "base_model=True returns the base model's logprobs instead (the LoRA delta off, same kernels), "
+            "leaving a policy pass's kept boundaries alone.")
         .def(
             "dispatch_pp_train_step_multigpu",
             [](MultiGPUPyTrainer* trainer,
@@ -1684,15 +1700,18 @@ NB_MODULE(_surogate, m) {
                int step_idx,
                bool stale,
                int num_microbatches,
-               nb::object custom_dloss_obj) {
+               nb::object custom_dloss_obj,
+               bool reuse_forward,
+               bool zero_grads,
+               bool apply_update) {
                 // inputs/targets carry num_microbatches microbatches of [batch_size, seq] each.
-                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 const float* custom_dloss_ptr = nullptr;
                 if (!custom_dloss_obj.is_none()) {
                     auto custom_dloss =
                         nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(custom_dloss_obj);
-                    CHECK_SHAPE(custom_dloss, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                    CHECK_SHAPE(custom_dloss, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                     custom_dloss_ptr = custom_dloss.data();
                 }
                 return trainer->dispatch_pp_train_step_multigpu(inputs.data(),
@@ -1703,7 +1722,10 @@ NB_MODULE(_surogate, m) {
                                                                 step_idx,
                                                                 stale,
                                                                 num_microbatches,
-                                                                custom_dloss_ptr);
+                                                                custom_dloss_ptr,
+                                                                reuse_forward,
+                                                                zero_grads,
+                                                                apply_update);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1714,10 +1736,16 @@ NB_MODULE(_surogate, m) {
             nb::arg("stale") = false,
             nb::arg("num_microbatches") = 1,
             nb::arg("custom_dloss") = nb::none(),
+            nb::arg("reuse_forward") = false,
+            nb::arg("zero_grads") = true,
+            nb::arg("apply_update") = true,
             "Debug-only dispatch-PP: one full multi-GPU training step (round-robin backward dispatch + "
             "cross-GPU grad handoff -> collect grads -> optimizer on the master -> broadcast weights to "
             "all GPUs); returns the (raw) step loss. stale=true defers the optimizer update by one step "
-            "(RoundPipe one-step staleness); call dispatch_pp_flush_pending at the end.")
+            "(RoundPipe one-step staleness); call dispatch_pp_flush_pending at the end. One optimizer step "
+            "can span several calls (gradient accumulation): zero_grads=False adds to the gradients the "
+            "previous calls left, apply_update=False leaves them for the next call; the call that applies "
+            "normalizes over the valid tokens of all of them.")
         .def(
             "dispatch_pp_flush_pending",
             [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& opt_config) {

@@ -286,8 +286,8 @@ void moe_grouped_gemm(nv_bfloat16* output,
                           weight_ptrs);
 }
 
-template <typename T>
-void moe_grouped_gemm_weight_grad_impl(T* d_weight,
+template <typename T, typename TOut = T>
+void moe_grouped_gemm_weight_grad_impl(TOut* d_weight,
                                        const T* grad_output,
                                        const T* input,
                                        const int* expert_offsets,
@@ -328,7 +328,7 @@ void moe_grouped_gemm_weight_grad_impl(T* d_weight,
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
     std::vector<const T*> A_vec, B_vec;
-    std::vector<T*> C_vec;
+    std::vector<TOut*> C_vec;
 
     m_vec.reserve(n_active);
     n_vec.reserve(n_active);
@@ -360,21 +360,21 @@ void moe_grouped_gemm_weight_grad_impl(T* d_weight,
 
     if (m_vec.empty()) return;
 
-    moe_expert_gemms<T>(cublas_handle,
-                        stream,
-                        CUBLAS_OP_N,
-                        CUBLAS_OP_T,
-                        m_vec,
-                        n_vec,
-                        k_vec,
-                        alpha,
-                        A_vec,
-                        lda_vec,
-                        B_vec,
-                        ldb_vec,
-                        beta,
-                        C_vec,
-                        ldc_vec);
+    moe_expert_gemms<T, TOut>(cublas_handle,
+                              stream,
+                              CUBLAS_OP_N,
+                              CUBLAS_OP_T,
+                              m_vec,
+                              n_vec,
+                              k_vec,
+                              alpha,
+                              A_vec,
+                              lda_vec,
+                              B_vec,
+                              ldb_vec,
+                              beta,
+                              C_vec,
+                              ldc_vec);
 }
 
 void moe_grouped_gemm_weight_grad(float* d_weight,
@@ -410,6 +410,38 @@ void moe_grouped_gemm_weight_grad(float* d_weight,
 }
 
 void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight,
+                                  const nv_bfloat16* grad_output,
+                                  const nv_bfloat16* input,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int M,
+                                  int N,
+                                  cublasHandle_t cublas_handle,
+                                  cudaStream_t stream,
+                                  const int* host_offsets,
+                                  float alpha,
+                                  float beta,
+                                  const int* active_expert_indices,
+                                  bool weight_is_compact,
+                                  int num_active_experts) {
+    moe_grouped_gemm_weight_grad_impl(d_weight,
+                                      grad_output,
+                                      input,
+                                      expert_offsets,
+                                      num_experts,
+                                      M,
+                                      N,
+                                      cublas_handle,
+                                      stream,
+                                      host_offsets,
+                                      alpha,
+                                      beta,
+                                      active_expert_indices,
+                                      weight_is_compact,
+                                      num_active_experts);
+}
+
+void moe_grouped_gemm_weight_grad(float* d_weight,
                                   const nv_bfloat16* grad_output,
                                   const nv_bfloat16* input,
                                   const int* expert_offsets,

@@ -34,6 +34,7 @@
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
+#include "runtime/dsl/stage_boundary.h"
 #include "kernels/kernels.h"
 #include "runtime/lora/lora_types.h"
 #include "utilities/stack.h"
@@ -200,6 +201,21 @@ public:
     /// Zero all layers' dKV accumulators — call once before each reverse
     /// backward sweep.
     void zero_sequence_chunk_dkv();
+    /// The same for layers [lo, hi] only: a GPU running several stages starts
+    /// one stage's row while another stage is still inside its own.
+    void zero_sequence_chunk_dkv(int lo, int hi);
+    /// Host copy of one row's chunk state (KV caches, GDN state slots, conv
+    /// tails) of layers [lo, hi] after its forward over `chunks` windows, kept
+    /// per slot (microbatch): the backward of the same rows restores it instead
+    /// of re-running the forward over windows 0 .. chunks-2. Pinned memory, at
+    /// most SUROGATE_DISPATCH_CHUNK_SNAPSHOT_GIB (default 4) per executor; a
+    /// slot past the budget is not saved, and its backward re-runs the forward.
+    void save_sequence_chunk_state(int lo, int hi, int slot, int chunks);
+    /// Copies the first `chunks` windows of slot's saved state of layers
+    /// [lo, hi] back; false (nothing copied) when no save covers them.
+    bool restore_sequence_chunk_state(int lo, int hi, int slot, int chunks);
+    /// Mark every saved slot stale (the pinned buffers stay for the next save).
+    void invalidate_sequence_chunk_snapshots();
     /// Free all chunked-sequence state (KV caches, accumulators, scratch).
     void free_sequence_chunk_state();
 
@@ -300,7 +316,7 @@ public:
     // graph tids the resumed stage's first block reads (blocks[hi].res_ffn = the
     // residual, blocks[hi].mlp_down = x). Buffers are owned here and freed on the
     // next inject / clear.
-    void set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+    void set_inject_named(StageBoundary items) {
         mInjectNamed = std::move(items);
     }
     void clear_inject_named();  // frees the device buffers
@@ -343,6 +359,22 @@ public:
         mSavedCache.reset_to_pool();
     }
 
+    // dispatch-PP: recycle the saved buffers of blocks [lo..hi] into the cache's pool once
+    // nothing reads them. Call it after a stage's first-pass forward (the log-prob pass and
+    // the train step's boundary forward), since dispatch_pp_backward_stage re-forwards the
+    // stage before its backward. Call it again after the stage's backward.
+    // Without it a GPU keeps every block of every stage it ran: W FP8 on 4 x RTX 5090 at
+    // 8k tokens held 7.3 GB by block 33. The next stage's acquire pops the same-size
+    // buffers back, so a GPU holds about one stage's worth.
+    // A buffer belongs to the range when its key is "blocks[L]." / "d_blocks[L]." with L in
+    // [lo..hi], or "<op_id>." of an op of those blocks in either graph (op-keyed saves:
+    // gated rmsnorm, attention, qk-norm). Its mSaved entry goes with it, and the stage's
+    // re-forward rebinds both. Returns the recycled bytes.
+    std::size_t retire_saved_layers(const CompiledGraph* fwd, const CompiledGraph* bwd, int lo, int hi);
+    const SavedTensorCache& saved_cache() const {
+        return mSavedCache;
+    }
+
     std::size_t mFwdOpLo = 0;
     std::size_t mFwdOpHi = SIZE_MAX;
     bool mFwdSkipInit = false;
@@ -359,7 +391,7 @@ public:
     int mBwdLayerHi = -1;
     bool mBwdLayerLoss = false;
     bool mBwdLayerEmbed = false;
-    std::vector<std::pair<std::string, std::vector<std::byte>>> mInjectNamed;
+    StageBoundary mInjectNamed;
     std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds (active)
     std::vector<void*> mInjectPool;     // recycled inject buffers -> no per-call cudaMalloc/cudaFree
     std::size_t mInjectBufBytes = 0;    // size of the pooled inject buffers (all boundaries are equal)
@@ -855,10 +887,11 @@ private:
 
     // Document masking context for Flash Attention varlen (null = disabled)
     /// Chunked-sequence carry for a GDN (gated delta rule) layer: per-chunk
-    /// initial states (slot c = state BEFORE chunk c, BF16 as the kernel
-    /// expects; slot 0 stays zero) and the FP32 reverse d-state carry.
+    /// initial states (slot c = state BEFORE chunk c, FP32 as the kernel takes
+    /// it -- a BF16 carry rounded the state at every window boundary; slot 0
+    /// stays zero) and the FP32 reverse d-state carry.
     struct ChunkGdnState {
-        nv_bfloat16* states = nullptr;  ///< [(num_chunks+1) * elems]
+        float* states = nullptr;        ///< [(num_chunks+1) * elems]
         float* d_state = nullptr;       ///< [elems] — d_final for the previous chunk
         std::size_t elems = 0;          ///< B*H*K*V
     };
@@ -883,8 +916,20 @@ private:
         float* dk = nullptr;
         float* dv = nullptr;
         std::size_t kv_elems = 0;
+        std::size_t window_elems = 0;  ///< T * Hkv * Hs: one window's rows
     };
     std::unordered_map<int, ChunkAttnState> mChunkAttn;  ///< by layer_idx
+    /// save_sequence_chunk_state's host copies, by (slot, layer, part); part 0
+    /// K, 1 V, 2 GDN state slots, 3 conv tails.
+    struct ChunkSnapshot {
+        void* host = nullptr;    ///< pinned
+        std::size_t cap = 0;     ///< bytes allocated
+        std::size_t bytes = 0;   ///< bytes of the last save
+    };
+    std::unordered_map<std::uint64_t, ChunkSnapshot> mChunkSnapshots;
+    /// Saved (slot, lo, hi) -> windows covered.
+    std::unordered_map<std::uint64_t, int> mChunkSnapshotSaved;
+    std::size_t mChunkSnapshotBytes = 0;  ///< pinned bytes over all snapshots
     int mChunkIdx = -1;
     int mChunkCount = 0;
     std::int32_t* mChunkCuDev = nullptr;   ///< device: cu_q then cu_k

@@ -506,7 +506,10 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
-        long needed = required_stack_bytes(mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions);
+        // The runtime skips a frozen param's weight gradient; the sizer leaves it out too.
+        const auto is_trainable = [this](const std::string& param) { return mParams && mParams->is_trainable(param); };
+        long needed = required_stack_bytes(
+            mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions, is_trainable);
         // dispatch-PP runs sub-range stages with skip_finalize, which keeps the boundary
         // saves (res_att/mlp_down) live on the stack on top of the normal backward peak --
         // the auto-sizer doesn't model that, so add headroom (env, MB). There is ample free
@@ -515,8 +518,17 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
             const long mb = std::atol(env);
             if (mb > 0) needed += mb * 1024L * 1024L;
         }
+        // Chunked sequences: the kv-prefix attention backward expands dK and dV to every query
+        // head over the whole prefix (kvprefix_dk_exp / _dv_exp, BF16), which reaches the full row
+        // at the last chunk; the sizer only models the chunk's own T.
+        if (options.SequenceChunks > 1) {
+            const long t_total = static_cast<long>(T) * options.SequenceChunks;
+            needed += 2L * t_total * static_cast<long>(mModelConfig.NumQueryHeads) *
+                      static_cast<long>(mModelConfig.head_size()) * 2L;
+        }
         if (options.DebugMemoryBreakdown && comm.rank() == 0) {
-            const long graph_peak = graph_backward_stack_peak(exec->compiled_backward(), mRunState->buffer_plan());
+            const long graph_peak =
+                graph_backward_stack_peak(exec->compiled_backward(), mRunState->buffer_plan(), is_trainable);
             std::cerr << "[DEBUG-STACK] graph_peak=" << graph_peak / (1024 * 1024) << " MiB"
                       << ", final_required=" << needed / (1024 * 1024) << " MiB"
                       << ", currently_allocated=" << required_size / (1024 * 1024) << " MiB" << std::endl;
@@ -2014,8 +2026,9 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
                                          NCCLCommunicator& comm,
                                          int lo,
                                          int hi,
-                                         std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
-                                         bool preserve_output) {
+                                         StageBoundary inject_named,
+                                         bool preserve_output,
+                                         bool include_head) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_forward_stage: requires the DSL GraphExecutor");
@@ -2037,8 +2050,9 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
     // Stage [0..] starts at the embedding; a resumed stage [lo>0..] starts at the
     // first op of block lo and consumes the injected boundary residual.
     const std::size_t op_lo = (lo == 0) ? 0 : fwd->layer_start_indices[static_cast<std::size_t>(lo)];
-    const std::size_t op_hi =
-        (hi == num_layers - 1) ? fwd->ops.size() : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+    const std::size_t op_hi = (hi == num_layers - 1 && include_head)
+                                  ? fwd->ops.size()
+                                  : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
 
     if (!inject_named.empty()) {
         ge->set_inject_named(std::move(inject_named));
@@ -2070,8 +2084,8 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
                                           int lo,
                                           int hi,
                                           bool is_loss_stage,
-                                          std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                          StageBoundary fwd_inject,
+                                          StageBoundary inject_named,
                                           int micro_step,
                                           int total_micro,
                                           const float* custom_dloss_cpu) {
@@ -2147,19 +2161,28 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
                                        cudaMemcpyDeviceToHost,
                                        rs.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-            // Per-token CE is exactly 0 for masked/padding positions and strictly > 0 for
-            // valid targets, so count(>0) is the local valid-token count. Normalize the loss
-            // by valid (not total B*T) tokens to match the standard per-valid-token loss, and
-            // accumulate the count across the step's microbatches for the grad-norm scale.
+            // Count the valid targets themselves: a confidently predicted target has a per-token
+            // CE of exactly 0 in FP32, so count(CE > 0) missed them (31 % of an agentic
+            // completion's targets, measured 2026-10-29), which inflated the reported loss and
+            // the per-token grad normalization. Normalize the loss by valid (not total B*T)
+            // tokens to match the standard per-valid-token loss, and accumulate the count across
+            // the step's microbatches for the grad-norm scale.
             double s = 0.0;
-            std::size_t valid = 0;
-            for (float x : h) {
+            for (float x : h)
                 s += x;
-                if (x > 0.0f) ++valid;
+            std::size_t valid = 0;
+            const std::int32_t* tg = targets.Data ? targets.template get<std::int32_t>() : nullptr;
+            if (tg != nullptr && targets.Device < 0) {
+                for (std::size_t i = 0; i < n; ++i)
+                    valid += tg[i] >= 0;
+            } else {
+                for (float x : h)
+                    valid += x > 0.0f;  // fallback when the targets are not on the host
             }
             const std::size_t vc = std::max<std::size_t>(1, valid);
             mDispatchPpLastLoss = static_cast<float>(s / static_cast<double>(vc));
-            mDispatchPpLossValidTokens = static_cast<int>(vc);
+            // The raw count: a chunked step sums it over windows, some of which hold no target.
+            mDispatchPpLossValidTokens = static_cast<int>(valid);
         }
     }
 
@@ -2537,7 +2560,7 @@ std::vector<float> DslModel::dispatch_pp_forward_loss_stage(
     NCCLCommunicator& comm,
     int lo,
     int hi,
-    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject) {
+    StageBoundary fwd_inject) {
     // Forward of the loss-owning stage, returning per-token logprobs.
     //
     // Deliberately mirrors the forward half of dispatch_pp_backward_stage rather
@@ -2612,6 +2635,17 @@ std::vector<float> DslModel::dispatch_pp_read_logprobs() {
     return out;
 }
 
+void DslModel::set_dispatch_pp_lora_forward(bool on) {
+    if (!lora_enabled() || !mExecutor) return;
+    if (on && !mLoRARunState) {
+        throw std::logic_error("set_dispatch_pp_lora_forward: no LoRA run state to re-attach");
+    }
+    mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
+                              mLoRAWeights.get(),
+                              mLoRAGrads.get(),
+                              on ? mLoRARunState.get() : nullptr);
+}
+
 float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
                                             const optimizers::OptimizerConfig& opt_config,
                                             int step_idx) {
@@ -2619,10 +2653,13 @@ float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
     // stage counted valid (non-pad) tokens locally over the step's microbatches. Publish
     // that into ValidTokenCount and use per-valid-token normalization so the grad norm (and
     // the optimizer's grad scale) match the standard path -- not the inflated total-token
-    // (incl padding x world_size) fallback. step_idx is already 1-based.
+    // (incl padding x world_size) fallback. step_idx is already 1-based. Custom per-token
+    // gradients (GRPO/DPO, mDispatchPpTokenScale off) arrive normalized by the caller's
+    // loss_scale, so -- like step_grpo_native_window -- no token scale: dividing by the count
+    // again shrank them by the step's token count, below AdamW's epsilon at RL step sizes.
     auto& rs = *mRunState;
     const int vc = std::max(1, mDispatchPpValidTokens);
-    if (rs.ValidTokenCount.Data) {
+    if (mDispatchPpTokenScale && rs.ValidTokenCount.Data) {
         CUDA_CHECK(cudaMemcpyAsync(rs.ValidTokenCount.Data, &vc, sizeof(int), cudaMemcpyHostToDevice, rs.MainStream));
         CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
         mUseTokenScale = true;
@@ -2635,6 +2672,7 @@ float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
     update_with_config(comm, opt_config, step_idx);
     mDispatchPpLocalGrads = false;
     mDispatchPpValidTokens = 0;  // reset for the next step
+    mDispatchPpTokenScale = true;
     return get_norm();
 }
 

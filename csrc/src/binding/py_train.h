@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "runtime/dsl/stage_boundary.h"
+
 #include "config/pretrained_config.h"
 #include "runtime/training/runtime_options.h"
 #include "config/lora_adapter_config.h"
@@ -98,7 +100,9 @@ public:
     void import_weights_from_external(std::string safetensors_path,
                                       std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
     void export_model(std::string path);
-    void export_adapter(std::string path, std::string base_model_path = "");
+    // dtype "" keeps the adapter's master dtype (checkpoints); "bf16" rounds FP32 masters to BF16 (broadcasts to a
+    // BF16 serving engine).
+    void export_adapter(std::string path, std::string base_model_path = "", std::string dtype = "");
     void import_adapter(std::string path);
     void init_weights();
     // `loader` (optional) has its position saved with / restored from the checkpoint
@@ -261,16 +265,30 @@ public:
     // forward pipeline at stage N-2 (the backward recomputes the last stage), so
     // logprobs are never materialized there. GRPO needs them to form its
     // per-token gradients, which then come back in via custom_dloss below.
+    // keep_boundaries: hold on to every stage's output boundary so the next
+    // dispatch_pp_train_step_multigpu(reuse_forward=true) over the same rows can take
+    // them as its stage inputs instead of running the same forward again.
+    // base_model: the base model's log-probs instead (the LoRA delta off, same kernels),
+    // e.g. the reference of a KL anchor; keeps nothing and leaves a policy pass's kept
+    // boundaries and chunk states as they are.
     std::vector<float> dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
                                                              const std::int32_t* targets,
                                                              const std::vector<int>& los,
                                                              const std::vector<int>& his,
-                                                             int num_microbatches = 1);
+                                                             int num_microbatches = 1,
+                                                             bool keep_boundaries = false,
+                                                             bool base_model = false);
     // custom_dloss (optional, host [num_microbatches * B * T]): per-token gradient
     // seeds for the loss stage, replacing the built-in cross-entropy. This is how
     // GRPO/DPO-style objectives run under dispatch-PP — the caller computes the
     // per-token gradients from logprobs and hands them in, exactly as the
     // non-dispatch path does via backward_grpo(). nullptr keeps the CE behaviour.
+    // reuse_forward: skip the step's forward when the last log-prob pass kept its
+    // boundaries for these exact rows, stages and weights (it recomputes nothing else).
+    // zero_grads / apply_update: one optimizer step over several calls (gradient
+    // accumulation), so the rows' host state (stage boundaries) is held one call at a time.
+    // The first call zeroes the gradients, every call adds its rows' gradients on the
+    // stages' GPUs, the last applies them once, normalized by the valid tokens of all calls.
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                           const std::int32_t* targets,
                                           const std::vector<int>& los,
@@ -279,7 +297,10 @@ public:
                                           int step_idx,
                                           bool stale,
                                           int num_microbatches = 1,
-                                          const float* custom_dloss = nullptr);
+                                          const float* custom_dloss = nullptr,
+                                          bool reuse_forward = false,
+                                          bool zero_grads = true,
+                                          bool apply_update = true);
     // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
     float dispatch_pp_last_grad_norm() const {
         return mDispatchPpLastGradNorm;
@@ -561,16 +582,40 @@ private:
 
     // dispatch-PP: apply collected grads on the master GPU (optimizer) and broadcast
     // the updated weights to every replica. opt_step_1based is the Adam step index.
+    // token_scale: divide by valid_tokens (built-in CE); off for custom_dloss gradients,
+    // which the caller normalized already.
     void dispatch_pp_apply_grads_(const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
                                   const optimizers::OptimizerConfig& opt_config,
                                   int opt_step_1based,
-                                  int valid_tokens);
+                                  int valid_tokens,
+                                  bool token_scale);
     // dispatch-PP one-step-stale state: gradients deferred from the previous step,
     // and the count of optimizer updates applied so far (1-based Adam step).
     std::vector<std::pair<std::string, std::vector<std::byte>>> mDispatchPpPendingGrads;
     int mDispatchPpAppliedStep = 0;
     int mDispatchPpPendingValidTokens = 0;  // valid-token count for the deferred (stale) grads
+    bool mDispatchPpPendingTokenScale = true;
     float mDispatchPpLastGradNorm = 0.0f;
+    /// dispatch-PP stage-local LoRA (each GPU holds and trains only its own stages' adapters): asked of GPU 0's model
+    /// once (-1 = not yet asked).
+    int mDispatchPpLoraStageLocal = -1;
+    bool dispatch_pp_lora_stage_local();
+    /// Stage-local LoRA: every layer of stage s must belong to GPU s % gpus under the plan the adapters were
+    /// allocated with (SUROGATE_DISPATCH_STAGE_BLOCKS); a layer run elsewhere would skip its adapters.
+    void check_lora_stage_plan(const std::vector<int>& los, const std::vector<int>& his, const char* caller);
+    // Boundaries kept by the last log-prob pass (keep_boundaries): [stage][microbatch] output of
+    // each stage but the last, valid for the rows/stages/weights summarized by mDppKeptKey.
+    std::vector<std::vector<dsl::StageBoundary>> mDppKeptBoundaries;
+    std::uint64_t mDppKeptKey = 0;
+    // Bumped by every dispatch-PP weight update, so kept boundaries never outlive their weights.
+    std::uint64_t mDppWeightVersion = 0;
+    // An optimizer step open over several train-step calls (apply_update=false so far): the valid tokens of its
+    // calls, and what the remaining calls must share with them.
+    bool mDppAccumOpen = false;
+    long mDppAccumValidTokens = 0;
+    bool mDppAccumTokenScale = true;
+    std::vector<int> mDppAccumLos, mDppAccumHis;
+    std::uint64_t mDppAccumWeightVersion = 0;
 };
 
 #endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

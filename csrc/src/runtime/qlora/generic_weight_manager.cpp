@@ -69,6 +69,9 @@ DeviceQuantizedScratch make_device_scratch_like(const QuantizedTensor& ref, int 
     scratch.tensor.double_quant = ref.double_quant;
     scratch.tensor.double_quant_group_size = ref.double_quant_group_size;
     scratch.tensor.global_scale = ref.global_scale;
+    // Per-component global scales are device-resident and never offloaded: share them.
+    scratch.tensor.component_scales = ref.component_scales;
+    scratch.tensor.component_rows = ref.component_rows;
 
     scratch.tensor.data = allocate_device_like(ref.data, device_id, scratch.allocations);
     scratch.tensor.scales = allocate_device_like(ref.scales, device_id, scratch.allocations);
@@ -99,6 +102,29 @@ void copy_quantized_storage(QuantizedTensor& dst, const QuantizedTensor& src, cu
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
     dst.global_scale = src.global_scale;
+    dst.component_scales = src.component_scales;
+    dst.component_rows = src.component_rows;
+}
+
+/// Dequantize a stored weight. FP8_PER_ROW is the second format of a mixed checkpoint (load-only, not the
+/// quantizer's own), so it is decoded here: code x its row's scale.
+void dequantize_stored(IQuantizer& quantizer,
+                       const QuantizedTensor& qt,
+                       Tensor& out,
+                       const cudaDeviceProp& dp,
+                       cudaStream_t stream) {
+    if (qt.format == QuantFormat::FP8_PER_ROW) {
+        dequantize_fp8_rowwise(out.get<nv_bfloat16>(),
+                               qt.data.get<__nv_fp8_e4m3>(),
+                               qt.scales.Data,
+                               qt.scales.DType,
+                               qt.M,
+                               qt.K,
+                               dp,
+                               stream);
+        return;
+    }
+    quantizer.dequantize(qt, out, stream);
 }
 
 }  // namespace
@@ -409,10 +435,29 @@ void GenericWeightManager::quantize_expert_slice(const std::string& name,
                                              name));
     }
 
-    const auto& full = entry.quantized;
+    auto& full = entry.quantized;
     const int K = full.K;
     const int num_experts = full.M / per_expert_M;
     const long per_expert_elems = static_cast<long>(per_expert_M) * K;
+
+    // FP4: each expert is quantized with its own global scale, which is kept per component
+    // (one per expert). It used to land in the temporary view below and be lost, so every expert
+    // then dequantized with the stacked tensor's default scale of 1.0.
+    const bool per_expert_global = full.format == QuantFormat::FP4_BLOCK_2D;
+    if (per_expert_global && (full.component_scales.is_null() || full.component_rows != per_expert_M)) {
+        full.component_scales = mAllocator->allocate(ETensorDType::FP32,
+                                                     (name + ".component_scales").c_str(),
+                                                     EAllocationType::ON_DEVICE,
+                                                     {static_cast<long>(num_experts)});
+        full.component_rows = per_expert_M;
+        const std::vector<float> ones(static_cast<std::size_t>(num_experts), 1.0f);
+        CUDA_CHECK(cudaMemcpyAsync(full.component_scales.Data,
+                                   ones.data(),
+                                   ones.size() * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     // Verify expert boundaries align with block boundaries.
     // For 1D block formats (BnB NF4): total elements per expert must be block-aligned.
@@ -497,6 +542,14 @@ void GenericWeightManager::quantize_expert_slice(const std::string& name,
         copy_quantized_storage(view, scratch.tensor, stream);
     } else {
         mQuantizer->quantize(bf16, view, stream);
+    }
+    if (per_expert_global) {
+        CUDA_CHECK(cudaMemcpyAsync(full.component_scales.get<float>() + expert_idx,
+                                   &view.global_scale,
+                                   sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     entry.dequant_valid = false;
@@ -893,7 +946,7 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry, const std::s
         }
 
         // Dequantize into temp buffer (data is in HF order)
-        mQuantizer->dequantize(entry.quantized, mTransposeTemp, stream);
+        dequantize_stored(*mQuantizer, entry.quantized, mTransposeTemp, mDeviceProps, stream);
 
         // Batched transpose: [E, hf_rows, hf_cols] → [E, hf_cols, hf_rows]
         // where hf_rows × hf_cols is the per-expert HF shape.
@@ -906,7 +959,7 @@ void GenericWeightManager::ensure_dequantized(ManagedWeight& entry, const std::s
                                   stream);
     } else {
         // Standard path: dequantize directly into the buffer
-        mQuantizer->dequantize(entry.quantized, entry.dequant_buffer, stream);
+        dequantize_stored(*mQuantizer, entry.quantized, entry.dequant_buffer, mDeviceProps, stream);
     }
 
     // Swap fused partition halves if needed (e.g., vLLM [gate, up] → surogate [up, gate]).

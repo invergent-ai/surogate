@@ -153,6 +153,10 @@ struct DslQLoRAPipelineConfig {
     /// Empty for formats with single-level scaling.
     std::string scale2_suffix;
 
+    /// The second-level scale holds the ENCODE scale (compressed-tensors' weight_global_scale = 448 * 6 / amax), not
+    /// the decode scale (ModelOpt's weight_scale_2 = amax / (448 * 6)); the loader inverts it.
+    bool scale2_is_encode = false;
+
     /// HF module paths that should NOT be quantized (loaded full-precision).
     /// Populated from HF quantization_config "ignore" / "modules_to_not_convert".
     std::vector<std::string> modules_to_not_convert;

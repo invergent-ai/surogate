@@ -276,6 +276,7 @@ CompiledExecutor::ChunkAttnState& CompiledExecutor::chunk_attn_state(int layer_i
         CUDA_CHECK(cudaMemsetAsync(st.dv, 0, need * sizeof(float), stream));
         st.kv_elems = need;
     }
+    st.window_elems = static_cast<std::size_t>(mT) * Hkv * Hs;
     return st;
 }
 
@@ -333,17 +334,147 @@ void CompiledExecutor::ensure_chunk_cu_uploaded() {
 }
 
 void CompiledExecutor::zero_sequence_chunk_dkv() {
+    zero_sequence_chunk_dkv(0, std::numeric_limits<int>::max());
+}
+
+void CompiledExecutor::zero_sequence_chunk_dkv(int lo, int hi) {
     for (auto& [layer, st] : mChunkAttn) {
+        if (layer < lo || layer > hi) continue;
         if (st.dk) CUDA_CHECK(cudaMemsetAsync(st.dk, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
         if (st.dv) CUDA_CHECK(cudaMemsetAsync(st.dv, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
     }
     for (auto& [layer, st] : mChunkGdn) {
+        if (layer < lo || layer > hi) continue;
         if (st.d_state) CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, st.elems * sizeof(float), mRunState.MainStream));
     }
     for (auto& [layer, st] : mChunkConv) {
+        if (layer < lo || layer > hi) continue;
         if (st.d_tail)
             CUDA_CHECK(cudaMemsetAsync(st.d_tail, 0, st.elems * get_dtype_size(st.dtype), mRunState.MainStream));
     }
+}
+
+namespace {
+
+std::uint64_t chunk_snapshot_key(int slot, int a, int b) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(slot)) << 40) |
+           (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a) & 0xFFFFFu) << 20) |
+           (static_cast<std::uint64_t>(static_cast<std::uint32_t>(b) & 0xFFFFFu));
+}
+
+}  // namespace
+
+void CompiledExecutor::save_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
+    const std::uint64_t saved_key = chunk_snapshot_key(slot, lo, hi);
+    mChunkSnapshotSaved.erase(saved_key);
+    if (chunks <= 0) return;
+    static const std::size_t budget = [] {
+        const char* env = std::getenv("SUROGATE_DISPATCH_CHUNK_SNAPSHOT_GIB");
+        const double gib = env ? std::atof(env) : 4.0;
+        return static_cast<std::size_t>(std::max(0.0, gib) * static_cast<double>(1ull << 30));
+    }();
+    // Window c's forward writes K/V rows [c*T, (c+1)*T) and state slot c+1 (slot 0 stays zero), so
+    // `chunks` windows fill rows [0, chunks*T) and slots 0 .. chunks.
+    struct Part {
+        std::uint64_t key;
+        const void* src;
+        std::size_t bytes;
+    };
+    std::vector<Part> parts;
+    for (const auto& [layer, st] : mChunkAttn) {
+        if (layer < lo || layer > hi || !st.k) continue;
+        const std::size_t b = static_cast<std::size_t>(chunks) * st.window_elems * sizeof(nv_bfloat16);
+        parts.push_back({chunk_snapshot_key(slot, layer, 0), st.k, b});
+        parts.push_back({chunk_snapshot_key(slot, layer, 1), st.v, b});
+    }
+    for (const auto& [layer, st] : mChunkGdn) {
+        if (layer < lo || layer > hi || !st.states) continue;
+        parts.push_back(
+            {chunk_snapshot_key(slot, layer, 2), st.states, static_cast<std::size_t>(chunks + 1) * st.elems * sizeof(float)});
+    }
+    for (const auto& [layer, st] : mChunkConv) {
+        if (layer < lo || layer > hi || !st.tails) continue;
+        parts.push_back({chunk_snapshot_key(slot, layer, 3),
+                         st.tails,
+                         static_cast<std::size_t>(chunks + 1) * st.elems * get_dtype_size(st.dtype)});
+    }
+    std::size_t grow = 0;
+    for (const auto& p : parts) {
+        auto it = mChunkSnapshots.find(p.key);
+        const std::size_t cap = it == mChunkSnapshots.end() ? 0 : it->second.cap;
+        if (cap < p.bytes) grow += p.bytes - cap;
+    }
+    if (mChunkSnapshotBytes + grow > budget) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr,
+                         "[dispatch_pp] chunk-state copies would pass SUROGATE_DISPATCH_CHUNK_SNAPSHOT_GIB (%.1f GiB): "
+                         "the backward re-runs the forward over those rows' earlier windows (reported once)\n",
+                         static_cast<double>(budget) / static_cast<double>(1ull << 30));
+        }
+        return;
+    }
+    cudaStream_t stream = mRunState.MainStream;
+    for (const auto& p : parts) {
+        auto& sn = mChunkSnapshots[p.key];
+        if (sn.cap < p.bytes) {
+            if (sn.host) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));  // an earlier copy may still target it
+                CUDA_CHECK(cudaFreeHost(sn.host));
+                mChunkSnapshotBytes -= sn.cap;
+                sn.host = nullptr;
+                sn.cap = 0;
+            }
+            CUDA_CHECK(cudaMallocHost(&sn.host, p.bytes));
+            sn.cap = p.bytes;
+            mChunkSnapshotBytes += p.bytes;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(sn.host, p.src, p.bytes, cudaMemcpyDeviceToHost, stream));
+        sn.bytes = p.bytes;
+    }
+    mChunkSnapshotSaved[saved_key] = chunks;
+}
+
+bool CompiledExecutor::restore_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
+    auto saved = mChunkSnapshotSaved.find(chunk_snapshot_key(slot, lo, hi));
+    if (saved == mChunkSnapshotSaved.end() || saved->second < chunks) return false;
+    struct Part {
+        const ChunkSnapshot* sn;
+        void* dst;
+        std::size_t bytes;
+    };
+    std::vector<Part> parts;
+    bool complete = true;
+    auto add = [&](int layer, int part, void* dst, std::size_t bytes) {
+        auto it = mChunkSnapshots.find(chunk_snapshot_key(slot, layer, part));
+        if (it == mChunkSnapshots.end() || it->second.bytes < bytes) {
+            complete = false;  // the state was reallocated since the save
+            return;
+        }
+        parts.push_back({&it->second, dst, bytes});
+    };
+    for (auto& [layer, st] : mChunkAttn) {
+        if (layer < lo || layer > hi || !st.k) continue;
+        const std::size_t b = static_cast<std::size_t>(chunks) * st.window_elems * sizeof(nv_bfloat16);
+        add(layer, 0, st.k, b);
+        add(layer, 1, st.v, b);
+    }
+    for (auto& [layer, st] : mChunkGdn) {
+        if (layer < lo || layer > hi || !st.states) continue;
+        add(layer, 2, st.states, static_cast<std::size_t>(chunks + 1) * st.elems * sizeof(float));
+    }
+    for (auto& [layer, st] : mChunkConv) {
+        if (layer < lo || layer > hi || !st.tails) continue;
+        add(layer, 3, st.tails, static_cast<std::size_t>(chunks + 1) * st.elems * get_dtype_size(st.dtype));
+    }
+    if (!complete) return false;
+    for (const auto& p : parts)
+        CUDA_CHECK(cudaMemcpyAsync(p.dst, p.sn->host, p.bytes, cudaMemcpyHostToDevice, mRunState.MainStream));
+    return true;
+}
+
+void CompiledExecutor::invalidate_sequence_chunk_snapshots() {
+    mChunkSnapshotSaved.clear();
 }
 
 CompiledExecutor::ChunkGdnState& CompiledExecutor::chunk_gdn_state(long elems, int key) {
@@ -354,10 +485,10 @@ CompiledExecutor::ChunkGdnState& CompiledExecutor::chunk_gdn_state(long elems, i
         if (st.states) CUDA_CHECK(cudaFreeAsync(st.states, stream));
         if (st.d_state) CUDA_CHECK(cudaFreeAsync(st.d_state, stream));
         const std::size_t slots = static_cast<std::size_t>(mChunkCount) + 1;
-        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.states), slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.states), slots * need * sizeof(float), stream));
         CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.d_state), need * sizeof(float), stream));
         // Slot 0 (state before chunk 0) stays zero forever; zero it all once.
-        CUDA_CHECK(cudaMemsetAsync(st.states, 0, slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.states, 0, slots * need * sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, need * sizeof(float), stream));
         st.elems = need;
     }
@@ -402,12 +533,17 @@ void CompiledExecutor::free_sequence_chunk_state() {
             if (st.d_tail) cudaFreeAsync(st.d_tail, mRunState.MainStream);
         }
         cudaStreamSynchronize(mRunState.MainStream);
+        for (auto& [key, sn] : mChunkSnapshots)
+            if (sn.host) cudaFreeHost(sn.host);
     } else {
         (void)cudaGetLastError();
     }
     mChunkAttn.clear();
     mChunkGdn.clear();
     mChunkConv.clear();
+    mChunkSnapshots.clear();
+    mChunkSnapshotSaved.clear();
+    mChunkSnapshotBytes = 0;
     if (mChunkCuDev) {
         cudaFree(mChunkCuDev);
         mChunkCuDev = nullptr;
