@@ -77,7 +77,7 @@ advertising those capabilities through the router. See the
 | `POST` | `/sleep` | Free a model's GPU memory while saving it in system RAM; requires `--enable-sleep-mode` |
 | `POST` | `/wake_up` | Restore a sleeping model |
 | `GET` | `/is_sleeping` | Sleep state (`?model=NAME`) |
-| `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora`; `?model=NAME` targets a specific model on multi-model servers) |
+| `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime, or replace a loaded one, draining or in place (`--enable-lora`; `?model=NAME` targets a specific model on multi-model servers) |
 | `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name (`?model=NAME`) |
 | `GET` | `/health` | Process health; also answers while a model sleeps. `503` once an inference engine has stopped (see below) |
 | `GET` | `/kv_stats` | Cache memory use and active or waiting requests per model |
@@ -540,10 +540,11 @@ explanation if the adapter is incompatible or no slot is available for a new nam
 The default rank limit is 32; use
 `--max-lora-rank` at startup for larger supported adapters.
 
-Replacement and unloading wait for requests already using that adapter to finish.
+By default, replacement and unloading wait for requests already using that adapter to finish.
 Those requests keep their original policy for their entire response. New requests for the
 same adapter wait during the update; requests for other adapters and the base model can
-continue. After unloading, requests still waiting for that adapter receive an error.
+continue. After unloading, requests still waiting for that adapter receive an error. A
+replacement can instead happen in place, without waiting; see below.
 
 Waiting for active requests is bounded by `--pending-timeout-ms`. An update that times out returns HTTP 503
 and leaves the current adapter unchanged. An incompatible replacement also leaves it
@@ -556,6 +557,63 @@ every request in it, base requests included: the same model through different ke
 base request's scores there can differ slightly from the ones it gets alone, and the round is
 slower than a base round. `--batch-invariant` and `--devices` pipelines keep every round on
 the adapter-capable routes.
+
+A successful load replies in `text/plain`, not JSON: `Success: LoRA adapter 'my-tune' added
+successfully (loaded: version 1)`. An incompatible adapter returns HTTP 400 with the reason as
+text; a draining update that times out returns 503. A server that loads or replaces adapters
+repeatedly needs `MALLOC_ARENA_MAX=2` in its environment, or it grows by about an adapter's size
+in host memory with every load ([LoRA adapters](cli.md#lora-adapters)).
+
+### Replacing an adapter in place
+
+Draining suits occasional updates. An RL trainer that publishes a new policy every few minutes
+needs it to change under running rollouts instead. Add `"in_place": true` to the load, or start
+the server with `--lora-swap in-place` to make it the default for every load of a loaded name:
+
+```bash
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name": "policy", "lora_path": "/adapters/step-42", "in_place": true, "version": 42}'
+```
+
+- The call reads, validates and stages the adapter in page-locked host memory while the engine
+  serves: about 16 s for a 2.5 GB rank-16 adapter on every expert of a 35B-A3B mixture (13 s
+  reading and validating, 2.5 s staging). Requests that arrive meanwhile run at once, on the
+  current weights.
+- The engine then pauses at a round boundary to copy the new weights in and refresh its host
+  copy of them: 87 ms with eight long generations running, 0.2–0.7 s with sixteen on a busy
+  host, for that adapter. Requests in flight continue on the new weights from their next token;
+  none is held, restarted or refused.
+- `version`, a non-negative 32-bit integer, is the number the adapter's tokens report from now
+  on (an RL trainer passes its step). Omitted, it is the previous version plus one, and 1 for a
+  first load.
+- The reply names the swap: `Success: LoRA adapter 'policy' added successfully (swapped in
+  place: version 42, engine paused 212.3 ms, 2647.0 MiB staged in 2.51 s)`.
+- An adapter that fails validation leaves the current one serving. In-place loads take plain
+  LoRA: a module with a DoRA magnitude, a bias or a replacement weight is refused with its
+  name; load such an adapter without `in_place`.
+- Conversations the server retains, and cached prefixes, stay reusable across the swap: their
+  KV, computed under the earlier weights, continues under the new ones, as a request in flight
+  does. The host prefix cache keys its entries by the adapter's weights instead, so a
+  conversation only it holds is prefilled again once
+  ([Host prefix cache](cli.md#host-prefix-cache)).
+
+### Which version sampled each token
+
+A choice from an adapter request carries `lora_versions`: `[[first completion token, version],
+...]`, one entry for each run of tokens sampled under the same version. A response that started
+before an in-place swap and finished after it has two entries or more:
+
+```json
+"lora_versions": [[0, 41], [2973, 42]]
+```
+
+Here completion tokens 0–2972 were sampled with version 41 and the rest with version 42. The
+versions describe the sampled tokens; the prompt's KV may come from an earlier version. A
+draining replacement never splits a response. Chat Completions and `/v1/completions` report the
+field on each choice of an adapter request; a stream sends it with the token-id arrays
+(`return_token_ids: true`). An RL client takes each call's behaviour policy from it rather than
+from the time it sent the request.
 
 ## Responses API
 
