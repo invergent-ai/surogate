@@ -181,6 +181,10 @@ struct SparseMoeWeights {
     Weight routed_down;
     Weight shared_gate_up;
     Weight shared_down;
+    /// Weight-only NVFP4 (Marlin tiles) only: an expert's gate/up rows are [up; gate] -- an NVFP4
+    /// W4A4 checkpoint rewritten at load (--moe-route marlin) keeps the TRT-LLM runner's order --
+    /// rather than [gate; up].
+    bool routed_up_first = false;
     /// Routed experts selected per token; with the weight shapes this fixes the geometry.
     std::int32_t experts_per_token = 0;
     /// Optional per-layer device table I32 [experts] mapping an expert id to the row block the
@@ -227,6 +231,24 @@ struct SparseMoeWeights {
 /// scaffolding is the whole round and costs about half the throughput, so that width stays ours.
 /// `SUROGATE_SERVE_MOE_TRTLLM_MIN` overrides it, so the crossover can be re-measured.
 inline constexpr std::int32_t kSparseMoeTrtllmMinTokens = 2;
+
+/// Which kernels the routed NVFP4 experts take (`surogate serve --moe-route`). Process-wide, set
+/// once before the first model loads; reading it is a relaxed atomic load.
+///   Auto  -- the vendored TRT-LLM W4A4 runner from kSparseMoeTrtllmMinTokens columns, ours below:
+///            the fastest, but a token's arithmetic follows its round's width (FP4 activations and
+///            a tactic per width), so decode, verify and prefill disagree by ~0.05 nat per token.
+///   W4A16 -- our W4A16 kernels (BF16 activations) at every width: decode, verify and prefill
+///            agree, as adapter rounds always have (2026-10-29, W's NVFP4 on an RTX 5090: k3 to the
+///            trainer 0.0036-0.0047 against Auto's 0.0089-0.0098). Wide rounds are slower until
+///            they get a grouped W4A16 GEMM.
+///   Marlin -- the routed experts are rewritten into Marlin tiles at load (in place) and every
+///            width runs the weight-only NVFP4 route (sparse_moe_nvfp4: BF16 activations, FP4 codes
+///            dequantised in registers, grouped GEMMs per expert), so wide rounds keep tensor-core
+///            speed and every width shares one kernel family. The draft head's mixture is left
+///            as stored.
+enum class SparseMoeRoute : std::uint8_t { Auto, W4A16, Marlin };
+void set_sparse_moe_route(SparseMoeRoute route) noexcept;
+[[nodiscard]] SparseMoeRoute sparse_moe_route() noexcept;
 
 /// The widest round `sparse_moe` hands the routed-NVFP4 runner in one call, and therefore the
 /// width `sparse_moe_prepare` has to tune up to.

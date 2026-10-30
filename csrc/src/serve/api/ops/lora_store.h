@@ -173,6 +173,83 @@ public:
     /// The caller must first drain every request that can select this slot.
     void clear_slot(std::int32_t slot);
 
+    /// One slot's next content, prepared on the host for an in-place swap: every bank the adapter
+    /// covers as its padded A and B (alpha/r folded in, exactly as `set_slot` writes them), in pinned
+    /// memory and in device-address order, so `commit_staged` moves the whole slot in a few large
+    /// copies -- the banks are one arena, laid out back to back -- and clears the banks it does not
+    /// cover. Staging reads the adapter and writes host memory only, so it runs while the engine
+    /// serves; the commit is the part that needs the slot unread.
+    class StagedSlot {
+    public:
+        StagedSlot() = default;
+        ~StagedSlot();
+        StagedSlot(const StagedSlot&)            = delete;
+        StagedSlot& operator=(const StagedSlot&) = delete;
+        /// Bytes the commit copies from the host.
+        [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+
+    private:
+        friend class LoraStore;
+        struct Region {
+            void* device       = nullptr;
+            std::size_t offset = 0; ///< into the host image (copies only)
+            std::size_t bytes  = 0;
+        };
+        std::int32_t slot_ = -1;
+        void* host_        = nullptr;
+        std::size_t bytes_ = 0;
+        std::vector<Region> copies_;
+        std::vector<Region> zeros_;
+        /// Banks that keep a host mirror (`host_bank_table`), with where their new A and B sit in
+        /// the image, or SIZE_MAX for a bank the adapter does not cover.
+        struct Mirror {
+            const void* weight = nullptr;
+            std::int32_t port  = 0;
+            std::size_t a      = 0;
+            std::size_t b      = 0;
+        };
+        std::vector<Mirror> mirrors_;
+    };
+    /// One module of a staged adapter: what `set_module_slot` takes, for plain LoRA.
+    struct StagedModule {
+        std::int32_t layer = 0;
+        const std::string* module          = nullptr;
+        const std::vector<std::uint16_t>* a = nullptr;
+        const std::vector<std::uint16_t>* b = nullptr;
+        std::int32_t rank = 0, in_dim = 0, out_dim = 0;
+        float scale = 1.0F;
+    };
+    /// Stages `payloads` (the modules this store covers) as `slot`'s next content. Plain LoRA only:
+    /// a module with a DoRA magnitude, a bias or a base-weight replacement is refused with its name,
+    /// and such an adapter loads the drained way.
+    template<class Payload>
+    [[nodiscard]] std::unique_ptr<StagedSlot> stage_slot(std::int32_t slot,
+                                                         const std::vector<Payload>& payloads) const {
+        std::vector<StagedModule> modules;
+        for (const auto& p : payloads) {
+            if (!covers_layer(p.layer)) { continue; }
+            if (!p.magnitude.empty() || !p.bias.empty() || !p.lora_bias.empty() || !p.base_weight.empty()) {
+                throw std::invalid_argument("in-place adapter swap: module '" + p.module +
+                    "' carries a DoRA magnitude, a bias or a full weight; load it without in_place");
+            }
+            modules.push_back({p.layer, &p.module, &p.a, &p.b, p.rank, p.in_dim, p.out_dim, p.scale});
+        }
+        return stage_modules(slot, modules);
+    }
+    [[nodiscard]] std::unique_ptr<StagedSlot> stage_modules(std::int32_t slot,
+                                                            const std::vector<StagedModule>& modules) const;
+    /// Writes a staged slot into the banks: the covered banks' A and B from the image, the rest of
+    /// the slot (uncovered banks, every affine row, replacement pointers) cleared, host mirrors
+    /// refreshed. The caller guarantees nothing reads the slot meanwhile -- the engine paused
+    /// between rounds. Synchronous: the banks hold the new adapter when it returns.
+    void commit_staged(const StagedSlot& staged);
+
+    /// What a slot holds, as a number its loader chose (0 until a load sets one). An in-place swap
+    /// changes it between rounds only, so the version read when a round's tokens are appended is the
+    /// one that round ran with.
+    [[nodiscard]] std::uint32_t slot_version(std::int32_t slot) const noexcept;
+    void set_slot_version(std::int32_t slot, std::uint32_t version) noexcept;
+
     /// A digest of the adapter's content in `slot` (zero when none is known), set by whoever
     /// loads it. The KV tier keys a conversation's host snapshots by it: a slot number names a
     /// different adapter after a swap, its content does not.
@@ -295,6 +372,7 @@ private:
     std::int32_t scratch_tokens_ = 0;
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
+    std::unique_ptr<std::atomic<std::uint32_t>[]> versions_;
     std::atomic<bool> active_{false};
     mutable std::mutex identity_mutex_;
     std::map<std::int32_t, std::array<std::uint8_t, 16>> identities_;

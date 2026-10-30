@@ -174,15 +174,15 @@ namespace {
 // silu(gate) * up folded to [rows, intermediate], which our own kernel produces inline.
 __global__ void moe_silu_mul_kernel(const __nv_bfloat16* __restrict__ product,
                                     __nv_bfloat16* __restrict__ out, std::int32_t rows,
-                                    std::int32_t intermediate) {
+                                    std::int32_t intermediate, bool up_first) {
     const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t total = static_cast<std::int64_t>(rows) * intermediate;
     if (index >= total) { return; }
     const std::int64_t row    = index / intermediate;
     const std::int64_t column = index - row * intermediate;
     const std::int64_t base   = row * (2 * static_cast<std::int64_t>(intermediate));
-    const float gate          = __bfloat162float(product[base + column]);
-    const float up            = __bfloat162float(product[base + intermediate + column]);
+    const float gate          = __bfloat162float(product[base + (up_first ? intermediate : 0) + column]);
+    const float up            = __bfloat162float(product[base + (up_first ? 0 : intermediate) + column]);
     const float activated     = gate / (1.0F + __expf(-gate));
     out[index]                = __float2bfloat16(activated * up);
 }
@@ -190,13 +190,13 @@ __global__ void moe_silu_mul_kernel(const __nv_bfloat16* __restrict__ product,
 } // namespace
 
 void marlin_moe_silu_mul(const void* product, void* out, std::int32_t rows,
-                         std::int32_t intermediate, cudaStream_t stream) {
+                         std::int32_t intermediate, cudaStream_t stream, bool up_first) {
     const std::int64_t total = static_cast<std::int64_t>(rows) * intermediate;
     const int threads        = 256;
     const int blocks         = static_cast<int>((total + threads - 1) / threads);
     moe_silu_mul_kernel<<<blocks, threads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(product), static_cast<__nv_bfloat16*>(out), rows,
-        intermediate);
+        intermediate, up_first);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -16,6 +16,7 @@
 #include "ops/linear/marlin/marlin_nvfp4.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
@@ -238,11 +239,18 @@ void validate_nvfp4_marlin_weights(const SparseMoeWeights& weights,
                          "routed_gate_up", ranges);
     require_nvfp4_marlin(weights.routed_down, geometry.routed_down_rows(), geometry.intermediate,
                          "routed_down", ranges);
-    if (geometry.has_shared()) {
+    if (geometry.has_shared() && weights.shared_gate_up.qtype == QType::NVFP4_A16) {
         require_nvfp4_marlin(weights.shared_gate_up, geometry.shared_rows(), geometry.hidden,
                              "shared_gate_up", ranges);
         require_nvfp4_marlin(weights.shared_down, geometry.hidden, geometry.shared_intermediate,
                              "shared_down", ranges);
+    } else if (geometry.has_shared()) {
+        // A checkpoint rewritten at load (--moe-route marlin) keeps its shared expert as stored;
+        // the route runs it on that format's own kernels.
+        require_quantized(weights.shared_gate_up, geometry.shared_rows(), geometry.hidden,
+                          "shared_gate_up", ranges);
+        require_quantized(weights.shared_down, geometry.hidden, geometry.shared_intermediate,
+                          "shared_down", ranges);
     }
 }
 
@@ -536,7 +544,13 @@ std::int32_t small_t_widest_slice(std::int32_t min_tokens, std::int32_t max_toke
 /// decode and small-T kernels are faster: the runner permutes, groups and reduces for a batch,
 /// and at a handful of rows that scaffolding costs more than the GEMMs it enables. Measured, and
 /// overridable so the crossover can be re-measured rather than assumed.
+std::atomic<SparseMoeRoute> g_sparse_moe_route{SparseMoeRoute::Auto};
+
 std::int32_t trtllm_min_tokens() {
+    // --moe-route w4a16: never the runner, at any width.
+    if (g_sparse_moe_route.load(std::memory_order_relaxed) == SparseMoeRoute::W4A16) {
+        return std::numeric_limits<std::int32_t>::max();
+    }
     static const std::int32_t value = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_MOE_TRTLLM_MIN");
         if (raw == nullptr || *raw == '\0') { return kSparseMoeTrtllmMinTokens; }
@@ -545,6 +559,11 @@ std::int32_t trtllm_min_tokens() {
     }();
     return value;
 }
+
+void set_sparse_moe_route(SparseMoeRoute route) noexcept {
+    g_sparse_moe_route.store(route, std::memory_order_relaxed);
+}
+SparseMoeRoute sparse_moe_route() noexcept { return g_sparse_moe_route.load(std::memory_order_relaxed); }
 
 bool sparse_moe_prefill_routing_admitted(QType routed_gate_up, QType routed_down) noexcept {
     return detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
@@ -562,60 +581,70 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     if (detail::sparse_moe_nvfp4_profile(routed_gate_up, routed_down)) {
         return detail::sparse_moe_nvfp4_workspace_bytes(geometry, max_tokens);
     }
-    (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
-    const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
-    // The NVFP4 routed profile has no kernel of ours at any width: the prefill family carries it
-    // from a single token upwards, with the vendored runner computing the routed half.
-    const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
-    const bool fp8_profile   = detail::sparse_moe_routed_fp8_profile(routed_gate_up, routed_down);
-    const std::int32_t prefill_first =
-        nvfp4_profile ? trtllm_min_tokens()
-        : fp8_profile ? detail::sparse_moe_fp8_prefill_min()
-        : w8_profile  ? detail::kSparseMoePrefillW8W8Min
-                      : std::min(detail::sparse_moe_ggml_prefill_min(),
-                                 routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
-                                                                  : detail::kSparseMoePrefillQ4Q6Min);
-    // Under SparseMoeRouting::WidthInvariant an admitted pair takes the prefill family from one
-    // token. Only the prefill interval widens: the width-chosen terms stay, because a call can
-    // still fall back to them (an adapter-bound round, a hook that resolves experts), so this
-    // capacity covers the ByWidth capacity by construction.
-    const bool width_invariant =
-        routing == SparseMoeRouting::WidthInvariant &&
-        detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
-    // Adapted rounds execute their columns concurrently in one set of launches; a wide one runs
-    // the expert-major kernels in slices of at most kSparseMoeAdapterSlice.
-    std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry, max_tokens);
-    if (max_tokens >= detail::kSparseMoeAdapterGroupedMin) {
-        required = std::max(required, detail::sparse_moe_decode_workspace_bytes(
-                                          geometry, std::min(max_tokens, detail::kSparseMoeAdapterSlice),
-                                          true));
+    const auto stored_capacity = [&]() -> std::size_t {
+        (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
+        const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+        // The NVFP4 routed profile has no kernel of ours at any width: the prefill family carries it
+        // from a single token upwards, with the vendored runner computing the routed half.
+        const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+        const bool fp8_profile   = detail::sparse_moe_routed_fp8_profile(routed_gate_up, routed_down);
+        const std::int32_t prefill_first =
+            nvfp4_profile ? trtllm_min_tokens()
+            : fp8_profile ? detail::sparse_moe_fp8_prefill_min()
+            : w8_profile  ? detail::kSparseMoePrefillW8W8Min
+                          : std::min(detail::sparse_moe_ggml_prefill_min(),
+                                     routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
+                                                                      : detail::kSparseMoePrefillQ4Q6Min);
+        // Under SparseMoeRouting::WidthInvariant an admitted pair takes the prefill family from one
+        // token. Only the prefill interval widens: the width-chosen terms stay, because a call can
+        // still fall back to them (an adapter-bound round, a hook that resolves experts), so this
+        // capacity covers the ByWidth capacity by construction.
+        const bool width_invariant =
+            routing == SparseMoeRouting::WidthInvariant &&
+            detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
+        // Adapted rounds execute their columns concurrently in one set of launches; a wide one runs
+        // the expert-major kernels in slices of at most kSparseMoeAdapterSlice.
+        std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry, max_tokens);
+        if (max_tokens >= detail::kSparseMoeAdapterGroupedMin) {
+            required = std::max(required, detail::sparse_moe_decode_workspace_bytes(
+                                              geometry, std::min(max_tokens, detail::kSparseMoeAdapterSlice),
+                                              true));
+        }
+        const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
+        const std::int32_t small_last =
+            std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
+        if (small_first <= small_last) {
+            required =
+                std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, small_last));
+        }
+        if (nvfp4_profile && small_last >= detail::kSparseMoeSmallTMin) {
+            // Between the small-T bound and the runner's first width, an NVFP4 round still walks the
+            // small-T path in slices, so the widest slice any round in that band takes sets the
+            // requirement.
+            const std::int32_t slice =
+                small_t_widest_slice(std::max(min_tokens, detail::kSparseMoeSmallTMin),
+                                     std::min(max_tokens, prefill_first - 1));
+            required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, slice));
+        }
+        const std::int32_t prefill_interval_first =
+            width_invariant ? min_tokens : std::max(min_tokens, prefill_first);
+        if (prefill_interval_first <= max_tokens) {
+            required = std::max(required,
+                                detail::sparse_moe_prefill_workspace_bytes(
+                                    geometry, max_tokens, nvfp4_profile,
+                                    detail::sparse_moe_routed_int8_profile(routed_gate_up, routed_down),
+                                    fp8_profile));
+        }
+        return required + (native_shared ? native_shared_capacity(geometry, min_tokens, max_tokens) : 0);
+    };
+    // --moe-route marlin rewrites an NVFP4 checkpoint's routed experts into that profile at load,
+    // after the plan has read their stored format: hold either (the draft head keeps its own).
+    if (sparse_moe_route() == SparseMoeRoute::Marlin && routed_gate_up == QType::NVFP4 &&
+        routed_down == QType::NVFP4 && detail::sparse_moe_nvfp4_geometry(geometry)) {
+        return std::max(stored_capacity(), detail::sparse_moe_nvfp4_workspace_bytes(geometry, max_tokens) +
+                                               (std::size_t{4} << 20U)); // the stored shared expert's kernels
     }
-    const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
-    const std::int32_t small_last =
-        std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
-    if (small_first <= small_last) {
-        required =
-            std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, small_last));
-    }
-    if (nvfp4_profile && small_last >= detail::kSparseMoeSmallTMin) {
-        // Between the small-T bound and the runner's first width, an NVFP4 round still walks the
-        // small-T path in slices, so the widest slice any round in that band takes sets the
-        // requirement.
-        const std::int32_t slice =
-            small_t_widest_slice(std::max(min_tokens, detail::kSparseMoeSmallTMin),
-                                 std::min(max_tokens, prefill_first - 1));
-        required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, slice));
-    }
-    const std::int32_t prefill_interval_first =
-        width_invariant ? min_tokens : std::max(min_tokens, prefill_first);
-    if (prefill_interval_first <= max_tokens) {
-        required = std::max(required,
-                            detail::sparse_moe_prefill_workspace_bytes(
-                                geometry, max_tokens, nvfp4_profile,
-                                detail::sparse_moe_routed_int8_profile(routed_gate_up, routed_down),
-                                fp8_profile));
-    }
-    return required + (native_shared ? native_shared_capacity(geometry, min_tokens, max_tokens) : 0);
+    return stored_capacity();
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
@@ -713,12 +742,26 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     const QType gate_up = weights.routed_gate_up.qtype;
     const QType down    = weights.routed_down.qtype;
     if (detail::sparse_moe_nvfp4_profile(gate_up, down)) {
-        // The Marlin route takes every width; nothing has measured the adapter or the expert
-        // cache against it, so both are refused rather than run through kernels that cannot
-        // read Marlin tiles.
-        if (lora_active() && lora_current_round().valid() &&
-            lora_store_for_current_device().bank_table(weights.router_shared_gate.qdata) != nullptr) {
-            throw std::invalid_argument("sparse_moe: adapters on weight-only NVFP4 experts are not supported");
+        // The Marlin route takes every width, adapter rounds included: their deltas run on the
+        // route's own expert blocks (marlin_moe_lora.h). The expert cache cannot read Marlin
+        // tiles and is refused.
+        detail::SparseMoeNvfp4Adapters marlin_adapters;
+        const bool adapted = lora_active() && lora_current_round().valid() &&
+                             lora_store_for_current_device().bank_table(weights.router_shared_gate.qdata) != nullptr;
+        if (adapted) {
+            const auto& store         = lora_store_for_current_device();
+            const auto& adapter_round = lora_current_round();
+            marlin_adapters.banks       = store.bank_table(weights.router_shared_gate.qdata);
+            marlin_adapters.slots       = adapter_round.slots
+                                              ? static_cast<const std::int32_t*>(adapter_round.slots->data)
+                                              : adapter_round.uniform_cell;
+            marlin_adapters.slot_stride = adapter_round.slots ? 1 : 0;
+            marlin_adapters.slot_count  = store.slots();
+            marlin_adapters.rank        = store.max_rank();
+            if (marlin_adapters.rank > detail::kSparseMoeNvfp4MaxLoraRank) {
+                throw std::invalid_argument("sparse_moe: the Marlin route serves adapters up to rank " +
+                                            std::to_string(detail::kSparseMoeNvfp4MaxLoraRank));
+            }
         }
         if (hook.resolve != nullptr || hook.resolve_experts != nullptr) {
             throw std::invalid_argument(
@@ -735,7 +778,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                                : nvtx::Name::SparseMoeDecode,
                                     nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
         detail::sparse_moe_nvfp4(geometry, x, router_x, weights, destination, workspace, stream,
-                                 round_hook);
+                                 round_hook, adapted ? &marlin_adapters : nullptr);
         return;
     }
     // The NVFP4 routed profile has two arms. Wide rounds go to the vendored TRT-LLM runner

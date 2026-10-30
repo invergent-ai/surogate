@@ -9,6 +9,7 @@
 #include "ops/kernel/lora_fused_limits.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,8 +17,10 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace sinfer::ops {
@@ -28,6 +31,24 @@ struct StoreContextScope {
     explicit StoreContextScope(const void* owner) { bind_ops_context(static_cast<EngineOpsContext*>(const_cast<void*>(owner))); }
     ~StoreContextScope() { bind_ops_context(static_cast<EngineOpsContext*>(const_cast<void*>(previous))); }
 };
+
+// SUROGATE_SERVE_LORA_MODULES="fragment,...": the layer modules whose name contains none of the fragments get no
+// bank and are refused on their layer (globals and the sparse-MoE bank tables keep theirs). A projection without a
+// bank keeps its fused base route and launches no delta, so adapter rounds stop paying for projections no served
+// adapter covers -- e.g. "experts.,shared_expert" for adapters on the MoE experts only. Unset: every module.
+const std::vector<std::string>& served_module_fragments() {
+    static const std::vector<std::string> fragments = [] {
+        std::vector<std::string> out;
+        const char* raw = std::getenv("SUROGATE_SERVE_LORA_MODULES");
+        for (std::string rest = raw != nullptr ? raw : ""; !rest.empty();) {
+            const std::size_t comma = rest.find(',');
+            if (comma != 0) { out.push_back(rest.substr(0, comma)); }
+            rest = comma == std::string::npos ? std::string{} : rest.substr(comma + 1);
+        }
+        return out;
+    }();
+    return fragments;
+}
 
 float bf16_to_float(std::uint16_t bits) {
     const std::uint32_t word = static_cast<std::uint32_t>(bits) << 16U;
@@ -96,6 +117,7 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
     slots_          = slots;
     max_rank_       = max_rank;
     scratch_tokens_ = max_tokens;
+    versions_       = std::make_unique<std::atomic<std::uint32_t>[]>(static_cast<std::size_t>(slots));
     // The device memory -- scratch, slot cell, banks -- is allocated by
     // ensure_banks, in one arena, so that under sleep mode the whole adapter
     // estate is a single Offload region of the engine. Direct users that never
@@ -389,6 +411,26 @@ void LoraStore::ensure_banks() {
     // banks are already pointed at by the directory and by captured graphs.
     if (device_ < 0) { device_ = current_device(); }
     const bool need_round_state = scratch_ == nullptr;
+    if (const auto& fragments = served_module_fragments(); !fragments.empty()) {
+        std::unordered_set<Key, KeyHash> tabled;
+        for (const auto& [key, bindings] : table_bindings_) {
+            for (const auto& binding : bindings) {
+                if (binding.key) { tabled.insert(Key{binding.key, binding.port}); }
+            }
+        }
+        for (auto it = directory_.begin(); it != directory_.end();) {
+            const auto& [where, parts] = *it;
+            const bool served = where.first < 0 ||
+                std::any_of(fragments.begin(), fragments.end(),
+                            [&](const std::string& f) { return where.second.find(f) != std::string::npos; }) ||
+                std::any_of(parts.begin(), parts.end(), [&](const ModuleBinding& b) {
+                    return tabled.contains(Key{b.key, b.port}) || banks_.contains(Key{b.key, b.port});
+                });
+            if (served) { ++it; continue; }
+            layer_refusals_.emplace(where, "not served by this engine (SUROGATE_SERVE_LORA_MODULES)");
+            it = directory_.erase(it);
+        }
+    }
 
     std::size_t total = 0;
     if (need_round_state) {
@@ -711,6 +753,236 @@ void LoraStore::clear_slot(std::int32_t slot) {
                                   static_cast<std::size_t>(slot) * bank.view.b_stride,
                               0, static_cast<std::size_t>(bank.view.b_stride) * sizeof(std::uint16_t)));
     }
+}
+
+LoraStore::StagedSlot::~StagedSlot() {
+    if (host_ != nullptr) { (void)cudaFreeHost(host_); }
+}
+
+std::unique_ptr<LoraStore::StagedSlot>
+LoraStore::stage_modules(std::int32_t slot, const std::vector<StagedModule>& modules) const {
+    if (slots_ == 0 || slot < 0 || slot >= slots_) {
+        throw std::invalid_argument("lora_store: slot is outside the configured range");
+    }
+    // Which bank each module part fills: the same resolution set_module_slot makes.
+    struct Fill {
+        const StagedModule* module   = nullptr;
+        const ModuleBinding* binding = nullptr;
+    };
+    std::unordered_map<Key, Fill, KeyHash> fills;
+    for (const StagedModule& m : modules) {
+        validate_module(m.layer, *m.module, *m.a, *m.b, m.rank, m.in_dim, m.out_dim, m.scale);
+        for (const auto& binding : module_parts(m.layer, *m.module)) {
+            const Key key{binding.key, binding.port};
+            if (!banks_.contains(key)) {
+                throw std::logic_error("in-place adapter swap: module '" + *m.module + "' has no bank");
+            }
+            if (!fills.emplace(key, Fill{&m, &binding}).second) {
+                throw std::invalid_argument("adapter modules overlap at '" + *m.module + "'");
+            }
+        }
+    }
+
+    // The slot's regions of every bank. A covered bank sends A, B and its (neutral, zero) affine
+    // rows from the image, so with one slot a run of covered banks -- adjacent in the arena -- is
+    // one copy; an uncovered bank's regions are cleared on the device.
+    struct Planned {
+        char* device      = nullptr;
+        std::size_t bytes = 0;
+        const Bank* bank  = nullptr;
+        const Fill* fill  = nullptr;
+        int part          = 0; // 0 A, 1 B, 2 affine
+    };
+    auto staged   = std::make_unique<StagedSlot>();
+    staged->slot_ = slot;
+    std::vector<Planned> planned;
+    for (const auto& [key, bank] : banks_) {
+        const std::size_t a_bytes = static_cast<std::size_t>(bank.view.a_stride) * sizeof(std::uint16_t);
+        const std::size_t b_bytes = static_cast<std::size_t>(bank.view.b_stride) * sizeof(std::uint16_t);
+        char* a = static_cast<char*>(bank.a) + static_cast<std::size_t>(slot) * a_bytes;
+        char* b = static_cast<char*>(bank.b) + static_cast<std::size_t>(slot) * b_bytes;
+        const auto found = fills.find(key);
+        const Fill* fill = found == fills.end() ? nullptr : &found->second;
+        const auto place = [&](char* device, std::size_t bytes, int part) {
+            if (fill != nullptr) {
+                planned.push_back({device, bytes, &bank, fill, part});
+            } else {
+                staged->zeros_.push_back({device, 0, bytes});
+            }
+        };
+        place(a, a_bytes, 0);
+        place(b, b_bytes, 1);
+        if (bank.affine) {
+            for (int half = 0; half < 2; ++half) {
+                const std::size_t offset =
+                    (static_cast<std::size_t>(half) * slots_ + slot) * static_cast<std::size_t>(bank.view.n);
+                place(reinterpret_cast<char*>(static_cast<float*>(bank.affine) + offset),
+                      static_cast<std::size_t>(bank.view.n) * sizeof(float), 2);
+            }
+        }
+    }
+    const auto by_device = [](const auto& x, const auto& y) { return x.device < y.device; };
+    std::sort(planned.begin(), planned.end(), by_device);
+    std::size_t total = 0;
+    for (const Planned& item : planned) { total += item.bytes; }
+    // Pinned, so the commit's copies run at the bus's speed and asynchronously.
+    CUDA_CHECK(cudaHostAlloc(&staged->host_, std::max<std::size_t>(total, 1), cudaHostAllocPortable));
+    staged->bytes_ = total;
+
+    std::unordered_map<Key, std::pair<std::size_t, std::size_t>, KeyHash> placed; // A and B offsets
+    std::size_t offset = 0;
+    for (const Planned& item : planned) {
+        char* out_bytes = static_cast<char*>(staged->host_) + offset;
+        const StagedModule& m = *item.fill->module;
+        const Bank& bank      = *item.bank;
+        if (item.part == 0) {
+            // A padded to max_rank rows with alpha/r folded in, as set_slot writes it.
+            auto* out              = reinterpret_cast<std::uint16_t*>(out_bytes);
+            const std::int32_t in  = bank.view.k;
+            for (std::int32_t r = 0; r < max_rank_; ++r) {
+                for (std::int32_t i = 0; i < in; ++i) {
+                    out[static_cast<std::size_t>(r) * in + i] =
+                        r < m.rank ? float_to_bf16(bf16_to_float((*m.a)[static_cast<std::size_t>(r) * in + i]) *
+                                                   m.scale)
+                                   : std::uint16_t{0};
+                }
+            }
+        } else if (item.part == 1) {
+            // B padded to max_rank columns, the binding's rows of the checkpoint's B.
+            auto* out                      = reinterpret_cast<std::uint16_t*>(out_bytes);
+            const ModuleBinding& binding   = *item.fill->binding;
+            for (std::int32_t row = 0; row < bank.view.n; ++row) {
+                const std::size_t source = static_cast<std::size_t>(binding.source_row(row)) * m.rank;
+                for (std::int32_t r = 0; r < max_rank_; ++r) {
+                    out[static_cast<std::size_t>(row) * max_rank_ + r] =
+                        r < m.rank ? (*m.b)[source + r] : std::uint16_t{0};
+                }
+            }
+        } else {
+            std::memset(out_bytes, 0, item.bytes); // plain LoRA: neutral affine rows
+        }
+        if (item.part < 2) {
+            const Key key{item.fill->binding->key, item.fill->binding->port};
+            auto& where = placed[key];
+            (item.part == 0 ? where.first : where.second) = offset;
+        }
+        if (!staged->copies_.empty() &&
+            static_cast<char*>(staged->copies_.back().device) + staged->copies_.back().bytes == item.device) {
+            staged->copies_.back().bytes += item.bytes;
+        } else {
+            staged->copies_.push_back({item.device, offset, item.bytes});
+        }
+        offset += item.bytes;
+    }
+    std::sort(staged->zeros_.begin(), staged->zeros_.end(), by_device);
+    std::vector<StagedSlot::Region> zeros;
+    for (const auto& region : staged->zeros_) {
+        if (!zeros.empty() && static_cast<char*>(zeros.back().device) + zeros.back().bytes == region.device) {
+            zeros.back().bytes += region.bytes;
+        } else {
+            zeros.push_back(region);
+        }
+    }
+    staged->zeros_ = std::move(zeros);
+    for (const auto& [key, bank] : banks_) {
+        if (bank.host_a.empty() && bank.host_affine.empty()) { continue; }
+        const auto found = placed.find(key);
+        staged->mirrors_.push_back({key.weight, key.port,
+                                    found == placed.end() ? SIZE_MAX : found->second.first,
+                                    found == placed.end() ? SIZE_MAX : found->second.second});
+    }
+    return staged;
+}
+
+void LoraStore::commit_staged(const StagedSlot& staged) {
+    const std::int32_t slot = staged.slot_;
+    if (slot < 0 || slot >= slots_) { throw std::invalid_argument("lora_store: staged slot is out of range"); }
+    const auto t0 = std::chrono::steady_clock::now();
+    const ScopedDevice on_store(device_ < 0 ? current_device() : device_);
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    try {
+        for (const auto& region : staged.zeros_) {
+            CUDA_CHECK(cudaMemsetAsync(region.device, 0, region.bytes, stream));
+        }
+        for (const auto& region : staged.copies_) {
+            CUDA_CHECK(cudaMemcpyAsync(region.device, static_cast<const char*>(staged.host_) + region.offset,
+                                       region.bytes, cudaMemcpyHostToDevice, stream));
+        }
+    } catch (...) {
+        (void)cudaStreamSynchronize(stream);
+        (void)cudaStreamDestroy(stream);
+        throw;
+    }
+    const auto t_enqueued = std::chrono::steady_clock::now();
+    // The host mirrors (the expert cache's CPU copies) are refreshed while the copies run: the
+    // image is read-only to both, and several threads keep this under the bus transfer.
+    std::size_t mirror_bytes = 0;
+    {
+        const char* image = static_cast<const char*>(staged.host_);
+        const auto refresh = [&](std::size_t first, std::size_t last) {
+            for (std::size_t i = first; i < last; ++i) {
+                const auto& mirror = staged.mirrors_[i];
+                Bank& bank         = banks_.at(Key{mirror.weight, mirror.port});
+                if (!bank.host_a.empty()) {
+                    auto* a = bank.host_a.data() + static_cast<std::size_t>(slot) * bank.view.a_stride;
+                    auto* b = bank.host_b.data() + static_cast<std::size_t>(slot) * bank.view.b_stride;
+                    if (mirror.a == SIZE_MAX) {
+                        std::fill_n(a, bank.view.a_stride, std::uint16_t{0});
+                        std::fill_n(b, bank.view.b_stride, std::uint16_t{0});
+                    } else {
+                        std::memcpy(a, image + mirror.a,
+                                    static_cast<std::size_t>(bank.view.a_stride) * sizeof(std::uint16_t));
+                        std::memcpy(b, image + mirror.b,
+                                    static_cast<std::size_t>(bank.view.b_stride) * sizeof(std::uint16_t));
+                    }
+                }
+                if (!bank.host_affine.empty()) {
+                    for (int half = 0; half < 2; ++half) {
+                        std::fill_n(bank.host_affine.data() +
+                                        (static_cast<std::size_t>(half) * slots_ + slot) * bank.view.n,
+                                    bank.view.n, 0.0F);
+                    }
+                }
+            }
+        };
+        for (const auto& mirror : staged.mirrors_) {
+            const Bank& bank = banks_.at(Key{mirror.weight, mirror.port});
+            mirror_bytes += (static_cast<std::size_t>(bank.view.a_stride) + bank.view.b_stride) * sizeof(std::uint16_t);
+        }
+        const std::size_t count   = staged.mirrors_.size();
+        const std::size_t workers = count < 64 ? 1 : 8;
+        std::vector<std::thread> threads;
+        for (std::size_t w = 1; w < workers; ++w) {
+            threads.emplace_back(refresh, count * w / workers, count * (w + 1) / workers);
+        }
+        refresh(0, count / workers);
+        for (auto& thread : threads) { thread.join(); }
+    }
+    const auto t_mirrored = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    // Plain LoRA replaces no base weight: every replacement pointer of the slot goes back to none.
+    for (auto& [key, replacement] : replacements_) {
+        void* empty = nullptr;
+        CUDA_CHECK(cudaMemcpy(replacement.table + slot, &empty, sizeof(empty), cudaMemcpyHostToDevice));
+        replacement.values[slot].reset();
+    }
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::fprintf(stderr,
+                 "lora: in-place commit slot %d on device %d: %zu copies (%.1f MiB), %zu clears, %zu mirrors "
+                 "(%.1f MiB): enqueue %.1f ms, mirrors %.1f ms, copies done %.1f ms\n",
+                 slot, device_, staged.copies_.size(), static_cast<double>(staged.bytes_) / (1 << 20),
+                 staged.zeros_.size(), staged.mirrors_.size(), static_cast<double>(mirror_bytes) / (1 << 20),
+                 ms(t0, t_enqueued), ms(t_enqueued, t_mirrored), ms(t0, std::chrono::steady_clock::now()));
+}
+
+std::uint32_t LoraStore::slot_version(std::int32_t slot) const noexcept {
+    return versions_ && slot >= 0 && slot < slots_ ? versions_[slot].load(std::memory_order_relaxed) : 0U;
+}
+
+void LoraStore::set_slot_version(std::int32_t slot, std::uint32_t version) noexcept {
+    if (versions_ && slot >= 0 && slot < slots_) { versions_[slot].store(version, std::memory_order_relaxed); }
 }
 
 void LoraStore::write_uniform_slot(std::int32_t slot, cudaStream_t stream) const {

@@ -1508,6 +1508,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_lora.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/sparse_moe_nvfp4.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp

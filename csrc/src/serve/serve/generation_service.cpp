@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "serve/generation_service.h"
+#include "api/ops/sparse_moe.h"
 #include "serve/vllm_max_tokens.h"
 #include "serve/vllm_qwen3_parser.h"
 #include <set>
@@ -1163,6 +1164,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     outcome.prompt_scores = std::move(result.prompt_logprobs);
     outcome.completion_scores = std::move(result.completion_logprobs);
+    outcome.lora_versions = std::move(result.lora_versions);
     if (prepared.return_routed_experts) {
         // The engine keeps one row per sequence position it ran: the prompt (prefix-cache
         // positions as -1) then every generated token fed back through the model -- all but the
@@ -1335,6 +1337,13 @@ void GenerationService::answer_after_thinking_guard(PreparedRequest& prepared, s
                                          answered.token_logprobs.end());
         } else {
             result.token_logprobs.insert(result.token_logprobs.end(), answer_tokens, none);
+        }
+    }
+    // The answer's version runs follow the thought and the close it was continued from.
+    for (auto run : answered.lora_versions) {
+        run[0] += static_cast<std::uint32_t>(tokens.size());
+        if (result.lora_versions.empty() || result.lora_versions.back()[1] != run[1]) {
+            result.lora_versions.push_back(run);
         }
     }
     result.generated_token_ids = std::move(tokens);
@@ -2155,7 +2164,8 @@ void GenerationService::clear_lora_slot_everywhere(std::int32_t slot) {
     }
 }
 
-void GenerationService::load_lora_adapter(const std::string& name, const std::string& path) {
+std::string GenerationService::load_lora_adapter(const std::string& name, const std::string& path,
+                                                 const LoraLoadOptions& load) {
     if (!options_.borrowed_weights.empty()) {
         throw std::invalid_argument("shared GRPO adapters are published by the trainer");
     }
@@ -2197,6 +2207,17 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
                         "with `surogate merge`, then convert and serve the merged checkpoint.");
     }
 
+    // The Marlin MoE route (--moe-route marlin) applies routed and shared expert deltas only.
+    if (ops::sparse_moe_route() == ops::SparseMoeRoute::Marlin) {
+        for (const auto& payload : payloads) {
+            const std::string& m = payload.module;
+            if (m == "mlp.gate" || m == "mlp.shared_expert_gate" || m == "router.proj" ||
+                m == "feed_forward.router" || m == "feed_forward.gate") {
+                throw std::invalid_argument("adapter '" + name + "': module '" + m +
+                                            "' adapts the router, which --moe-route marlin does not serve");
+            }
+        }
+    }
     // Validate every module before draining requests or changing a live adapter.
     // An incompatible replacement leaves the current policy untouched.
     for (const auto& payload : payloads) {
@@ -2225,8 +2246,53 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             if (const auto* store = stores.peek(device)) { store->validate_payloads(payloads); }
         }
     }
+    const bool loaded       = lora_slots_.find(name) >= 0;
+    const auto next_version = [&](std::int32_t slot) {
+        if (load.version) { return *load.version; }
+        const ops::LoraStore* store = devices.empty() ? nullptr : stores.peek(devices.front());
+        return loaded && store != nullptr ? store->slot_version(slot) + 1U : 1U;
+    };
+    if (load.in_place.value_or(options_.lora_swap_in_place) && loaded) {
+        // In place: nothing waits for the adapter's requests. Stage every store's image while the
+        // engine serves, then copy them in at one round boundary.
+        auto swap       = lora_slots_.swap(name, adapter_update_deadline(options_));
+        const auto slot = swap.slot();
+        const auto t0   = std::chrono::steady_clock::now();
+        std::vector<std::pair<ops::LoraStore*, std::unique_ptr<ops::LoraStore::StagedSlot>>> staged;
+        std::size_t staged_bytes = 0;
+        for (int device : devices) {
+            ops::LoraStore* store = stores.peek(device);
+            if (store == nullptr || !store->has_bindings()) { continue; }
+            const ScopedDevice on_store(store->device() >= 0 ? store->device() : device);
+            staged.emplace_back(store, store->stage_slot(slot, payloads));
+            staged_bytes += staged.back().second->bytes();
+        }
+        const double staging_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const std::uint32_t version = next_version(slot);
+        std::lock_guard memory_lock(adapter_memory_mutex_);
+        if (engine_->is_sleeping()) {
+            throw std::invalid_argument("the model is asleep; wake it before loading an adapter");
+        }
+        const double paused = engine_->with_execution_paused([&] {
+            for (auto& [store, image] : staged) {
+                store->commit_staged(*image);
+                store->set_slot_identity(slot, kv_identity);
+                store->set_slot_version(slot, version);
+            }
+        });
+        // Conversations kept on the GPU stay reusable: like the requests in flight, they carry on
+        // under the new adapter. Host-tier snapshots are keyed by the old identity and stop matching.
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "swapped in place: version %u, engine paused %.1f ms, %.1f MiB staged in %.2f s",
+                      version, paused * 1e3, static_cast<double>(staged_bytes) / (1024.0 * 1024.0),
+                      staging_seconds);
+        return line;
+    }
     auto update = lora_slots_.update(name, adapter_update_deadline(options_));
     const auto slot = update.slot();
+    const std::uint32_t version = next_version(slot);
     std::lock_guard memory_lock(adapter_memory_mutex_);
     if (engine_->is_sleeping()) {
         throw std::invalid_argument("the model is asleep; wake it before loading an adapter");
@@ -2243,6 +2309,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
         for (int device : devices) {
             if (ops::LoraStore* store = stores.peek(device)) {
                 store->set_slot_identity(slot, kv_identity);
+                store->set_slot_version(slot, version);
                 store->set_active(true);
             }
         }
@@ -2256,6 +2323,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
         throw;
     }
     update.commit();
+    return "loaded: version " + std::to_string(version);
 }
 
 void GenerationService::unload_lora_adapter(const std::string& name) {

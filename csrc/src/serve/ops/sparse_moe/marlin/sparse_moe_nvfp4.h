@@ -10,6 +10,7 @@
 // the residual. Every width runs this, from one decode token to a prefill round in slices, so
 // there is no other route for these weights to fall back to and none is needed.
 
+#include "api/ops/lora.h"
 #include "api/ops/sparse_moe.h"
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -34,15 +35,27 @@ inline constexpr std::int32_t kSparseMoeNvfp4Slice = 1024;
 /// SiLU shared expert (or none) -- the Qwen3.5/3.6 mixtures, at any width.
 [[nodiscard]] bool sparse_moe_nvfp4_geometry(const SparseMoeGeometry& geometry) noexcept;
 
-/// Workspace one call of up to `max_tokens` tokens needs.
+/// Workspace one call of up to `max_tokens` tokens needs (adapters included).
 [[nodiscard]] std::size_t sparse_moe_nvfp4_workspace_bytes(const SparseMoeGeometry& geometry,
                                                            std::int32_t max_tokens);
+
+/// An adapter round's selection on this route: the mixture's bank table, each token's slot
+/// (stride 1) or the round's uniform cell (stride 0), the store's slot count and max rank.
+struct SparseMoeNvfp4Adapters {
+    const LoraBank* banks     = nullptr;
+    const std::int32_t* slots = nullptr;
+    std::int32_t slot_stride  = 0;
+    std::int32_t slot_count   = 0;
+    std::int32_t rank         = 0;
+};
+/// Low-rank rows the adapter deltas stage: the largest rank this route serves.
+inline constexpr std::int32_t kSparseMoeNvfp4MaxLoraRank = 64;
 
 /// The round, `destination += sparse_moe(x)`. The weights are validated by the wrapper; `hook`
 /// may capture the routing (its `resolve` is refused there).
 void sparse_moe_nvfp4(const SparseMoeGeometry& geometry, const Tensor& x, const Tensor& router_x,
                       const SparseMoeWeights& weights, Tensor& destination,
                       WorkspaceArena& workspace, cudaStream_t stream,
-                      const SparseMoeRoundHook* hook);
+                      const SparseMoeRoundHook* hook, const SparseMoeNvfp4Adapters* adapters = nullptr);
 
 } // namespace sinfer::ops::detail

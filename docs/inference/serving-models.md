@@ -54,6 +54,43 @@ Adjust the settings to your workload:
   weights. The benefit depends on the prompts, hardware, and number of simultaneous requests.
   By default, MTP checks drafts only while one request is decoding.
 
+### Rollout server for RL with adapters
+
+An RL run samples agent rollouts from the policy, an adapter the trainer replaces every step,
+and trains on the sampled tokens' log-probabilities. One such server per GPU, for a rank-16
+adapter on the experts of Surogate3.7-35B-A3B:
+
+```bash
+MALLOC_ARENA_MAX=2 SUROGATE_SERVE_LORA_MODULES=experts.,shared_expert \
+surogate serve surogate/Surogate3.7-35B-A3B-NVFP4 --device 0 --port 8000 \
+  --max-model-len 132096 --kv-cache-dtype fp8 --kv-capacity 400000 \
+  --max-num-seqs 16 --max-num-batched-tokens 4096 --spec mtp --draft-tokens 2 --spec-max-lanes all \
+  --enable-lora --max-loras 1 --max-lora-rank 16 --lora-swap in-place --moe-route marlin \
+  --prefix-cache-host-gb 8
+```
+
+- `--moe-route marlin` keeps decode, prefill and the trainer in agreement under the adapter;
+  the default route's adapter path scores some tokens too low
+  ([NVFP4 expert route](cli.md#nvfp4-expert-route)).
+- `--lora-swap in-place` lets each step's adapter replace the policy under the running
+  rollouts, and every choice reports in `lora_versions` which version sampled its tokens
+  ([Replacing an adapter in place](api.md#replacing-an-adapter-in-place)).
+- `MALLOC_ARENA_MAX=2` is required: without it each swap leaves about an adapter's size of
+  host memory behind (2.4 GiB for this adapter).
+- `SUROGATE_SERVE_LORA_MODULES` gives adapter banks to the experts only, so attention and
+  linear-attention projections keep their fused base kernels: 8 % more decode and 16 % more
+  prefill under the adapter. In one test the server's prefill of its own rollouts was then
+  further from the trainer (k3 0.0189) than its sampled log-probabilities were (0.0055), so a
+  server that scores rollouts by prefill (KL panels, evaluations) runs without it.
+- `--prefix-cache-host-gb 8` resumes agent conversations the KV cache drops between turns
+  from host RAM: 85 % of the later turns' prompts cached instead of 15 % in our test
+  ([Host prefix cache](cli.md#host-prefix-cache)).
+
+On one RTX 5090 this server decodes 1,943 tokens/s for 16 requests and prefills 16,662 tokens/s
+under the adapter, against 2,224 and 19,218 for the base model. Each server holds about 12 GiB of
+host memory plus its tier: eight on a 251 GiB host with the model in `/dev/shm` take about
+160 GiB.
+
 ## GGUF model
 
 Point `surogate serve` at the `.gguf` file:

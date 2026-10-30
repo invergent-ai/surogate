@@ -16,8 +16,10 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -752,6 +754,28 @@ void Engine::shrink_kv() {
         [](auto& executor) {
             using Executor = std::remove_cvref_t<decltype(executor)>;
             if constexpr (!std::is_same_v<Executor, std::monostate>) { executor->shrink_kv(); }
+        },
+        impl_->executor);
+}
+
+double Engine::with_execution_paused(const std::function<void()>& fn) {
+    const ScopedDevice on_engine_device(impl_->device.device, /*restore_always=*/true);
+    return std::visit(
+        [&](auto& executor) -> double {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                auto paused        = executor->pause_execution_promptly();
+                const auto started = std::chrono::steady_clock::now();
+                for (int device : devices()) {
+                    CUDA_CHECK(cudaSetDevice(device));
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
+                CUDA_CHECK(cudaSetDevice(impl_->device.device));
+                fn();
+                return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            }
         },
         impl_->executor);
 }

@@ -133,7 +133,16 @@ surogate serve surogate/Surogate3.7-35B-A3B-NVFP4 --devices 0,1,2,3 --data-paral
 How much to give it: enough for the conversations that wait while others hold the GPU. With 24
 agents replaying recorded tool-calling conversations of up to 100k tokens on four GPUs (FP8 cache
 of 300k tokens each, 262,144 context), 2 GiB per GPU still let 18 % of the long turns prefill
-again and 8 GiB per GPU none.
+again and 8 GiB per GPU none. An RL rollout server on one RTX 5090 (FP8 cache of 400k tokens,
+an adapter loaded) running ten agent conversations that grow to 100k tokens, four at a time, kept
+85 % of the later turns' prompts cached with 8 GiB, against 15 % without the tier, and a turn took
+7.1 s instead of 18.8 s; 4 GiB held two or three of those conversations and kept 23 %.
+
+Across an in-place adapter swap (`--lora-swap in-place`), conversations on the GPU continue with
+the KV they have, as requests in flight do. The host's entries are keyed by the adapter's
+weights, so a conversation that only the host holds prefills again once under the new adapter,
+and its next finished turn is stored under it. With two swaps during the RL test above, the hit
+rate stayed at 83–90 %.
 
 `0` keeps nothing on the host, not even the 512 MiB archive.
 
@@ -308,6 +317,46 @@ misses, so a fully cached expert does not need CPU execution.
 Automatic host precision keeps four-bit, five-bit, and wider source weights at suitable
 precisions. Force `q4` only when you want the RAM saving from reducing wider weights to four bits.
 
+### NVFP4 expert route
+
+`--moe-route` chooses the kernels for the routed experts of an NVFP4 mixture
+(Surogate3.7-35B-A3B and other Qwen3.5/3.6 mixtures in NVFP4):
+
+| Route | What runs the routed experts |
+|---|---|
+| `auto` (default) | Rounds of two or more tokens: the FP4-activation (W4A4) runner, fastest in prefill. One-token rounds and adapter rounds: BF16-activation (W4A16) kernels |
+| `w4a16` | The BF16-activation kernels at every round width |
+| `marlin` | The experts are rewritten into Marlin tiles at load and every width runs on BF16 activations, with grouped tensor-core GEMMs; adapter deltas run on the same expert tiles |
+
+The FP4-activation runner's result for a token depends on how many tokens share its round, so
+under `auto` a token's log-probability at decode differs from the one a prefill of the same text
+gives it, with a fat tail. One RTX 5090 serving Surogate3.7-35B-A3B with MTP 2, an FP8 cache and
+16 requests at once:
+
+| Route | Decode / prefill tokens/s, no adapter | With a rank-16 expert adapter | Decode vs prefill k3, no adapter |
+|---|---|---|---|
+| `auto` | 2,238 / 26,498 | 714 / 4,742 | 0.0117 |
+| `w4a16` | 1,469 / 2,654 | — | 0.0054 |
+| `marlin` | 2,224 / 19,218 | 1,728 / 14,418 | 0.0053–0.0060 |
+
+Use `marlin` when the server serves adapters, and wherever decode and prefill log-probabilities
+are compared (RL rollouts, KL panels). A trainer re-scoring the server's rollouts under an
+adapter of realistic size (rank 16, a mean shift of 0.11 nats a token from the base model) agreed
+with `marlin` nearly as closely as with the base model, and less with `auto`:
+
+| Rollouts scored by the trainer | k3 against the sampled log-probabilities | Tokens more than 1 / 2 / 3 nats apart |
+|---|---|---|
+| No adapter (`w4a16`) | 0.0047 | 11 / 0 / 0 per 17k |
+| Adapter, `marlin` | 0.0055 | 9 / 1 / 0 per 8.5k |
+| Adapter, `auto` | 0.0076 | 23 / 2 / 1 per 8.4k |
+
+Prefill of a fixed text under the adapter put `auto` further off (k3 0.0395, 56 / 16 / 7
+tokens) than `marlin` (0.0074, 25 / 1 / 1). The default route's adapter path scores some of the
+tokens the adapter moves most too low: where the two routes differ by more than a nat, the
+trainer sides with `marlin` on 49 of 65 tokens. `marlin` does not apply router adapters
+(`mlp.gate` and its aliases): an adapter that has them is refused. `auto` stays the default
+for serving the base model, where its prefill is fastest.
+
 ### Scheduling
 
 | Flag | Default | Meaning |
@@ -444,6 +493,7 @@ requests at the same time.
 | `--lora-modules name=path,...` | — | Adapter directories to load at startup |
 | `--max-loras N` | 1 | Maximum loaded adapters per model |
 | `--max-lora-rank N` | 32 | Largest adapter rank accepted |
+| `--lora-swap in-place\|drain` | `drain` | How loading a name that is already loaded replaces it: `in-place` swaps the weights at a round boundary while that adapter's requests keep running; `drain` waits for them to finish. The load's `"in_place"` field overrides it per call |
 
 LoRA and DoRA adapters support the following modules, where they exist in the checkpoint:
 
@@ -487,6 +537,29 @@ skipped; a rejected replacement leaves the currently loaded adapter available.
 Additional models have their own adapters through `lora=name:path` in `--model`. Every model
 and adapter name must be unique. The runtime load/unload endpoints accept `?model=NAME`; see
 [LoRA adapters at runtime](api.md#lora-adapters-at-runtime).
+
+An RL trainer that publishes a new adapter every step replaces it in place: with
+`--lora-swap in-place` the new weights are staged in host memory while the engine serves and
+copied in at the next round boundary, requests in flight continue on them, and every choice
+reports which adapter version sampled its tokens. See
+[Replacing an adapter in place](api.md#replacing-an-adapter-in-place). On an NVFP4 mixture,
+serve adapters with `--moe-route marlin` ([NVFP4 expert route](#nvfp4-expert-route)).
+
+A server that loads or replaces adapters repeatedly needs `MALLOC_ARENA_MAX=2` in its
+environment. A load parses the adapter into tens of thousands of small buffers on an HTTP
+thread, and glibc keeps the freed ones in that thread's arena, so without the cap the process
+grows by about an adapter's size with every load: twelve in-place swaps of a 2.5 GB rank-16
+expert adapter took the server from 11.2 to 30.3 GiB of resident memory, and with
+`MALLOC_ARENA_MAX=2` it stayed at 11.2 GiB.
+
+When the adapters cover only part of the model, such as the experts of a mixture,
+`SUROGATE_SERVE_LORA_MODULES` limits the adapter banks to those modules (see
+[Environment](#environment)). Every other projection then keeps its fused base route in adapter
+rounds and runs no delta: on `--moe-route marlin` with an expert-only adapter,
+`SUROGATE_SERVE_LORA_MODULES=experts.,shared_expert` raised adapter decode from 1,728 to
+1,943 tokens/s and prefill from 14,418 to 16,662 on one RTX 5090. Those projections' outputs
+in adapter rounds then match base rounds instead of the adapter-capable routes: a
+rounding-level change.
 
 ### Sampling defaults
 
@@ -748,9 +821,12 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | GPU memory kept free when sharing caches across models; default 1024 MiB |
 | `SUROGATE_SERVE_DFLASH_PACKED_PREFILL` | `1` lets a DFlash server prefill several waiting prompts in one round, as a server without speculation does; off by default. See [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair) |
 | `SUROGATE_SERVE_MOE_TRTLLM_FUSED_FINALIZE` | `1` lets NVFP4 mixture experts add their outputs in the GEMM epilogue: up to about 3% faster, but the same request can then get slightly different answers from run to run; off by default |
+| `SUROGATE_SERVE_LORA_MODULES` | Comma-separated fragments of adapter module names, such as `experts.,shared_expert`. Only layer modules whose name contains one get an adapter bank; embeddings, the output head and a mixture's router and expert tables keep theirs. Projections without a bank keep their fused base kernels in adapter rounds and run no delta. An adapter that covers another module then fails to load, naming it. Unset: every module. See [LoRA adapters](#lora-adapters) |
+| `SUROGATE_SERVE_MARLIN_LORA_FAST` | `0` runs `--moe-route marlin`'s wide adapter rounds (more than 1,024 routed rows) on the earlier grouped kernels: the same results, slower prefill (9,836 instead of 14,418 tokens/s in the table under [NVFP4 expert route](#nvfp4-expert-route)). A fallback |
 | `SUROGATE_SERVE_PREFILL_GRAPH_BUDGET_MIB` | GPU memory for prefill and mixed-round CUDA graphs captured while serving; new shapes run without a graph once it is spent; default 512 MiB, 0 captures none |
 | `SUROGATE_SERVE_PROMPT_TOKEN_REUSE` | By default a prompt that opens with a recent prompt's text, such as an agent's next turn, reuses that prompt's token ids and tokenizes only the rest, with the same ids as a whole encode. `0` tokenizes every prompt whole; `verify` tokenizes both ways and fails the request if they differ |
 | `SUROGATE_SERVE_PROMPT_ATTENTION_FP8_PV` | With an FP8 KV cache on compute capability 12.x GPUs (RTX 50 series, RTX PRO 6000, DGX Spark), prompt attention over 128- and 256-wide heads in layers without a sliding window multiplies the probabilities, rounded to e4m3, with V's cached codes on the FP8 tensor cores (a third faster on a DGX Spark, with the same accuracy in our measurements). `0` keeps that product in bf16 |
+| `MALLOC_ARENA_MAX` | glibc's arena limit. Set `2` for a server that loads or replaces adapters repeatedly, or it grows by about an adapter's size per load; see [LoRA adapters](#lora-adapters) |
 
 ## Public admission limits
 

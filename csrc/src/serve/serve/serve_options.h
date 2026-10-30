@@ -110,6 +110,11 @@ struct ServeOptions {
     // too, past the admin client's own timeout, so a weight update that was
     // draining normally failed as an opaque client-side disconnect.
     std::uint32_t adapter_update_timeout_ms = 0;
+    /// --lora-swap in-place|drain: what reloading a loaded adapter name does when the request does
+    /// not say ("in_place"). drain (the default) lets the adapter's admitted requests finish and
+    /// holds new ones; in-place copies the new bytes in at a round boundary and keeps serving --
+    /// what an RL rollout fleet wants, whose calls run for minutes.
+    bool lora_swap_in_place = false;
     // surogate vendor patch (PATCHES.md #13): 2048 measured +16% prefill on
     // qwen3.5-0.8b (K=1024 tiles amortize) and neutral on qwen3.6-27b
     // (1832 vs 1834 tok/s) on RTX 5090.
@@ -143,6 +148,11 @@ struct ServeOptions {
     // on what else shares its rounds (api/ops/batch_invariant.h). Off by default: it trades
     // throughput for reproducibility.
     bool batch_invariant = false;
+    /// --moe-route auto|w4a16|marlin (api/ops/sparse_moe.h SparseMoeRoute): w4a16 keeps the routed
+    /// NVFP4 experts on our W4A16 kernels at every width, so a token's log-prob does not depend on
+    /// its round's width -- the RL engines' setting (rollouts, KL-anchor prefill); marlin rewrites
+    /// them into Marlin tiles at load and serves every width weight-only. auto is the default.
+    std::string moe_route = "auto";
     // Default thinking mode for the generation prompt: --thinking or --no-thinking, else what
     // the chat template does when nothing asks (PromptCapabilities::thinking_by_default).
     std::optional<bool> enable_thinking;
