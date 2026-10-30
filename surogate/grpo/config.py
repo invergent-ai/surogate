@@ -151,6 +151,11 @@ class GRPOTrainConfig(SFTConfig):
     # Drop the samples whose trained tokens were sampled by a policy version older than the step's by more than this,
     # or by several versions (TrainingSample.completion_versions); 0 = on-policy batches only. None = no check.
     max_policy_lag: int | None = None
+    # The LoRA forward computes its products from the fp32 masters (lora_dtype: fp32) instead of their bf16 work
+    # copies: the expert kernel and dense LoRA (the shared expert) through the same kernel. A bf16 work copy changes
+    # only where an update crosses a rounding step, so with bf16 copies the function moves in rounding jumps, about
+    # as large at lr 1e-6 as at 5e-5 (2026-10-30). The backward keeps the bf16 copies; broadcasts stay bf16.
+    lora_fp32_forward: bool = False
 
     def __init__(self, cfg: DictDefault):
         # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
@@ -223,6 +228,7 @@ class GRPOTrainConfig(SFTConfig):
         self.turn_diagnostics = cfg.get("turn_diagnostics", self.turn_diagnostics)
         self.teacher_from_base = bool(cfg.get("teacher_from_base", self.teacher_from_base))
         self.broadcast_dtype = cfg.get("broadcast_dtype", self.broadcast_dtype)
+        self.lora_fp32_forward = bool(cfg.get("lora_fp32_forward", self.lora_fp32_forward))
         self.minibatches = int(cfg.get("minibatches", self.minibatches))
         lag = cfg.get("max_policy_lag", self.max_policy_lag)
         self.max_policy_lag = None if lag is None else int(lag)

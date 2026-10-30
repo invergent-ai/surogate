@@ -40,6 +40,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
 
 #include <cuda_bf16.h>
@@ -87,6 +88,33 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p, float* f) 
         f[4 * q + 1] = v.y;
         f[4 * q + 2] = v.z;
         f[4 * q + 3] = v.w;
+    }
+}
+
+// 8 consecutive LoRA weights as fp32: bf16 work copies or fp32 masters (SUROGATE_LORA_FP32_FORWARD).
+__device__ __forceinline__ void load8(const nv_bfloat16* p, float* f) {
+    unpack8(*reinterpret_cast<const uint4*>(p), f);
+}
+__device__ __forceinline__ void load8(const float* p, float* f) {
+    const float4 a = reinterpret_cast<const float4*>(p)[0];
+    const float4 b = reinterpret_cast<const float4*>(p)[1];
+    f[0] = a.x;
+    f[1] = a.y;
+    f[2] = a.z;
+    f[3] = a.w;
+    f[4] = b.x;
+    f[5] = b.y;
+    f[6] = b.z;
+    f[7] = b.w;
+}
+
+// 8 consecutive weights, 16 bytes of bf16 or 32 of fp32 (16-byte aligned).
+template <typename W>
+__device__ __forceinline__ void copy8(W* __restrict__ dst, const W* __restrict__ src) {
+    constexpr int kVecs = static_cast<int>(sizeof(W)) * 8 / 16;
+#pragma unroll
+    for (int i = 0; i < kVecs; ++i) {
+        reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(src)[i];
     }
 }
 
@@ -180,17 +208,19 @@ __device__ void expert_tile_range(const int* __restrict__ offsets,
 }
 
 // dst[t][r] += Σ_k src[row0 + t][k] · W[r][k] for the tile's rows, with W
-// staged through `chunk` (R × kChunk bf16) kChunk columns at a time. For
-// kTransposed the weight is stored [k][r] (LoRA B) and is transposed while
-// staging. src rows are k_dim wide (k_dim % 8 == 0). Block-uniform loops.
-template <int R, bool kTransposed>
+// staged through `chunk` (R × kChunk of WT, bf16 or fp32) kChunk columns at a
+// time. For kTransposed the weight is stored [k][r] (LoRA B, bf16 only) and is
+// transposed while staging. src rows are k_dim wide (k_dim % 8 == 0).
+// Block-uniform loops.
+template <int R, bool kTransposed, typename WT = nv_bfloat16>
 __device__ void project_tile(float* __restrict__ dst,
                              const nv_bfloat16* __restrict__ src,
-                             const nv_bfloat16* __restrict__ w,
+                             const WT* __restrict__ w,
                              int k_dim,
                              int row0,
                              int rows,
-                             nv_bfloat16* __restrict__ chunk) {
+                             WT* __restrict__ chunk) {
+    static_assert(!kTransposed || std::is_same_v<WT, nv_bfloat16>, "the transposed staging reads bf16 weights");
     const int slot = static_cast<int>(threadIdx.x) / kLanes;
     const int lane = static_cast<int>(threadIdx.x) % kLanes;
     for (int k0 = 0; k0 < k_dim; k0 += kChunk) {
@@ -213,8 +243,7 @@ __device__ void project_tile(float* __restrict__ dst,
             for (int v = threadIdx.x; v < R * vecs; v += kThreads) {
                 const int r = v / vecs;
                 const int c = (v - r * vecs) * 8;
-                *reinterpret_cast<uint4*>(chunk + r * kChunk + c) =
-                    *reinterpret_cast<const uint4*>(w + static_cast<size_t>(r) * k_dim + k0 + c);
+                copy8(chunk + r * kChunk + c, w + static_cast<size_t>(r) * k_dim + k0 + c);
             }
         }
         __syncthreads();
@@ -233,7 +262,7 @@ __device__ void project_tile(float* __restrict__ dst,
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
                         float wf[8];
-                        unpack8(*reinterpret_cast<const uint4*>(chunk + r * kChunk + j), wf);
+                        load8(chunk + r * kChunk + j, wf);
 #pragma unroll
                         for (int i = 0; i < 8; ++i) {
                             acc[r] = fmaf(xf[i], wf[i], acc[r]);
@@ -259,56 +288,72 @@ __device__ void project_tile(float* __restrict__ dst,
     }
 }
 
-// Shared memory: [scan ints][weight chunk][h][g (backward only)].
-__host__ __device__ constexpr size_t chunk_bytes(int rank) {
-    return static_cast<size_t>(rank) * kChunk * sizeof(nv_bfloat16);
+// Shared memory: [scan ints][weight chunk][h][g (backward only)]. The chunk holds bf16 weights, or fp32 ones in the
+// fp32-weight forward.
+__host__ __device__ constexpr size_t chunk_bytes(int rank, size_t weight_bytes = sizeof(nv_bfloat16)) {
+    return static_cast<size_t>(rank) * kChunk * weight_bytes;
 }
 __host__ __device__ constexpr size_t tile_bytes(int rank, int tile_tokens) {
     return static_cast<size_t>(rank) * tile_tokens * sizeof(float);
 }
-__host__ __device__ constexpr size_t smem_bytes(int rank, int tile_tokens, bool with_g) {
-    return kScanBytes + chunk_bytes(rank) + tile_bytes(rank, tile_tokens) * (with_g ? 2 : 1);
+__host__ __device__ constexpr size_t smem_bytes(int rank, int tile_tokens, bool with_g,
+                                                size_t weight_bytes = sizeof(nv_bfloat16)) {
+    return kScanBytes + chunk_bytes(rank, weight_bytes) + tile_bytes(rank, tile_tokens) * (with_g ? 2 : 1);
 }
 
+// R weights of one LoRA B row (R contiguous values) as fp32.
 template <int R>
+__device__ __forceinline__ void load_b_row(const nv_bfloat16* __restrict__ p, float* f) {
+    const uint4* v = reinterpret_cast<const uint4*>(p);
+#pragma unroll
+    for (int q = 0; q < R / 8; ++q) {
+        unpack8(v[q], f + 8 * q);
+    }
+}
+template <int R>
+__device__ __forceinline__ void load_b_row(const float* __restrict__ p, float* f) {
+    load_row<R>(p, f);
+}
+
+// WT: the LoRA weights' type -- bf16 work copies, or the fp32 masters themselves, so that the forward moves smoothly
+// with every update instead of in bf16 rounding steps of A and B. out rows are out_ld apart (a slice of a wider
+// output for dense LoRA); x rows are in_features apart.
+template <int R, typename WT>
 __global__ void __launch_bounds__(kThreads) moe_lora_grouped_forward_kernel(nv_bfloat16* __restrict__ out,
                                                                             const nv_bfloat16* __restrict__ x,
-                                                                            const nv_bfloat16* __restrict__ A,
-                                                                            const nv_bfloat16* __restrict__ B,
+                                                                            const WT* __restrict__ A,
+                                                                            const WT* __restrict__ B,
                                                                             const int* __restrict__ expert_offsets,
                                                                             int num_experts,
                                                                             int in_features,
                                                                             int out_features,
+                                                                            int out_ld,
                                                                             int tile_tokens,
                                                                             float scaling,
                                                                             int accumulate) {
     extern __shared__ __align__(16) unsigned char smem[];
     int* s_scan = reinterpret_cast<int*>(smem);
-    nv_bfloat16* chunk = reinterpret_cast<nv_bfloat16*>(smem + kScanBytes);
-    float* h = reinterpret_cast<float*>(smem + kScanBytes + chunk_bytes(R));
+    WT* chunk = reinterpret_cast<WT*>(smem + kScanBytes);
+    float* h = reinterpret_cast<float*>(smem + kScanBytes + chunk_bytes(R, sizeof(WT)));
 
     TileLoc loc;
     if (!locate_tile(expert_offsets, num_experts, tile_tokens, static_cast<int>(blockIdx.x), s_scan, loc)) return;
-    const nv_bfloat16* A_e = A + static_cast<size_t>(loc.expert) * R * in_features;
-    const nv_bfloat16* B_e = B + static_cast<size_t>(loc.expert) * out_features * R;
+    const WT* A_e = A + static_cast<size_t>(loc.expert) * R * in_features;
+    const WT* B_e = B + static_cast<size_t>(loc.expert) * out_features * R;
 
     for (int i = threadIdx.x; i < loc.rows * R; i += kThreads) {
         h[i] = 0.f;
     }
-    project_tile<R, false>(h, x, A_e, in_features, loc.row0, loc.rows, chunk);
+    project_tile<R, false, WT>(h, x, A_e, in_features, loc.row0, loc.rows, chunk);
 
     // out[t, o:o+2] (+)= s · h[t, :] · B_e[o:o+2, :]^T
     for (int c0 = 0; c0 < out_features; c0 += kColumnsPerPass) {
         const int o = c0 + 2 * static_cast<int>(threadIdx.x);
         if (o >= out_features) break;
         float b0[R], b1[R];
-        const uint4* bp = reinterpret_cast<const uint4*>(B_e + static_cast<size_t>(o) * R);
-#pragma unroll
-        for (int q = 0; q < R / 8; ++q) {
-            unpack8(bp[q], b0 + 8 * q);
-            unpack8(bp[R / 8 + q], b1 + 8 * q);
-        }
-        nv_bfloat16* col = out + static_cast<size_t>(loc.row0) * out_features + o;
+        load_b_row<R>(B_e + static_cast<size_t>(o) * R, b0);
+        load_b_row<R>(B_e + static_cast<size_t>(o + 1) * R, b1);
+        nv_bfloat16* col = out + static_cast<size_t>(loc.row0) * out_ld + o;
 #pragma unroll 4
         for (int t = 0; t < loc.rows; ++t) {
             float hr[R];
@@ -319,7 +364,7 @@ __global__ void __launch_bounds__(kThreads) moe_lora_grouped_forward_kernel(nv_b
                 v0 = fmaf(hr[r], b0[r], v0);
                 v1 = fmaf(hr[r], b1[r], v1);
             }
-            __nv_bfloat162* p = reinterpret_cast<__nv_bfloat162*>(col + static_cast<size_t>(t) * out_features);
+            __nv_bfloat162* p = reinterpret_cast<__nv_bfloat162*>(col + static_cast<size_t>(t) * out_ld);
             float2 cur = accumulate ? __bfloat1622float2(*p) : make_float2(0.f, 0.f);
             cur.x = fmaf(scaling, v0, cur.x);
             cur.y = fmaf(scaling, v1, cur.y);
@@ -580,22 +625,23 @@ void enable_large_smem(Kernel kernel, size_t bytes) {
     }
 }
 
-template <int R>
+template <int R, typename WT>
 void launch_forward(nv_bfloat16* out,
                     const nv_bfloat16* x,
-                    const nv_bfloat16* A,
-                    const nv_bfloat16* B,
+                    const WT* A,
+                    const WT* B,
                     const int* expert_offsets,
                     int num_experts,
                     int in_features,
                     int out_features,
+                    int out_ld,
                     const Tiling& tiling,
                     float scaling,
                     bool accumulate,
                     cudaStream_t stream) {
-    const size_t smem = smem_bytes(R, tiling.tile_tokens, false);
-    enable_large_smem(moe_lora_grouped_forward_kernel<R>, smem);
-    moe_lora_grouped_forward_kernel<R>
+    const size_t smem = smem_bytes(R, tiling.tile_tokens, false, sizeof(WT));
+    enable_large_smem(moe_lora_grouped_forward_kernel<R, WT>, smem);
+    moe_lora_grouped_forward_kernel<R, WT>
         <<<static_cast<unsigned>(tiling.total_tiles), kThreads, smem, stream>>>(out,
                                                                                 x,
                                                                                 A,
@@ -604,10 +650,70 @@ void launch_forward(nv_bfloat16* out,
                                                                                 num_experts,
                                                                                 in_features,
                                                                                 out_features,
+                                                                                out_ld,
                                                                                 tiling.tile_tokens,
                                                                                 scaling,
                                                                                 accumulate ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// The forward for either weight type: false (nothing launched) for an unsupported shape or alignment.
+template <typename WT>
+bool grouped_forward(nv_bfloat16* out,
+                     const nv_bfloat16* x,
+                     const WT* A,
+                     const WT* B,
+                     const int* expert_offsets,
+                     const int* host_offsets,
+                     int num_experts,
+                     int total_tokens,
+                     int in_features,
+                     int out_features,
+                     int out_ld,
+                     int rank,
+                     float scaling,
+                     bool accumulate,
+                     cudaStream_t stream,
+                     int tile_tokens) {
+    if (!shape_supported(num_experts, in_features, out_features, rank)) return false;
+    if (!out || !x || !A || !B || !expert_offsets) return false;
+    if (!aligned16(out) || !aligned16(x) || !aligned16(A) || !aligned16(B)) return false;
+    if (out_ld < out_features || out_ld % 8 != 0) return false;  // rows stay 16-byte aligned
+    if (total_tokens <= 0) return true;
+    const Tiling tiling = choose_tiling(host_offsets, num_experts, total_tokens, tile_tokens);
+    if (tiling.total_tiles <= 0) return true;
+    switch (rank) {
+        case 8:
+            launch_forward<8, WT>(out, x, A, B, expert_offsets, num_experts, in_features, out_features, out_ld, tiling,
+                                  scaling, accumulate, stream);
+            return true;
+        case 16:
+            launch_forward<16, WT>(out, x, A, B, expert_offsets, num_experts, in_features, out_features, out_ld, tiling,
+                                   scaling, accumulate, stream);
+            return true;
+        case 32:
+            launch_forward<32, WT>(out, x, A, B, expert_offsets, num_experts, in_features, out_features, out_ld, tiling,
+                                   scaling, accumulate, stream);
+            return true;
+        default: return false;
+    }
+}
+
+// [0, tokens] in device memory, the expert offsets of a one-expert group; one 2-int buffer per device.
+__global__ void write_one_group_offsets(int* offsets, int tokens) {
+    offsets[0] = 0;
+    offsets[1] = tokens;
+}
+int* one_group_offsets(int tokens, cudaStream_t stream) {
+    static std::mutex mutex;
+    static int* buffers[64] = {};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!buffers[device]) CUDA_CHECK(cudaMalloc(&buffers[device], 2 * sizeof(int)));
+    write_one_group_offsets<<<1, 1, 0, stream>>>(buffers[device], tokens);
+    CUDA_CHECK(cudaGetLastError());
+    return buffers[device];
 }
 
 template <int R, bool kWgrad, typename GradT>
@@ -689,57 +795,56 @@ bool moe_lora_grouped_forward_bf16(nv_bfloat16* out,
                                    bool accumulate,
                                    cudaStream_t stream,
                                    int tile_tokens) {
-    if (!shape_supported(num_experts, in_features, out_features, rank)) return false;
-    if (!out || !x || !A || !B || !expert_offsets) return false;
-    if (!aligned16(out) || !aligned16(x) || !aligned16(A) || !aligned16(B)) return false;
-    if (total_tokens <= 0) return true;
-    const Tiling tiling = choose_tiling(host_offsets, num_experts, total_tokens, tile_tokens);
-    if (tiling.total_tiles <= 0) return true;
-    switch (rank) {
-        case 8:
-            launch_forward<8>(out,
-                              x,
-                              A,
-                              B,
-                              expert_offsets,
-                              num_experts,
-                              in_features,
-                              out_features,
-                              tiling,
-                              scaling,
-                              accumulate,
-                              stream);
-            return true;
-        case 16:
-            launch_forward<16>(out,
-                               x,
-                               A,
-                               B,
-                               expert_offsets,
-                               num_experts,
-                               in_features,
-                               out_features,
-                               tiling,
-                               scaling,
-                               accumulate,
-                               stream);
-            return true;
-        case 32:
-            launch_forward<32>(out,
-                               x,
-                               A,
-                               B,
-                               expert_offsets,
-                               num_experts,
-                               in_features,
-                               out_features,
-                               tiling,
-                               scaling,
-                               accumulate,
-                               stream);
-            return true;
-        default: return false;
-    }
+    return grouped_forward<nv_bfloat16>(out, x, A, B, expert_offsets, host_offsets, num_experts, total_tokens,
+                                        in_features, out_features, out_features, rank, scaling, accumulate, stream,
+                                        tile_tokens);
+}
+
+bool lora_fp32_forward_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SUROGATE_LORA_FP32_FORWARD");
+        return env && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool moe_lora_grouped_forward_f32w(nv_bfloat16* out,
+                                   const nv_bfloat16* x,
+                                   const float* A,
+                                   const float* B,
+                                   const int* expert_offsets,
+                                   const int* host_offsets,
+                                   int num_experts,
+                                   int total_tokens,
+                                   int in_features,
+                                   int out_features,
+                                   int rank,
+                                   float scaling,
+                                   bool accumulate,
+                                   cudaStream_t stream,
+                                   int tile_tokens) {
+    return grouped_forward<float>(out, x, A, B, expert_offsets, host_offsets, num_experts, total_tokens, in_features,
+                                  out_features, out_features, rank, scaling, accumulate, stream, tile_tokens);
+}
+
+bool lora_dense_forward_f32w(nv_bfloat16* out,
+                             int out_ld,
+                             const nv_bfloat16* x,
+                             const float* A,
+                             const float* B,
+                             int tokens,
+                             int in_features,
+                             int out_features,
+                             int rank,
+                             float scaling,
+                             bool accumulate,
+                             cudaStream_t stream) {
+    if (!shape_supported(1, in_features, out_features, rank) || out_ld < out_features || out_ld % 8 != 0) return false;
+    if (!out || !x || !A || !B || !aligned16(out) || !aligned16(x) || !aligned16(A) || !aligned16(B)) return false;
+    if (tokens <= 0) return true;
+    const int host_offsets[2] = {0, tokens};
+    return grouped_forward<float>(out, x, A, B, one_group_offsets(tokens, stream), host_offsets, 1, tokens,
+                                  in_features, out_features, out_ld, rank, scaling, accumulate, stream, 0);
 }
 
 std::size_t moe_lora_grouped_backward_workspace_floats(const int* host_offsets,

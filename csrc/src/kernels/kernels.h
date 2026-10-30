@@ -4825,6 +4825,47 @@ bool moe_lora_grouped_forward_bf16(nv_bfloat16* out,
                                    cudaStream_t stream,
                                    int tile_tokens = 0);
 
+/// @brief FP32-weight LoRA forward switch: true when SUROGATE_LORA_FP32_FORWARD is set and not "0" (read once).
+/// The expert and dense LoRA forwards then read the fp32 masters instead of their bf16 work copies, so the
+/// function moves smoothly with every update; the backward keeps the bf16 copies.
+bool lora_fp32_forward_enabled();
+
+/// @brief moe_lora_grouped_forward_bf16 with fp32 A and B (the LoRA masters): the same semantics, the products
+/// taken from fp32 weights. Same shape and alignment rules.
+bool moe_lora_grouped_forward_f32w(nv_bfloat16* out,
+                                   const nv_bfloat16* x,
+                                   const float* A,
+                                   const float* B,
+                                   const int* expert_offsets,
+                                   const int* host_offsets,
+                                   int num_experts,
+                                   int total_tokens,
+                                   int in_features,
+                                   int out_features,
+                                   int rank,
+                                   float scaling,
+                                   bool accumulate,
+                                   cudaStream_t stream,
+                                   int tile_tokens = 0);
+
+/// @brief Dense LoRA forward with fp32 weights through the same kernel as a one-expert group:
+///   out[t, :out_features] = (accumulate ? out : 0) + scaling * (x[t, :] . A^T) . B^T
+/// for t < tokens, out rows out_ld elements apart (a column slice of a wider output), x rows in_features apart.
+/// @param A [rank, in_features] fp32. @param B [out_features, rank] fp32.
+/// @return false, launching nothing, for an unsupported shape or alignment (out_ld % 8 != 0 included).
+bool lora_dense_forward_f32w(nv_bfloat16* out,
+                             int out_ld,
+                             const nv_bfloat16* x,
+                             const float* A,
+                             const float* B,
+                             int tokens,
+                             int in_features,
+                             int out_features,
+                             int rank,
+                             float scaling,
+                             bool accumulate,
+                             cudaStream_t stream);
+
 /// @brief Workspace (in floats) that moe_lora_grouped_backward_bf16 needs for the same arguments.
 std::size_t moe_lora_grouped_backward_workspace_floats(const int* host_offsets,
                                                        int num_experts,

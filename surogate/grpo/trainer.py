@@ -279,6 +279,12 @@ class GRPOTrainer:
                 f"resident window {os.environ['SUROGATE_DISPATCH_PREFETCH_BLOCKS']} layers)"
             )
 
+        if getattr(config, "lora_fp32_forward", False):
+            # The LoRA forward reads the fp32 masters, not their bf16 work copies (read once by the engine).
+            if config.lora_dtype != "fp32":
+                raise ValueError("lora_fp32_forward needs lora_dtype: fp32 (the forward reads the fp32 masters)")
+            os.environ["SUROGATE_LORA_FP32_FORWARD"] = "1"
+
         # Create C++ trainer using inherited config objects
         logger.info(f"Creating GRPO trainer for {config.model} ({config.gpus} GPUs)")
         self.trainer = _surogate.SurogateTrainer(
