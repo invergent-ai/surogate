@@ -245,6 +245,9 @@ public:
     // ops. GRPO computes its per-token gradients from these, then feeds them back
     // through dispatch_pp_backward_stage's custom_dloss_cpu.
     std::vector<float> dispatch_pp_read_logprobs();
+    // Forwards with or without the LoRA delta: off detaches the executor's LoRA run state, as
+    // compute_ref_logprobs does, so the base model's log-probs come from the policy's kernels.
+    void set_dispatch_pp_lora_forward(bool on);
     // Valid (non-pad) tokens the loss stage counted for the last microbatch; the multi-GPU
     // trainer sums these across microbatches and publishes the total via the setter below so
     // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale

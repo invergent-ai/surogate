@@ -104,6 +104,8 @@ GRPO drives the two halves of a dispatch-PP step itself. A staged forward throug
 the per-token log-probs, Python forms the GRPO per-token gradients from them, and the staged backward is
 seeded with those gradients. They are normalized by the step's loss tokens (`loss_scale`), as on the
 standard path; the optimizer applies no second token scale.
+With `teacher_from_base: true` each call first runs the same pass with the LoRA delta off; its log-probs
+are the rows' teacher log-probs (a KL anchor to the base weights, `loss.teacher_tau`).
 
 The log-prob pass keeps every stage's output boundary in host memory, so the training step over the same
 rows skips its own forward (`SUROGATE_DPP_REUSE_FORWARD=0` turns this off). A call holds these boundaries

@@ -145,6 +145,10 @@ class GRPOTrainer:
         # stage re-streams its weights for every microbatch (8 microbatches x 3
         # passes = 24 copies of the base per step, measured 2026-10-29).
         self._dispatch_pp = getattr(config, "parallelism", None) == "dispatch_pp"
+        if config.teacher_from_base and not self._dispatch_pp:
+            raise ValueError("teacher_from_base needs parallelism: dispatch_pp (its log-prob pass scores the base)")
+        if config.teacher_from_base and config.loss.teacher_tau == 0.0:
+            logger.warning("teacher_from_base with loss.teacher_tau = 0: the base pass only feeds the teacher_kl metric")
         self._dpp_los: list[int] | None = None
         self._dpp_his: list[int] | None = None
         if self._dispatch_pp:
@@ -546,6 +550,16 @@ class GRPOTrainer:
             M = len(rows)
             inputs = np.ascontiguousarray(np.concatenate([prepared[i]["input"] for i in rows], axis=0))
             targets = np.ascontiguousarray(np.concatenate([prepared[i]["targets"] for i in rows], axis=0))
+            if self.config.teacher_from_base:
+                # The base model's log-probs of the same rows (LoRA delta off), as the teacher of the KL anchor.
+                # Before the policy pass, whose boundaries the train step takes.
+                base_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
+                    inputs, targets, self._dpp_los, self._dpp_his, M, keep_boundaries=False, base_model=True
+                )
+                for j, i in enumerate(rows):
+                    prepared[i]["teacher"] = unshift_to_logical(
+                        np.asarray(base_rows[j, :seq_len], dtype=np.float32), prepared[i]["sample_ranges"]
+                    )
             logprob_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
                 inputs, targets, self._dpp_los, self._dpp_his, M, keep_boundaries=reuse_forward
             )

@@ -510,6 +510,8 @@ The `teacher_tau * (teacher_logprob - trainer_logprob)` term is positive when th
 
 Set `teacher_tau > 0` in `train.yaml` and configure the teacher in `orch.yaml`. The orchestrator computes teacher log-probabilities and delivers them alongside advantages in each micro-batch — no changes to the trainer command are needed.
 
+When the teacher is the base model the adapter trains on (a KL anchor that keeps the policy near its start), a dispatch-PP trainer can score it itself: set `teacher_from_base: true` in `train.yaml` and leave `teacher_model` out of `orch.yaml`. Each dispatch call then runs one more log-prob pass with the LoRA delta off, on the same kernels as the policy pass, and its log-probs replace the rows' `teacher_logprobs`.
+
 **`train.yaml`** — add `teacher_tau` to the loss block:
 
 ```yaml

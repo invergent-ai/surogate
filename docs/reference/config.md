@@ -522,6 +522,7 @@ than from `datasets`, which is forced empty. See the
 | `doc_masking`           | bool   | `true`         | Document-level masking so packed samples cannot see each other: attention, and the convolution and recurrent state of linear-attention (Gated DeltaNet) layers. |
 | `single_sample_bins`    | bool   | `false`        | Pack one sample per row instead of filling each row. Chunked-training attention has no packed-doc isolation, so multi-sample rows would let samples attend across each other. |
 | `turn_diagnostics`      | bool   | `false`        | Route the micro-step through the Python loss instead of the fused native step so per-token logprobs are visible. Same gradients, slower — measurement only. |
+| `teacher_from_base`     | bool   | `false`        | dispatch-PP only: the trainer scores each row with its own base model (the LoRA delta off) and uses those log-probs as the rows' `teacher_logprobs`, a KL anchor to the base weighted by `loss.teacher_tau` that needs no teacher server. One more log-prob pass per dispatch call. |
 
 `gradient_dtype` defaults to `fp32` for GRPO (the per-token gradient is 10-100x
 smaller than in SFT), while master weights follow the model dtype; precision

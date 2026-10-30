@@ -266,12 +266,16 @@ public:
     // keep_boundaries: hold on to every stage's output boundary so the next
     // dispatch_pp_train_step_multigpu(reuse_forward=true) over the same rows can take
     // them as its stage inputs instead of running the same forward again.
+    // base_model: the base model's log-probs instead (the LoRA delta off, same kernels),
+    // e.g. the reference of a KL anchor; keeps nothing and leaves a policy pass's kept
+    // boundaries and chunk states as they are.
     std::vector<float> dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
                                                              const std::int32_t* targets,
                                                              const std::vector<int>& los,
                                                              const std::vector<int>& his,
                                                              int num_microbatches = 1,
-                                                             bool keep_boundaries = false);
+                                                             bool keep_boundaries = false,
+                                                             bool base_model = false);
     // custom_dloss (optional, host [num_microbatches * B * T]): per-token gradient
     // seeds for the loss stage, replacing the built-in cross-entropy. This is how
     // GRPO/DPO-style objectives run under dispatch-PP — the caller computes the

@@ -2976,11 +2976,16 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
                                                                            const std::vector<int>& los,
                                                                            const std::vector<int>& his,
                                                                            int num_microbatches,
-                                                                           bool keep_boundaries) {
+                                                                           bool keep_boundaries,
+                                                                           bool base_model) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: bad stage ranges");
     }
     check_lora_stage_plan(los, his, "dispatch_pp_forward_logprobs_multigpu");
+    if (base_model && keep_boundaries) {
+        throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: a base-model pass keeps no boundaries "
+                                 "(the train step runs the policy)");
+    }
     DppPhaseTimer timer;
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
@@ -3002,12 +3007,15 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
     // through the LAST stage too. The training step deliberately stops at N-2 (the
     // backward recomputes the final stage), but GRPO needs the logprobs the loss
     // ops produce *before* it can form its per-token gradients.
-    run_work([](sThreadContext& ctx) {
+    // base_model: the same pass without the LoRA delta (the base model's log-probs, e.g. a KL
+    // anchor's reference). It leaves a policy pass's kept boundaries and chunk states alone.
+    run_work([base_model](sThreadContext& ctx) {
         if (auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
             if (auto* ge = m->graph_executor()) {
                 ge->dispatch_reset_stack();
-                ge->invalidate_sequence_chunk_snapshots();
+                if (!base_model) ge->invalidate_sequence_chunk_snapshots();
             }
+            if (base_model) m->set_dispatch_pp_lora_forward(false);
         }
     });
     timer.mark("reset");
@@ -3113,12 +3121,13 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
     // clears it on entry, but a caller may follow this with a NON-dispatch call
     // (e.g. forward_for_grpo, export) and would otherwise hit an async launch
     // failure from the stale preserved stage.
-    run_work([](sThreadContext& ctx) {
+    run_work([base_model](sThreadContext& ctx) {
         if (auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
             if (auto* ge = m->graph_executor()) {
                 ge->set_preserve_layer(-1);
                 ge->dispatch_reset_stack();
             }
+            if (base_model) m->set_dispatch_pp_lora_forward(true);
         }
     });
     // The boundaries are exactly the stage inputs the training step's forward would
@@ -3131,11 +3140,11 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(cons
                                    his,
                                    M,
                                    mDppWeightVersion);
-    } else {
+    } else if (!base_model) {
         mDppKeptBoundaries.clear();
     }
     timer.mark("cleanup");
-    timer.print("logprob_pass");
+    timer.print(base_model ? "base_logprob_pass" : "logprob_pass");
     return logprobs;
 }
 

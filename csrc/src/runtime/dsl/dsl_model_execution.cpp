@@ -2635,6 +2635,17 @@ std::vector<float> DslModel::dispatch_pp_read_logprobs() {
     return out;
 }
 
+void DslModel::set_dispatch_pp_lora_forward(bool on) {
+    if (!lora_enabled() || !mExecutor) return;
+    if (on && !mLoRARunState) {
+        throw std::logic_error("set_dispatch_pp_lora_forward: no LoRA run state to re-attach");
+    }
+    mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
+                              mLoRAWeights.get(),
+                              mLoRAGrads.get(),
+                              on ? mLoRARunState.get() : nullptr);
+}
+
 float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
                                             const optimizers::OptimizerConfig& opt_config,
                                             int step_idx) {

@@ -1653,7 +1653,8 @@ NB_MODULE(_surogate, m) {
                std::vector<int> los,
                std::vector<int> his,
                int num_microbatches,
-               bool keep_boundaries) {
+               bool keep_boundaries,
+               bool base_model) {
                 CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->step_seq_length());
                 auto lp = trainer->dispatch_pp_forward_logprobs_multigpu(inputs.data(),
@@ -1661,7 +1662,8 @@ NB_MODULE(_surogate, m) {
                                                                         los,
                                                                         his,
                                                                         num_microbatches,
-                                                                        keep_boundaries);
+                                                                        keep_boundaries,
+                                                                        base_model);
                 const std::size_t n = lp.size();
                 float* data = new float[n];
                 std::copy(lp.begin(), lp.end(), data);
@@ -1677,10 +1679,13 @@ NB_MODULE(_surogate, m) {
             nb::arg("his"),
             nb::arg("num_microbatches") = 1,
             nb::arg("keep_boundaries") = false,
+            nb::arg("base_model") = false,
             "dispatch-PP staged forward through the loss stage; returns per-token logprobs "
             "[num_microbatches*batch_size, seq]. Pair with dispatch_pp_train_step_multigpu(custom_dloss=...) "
             "to run GRPO-style objectives under dispatch-PP. keep_boundaries=True keeps every stage's "
-            "output for the next train step over the same rows (reuse_forward=True skips its forward).")
+            "output for the next train step over the same rows (reuse_forward=True skips its forward). "
+            "base_model=True returns the base model's logprobs instead (the LoRA delta off, same kernels), "
+            "leaving a policy pass's kept boundaries alone.")
         .def(
             "dispatch_pp_train_step_multigpu",
             [](MultiGPUPyTrainer* trainer,
