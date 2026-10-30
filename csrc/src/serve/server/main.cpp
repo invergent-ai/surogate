@@ -110,10 +110,14 @@ int main(int argc, char** argv) {
 
         // Before any model loads or kernel runs: every op reads it from the first forward on.
         sinfer::ops::set_batch_invariant(options.batch_invariant);
-        if (options.moe_route_w4a16) {
+        if (options.moe_route == "w4a16") {
             sinfer::ops::set_sparse_moe_route(sinfer::ops::SparseMoeRoute::W4A16);
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
                                              "moe-route: routed NVFP4 experts on W4A16 kernels at every width");
+        } else if (options.moe_route == "marlin") {
+            sinfer::ops::set_sparse_moe_route(sinfer::ops::SparseMoeRoute::Marlin);
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
+                                             "moe-route: routed NVFP4 experts in Marlin tiles, weight-only at every width");
         }
         if (options.batch_invariant) {
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,

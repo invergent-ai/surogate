@@ -98,6 +98,9 @@ void adopt_weight_only_nvfp4(ops::SparseMoeWeights& weights, std::int32_t expert
                                         weights.routed_gate_up_scale, 2, stream);
         ops::detail::nvfp4_marlin_adopt(weights.routed_down, experts, weights.routed_down_scale, 1,
                                         stream);
+        // Folded into each bank's Marlin global scale; the weight-only profile carries none.
+        weights.routed_gate_up_scale = nullptr;
+        weights.routed_down_scale    = nullptr;
     }
     if (weights.shared_gate_up.qtype == QType::NVFP4_A16) {
         ops::detail::nvfp4_marlin_adopt(weights.shared_gate_up, 1, nullptr, 1, stream);

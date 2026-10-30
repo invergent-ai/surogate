@@ -3,6 +3,8 @@
 
 #include "artifact/typed_binding.h"
 #include "family/impl/load/routed_nvfp4.h"
+#include "api/ops/sparse_moe.h"
+#include "ops/sparse_moe/marlin/sparse_moe_nvfp4.h"
 
 #include <array>
 #include <bit>
@@ -174,6 +176,20 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
 /// routed banks must be on the device: the host bank streams experts in their stored layout.
 void adopt_mixture(SparseMoePayload& mixture, const family::HostBank* host_bank, std::int32_t layer,
                    const family::TextGeometry& g) {
+    // --moe-route marlin: an NVFP4 checkpoint's routed experts are served weight-only. Same codes,
+    // same block scales and the same per-expert second level (the W4A4 runner's activation
+    // scales and alphas go unused); only the gate/up row order stays the runner's [up; gate].
+    if (ops::sparse_moe_route() == ops::SparseMoeRoute::Marlin &&
+        mixture.op.routed_gate_up.qtype == QType::NVFP4 && mixture.op.routed_down.qtype == QType::NVFP4 &&
+        ops::detail::sparse_moe_nvfp4_geometry(ops::sparse_moe_geometry(mixture.op))) {
+        mixture.op.routed_gate_up.qtype     = QType::NVFP4_A16;
+        mixture.op.routed_down.qtype        = QType::NVFP4_A16;
+        mixture.op.routed_up_first          = true;
+        mixture.op.routed_gate_up_act_scale = nullptr;
+        mixture.op.routed_gate_up_alpha     = nullptr;
+        mixture.op.routed_down_act_scale    = nullptr;
+        mixture.op.routed_down_alpha        = nullptr;
+    }
     if (mixture.op.routed_gate_up.qtype != QType::NVFP4_A16) { return; }
     if (host_bank != nullptr) {
         throw artifact::ArtifactError("layer " + std::to_string(layer) +

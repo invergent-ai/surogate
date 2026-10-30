@@ -7,7 +7,10 @@
 #include "ops/linear/marlin/marlin_gemm.h"
 #include "ops/linear/marlin/marlin_nvfp4.h"
 #include "ops/sparse_moe/marlin/marlin_moe_gemm.h"
+#include "ops/sparse_moe/marlin/marlin_moe_lora.h"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
+#include "api/ops/linear.h"
+#include "api/ops/linear_swiglu.h"
 
 #include <cuda_bf16.h>
 
@@ -59,6 +62,8 @@ struct SliceWorkspace {
     __nv_bfloat16* shared_up  = nullptr; // [tokens][2 * shared]
     __nv_bfloat16* shared_act = nullptr; // [tokens][shared]
     __nv_bfloat16* shared_out = nullptr; // [tokens][hidden]
+    __nv_bfloat16* lora_low   = nullptr; // [tokens * top_k][3][max rank], adapter rounds
+    __nv_bfloat16* lora_shared_low = nullptr; // [tokens][3][max rank]
 };
 
 // One layout for sizing and for carving, so the two cannot drift.
@@ -87,7 +92,11 @@ SliceWorkspace layout(const SparseMoeGeometry& g, std::int32_t tokens, Allocate&
             allocate(sizeof(__nv_bfloat16) * tokens * g.shared_intermediate));
         w.shared_out = static_cast<__nv_bfloat16*>(
             allocate(sizeof(__nv_bfloat16) * tokens * g.hidden));
+        w.lora_shared_low = static_cast<__nv_bfloat16*>(
+            allocate(sizeof(__nv_bfloat16) * tokens * 3 * kSparseMoeNvfp4MaxLoraRank));
     }
+    w.lora_low = static_cast<__nv_bfloat16*>(
+        allocate(sizeof(__nv_bfloat16) * assignments * 3 * kSparseMoeNvfp4MaxLoraRank));
     return w;
 }
 
@@ -341,7 +350,8 @@ __global__ void combine_kernel(const __nv_bfloat16* __restrict__ routed,
 void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router_x,
                const SparseMoeWeights& weights, Tensor& destination, const SliceWorkspace& w,
                const Nvfp4MarlinScratch& scratch, cudaStream_t stream,
-               const SparseMoeRoundHook* hook, std::int32_t first_token) {
+               const SparseMoeRoundHook* hook, std::int32_t first_token, WorkspaceArena& workspace,
+               const SparseMoeNvfp4Adapters* adapters) {
     const std::int32_t tokens      = x.ne[1];
     const std::int32_t assignments = tokens * kTopK;
     const int rows                 = g.router_rows();
@@ -383,15 +393,106 @@ void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router
                                2 * g.intermediate, g.hidden, g.experts, block, scratch.locks,
                                scratch.sm_count, stream);
     CUDA_CHECK(cudaGetLastError());
-    marlin_moe_silu_mul(w.product, w.activation, assignments, g.intermediate, stream);
+    // An adapter round: each routed path's delta, on the same expert blocks.
+    MarlinMoeLoraCall lora;
+    if (adapters != nullptr) {
+        lora.ids            = w.ids;
+        lora.sorted_ids     = w.sorted_ids;
+        lora.expert_ids     = w.expert_ids;
+        lora.past_padded    = w.past_padded;
+        lora.block          = block;
+        lora.block_capacity = block_capacity(assignments, g.experts);
+        lora.rows           = assignments;
+        lora.top_k          = kTopK;
+        lora.banks          = adapters->banks;
+        lora.slots          = adapters->slots;
+        lora.slot_stride    = adapters->slot_stride;
+        lora.slot_count     = adapters->slot_count;
+        lora.rank           = adapters->rank;
+        lora.low            = w.lora_low;
+        MarlinMoeLoraCall gate_up = lora;
+        gate_up.input            = x.data;
+        gate_up.input_per_token  = true;
+        gate_up.out              = w.product;
+        gate_up.out_ld           = 2 * g.intermediate;
+        gate_up.k                = g.hidden;
+        gate_up.n                = g.intermediate;
+        gate_up.parts            = 2;
+        gate_up.column_offset[0] = weights.routed_up_first ? g.intermediate : 0; // gate
+        gate_up.column_offset[1] = weights.routed_up_first ? 0 : g.intermediate; // up
+        marlin_moe_lora_delta(gate_up, stream);
+    }
+    marlin_moe_silu_mul(w.product, w.activation, assignments, g.intermediate, stream,
+                        weights.routed_up_first);
     marlin_moe_gemm_nvfp4_bf16(w.activation, down.qdata, down.scales, down.marlin_global_scale,
                                w.product, scratch.c_tmp, w.sorted_ids, w.expert_ids, w.past_padded,
                                w.alpha, assignments, 1, /*mul_topk_weights=*/true, g.hidden,
                                g.intermediate, g.experts, block, scratch.locks, scratch.sm_count,
                                stream);
     CUDA_CHECK(cudaGetLastError());
+    if (adapters != nullptr) {
+        MarlinMoeLoraCall down = lora;
+        down.input           = w.activation;
+        down.input_per_token = false;
+        down.top_k           = kTopK; // a row's token still selects its slot
+        down.out             = w.product;
+        down.out_ld          = g.hidden;
+        down.k               = g.intermediate;
+        down.n               = g.hidden;
+        down.down            = true;
+        down.parts           = 1;
+        down.row_weights     = w.alpha;
+        marlin_moe_lora_delta(down, stream);
+    }
 
-    if (g.has_shared()) {
+    if (g.has_shared() && weights.shared_gate_up.qtype != QType::NVFP4_A16) {
+        // A checkpoint whose experts were rewritten at load (--moe-route marlin) keeps its shared
+        // expert as stored: its own kernels, BF16 activations, into the same combine.
+        auto scope = workspace.scope();
+        Tensor activation(w.shared_act, DType::BF16, {g.shared_intermediate, tokens});
+        Tensor shared_out(w.shared_out, DType::BF16, {g.hidden, tokens});
+        if (adapters == nullptr) {
+            linear_swiglu(x, weights.shared_gate_up, activation, LinearPolicy::A16Only, workspace, stream);
+            linear(activation, weights.shared_down, shared_out, LinearPolicy::A16Only, workspace, stream);
+        } else {
+            // The adapter's shared-expert deltas go in before the SiLU and into its output: the
+            // stored [gate; up] product is materialised for them.
+            Tensor product(w.shared_up, DType::BF16, {2 * g.shared_intermediate, tokens});
+            linear(x, weights.shared_gate_up, product, LinearPolicy::A16Only, workspace, stream);
+            MarlinMoeLoraCall shared;
+            shared.fixed_expert     = g.experts;
+            shared.block            = 64;
+            shared.block_capacity   = (tokens + 63) / 64;
+            shared.rows             = tokens;
+            shared.top_k            = 1;
+            shared.banks            = adapters->banks;
+            shared.slots            = adapters->slots;
+            shared.slot_stride      = adapters->slot_stride;
+            shared.slot_count       = adapters->slot_count;
+            shared.rank             = adapters->rank;
+            shared.low              = w.lora_shared_low;
+            shared.input            = x.data;
+            shared.out              = w.shared_up;
+            shared.out_ld           = 2 * g.shared_intermediate;
+            shared.k                = g.hidden;
+            shared.n                = g.shared_intermediate;
+            shared.parts            = 2;
+            shared.column_offset[0] = 0;
+            shared.column_offset[1] = g.shared_intermediate;
+            marlin_moe_lora_delta(shared, stream);
+            marlin_moe_silu_mul(w.shared_up, w.shared_act, tokens, g.shared_intermediate, stream);
+            linear(activation, weights.shared_down, shared_out, LinearPolicy::A16Only, workspace, stream);
+            MarlinMoeLoraCall shared_down = shared;
+            shared_down.input            = w.shared_act;
+            shared_down.out              = w.shared_out;
+            shared_down.out_ld           = g.hidden;
+            shared_down.k                = g.shared_intermediate;
+            shared_down.n                = g.hidden;
+            shared_down.down             = true;
+            shared_down.parts            = 1;
+            marlin_moe_lora_delta(shared_down, stream);
+        }
+    } else if (g.has_shared()) {
         const Weight& shared_gate_up = weights.shared_gate_up;
         const Weight& shared_down    = weights.shared_down;
         marlin_gemm_nvfp4_bf16(x.data, shared_gate_up.qdata, shared_gate_up.scales,
@@ -438,7 +539,7 @@ std::size_t sparse_moe_nvfp4_workspace_bytes(const SparseMoeGeometry& geometry,
 void sparse_moe_nvfp4(const SparseMoeGeometry& geometry, const Tensor& x, const Tensor& router_x,
                       const SparseMoeWeights& weights, Tensor& destination,
                       WorkspaceArena& workspace, cudaStream_t stream,
-                      const SparseMoeRoundHook* hook) {
+                      const SparseMoeRoundHook* hook, const SparseMoeNvfp4Adapters* adapters) {
     const Nvfp4MarlinScratch scratch = nvfp4_marlin_scratch();
     const std::int32_t tokens        = x.ne[1];
     for (std::int32_t offset = 0; offset < tokens; offset += kSparseMoeNvfp4Slice) {
@@ -450,8 +551,16 @@ void sparse_moe_nvfp4(const SparseMoeGeometry& geometry, const Tensor& x, const 
         const Tensor x_slice      = x.slice(1, offset, count);
         const Tensor router_slice = router_x.slice(1, offset, count);
         Tensor destination_slice  = destination.slice(1, offset, count);
+        // A slice's tokens are the round's [offset, offset + count): their slots follow them.
+        SparseMoeNvfp4Adapters slice_adapters;
+        if (adapters != nullptr) {
+            slice_adapters = *adapters;
+            if (slice_adapters.slot_stride != 0) {
+                slice_adapters.slots += static_cast<std::ptrdiff_t>(offset) * slice_adapters.slot_stride;
+            }
+        }
         run_slice(geometry, x_slice, router_slice, weights, destination_slice, views, scratch,
-                  stream, hook, offset);
+                  stream, hook, offset, workspace, adapters != nullptr ? &slice_adapters : nullptr);
     }
 }
 
