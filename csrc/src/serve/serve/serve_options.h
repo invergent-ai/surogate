@@ -148,6 +148,10 @@ struct ServeOptions {
     // on what else shares its rounds (api/ops/batch_invariant.h). Off by default: it trades
     // throughput for reproducibility.
     bool batch_invariant = false;
+    /// --moe-route auto|w4a16 (api/ops/sparse_moe.h SparseMoeRoute): w4a16 keeps the routed NVFP4
+    /// experts on our W4A16 kernels at every width, so a token's log-prob does not depend on its
+    /// round's width -- the RL engines' setting (rollouts, KL-anchor prefill). auto is the default.
+    bool moe_route_w4a16 = false;
     // Default thinking mode for the generation prompt: --thinking or --no-thinking, else what
     // the chat template does when nothing asks (PromptCapabilities::thinking_by_default).
     std::optional<bool> enable_thinking;

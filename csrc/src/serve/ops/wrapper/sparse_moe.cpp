@@ -16,6 +16,7 @@
 #include "ops/linear/marlin/marlin_nvfp4.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
@@ -536,7 +537,13 @@ std::int32_t small_t_widest_slice(std::int32_t min_tokens, std::int32_t max_toke
 /// decode and small-T kernels are faster: the runner permutes, groups and reduces for a batch,
 /// and at a handful of rows that scaffolding costs more than the GEMMs it enables. Measured, and
 /// overridable so the crossover can be re-measured rather than assumed.
+std::atomic<SparseMoeRoute> g_sparse_moe_route{SparseMoeRoute::Auto};
+
 std::int32_t trtllm_min_tokens() {
+    // --moe-route w4a16: never the runner, at any width.
+    if (g_sparse_moe_route.load(std::memory_order_relaxed) == SparseMoeRoute::W4A16) {
+        return std::numeric_limits<std::int32_t>::max();
+    }
     static const std::int32_t value = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_MOE_TRTLLM_MIN");
         if (raw == nullptr || *raw == '\0') { return kSparseMoeTrtllmMinTokens; }
@@ -545,6 +552,11 @@ std::int32_t trtllm_min_tokens() {
     }();
     return value;
 }
+
+void set_sparse_moe_route(SparseMoeRoute route) noexcept {
+    g_sparse_moe_route.store(route, std::memory_order_relaxed);
+}
+SparseMoeRoute sparse_moe_route() noexcept { return g_sparse_moe_route.load(std::memory_order_relaxed); }
 
 bool sparse_moe_prefill_routing_admitted(QType routed_gate_up, QType routed_down) noexcept {
     return detail::sparse_moe_prefill_routing_admitted_pair(routed_gate_up, routed_down);
