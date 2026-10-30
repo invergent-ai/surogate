@@ -67,6 +67,8 @@ struct SliceWorkspace {
     __nv_bfloat16* shared_out = nullptr; // [tokens][hidden]
     __nv_bfloat16* lora_low   = nullptr; // [tokens * top_k][3][max rank], adapter rounds
     __nv_bfloat16* lora_shared_low = nullptr; // [tokens][3][max rank]
+    int2* lora_tiles              = nullptr; // adapter rounds: the routed mixture's 64-slot tiles
+    std::int32_t* lora_tile_count = nullptr; // [1]
 };
 
 // One layout for sizing and for carving, so the two cannot drift.
@@ -100,6 +102,9 @@ SliceWorkspace layout(const SparseMoeGeometry& g, std::int32_t tokens, Allocate&
     }
     w.lora_low = static_cast<__nv_bfloat16*>(
         allocate(sizeof(__nv_bfloat16) * assignments * 3 * kSparseMoeNvfp4MaxLoraRank));
+    w.lora_tiles = static_cast<int2*>(
+        allocate(sizeof(int2) * marlin_moe_lora_tile_capacity(assignments, g.experts)));
+    w.lora_tile_count = static_cast<std::int32_t*>(allocate(sizeof(std::int32_t)));
     return w;
 }
 
@@ -506,6 +511,11 @@ void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router
         lora.slot_count     = adapters->slot_count;
         lora.rank           = adapters->rank;
         lora.low            = w.lora_low;
+        lora.offsets        = w.offsets;
+        lora.experts        = g.experts;
+        lora.tiles          = w.lora_tiles;
+        lora.tile_count     = w.lora_tile_count;
+        lora.tile_capacity  = marlin_moe_lora_tile_capacity(assignments, g.experts);
         MarlinMoeLoraCall gate_up = lora;
         gate_up.input            = x.data;
         gate_up.input_per_token  = true;

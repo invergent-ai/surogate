@@ -53,7 +53,17 @@ struct MarlinMoeLoraCall {
     std::int32_t parts              = 2;
     std::int32_t column_offset[2]   = {0, 0};
     const float* row_weights        = nullptr;
+    /// Wide rounds of a routed mixture: Marlin's padded expert offsets ([experts + 1]) and the
+    /// 64-slot tile table the call lays out from them (workspace, `tile_capacity` entries).
+    const std::int32_t* offsets  = nullptr;
+    std::int32_t experts         = 0;
+    int2* tiles                  = nullptr;
+    std::int32_t* tile_count     = nullptr;
+    std::int32_t tile_capacity   = 0;
 };
+
+/// Tile-table entries a routed call of `assignments` rows over `experts` experts can need.
+std::int32_t marlin_moe_lora_tile_capacity(std::int32_t assignments, std::int32_t experts);
 
 void marlin_moe_lora_delta(const MarlinMoeLoraCall& call, cudaStream_t stream);
 
