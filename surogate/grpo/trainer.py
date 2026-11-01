@@ -1399,7 +1399,7 @@ class GRPOTrainer:
                     adamw_epsilon=config.adamw_epsilon,
                 )
 
-            result = self.trainer.update_with_config(opt_config, step + 1)
+            result = self.trainer.update_with_config(opt_config, step)
             # The diagnostic path computes the loss in Python, so the native
             # accumulator is empty — use the Python metrics from the last
             # micro-batch instead.

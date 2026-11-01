@@ -269,7 +269,7 @@ def _run_with_dumps_root(
 
             ok, err = capture_exception(
                 lambda: wrapper.trainer.update_with_config(
-                    build_optimizer_config(config, _lr_for_step(wrapper, config, step)), step + 1
+                    build_optimizer_config(config, _lr_for_step(wrapper, config, step)), step
                 ),
             )
             if not ok:

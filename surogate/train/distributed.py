@@ -672,7 +672,7 @@ class NodeTrainer:
                 normuon_lr=lr,
                 normuon_cautious_wd=config.normuon_cautious_wd,
             )
-            result = self._trainer.update_with_config(opt_config, step + 1)
+            result = self._trainer.update_with_config(opt_config, step)
             return result["loss"], result["norm"]
 
         use_full_step_graphs = True
@@ -720,9 +720,9 @@ class NodeTrainer:
             normuon_cautious_wd=config.normuon_cautious_wd,
         )
         if use_full_step_graphs:
-            result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+            result = self._trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step)
         else:
-            result = self._trainer.update_with_config(opt_config, step + 1)
+            result = self._trainer.update_with_config(opt_config, step)
 
         return result["loss"], result["norm"]
 
