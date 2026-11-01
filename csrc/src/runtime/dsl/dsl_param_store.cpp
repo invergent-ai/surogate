@@ -368,6 +368,7 @@ std::optional<std::size_t> DslParamStore::persistent_arena_offset(const Compiled
 std::size_t DslParamStore::release_storage_for_persistent_arena(const CompiledGraph& graph, std::size_t arena_bytes) {
     if (mContentsValid) return 0;  // weights already loaded: the rebind copies them
     if (mParams.contains("lm_head") && mParams.at("lm_head").storage_alias) return 0;
+    arena_bytes = std::min(arena_bytes, rebindable_persistent_bytes(graph));  // the base region (see the rebind)
     std::size_t released = 0;
     for (const auto& name : mParamOrder) {
         auto it = mParams.find(name);
@@ -412,6 +413,15 @@ void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
         return;
     }
 
+    // Local parameters belong to the arena's base region only, [0, rebindable_persistent_bytes()); the graph
+    // executor lays the weight-manager, LoRA and extras slabs out behind it. With a provider-resolved or managed
+    // parameter in the store that region is empty. Bounding by the whole arena instead bound every local
+    // parameter whose compiler offset fell inside it into the LoRA slab, where the adapter's rebind and every
+    // master-to-work sync overwrote it: under QLoRA, Qwen3.5-MoE router weights, so at LoRA r8 / r16 on the
+    // experts' gate/up a few layers routed every token to the wrong experts (r1 and attention-only LoRA, with
+    // smaller slabs, stayed clean).
+    const std::size_t base_bytes = std::min(arenas.persistent_bytes, rebindable_persistent_bytes(graph));
+
     std::size_t rebound = 0;
     std::size_t bound_in_place = 0;
     std::size_t skipped_external = 0;
@@ -430,7 +440,7 @@ void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
             ++skipped_managed;
             continue;
         }
-        const auto offset = persistent_arena_offset(graph, name, entry, arenas.persistent_bytes);
+        const auto offset = persistent_arena_offset(graph, name, entry, base_bytes);
         if (!offset) {
             if (entry.arena_pending) {
                 throw std::logic_error("DslParamStore: released parameter " + name + " has no persistent arena slot");

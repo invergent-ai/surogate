@@ -16,6 +16,7 @@
 #ifndef SUROGATE_SRC_DSL_BUFFER_PLAN_H
 #define SUROGATE_SRC_DSL_BUFFER_PLAN_H
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -415,7 +416,15 @@ struct BufferPlan {
 /// boundaries so the peak is computed per-layer and max'd across layers.
 ///
 /// Returns 0 if `bwd_graph` is null or has no operations.
-[[nodiscard]] long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan& plan);
+///
+/// `is_trainable(param)`, when given, drops the gradients the runtime never materializes: a weight gradient whose
+/// param is frozen (the matmul / grouped-GEMM / embedding backward dispatchers skip dW when
+/// !DslParamStore::is_trainable). Under LoRA the frozen base's dW are the largest outputs of a block's backward:
+/// Qwen3.5-35B-A3B at 8k counted 1.9 GB of embedding gradient and 3 GB of routed-expert dW. The walk said 8.1 GB; the
+/// runtime peaked at 3.9 GB.
+[[nodiscard]] long graph_backward_stack_peak(const CompiledGraph* bwd_graph,
+                                             const BufferPlan& plan,
+                                             const std::function<bool(const std::string&)>& is_trainable = {});
 
 /// Total DSL stack size required for training, combining plan-level and
 /// graph-level peaks with safety / MoE / CUDA-graph / architecture margins.
@@ -430,7 +439,8 @@ struct BufferPlan {
 [[nodiscard]] long required_stack_bytes(const BufferPlan& plan,
                                         const CompiledGraph* bwd_graph,
                                         const PretrainedConfig& cfg,
-                                        const RuntimeOptions& options);
+                                        const RuntimeOptions& options,
+                                        const std::function<bool(const std::string&)>& is_trainable = {});
 
 }  // namespace dsl
 

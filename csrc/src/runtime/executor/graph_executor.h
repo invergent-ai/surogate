@@ -21,6 +21,7 @@
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/dsl/stage_boundary.h"
 #include "runtime/executor/execution_request.h"
 #include "runtime/executor/glm_decode_state.h"
 #include "runtime/core/forward_hooks.h"
@@ -201,6 +202,11 @@ class GraphExecutor final : public IGraphExecutor {
 public:
     void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr) override;
     void zero_sequence_chunk_dkv() override;
+    void zero_sequence_chunk_dkv(int lo, int hi);
+    /// Chunk-state snapshots of a stage's layers (CompiledExecutor::save_sequence_chunk_state).
+    void save_sequence_chunk_state(int lo, int hi, int slot, int chunks);
+    bool restore_sequence_chunk_state(int lo, int hi, int slot, int chunks);
+    void invalidate_sequence_chunk_snapshots();
 
     GraphExecutor(const Module& module,
                   DslRunState& run_state,
@@ -331,8 +337,8 @@ public:
     // Read a named graph tensor's raw device bytes to host (empty if absent), and
     // stage/clear named boundary tensors to bind on the next forward (cross-GPU
     // handoff). restore_stage_base drops a preserved stage's allocations.
-    std::vector<std::byte> read_named_bytes(const std::string& name);
-    void set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items);
+    surogate::PinnedBytes read_named_bytes(const std::string& name);
+    void set_inject_named(StageBoundary items);
     void clear_inject_named();
     void restore_stage_base();
     // dispatch-PP: reset the compute stack to a clean per-step base (reclaims the
@@ -340,6 +346,11 @@ public:
     void dispatch_reset_stack();
     // dispatch-PP recompute:false: release the saved-tensor cache between resident stages.
     void reset_saved_cache();
+    // dispatch-PP: recycle blocks [lo..hi]'s saved buffers once nothing reads them: after a
+    // stage's first-pass forward and after its backward (CompiledExecutor::retire_saved_layers).
+    // SUROGATE_DPP_MEM_TRACE=1 prints one line per call: saved-cache and pool bytes, stack use
+    // and high-water mark, device free. Returns the recycled bytes.
+    std::size_t retire_saved_layers(int lo, int hi, const char* phase = nullptr, int stage = -1);
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.

@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <functional>
@@ -80,6 +81,10 @@ public:
         std::vector<std::uint8_t> layer_has_dense_mlp;
         std::vector<std::uint8_t> layer_has_moe;
 
+        /// dispatch-PP stage-local LoRA: this rank allocates layer l's adapters only where layer_local[l], the
+        /// layers of the stages its GPU runs. Empty = every layer (replicated).
+        std::vector<std::uint8_t> layer_local;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }
@@ -107,12 +112,27 @@ public:
 
     /**
      * @brief Export LoRA adapter to safetensors file
+     *
+     * dtype: the dtype the tensors are written in. Unset keeps the master dtype (checkpoints resume from it);
+     * BF16 rounds FP32 masters to nearest-even, the copy a BF16 serving engine loads.
      */
-    void export_to_file(const std::string& file_name, NCCLCommunicator& comm) const;
+    void export_to_file(const std::string& file_name,
+                        NCCLCommunicator& comm,
+                        std::optional<ETensorDType> dtype = std::nullopt) const;
 
     /// True when grouped expert-LoRA holds only an EP-local shard of the experts
     /// (num_grouped_experts < num_experts and grouped buffers exist).
     [[nodiscard]] bool has_ep_local_grouped() const;
+
+    /// dispatch-PP stage-local adapters: this rank holds only its own stages' layers (Config::layer_local).
+    [[nodiscard]] bool stage_local() const {
+        return !mConfig.layer_local.empty();
+    }
+    [[nodiscard]] bool layer_is_local(int layer) const {
+        return mConfig.layer_local.empty() ||
+               (layer >= 0 && static_cast<std::size_t>(layer) < mConfig.layer_local.size() &&
+                mConfig.layer_local[static_cast<std::size_t>(layer)] != 0);
+    }
 
     /**
      * @brief Get block weights for forward/backward pass
@@ -223,6 +243,23 @@ private:
 
     void gather_grouped_for_export(NCCLCommunicator& comm) const;
     void release_export_gathered() const;
+
+    // Stage-local export staging: host copies of every rank's adapter tensors under their export names, set
+    // on rank 0 only while it writes the file (iterate_tensors then yields exactly these).
+    struct StagedTensor {
+        std::string name;
+        Tensor host;  ///< Device -1, Data into `bytes`
+        std::unique_ptr<std::byte[]> bytes;
+    };
+    mutable std::vector<StagedTensor> mExportStaged;
+
+    /// A host copy of `t` under `name`, an FP32 tensor rounded to BF16 when dtype asks for it.
+    static StagedTensor stage_tensor(std::string name, const TensorShard& t, std::optional<ETensorDType> dtype);
+    /// Writes the staged tensors (rank 0 only), then drops them.
+    void write_staged(const std::string& file_name, std::vector<StagedTensor> staged) const;
+    void export_stage_local(const std::string& file_name,
+                            NCCLCommunicator& comm,
+                            std::optional<ETensorDType> dtype) const;
 
     // Master weights (sharded for multi-GPU)
     LoRAWeightsSet<TensorShard> mMaster;

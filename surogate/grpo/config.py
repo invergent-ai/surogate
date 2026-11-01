@@ -107,6 +107,16 @@ class GRPOTrainConfig(SFTConfig):
     # visible to Python. Same math, same gradients (covered by
     # tests/grpo/test_native_formula.py), but slower — measurement only.
     turn_diagnostics: bool = False
+    # dispatch-PP only: score every row with the trainer's own base model (the
+    # LoRA delta off, the policy pass's kernels) and use those log-probs as the
+    # rows' teacher_logprobs -- a KL anchor to the base weights, weighted by
+    # loss.teacher_tau, with no teacher server. Costs one more log-prob pass per
+    # dispatch call; the rows' own teacher_logprobs are replaced.
+    teacher_from_base: bool = False
+    # dtype of the LoRA adapter in weight broadcasts: "bf16" rounds FP32 masters
+    # (lora_dtype: fp32) to BF16, the copy a BF16 serving engine loads, at half
+    # the bytes; "master" writes them as stored. Checkpoints keep full precision.
+    broadcast_dtype: Literal["bf16", "master"] = "bf16"
 
     def __init__(self, cfg: DictDefault):
         # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
@@ -177,6 +187,8 @@ class GRPOTrainConfig(SFTConfig):
         self.pad_to_multiple_of = cfg.get("pad_to_multiple_of", self.pad_to_multiple_of)
         self.doc_masking = cfg.get("doc_masking", self.doc_masking)
         self.turn_diagnostics = cfg.get("turn_diagnostics", self.turn_diagnostics)
+        self.teacher_from_base = bool(cfg.get("teacher_from_base", self.teacher_from_base))
+        self.broadcast_dtype = cfg.get("broadcast_dtype", self.broadcast_dtype)
 
         # Initialize inherited config: model_dir, runtime_config, lora_config, etc.
         # In the SFT path this is called by TokenizeDatasets.__init__(), but GRPO

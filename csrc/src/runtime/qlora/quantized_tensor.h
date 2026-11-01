@@ -25,6 +25,9 @@ enum class QuantFormat : int {
     FP8_PER_BLOCK,  // Per-block FP8 E4M3 with block scales
     FP4_BLOCK_2D,   // Two-level block scaling FP4 E2M1 (Blackwell)
     HF_MXFP4,       // HF pre-quantized MXFP4: packed FP4 + E8M0 shared exponents per 32 elements
+    FP8_PER_ROW,    // Pre-quantized FP8 E4M3 with one scale per row (compressed-tensors "channel" strategy).
+                    // Load-only: kept beside the main format of a mixed checkpoint, e.g. the attention / GDN
+                    // projections of an NVFP4-experts export; the weight manager dequantizes it itself.
 };
 
 /// Storage for a single quantized tensor.
@@ -78,6 +81,13 @@ struct QuantizedTensor {
 
     /// Global decode scale for FP4 row-wise dequantization.
     float global_scale = 1.0f;
+
+    /// FP4_BLOCK_2D stacked from independently quantized components (the routed experts of a
+    /// pre-quantized NVFP4 checkpoint, one global scale each): rows [g*component_rows,
+    /// (g+1)*component_rows) dequantize with component_scales[g] instead of global_scale.
+    /// Device FP32, M / component_rows entries, never offloaded. component_rows == 0: unused.
+    Tensor component_scales;
+    int component_rows = 0;
 
     /// Number of elements in the original (unquantized) tensor.
     [[nodiscard]] long nelem() const {

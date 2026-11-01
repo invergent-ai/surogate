@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <string_view>
 #include <unordered_map>
@@ -928,7 +929,9 @@ long BufferPlan::plan_stack_peak_bytes(long mlp_tokens) const {
 // Graph-level peak: op-internal + stack-resident outputs in compiled backward
 // ----------------------------------------------------------------------------
 
-long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan& plan) {
+long graph_backward_stack_peak(const CompiledGraph* bwd_graph,
+                               const BufferPlan& plan,
+                               const std::function<bool(const std::string&)>& is_trainable) {
     if (bwd_graph == nullptr || bwd_graph->ops.empty()) {
         return 0;
     }
@@ -939,17 +942,47 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
     long peak = 0;
     long current = 0;
 
+    // SUROGATE_DEBUG_STACK_WALK=1: print the peak layer's contributions (op, stack outputs, op-internal bound), to
+    // compare with the stack's high-water allocation list (DeviceMemoryStack::get_allocation_stats).
+    static const bool walk_trace = [] {
+        const char* env = std::getenv("SUROGATE_DEBUG_STACK_WALK");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    struct Contribution {
+        std::size_t op = 0;
+        const char* kind = "";
+        long outputs = 0;
+        long bound = 0;
+    };
+    std::vector<Contribution> layer_contrib, peak_contrib;
+
     // Tiled groups restore their scratch after each tile. Logical full-size
     // intermediates and the ordinary dispatchers' bounds do not apply to them.
     std::unordered_map<std::size_t, const MlpTileGroup*> tile_starts;
     for (const auto& group : bwd_graph->mlp_tile_groups)
         tile_starts[group.start_op_idx] = &group;
 
+    // A frozen param's gradient is never materialized (see the header). The ref names it d_<param>.
+    auto frozen_param_grad = [&](const TensorRef& ref) {
+        if (!is_trainable || ref.tensor_id < 0 ||
+            static_cast<std::size_t>(ref.tensor_id) >= bwd_graph->tensor_meta.size() ||
+            bwd_graph->tensor_meta[static_cast<std::size_t>(ref.tensor_id)].kind != TensorKind::ParamGrad) {
+            return false;
+        }
+        const std::string_view n(ref.name);
+        return n.size() > 2 && n.substr(0, 2) == "d_" && !is_trainable(std::string(n.substr(2)));
+    };
+    // A byte count no op could allocate means the output's shape was never resolved (one 16k plan walked to
+    // 8.8e12 MiB); it is left out of the walk, and the outer margins still apply.
+    constexpr long kSaneOutputBytes = 1L << 40;
+    bool warned_insane = false;
+
     auto count_outputs = [&](const CompiledOp& op) {
         // (1) Graph-level outputs that land on the stack.
         for (const auto& ref : op.outputs) {
             if (bwd_graph->mlp_tile_internal_tids.count(ref.tensor_id)) continue;
             if (ref.shape.empty()) continue;
+            if (frozen_param_grad(ref)) continue;
             bool on_stack = false;
             switch (ref.slot) {
                 case TensorSlot::Mapped: on_stack = true; break;
@@ -961,7 +994,16 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
                 default: break;
             }
             if (on_stack) {
-                current += tensor_stack_bytes(ref.dtype, ref.shape);
+                const long bytes = tensor_stack_bytes(ref.dtype, ref.shape);
+                if (bytes < 0 || bytes > kSaneOutputBytes) {
+                    if (!warned_insane) {
+                        std::fprintf(stderr, "[stack plan] ignoring output '%s' of %ld bytes (unresolved shape)\n",
+                                     ref.name.c_str(), bytes);
+                        warned_insane = true;
+                    }
+                    continue;
+                }
+                current += bytes;
             }
         }
     };
@@ -992,7 +1034,10 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
             if (bwd_graph->ops[i].layer_end >= 0) current = 0;
             continue;
         }
+        const long before_outputs = current;
         count_outputs(op);
+        const long op_outputs = current - before_outputs;
+        long op_bound = 0;
 
         // (2) Op-internal temps allocated by dispatch functions — workspaces,
         //     recompute scratch, fused-kernel temps — that are NOT visible
@@ -1000,8 +1045,14 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
         //     `StackBoundFn` alongside their dispatch (see op_registry.h's
         //     `REGISTER_STACK_BOUND`). Ops without a bound contribute 0; the
         //     outer safety margin in `required_stack_bytes` covers them.
-        if (const auto* desc = OpRegistry::instance().find(op.type); desc && desc->stack_bound_fn) {
-            current += desc->stack_bound_fn(op, plan);
+        const auto* desc = OpRegistry::instance().find(op.type);
+        if (desc && desc->stack_bound_fn) {
+            op_bound = desc->stack_bound_fn(op, plan);
+            current += op_bound;
+        }
+        if (walk_trace) {
+            layer_contrib.push_back({i, desc ? desc->name.c_str() : "?", op_outputs, op_bound});
+            if (current > peak) peak_contrib = layer_contrib;
         }
 
         peak = std::max(peak, current);
@@ -1010,9 +1061,23 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
         // op-internal temps within a layer are freed by then.
         if (op.layer_end >= 0) {
             current = 0;
+            layer_contrib.clear();
         }
     }
 
+    if (walk_trace && !peak_contrib.empty()) {
+        auto sorted = peak_contrib;
+        std::sort(sorted.begin(), sorted.end(), [](const Contribution& a, const Contribution& b) {
+            return a.outputs + a.bound > b.outputs + b.bound;
+        });
+        constexpr double MiB = 1024.0 * 1024.0;
+        std::fprintf(stderr, "[stack-walk] peak %.0f MiB over %zu ops of its layer; largest:\n", peak / MiB,
+                     peak_contrib.size());
+        for (std::size_t k = 0; k < std::min<std::size_t>(sorted.size(), 20); ++k) {
+            std::fprintf(stderr, "[stack-walk]   op %zu %s: outputs %.0f MiB, internal bound %.0f MiB\n", sorted[k].op,
+                         sorted[k].kind, sorted[k].outputs / MiB, sorted[k].bound / MiB);
+        }
+    }
     return peak;
 }
 
@@ -1173,7 +1238,8 @@ static long min_stack_floor(const BufferPlan& plan, const PretrainedConfig& cfg,
 long required_stack_bytes(const BufferPlan& plan,
                           const CompiledGraph* bwd_graph,
                           const PretrainedConfig& cfg,
-                          const RuntimeOptions& options) {
+                          const RuntimeOptions& options,
+                          const std::function<bool(const std::string&)>& is_trainable) {
     // Global MoE slack (applied to both heuristic path and floor). Env-
     // override kept for operator control when a model spikes beyond the
     // built-in 2 GiB allowance.
@@ -1184,7 +1250,7 @@ long required_stack_bytes(const BufferPlan& plan,
     }
 
     const long heuristic = heuristic_required_bytes(plan, cfg, options, moe_stack_slack);
-    const long graph_peak = graph_backward_stack_peak(bwd_graph, plan);
+    const long graph_peak = graph_backward_stack_peak(bwd_graph, plan, is_trainable);
     const long graph_based = graph_required_bytes(graph_peak, options);
     const long floor = min_stack_floor(plan, cfg, options) + moe_stack_slack;
 

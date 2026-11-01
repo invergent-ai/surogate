@@ -6,7 +6,9 @@
 // and single-token experts), ranks 8/16/32, both Gemma4 expert shapes, several
 // tile sizes, both accumulate modes, grids sized with and without the host copy
 // of the offsets, and 300 experts (multi-pass tile scan); reruns must be
-// bit-identical; unsupported shapes and a short workspace launch nothing.
+// bit-identical; unsupported shapes and a short workspace launch nothing. fp32
+// weight gradients (FP32 LoRA masters) match the oracle to fp32 accumulation
+// error and, rounded to bf16, equal the bf16 gradients bit for bit.
 #include <catch2/catch_test_macros.hpp>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -296,12 +298,67 @@ void run_case(const Problem& p, const Inputs& in, const Mode& m, const Oracle& r
         }
     }
 
+    // fp32 weight gradients from the same partials: dx unchanged, dA/dB close to the oracle without the bf16
+    // store, and rounded to bf16 exactly the bf16 run's results.
+    {
+        std::vector<float> dA0(in.dA0.size()), dB0(in.dB0.size());
+        for (std::size_t i = 0; i < dA0.size(); ++i)
+            dA0[i] = __bfloat162float(in.dA0[i]);
+        for (std::size_t i = 0; i < dB0.size(); ++i)
+            dB0[i] = __bfloat162float(in.dB0[i]);
+        Device<nv_bfloat16> dx(in.dx0);
+        Device<float> dA(dA0), dB(dB0);
+        Device<float> workspace(std::vector<float>(ws_floats, 12345.0f));
+        REQUIRE(moe_lora_grouped_backward_bf16(dx.ptr,
+                                               dA.ptr,
+                                               dB.ptr,
+                                               d_out.ptr,
+                                               x.ptr,
+                                               A.ptr,
+                                               B.ptr,
+                                               offsets.ptr,
+                                               host_offsets,
+                                               in.E,
+                                               in.T,
+                                               p.in,
+                                               p.out,
+                                               p.rank,
+                                               p.scaling,
+                                               m.dx_accumulate,
+                                               /*grad_accumulate=*/accumulate,
+                                               workspace.ptr,
+                                               ws_floats,
+                                               nullptr,
+                                               tile));
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        REQUIRE(cudaGetLastError() == cudaSuccess);
+        require_same_bits(dx.read(in.dx0.size()), dx_first, tag + " dx with fp32 weight gradients");
+        auto check_fp32 = [&](const std::vector<float>& got, const std::vector<double>& ref,
+                              const std::vector<nv_bfloat16>& bf16, const std::string& what) {
+            double sq_err = 0.0, sq_ref = 0.0;
+            std::size_t same = 0;
+            for (std::size_t i = 0; i < ref.size(); ++i) {
+                const double d = static_cast<double>(got[i]) - ref[i];
+                sq_err += d * d;
+                sq_ref += ref[i] * ref[i];
+                const nv_bfloat16 r = __float2bfloat16(got[i]);
+                same += std::memcmp(&r, &bf16[i], sizeof(r)) == 0;
+            }
+            INFO(what << ": relative L2 error " << std::sqrt(sq_err / std::max(sq_ref, 1e-300)) << ", "
+                      << same << "/" << ref.size() << " equal to the bf16 gradients after rounding");
+            REQUIRE(std::sqrt(sq_err) <= 2e-5 * std::sqrt(sq_ref) + 1e-12);
+            REQUIRE(same == ref.size());
+        };
+        check_fp32(dA.read(in.dA0.size()), ref.dA, dA_first, tag + " fp32 dA");
+        check_fp32(dB.read(in.dB0.size()), ref.dB, dB_first, tag + " fp32 dB");
+    }
+
     // dx only (no weight gradients): one launch, no workspace.
     {
         Device<nv_bfloat16> dx(in.dx0);
         REQUIRE(moe_lora_grouped_backward_bf16(dx.ptr,
-                                               nullptr,
-                                               nullptr,
+                                               static_cast<nv_bfloat16*>(nullptr),  // the bf16 overload
+                                               static_cast<nv_bfloat16*>(nullptr),
                                                d_out.ptr,
                                                x.ptr,
                                                A.ptr,

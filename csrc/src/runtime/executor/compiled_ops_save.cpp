@@ -20,7 +20,9 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/core.h>
@@ -665,7 +667,11 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         return ls < mFwdOpLo || ls >= mFwdOpHi;
     };
     // Op-id-keyed saves (e.g. mamba_gated_rmsnorm "<op_id>.normed"/".rstd") carry the
-    // producing op index as the name prefix; out-of-range if that op wasn't run.
+    // producing op's op_id as the name prefix; out-of-range if that op wasn't run.
+    // The op_id is not the op's index (Qwen3.5-35B-A3B: op_id 1345 sits at index 1319),
+    // so the producer is looked up. Reading the id as an index threw "cannot save tensor
+    // 1345.normed" in the 2-block dispatch stage that starts between the two.
+    std::unordered_map<std::string_view, std::size_t> op_index_of_id;
     auto opkeyed_out_of_range = [&](const std::string& nm) -> bool {
         if (!sub_range_forward) return false;
         const std::size_t dot = nm.find('.');
@@ -673,8 +679,28 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         for (std::size_t i = 0; i < dot; ++i) {
             if (nm[i] < '0' || nm[i] > '9') return false;
         }
-        const std::size_t op = static_cast<std::size_t>(std::stoul(nm.substr(0, dot)));
-        return op < mFwdOpLo || op >= mFwdOpHi;
+        if (op_index_of_id.empty()) {
+            for (std::size_t i = 0; i < mCurrentGraph->ops.size(); ++i) {
+                op_index_of_id.emplace(mCurrentGraph->ops[i].op_id, i);
+            }
+        }
+        const auto it = op_index_of_id.find(std::string_view(nm).substr(0, dot));
+        if (it == op_index_of_id.end()) return false;  // unknown producer: keep the hard failure
+        return it->second < mFwdOpLo || it->second >= mFwdOpHi;
+    };
+    // The save list comes from the IR, before graph fusion. A fused op can drop an intermediate
+    // (moe_routing_topk_softmax drops router_probs; its backward reads router_logits), so a listed
+    // name that no op of the compiled forward produces has nothing to save. Under recompute every
+    // block save is metadata only and this never mattered; with recompute off it threw.
+    std::unordered_set<std::string_view> forward_outputs;
+    auto fused_away = [&](const std::string& nm) -> bool {
+        if (!mCurrentGraph) return false;
+        if (forward_outputs.empty()) {
+            for (const auto& op : mCurrentGraph->ops)
+                for (const auto& out : op.outputs)
+                    if (!out.name.empty()) forward_outputs.insert(out.name);
+        }
+        return forward_outputs.find(nm) == forward_outputs.end();
     };
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
@@ -821,6 +847,14 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     };
 
     for (const auto& name : save_list) {
+        // A dispatch-PP stage saves its own blocks only. The other blocks' FwdStack tids are
+        // pre-bound to the cyclic arena sections, so they looked live, and the MoE ones were
+        // force-persisted (with recompute off: 9.3 GB of copies for 23 blocks on one 32k stage).
+        if (sub_range_forward) {
+            int block = -1;
+            std::string field;
+            if (parse_block_param(name, block, field) && block_out_of_range(block)) continue;
+        }
         // LoRA hook activations (att, swiglu) need persistence for backward LoRA
         // gradient computation — BUT only when forward replay is NOT active.
         // When replay regenerates these tensors, no persistent buffer is needed.
@@ -915,6 +949,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             }
             if (block_out_of_range(layer_idx) || opkeyed_out_of_range(name)) {
                 continue;  // block belongs to a stage not forwarded here
+            }
+            if (fused_away(name)) {
+                continue;
             }
             throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
         }

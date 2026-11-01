@@ -220,7 +220,24 @@ The `model_dtype` parameter is the fundamental dtype that controls the precision
 
 ### LoRA Dtype
 
-The `lora_dtype` parameter controls the precision of **LoRA adapter master weights**.
+The `lora_dtype` parameter controls the precision of **LoRA adapter master weights**, and of the
+adapter's gradients. The forward and backward use work copies of the masters in `model_dtype` (BF16 by
+default, rounded to nearest even), so compute precision is the same either way. What `lora_dtype`
+decides is where updates and gradient sums are kept:
+
+- **`fp32` (default).** The optimizer updates FP32 masters, so an update smaller than half a BF16 ulp
+  of a weight still accumulates. Gradients are summed in FP32 over all of a step's microbatches,
+  chunks and dispatch-PP calls. This includes MoE expert LoRA: the grouped expert weight-gradient
+  GEMMs take BF16 operands and accumulate and store in FP32.
+- **`bf16`.** Half the adapter memory, but gradients are rounded to BF16 after each microbatch or
+  chunk is added. Over many of them the sum drifts, most when contributions cancel, as GRPO advantages
+  of mixed sign do. On a 1.04M-token GRPO step of Qwen3.5-35B-A3B (expert LoRA r16, 32 chunks per
+  row), the BF16-summed gradient was 41 % off the FP32 one (cosine 0.93). Small updates to large
+  weights are also rounded away, so at RL learning rates the A matrices barely move.
+
+Exported adapters keep the master dtype. GRPO weight broadcasts round FP32 masters to BF16
+(`broadcast_dtype: bf16`, the default) for serving engines that load BF16 LoRA, while checkpoints keep
+FP32 for resuming.
 
 ---
 

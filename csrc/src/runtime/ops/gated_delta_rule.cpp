@@ -377,9 +377,9 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         mTemps.push_back(h);
         Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
         mTemps.push_back(v_new);
-        Tensor h0_zero = mRunState.temp_alloc(ETensorDType::BF16, {1, H, K, V}, "gated_delta_rule_h0_buf");
+        Tensor h0_zero = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_h0_buf");
         mTemps.push_back(h0_zero);
-        CUDA_CHECK(cudaMemsetAsync(h0_zero.Data, 0, h0_zero.nelem() * 2, stream));
+        CUDA_CHECK(cudaMemsetAsync(h0_zero.Data, 0, h0_zero.nelem() * sizeof(float), stream));
         const ETensorDType qk = q.DType;
         const unsigned Hu = static_cast<unsigned>(H);
         for (const GdnDocument& doc : docs) {
@@ -455,23 +455,28 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
     mTemps.push_back(v_new);
 
     // If no initial_state, allocate a zeroed one.
-    // Note: the AOT kernel expects h0 as BF16 (see gdr_fwd_h manifest signature).
+    // Note: the JIT kernel takes h0 in FP32 (gdr_fwd_h signature): a chunked sequence carries the
+    // recurrent state across windows, and a BF16 carry rounded it at every window boundary.
     Tensor h0_buf;
     void* h0_ptr;
     ChunkGdnState* chunk_gdn = nullptr;
     if (sequence_chunk_active()) {
         // Chunked-sequence carry: slot c holds the recurrent state BEFORE
-        // chunk c (slot 0 is permanently zero). The final state is converted
+        // chunk c (slot 0 is permanently zero). The final state is copied
         // into slot c+1 after fwd_h below — idempotent across the phase-B
         // re-forward and the backward's recompute of the same chunk.
         chunk_gdn = &chunk_gdn_state(static_cast<long>(B) * H * K * V, op_layer_idx(op));
         h0_ptr = chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx()) * chunk_gdn->elems;
-    } else if (initial_state) {
+    } else if (initial_state && initial_state->DType == ETensorDType::FP32) {
         h0_ptr = initial_state->Data;
     } else {
-        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
+        h0_buf = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_h0_buf");
         mTemps.push_back(h0_buf);
-        CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
+        if (initial_state) {
+            convert_dtype(h0_buf.get<float>(), initial_state->get<nv_bfloat16>(), h0_buf.nelem(), stream);
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * sizeof(float), stream));
+        }
         h0_ptr = h0_buf.Data;
     }
 
@@ -535,10 +540,11 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
     }
 
     if (chunk_gdn) {
-        convert_dtype(chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx() + 1) * chunk_gdn->elems,
-                      reinterpret_cast<const float*>(final_state_ptr->Data),
-                      chunk_gdn->elems,
-                      stream);
+        CUDA_CHECK(cudaMemcpyAsync(chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx() + 1) * chunk_gdn->elems,
+                                   final_state_ptr->Data,
+                                   chunk_gdn->elems * sizeof(float),
+                                   cudaMemcpyDeviceToDevice,
+                                   stream));
     }
 
     // 6. fwd_o: (q, k, v_new, h, g_cum, o, scale, T) grid=(cdiv(V,BV_o), NT, B*H)
@@ -843,9 +849,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         Tensor dg_nk =
             mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), max_length, H}, "gated_delta_rule_dg_nk");
         mTemps.push_back(dg_nk);
-        Tensor h0_zero = mRunState.temp_alloc(ETensorDType::BF16, {1, H, K, V}, "gated_delta_rule_h0_buf");
+        Tensor h0_zero = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_h0_buf");
         mTemps.push_back(h0_zero);
-        CUDA_CHECK(cudaMemsetAsync(h0_zero.Data, 0, h0_zero.nelem() * 2, stream));
+        CUDA_CHECK(cudaMemsetAsync(h0_zero.Data, 0, h0_zero.nelem() * sizeof(float), stream));
         Tensor ht_scratch = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_ht_dummy");
         mTemps.push_back(ht_scratch);
         Tensor dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {1, H, K, V}, "gated_delta_rule_dht_zero");
@@ -1021,12 +1027,17 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         if (sequence_chunk_active()) {
             chunk_gdn = &chunk_gdn_state(static_cast<long>(B) * H * K * V, op_layer_idx(op));
             h0_ptr = chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx()) * chunk_gdn->elems;
-        } else if (initial_state) {
+        } else if (initial_state && initial_state->DType == ETensorDType::FP32) {
             h0_ptr = initial_state->Data;
         } else {
-            h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
+            // FP32, as the forward (gdr_fwd_h takes h0 in FP32).
+            h0_buf = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_h0_buf");
             mTemps.push_back(h0_buf);
-            CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
+            if (initial_state) {
+                convert_dtype(h0_buf.get<float>(), initial_state->get<nv_bfloat16>(), h0_buf.nelem(), stream);
+            } else {
+                CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * sizeof(float), stream));
+            }
             h0_ptr = h0_buf.Data;
         }
         {

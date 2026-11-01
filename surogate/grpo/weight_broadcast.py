@@ -36,12 +36,18 @@ class SurogateWeightBroadcast:
         base_model_dir: str | None = None,
         max_steps: int = 0,
         broadcast_dir: str | Path | None = None,
+        adapter_dtype: str = "bf16",
     ):
         self.broadcast_dir = (
             Path(broadcast_dir) if broadcast_dir is not None else guess_broadcast_dir(output_dir)
         )
         self.broadcast_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_only = adapter_only
+        # "bf16": FP32 LoRA masters go out rounded to BF16, the copy the engine serves (half the bytes); "master"
+        # writes them as stored. Checkpoints keep the master precision either way.
+        if adapter_dtype not in ("bf16", "master"):
+            raise ValueError(f"broadcast adapter dtype must be 'bf16' or 'master', got {adapter_dtype!r}")
+        self.adapter_dtype = adapter_dtype
         self.max_async_level = max_async_level
         self.noise_config = noise_config
         self.base_model_dir = Path(base_model_dir) if base_model_dir else None
@@ -61,7 +67,7 @@ class SurogateWeightBroadcast:
         # The adapter is written with the keys the engine's LoRA loader reads,
         # `base_model.model.<module>`; nothing is renamed on the way out.
         if self.adapter_only:
-            trainer.export_adapter(str(save_dir))
+            trainer.export_adapter(str(save_dir), dtype="bf16" if self.adapter_dtype == "bf16" else "")
         else:
             trainer.export_model(str(save_dir))
 

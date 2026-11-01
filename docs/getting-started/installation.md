@@ -52,6 +52,13 @@ From the repository root:
 uv pip install -e .
 ```
 
+Modules copied out of a CMake build tree are not self-contained. In the build tree, `_surogate` keeps
+the build directory's RUNPATH: the `$ORIGIN` RUNPATH applies only to installed wheels, because
+`BUILD_WITH_INSTALL_RPATH` is off. So a module copied elsewhere still loads `libsurogate-common.so`
+from that build directory, not the copy next to it. A rebuild there then changes, or breaks, every
+copy. Check with `ldd` or `/proc/<pid>/maps`. Use an installed wheel, or set the copy's RUNPATH to
+`$ORIGIN` (e.g. `patchelf --set-rpath`), for a package that must not move.
+
 ## DGX Spark (GB10)
 
 The install script detects the Arm host and installs the aarch64 wheel, which is built for

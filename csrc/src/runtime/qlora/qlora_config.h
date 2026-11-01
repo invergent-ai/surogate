@@ -161,6 +161,10 @@ struct QLoRAConfig {
     /// Examples: "lm_head", "model.layers.0.mlp.gate" (router gates in MoE).
     std::vector<std::string> modules_to_not_convert;
 
+    /// PrequantNVFP4 read from a compressed-tensors (llm-compressor) export instead of ModelOpt: codes in
+    /// `<weight>_packed`, E4M3 block scales in `<weight>_scale`, the ENCODE global scale in `<weight>_global_scale`.
+    bool prequant_compressed_tensors = false;
+
     /**
      * @brief Check if this is an MoE model
      */

@@ -19,6 +19,7 @@
 #include <cublas_v2.h>
 
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/stage_boundary.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_runtime_config.h"
 #include "runtime/dsl/hook_registry.h"
@@ -153,13 +154,16 @@ public:
     // When inject_layer >= 0, inject ``inject_host`` into get_residual(inject_layer)
     // first (the cross-GPU activation handoff). Read the result via the executor's
     // debug readers (debug_read_residual_bytes / last_block_hidden_f32).
+    // include_head=false stops the last stage at its last block (no final norm, lm-head or
+    // loss), for a chunked backward's KV sweep, which only rebuilds the blocks' chunk state.
     void dispatch_pp_forward_stage(Tensor inputs,
                                    Tensor position_ids,
                                    NCCLCommunicator& comm,
                                    int lo,
                                    int hi,
-                                   std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
-                                   bool preserve_output);
+                                   StageBoundary inject_named,
+                                   bool preserve_output,
+                                   bool include_head = true);
     // Run one backward stage (blocks [lo..hi]) on this GPU. Forward only this
     // stage's blocks from fwd_inject (block lo-1's residual, captured in the
     // forward pass; empty for lo==0, which forwards from the embedding), then run
@@ -182,8 +186,8 @@ public:
                                     int lo,
                                     int hi,
                                     bool is_loss_stage,
-                                    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-                                    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                    StageBoundary fwd_inject,
+                                    StageBoundary inject_named,
                                     int micro_step = 0,
                                     int total_micro = 1,
                                     const float* custom_dloss_cpu = nullptr);
@@ -215,9 +219,10 @@ public:
     // Read / write every parameter weight to / from host (the master broadcast).
     std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_weights();
     void dispatch_pp_write_weights(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
-    // Run the optimizer over the (collected) grad store on this GPU. Uses
-    // total-token normalization (ValidTokenCount is not populated on the collecting
-    // GPU since the dispatch backward skips the DP loss reduce). step_idx is 1-based.
+    // Run the optimizer over the (collected) grad store on this GPU, normalized per valid
+    // token by the count published with set_dispatch_pp_valid_tokens (ValidTokenCount is not
+    // populated on the collecting GPU since the dispatch backward skips the DP loss reduce),
+    // or not at all for custom gradients. step_idx is 1-based.
     float
     dispatch_pp_apply_optimizer(NCCLCommunicator& comm, const optimizers::OptimizerConfig& opt_config, int step_idx);
     // Raw (summed) loss from the last forward — readable without ValidTokenCount,
@@ -235,20 +240,27 @@ public:
         NCCLCommunicator& comm,
         int lo,
         int hi,
-        std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject);
+        StageBoundary fwd_inject);
     // Per-token logprobs (B*T, = -losses) from the last forward that ran the loss
     // ops. GRPO computes its per-token gradients from these, then feeds them back
     // through dispatch_pp_backward_stage's custom_dloss_cpu.
     std::vector<float> dispatch_pp_read_logprobs();
+    // Forwards with or without the LoRA delta: off detaches the executor's LoRA run state, as
+    // compute_ref_logprobs does, so the base model's log-probs come from the policy's kernels.
+    void set_dispatch_pp_lora_forward(bool on);
     // Valid (non-pad) tokens the loss stage counted for the last microbatch; the multi-GPU
     // trainer sums these across microbatches and publishes the total via the setter below so
     // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale
     // the grad norm per valid token instead of per total (padded) token.
+    // token_scale=false: the step's gradients came from custom per-token seeds (GRPO/DPO)
+    // the caller already normalized (its loss_scale is folded into custom_dloss), so the
+    // optimizer must not divide by the count as well -- as step_grpo_native_window.
     [[nodiscard]] int dispatch_pp_loss_valid_tokens() const {
         return mDispatchPpLossValidTokens;
     }
-    void set_dispatch_pp_valid_tokens(int n) {
+    void set_dispatch_pp_valid_tokens(int n, bool token_scale = true) {
         mDispatchPpValidTokens = n;
+        mDispatchPpTokenScale = token_scale;
     }
     // Backward as two contiguous block sub-ranges (high range first, boundary
     // grad round-tripped through host); returns per-block grad norms.
@@ -305,7 +317,11 @@ public:
     ITensorContainer& opt_variance_scales() override;
 
     // LoRA adapter API (no-op for non-LoRA models).
-    void export_adapter(const std::string& directory, NCCLCommunicator& comm, const std::string& base_model_path = "");
+    // dtype: as ModularLoRAWeightsManager::export_to_file (unset keeps the master dtype, BF16 rounds FP32 masters).
+    void export_adapter(const std::string& directory,
+                        NCCLCommunicator& comm,
+                        const std::string& base_model_path = "",
+                        std::optional<ETensorDType> dtype = std::nullopt);
     void import_adapter(const std::string& file_name, NCCLCommunicator& comm);
     void save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
     void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) override;
@@ -724,6 +740,7 @@ private:
     int mDispatchPpValidTokens = 0;           // valid tokens summed over the step's microbatches,
                                               // published onto the optimizer GPU for valid-token
                                               // grad-norm scaling (the dispatch path skips reduce_loss)
+    bool mDispatchPpTokenScale = true;        // false: custom (pre-normalized) gradients, no 1/valid
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     bool mSequenceChunkActive = false;        // chunked-sequence mode (doc masking handled per chunk)
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()

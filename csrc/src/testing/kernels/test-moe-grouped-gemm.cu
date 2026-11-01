@@ -281,6 +281,64 @@ TEST_CASE("MoE grouped GEMM bf16 entry points match a double-precision reference
         const auto got = da.read();
         for (int j = 0; j < R * C; ++j)
             REQUIRE(got[(std::size_t)3 * R * C + j] == init[(std::size_t)3 * R * C + j]);
+
+        // The same into fp32 gradients (FP32 LoRA masters): accumulated and stored in fp32, so only fp32
+        // accumulation error remains, and rounded to bf16 they are the bf16 entry point's results bit for bit
+        // (same kernel and tiles, only the stores differ).
+        std::vector<float> init32(init);
+        float* da32 = nullptr;
+        float* db32 = nullptr;
+        require_cuda(cudaMalloc(&da32, init32.size() * sizeof(float)));
+        require_cuda(cudaMalloc(&db32, (std::size_t)E * D * R * sizeof(float)));
+        require_cuda(cudaMemcpy(da32, init32.data(), init32.size() * sizeof(float), cudaMemcpyHostToDevice));
+        require_cuda(cudaMemset(db32, 0, (std::size_t)E * D * R * sizeof(float)));
+        moe_grouped_gemm_weight_grad(da32,
+                                     x_r.dev,
+                                     x_c.dev,
+                                     off.dev,
+                                     E,
+                                     R,
+                                     C,
+                                     h.cublas,
+                                     h.stream,
+                                     off.host.data(),
+                                     1.0f,
+                                     1.0f,
+                                     nullptr,
+                                     false,
+                                     -1);
+        moe_grouped_gemm_weight_grad(db32,
+                                     x_d.dev,
+                                     x_r.dev,
+                                     off.dev,
+                                     E,
+                                     D,
+                                     R,
+                                     h.cublas,
+                                     h.stream,
+                                     off.host.data(),
+                                     1.0f,
+                                     0.0f,
+                                     nullptr,
+                                     false,
+                                     -1);
+        std::vector<float> ga(init32.size()), gb((std::size_t)E * D * R);
+        require_cuda(cudaDeviceSynchronize());
+        require_cuda(cudaMemcpy(ga.data(), da32, ga.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        require_cuda(cudaMemcpy(gb.data(), db32, gb.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaFree(da32);
+        cudaFree(db32);
+        CHECK(rel_l2(ga, ra) < 1e-5);
+        CHECK(rel_l2(gb, rb) < 1e-5);
+        const auto got_b = db.read();
+        std::size_t same = 0;
+        for (std::size_t i = 0; i < ga.size(); ++i)
+            same += __bfloat162float(__float2bfloat16(ga[i])) == got[i];
+        for (std::size_t i = 0; i < gb.size(); ++i)
+            same += __bfloat162float(__float2bfloat16(gb[i])) == got_b[i];
+        CHECK(same == ga.size() + gb.size());
+        for (int j = 0; j < R * C; ++j)
+            REQUIRE(ga[(std::size_t)3 * R * C + j] == init32[(std::size_t)3 * R * C + j]);
     }
     SECTION("base forward and dX backward") {
         Bf16 gu(T * 2 * D, 0.0f, rng), dn(T * C, 0.0f, rng), dnb(T * D, 0.0f, rng), gub(T * C, 0.0f, rng);

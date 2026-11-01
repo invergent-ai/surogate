@@ -1070,11 +1070,27 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                             lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
                             lora_num_active = fallback_count;
                         }
-                        if (grad_output.DType == ETensorDType::BF16) {
+                        if (grad_output.DType == ETensorDType::BF16 && d_weight_view.DType == ETensorDType::FP32) {
+                            // FP32 LoRA masters: bf16 operands, the gradient accumulated and stored in fp32, so a step's
+                            // windows add up without a rounding to bf16 after each.
+                            moe_grouped_gemm_weight_grad(d_weight_view.get<float>(),
+                                                         grad_output.get<nv_bfloat16>(),
+                                                         in.get<nv_bfloat16>(),
+                                                         expert_offsets_data,
+                                                         num_experts,
+                                                         M,
+                                                         N,
+                                                         mRunState.cublas_handle(),
+                                                         mRunState.MainStream,
+                                                         host_offsets_ptr,
+                                                         /*alpha=*/1.0f,
+                                                         beta,
+                                                         lora_active_ptr,
+                                                         lora_weight_is_compact,
+                                                         lora_num_active);
+                        } else if (grad_output.DType == ETensorDType::BF16) {
                             if (d_weight_view.DType != ETensorDType::BF16) {
-                                throw std::runtime_error(
-                                    "MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "
-                                    "Set lora_dtype='bf16' in your config.");
+                                throw std::runtime_error("MoE LoRA backward: dtype mismatch in weight gradients.");
                             }
                             moe_grouped_gemm_weight_grad(d_weight_view.get<nv_bfloat16>(),
                                                          grad_output.get<nv_bfloat16>(),
