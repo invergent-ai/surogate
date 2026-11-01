@@ -26,6 +26,10 @@ AdamW maintains two state tensors per parameter:
 
 These states are quantized to 8-bit using dynamic block quantization with per-block absmax scaling. This reduces optimizer state memory by approximately 4x compared to full-precision AdamW while maintaining training quality.
 
+Each block of 32 elements keeps two FP32 scales, the largest |m| and the largest √v. The scales were FP16 until 2026-11: FP16 rounds to 0 below 2.98e-8, and LoRA gradients on long sequences sit below that per coordinate, so a block lost its moments at every step and its updates were too large and no longer followed the gradient. A checkpoint with FP16 scales still loads (they widen exactly), but the moments it lost stay lost and the trainer says how many blocks that hits; to restart Adam cleanly, load the adapter alone.
+
+The moments are still 8-bit relative to their block's largest element, so √v resolves down to about 1/510 of that element. Up to 100x between the neighbours of one block the updates stay within cos 0.98 and 4 % in norm of full-precision Adam; on real LoRA gradients, from 7 groups of long rows, every update over 100 steps stayed within cos 0.9997 and 0.4 % in norm (`integration-tests "[optim][flash]"`).
+
 The update rule is:
 ```
 m = β₁ · m + (1 - β₁) · g
@@ -143,7 +147,7 @@ These options apply to both optimizers:
 ## Memory Considerations
 
 Both optimizers use 8-bit quantized states, consuming approximately:
-- **AdamW 8-bit**: ~2 bytes per parameter (1 byte for m, 1 byte for v, plus absmax overhead)
+- **AdamW 8-bit**: 2.25 bytes per parameter (1 byte for m, 1 byte for v, two FP32 scales per 32 parameters)
 - **NorMuon**: ~2 bytes per parameter for 2D weights, ~2 bytes per parameter for AdamW-managed parameters
 
 Additional memory for NorMuon:

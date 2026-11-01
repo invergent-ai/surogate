@@ -2274,6 +2274,7 @@ void zero_matrix_columns(Tensor& dest, long col_start, long col_end, cudaStream_
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size);
+void convert_dtype(float* target, const half* source, std::size_t size);
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size, cudaStream_t stream);

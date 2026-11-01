@@ -13,7 +13,8 @@
 //   Encode: sqrt(v) -> normalize by absmax -> scale to [0, 255]
 //   Decode: scale by 1/255 -> multiply by scale -> square to recover v
 //
-// Both use per-group (32 elements) FP16 scale factors.
+// Both use per-group (32 elements) FP32 scale factors. (FP16 scales rounded to 0 below 2.98e-8, which is where LoRA
+// gradients live, so a group lost its moment at the next step.)
 
 #include <cfloat>
 #include <cuda_bf16.h>
@@ -71,8 +72,8 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
                                T* __restrict__ const g,
                                signed char* state1,    // momentum as int8
                                unsigned char* state2,  // variance as uint8
-                               half* scales1,          // FP16 scales for momentum
-                               half* scales2,          // FP16 scales for variance
+                               float* scales1,         // FP32 scales for momentum
+                               float* scales2,         // FP32 scales for variance
                                const float beta1,
                                const float beta2,
                                const float eps,
@@ -139,8 +140,8 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
 
                     // Dequantize momentum: int8 -> softsign_inv -> scale
                     const int group_idx = idx / FLASH_GROUP_SIZE;
-                    float scale1 = __half2float(scales1[group_idx]);
-                    float scale2 = __half2float(scales2[group_idx]);
+                    const float scale1 = scales1[group_idx];
+                    const float scale2 = scales2[group_idx];
 
                     float m_quantized = float(state1[idx]) / 127.0f;
                     m_vals[j] = inverse_softsign(m_quantized) * scale1;
@@ -242,11 +243,11 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
                 v_int = max(0, min(255, v_int));
                 state2[idx] = static_cast<unsigned char>(v_int);
 
-                // Store per-group scales as FP16
+                // Store per-group scales
                 // Only the first thread in each group writes the scale
                 if (idx % FLASH_GROUP_SIZE == 0) {
-                    scales1[global_group] = __float2half(abs1);
-                    scales2[global_group] = __float2half(abs2);
+                    scales1[global_group] = abs1;
+                    scales2[global_group] = abs2;
                 }
             }
         }
@@ -263,8 +264,8 @@ static void launch_flash_adamw_8bit(T* p,
                                     const T* g,
                                     signed char* state1,
                                     unsigned char* state2,
-                                    half* scales1,
-                                    half* scales2,
+                                    float* scales1,
+                                    float* scales2,
                                     size_t n,
                                     float lr,
                                     float beta1,
@@ -305,8 +306,8 @@ void flash_adamw_update_8bit(float* p,
                              const float* g,
                              signed char* state1,
                              unsigned char* state2,
-                             half* scales1,
-                             half* scales2,
+                             float* scales1,
+                             float* scales2,
                              size_t n,
                              float lr,
                              float beta1,
@@ -341,8 +342,8 @@ void flash_adamw_update_8bit(nv_bfloat16* p,
                              const nv_bfloat16* g,
                              signed char* state1,
                              unsigned char* state2,
-                             half* scales1,
-                             half* scales2,
+                             float* scales1,
+                             float* scales2,
                              size_t n,
                              float lr,
                              float beta1,
@@ -377,8 +378,8 @@ void flash_adamw_update_8bit(half* p,
                              const half* g,
                              signed char* state1,
                              unsigned char* state2,
-                             half* scales1,
-                             half* scales2,
+                             float* scales1,
+                             float* scales2,
                              size_t n,
                              float lr,
                              float beta1,
@@ -425,8 +426,8 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
                                           int num_tensors,
                                           signed char* state1,
                                           unsigned char* state2,
-                                          half* scales1,
-                                          half* scales2,
+                                          float* scales1,
+                                          float* scales2,
                                           const int* state_offsets,
                                           const float beta1,
                                           const float beta2,
@@ -475,8 +476,8 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
         signed char* t_state1 = state1 + s_offset;
         unsigned char* t_state2 = state2 + s_offset;
         const int group_offset = s_offset / FLASH_GROUP_SIZE;
-        half* t_scales1 = scales1 + group_offset;
-        half* t_scales2 = scales2 + group_offset;
+        float* t_scales1 = scales1 + group_offset;
+        float* t_scales2 = scales2 + group_offset;
 
         const int total_blocks = (n + FLASH_BLOCK_SIZE_N - 1) / FLASH_BLOCK_SIZE_N;
 
@@ -495,8 +496,8 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
                         g_vals[j] = g_val;
 
                         const int local_group_idx = idx / FLASH_GROUP_SIZE;
-                        float scale1 = __half2float(t_scales1[local_group_idx]);
-                        float scale2 = __half2float(t_scales2[local_group_idx]);
+                        const float scale1 = t_scales1[local_group_idx];
+                        const float scale2 = t_scales2[local_group_idx];
 
                         float m_quantized = float(t_state1[idx]) / 127.0f;
                         m_vals[j] = inverse_softsign(m_quantized) * scale1;
@@ -583,8 +584,8 @@ __launch_bounds__(FLASH_BLOCK_THREADS, 3) __global__
                     t_state2[idx] = static_cast<unsigned char>(v_int);
 
                     if (idx % FLASH_GROUP_SIZE == 0) {
-                        t_scales1[global_group] = __float2half(abs1);
-                        t_scales2[global_group] = __float2half(abs2);
+                        t_scales1[global_group] = abs1;
+                        t_scales2[global_group] = abs2;
                     }
                 }
             }
@@ -606,8 +607,8 @@ static void launch_flash_adamw_8bit_multi_tensor(T** params,
                                                  int num_tensors,
                                                  signed char* state1,
                                                  unsigned char* state2,
-                                                 half* scales1,
-                                                 half* scales2,
+                                                 float* scales1,
+                                                 float* scales2,
                                                  const int* state_offsets,
                                                  size_t total_params,
                                                  float lr,
@@ -652,8 +653,8 @@ void flash_adamw_update_8bit_multi_tensor(float** params,
                                           int num_tensors,
                                           signed char* state1,
                                           unsigned char* state2,
-                                          half* scales1,
-                                          half* scales2,
+                                          float* scales1,
+                                          float* scales2,
                                           const int* state_offsets,
                                           size_t total_params,
                                           float lr,
@@ -694,8 +695,8 @@ void flash_adamw_update_8bit_multi_tensor(nv_bfloat16** params,
                                           int num_tensors,
                                           signed char* state1,
                                           unsigned char* state2,
-                                          half* scales1,
-                                          half* scales2,
+                                          float* scales1,
+                                          float* scales2,
                                           const int* state_offsets,
                                           size_t total_params,
                                           float lr,
@@ -735,8 +736,8 @@ void flash_adamw_update_8bit_multi_tensor(nv_bfloat16** params,
 
 __global__ void kInitFlashAdamW8bitState(signed char* state1,
                                          unsigned char* state2,
-                                         half* scales1,
-                                         half* scales2,
+                                         float* scales1,
+                                         float* scales2,
                                          size_t n,
                                          size_t num_groups) {
     const size_t total = n > num_groups ? n : num_groups;
@@ -750,16 +751,16 @@ __global__ void kInitFlashAdamW8bitState(signed char* state1,
             state2[idx] = 0;  // Zero variance (uint8)
         }
         if (idx < num_groups) {
-            scales1[idx] = __float2half(1e-7f);  // Small positive scale
-            scales2[idx] = __float2half(1e-7f);
+            scales1[idx] = 1e-7f;  // Small positive scale
+            scales2[idx] = 1e-7f;
         }
     }
 }
 
 void init_flash_adamw8bit_state(signed char* state1,
                                 unsigned char* state2,
-                                half* scales1,
-                                half* scales2,
+                                float* scales1,
+                                float* scales2,
                                 size_t n,
                                 cudaStream_t stream) {
     if (n == 0) return;
