@@ -3504,10 +3504,14 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     }
     timer.mark("backward");
     {
+        // Per valid token over the call, as the gradients are normalized, not a mean of the rows' means.
         double ls = 0.0;
-        for (int m = 0; m < M; ++m)
-            ls += loss_per_mb[static_cast<std::size_t>(m)] / std::max(1, valid_per_mb[static_cast<std::size_t>(m)]);
-        loss = static_cast<float>(ls / static_cast<double>(M));
+        long valid = 0;
+        for (int m = 0; m < M; ++m) {
+            ls += loss_per_mb[static_cast<std::size_t>(m)];
+            valid += valid_per_mb[static_cast<std::size_t>(m)];
+        }
+        loss = static_cast<float>(ls / static_cast<double>(std::max(1L, valid)));
     }
     int step_valid_tokens = 0;
     for (int v : valid_per_mb)
