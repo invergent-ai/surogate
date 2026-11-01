@@ -174,8 +174,8 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
 
 /// A weight-only NVFP4 mixture is served from Marlin tiles, rewritten in place here, at load. Its
 /// routed banks must be on the device: the host bank streams experts in their stored layout.
-void adopt_mixture(SparseMoePayload& mixture, const family::HostBank* host_bank, std::int32_t layer,
-                   const family::TextGeometry& g) {
+void adopt_mixture(SparseMoePayload& mixture, const family::HostBank* host_bank, artifact::ObjectHandle gate_up,
+                   artifact::ObjectHandle down, std::int32_t layer, const family::TextGeometry& g) {
     // --moe-route marlin: an NVFP4 checkpoint's routed experts are served weight-only. Same codes,
     // same block scales and the same per-expert second level (the W4A4 runner's activation
     // scales and alphas go unused); only the gate/up row order stays the runner's [up; gate].
@@ -191,7 +191,9 @@ void adopt_mixture(SparseMoePayload& mixture, const family::HostBank* host_bank,
         mixture.op.routed_down_alpha        = nullptr;
     }
     if (mixture.op.routed_gate_up.qtype != QType::NVFP4_A16) { return; }
-    if (host_bank != nullptr) {
+    // The bank may hold only other weights (--offload-vision keeps the vision tower there): only this
+    // layer's own experts being in it rules the Marlin tiles out.
+    if (host_bank != nullptr && (host_bank->find(gate_up) != nullptr || host_bank->find(down) != nullptr)) {
         throw artifact::ArtifactError("layer " + std::to_string(layer) +
                                       ": weight-only NVFP4 experts cannot be banked on the host");
     }
@@ -445,7 +447,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             target.post_mixer = load_moe(source.moe, backing, g);
-            adopt_mixture(target.post_mixer, host_bank.get(), static_cast<std::int32_t>(layer), g);
+            adopt_mixture(target.post_mixer, host_bank.get(), source.moe.routed_gate_up.object, source.moe.routed_down.object,
+                          static_cast<std::int32_t>(layer), g);
             target.post_mixer.banked = family::bind_banked_experts(
                 target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
                 source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
@@ -479,7 +482,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             target.post_mixer = load_moe(source.moe, backing, g);
-            adopt_mixture(target.post_mixer, host_bank.get(), static_cast<std::int32_t>(layer), g);
+            adopt_mixture(target.post_mixer, host_bank.get(), source.moe.routed_gate_up.object, source.moe.routed_down.object,
+                          static_cast<std::int32_t>(layer), g);
             target.post_mixer.banked = family::bind_banked_experts(
                 target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
                 source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
