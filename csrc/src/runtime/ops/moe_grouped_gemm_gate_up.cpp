@@ -552,14 +552,41 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                 }
                 return v;
             };
+            // SUROGATE_LORA_FP32_FORWARD: the products from the fp32 masters themselves (not with LLEP-merged
+            // weights or EP-global tensors), so the forward moves smoothly with every update.
+            const modules::LoRAGroupedLayerWeights<TensorShard>* master_gate_up = nullptr;
+            if (lora_fp32_forward_enabled() && lora_grouped_ptr == &lora_block.moe.grouped) {
+                auto& master_block = mLoRAWeights->get_master_block(layer_idx_any, mRunState.MainStream);
+                if (master_block.moe.grouped.gate_up.has_value() && master_block.moe.grouped.gate_up->has_value())
+                    master_gate_up = &*master_block.moe.grouped.gate_up;
+            }
             auto fused_lora_forward = [&](Tensor& out_t,
                                           const Tensor& in_t,
                                           const modules::LoRAGroupedLayerWeights<Tensor>& w,
                                           int in_features,
-                                          int out_features) -> bool {
+                                          int out_features,
+                                          const modules::LoRAGroupedLayerWeights<TensorShard>* master = nullptr) -> bool {
                 if (!moe_lora_grouped_enabled() || (training && dropout > 0.0f) || mOptions.rollout_parity())
                     return false;
                 if (out_t.DType != ETensorDType::BF16 || in_t.DType != ETensorDType::BF16) return false;
+                if (master && master->A.DType == ETensorDType::FP32 && master->B.DType == ETensorDType::FP32 &&
+                    master->A.Rank == 3 && master->A.Sizes[0] == num_experts &&
+                    moe_lora_grouped_forward_f32w(out_t.get<nv_bfloat16>(),
+                                                  in_t.get<nv_bfloat16>(),
+                                                  master->A.get<float>(),
+                                                  master->B.get<float>(),
+                                                  expert_offsets.get<int>(),
+                                                  host_offsets_ptr,
+                                                  num_experts,
+                                                  total_tokens_i,
+                                                  in_features,
+                                                  out_features,
+                                                  rank,
+                                                  scaling,
+                                                  /*accumulate=*/true,
+                                                  mRunState.MainStream)) {
+                    return true;
+                }
                 const Tensor A = native_expert_view(w.A);
                 const Tensor B = native_expert_view(w.B);
                 if (!A.Data || !B.Data) return false;
@@ -583,8 +610,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                 Tensor lora_intermediate = view_or_temp(mLoRARunState->moe_lora_intermediate1, total_tokens_l, rank);
                 const bool has_gate_up = grouped.gate_up.has_value() && grouped.gate_up->has_value();
 
-                if (has_gate_up &&
-                    fused_lora_forward(out, inp, *grouped.gate_up, hidden_size, static_cast<int>(gate_up_dim))) {
+                if (has_gate_up && fused_lora_forward(out, inp, *grouped.gate_up, hidden_size,
+                                                      static_cast<int>(gate_up_dim), master_gate_up)) {
                     lora_applied = true;
                 } else if (has_gate_up) {
                     Tensor lora_gate_up = view_or_temp(mLoRARunState->moe_lora_gate_up, total_tokens_l, gate_up_dim);

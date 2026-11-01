@@ -295,6 +295,10 @@ class SurogateTrainerWrapper:
         self._regression_cuda_peak_memory_bytes: int | None = None
         self._block_schema_summary: dict[str, int] = {}
 
+        if config.lora_fp32_forward:
+            # The LoRA forward reads the fp32 masters, not their bf16 work copies (read once by the engine).
+            os.environ["SUROGATE_LORA_FP32_FORWARD"] = "1"
+
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing
         # the native trainer to avoid capture-only save-buffer requirements.
@@ -1154,7 +1158,7 @@ class SurogateTrainerWrapper:
             )
 
             self._maybe_log_lora_grad_stats(step)
-            result = self.trainer.update_with_config(opt_config, step + 1)
+            result = self.trainer.update_with_config(opt_config, step)
             self._maybe_shrink_stack_after_warmup()
 
             step_time = time.time() - step_start
@@ -1568,7 +1572,7 @@ class SurogateTrainerWrapper:
             if self._kd_enabled:
                 # Optional LoRA gradient debug (before optimizer update)
                 self._maybe_log_lora_grad_stats(step)
-                result = self.trainer.update_with_config(opt_config, step + 1)
+                result = self.trainer.update_with_config(opt_config, step)
                 kd_loss = self.trainer.get_kd_loss()
             elif self._dispatch_pp:
                 # Stage-level dispatch: forward+backward across the GPU pool, collect grads
@@ -1590,17 +1594,17 @@ class SurogateTrainerWrapper:
                     np.concatenate(packed.targets),
                     np.concatenate(packed.positions),
                     opt_config,
-                    step + 1,
+                    step,
                 )
                 self._maybe_log_lora_grad_stats(step)
             elif use_full_step_graphs:
-                result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
+                result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step)
                 # Optional LoRA grad debug runs after graph replay (post-update).
                 self._maybe_log_lora_grad_stats(step)
             else:
                 # Optional LoRA gradient debug (before optimizer update)
                 self._maybe_log_lora_grad_stats(step)
-                result = self.trainer.update_with_config(opt_config, step + 1)
+                result = self.trainer.update_with_config(opt_config, step)
             # Full-step CUDA graphs shrink internally after warmup and before
             # capture, because the captured graph references absolute stack
             # pointers. When full-step execution runs with CUDA graphs disabled

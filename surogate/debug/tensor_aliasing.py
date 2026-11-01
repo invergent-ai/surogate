@@ -137,7 +137,7 @@ def _run_runtime_mode(writer: Any, resolved: Any) -> int:
                 from surogate import _surogate
 
                 opt = _surogate.OptimizerConfig(optimizer="adamw", learning_rate=1e-4, weight_decay=0.0)
-                trainer.update_with_config(opt, 1)
+                trainer.update_with_config(opt, 0)
             except Exception as e:
                 # Preserve the exception but make sure stderr is restored.
                 os.dup2(saved_fd, 2)

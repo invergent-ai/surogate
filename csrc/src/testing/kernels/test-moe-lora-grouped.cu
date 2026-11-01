@@ -487,3 +487,188 @@ TEST_CASE("Fused grouped expert LoRA rejects unsupported shapes without launchin
     require_same_bits(dx.read(in.dx0.size()), in.dx0, "workspace rejection leaves dx untouched");
     require_same_bits(dA.read(in.dA0.size()), in.dA0, "workspace rejection leaves dA untouched");
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FP32-weight forward (SUROGATE_LORA_FP32_FORWARD): the fp32 LoRA masters read directly, for the routed experts and,
+// as a one-expert group writing a column slice, for dense LoRA (the shared expert).
+
+namespace {
+
+std::vector<float> random_floats(std::size_t n, float scale, unsigned seed) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dist(-scale, scale);
+    std::vector<float> v(n);
+    for (auto& e : v) {
+        e = dist(gen);  // full fp32 mantissas, not bf16-representable
+    }
+    return v;
+}
+
+// fp64 forward with fp32 weights over rows out_ld apart; columns [0, O) of each row change, the rest keep out0.
+std::vector<double> forward_reference_f32w(int I,
+                                           int O,
+                                           int R,
+                                           double s,
+                                           const std::vector<int>& offsets,
+                                           const std::vector<nv_bfloat16>& x,
+                                           const std::vector<float>& A,
+                                           const std::vector<float>& B,
+                                           const std::vector<nv_bfloat16>& out0,
+                                           int out_ld,
+                                           bool accumulate) {
+    std::vector<double> out(out0.size());
+    for (std::size_t i = 0; i < out0.size(); ++i)
+        out[i] = static_cast<double>(__bfloat162float(out0[i]));
+    std::vector<double> h(R);
+    const int E = static_cast<int>(offsets.size()) - 1;
+    for (int e = 0; e < E; ++e) {
+        const float* Ae = A.data() + static_cast<std::size_t>(e) * R * I;
+        const float* Be = B.data() + static_cast<std::size_t>(e) * O * R;
+        for (int t = offsets[e]; t < offsets[e + 1]; ++t) {
+            const nv_bfloat16* xt = x.data() + static_cast<std::size_t>(t) * I;
+            for (int r = 0; r < R; ++r) {
+                double acc = 0.0;
+                for (int k = 0; k < I; ++k)
+                    acc += static_cast<double>(__bfloat162float(xt[k])) * static_cast<double>(Ae[r * I + k]);
+                h[r] = acc;
+            }
+            for (int c = 0; c < O; ++c) {
+                double acc = 0.0;
+                for (int r = 0; r < R; ++r)
+                    acc += h[r] * static_cast<double>(Be[c * R + r]);
+                double& o = out[static_cast<std::size_t>(t) * out_ld + c];
+                o = (accumulate ? o : 0.0) + s * acc;
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<nv_bfloat16> to_bf16(const std::vector<float>& v) {
+    std::vector<nv_bfloat16> r(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i)
+        r[i] = __float2bfloat16(v[i]);
+    return r;
+}
+
+std::vector<float> from_bf16(const std::vector<nv_bfloat16>& v) {
+    std::vector<float> r(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i)
+        r[i] = __bfloat162float(v[i]);
+    return r;
+}
+
+}  // namespace
+
+TEST_CASE("Fused expert LoRA forward with fp32 weights matches the fp64 oracle", "[moe][lora][grouped][fp32w]") {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA device required");
+    // Qwen3.5-35B-A3B's expert projections: gate_up (hidden 2048 -> 2 x 512) and down (512 -> 2048).
+    const std::vector<int> counts = {37, 0, 1, 300, 0, 64, 129};
+    std::vector<int> offsets(counts.size() + 1, 0);
+    for (std::size_t e = 0; e < counts.size(); ++e)
+        offsets[e + 1] = offsets[e] + counts[e];
+    const int T = offsets.back(), E = static_cast<int>(counts.size());
+    unsigned seed = 101;
+    for (const auto& shape : std::vector<std::pair<int, int>>{{2048, 1024}, {512, 2048}}) {
+        const int I = shape.first, O = shape.second;
+        for (int rank : {8, 16, 32}) {
+            const float s = 32.0f / static_cast<float>(rank);
+            const std::string tag = "in=" + std::to_string(I) + " out=" + std::to_string(O) + " rank=" + std::to_string(rank);
+            INFO(tag);
+            std::mt19937 gen(seed++);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            std::vector<nv_bfloat16> x(static_cast<std::size_t>(T) * I), out0(static_cast<std::size_t>(T) * O);
+            for (auto& v : x) v = __float2bfloat16(dist(gen));
+            for (auto& v : out0) v = __float2bfloat16(dist(gen));
+            const auto A = random_floats(static_cast<std::size_t>(E) * rank * I, 1.0f / std::sqrt(static_cast<float>(I)), seed++);
+            const auto B = random_floats(static_cast<std::size_t>(E) * O * rank, 0.05f, seed++);
+            Device<int> d_off(offsets);
+            Device<nv_bfloat16> d_x(x);
+            Device<float> d_A(A), d_B(B);
+            for (bool accumulate : {false, true}) {
+                const auto ref = forward_reference_f32w(I, O, rank, s, offsets, x, A, B, out0, O, accumulate);
+                std::vector<nv_bfloat16> first;
+                for (int run = 0; run < 2; ++run) {
+                    Device<nv_bfloat16> d_out(out0);
+                    REQUIRE(moe_lora_grouped_forward_f32w(d_out.ptr, d_x.ptr, d_A.ptr, d_B.ptr, d_off.ptr, offsets.data(),
+                                                          E, T, I, O, rank, s, accumulate, nullptr));
+                    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+                    const auto got = d_out.read(out0.size());
+                    if (run == 0) {
+                        check_close(got, ref, tag + " fp32-weight forward");
+                        first = got;
+                    } else {
+                        require_same_bits(got, first, tag + " fp32-weight forward determinism");
+                    }
+                }
+            }
+            // With weights that are exactly bf16 values, the fp32-weight forward is the bf16 forward bit for bit:
+            // the same products in the same order, only read from fp32.
+            const auto A16 = to_bf16(A), B16 = to_bf16(B);
+            Device<nv_bfloat16> d_A16(A16), d_B16(B16);
+            Device<float> d_A16f(from_bf16(A16)), d_B16f(from_bf16(B16));
+            Device<nv_bfloat16> o16(out0), o32(out0);
+            REQUIRE(moe_lora_grouped_forward_bf16(o16.ptr, d_x.ptr, d_A16.ptr, d_B16.ptr, d_off.ptr, offsets.data(), E, T,
+                                                  I, O, rank, s, true, nullptr));
+            REQUIRE(moe_lora_grouped_forward_f32w(o32.ptr, d_x.ptr, d_A16f.ptr, d_B16f.ptr, d_off.ptr, offsets.data(), E,
+                                                  T, I, O, rank, s, true, nullptr));
+            REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+            require_same_bits(o32.read(out0.size()), o16.read(out0.size()), tag + " bf16-valued fp32 weights");
+        }
+    }
+}
+
+TEST_CASE("Dense LoRA forward with fp32 weights writes its column slice (the shared expert)", "[moe][lora][grouped][fp32w]") {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA device required");
+    const int T = 300, rank = 16;
+    const float s = 2.0f;
+    std::mt19937 gen(5);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    // (in, slice width, offset, row width): the up half of a fused [gate | up] output, and the down projection.
+    struct Slice {
+        int in, width, offset, ld;
+    };
+    for (const Slice sl : {Slice{2048, 512, 512, 1024}, Slice{2048, 512, 0, 1024}, Slice{512, 2048, 0, 2048}}) {
+        const std::string tag = "in=" + std::to_string(sl.in) + " width=" + std::to_string(sl.width) +
+                                " offset=" + std::to_string(sl.offset) + " ld=" + std::to_string(sl.ld);
+        INFO(tag);
+        std::vector<nv_bfloat16> x(static_cast<std::size_t>(T) * sl.in), out0(static_cast<std::size_t>(T) * sl.ld);
+        for (auto& v : x) v = __float2bfloat16(dist(gen));
+        for (auto& v : out0) v = __float2bfloat16(dist(gen));
+        const auto A = random_floats(static_cast<std::size_t>(rank) * sl.in, 1.0f / std::sqrt(static_cast<float>(sl.in)), 9);
+        const auto B = random_floats(static_cast<std::size_t>(sl.width) * rank, 0.05f, 10);
+        Device<nv_bfloat16> d_x(x), d_out(out0);
+        Device<float> d_A(A), d_B(B);
+        REQUIRE(lora_dense_forward_f32w(d_out.ptr + sl.offset, sl.ld, d_x.ptr, d_A.ptr, d_B.ptr, T, sl.in, sl.width, rank,
+                                        s, true, nullptr));
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        const auto got = d_out.read(out0.size());
+        // The reference over the slice's columns; every other column keeps its bits.
+        std::vector<nv_bfloat16> shifted0(out0.begin() + sl.offset, out0.end());
+        shifted0.resize(out0.size());  // tail padding is never read (rows are ld apart, the slice ends in the row)
+        const auto ref = forward_reference_f32w(sl.in, sl.width, rank, s, {0, T}, x, A, B, shifted0, sl.ld, true);
+        std::vector<nv_bfloat16> got_slice, out0_rest, got_rest;
+        std::vector<double> ref_slice;
+        for (int t = 0; t < T; ++t) {
+            for (int c = 0; c < sl.ld; ++c) {
+                const std::size_t i = static_cast<std::size_t>(t) * sl.ld + c;
+                if (c >= sl.offset && c < sl.offset + sl.width) {
+                    got_slice.push_back(got[i]);
+                    ref_slice.push_back(ref[static_cast<std::size_t>(t) * sl.ld + (c - sl.offset)]);
+                } else {
+                    out0_rest.push_back(out0[i]);
+                    got_rest.push_back(got[i]);
+                }
+            }
+        }
+        check_close(got_slice, ref_slice, tag + " slice");
+        require_same_bits(got_rest, out0_rest, tag + " columns outside the slice");
+    }
+    std::vector<nv_bfloat16> x(64 * 64), out(64 * 72);
+    Device<nv_bfloat16> d_x(x), d_out(out);
+    Device<float> d_A(std::vector<float>(16 * 64)), d_B(std::vector<float>(64 * 16));
+    REQUIRE_FALSE(lora_dense_forward_f32w(d_out.ptr, 68, d_x.ptr, d_A.ptr, d_B.ptr, 64, 64, 64, 16, 1.0f, true, nullptr));
+    REQUIRE_FALSE(lora_dense_forward_f32w(d_out.ptr, 72, d_x.ptr, d_A.ptr, d_B.ptr, 64, 64, 64, 12, 1.0f, true, nullptr));
+}

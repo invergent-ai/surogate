@@ -258,17 +258,33 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
             state.state2 = mAllocator->allocate(ETensorDType::BYTE,
                                                 "lora_adamw8bit_state2",
                                                 {static_cast<long>(state.total_params)});
-            state.scales1 = mAllocator->allocate(ETensorDType::FP16,
+            state.scales1 = mAllocator->allocate(ETensorDType::FP32,
                                                  "lora_adamw8bit_scales1",
                                                  {static_cast<long>(state.num_groups)});
-            state.scales2 = mAllocator->allocate(ETensorDType::FP16,
+            state.scales2 = mAllocator->allocate(ETensorDType::FP32,
                                                  "lora_adamw8bit_scales2",
                                                  {static_cast<long>(state.num_groups)});
         }
 
         internal::LoRAAdamW8BitStateContainer container(&state);
-        load_safetensors(opt_file.string(), container, /*allow_cast=*/false);
+        // Checkpoints from before the FP32 scales hold them in FP16; the cast widens those exactly. The moments are
+        // bytes in both, so nothing else is cast.
+        load_safetensors(opt_file.string(), container, /*allow_cast=*/true);
         state.values_restored = true;
+
+        // Those FP16 scales rounded to 0 below 2.98e-8, which lost the group's moments, and they stay lost: until the group's
+        // second moment has built up again (Adam's step count goes on from the checkpoint) its updates are too large.
+        std::vector<float> host_scales(state.num_groups);
+        CUDA_CHECK(cudaMemcpy(host_scales.data(), state.scales2.Data, state.num_groups * sizeof(float), cudaMemcpyDefault));
+        const auto lost = std::count(host_scales.begin(), host_scales.end(), 0.f);
+        if (lost > 0) {
+            fprintf(stderr,
+                    "[lora] rank %d: %zd of %zu optimizer groups have no second moment (a checkpoint from before the FP32 "
+                    "scales); to restart Adam cleanly, load the adapter alone\n",
+                    comm.rank(),
+                    static_cast<std::ptrdiff_t>(lost),
+                    state.num_groups);
+        }
 
     } else if (optimizer_type == "normuon") {
         // NorMuon keeps one variance buffer per tensor, so their count is the tensor count.
@@ -643,11 +659,11 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
                                             "lora_adamw8bit_state2",
                                             EAllocationType::ON_DEVICE,
                                             {(long)total_params});
-        state.scales1 = mAllocator->allocate(ETensorDType::FP16,
+        state.scales1 = mAllocator->allocate(ETensorDType::FP32,
                                              "lora_adamw8bit_scales1",
                                              EAllocationType::ON_DEVICE,
                                              {(long)state.num_groups});
-        state.scales2 = mAllocator->allocate(ETensorDType::FP16,
+        state.scales2 = mAllocator->allocate(ETensorDType::FP32,
                                              "lora_adamw8bit_scales2",
                                              EAllocationType::ON_DEVICE,
                                              {(long)state.num_groups});
@@ -656,17 +672,17 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     if (!state.values_restored) {
         optimizers::init_flash_adamw8bit_state(reinterpret_cast<signed char*>(state.state1.Data),
                                                reinterpret_cast<unsigned char*>(state.state2.Data),
-                                               state.scales1.template get<half>(),
-                                               state.scales2.template get<half>(),
+                                               state.scales1.template get<float>(),
+                                               state.scales2.template get<float>(),
                                                total_params,
                                                stream);
     }
 
     fprintf(stderr,
-            "[LoRA] Flash AdamW 8-bit optimizer: %d tensors, %zu params, %.1f MB state (int8 m+v + FP16 scales)\n",
+            "[LoRA] Flash AdamW 8-bit optimizer: %d tensors, %zu params, %.1f MB state (int8 m+v + FP32 scales)\n",
             state.num_tensors,
             total_params,
-            (total_params * 2 + state.num_groups * 2 * sizeof(half)) / 1e6);
+            (total_params * 2 + state.num_groups * 2 * sizeof(float)) / 1e6);
 
     state.initialized = true;
 }
@@ -1044,8 +1060,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
             mLoRAAdamW8BitState->num_tensors,
             reinterpret_cast<signed char*>(mLoRAAdamW8BitState->state1.Data),
             reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state2.Data),
-            mLoRAAdamW8BitState->scales1.template get<half>(),
-            mLoRAAdamW8BitState->scales2.template get<half>(),
+            mLoRAAdamW8BitState->scales1.template get<float>(),
+            mLoRAAdamW8BitState->scales2.template get<float>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
             learning_rate,
@@ -1066,8 +1082,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
             mLoRAAdamW8BitState->num_tensors,
             reinterpret_cast<signed char*>(mLoRAAdamW8BitState->state1.Data),
             reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state2.Data),
-            mLoRAAdamW8BitState->scales1.template get<half>(),
-            mLoRAAdamW8BitState->scales2.template get<half>(),
+            mLoRAAdamW8BitState->scales1.template get<float>(),
+            mLoRAAdamW8BitState->scales2.template get<float>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
             learning_rate,
@@ -1139,8 +1155,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
                                                          state.num_tensors,
                                                          reinterpret_cast<signed char*>(state.state1.Data),
                                                          reinterpret_cast<unsigned char*>(state.state2.Data),
-                                                         state.scales1.template get<half>(),
-                                                         state.scales2.template get<half>(),
+                                                         state.scales1.template get<float>(),
+                                                         state.scales2.template get<float>(),
                                                          state.state_offsets.template get<int>(),
                                                          state.total_params,
                                                          /*lr=*/0.f,
@@ -1160,8 +1176,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
                                                          state.num_tensors,
                                                          reinterpret_cast<signed char*>(state.state1.Data),
                                                          reinterpret_cast<unsigned char*>(state.state2.Data),
-                                                         state.scales1.template get<half>(),
-                                                         state.scales2.template get<half>(),
+                                                         state.scales1.template get<float>(),
+                                                         state.scales2.template get<float>(),
                                                          state.state_offsets.template get<int>(),
                                                          state.total_params,
                                                          /*lr=*/0.f,

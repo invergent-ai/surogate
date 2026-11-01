@@ -260,7 +260,7 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
             load_safetensors(
                 source + fmt::format("/adam.m.scales.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count),
                 model.opt_momentum_scales(),
-                false);
+                /*allow_cast=*/true);  // FP16 in checkpoints from before the FP32 scales
         }
 
         bool has_v_scales = false;
@@ -273,7 +273,7 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
             load_safetensors(
                 source + fmt::format("/adam.v.scales.shard_{:03}_of_{:03}.safetensors", shard_rank, shard_count),
                 model.opt_variance_scales(),
-                false);
+                /*allow_cast=*/true);  // FP16 in checkpoints from before the FP32 scales
         }
     }
 

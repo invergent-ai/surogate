@@ -123,13 +123,10 @@ lora_target_modules:
   - down_proj
 
 loss:
-  ratio_type: token
   kl_tau: 0.0
   adv_tau: 1.0
-  token_mask_low: 0.125
-  token_mask_high: 8.0
-  geo_mask_low: 0.1
-  geo_mask_high: 10.0
+  ipo_mask_low: 0.2
+  ipo_mask_high: 0.2
 ```
 
 **`infer.yaml`**:
@@ -381,6 +378,97 @@ merged-weight reloads the sampling policy and the trainer policy can diverge
 enough that surviving tokens still carry an extreme ratio. `ratio_clip` bounds
 what any single token can contribute.
 
+### GSPO: one ratio per sequence
+
+`loss.variant: gspo` is [GSPO](https://arxiv.org/abs/2507.18071) in its GSPO-token form. Each sequence $y_i$ has one
+importance ratio, the geometric mean of its tokens' ratios:
+
+$$
+s_i(\theta) = \exp\Big(\frac{1}{|y_i|}\sum_{t} \log\frac{\pi_\theta(y_{i,t}\mid x, y_{i,<t})}{\mu(y_{i,t}\mid x, y_{i,<t})}\Big)
+$$
+
+The objective takes PPO's minimum of $s_i \hat{A}_{i,t}$ and $\mathrm{clip}(s_i, 1-\epsilon_{low}, 1+\epsilon_{high})
+\hat{A}_{i,t}$. Its gradient on token $t$ is therefore $\hat{A}_{i,t}\, s_i / |y_i|$, or zero when the clipped term is
+the minimum: $\hat{A} > 0$ with $s_i > 1 + \epsilon_{high}$, or $\hat{A} < 0$ with $s_i < 1 - \epsilon_{low}$. A step
+divides by its number of trials (sequences), not by its tokens, so every sequence weighs the same whatever its length.
+
+- **Settings.** `seq_clip_low` and `seq_clip_high` are $\epsilon_{low}$ and $\epsilon_{high}$; the defaults are the
+  paper's 3e-4 and 4e-4. GSPO turns off the probability-difference mask and the KL term, and does not use
+  `ratio_clip`.
+- **The ratio carries the engine mismatch.** $\mu$ is the rollout engine's log-probs, so $s_i$ also holds the gap
+  between the engine and the trainer. The mean log-ratio is $-\mathrm{KL}(\mu \Vert \pi_\theta)$, so a k3 mismatch
+  of 0.005 per token puts $s_i$ near 0.995, outside the paper's clips. Read `train/seq_log_ratio` and the clip shares
+  before choosing the clips. `seq_ratio_old: trainer` takes π_old from the trainer at the current parameters
+  instead: the ratio is then 1, nothing is clipped, and the update corrects for neither the lag nor the mismatch.
+- **Trials split into several rows.** A trial whose turns do not merge into one sequence becomes several samples.
+  Give them the same `TrainingSample.trial_idx` and divide each one's advantage by their count. The step then counts
+  that trial once; a sample without `trial_idx` is a trial of its own.
+- **Metrics.** `is_masked_low` and `is_masked_high` are the shares of sequences clipped on each side, and
+  `train/seq_log_ratio` is the mean of $\log s_i$.
+- **Constraint.** `parallelism: dispatch_pp` only: the sequence ratio needs a whole sequence's log-probs before its
+  backward, which the native step does not have.
+
+The paper's own procedure recomputes π_old with the training engine and takes several mini-batch updates per rollout
+batch. That is these settings together:
+
+```yaml
+minibatches: 4            # four updates per rollout batch, each over whole groups (group_idx) or trials
+max_policy_lag: 0         # on-policy batches: drop samples sampled by any other policy version
+learning_rate: 1.25e-5    # per update
+lr_scheduler_type: constant
+loss:
+  variant: gspo
+  seq_ratio_old: step_start   # pi_old = the trainer's log-probs at the weights the step starts from
+  seq_clip_low: 3.0e-4
+  seq_clip_high: 4.0e-4
+  teacher_tau: 0.0
+```
+
+- **Groups.** With `TrainingSample.group_idx` each mini-batch holds whole GRPO groups, so its advantages still sum to
+  zero per group; the mini-batch size is the batch's groups divided by `minibatches`.
+- **Versions.** The producer sends `TrainingSample.completion_versions`, the policy version that sampled each
+  completion token; samples sampled by another version, or by several, are dropped and counted
+  (`train/offpolicy_dropped_samples`).
+- **π_old.** One scoring pass over the step's rows before its first update gives π_old, so mini-batch 1 has
+  $s_i = 1$. Later mini-batches see the drift of the updates before them.
+- **Metrics.** Per mini-batch: `train/mb<k>/log_s_p05`, `_p50`, `_p95`, the shares of A < 0 and A > 0 sequences
+  clipped (`clip_neg`, `clip_pos`), `trials` and `grad_norm`. `train/engine_mismatch_kl` keeps the k3 gap between the
+  rollout engine and the trainer's π_old.
+
+#### Precision: the LoRA forward from the fp32 masters
+
+With `lora_dtype: fp32` the optimizer updates FP32 masters, but by default the forward computes the LoRA products from
+their BF16 work copies. A work copy changes only where an update crosses a BF16 rounding step, and then by a whole
+step, so the policy moves in rounding jumps rather than with the learning rate.
+
+On Qwen3.5-35B-A3B's NVFP4 base at 131k (expert LoRA r16, a real on-policy GSPO batch), the spread of log s_i over a
+mini-batch's sequences after one update was about ±0.0012-0.0020 at every lr from 1.25e-6 to 5e-5. That is the size of
+rounding the whole adapter once (truncated vs. to nearest: ±0.0012, token k3 0.0025).
+
+`lora_fp32_forward: true` (needs `lora_dtype: fp32`) computes the forward's LoRA products from the masters themselves:
+the expert kernel for gate_up and down, and dense LoRA (the shared expert) through the same kernel as a one-expert
+group. The backward keeps the BF16 copies, and broadcasts stay BF16. On the same batch:
+
+- **The spread grows with lr.** About ±0.002 after one update at 1.25e-5 and ±0.008 at 5e-5.
+- **A floor remains.** After any update, even at lr 1.25e-6, the spread stays near ±0.0012, probably from MoE
+  routing flips and the activations' own BF16 rounding. It is above the paper's clips, so several mini-batches per
+  rollout batch clip 25-80 % of this model's sequences at any lr. With `minibatches: 1` on on-policy batches the
+  ratio is exactly 1 and nothing is clipped.
+- **The same nominal lr moves the policy further,** since the BF16 copies used to drop most updates to lora_A.
+  Probe: a fresh adapter (B = 0) and fresh Adam, 5 updates on one batch, token k3 / mean |log s| against the start
+  on a held batch of the start's samples:
+
+  | lr | after update 1 | 3 | 5 |
+  | --- | --- | --- | --- |
+  | 5e-5 | 0.0019 / 0.0008 | 0.0080 / 0.0056 | 0.0233 / 0.0210 |
+  | 2.5e-5 | 0.0018 / 0.0007 | 0.0026 / 0.0009 | 0.0067 / 0.0043 |
+  | 1.25e-5 | 0.0018 / 0.0006 | 0.0019 / 0.0006 | 0.0025 / 0.0009 |
+
+  A run with the BF16 forward at lr warming up to 5e-5 reached a per-step drift from its start of 0.004-0.005 after
+  five steps (`teacher_kl`), about the 2.5e-5 row.
+- **Cost and agreement.** The step time did not change measurably (+2 %). The engine/trainer k3 at lag 0 against the
+  BF16 broadcast was 0.0043, against 0.0044 with the BF16 forward.
+
 ### Reading progress from a log file
 
 The orchestrator's rollout progress bar is `tqdm`, which needs a TTY. Under
@@ -521,11 +609,15 @@ Set `teacher_tau > 0` in `train.yaml` and configure the teacher in `orch.yaml`. 
 
 When the teacher is the base model the adapter trains on (a KL anchor that keeps the policy near its start), a dispatch-PP trainer can score it itself: set `teacher_from_base: true` in `train.yaml` and leave `teacher_model` out of `orch.yaml`. Each dispatch call then runs one more log-prob pass with the LoRA delta off, on the same kernels as the policy pass, and its log-probs replace the rows' `teacher_logprobs`.
 
+A run without the anchor sets `teacher_tau: 0` and `teacher_from_base: false`, and its producer sends no teacher
+log-probs. The trainer refuses `teacher_from_base: true` with `teacher_tau: 0`, a base pass that would only feed the
+`teacher_kl` metric. It warns once when rows arrive without teacher log-probs while `teacher_tau > 0` (no anchor on
+those rows), or with teacher log-probs while `teacher_tau` is 0.
+
 **`train.yaml`** — add `teacher_tau` to the loss block:
 
 ```yaml
 loss:
-  ratio_type: token
   adv_tau: 1.0
   teacher_tau: 0.5   # blend: half reward signal, half teacher signal
   kl_tau: 0.0
@@ -1089,19 +1181,18 @@ All LoRA, QLoRA, precision, and multi-GPU settings from SFT are available. See t
 
 Controls the GRPO policy gradient loss computation.
 
-| Parameter            | Default   | Description                                                                        |
-| -------------------- | --------- | ---------------------------------------------------------------------------------- |
-| `ratio_type`         | `"token"` | Importance ratio granularity: `"token"` (per-token) or `"sequence"` (per-sequence) |
-| `kl_tau`             | 0.0       | KL penalty coefficient. Higher values keep the policy closer to the reference      |
-| `adv_tau`            | 1.0       | Advantage scaling factor                                                           |
-| `teacher_tau`        | 0.0       | Teacher KL distillation coefficient (requires teacher logprobs)                    |
-| `token_mask_low`     | 0.125     | Mask tokens with importance ratio below this threshold                             |
-| `token_mask_high`    | 8.0       | Mask tokens with importance ratio above this threshold                             |
-| `geo_mask_low`       | 0.1       | Mask entire sequence when geometric mean ratio < threshold                         |
-| `geo_mask_high`      | 10.0      | Mask entire sequence when geometric mean ratio > threshold                         |
-| `sequence_mask_low`  | 0.0       | Mask sequence when min token ratio < threshold                                     |
-| `sequence_mask_high` | 100.0     | Mask sequence when max token ratio > threshold                                     |
-| `sequence_clip_high` | 10.0      | Clip sequence-level importance ratio                                               |
+| Parameter       | Default    | Description                                                                          |
+| --------------- | ---------- | ------------------------------------------------------------------------------------ |
+| `variant`       | `"ipo"`    | `ipo`, `cispo` or `gspo` (one ratio per sequence, see [GSPO](#gspo-one-ratio-per-sequence)) |
+| `ipo_mask_low`  | 0.2        | `ipo`: mask a token whose probability fell by more than this                         |
+| `ipo_mask_high` | 0.2        | `ipo`: mask a token whose probability rose by more than this                         |
+| `kl_tau`        | 1e-3       | `ipo`: KL penalty coefficient. Higher values keep the policy closer to the sampler   |
+| `adv_tau`       | 1.0        | Advantage scaling factor                                                             |
+| `teacher_tau`   | 0.0        | Teacher KL distillation coefficient (requires teacher logprobs)                      |
+| `ratio_clip`    | 7.389056   | Cap on a token's importance ratio (`ipo`, `cispo`)                                   |
+| `seq_clip_low`  | 3e-4       | `gspo`: clip the sequence ratio at `1 - seq_clip_low`                                |
+| `seq_clip_high` | 4e-4       | `gspo`: clip the sequence ratio at `1 + seq_clip_high`                               |
+| `seq_ratio_old` | `"inference"` | `gspo`: π_old from the rollout engine, or `trainer` (ratio 1, no clip)          |
 
 #### `noise_scheduler` (nested)
 

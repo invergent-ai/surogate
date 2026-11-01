@@ -448,6 +448,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora_alpha: int | None = 32
     lora_dropout: float | None = 0
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
+    # The LoRA forward computes its products from the fp32 masters (lora_dtype: fp32) instead of their bf16 work
+    # copies: the expert kernel and dense LoRA (the shared expert) through the same kernel. A bf16 work copy changes
+    # only where an update crosses a rounding step, so with bf16 copies the function moves in rounding jumps, about
+    # as large at lr 1e-6 as at 5e-5 (2026-10-30). The backward keeps the bf16 copies; broadcasts stay bf16.
+    lora_fp32_forward: bool = False
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
     router_aux_loss_coef: float | None = None
@@ -607,6 +612,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora_alpha = cfg.get("lora_alpha", self.lora_alpha)
         self.lora_dropout = float(cfg["lora_dropout"]) if "lora_dropout" in cfg else self.lora_dropout
         self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
+        self.lora_fp32_forward = bool(cfg.get("lora_fp32_forward", self.lora_fp32_forward))
+        if self.lora_fp32_forward and self.lora_dtype != "fp32":
+            raise ValueError("lora_fp32_forward needs lora_dtype: fp32 (the forward reads the fp32 masters)")
         self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
         self.train_router = cfg.get("train_router", self.train_router)
         self.router_aux_loss_coef = cfg.get("router_aux_loss_coef", self.router_aux_loss_coef)

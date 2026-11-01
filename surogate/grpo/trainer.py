@@ -13,6 +13,7 @@ prevent cross-sample attention in packed sequences.
 
 import json
 import os
+import random
 import shutil
 import time
 from pathlib import Path
@@ -63,6 +64,7 @@ _SAMPLE_MEAN_METRICS = (
     "is_masked_high",
     "ratio_clipped",
     "teacher_kl",
+    "seq_log_ratio",
 )
 _TOKEN_MEAN_METRICS = {"opd_loss": "opd_tokens", "opd_gate": "opd_tokens", "opd_shift": "opd_tokens",
                        "replay_loss": "replay_tokens"}
@@ -89,6 +91,74 @@ def _combine_row_metrics(rows: list[dict]) -> dict:
         else:
             out[key] = sum(r[key] for r in rows)
     return out
+
+
+def _check_loss_options(config, dispatch_pp: bool) -> None:
+    """Refuse loss settings this trainer would run differently from what they say."""
+    if config.teacher_from_base and not dispatch_pp:
+        raise ValueError("teacher_from_base needs parallelism: dispatch_pp (its log-prob pass scores the base)")
+    if config.teacher_from_base and config.loss.teacher_tau == 0.0:
+        # A run without the anchor must not pay for the base pass (one more forward per call, ~18 % of a step).
+        raise ValueError("teacher_from_base with loss.teacher_tau = 0 runs a base-model pass that only feeds the "
+                         "teacher_kl metric; set teacher_from_base: false for a run without the KL anchor")
+    if config.loss.variant == "gspo" and not dispatch_pp:
+        raise ValueError("loss.variant gspo needs parallelism: dispatch_pp (its sequence ratio needs each "
+                         "sequence's log-probs before its backward; the native step seeds window by window)")
+    if getattr(config, "minibatches", 1) > 1 and not dispatch_pp:
+        raise ValueError("minibatches > 1 needs parallelism: dispatch_pp")
+    if getattr(config, "max_policy_lag", None) is not None and not dispatch_pp:
+        raise ValueError("max_policy_lag needs parallelism: dispatch_pp (the dispatch-PP step drops the rows)")
+    if config.loss.variant == "gspo" and config.loss.seq_ratio_old == "step_start" and (
+            getattr(config, "max_policy_lag", None) != 0):
+        # The weights a step starts from sampled its rows only when every row is on-policy.
+        raise ValueError("loss.seq_ratio_old step_start takes pi_old from the weights the step starts from, which "
+                         "sampled the rows only for on-policy batches: set max_policy_lag: 0")
+
+
+def _step_trial_count(micro_batches) -> int:
+    """GSPO's step normalizer: the number of trials whose samples the step trains on.
+
+    Samples with the same trial_idx are one trial (the producer divides their advantages by their count, so each
+    trial counts once); a sample without one (-1, or no trial_idx at all) is a trial of its own. Samples without loss
+    tokens, padding included, do not count.
+    """
+    trials: set[int] = set()
+    single = 0
+    for mb in micro_batches:
+        pos = mb["position_ids"].flatten()
+        if not len(pos):
+            continue
+        # The sample starts of _find_sample_boundaries (every position that does not advance its predecessor by one),
+        # vectorized: a step holds millions of tokens.
+        starts = np.concatenate([[0], np.flatnonzero(np.diff(pos) != 1) + 1])
+        trained = np.add.reduceat(mb["loss_mask"].flatten().astype(np.int64), starts) > 0
+        ids = mb.get("trial_idx")
+        tids = ids.flatten()[starts] if ids is not None else np.full(len(starts), -1)
+        trials.update(int(t) for t in tids[trained & (tids >= 0)])
+        single += int(np.count_nonzero(trained & (tids < 0)))
+    return len(trials) + single
+
+
+def _minibatch_summary(prepared, part_metrics, k: int, trials: int, grad_norm: float) -> dict[str, float]:
+    """Mini-batch k's sequence ratios: quantiles of its sequences' log s_i, the shares of its A < 0 and A > 0
+    sequences that are clipped (no gradient), its trial count and its update's grad norm."""
+    log_s, neg, pos = [], [], []
+    for i, m in part_metrics:
+        if not m.get("policy_sample_count"):
+            continue
+        mask = prepared[i]["loss_mask"].astype(bool)
+        adv = float(prepared[i]["advantages"][mask].mean())
+        if "seq_log_ratio" in m:
+            log_s.append(m["seq_log_ratio"])
+        if adv < 0:
+            neg.append(m.get("is_masked_low", 0.0) > 0.0)
+        elif adv > 0:
+            pos.append(m.get("is_masked_high", 0.0) > 0.0)
+    q = np.quantile(log_s, [0.05, 0.5, 0.95]) if log_s else np.zeros(3)
+    return {f"mb{k}/log_s_p05": float(q[0]), f"mb{k}/log_s_p50": float(q[1]), f"mb{k}/log_s_p95": float(q[2]),
+            f"mb{k}/clip_neg": float(np.mean(neg)) if neg else 0.0,
+            f"mb{k}/clip_pos": float(np.mean(pos)) if pos else 0.0,
+            f"mb{k}/trials": float(trials), f"mb{k}/grad_norm": float(grad_norm)}
 
 
 def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
@@ -185,10 +255,8 @@ class GRPOTrainer:
         # stage re-streams its weights for every microbatch (8 microbatches x 3
         # passes = 24 copies of the base per step, measured 2026-10-29).
         self._dispatch_pp = getattr(config, "parallelism", None) == "dispatch_pp"
-        if config.teacher_from_base and not self._dispatch_pp:
-            raise ValueError("teacher_from_base needs parallelism: dispatch_pp (its log-prob pass scores the base)")
-        if config.teacher_from_base and config.loss.teacher_tau == 0.0:
-            logger.warning("teacher_from_base with loss.teacher_tau = 0: the base pass only feeds the teacher_kl metric")
+        _check_loss_options(config, self._dispatch_pp)
+        self._teacher_warned = False
         self._dpp_los: list[int] | None = None
         self._dpp_his: list[int] | None = None
         if self._dispatch_pp:
@@ -210,6 +278,10 @@ class GRPOTrainer:
                 f"(max {max_stage} blocks/stage, stage_blocks={sb}, "
                 f"resident window {os.environ['SUROGATE_DISPATCH_PREFETCH_BLOCKS']} layers)"
             )
+
+        if config.lora_fp32_forward:
+            # The LoRA forward reads the fp32 masters, not their bf16 work copies (read once by the engine).
+            os.environ["SUROGATE_LORA_FP32_FORWARD"] = "1"
 
         # Create C++ trainer using inherited config objects
         logger.info(f"Creating GRPO trainer for {config.model} ({config.gpus} GPUs)")
@@ -416,6 +488,15 @@ class GRPOTrainer:
                 f"expected={expected_loss_scale} "
                 f"time={step_time:.2f}s"
             )
+            k = 1
+            while f"mb{k}/trials" in step_metrics:  # minibatches > 1: one line per update
+                logger.info(
+                    f"  mini-batch {k}: trials={int(step_metrics[f'mb{k}/trials'])} "
+                    f"log_s p5/p50/p95={step_metrics[f'mb{k}/log_s_p05']:+.5f}/{step_metrics[f'mb{k}/log_s_p50']:+.5f}/"
+                    f"{step_metrics[f'mb{k}/log_s_p95']:+.5f} clipped A<0={step_metrics[f'mb{k}/clip_neg']:.0%} "
+                    f"A>0={step_metrics[f'mb{k}/clip_pos']:.0%} grad_norm={step_metrics[f'mb{k}/grad_norm']:.4f}"
+                )
+                k += 1
 
             if self.metrics_writer is not None:
                 duration_ms = step_time * 1000.0
@@ -441,6 +522,12 @@ class GRPOTrainer:
                         "train/duration_ms": duration_ms,
                         "train/tokens_per_second": tps,
                         "train/orch_step": float(orch_step),
+                        # GSPO: the mean over the step's sequences of log s_i (is_masked* are its clip shares).
+                        **({"train/seq_log_ratio": float(step_metrics["seq_log_ratio"])}
+                           if "seq_log_ratio" in step_metrics else {}),
+                        # minibatches > 1 (train/mb<k>/...) and max_policy_lag (train/offpolicy_*, unversioned_samples)
+                        **{f"train/{key}": float(v) for key, v in step_metrics.items()
+                           if key.startswith(("mb", "offpolicy_", "unversioned_", "engine_"))},
                         **turn_summary,
                         **self._r3_step_summary,
                     },
@@ -540,6 +627,14 @@ class GRPOTrainer:
             turn_ids_padded = np.full(seq_len, -1, dtype=np.int32)
             turn_ids_padded[:T_actual] = mb["turn_ids"].flatten()[:T_actual]
 
+        trial_idx_padded = group_idx_padded = None
+        if mb.get("trial_idx") is not None:
+            trial_idx_padded = np.full(seq_len, -1, dtype=np.int32)
+            trial_idx_padded[:T_actual] = mb["trial_idx"].flatten()[:T_actual]
+        if mb.get("group_idx") is not None:
+            group_idx_padded = np.full(seq_len, -1, dtype=np.int32)
+            group_idx_padded[:T_actual] = mb["group_idx"].flatten()[:T_actual]
+
         return {
             "input": input_padded,
             "position_ids": pos_padded,
@@ -550,12 +645,31 @@ class GRPOTrainer:
             "loss_mask": loss_mask_padded,
             "teacher": teacher_padded,
             "turn_ids": turn_ids_padded,
+            "trial_idx": trial_idx_padded,
+            "group_idx": group_idx_padded,
             "sample_ranges": sample_ranges,
             "T_actual": T_actual,
         }
 
-    def _dispatch_pp_step(self, micro_batches, loss_scale: float, opt_config, step: int, turn_acc) -> dict:
-        """One optimizer step under dispatch-PP.
+    def _check_teacher_rows(self, micro_batches) -> None:
+        """Warn once when the KL anchor and the rows' teacher log-probs disagree, which would otherwise pass silently:
+        teacher_tau > 0 with rows that have no teacher (no anchor on them), or teacher log-probs nobody uses."""
+        if getattr(self, "_teacher_warned", False) or self.config.teacher_from_base:
+            return
+        tau = self.config.loss.teacher_tau
+        without = sum(mb["teacher_logprobs"] is None for mb in micro_batches)
+        if tau != 0.0 and without:
+            logger.warning(f"loss.teacher_tau = {tau} but {without} of {len(micro_batches)} rows have no teacher "
+                           "log-probs and teacher_from_base is off: the KL anchor is off for those rows")
+            self._teacher_warned = True
+        elif tau == 0.0 and without < len(micro_batches):
+            logger.warning("rows carry teacher log-probs but loss.teacher_tau = 0: they only feed the teacher_kl "
+                           "metric (turn the producer's teacher scorer off for a run without the anchor)")
+            self._teacher_warned = True
+
+    def _dispatch_pp_step(self, micro_batches, loss_scale: float, opt_config, step: int, turn_acc,
+                          version: int | None = None) -> dict:
+        """One rollout batch under dispatch-PP: one optimizer update, or `minibatches` of them.
 
         GRPO's gradients do not come from cross-entropy, so the fused dispatch step
         cannot be used as-is. Instead the two halves are driven explicitly:
@@ -566,38 +680,102 @@ class GRPOTrainer:
              existing collect + optimizer + broadcast
 
         GRPO's micro-batches map onto dispatch-PP's M microbatches directly: each is
-        already [1, seq_len], and GRPO takes exactly one optimizer step per
-        orchestrator step, which is what the fused call does.
+        already [1, seq_len].
 
         A call holds its rows' stage boundaries in host memory from the log-prob pass
-        to the end of its training step. A step whose rows do not fit runs as several
+        to the end of its training step. An update whose rows do not fit runs as several
         calls (_dispatch_pp_call_groups), each with its own log-prob pass and staged
-        backward: the gradients accumulate on the stages' GPUs, and one optimizer
-        update follows the last call. The per-token gradients are normalized by the
-        whole step's loss_scale either way.
+        backward: the gradients accumulate on the stages' GPUs, and the update follows
+        the last call.
+
+        With max_policy_lag, rows sampled by too old a policy version (`version` is the step's) are dropped first.
+        loss.seq_ratio_old step_start then scores the remaining rows once at the step's starting weights, the
+        rollout policy pi_old. With minibatches > 1 the rows are partitioned into mini-batches of whole trials,
+        each updated in turn and normalized by its own trial count (gspo) or loss tokens; otherwise the one update
+        is normalized by the caller's loss_scale.
         """
-        seq_len = self.config.sequence_len
+        config = self.config
+        seq_len = config.sequence_len
         prepared = [self._prepare_micro_batch(mb, seq_len) for mb in micro_batches]
-        groups = self._dispatch_pp_call_groups(prepared, step)
+        dropped = self._drop_off_policy_samples(prepared, micro_batches, version)
+        n_updates = max(1, int(getattr(config, "minibatches", 1)))
+        rows = list(range(len(prepared)))
+        if dropped["samples"] or n_updates > 1:
+            rows = [i for i in rows if prepared[i]["loss_mask"].any()]
 
         # The log-prob pass keeps every stage's output so the training step below,
         # over the same rows and weights, takes them as its stage inputs instead of
         # running the same forward pipeline a second time (SUROGATE_DPP_REUSE_FORWARD=0
         # turns this off).
         reuse_forward = os.environ.get("SUROGATE_DPP_REUSE_FORWARD", "1") != "0"
+        engine_metrics: dict[str, float] = {}
+        if config.loss.variant == "gspo" and config.loss.seq_ratio_old == "step_start" and rows:
+            # pi_old: the trainer's own log-probs at the weights the step starts from, before its first update. The
+            # rollout engine's log-probs it replaces still give the engine/trainer mismatch, per row then averaged.
+            kl, log_ratio = [], []
+            for i, lp in self._dispatch_pp_score(prepared, rows, step).items():
+                m = prepared[i]["loss_mask"].astype(bool)
+                if m.any():
+                    r = lp[m].astype(np.float64) - prepared[i]["inference"][m]
+                    kl.append(float(np.mean(np.exp(r) - r - 1.0)))
+                    log_ratio.append(float(np.mean(r)))
+                prepared[i]["inference"] = lp
+            if kl:
+                engine_metrics = {"engine_mismatch_kl": float(np.mean(kl)), "engine_log_ratio": float(np.mean(log_ratio))}
+
+        parts = [rows] if n_updates == 1 else self._minibatch_parts(prepared, rows, n_updates, step)
         row_metrics: list[dict] = []
+        minibatch_metrics: dict[str, float] = {}
+        loss_sum, norms = 0.0, []
+        for k, part in enumerate(parts):
+            if not part:
+                continue
+            trials = _step_trial_count([{"position_ids": micro_batches[i]["position_ids"],
+                                         "loss_mask": prepared[i]["loss_mask"][None, :micro_batches[i]["loss_mask"].shape[1]],
+                                         "trial_idx": micro_batches[i].get("trial_idx")} for i in part])
+            scale = loss_scale
+            if n_updates > 1 or dropped["samples"]:
+                if config.loss.variant == "gspo":
+                    scale = float(max(trials, 1))
+                else:
+                    scale = float(max(sum(int(prepared[i]["loss_mask"].sum()) for i in part), 1))
+            part_metrics, part_loss = self._dispatch_pp_update(
+                prepared, part, scale, opt_config, n_updates * step + k, turn_acc, reuse_forward, step)
+            row_metrics += [m for _, m in part_metrics]
+            loss_sum += part_loss
+            norms.append(float(self.trainer.dispatch_pp_last_grad_norm()))
+            if n_updates > 1:
+                minibatch_metrics.update(_minibatch_summary(prepared, part_metrics, k + 1, trials, norms[-1]))
+        # Over all of the step's rows, not the last one's.
+        self._diag_metrics = _combine_row_metrics(row_metrics)
+        self._diag_metrics.update(minibatch_metrics)
+        self._diag_metrics.update(engine_metrics)
+        if version is not None and getattr(config, "max_policy_lag", None) is not None:
+            self._diag_metrics.update({"offpolicy_dropped_samples": dropped["samples"],
+                                       "offpolicy_dropped_tokens": dropped["tokens"],
+                                       "unversioned_samples": dropped["unversioned"]})
+        norm = norms[-1] if len(norms) == 1 else (float(np.mean(norms)) if norms else 0.0)
+        return {"loss": loss_sum / max(len(rows), 1), "norm": norm}
+
+    def _dispatch_pp_update(self, prepared, rows, loss_scale: float, opt_config, step_idx: int, turn_acc,
+                            reuse_forward: bool, step: int):
+        """One optimizer update (Adam step index step_idx) over rows, in as many dispatch calls as host memory
+        needs. Returns each row's (index, metrics) and the summed loss."""
+        seq_len = self.config.sequence_len
+        groups = [[rows[j] for j in g] for g in self._dispatch_pp_call_groups([prepared[i] for i in rows], step)]
+        row_metrics: list[tuple[int, dict]] = []
         loss_sum = 0.0
-        for g, rows in enumerate(groups):
-            M = len(rows)
-            inputs = np.ascontiguousarray(np.concatenate([prepared[i]["input"] for i in rows], axis=0))
-            targets = np.ascontiguousarray(np.concatenate([prepared[i]["targets"] for i in rows], axis=0))
+        for g, call in enumerate(groups):
+            M = len(call)
+            inputs = np.ascontiguousarray(np.concatenate([prepared[i]["input"] for i in call], axis=0))
+            targets = np.ascontiguousarray(np.concatenate([prepared[i]["targets"] for i in call], axis=0))
             if self.config.teacher_from_base:
                 # The base model's log-probs of the same rows (LoRA delta off), as the teacher of the KL anchor.
                 # Before the policy pass, whose boundaries the train step takes.
                 base_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
                     inputs, targets, self._dpp_los, self._dpp_his, M, keep_boundaries=False, base_model=True
                 )
-                for j, i in enumerate(rows):
+                for j, i in enumerate(call):
                     prepared[i]["teacher"] = unshift_to_logical(
                         np.asarray(base_rows[j, :seq_len], dtype=np.float32), prepared[i]["sample_ranges"]
                     )
@@ -606,7 +784,7 @@ class GRPOTrainer:
             )
 
             custom_dloss = np.zeros((M, seq_len), dtype=np.float32)
-            for j, i in enumerate(rows):
+            for j, i in enumerate(call):
                 p = prepared[i]
                 # Un-shift from target-slot layout to logical layout (see
                 # _diagnostic_micro_step for why this is required).
@@ -623,7 +801,7 @@ class GRPOTrainer:
                     sample_ranges=p["sample_ranges"],
                     teacher_logprobs=p["teacher"],
                 )
-                row_metrics.append(metrics)
+                row_metrics.append((i, metrics))
 
                 if turn_acc is not None and p["turn_ids"] is not None:
                     reference_lp = p["teacher"] if p["teacher"] is not None else p["inference"]
@@ -645,7 +823,7 @@ class GRPOTrainer:
                     self._dpp_los,
                     self._dpp_his,
                     opt_config,
-                    step,
+                    step_idx,
                     False,
                     M,
                     custom_dloss,
@@ -654,9 +832,75 @@ class GRPOTrainer:
                     apply_update=g == len(groups) - 1,
                 )
             )
-        # Over all of the step's rows, not the last one's.
-        self._diag_metrics = _combine_row_metrics(row_metrics)
-        return {"loss": loss_sum / len(prepared), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
+        return row_metrics, loss_sum
+
+    def _dispatch_pp_score(self, prepared, rows, step: int) -> dict[int, np.ndarray]:
+        """The trainer's log-probs of rows at the current weights (logical layout), in dispatch calls; no boundaries
+        are kept, so a following update's own log-prob pass is unaffected."""
+        seq_len = self.config.sequence_len
+        out: dict[int, np.ndarray] = {}
+        for g in self._dispatch_pp_call_groups([prepared[i] for i in rows], step):
+            call = [rows[j] for j in g]
+            inputs = np.ascontiguousarray(np.concatenate([prepared[i]["input"] for i in call], axis=0))
+            targets = np.ascontiguousarray(np.concatenate([prepared[i]["targets"] for i in call], axis=0))
+            lp = self.trainer.dispatch_pp_forward_logprobs_multigpu(
+                inputs, targets, self._dpp_los, self._dpp_his, len(call), keep_boundaries=False
+            )
+            for j, i in enumerate(call):
+                out[i] = unshift_to_logical(np.asarray(lp[j, :seq_len], dtype=np.float32), prepared[i]["sample_ranges"])
+        return out
+
+    def _drop_off_policy_samples(self, prepared, micro_batches, version: int | None) -> dict[str, int]:
+        """max_policy_lag: clear the loss mask of every sample whose trained tokens were sampled by several policy
+        versions, by one older than `version` by more than the lag, or partly by an unknown one. A sample with no
+        versions at all is kept and counted as unversioned."""
+        counts = {"samples": 0, "tokens": 0, "unversioned": 0}
+        lag = getattr(self.config, "max_policy_lag", None)
+        if lag is None or version is None:
+            return counts
+        for p, mb in zip(prepared, micro_batches):
+            mask = p["loss_mask"]
+            ids = mb.get("policy_version")
+            ids = ids.flatten() if ids is not None else None
+            for start, end in p["sample_ranges"]:
+                trained = mask[start:end].astype(bool)
+                if not trained.any():
+                    continue
+                vs = ids[start:end][trained] if ids is not None else np.array([], np.int32)
+                if not len(vs) or (vs < 0).all():
+                    counts["unversioned"] += 1
+                    continue
+                distinct = set(int(v) for v in vs)
+                if len(distinct) > 1 or not version - lag <= distinct.pop() <= version:
+                    counts["samples"] += 1
+                    counts["tokens"] += int(trained.sum())
+                    mask[start:end] = 0
+        if counts["samples"]:
+            logger.warning(f"max_policy_lag {lag}: dropped {counts['samples']} samples ({counts['tokens']} loss tokens) "
+                           f"not sampled by policy version {version - lag}..{version} alone")
+        return counts
+
+    def _minibatch_parts(self, prepared, rows, n_parts: int, step: int) -> list[list[int]]:
+        """Rows into n_parts mini-batches of whole GRPO groups, or of whole trials where rows carry no group_idx.
+        A row's group and trial are those of its first loss token; a row without a trial_idx is a trial of its own.
+        The units are shuffled with a seed per step and dealt round-robin, so the mini-batch size follows the batch."""
+        units: dict[object, list[int]] = {}
+        for i in rows:
+            first = int(np.flatnonzero(prepared[i]["loss_mask"])[0])
+            gids, tids = prepared[i].get("group_idx"), prepared[i].get("trial_idx")
+            if gids is not None and int(gids[first]) >= 0:
+                key = ("group", int(gids[first]))
+            elif tids is not None and int(tids[first]) >= 0:
+                key = ("trial", int(tids[first]))
+            else:
+                key = ("row", i)
+            units.setdefault(key, []).append(i)
+        keys = list(units)
+        random.Random(f"{getattr(self.config, 'train_seed', 0)}:{step}").shuffle(keys)
+        parts: list[list[int]] = [[] for _ in range(n_parts)]
+        for q, key in enumerate(keys):
+            parts[q % n_parts] += units[key]
+        return [sorted(p) for p in parts]
 
     def _dispatch_pp_call_groups(self, prepared, step: int) -> list[list[int]]:
         """Split a step's rows into dispatch calls that fit host memory.
@@ -939,6 +1183,11 @@ class GRPOTrainer:
             # across all micro-batches in this optimizer step.
             loss_tokens = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))
             loss_scale = max(loss_tokens, 1)
+            if config.loss.variant == "gspo":
+                # GSPO weighs sequences, not tokens: its per-token gradients already carry 1 / |y_i|, so the step
+                # divides by its trial count (the mean over the G responses of a group, over all of the step's).
+                loss_scale = max(_step_trial_count(micro_batches), 1)
+            self._check_teacher_rows(micro_batches)
 
             step_start = time.time()
 
@@ -968,7 +1217,9 @@ class GRPOTrainer:
                 # over all micro-batches, so it replaces both the loop below and the
                 # update_with_config call further down.
                 expected_loss_scale = loss_scale
-                result = self._dispatch_pp_step(micro_batches, float(loss_scale), opt_config, step, turn_acc)
+                # The batch for orch_step was sampled by the weights broadcast as step_<orch_step>: its policy version.
+                result = self._dispatch_pp_step(micro_batches, float(loss_scale), opt_config, step, turn_acc,
+                                                version=orch_step)
                 step_metrics = dict(self._diag_metrics or {})
                 step_time = time.time() - step_start
                 self._log_step(
@@ -1146,7 +1397,7 @@ class GRPOTrainer:
                     adamw_epsilon=config.adamw_epsilon,
                 )
 
-            result = self.trainer.update_with_config(opt_config, step + 1)
+            result = self.trainer.update_with_config(opt_config, step)
             # The diagnostic path computes the loss in Python, so the native
             # accumulator is empty — use the Python metrics from the last
             # micro-batch instead.

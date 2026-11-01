@@ -523,7 +523,10 @@ than from `datasets`, which is forced empty. See the
 | `single_sample_bins`    | bool   | `false`        | Pack one sample per row instead of filling each row. Chunked-training attention has no packed-doc isolation, so multi-sample rows would let samples attend across each other. |
 | `turn_diagnostics`      | bool   | `false`        | Route the micro-step through the Python loss instead of the fused native step so per-token logprobs are visible. Same gradients, slower — measurement only. |
 | `broadcast_dtype`       | string | `"bf16"`       | dtype of the LoRA adapter in weight broadcasts: `bf16` rounds FP32 masters (`lora_dtype: fp32`) to BF16, the copy a BF16 serving engine loads, at half the bytes; `master` writes them as stored. Checkpoints keep full precision. |
-| `teacher_from_base`     | bool   | `false`        | dispatch-PP only: the trainer scores each row with its own base model (the LoRA delta off) and uses those log-probs as the rows' `teacher_logprobs`, a KL anchor to the base weighted by `loss.teacher_tau` that needs no teacher server. One more log-prob pass per dispatch call. |
+| `minibatches`           | int    | `1`            | dispatch-PP only: optimizer updates per rollout batch. The rows are partitioned into this many mini-batches of whole GRPO groups (`TrainingSample.group_idx`), or whole trials without one, seeded per step; each gets its own log-prob pass, backward and update, normalized by its own trial count (`gspo`) or loss tokens. Adam's step index of update k is `minibatches * step + k`. |
+| `lora_fp32_forward`     | bool   | `false`        | The forward computes its LoRA products from the FP32 masters (`lora_dtype: fp32`), not their BF16 work copies, so the policy moves with the learning rate instead of in BF16 rounding jumps: routed experts and dense LoRA (the shared expert). The backward keeps the BF16 copies; broadcasts stay BF16. See [Precision](../guides/rl-training.md#precision-the-lora-forward-from-the-fp32-masters). |
+| `max_policy_lag`        | int    | `null`         | dispatch-PP only: drop the samples whose trained tokens were sampled (`TrainingSample.completion_versions`) by several policy versions or by one older than the step's by more than this. `0` = on-policy batches only. |
+| `teacher_from_base`     | bool   | `false`        | dispatch-PP only: the trainer scores each row with its own base model (the LoRA delta off) and uses those log-probs as the rows' `teacher_logprobs`, a KL anchor to the base weighted by `loss.teacher_tau` that needs no teacher server. One more log-prob pass per dispatch call. Needs `loss.teacher_tau > 0`. |
 
 `gradient_dtype` defaults to `fp32` for GRPO (the per-token gradient is 10-100x
 smaller than in SFT), while master weights follow the model dtype; precision
@@ -539,6 +542,10 @@ where it matters comes from `lora_dtype`, which stays `fp32`.
 | `teacher_tau`   | float | `0.0`   | Weight on the teacher term for on-policy distillation. `0.0` disables it.         |
 | `kl_tau`        | float | `1e-3`  | KL penalty coefficient. Raise if the policy diverges from the reference too fast. |
 | `ratio_clip`    | float | `7.389056` | Hard ceiling on the importance ratio (default e²). Bounds the update when the sampling policy and the trainer policy drift apart — e.g. under periodic merged-weight reloads, where the baseline mismatch is larger than the IPO mask alone can absorb. |
+| `variant`       | string | `"ipo"` | `ipo` (token-level, the masks above), `cispo` (token-level, no mask, ratio truncated at `ratio_clip`) or `gspo` (one ratio per sequence, every sequence weighted equally; `parallelism: dispatch_pp` only). See [GSPO](../guides/rl-training.md#gspo-one-ratio-per-sequence). |
+| `seq_clip_low`  | float | `3e-4`  | `gspo`: the sequence ratio's clip below 1, `1 - seq_clip_low` (the paper's value). |
+| `seq_clip_high` | float | `4e-4`  | `gspo`: the sequence ratio's clip above 1, `1 + seq_clip_high` (the paper's value). |
+| `seq_ratio_old` | string | `"inference"` | `gspo`: the ratio's π_old. `inference` = the rollout engine's log-probs; `step_start` = the trainer's own, scored once at the weights the step starts from (the paper's recomputation; needs `max_policy_lag: 0`); `trainer` = the trainer's own at the current parameters, so the ratio is 1 and nothing is clipped. |
 
 ### QeRL noise scheduler (`noise_scheduler:` block)
 
@@ -594,6 +601,7 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | `lora_alpha`          | int    | `32`      | Alpha value for LoRA adapters.                                             |
 | `lora_dropout`        | float  | `0.05`    | Dropout rate for LoRA adapters.                                            |
 | `lora_dtype`          | string | `"fp32"`  | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                         |
+| `lora_fp32_forward`   | bool   | `false`   | The forward computes its LoRA products from the FP32 masters (`lora_dtype: fp32`), not their BF16 work copies. Fine-tuning and GRPO alike. |
 | `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
 | `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
 | `adapter_path`        | string | `null`    | Path to a PEFT adapter directory to merge into base weights before training. Requires `lora: true`. Not supported with pre-quantized models. |

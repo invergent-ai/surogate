@@ -1675,7 +1675,7 @@ class SurogateTrainer:
 
         Parameters:
         - config: OptimizerConfig with all hyperparameters.
-        - step: Global step index.
+        - step: Zero-based index of this update; the native side turns it into Adam's 1-based step count.
 
         Returns: dict with keys {loss: float, norm: float}.
         """
@@ -1691,7 +1691,7 @@ class SurogateTrainer:
         - inputs: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
         - targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
         - config: OptimizerConfig with all hyperparameters.
-        - step: Global step index.
+        - step: Zero-based index of this update; the native side turns it into Adam's 1-based step count.
 
         Returns: dict with keys {loss: float, norm: float}.
         """
@@ -1711,7 +1711,7 @@ class SurogateTrainer:
         - targets: int32 token ids shaped [grad_accum * local_gpus * batch_size, seq_length].
         - position_ids: int32 position ids shaped [grad_accum * local_gpus * batch_size, seq_length].
         - config: OptimizerConfig with all hyperparameters.
-        - step: Global step index.
+        - step: Zero-based index of this update; the native side turns it into Adam's 1-based step count.
 
         Returns: dict with keys {loss: float, norm: float}.
         """
@@ -1845,7 +1845,7 @@ class TrainingRunLogger:
         Log an evaluation step.
 
         Parameters:
-        - step: Global step index.
+        - step: Zero-based index of this update; the native side turns it into Adam's 1-based step count.
         - epoch: Current epoch.
         - eval_tokens: Tokens processed.
         - duration_ms: Eval wall time.
@@ -1874,7 +1874,7 @@ class TrainingRunLogger:
         Log a training step.
 
         Parameters:
-        - step: Global step index.
+        - step: Zero-based index of this update; the native side turns it into Adam's 1-based step count.
         - epoch: Current epoch.
         - step_tokens: Tokens processed in this step.
         - duration_ms: Step wall time.

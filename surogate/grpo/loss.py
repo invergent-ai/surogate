@@ -96,6 +96,27 @@ def _compute_sample_grads(
         teacher_kl = teacher_logprobs - trainer_logprobs
         scaled_advantages = scaled_advantages + loss_config.teacher_tau * teacher_kl
 
+    # The importance weight each kept token's advantage is multiplied by.
+    token_weight = capped_ratio
+    seq_log_ratio = None
+    if loss_config.variant == "gspo":
+        # GSPO-token (Zheng et al. 2025, eqs. 13-14): s_{i,t} = sg[s_i] * pi_t / sg[pi_t], equal to s_i in value, with
+        # s_i = exp(mean over the sequence's tokens of log(pi_theta / pi_old)). PPO's min of s * A and clip(s) * A is
+        # taken per token's advantage: the clipped term is the minimum, and the token has no gradient, when A > 0 and
+        # s_i > 1 + seq_clip_high, or A < 0 and s_i < 1 - seq_clip_low. Otherwise d(objective)/d(log pi_t) is
+        # A_t * s_i / |y_i|. The probability-difference masks above are replaced by these clips, and the caller
+        # divides by the step's trial count instead of its loss tokens.
+        n_policy = int(policy_token_mask.sum())
+        seq_log_ratio = float(log_importance_ratio[policy_token_mask].mean()) if n_policy else 0.0
+        # seq_ratio_old "trainer": pi_old = sg[pi_theta], so s_i = 1 (the metric keeps the engine-based log-ratio).
+        # "step_start" arrives as inference_logprobs: the trainer put its step-start scores there.
+        seq_ratio = float(np.exp(seq_log_ratio)) if loss_config.seq_ratio_old != "trainer" else 1.0
+        ipo_mask_high = policy_token_mask & (scaled_advantages > 0) & (seq_ratio > 1.0 + loss_config.seq_clip_high)
+        ipo_mask_low = policy_token_mask & (scaled_advantages < 0) & (seq_ratio < 1.0 - loss_config.seq_clip_low)
+        is_masked = ipo_mask_high | ipo_mask_low
+        keep_mask = policy_token_mask & ~is_masked
+        token_weight = np.full_like(trainer_logprobs, seq_ratio / max(n_policy, 1))
+
     # Per-token gradient seeding for surogate's CE backward kernel.
     #
     # IPO loss = sum_t[-keep_mask_t * adv_t * ratio_t + kl_tau * loss_mask_t * log_ratio_t^2]
@@ -104,7 +125,7 @@ def _compute_sample_grads(
     # We need dloss = -d(loss)/d(trainer_logprob_t), giving:
     #   dloss = keep_mask_t * adv_t * ratio_t - 2 * kl_tau * loss_mask_t * log_ratio_t
     per_token_grads = np.zeros_like(trainer_logprobs)
-    per_token_grads[keep_mask] = scaled_advantages[keep_mask] * capped_ratio[keep_mask]
+    per_token_grads[keep_mask] = scaled_advantages[keep_mask] * token_weight[keep_mask]
     per_token_grads[policy_token_mask] -= 2.0 * loss_config.kl_tau * log_importance_ratio[policy_token_mask]
 
     opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
@@ -134,7 +155,13 @@ def _compute_sample_grads(
     # Policy loss metric
     loss_mask_count = max(loss_mask.sum(), 1)
     pg_loss = np.zeros_like(trainer_logprobs)
-    pg_loss[keep_mask] = scaled_advantages[keep_mask] * capped_ratio[keep_mask]
+    if seq_log_ratio is None:
+        pg_loss[keep_mask] = scaled_advantages[keep_mask] * capped_ratio[keep_mask]
+    else:  # GSPO: the sequence's objective, the min of the unclipped and the clipped term, per token
+        s = float(np.exp(seq_log_ratio)) if loss_config.seq_ratio_old != "trainer" else 1.0
+        s_clip = min(max(s, 1.0 - loss_config.seq_clip_low), 1.0 + loss_config.seq_clip_high)
+        adv = scaled_advantages[policy_token_mask]
+        pg_loss[policy_token_mask] = np.minimum(s * adv, s_clip * adv)
     kl_loss = np.zeros_like(trainer_logprobs)
     kl_loss[policy_token_mask] = loss_config.kl_tau * log_importance_ratio[policy_token_mask] ** 2
     opd_loss = np.zeros_like(trainer_logprobs)
@@ -170,6 +197,8 @@ def _compute_sample_grads(
 
     if teacher_logprobs is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_logprobs - trainer_logprobs, policy_token_mask)
+    if seq_log_ratio is not None:
+        metrics["seq_log_ratio"] = seq_log_ratio
 
     return per_token_grads, metrics
 
@@ -296,6 +325,9 @@ def compute_grpo_per_token_grads(
         if policy_tokens > 0 and s_teacher is not None and "teacher_kl" in s_metrics:
             agg_metrics.setdefault("teacher_kl", 0.0)
             agg_metrics["teacher_kl"] += s_metrics["teacher_kl"]
+        if policy_tokens > 0 and "seq_log_ratio" in s_metrics:
+            agg_metrics.setdefault("seq_log_ratio", 0.0)
+            agg_metrics["seq_log_ratio"] += s_metrics["seq_log_ratio"]
 
     # Policy loss includes both policy and CE-only replay rows, but
     # behavior-likelihood metrics must never be diluted by replay-only rows.
@@ -313,8 +345,9 @@ def compute_grpo_per_token_grads(
             "ratio_clipped",
         ):
             agg_metrics[key] /= policy_samples
-        if "teacher_kl" in agg_metrics:
-            agg_metrics["teacher_kl"] /= policy_samples
+        for key in ("teacher_kl", "seq_log_ratio"):
+            if key in agg_metrics:
+                agg_metrics[key] /= policy_samples
     if n_samples > 0:
         if agg_metrics["opd_tokens"] > 0:
             for key in ("opd_loss", "opd_gate", "opd_shift"):

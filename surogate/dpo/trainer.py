@@ -362,7 +362,7 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
             adamw_beta2=config.adamw_beta2,
             adamw_epsilon=config.adamw_epsilon,
         )
-        result = trainer.update_with_config(opt_config, step + 1)
+        result = trainer.update_with_config(opt_config, step)
         m = dict(trainer.get_dpo_native_metrics())
         dt = time.time() - t0
 

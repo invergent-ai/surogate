@@ -42,17 +42,43 @@ class GRPOLossConfig:
     # gradient (no probability-difference mask), no KL term, and the stop-gradient importance weight is truncated at
     # `ratio_clip` (set it to 1 + eps_high). The native seed already computes A * min(ratio, ratio_clip) per kept token,
     # so CISPO is this parameter setting: masks wider than any probability difference (|p_t - p_i| <= 1), kl_tau = 0.
-    variant: Literal["ipo", "cispo"] = "ipo"
+    # "gspo": GSPO (Zheng et al. 2025, arXiv 2507.18071) in its GSPO-token form (eqs. 13-14). One importance ratio per
+    # sequence, s_i = exp(mean over its loss tokens of log(pi_theta / pi_old)), clipped with PPO's min to
+    # [1 - seq_clip_low, 1 + seq_clip_high]; every sequence weighs the same (a token's gradient is A * s_i / |y_i| and
+    # the step divides by its trial count). No probability-difference mask, no KL term; ratio_clip is not used.
+    # dispatch-PP only: the ratio needs a whole sequence's log-probs before its backward.
+    variant: Literal["ipo", "cispo", "gspo"] = "ipo"
+    # GSPO's left and right clipping ranges; the defaults are the paper's. pi_old is the rollout engine's log-probs,
+    # so s_i also carries the engine/trainer mismatch: the mean log-ratio is -KL(engine || trainer), and a k3 of 0.005
+    # per token puts s_i near 0.995. Measure s_i (train/seq_log_ratio) before choosing these.
+    seq_clip_low: float = 3e-4
+    seq_clip_high: float = 4e-4
+    # GSPO's pi_old: "inference", the rollout engine's log-probs (section 5.4's possibility); "step_start", the trainer's
+    # own log-probs of the step's rows at the weights the step starts from, scored once before its first update (the
+    # paper's recomputation: with on-policy batches, max_policy_lag 0, those weights sampled the rows); or "trainer",
+    # the trainer's log-probs at the current parameters (stop-gradient), so s_i = 1 and nothing is clipped.
+    # seq_log_ratio reports the engine-based value for "trainer" and the pi_old-based one otherwise.
+    seq_ratio_old: Literal["inference", "step_start", "trainer"] = "inference"
 
     def __post_init__(self):
-        if self.variant not in ("ipo", "cispo"):
-            raise ValueError(f"loss.variant must be 'ipo' or 'cispo', got {self.variant!r}")
-        if self.variant == "cispo":
+        if self.variant not in ("ipo", "cispo", "gspo"):
+            raise ValueError(f"loss.variant must be 'ipo', 'cispo' or 'gspo', got {self.variant!r}")
+        if self.variant in ("cispo", "gspo"):
             if self.kl_tau not in (0.0, 1e-3):
-                logger.warning(f"loss.variant=cispo ignores kl_tau={self.kl_tau} (CISPO has no KL term)")
+                logger.warning(f"loss.variant={self.variant} ignores kl_tau={self.kl_tau} (it has no KL term)")
             self.ipo_mask_low = 2.0
             self.ipo_mask_high = 2.0
             self.kl_tau = 0.0
+        if self.variant == "gspo":
+            if not 0.0 < self.seq_clip_low < 1.0 or not self.seq_clip_high > 0.0:
+                raise ValueError(
+                    f"loss.seq_clip_low must be in (0, 1) and loss.seq_clip_high positive, got "
+                    f"{self.seq_clip_low} and {self.seq_clip_high}")
+            if self.opd_tau or self.replay_tau:
+                raise ValueError("loss.variant=gspo does not combine with opd_tau or replay_tau (per-token terms)")
+            if self.seq_ratio_old not in ("inference", "step_start", "trainer"):
+                raise ValueError(
+                    f"loss.seq_ratio_old must be 'inference', 'step_start' or 'trainer', got {self.seq_ratio_old!r}")
         if not self.ratio_clip > 0.0:
             raise ValueError(f"loss.ratio_clip must be positive, got {self.ratio_clip}")
 
@@ -117,6 +143,14 @@ class GRPOTrainConfig(SFTConfig):
     # (lora_dtype: fp32) to BF16, the copy a BF16 serving engine loads, at half
     # the bytes; "master" writes them as stored. Checkpoints keep full precision.
     broadcast_dtype: Literal["bf16", "master"] = "bf16"
+    # dispatch-PP only: optimizer updates per rollout batch. The step's rows are partitioned into this many mini-batches
+    # of whole GRPO groups (TrainingSample.group_idx), or whole trials without one, seeded per step; each gets its own
+    # log-prob pass, backward and update, normalized by its own trial count (gspo) or loss tokens. The Adam step index
+    # of update k is minibatches * step + k. Mini-batch sizes follow the batch.
+    minibatches: int = 1
+    # Drop the samples whose trained tokens were sampled by a policy version older than the step's by more than this,
+    # or by several versions (TrainingSample.completion_versions); 0 = on-policy batches only. None = no check.
+    max_policy_lag: int | None = None
 
     def __init__(self, cfg: DictDefault):
         # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
@@ -189,6 +223,11 @@ class GRPOTrainConfig(SFTConfig):
         self.turn_diagnostics = cfg.get("turn_diagnostics", self.turn_diagnostics)
         self.teacher_from_base = bool(cfg.get("teacher_from_base", self.teacher_from_base))
         self.broadcast_dtype = cfg.get("broadcast_dtype", self.broadcast_dtype)
+        self.minibatches = int(cfg.get("minibatches", self.minibatches))
+        lag = cfg.get("max_policy_lag", self.max_policy_lag)
+        self.max_policy_lag = None if lag is None else int(lag)
+        if self.minibatches < 1:
+            raise ValueError(f"minibatches must be at least 1, got {self.minibatches}")
 
         # Initialize inherited config: model_dir, runtime_config, lora_config, etc.
         # In the SFT path this is called by TokenizeDatasets.__init__(), but GRPO

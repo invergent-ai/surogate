@@ -492,6 +492,15 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
             }
             return v;
         };
+        // SUROGATE_LORA_FP32_FORWARD: the products from the fp32 masters themselves (not with LLEP-merged weights or
+        // EP-global tensors), so the forward moves smoothly with every update.
+        const modules::LoRAGroupedLayerWeights<TensorShard>* master_down = nullptr;
+        if (lora_fp32_forward_enabled() && lora_block.moe.grouped.down.has_value() &&
+            down_ptr == &(*lora_block.moe.grouped.down)) {
+            auto& master_block = mLoRAWeights->get_master_block(layer_idx_any, mRunState.MainStream);
+            if (master_block.moe.grouped.down.has_value() && master_block.moe.grouped.down->has_value())
+                master_down = &*master_block.moe.grouped.down;
+        }
         auto fused_lora_forward = [&](Tensor& out_t,
                                       const Tensor& in_t,
                                       const modules::LoRAGroupedLayerWeights<Tensor>& w,
@@ -499,6 +508,25 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                                       int out_features) -> bool {
             if (!moe_lora_grouped_enabled() || (training && dropout > 0.0f) || mOptions.rollout_parity()) return false;
             if (out_t.DType != ETensorDType::BF16 || in_t.DType != ETensorDType::BF16) return false;
+            if (master_down && master_down->A.DType == ETensorDType::FP32 &&
+                master_down->B.DType == ETensorDType::FP32 && master_down->A.Rank == 3 &&
+                master_down->A.Sizes[0] == num_experts &&
+                moe_lora_grouped_forward_f32w(out_t.get<nv_bfloat16>(),
+                                              in_t.get<nv_bfloat16>(),
+                                              master_down->A.get<float>(),
+                                              master_down->B.get<float>(),
+                                              expert_offsets.get<int>(),
+                                              host_offsets_ptr,
+                                              num_experts,
+                                              total_tokens_i,
+                                              in_features,
+                                              out_features,
+                                              rank,
+                                              scaling,
+                                              /*accumulate=*/true,
+                                              mRunState.MainStream)) {
+                return true;
+            }
             const Tensor A = native_expert_view(w.A);
             const Tensor B = native_expert_view(w.B);
             if (!A.Data || !B.Data) return false;

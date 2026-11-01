@@ -24,6 +24,18 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # [len(prompt_ids) + len(completion_ids), layers, top_k]; -1 rows = no replay. None when not collected.
     routed_experts: bytes | None = None
     routed_experts_dims: list[int] | None = None  # [layers, top_k]
+    # The trajectory (trial) this sample was cut from, unique per trial within the step's batch: a trial whose turns
+    # do not merge into one sequence becomes several samples with the same index. The producer divides each sample's
+    # advantage by its trial's sample count, and loss.variant=gspo divides the step by the number of distinct trials,
+    # so each trial counts once. None = a trial of its own.
+    trial_idx: int | None = None
+    # Per completion token: the policy version (the weight broadcast, one per trainer step) whose adapter sampled it;
+    # -1 for tokens the model did not sample (completion_mask False). With max_policy_lag set, the trainer drops a
+    # sample whose sampled tokens carry several versions, or one older than the lag allows. None = not collected.
+    completion_versions: list[int] | None = None
+    # The GRPO group (one prompt's attempts) of this sample's trial, unique per group within the step's batch. With
+    # minibatches > 1 the trainer keeps a group's samples in one mini-batch. None = no group (its trial alone).
+    group_idx: int | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -53,3 +65,10 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # [len(input_ids), layers, top_k], -1 = no replay (padding, cache-served prompt tokens).
     routed_experts: bytes | None = None
     routed_experts_dims: list[int] | None = None  # [layers, top_k]
+    # Per-token TrainingSample.trial_idx; -1 for padding and for samples without one. None when no sample has one.
+    trial_idx: list[int] | None = None
+    # Per-token TrainingSample.completion_versions; -1 for prompt tokens, padding and samples without versions. None
+    # when no sample has versions.
+    policy_version: list[int] | None = None
+    # Per-token TrainingSample.group_idx; -1 for padding and samples without one. None when no sample has one.
+    group_idx: list[int] | None = None

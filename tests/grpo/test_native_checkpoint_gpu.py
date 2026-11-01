@@ -6,7 +6,7 @@ import json
 import numpy as np
 import pytest
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from tests.grpo.test_batched_decode_gpu import make_trainer
 
@@ -62,5 +62,47 @@ def test_adamw_resume_matches_uninterrupted_updates(tmp_path, case, optimizer):
     actual = load_file(str(tmp_path / "resumed/step_00000002/lora_optimizer.safetensors"))
     for name in reference:
         torch.testing.assert_close(actual[name], reference[name], atol=2e-7, rtol=0.005)
+    del resumed
+    gc.collect()
+
+
+def test_adamw_8bit_loads_a_checkpoint_with_fp16_scales(tmp_path):
+    """A checkpoint from before the FP32 scales: its FP16 scales widen exactly, it saves as FP32, and it trains on."""
+    from surogate import _surogate as ext
+
+    model = tmp_path / "model"
+    model.mkdir()
+    trainer = make_trainer(model, "qwen3_5_moe", sequence=128)
+    rng = np.random.default_rng(11)
+    inputs = rng.integers(3, 97, size=(2, 128), dtype=np.int32)
+    targets = np.roll(inputs, -1, axis=1)
+    gradients = rng.normal(0, 0.01, size=inputs.shape).astype(np.float32)
+    options = ext.OptimizerConfig(optimizer="adamw_8bit", learning_rate=1e-3)
+
+    def update(owner, step):
+        owner.step_with_custom_loss(inputs, targets, gradients)
+        result = owner.update_with_config(options, step)
+        assert np.isfinite(result["norm"]) and result["norm"] > 0
+
+    update(trainer, 1)
+    trainer.save_checkpoint(str(tmp_path / "saved"), 0)
+    state_file = tmp_path / "saved/step_00000000/lora_optimizer.safetensors"
+    saved = load_file(str(state_file))
+    scales = [name for name in saved if "scales" in name]
+    assert len(scales) == 2 and all(saved[name].dtype == torch.float32 for name in scales)
+    old = {name: t.half() if name in scales else t for name, t in saved.items()}
+    save_file(old, str(state_file))
+    del trainer
+    gc.collect()
+
+    resumed = make_trainer(model, "qwen3_5_moe", sequence=128)
+    resumed.load_checkpoint(str(tmp_path / "saved"), 0)
+    resumed.save_checkpoint(str(tmp_path / "restored"), 0)
+    restored = load_file(str(tmp_path / "restored/step_00000000/lora_optimizer.safetensors"))
+    assert restored.keys() == old.keys()
+    for name in restored:
+        expected = old[name].float() if name in scales else old[name]
+        assert restored[name].dtype == expected.dtype and torch.equal(restored[name], expected)
+    update(resumed, 2)
     del resumed
     gc.collect()
