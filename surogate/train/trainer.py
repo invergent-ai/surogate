@@ -295,6 +295,10 @@ class SurogateTrainerWrapper:
         self._regression_cuda_peak_memory_bytes: int | None = None
         self._block_schema_summary: dict[str, int] = {}
 
+        if config.lora_fp32_forward:
+            # The LoRA forward reads the fp32 masters, not their bf16 work copies (read once by the engine).
+            os.environ["SUROGATE_LORA_FP32_FORWARD"] = "1"
+
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing
         # the native trainer to avoid capture-only save-buffer requirements.

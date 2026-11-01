@@ -601,6 +601,7 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | `lora_alpha`          | int    | `32`      | Alpha value for LoRA adapters.                                             |
 | `lora_dropout`        | float  | `0.05`    | Dropout rate for LoRA adapters.                                            |
 | `lora_dtype`          | string | `"fp32"`  | Data type for LoRA adapters: `"bf16"` or `"fp32"`.                         |
+| `lora_fp32_forward`   | bool   | `false`   | The forward computes its LoRA products from the FP32 masters (`lora_dtype: fp32`), not their BF16 work copies. Fine-tuning and GRPO alike. |
 | `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
 | `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
 | `adapter_path`        | string | `null`    | Path to a PEFT adapter directory to merge into base weights before training. Requires `lora: true`. Not supported with pre-quantized models. |
