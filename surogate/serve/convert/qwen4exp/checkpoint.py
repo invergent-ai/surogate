@@ -19,14 +19,28 @@ scale per 128 x 128 block in the release; they are dequantised and stored W8, as
 stores them, so `--spec mtp` runs them through the same device MoE as any W8 layer. Beside it goes
 a shortlist head for `--lm-head-draft`, unless `--no-draft-head`: the output head's rows for the
 131,072 tokens the bundled frequency ranking counts most, at Q4, so a draft step reads about a
-quarter of the full head's 675 MB. The vision tower stays in the checkpoint.
+quarter of the full head's 675 MB.
+
+The vision tower (27 blocks in the release, BF16) is converted with its processor configs
+whenever the checkpoint carries one, as the BF16 objects the GGUF path builds from an mmproj, so
+`--vision` serves it; `--no-vision` leaves it out and gives a text-only artifact.
+
+`--ple-table PATH` keeps the n-gram table out of the artifact: its IQ4_NL rows go to PATH once
+(with `PATH.json` describing them and their checksums) and the artifact reads them in place, as
+a GGUF-made artifact reads its GGUF. A later conversion -- a pruned student of the same release,
+whose table is the teacher's -- given the same PATH reuses the file after checking it was made
+from the same table, so several artifacts share one 28.8 GB copy. Such a student checkpoint may
+then leave the FP8 table shards out altogether; it still carries the small hash arrays.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+from dataclasses import replace
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -39,11 +53,12 @@ from surogate.serve.artifact.layouts import encode_direct, encode_nvfp4
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import iq4nl
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
-from surogate.serve.convert.common.inventory import Q4, TensorSpec
+from surogate.serve.convert.common.inventory import GGML_BLOCKS_LAYOUT, Q4, TensorSpec
+from surogate.serve.convert.common.qwen3_5 import vision_geometry_block
 from surogate.serve.convert.common.qwen4exp import geometry_block
 from surogate.serve.convert.common.recipe import (
-    Concat, Reshape, Slice, TensorRecipe, Transpose, attention_qproj_part, materialize_recipe,
-    preflight_source_reader, source,
+    Concat, Reshape, Slice, TensorRecipe, Transpose, attention_qproj_part, build_vision_recipes,
+    materialize_recipe, preflight_source_reader, source,
 )
 from surogate.serve.convert.common.safetensors import ShardReader
 
@@ -81,6 +96,40 @@ def text_config(config: Mapping, *, mtp: bool = False) -> dict:
                 image_token_id=config.get("image_token_id", text.get("image_token_id")),
                 mtp_num_hidden_layers=int(text.get("mtp_num_hidden_layers") or 0) if mtp else 0)
     return text
+
+
+def geometry_config(config: Mapping, *, mtp: bool = False, vision: bool = False) -> dict:
+    """What the geometry resolver reads: the text tower alone, or nested with its vision tower.
+
+    The nesting is the one the GGUF path builds from an mmproj (`geometry_from_gguf`), so a tower
+    converted from the release and one paired from a projector resolve to the same objects.
+    """
+    text = text_config(config, mtp=mtp)
+    if not vision:
+        return text
+    return {"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp",
+            "text_config": text, "vision_config": dict(config["vision_config"]),
+            "image_token_id": text.get("image_token_id")}
+
+
+def carries_vision(config: Mapping, reader: ShardReader) -> bool:
+    """A vision tower in the config and its weights in the shards (`model.visual.*`)."""
+    return bool(config.get("vision_config")) and any(
+        name.startswith("model.visual.") for name in reader.names)
+
+
+def build_vision_tower_recipes(g: inv.Geometry) -> tuple[TensorRecipe, ...]:
+    """The tower's objects from the release's HF names (`model.visual.*`), as qwen3_5's
+    safetensors converter reads the same Qwen3-VL tower: patch embedding, position embedding,
+    the blocks and the merger, every object BF16 at the release's own values."""
+    tower = dict(inv.vision_tower(g))
+    if not tower:
+        return ()
+    tower.pop("patch_rows")
+    vision = g.declared.hf_config["vision_config"]
+    return build_vision_recipes(g.hidden, **tower, patch_channels=vision["in_channels"],
+                                patch_temporal=vision["temporal_patch_size"],
+                                patch_size=vision["patch_size"])
 
 
 def validate_mtp(text: Mapping) -> None:
@@ -363,24 +412,47 @@ class NgramTable:
     happens to store them in lexicographic order, which is why they are addressed by name.
     """
 
-    def __init__(self, reader: ShardReader, layer: int, parts: int, head_dim: int) -> None:
+    def __init__(self, reader: ShardReader, layer: int, parts: int, head_dim: int,
+                 shared: "SharedTable | None" = None) -> None:
         self.reader = reader
         self.prefix = f"model.layers.{layer}.ple.ple_embedding."
         self.parts = [self.prefix + f"ngram_embedding.shard_{i}.weight" for i in range(parts)]
+        self.head_dim = head_dim
+        # A student that references its teacher's table ships the hash arrays but no shards; the
+        # rows then come from the table file it is converted against, checked in `SharedTable`.
+        self.stored = any(reader.has(name) for name in self.parts)
+        if not self.stored:
+            if shared is None or not shared.exists():
+                raise ValueError("the checkpoint holds no n-gram table shards; pass the --ple-table "
+                                 "file its table was converted to")
+            record = shared.record()
+            self.rows, self.scale, self.shard_rows = (int(record["rows"]), float(record["fp8_scale"]),
+                                                      list(record["shard_rows"]))
+            if len(self.shard_rows) != parts or int(record["head_dim"]) != head_dim:
+                raise ValueError(f"{shared.path}: made from a table of {len(self.shard_rows)} shards of "
+                                 f"{record['head_dim']}-wide rows, not {parts} of {head_dim}")
+            return
         if reader.has(self.prefix + f"ngram_embedding.shard_{parts}.weight"):
             raise ValueError("the checkpoint holds more n-gram shards than split_ngram_parts says")
         metadata = reader.metadata(self.parts + [self.prefix + "ngram_embedding.weight_scale"])
         self.rows = 0
+        self.shard_rows = []
         for name in self.parts:
             shape, dtype = metadata[name].shape, metadata[name].dtype
             if len(shape) != 2 or shape[1] != head_dim or dtype != "F8_E4M3":
                 raise ValueError(f"{name}: expected F8_E4M3 rows of {head_dim}, not {dtype} {shape}")
             self.rows += shape[0]
+            self.shard_rows.append(int(shape[0]))
         scale = reader.get(self.prefix + "ngram_embedding.weight_scale").to(torch.float32).reshape(-1)
         if scale.numel() != 1 or not (float(scale[0]) > 0 and math.isfinite(float(scale[0]))):
             raise ValueError("the n-gram table must carry one finite positive scale")
         self.scale = float(scale[0])
-        self.head_dim = head_dim
+
+    def identity(self) -> dict:
+        """What the IQ4_NL rows are made from: the FP8 rows' shape and their one scale."""
+        return {"format": inv.PLE_TABLE_FORMAT, "rows": self.rows, "head_dim": self.head_dim,
+                "row_bytes": self.head_dim // 32 * 18, "shard_rows": list(self.shard_rows),
+                "fp8_scale": self.scale, "quantizer": "iq4nl.quantize_rows (llama.cpp search, GPU)"}
 
     def hash_words(self, ngram: int, heads: int) -> dict[str, bytes]:
         multipliers = self.reader.get(self.prefix + "layer_multipliers").to(torch.int64).tolist()
@@ -418,6 +490,97 @@ class NgramTable:
             if (index + 1) % 16 == 0 or index + 1 == len(self.parts):
                 print(f"n-gram table: {index + 1}/{len(self.parts)} shards as IQ4_NL "
                       f"({time.perf_counter() - started:.0f} s)", flush=True)
+
+
+#: The chunk the table file's parallel checksum is taken over (`sha256_chunks`).
+TABLE_CHUNK_BYTES = 1 << 26
+
+
+class SharedTable:
+    """The n-gram table as a file of its own that several artifacts read in place.
+
+    The file is the IQ4_NL rows and nothing else, so an artifact names it as an external source
+    with one run covering it -- the way a GGUF-made artifact reads the GGUF's table. Beside it,
+    `PATH.json` records what the rows were made from (`NgramTable.identity`), their byte count
+    and two checksums: the whole file's sha256 and `sha256_chunks`, the sha256 of the 64 MiB
+    chunks' digests, which the engine can verify on several threads at load.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.sidecar = Path(str(self.path) + ".json")
+
+    def exists(self) -> bool:
+        return self.path.is_file() and self.sidecar.is_file()
+
+    def record(self) -> dict:
+        return json.loads(self.sidecar.read_text())
+
+    def ensure(self, table: NgramTable, device: torch.device) -> dict:
+        """The file's record, writing the rows first unless a matching file is already there."""
+        if self.exists():
+            record = self.record()
+            mismatched = {key: (record.get(key), value) for key, value in table.identity().items()
+                          if key != "quantizer" and record.get(key) != value}
+            if mismatched:
+                raise ValueError(f"{self.path} was made from another n-gram table: {mismatched}")
+            if self.path.stat().st_size != int(record["bytes"]):
+                raise ValueError(f"{self.path} is {self.path.stat().st_size} bytes but its record "
+                                 f"says {record['bytes']}; the file has changed")
+            print(f"n-gram table: reusing {self.path} ({record['bytes'] / 1e9:.1f} GB, "
+                  f"sha256 {record['sha256'][:12]}...)", flush=True)
+            return record
+        if self.path.exists() or self.sidecar.exists():
+            raise ValueError(f"{self.path} or its record exists without the other; remove the stray "
+                             "file or name another path")
+        if not table.stored:
+            raise ValueError("the checkpoint holds no n-gram table to write")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        partial = self.path.with_name(self.path.name + ".partial")
+        whole, chunks, chunk, written, in_chunk = hashlib.sha256(), [], hashlib.sha256(), 0, 0
+        with partial.open("wb") as out:
+            for payload in table.payload(device):
+                view = memoryview(payload)
+                out.write(view)
+                whole.update(view)
+                written += len(view)
+                while len(view):
+                    take = min(len(view), TABLE_CHUNK_BYTES - in_chunk)
+                    chunk.update(view[:take])
+                    view, in_chunk = view[take:], in_chunk + take
+                    if in_chunk == TABLE_CHUNK_BYTES:
+                        chunks.append(chunk.digest())
+                        chunk, in_chunk = hashlib.sha256(), 0
+            out.flush()
+            os.fsync(out.fileno())
+        if in_chunk:
+            chunks.append(chunk.digest())
+        expected = table.rows * (table.head_dim // 32 * 18)
+        if written != expected:
+            raise ValueError(f"n-gram table: wrote {written} bytes, expected {expected}")
+        record = dict(table.identity(), bytes=written, sha256=whole.hexdigest(),
+                      sha256_chunks={"chunk_bytes": TABLE_CHUNK_BYTES,
+                                     "digest": hashlib.sha256(b"".join(chunks)).hexdigest()},
+                      created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        os.replace(partial, self.path)
+        self.sidecar.write_text(json.dumps(record, indent=2))
+        return record
+
+    def external(self, record: Mapping) -> tuple[str, int, dict]:
+        """The artifact's external entry: the absolute path (as the GGUF path names its shards,
+        so an artifact copied elsewhere -- to /dev/shm, say -- still finds its table), the size and
+        the checksums."""
+        return str(self.path.resolve()), int(record["bytes"]), {
+            "sha256": record["sha256"], "sha256_chunks": dict(record["sha256_chunks"])}
+
+
+def chunked_sha256(path: str | Path, chunk_bytes: int = TABLE_CHUNK_BYTES) -> str:
+    """`sha256_chunks` of a file, as `SharedTable` records it (a check for tests and tools)."""
+    digests = []
+    with open(path, "rb") as stream:
+        while block := stream.read(chunk_bytes):
+            digests.append(hashlib.sha256(block).digest())
+    return hashlib.sha256(b"".join(digests)).hexdigest()
 
 
 # --------------------------------------------------------------------------------------------
@@ -623,7 +786,8 @@ def encode(tensor: torch.Tensor, spec, device: torch.device) -> bytes:
 
 
 def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None = None,
-            mtp: bool = True, draft_head: bool = True) -> Path:
+            mtp: bool = True, draft_head: bool = True, vision: bool = True,
+            ple_table: str | Path | None = None) -> Path:
     started = time.perf_counter()
     model_dir = Path(model_dir)
     output = Path(out_path)
@@ -636,8 +800,10 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
     table_layer = validate_quantization(config, layers)
     if mtp:
         validate_mtp(text)
+    shared = SharedTable(ple_table) if ple_table is not None else None
 
     with ShardReader.for_directory(model_dir) as reader:
+        vision = vision and carries_vision(config, reader)
         ple_layers = [i - 1 for i in text.get("ple_layer_ids") or []]
         if ple_layers != ([table_layer] if table_layer >= 0 else []):
             raise ValueError("the FP8 n-gram table must sit on the configured PLE layer")
@@ -647,12 +813,16 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
             if isinstance(parts, bool) or not isinstance(parts, int) or parts <= 0:
                 raise ValueError("config.split_ngram_parts must name the n-gram table's shard count")
             heads = (text["ngram_size"] - 1) * text["heads_per_ngram"]
-            table = NgramTable(reader, ple_layers[0], parts, text["ple_embed_dim"] // heads)
-        g = inv.geometry_from_config(text, ple_table_rows=table.rows if table else 0,
+            table = NgramTable(reader, ple_layers[0], parts, text["ple_embed_dim"] // heads, shared)
+            if shared is None and not table.stored:
+                raise ValueError("the checkpoint holds no n-gram table shards; convert it against "
+                                 "the table file of its teacher with --ple-table")
+        g = inv.geometry_from_config(geometry_config(config, mtp=mtp, vision=vision),
+                                     ple_table_rows=table.rows if table else 0,
                                      token_domain=tokenizer_domain(model_dir))
         if g.hidden % _NVFP4_BLOCK or g.intermediate % _NVFP4_BLOCK:
             raise ValueError("routed NVFP4 requires hidden and expert widths divisible by 16")
-        tensor_specs, object_specs = inv.active_specs(geometry=g, vision=False, mtp=mtp)
+        tensor_specs, object_specs = inv.active_specs(geometry=g, vision=vision, mtp=mtp)
         tensor_specs = w8_mixer_specs(routed_nvfp4_specs(tensor_specs, g))
         object_specs = w8_mixer_specs(routed_nvfp4_specs(object_specs, g))
         # The shortlist only serves speculation, so it rides with the NextN head.
@@ -664,7 +834,8 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         draft_vocab = g.draft_vocab if draft is not None else 0
 
         recipes = {item.object_name: item
-                   for item in build_recipes(g) + (build_mtp_recipes(g) if mtp else ())}
+                   for item in build_recipes(g) + (build_mtp_recipes(g) if mtp else ())
+                   + (build_vision_tower_recipes(g) if vision else ())}
         unit_offset = unit_offset_objects(g)
         hashes = table.hash_words(g.ple_ngram, g.ple_heads) if table else {}
         draft_experts = MtpExperts(reader, g, mtp_expert_quantization(config)) if mtp else None
@@ -680,17 +851,30 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
             draft_experts.preflight()
         print(f"preflight: {preflight.source_tensor_count} dense sources, "
               f"{g.layers} layers of {g.experts} NVFP4 experts, "
-              f"n-gram table {g.ple_table_rows} rows, "
+              f"n-gram table {g.ple_table_rows} rows"
+              f"{' in ' + str(shared.path) if shared is not None else ''}, "
               f"NextN head {'converted' if mtp else 'left out'}, "
+              f"vision tower {'of ' + str(len(inv.build_vision_specs(g))) + ' objects' if vision else 'left out'}, "
               f"draft head {'of ' + str(g.draft_vocab) + ' rows' if draft is not None else 'left out'}"
               + (f" (ranking {'matched' if draft.ranking is not None else 'not attested: token-id order'})"
                  if draft is not None else ""), flush=True)
 
+        # The shared table: written once (or found and checked), then read in place -- one run
+        # covering the file -- so the artifact carries none of its bytes.
+        table_record = shared.ensure(table, target) if (shared is not None and table is not None) else None
+        external = (shared.external(table_record),) if table_record is not None else ()
+        if table_record is not None:
+            object_specs = tuple(
+                replace(spec, runs=((1, 0, int(table_record["bytes"])),))
+                if isinstance(spec, TensorSpec) and spec.name == inv.PLE_TABLE_RESOURCE else spec
+                for spec in object_specs)
+
         # A text-only artifact must not offer pixels: the processor configs the release ships
-        # stay out, and the engine then refuses `--vision` against it.
+        # stay out, and the engine then refuses `--vision` against it. With the tower they go in
+        # as the release states them (Qwen3-VL's 16-pixel patches, merge 2, mean and std 0.5).
         frontend = family_conversion.load_resources(model_dir, inv.RESOURCE_SPECS)
         resources = {item.name: item.data for item in frontend
-                     if not item.name.endswith("preprocessor_config.json")}
+                     if vision or not item.name.endswith("preprocessor_config.json")}
         plan = family_conversion.build_object_plan(object_specs, resources)
         routed = RoutedLayers(reader, g)
         specs = list(plan.specs)
@@ -699,11 +883,16 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
             output,
             ArtifactIdentity(inv.MODEL_ID, WEIGHTS_ID, architecture="qwen4exp"),
             plan.specs,
+            external=external,
             geometry=geometry_block(g, draft_vocab=draft_vocab),
+            vision_geometry=(vision_geometry_block(g.declared.hf_config, text_hidden=g.hidden)
+                             if vision else None),
             layer_types=g.layer_types,
         ) as writer:
             for index, spec in enumerate(specs, start=1):
                 t0 = time.perf_counter()
+                if getattr(spec, "runs", ()):
+                    continue  # read in place from its file; the artifact carries no bytes for it
                 if spec.name in resources:
                     payload = resources[spec.name]
                 elif spec.name == inv.PLE_TABLE_RESOURCE:
@@ -747,6 +936,11 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
         },
         "source": str(model_dir),
         "device": str(target),
+        "vision": vision,
+        "mtp": mtp,
+        "ple_table": None if table_record is None else {
+            "path": str(shared.path.resolve()), **{key: table_record[key] for key in
+                                                  ("bytes", "sha256", "sha256_chunks", "rows")}},
         "elapsed_seconds": time.perf_counter() - started,
         "bytes": output.stat().st_size,
         "objects": len(specs),
@@ -762,14 +956,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", required=True, help="the release's directory (config.json, shards)")
     parser.add_argument("--out", required=True)
     parser.add_argument("--device", default=None, help="where the dense and table quantisers run")
-    # The ingest path asks every converter the same way; this one never converts either.
-    parser.add_argument("--no-vision", action="store_true", help="accepted; the tower is never converted")
+    parser.add_argument("--no-vision", action="store_true",
+                        help="leave the vision tower out (a text-only artifact)")
     parser.add_argument("--no-mtp", action="store_true", help="leave the NextN draft head out")
     parser.add_argument("--no-draft-head", action="store_true",
                         help="leave the shortlist head for --lm-head-draft out")
+    parser.add_argument("--ple-table", default=None, metavar="PATH",
+                        help="keep the n-gram table in this file (written once, with PATH.json, and "
+                             "reused by later conversions of the same release) and read it in "
+                             "place instead of storing it in the artifact")
     args = parser.parse_args(argv)
     convert(args.model, args.out, device=args.device, mtp=not args.no_mtp,
-            draft_head=not args.no_draft_head)
+            draft_head=not args.no_draft_head, vision=not args.no_vision, ple_table=args.ple_table)
     return 0
 
 

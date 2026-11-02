@@ -262,10 +262,46 @@ def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
     )
 
 
+#: What an external entry may carry beyond its path and size: checksums of the file, which a
+#: reader verifies before it serves weights from it. Engines that predate them ignore them.
+#: ``sha256`` is the whole file's (what `sha256sum` prints); ``sha256_chunks`` is
+#: ``{"chunk_bytes": C, "digest": hex}``, the sha256 of the concatenated sha256 digests of the
+#: file's consecutive C-byte chunks (the last one shorter), which a loader can compute in parallel.
+_EXTERNAL_CHECKSUMS = ("sha256", "sha256_chunks")
+
+
+def _external_entry(entry) -> dict[str, object]:
+    """One external table entry from `(path, bytes)` or `(path, bytes, {checksums})`."""
+    if len(entry) not in (2, 3):
+        raise ArtifactError("an external entry is (path, bytes) or (path, bytes, checksums)")
+    path, size = entry[0], entry[1]
+    value: dict[str, object] = {"path": str(path), "bytes": int(size)}
+    if len(entry) == 3 and entry[2]:
+        extra = dict(entry[2])
+        unknown = set(extra) - set(_EXTERNAL_CHECKSUMS)
+        if unknown:
+            raise ArtifactError(f"unknown external checksum fields: {sorted(unknown)}")
+        if "sha256" in extra:
+            digest = _require_string(extra["sha256"], "external sha256")
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ArtifactError("external sha256 must be 64 lowercase hex digits")
+            value["sha256"] = digest
+        if "sha256_chunks" in extra:
+            chunks = extra["sha256_chunks"]
+            if (not isinstance(chunks, Mapping) or set(chunks) != {"chunk_bytes", "digest"}
+                    or len(str(chunks["digest"])) != 64):
+                raise ArtifactError("external sha256_chunks must be {chunk_bytes, digest}")
+            value["sha256_chunks"] = {
+                "chunk_bytes": _require_integer(chunks["chunk_bytes"], "chunk_bytes", positive=True),
+                "digest": _require_string(chunks["digest"], "sha256_chunks digest"),
+            }
+    return value
+
+
 def encode_directory(
     identity: ArtifactIdentity,
     objects: Sequence[ArtifactObject],
-    external: Sequence[tuple[str, int]] = (),
+    external: Sequence[tuple] = (),
     geometry: Mapping[str, float] | None = None,
     vision_geometry: Mapping[str, float] | None = None,
     layer_types: Sequence[str] | None = None,
@@ -292,9 +328,7 @@ def encode_directory(
     if checked_identity.architecture is not None:
         value["identity"]["architecture"] = checked_identity.architecture
     if external:
-        value["external"] = [
-            {"path": str(path), "bytes": int(size)} for path, size in external
-        ]
+        value["external"] = [_external_entry(entry) for entry in external]
     if geometry:
         value["geometry"] = _checked_geometry(geometry, "geometry")
     if vision_geometry:
@@ -352,6 +386,15 @@ def parse_external(directory: bytes) -> tuple[tuple[str, int], ...]:
          _require_integer(entry["bytes"], "external bytes", positive=True))
         for entry in raw
     )
+
+
+def parse_external_checksums(directory: bytes) -> tuple[dict[str, object], ...]:
+    """The checksums each external entry declares (empty where it declares none), in order."""
+    value = json.loads(directory.decode("utf-8"))
+    raw = value.get("external") if isinstance(value, dict) else None
+    if not raw:
+        return ()
+    return tuple({key: entry[key] for key in _EXTERNAL_CHECKSUMS if key in entry} for entry in raw)
 
 
 def parse_geometry(directory: bytes) -> dict[str, float]:
@@ -525,6 +568,7 @@ class Artifact:
                 raise ArtifactError("artifact JSON is truncated")
             self.identity, self.objects = parse_directory(directory)
             self.external = parse_external(directory)
+            self.external_checksums = parse_external_checksums(directory)
             self.geometry = parse_geometry(directory)
             self.vision_geometry = parse_vision_geometry(directory)
             raw = json.loads(directory)
@@ -597,7 +641,7 @@ class ArtifactWriter:
         path: str | Path,
         identity: ArtifactIdentity,
         specs: Sequence[ObjectSpec],
-        external: Sequence[tuple[str, int]] = (),
+        external: Sequence[tuple] = (),
         geometry: Mapping[str, float] | None = None,
         vision_geometry: Mapping[str, float] | None = None,
         layer_types: Sequence[str] | None = None,
@@ -607,7 +651,8 @@ class ArtifactWriter:
         self.path = Path(path)
         self.identity = _require_identity(identity)
         self.objects = plan_objects(specs)
-        self.external = tuple((str(p), int(n)) for p, n in external)
+        # (path, bytes) or (path, bytes, checksums): see `_external_entry`.
+        self.external = tuple((str(e[0]), int(e[1])) + tuple(e[2:]) for e in external)
         self.geometry = dict(geometry) if geometry else {}
         self.vision_geometry = dict(vision_geometry) if vision_geometry else {}
         self.layer_types = tuple(layer_types) if layer_types is not None else None
