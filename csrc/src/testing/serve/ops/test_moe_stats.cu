@@ -877,6 +877,45 @@ int run_residual_case(const std::filesystem::path& dir) {
     return failures;
 }
 
+/// The same columns through one wide round and one decode round each (NVFP4 weights): a column's
+/// output must not depend on the width it was computed at beyond rounding. Under the W4A16 route
+/// both run our own kernels -- the student geometries' decode and prefill bodies included -- so a
+/// width-dependent defect in either shows as a large difference; the auto route (the vendored
+/// W4A4 runner from two columns) is printed for scale.
+int run_cross_width(const ops::SparseMoeGeometry& g, const std::string& name) {
+    if (!nvfp4_device("moe cross-width nvfp4")) { return 0; }
+    const Layer layer = make_layer(g, QType::NVFP4);
+    constexpr int kColumns = 64;
+    const std::vector<float> x = make_inputs(g, 3, kColumns);
+    std::vector<std::uint16_t> bits(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) { bits[i] = f32_to_bf16(x[i]); }
+    const DeviceBuffer all = to_device(bits);
+    int failures = 0;
+    for (const auto route : {ops::SparseMoeRoute::W4A16, ops::SparseMoeRoute::Auto}) {
+        ops::set_sparse_moe_route(route);
+        const std::vector<double> wide = run_moe(layer, all, kColumns, ops::SparseMoeRoundHook{}, ops::SparseMoeRouting::ByWidth);
+        double worst = 0.0, sum = 0.0;
+        for (int c = 0; c < kColumns; ++c) {
+            const std::vector<std::uint16_t> column(bits.begin() + static_cast<std::ptrdiff_t>(c) * g.hidden,
+                                                    bits.begin() + static_cast<std::ptrdiff_t>(c + 1) * g.hidden);
+            const DeviceBuffer one_device = to_device(column);
+            const std::vector<double> one = run_moe(layer, one_device, 1, ops::SparseMoeRoundHook{}, ops::SparseMoeRouting::ByWidth);
+            const std::vector<double> want(wide.begin() + static_cast<std::ptrdiff_t>(c) * g.hidden,
+                                           wide.begin() + static_cast<std::ptrdiff_t>(c + 1) * g.hidden);
+            const double rel = relative_l2(one, want);
+            worst = std::max(worst, rel);
+            sum += rel;
+        }
+        const bool own = route == ops::SparseMoeRoute::W4A16;
+        const bool ok = !own || worst < 2e-2;
+        std::printf("%s nvfp4 cross-width (%s route): decode vs %d-column round, rel L2 mean %.2e max %.2e (%s)\n",
+                    name.c_str(), own ? "w4a16" : "auto", kColumns, sum / kColumns, worst, ok ? "ok" : "WRONG");
+        failures += ok ? 0 : 1;
+    }
+    ops::set_sparse_moe_route(ops::SparseMoeRoute::Auto);
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -889,6 +928,15 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--dump") { dump_dir = argv[i + 1]; }
         if (std::string(argv[i]) == "--geometry") { experts = std::atoi(argv[i + 1]); }
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--cross-width") {
+        int bad = 0;
+        for (const auto* geometry : {&ops::kSparseMoeFlashNextGeometry, &ops::kSparseMoeFlashNext192Geometry,
+                                     &ops::kSparseMoeFlashNext160Geometry, &ops::kSparseMoeFlashNext128Geometry}) {
+            bad += run_cross_width(*geometry, "flash-next-" + std::to_string(geometry->experts));
+        }
+        std::cout << (bad == 0 ? "OK" : "FAIL") << " moe cross-width\n";
+        return bad == 0 ? 0 : 1;
     }
     const ops::SparseMoeGeometry g = experts == 512 ? ops::kSparseMoeFlashNextGeometry
                                    : experts == 192 ? ops::kSparseMoeFlashNext192Geometry

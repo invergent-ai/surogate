@@ -12,6 +12,10 @@
 //     (ops/linear/bf16/bf16_invariant_gemm.h);
 //   - the fused GDN norm + gating projection takes its generic fixed-order kernel instead of the
 //     registered routes, which split k by the token count (ops/wrapper/gdn_gating_proj.cpp);
+//   - the hyper-connection mixer (Qwen3.8-Flash-Next) dequantises its W8 projections for the
+//     fixed-order GEMM at every width, instead of running its own W8 kernels on rounds of up to 64
+//     tokens; its fused BF16 up projection already sums in that GEMM's order
+//     (ops/hyper_connection/hyper_connection.cu);
 //   - prompts are cut only at fixed multiples from position zero, never where a shared round's
 //     window runs out (ProgramImplCore::invariant_prefill_piece);
 //   - on Hopper, prompt attention stays on the split-KV tile kernels instead of FlashAttention-3,

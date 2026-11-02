@@ -1,5 +1,7 @@
 #include "api/ops/hyper_connection.h"
 
+#include "api/ops/batch_invariant.h"
+
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -519,6 +521,10 @@ unsigned grid_for(std::int64_t count) {
 bool is_w8(const Weight& weight) { return weight.qtype == QType::W8G32_F16S; }
 
 // SUROGATE_SERVE_HC_UP_FINISH=0 keeps the wide mixer on cuBLASLt's up projection and finish_kernel.
+// The fused kernel stays on under --batch-invariant: it runs each logit as one FP32 chain of
+// m16n8k16 MMAs over k in increasing steps from zero, which is the fixed-order GEMM's chain, and
+// rounds it to BF16 before the sigmoid as the unfused route stores it, so a token's bits are the
+// same on either side of kUpMinTokens (test_batch_invariant.cpp checks it).
 bool up_finish_allowed() {
     static const bool allowed = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_HC_UP_FINISH");
@@ -559,8 +565,10 @@ std::size_t round_256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 // Whether the W8 kernels take this projection at this width. Their staged activations, a
 // token tile of one K slice, must fit the default 48 KiB of shared memory: a sliced projection's
 // slice is always under 2 * kW8SliceK values, and an unsliced one is held to the same bound.
+// Under --batch-invariant a W8 matrix always takes the dequantised route, so a token's bits do not
+// depend on whether its round is narrow enough for the mixer's own kernels.
 bool w8_direct(const Weight& weight, std::int32_t tokens, std::int32_t slices) {
-    return is_w8(weight) && tokens <= kW8DirectTokens &&
+    return is_w8(weight) && !batch_invariant() && tokens <= kW8DirectTokens &&
            w8_slice_k(weight.k, slices) <= 2 * kW8SliceK;
 }
 
@@ -669,7 +677,7 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(std::int32_t streams,
         bytes += round_256(static_cast<std::size_t>(w8_slices(static_cast<std::int32_t>(width))) *
                            narrow * low_rank * sizeof(float)) + 256;
     }
-    if (max_tokens > kW8DirectTokens || low_rank > 2 * kW8SliceK) {
+    if (max_tokens > kW8DirectTokens || low_rank > 2 * kW8SliceK || batch_invariant()) {
         bytes += round_256(width * static_cast<std::size_t>(low_rank) * 2) + 256;
     }
     return bytes;
