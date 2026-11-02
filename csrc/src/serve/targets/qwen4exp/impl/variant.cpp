@@ -14,6 +14,7 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "api/ops/linear.h"
 #include "api/ops/ngram_ple.h"
+#include "api/ops/ngram_ple_host_table.h"
 #include "api/ops/scatter.h"
 #include "api/ops/sparse_moe.h"
 #include "core/device.h"
@@ -407,6 +408,15 @@ void Variant::prewarm_device_scratch(const family::TextGeometry& g) {
     }
     if (family::ExpertCache::pool_floor() != 0) {
         (void)family::ExpertCache::for_current_device(moe_geometry(g), g.layers + g.mtp_layers);
+    }
+    // SUROGATE_SERVE_NGRAM_TABLE: the host table's staging on this device, before any capture,
+    // for forwards of up to SUROGATE_SERVE_NGRAM_TABLE_COLUMNS columns (default 16,384).
+    if (g.ple_ngram) {
+        if (const auto table = ops::NgramPleHostTable::active()) {
+            const char* raw = std::getenv("SUROGATE_SERVE_NGRAM_TABLE_COLUMNS");
+            const std::int64_t columns = raw != nullptr && *raw ? std::atoll(raw) : 16384;
+            table->prepare(columns * g.ple_heads());
+        }
     }
     // --moe-stats-out: this device's accumulators, one row per mixture (the draft head's last).
     ops::moe_stats_prepare_device(g.layers + g.mtp_layers, g.layers, g.experts, g.experts_per_token,

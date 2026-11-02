@@ -1526,6 +1526,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/hyper_connection/manifold.cu
   ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu
+  ${SERVE_ROOT}/ops/ngram_ple/ngram_ple_host_table.cpp
   ${SERVE_ROOT}/ops/qsa_indexer/qsa_indexer.cu
   ${SERVE_ROOT}/ops/glm_indexer/glm_indexer.cu
   ${SERVE_ROOT}/ops/expert_slot_cache/expert_slot_cache.cu

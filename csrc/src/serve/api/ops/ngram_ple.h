@@ -35,13 +35,17 @@ struct NgramPleHash {
 /**
  * The n-gram embedding table: IQ4_NL rows (blocks of 32 values in 18 bytes: FP16 scale and 16
  * nibble bytes; value = scale * kvalues[nibble]) at any device-accessible address, typically
- * pinned host memory mapped into the device address space.
+ * pinned host memory mapped into the device address space -- or, when `host` is set, the
+ * release's own rows read from their files and staged per forward
+ * (api/ops/ngram_ple_host_table.h), in which case `rows` and `row_bytes` are unused.
  */
+class NgramPleHostTable;
 struct NgramPleTable {
     const void* rows       = nullptr;
     std::int64_t row_count = 0;
     std::int32_t row_bytes = 0; ///< head_dim / 32 * 18
     std::int32_t head_dim  = 0; ///< values per row, a multiple of 32
+    const NgramPleHostTable* host = nullptr;
 };
 
 /**
