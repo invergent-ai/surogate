@@ -42,6 +42,7 @@ from dataclasses import replace
 import math
 import os
 import re
+import struct
 import time
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
@@ -405,6 +406,16 @@ def unit_offset_objects(g: inv.Geometry) -> frozenset[str]:
 # --------------------------------------------------------------------------------------------
 
 
+#: The chunk the table file's parallel checksum is taken over (`sha256_chunks`).
+TABLE_CHUNK_BYTES = 1 << 26
+#: Rows at each end of every FP8 shard the table's source digest reads (`NgramTable.source_digest`).
+TABLE_SAMPLE_ROWS = 4096
+#: What a table-less student's builder writes beside its config: the teacher table's identity as
+#: `NgramTable.identity()` gives it (at least `fp8_sample_sha256`), so the converter can check the
+#: --ple-table file against the table the student was cut from.
+STUDENT_TABLE_IDENTITY = "ple_table_identity.json"
+
+
 class NgramTable:
     """The FP8 n-gram table as IQ4_NL rows, one stored shard at a time.
 
@@ -449,10 +460,38 @@ class NgramTable:
         self.scale = float(scale[0])
 
     def identity(self) -> dict:
-        """What the IQ4_NL rows are made from: the FP8 rows' shape and their one scale."""
-        return {"format": inv.PLE_TABLE_FORMAT, "rows": self.rows, "head_dim": self.head_dim,
-                "row_bytes": self.head_dim // 32 * 18, "shard_rows": list(self.shard_rows),
-                "fp8_scale": self.scale, "quantizer": "iq4nl.quantize_rows (llama.cpp search, GPU)"}
+        """What the IQ4_NL rows are made from: the FP8 rows' shape and their one scale, the hash
+        arrays that index them and -- where this checkpoint stores the rows -- a digest of a sample
+        of them (`source_digest`)."""
+        out = {"format": inv.PLE_TABLE_FORMAT, "rows": self.rows, "head_dim": self.head_dim,
+               "row_bytes": self.head_dim // 32 * 18, "shard_rows": list(self.shard_rows),
+               "fp8_scale": self.scale, "quantizer": "iq4nl.quantize_rows (llama.cpp search, GPU)",
+               "hash_arrays_sha256": self.hash_arrays_digest()}
+        if self.stored:
+            out["fp8_sample_sha256"] = self.source_digest()
+        return out
+
+    def hash_arrays_digest(self) -> str:
+        """sha256 of the three hash arrays (multipliers, head offsets, head vocabulary sizes) as
+        int64: a student copies them from its teacher, so they must equal the table's source's."""
+        digest = hashlib.sha256()
+        for leaf in ("layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes"):
+            digest.update(self.reader.get(self.prefix + leaf).to(torch.int64).contiguous().numpy().tobytes())
+        return digest.hexdigest()
+
+    def source_digest(self, rows: int = TABLE_SAMPLE_ROWS) -> str:
+        """sha256 over each FP8 shard's first and last `rows` rows (shape, then bytes) and the
+        scale: what the table rows are made from, without reading all 51 GB of them. A table-less
+        student's builder records it from the teacher (`ple_table_identity.json`, see
+        `SharedTable.check_student`)."""
+        digest = hashlib.sha256()
+        digest.update(struct.pack("<d", self.scale))
+        for name, count in zip(self.parts, self.shard_rows):
+            digest.update(struct.pack("<qq", count, self.head_dim))
+            for begin, end in ((0, min(rows, count)), (max(0, count - rows), count)):
+                block = self.reader.get_rows(name, begin, end)
+                digest.update(block.contiguous().view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
 
     def hash_words(self, ngram: int, heads: int) -> dict[str, bytes]:
         multipliers = self.reader.get(self.prefix + "layer_multipliers").to(torch.int64).tolist()
@@ -492,10 +531,6 @@ class NgramTable:
                       f"({time.perf_counter() - started:.0f} s)", flush=True)
 
 
-#: The chunk the table file's parallel checksum is taken over (`sha256_chunks`).
-TABLE_CHUNK_BYTES = 1 << 26
-
-
 class SharedTable:
     """The n-gram table as a file of its own that several artifacts read in place.
 
@@ -516,14 +551,28 @@ class SharedTable:
     def record(self) -> dict:
         return json.loads(self.sidecar.read_text())
 
-    def ensure(self, table: NgramTable, device: torch.device) -> dict:
-        """The file's record, writing the rows first unless a matching file is already there."""
+    def ensure(self, table: NgramTable, device: torch.device,
+               student_identity: Mapping | None = None) -> dict:
+        """The file's record, writing the rows first unless a matching file is already there.
+
+        A reused file must have been made from this checkpoint's table: every identity field both
+        sides state must agree (a record written before a field existed simply lacks it). A
+        table-less student cannot show its rows, so the identity its builder recorded from the
+        teacher (`student_identity`, from STUDENT_TABLE_IDENTITY) stands in for them; without one
+        only the shapes, the scale and the hash arrays are checked, and that is said.
+        """
         if self.exists():
             record = self.record()
-            mismatched = {key: (record.get(key), value) for key, value in table.identity().items()
-                          if key != "quantizer" and record.get(key) != value}
+            claimed = dict(table.identity())
+            for key, value in (student_identity or {}).items():
+                claimed.setdefault(key, value)
+            mismatched = {key: (record[key], value) for key, value in claimed.items()
+                          if key != "quantizer" and key in record and record[key] != value}
             if mismatched:
                 raise ValueError(f"{self.path} was made from another n-gram table: {mismatched}")
+            if not table.stored and "fp8_sample_sha256" not in claimed:
+                print(f"n-gram table: this checkpoint carries no table rows and no {STUDENT_TABLE_IDENTITY}; "
+                      "the file's rows are checked by shape, scale and hash arrays only", flush=True)
             if self.path.stat().st_size != int(record["bytes"]):
                 raise ValueError(f"{self.path} is {self.path.stat().st_size} bytes but its record "
                                  f"says {record['bytes']}; the file has changed")
@@ -861,7 +910,10 @@ def convert(model_dir: str | Path, out_path: str | Path, *, device: str | None =
 
         # The shared table: written once (or found and checked), then read in place -- one run
         # covering the file -- so the artifact carries none of its bytes.
-        table_record = shared.ensure(table, target) if (shared is not None and table is not None) else None
+        student_identity = (json.loads((model_dir / STUDENT_TABLE_IDENTITY).read_text())
+                            if (model_dir / STUDENT_TABLE_IDENTITY).is_file() else None)
+        table_record = (shared.ensure(table, target, student_identity)
+                        if (shared is not None and table is not None) else None)
         external = (shared.external(table_record),) if table_record is not None else ()
         if table_record is not None:
             object_specs = tuple(

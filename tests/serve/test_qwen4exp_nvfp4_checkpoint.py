@@ -256,6 +256,24 @@ def test_shared_ple_table(tmp_path):
     _release(tmp_path / "other", scale=0.004)
     with pytest.raises(ValueError, match="another n-gram table"):
         checkpoint.convert(tmp_path / "other", tmp_path / "other.sinfer", device="cpu", ple_table=table)
+    # The record names the rows' source: the hash arrays, and a digest of the FP8 rows a table-less
+    # student's builder copies from its teacher (ple_table_identity.json) and the converter checks.
+    assert len(record["hash_arrays_sha256"]) == 64 and len(record["fp8_sample_sha256"]) == 64
+    student_dir = tmp_path / "student"
+    (student_dir / checkpoint.STUDENT_TABLE_IDENTITY).write_text(
+        json.dumps({"fp8_sample_sha256": record["fp8_sample_sha256"]}))
+    checkpoint.convert(student_dir, tmp_path / "student2.sinfer", device="cpu", ple_table=table)
+    (student_dir / checkpoint.STUDENT_TABLE_IDENTITY).write_text(json.dumps({"fp8_sample_sha256": "0" * 64}))
+    with pytest.raises(ValueError, match="another n-gram table"):
+        checkpoint.convert(student_dir, tmp_path / "student3.sinfer", device="cpu", ple_table=table)
+    # A student whose hash arrays are not the table's source's is refused without any identity file.
+    _release(tmp_path / "rehashed", table=False, seed=7)
+    with safe_open(str(tmp_path / "rehashed" / "model.safetensors"), "pt") as handle:
+        stored = {name: handle.get_tensor(name) for name in handle.keys()}
+    stored[f"model.language_model.layers.1.ple.ple_embedding.layer_multipliers"] = torch.tensor([5, 9], dtype=torch.int64)
+    save_file(stored, tmp_path / "rehashed" / "model.safetensors")
+    with pytest.raises(ValueError, match="another n-gram table"):
+        checkpoint.convert(tmp_path / "rehashed", tmp_path / "rehashed.sinfer", device="cpu", ple_table=table)
 
 
 def _student_of(release, path, *, keep_layers, keep_experts):
