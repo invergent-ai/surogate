@@ -650,6 +650,7 @@ struct Reader::Impl {
                                     "; the file it serves weights from has changed");
             }
             external_maps.push_back(std::make_unique<MappedFile>(resolved));
+            external_resolved.push_back(resolved);
         }
     }
 
@@ -673,6 +674,7 @@ struct Reader::Impl {
     std::map<std::string, double> dflash_geometry;
     std::vector<std::int32_t> dflash_target_layers;
     std::vector<std::unique_ptr<MappedFile>> external_maps; // MappedFile owns an fd and a mapping
+    std::vector<std::filesystem::path> external_resolved;   // the paths external_maps opened
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
 };
@@ -732,6 +734,13 @@ std::span<const PayloadRun> Reader::runs(const ObjectDescriptor& object) const {
 }
 
 const std::vector<ExternalFile>& Reader::external_files() const noexcept { return impl_->external; }
+
+const std::filesystem::path& Reader::external_path(std::uint32_t source) const {
+    if (source == 0 || source > impl_->external_resolved.size()) {
+        throw ArtifactError("unknown external source " + std::to_string(source));
+    }
+    return impl_->external_resolved[source - 1];
+}
 
 PayloadSpan Reader::payload(std::string_view name) const {
     const auto* object = find(name);

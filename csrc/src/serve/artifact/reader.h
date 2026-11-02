@@ -263,6 +263,9 @@ public:
     /// runs has no single payload span, but each of its runs does.
     std::span<const std::byte> run_span(const PayloadRun& run) const;
     const std::vector<ExternalFile>& external_files() const noexcept;
+    /// The file external source `source` (one and up) was opened from: its declared path, a
+    /// relative one resolved against the artifact's directory.
+    [[nodiscard]] const std::filesystem::path& external_path(std::uint32_t source) const;
     /// The artifact's declared dimensions, keyed as `family::TextGeometry` names them; empty
     /// for an artifact written without a `geometry` member.
     const std::map<std::string, double>& geometry() const noexcept;

@@ -562,7 +562,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
                                               " bytes, expected " + std::to_string(expected));
             }
             verify_external_table(binder.reader(), span, "text/ple/table.iq4nl");
-            out.host_bank.objects.push_back({out.ple_table, payload, "text/ple/table.iq4nl"});
+            family::HostObjectPlan table{out.ple_table, payload, "text/ple/table.iq4nl"};
+            if (span.source != 0) {
+                // A file of its own (the converter's --ple-table), which several artifacts and
+                // every replica on the host read: the bank pins its page cache once for all.
+                table.shared_file        = binder.reader().external_path(span.source).string();
+                table.shared_file_offset = span.absolute_offset;
+            }
+            out.host_bank.objects.push_back(std::move(table));
         }
 
     }
