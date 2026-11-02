@@ -123,4 +123,29 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
                               cudaStream_t stream, const SparseMoeRoundHook* hook = nullptr,
                               const LoraBank* adapters = nullptr, const std::int32_t* adapter_slot = nullptr);
 
+/// The four entry points above for the Flash-Next student mixtures
+/// (`sparse_moe_flash_next_student`), compiled in sparse_moe_decode_kernels_students.cu; the
+/// dispatchers above forward those geometries here. Any other geometry throws.
+bool sparse_moe_decode_students_launch_expert_major(
+    const SparseMoeGeometry& geometry, const Tensor& x, const PreparedSparseMoeWeights& weights,
+    Tensor& destination, const int* token_ids, const float* token_alpha, const float* shared_scale,
+    float* token_activations, int* groups, std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+    cudaStream_t stream);
+void sparse_moe_decode_students_launch_d3_small_t(
+    const SparseMoeGeometry& geometry, const Tensor& x, const PreparedSparseMoeWeights& weights,
+    const int* token_ids, float* token_activations, std::int32_t tokens,
+    SparseMoeSmallTD3Schedule schedule, cudaStream_t stream, const int* adaptive_route_jobs);
+void sparse_moe_decode_students_launch_d4_small_t(
+    const SparseMoeGeometry& geometry, const PreparedSparseMoeWeights& weights, Tensor& destination,
+    const int* token_ids, const float* token_alpha, const float* shared_scale,
+    const float* token_activations, std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+    cudaStream_t stream, const int* adaptive_route_jobs);
+void sparse_moe_decode_students_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                                       const Tensor& router_x,
+                                       const PreparedSparseMoeWeights& weights,
+                                       Tensor& destination,
+                                       const SparseMoeDecodeWorkspace& workspace,
+                                       cudaStream_t stream, const SparseMoeRoundHook* hook,
+                                       const LoraBank* adapters, const std::int32_t* adapter_slot);
+
 } // namespace sinfer::ops::detail

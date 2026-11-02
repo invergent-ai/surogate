@@ -1,6 +1,7 @@
 #include "family/impl/lora_gdn.h"
 #include "targets/qwen4exp/impl/variant.h"
 
+#include "api/ops/calibration.h"
 #include "family/impl/lora_hook.h"
 #include "family/impl/storage_workspace.h"
 #include "ops/sparse_moe/shared.h"
@@ -188,6 +189,23 @@ std::size_t plane_bytes(std::int32_t rows, std::int32_t tokens, DType dtype) {
                     dtype_size(dtype));
 }
 
+// Calibration residual samples (api/ops/calibration.h, --residual-samples-out): the residual
+// entering every layer group -- layer 0 and each layer after a full-attention one, so the groups
+// are the GGGA blocks -- and the final residual, the last group's output.
+bool starts_group(const family::TextGeometry& g, int layer) {
+    return layer == 0 || g.layer_attends(layer - 1);
+}
+
+std::int32_t group_boundary(const family::TextGeometry& g, int layer) {
+    std::int32_t index = 0;
+    for (int earlier = 0; earlier < layer; ++earlier) { index += starts_group(g, earlier) ? 1 : 0; }
+    return index;
+}
+
+std::int32_t group_boundaries(const family::TextGeometry& g) {
+    return group_boundary(g, g.layers) + 1;
+}
+
 std::size_t mix_capacity(const family::TextGeometry& g, std::int32_t first, std::int32_t last) {
     return ops::hyper_connection_mix_workspace_capacity_bytes(g.hc_streams, g.hidden, g.hc_low_rank, first,
                                                               last);
@@ -357,11 +375,18 @@ void Variant::prewarm_device_scratch(const family::TextGeometry& g) {
     if (family::ExpertCache::pool_floor() != 0) {
         (void)family::ExpertCache::for_current_device(moe_geometry(g), g.layers + g.mtp_layers);
     }
+    // --moe-stats-out: this device's accumulators, one row per mixture (the draft head's last).
+    ops::moe_stats_prepare_device(g.layers + g.mtp_layers, g.layers, g.experts, g.experts_per_token,
+                                  g.hidden);
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
     const auto& g = model.geometry;
+    if (ops::residual_samples_enabled()) {
+        const std::int32_t boundaries = group_boundaries(g);
+        ops::residual_sample(boundaries - 1, boundaries, g.layers, residual, Tensor{}, stream);
+    }
     ops::hyper_connection_mix(residual, model.output_mix, g.hc_streams, g.rms_epsilon, hidden, nullptr,
                               workspace, stream);
     maybe_dump_final(hidden, stream);
@@ -385,6 +410,10 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
                              cudaStream_t stream) {
     const auto& g = model.geometry;
     maybe_dump_layer(layer, residual, stream);
+    if (ops::residual_samples_enabled() && starts_group(g, layer)) {
+        ops::residual_sample(group_boundary(g, layer), group_boundaries(g), layer, residual,
+                             columns.ids, stream);
+    }
     if (layer != model.ple.layer) { return; }
     if (ple_state == nullptr || ple_state->empty()) {
         throw std::logic_error("qwen4exp: the PLE layer needs its state pool");
@@ -683,14 +712,27 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                                         weights.gate_up_planes, weights.down_planes,
                                         weights.host_gate_up, weights.host_down},
                   hidden, output, workspace, stream);
+        // The expert cache's rounds carry its own hook; --moe-stats-out leaves them unobserved
+        // and says so in the dump.
+        ops::moe_stats_note_unobserved(weights.layer);
     } else {
         const ops::SparseMoeRouting routing = family::moe_routing(phase);
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype,
             weights.op.routed_down.qtype, tokens, tokens, routing, ops::detail::native_shared(weights.op)));
         WorkspaceArena leaf(storage);
+        // --moe-stats-out: the served round records its routing through a hook that rewrites
+        // nothing; with norms, probe rounds of the same kernels then measure each selected
+        // expert's own output (api/ops/calibration.h). Both are absent otherwise.
+        ops::MoeStatsObserver observer;
+        const ops::SparseMoeRoundHook hook = ops::moe_stats_enabled()
+                                                 ? ops::moe_stats_observer(weights.layer, observer)
+                                                 : ops::SparseMoeRoundHook{};
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
-                        stream, ops::SparseMoeRoundHook{}, routing);
+                        stream, hook, routing);
+        if (ops::moe_stats_norms()) {
+            ops::moe_stats_probe(weights.layer, hidden, weights.op, routing, leaf, workspace, stream);
+        }
     }
     combine_into(output, residual, stream);
 }
@@ -788,7 +830,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     };
     auto peak = family::text_layers_workspace(g, family::WorkspaceLayers::All, capacity);
     if (g.mtp_layers) { peak = std::max(peak, capacity("mtp/layer/")); }
-    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) + round_up(peak);
+    // --moe-stats-out with norms: the probe rounds' output plane and the kept slot of each column.
+    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) + round_up(peak) +
+           ops::moe_stats_probe_workspace_bytes(g.hidden, last);
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {

@@ -510,6 +510,21 @@ struct Reader::Impl {
                 ExternalFile out;
                 out.path  = require_string(entry.at("path"), "external path");
                 out.bytes = require_unsigned(entry.at("bytes"), "external bytes", true);
+                if (entry.contains("sha256")) {
+                    out.sha256 = require_string(entry.at("sha256"), "external sha256");
+                }
+                if (entry.contains("sha256_chunks")) {
+                    const auto& chunks = entry.at("sha256_chunks");
+                    if (!chunks.is_object() || !chunks.contains("chunk_bytes") || !chunks.contains("digest")) {
+                        throw ArtifactError("external sha256_chunks must be {chunk_bytes, digest}");
+                    }
+                    out.sha256_chunk_bytes =
+                        require_unsigned(chunks.at("chunk_bytes"), "external sha256_chunks chunk_bytes", true);
+                    out.sha256_chunks = require_string(chunks.at("digest"), "external sha256_chunks digest");
+                    if (out.sha256_chunks.size() != 64) {
+                        throw ArtifactError("external sha256_chunks digest must be 64 hex digits");
+                    }
+                }
                 external.push_back(std::move(out));
             }
         }

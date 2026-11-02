@@ -645,6 +645,16 @@ set_tests_properties(sinfer_sparse_moe_width_invariance_test PROPERTIES SKIP_RET
 add_test(NAME sinfer_sparse_moe_qwen3_vl_235b_test
     COMMAND sinfer_sparse_moe_test --qwen3-vl-235b)
 set_tests_properties(sinfer_sparse_moe_qwen3_vl_235b_test PROPERTIES SKIP_RETURN_CODE 77)
+# Calibration statistics for expert pruning (api/ops/calibration.h): the observing hook leaves the
+# served round alone, the probe rounds decompose it on every route, and the dumped statistics are
+# the rounds' own -- for the Flash-Next teacher's mixture and each student's.
+sinfer_add_op_test(sinfer_moe_stats_test
+    SOURCES ops/test_moe_stats.cu
+    LIBRARIES sinfer_ops)
+foreach(experts 512 192 160)
+  add_test(NAME sinfer_moe_stats_${experts}_test COMMAND sinfer_moe_stats_test --geometry ${experts})
+  set_tests_properties(sinfer_moe_stats_${experts}_test PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 sinfer_add_op_test(sinfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES sinfer_ops)

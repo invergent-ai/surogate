@@ -112,5 +112,13 @@ void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& 
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);
+/// The Flash-Next student mixtures' small-T rounds (sparse_moe_small_t_kernels_students.cu);
+/// sparse_moe_small_t_launch forwards those geometries here. Any other geometry throws.
+void sparse_moe_small_t_students_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                                        const Tensor& router_x,
+                                        const PreparedSparseMoeWeights& weights,
+                                        Tensor& destination, const SparseMoeSmallTPlan& plan,
+                                        const SparseMoeSmallTWorkspace& workspace,
+                                        cudaStream_t stream, const SparseMoeRoundHook* hook);
 
 } // namespace sinfer::ops::detail

@@ -4,17 +4,24 @@
 #include "artifact/reader.h"
 #include "artifact/linear_storage.h"
 #include "artifact/typed_binding.h"
+#include "family/impl/frontend/digest.h"
 #include "family/impl/load/routed_nvfp4.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace sinfer::targets::qwen4exp::detail {
@@ -295,6 +302,67 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     return out;
 }
 
+/// A table read in place from a file of its own (the converter's --ple-table) can be checked
+/// against the chunked sha256 its artifact recorded, before anything reads its rows: several
+/// artifacts share the file, and a table quantised from another release, or a rewritten one,
+/// would serve every n-gram lookup wrongly without failing anywhere. Opt-in, since it reads the
+/// whole 28.8 GB file at load: SUROGATE_SERVE_VERIFY_EXTERNAL=1 (the chunks are hashed on several
+/// threads). The reader always checks the file's size against the artifact's record.
+void verify_external_table(const artifact::Reader& reader, const artifact::PayloadSpan& span,
+                           const char* name) {
+    if (span.source == 0) { return; } // stored in the artifact itself
+    const auto& files = reader.external_files();
+    if (span.source > files.size()) { throw artifact::ArtifactError(std::string(name) + ": unknown source"); }
+    const artifact::ExternalFile& file = files[span.source - 1];
+    if (file.sha256_chunks.empty() || file.sha256_chunk_bytes == 0) { return; }
+    if (const char* raw = std::getenv("SUROGATE_SERVE_VERIFY_EXTERNAL"); raw == nullptr || std::string_view(raw) != "1") {
+        return;
+    }
+    if (span.absolute_offset != 0 || span.data.size() != file.bytes) {
+        throw artifact::ArtifactError(std::string(name) + " does not cover its whole file " + file.path +
+                                      ", which its checksum is over");
+    }
+    // Every pipeline stage binds the whole artifact; the file is checked once per process.
+    static std::mutex verified_mutex;
+    static std::set<std::string> verified;
+    const std::lock_guard<std::mutex> lock(verified_mutex);
+    if (verified.contains(file.path + "@" + file.sha256_chunks)) { return; }
+    const auto started = std::chrono::steady_clock::now();
+    const std::size_t chunk  = static_cast<std::size_t>(file.sha256_chunk_bytes);
+    const std::size_t chunks = (span.data.size() + chunk - 1) / chunk;
+    std::vector<family::frontend_internal::Sha256Digest> digests(chunks);
+    const unsigned threads = std::max(1U, std::min({std::thread::hardware_concurrency() / 2, 16U,
+                                                    static_cast<unsigned>(chunks)}));
+    std::atomic<std::size_t> next{0};
+    std::vector<std::thread> workers;
+    for (unsigned t = 0; t < threads; ++t) {
+        workers.emplace_back([&] {
+            for (std::size_t i = next++; i < chunks; i = next++) {
+                const std::size_t begin = i * chunk;
+                const std::size_t bytes = std::min(chunk, span.data.size() - begin);
+                digests[i] = family::frontend_internal::sha256(std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(span.data.data()) + begin, bytes));
+            }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    std::vector<std::uint8_t> joined;
+    joined.reserve(chunks * 32);
+    for (const auto& digest : digests) { joined.insert(joined.end(), digest.begin(), digest.end()); }
+    const std::string actual = family::frontend_internal::sha256_hex(family::frontend_internal::sha256(
+        std::span<const std::uint8_t>(joined.data(), joined.size())));
+    if (actual != file.sha256_chunks) {
+        throw artifact::ArtifactError(std::string(name) + ": " + file.path + " does not match the checksum its "
+                                      "artifact recorded (sha256_chunks " + actual + ", expected " +
+                                      file.sha256_chunks + "); the table file has changed or is another one");
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::fprintf(stderr, "%s: %s verified (sha256_chunks over %zu chunks, %u threads, %.1f s)\n", name,
+                 file.path.c_str(), chunks, threads, seconds);
+    verified.insert(file.path + "@" + file.sha256_chunks);
+}
+
 // The shortlist's ids must be distinct tokens of the tokenizer: the proposal maps a row's
 // argmax back through them.
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle,
@@ -485,13 +553,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             {static_cast<std::uint64_t>(g.ple_table_rows), static_cast<std::uint64_t>(g.ple_head_dim)},
             TensorPlacement::ValidateOnly);
         {
-            const auto payload = binder.payload(out.ple_table).data;
+            const artifact::PayloadSpan span = binder.payload(out.ple_table);
+            const auto payload = span.data;
             const std::uint64_t expected = static_cast<std::uint64_t>(g.ple_table_rows) *
                                            g.ple_table_row_bytes();
             if (payload.size() != expected) {
                 throw artifact::ArtifactError("PLE table has " + std::to_string(payload.size()) +
                                               " bytes, expected " + std::to_string(expected));
             }
+            verify_external_table(binder.reader(), span, "text/ple/table.iq4nl");
             out.host_bank.objects.push_back({out.ple_table, payload, "text/ple/table.iq4nl"});
         }
 

@@ -1,4 +1,5 @@
 #include "api/ops/batch_invariant.h"
+#include "api/ops/calibration.h"
 #include "api/ops/sparse_moe.h"
 #include "product/load_progress/load_progress.h"
 #include "product/cuda_visibility/cuda_visibility.h"
@@ -123,6 +124,49 @@ int main(int argc, char** argv) {
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
                                              "batch-invariant numerics enabled");
         }
+        // Calibration statistics (api/ops/calibration.h): before any model loads, since the
+        // targets size their workspaces and capture their graphs with them.
+        if (!options.moe_stats_out.empty()) {
+            sinfer::ops::configure_moe_stats({.directory  = options.moe_stats_out,
+                                              .norms      = options.moe_stats_norms,
+                                              .mtp_prompt = options.moe_stats_mtp_prompt,
+                                              .model      = options.artifact_path});
+            sinfer::serve::write_console_log(
+                sinfer::serve::ConsoleLogLevel::Info,
+                "moe-stats: every MoE layer's expert statistics into " + options.moe_stats_out +
+                    (options.moe_stats_norms ? " (with expert-output norms: one probe round per selected expert)"
+                                             : " (counts and gate sums only)") +
+                    "; dumped at shutdown and on POST /admin/moe_stats");
+        }
+        if (!options.residual_samples_out.empty()) {
+            sinfer::ops::configure_residual_samples({.directory  = options.residual_samples_out,
+                                                     .every      = options.residual_samples_every,
+                                                     .max_tokens = options.residual_samples_max_tokens,
+                                                     .model      = options.artifact_path});
+            sinfer::serve::write_console_log(
+                sinfer::serve::ConsoleLogLevel::Info,
+                "residual-samples: every " + std::to_string(options.residual_samples_every) +
+                    "th column of eager forwards at the layer-group boundaries, up to " +
+                    std::to_string(options.residual_samples_max_tokens) + " columns, into " +
+                    options.residual_samples_out);
+        }
+        // Declared before the server and the services, so it runs after they are gone: the final
+        // dump sees every round they ran.
+        struct CalibrationShutdown {
+            ~CalibrationShutdown() {
+                try {
+                    if (sinfer::ops::moe_stats_enabled()) {
+                        const std::string dir = sinfer::ops::moe_stats_dump("final", false);
+                        sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
+                                                         "moe-stats: final statistics in " + dir);
+                    }
+                    if (sinfer::ops::residual_samples_enabled()) { (void)sinfer::ops::residual_samples_flush(); }
+                } catch (const std::exception& error) {
+                    sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Error,
+                                                     std::string("calibration: final dump failed: ") + error.what());
+                }
+            }
+        } calibration_shutdown;
 
         using Clock = std::chrono::steady_clock;
         sinfer::serve::HttpServer server(options);
@@ -306,6 +350,11 @@ int main(int argc, char** argv) {
             plan << ' ' << (options.extra_models.size() + 1) << " models";
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, plan.str());
         }
+
+        // The startup's own rounds (warm-up, the runs graph capture needs) are not calibration
+        // data: the statistics and the samples start empty at the first request.
+        if (sinfer::ops::moe_stats_enabled()) { sinfer::ops::moe_stats_reset(); }
+        if (sinfer::ops::residual_samples_enabled()) { (void)sinfer::ops::residual_samples_reset(); }
 
         std::ostringstream listening;
         listening << "listening on http://" << options.host << ':' << options.port

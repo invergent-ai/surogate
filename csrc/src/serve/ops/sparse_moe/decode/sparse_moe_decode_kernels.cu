@@ -99,6 +99,12 @@ bool sparse_moe_decode_launch_expert_major(const SparseMoeGeometry& geometry, co
                                            float* token_activations, int* groups,
                                            std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                            cudaStream_t stream) {
+    if (sparse_moe_flash_next_student(geometry)) {
+        return sparse_moe_decode_students_launch_expert_major(geometry, x, weights, destination,
+                                                              token_ids, token_alpha, shared_scale,
+                                                              token_activations, groups, tokens,
+                                                              schedule, stream);
+    }
     if (geometry == kSparseMoeQwen36Geometry) {
         return geometry_qwen36::decode_launch_expert_major(x, weights, destination, token_ids, token_alpha,
                                                 shared_scale, token_activations, groups,
@@ -152,6 +158,12 @@ void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, cons
                                          float* token_activations, std::int32_t tokens,
                                          SparseMoeSmallTD3Schedule schedule, cudaStream_t stream,
                                          const int* adaptive_route_jobs) {
+    if (sparse_moe_flash_next_student(geometry)) {
+        sparse_moe_decode_students_launch_d3_small_t(geometry, x, weights, token_ids,
+                                                     token_activations, tokens, schedule, stream,
+                                                     adaptive_route_jobs);
+        return;
+    }
     if (geometry == kSparseMoeQwen36Geometry) {
         geometry_qwen36::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
                                                   tokens, schedule, stream, adaptive_route_jobs);
@@ -213,6 +225,12 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream, const int* adaptive_route_jobs) {
+    if (sparse_moe_flash_next_student(geometry)) {
+        sparse_moe_decode_students_launch_d4_small_t(geometry, weights, destination, token_ids,
+                                                     token_alpha, shared_scale, token_activations,
+                                                     tokens, schedule, stream, adaptive_route_jobs);
+        return;
+    }
     if (geometry == kSparseMoeQwen36Geometry) {
         geometry_qwen36::decode_launch_d4_small_t(weights, destination, token_ids, token_alpha,
                                                   shared_scale, token_activations, tokens,
@@ -276,6 +294,11 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
                               Tensor& destination, const SparseMoeDecodeWorkspace& workspace,
                               cudaStream_t stream, const SparseMoeRoundHook* hook,
                               const LoraBank* adapters, const std::int32_t* adapter_slot) {
+    if (sparse_moe_flash_next_student(geometry)) {
+        sparse_moe_decode_students_launch(geometry, x, router_x, weights, destination, workspace,
+                                          stream, hook, adapters, adapter_slot);
+        return;
+    }
     if (geometry == kSparseMoeQwen36Geometry) {
         geometry_qwen36::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;

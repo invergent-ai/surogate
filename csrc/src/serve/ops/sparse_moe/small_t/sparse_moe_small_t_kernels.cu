@@ -82,6 +82,11 @@ void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& 
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook) {
+    if (sparse_moe_flash_next_student(geometry)) {
+        sparse_moe_small_t_students_launch(geometry, x, router_x, weights, destination, plan,
+                                           workspace, stream, hook);
+        return;
+    }
     if (geometry == kSparseMoeQwen36Geometry) {
         geometry_qwen36::small_t_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;

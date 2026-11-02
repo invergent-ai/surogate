@@ -479,6 +479,13 @@ void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router
         const Tensor ids(w.ids, DType::I32, {kTopK, tokens});
         hook->capture(hook->capture_context, ids, hook->capture_base + first_token, tokens, stream);
     }
+    // Calibration statistics (SparseMoeRoundHook::reweight): both GEMMs below and the combine
+    // read `alpha` and the shared scale only after this.
+    if (hook != nullptr && hook->reweight != nullptr) {
+        const Tensor ids(w.ids, DType::I32, {kTopK, tokens});
+        hook->reweight(hook->reweight_context, ids, w.alpha, g.has_shared() ? w.shared_scale : nullptr,
+                       hook->capture_base + first_token, tokens, stream);
+    }
 
     const int block = moe_block_size(tokens, g.experts);
     count_kernel<<<g.experts, 256, 0, stream>>>(w.ids, assignments, w.offsets);

@@ -1716,13 +1716,29 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // asked for: its capabilities are what the artifact can actually do.
     bool opens_reasoning = options.add_generation_prompt && options.enable_thinking &&
                            impl_->capabilities.enable_thinking;
+    // `SUROGATE_SERVE_RAW_PROMPT`: a lone user message is the prompt itself, no template around
+    // it (see the text-only branch below). Measurement only.
+    static const bool raw_prompt = std::getenv("SUROGATE_SERVE_RAW_PROMPT") != nullptr;
+    const bool raw_single =
+        raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
             std::optional<fi::RenderedChat> rendered;
-            if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !(impl_->processor.gemma.version || impl_->processor.gemma.muse_glimmer)) {
+            const bool qwen_layout = !impl_->processor.lfm2_vl &&
+                                     !(impl_->processor.gemma.version || impl_->processor.gemma.muse_glimmer);
+            if (raw_single && qwen_layout) {
+                // With images too: the message's text, each image part as the placeholder the
+                // processor expands (`<|vision_start|><|image_pad|><|vision_end|>`), in order. A
+                // client that rendered a whole conversation itself -- images in tool turns
+                // included, which a tool message cannot carry -- sends it as one such message.
+                result.uses_chat_template = false;
+                rendered = fi::RenderedChat{.text = messages.front().rendered_content()};
+                opens_reasoning = false;
+                result.prompt_characters = utf8_code_points(rendered->text);
+            } else if (impl_->tokenizer->renders_chat_template() && qwen_layout) {
                 rendered = impl_->render_chat(messages, options);
                 opens_reasoning = options.add_generation_prompt &&
                     fi::prompt_opens_reasoning(rendered->text, impl_->reasoning.open);
@@ -1771,9 +1787,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         // template loaded", and a base model -- `google/gemma-4-12B` is one -- has no template
         // by definition. Asking for the raw prompt and then failing to render the template it
         // is bypassing left exactly the checkpoints this flag exists to measure unmeasurable.
-        static const bool raw_prompt = std::getenv("SUROGATE_SERVE_RAW_PROMPT") != nullptr;
-        const bool raw_single =
-            raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User;
+        // (`raw_single` is decided above, for media prompts too.)
         fi::RenderedChat rendered;
         if (raw_single) {
             result.uses_chat_template = false;

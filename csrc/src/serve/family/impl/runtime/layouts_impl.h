@@ -7,6 +7,7 @@
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
 #include "api/ops/batch_invariant.h"
+#include "api/ops/calibration.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/vision_context.h"
@@ -766,6 +767,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         auto call = layout.scope();
         if constexpr (mtp_block_is_trunk_layer<Variant>()) {
             mtp_trunk_prefill_core(layout, first, last, preembedded);
+            // --moe-stats-out runs the head's block over every prompt column instead
+            // (mtp_prefill_trunk_block_all_columns): a trunk block's attention and mixture over
+            // the chunk. The two never run together, so the larger one is what the round needs.
+            if (ops::moe_stats_mtp_prompt()) {
+                mtp_trunk_core(layout, first, last, preembedded, 1, first, last, text_envelope);
+            }
             proposal_scratch(layout, 1);
             return;
         }

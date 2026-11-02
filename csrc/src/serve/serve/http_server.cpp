@@ -12,6 +12,8 @@
 #include "serve/request_log.h"
 #include "serve/translate.h"
 
+#include "api/ops/calibration.h"
+
 #include "core/sleep.h"
 #include "core/unified_memory.h"
 
@@ -836,6 +838,114 @@ void HttpServer::register_routes() {
     };
     server_.Post("/v1/unload_lora_adapter", unload_lora_adapter_handler);
     server_.Post("/unload_lora_adapter", unload_lora_adapter_handler);
+
+    // Calibration statistics (--moe-stats-out, --residual-samples-out; api/ops/calibration.h).
+    // A dump synchronises the devices and reads their accumulators, which is exact only when no
+    // request is running, so a busy server answers 409 unless the body says "force": true.
+    const auto busy = [this] {
+        std::size_t active = service_->active_requests();
+        for (const auto* replica : replicas_) {
+            if (replica != service_) { active += replica->active_requests(); }
+        }
+        for (const auto& [name, extra] : extra_services_) { active += extra->active_requests(); }
+        return active;
+    };
+    server_.Get("/admin/moe_stats", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(std::string("{\"enabled\": ") + (sinfer::ops::moe_stats_enabled() ? "true" : "false") +
+                            ", \"norms\": " + (sinfer::ops::moe_stats_norms() ? "true" : "false") +
+                            ", \"tokens\": " + sinfer::ops::moe_stats_tokens_json() + "}",
+                        "application/json");
+    });
+    server_.Post("/admin/moe_stats", [this, busy](const httplib::Request& req, httplib::Response& res) {
+        nlohmann::json body = nlohmann::json::object();
+        if (!req.body.empty()) {
+            try {
+                body = nlohmann::json::parse(req.body);
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content("request body is not valid JSON", "text/plain");
+                return;
+            }
+        }
+        if (!body.is_object() || (body.contains("tag") && !body.at("tag").is_string()) ||
+            (body.contains("reset") && !body.at("reset").is_boolean()) ||
+            (body.contains("force") && !body.at("force").is_boolean()) ||
+            (body.contains("action") && !body.at("action").is_string())) {
+            res.status = 400;
+            res.set_content("expected {\"action\": \"dump\"|\"reset\", \"tag\": string, \"reset\": bool, "
+                            "\"force\": bool}",
+                            "text/plain");
+            return;
+        }
+        const std::string action = body.value("action", "dump");
+        if (action != "dump" && action != "reset") {
+            res.status = 400;
+            res.set_content("action must be dump or reset", "text/plain");
+            return;
+        }
+        if (const std::size_t active = busy(); active != 0 && !body.value("force", false)) {
+            res.status = 409;
+            res.set_content(std::to_string(active) + " requests are running; dump when idle or pass "
+                            "\"force\": true for a snapshot of rounds in flight",
+                            "text/plain");
+            return;
+        }
+        try {
+            if (action == "reset") {
+                sinfer::ops::moe_stats_reset();
+                res.set_content("{\"reset\": true}", "application/json");
+                return;
+            }
+            const std::string dir = sinfer::ops::moe_stats_dump(body.value("tag", ""), body.value("reset", false));
+            res.set_content(nlohmann::json{{"directory", dir}, {"reset", body.value("reset", false)}}.dump(),
+                            "application/json");
+            log_line("moe-stats: dumped to " + dir);
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(e.what(), "text/plain");
+        }
+    });
+    // {"action": "flush"} (the default) writes the summary; "reset" starts the file over, empty,
+    // which forgets forwards in flight, so it waits for an idle server like a statistics dump.
+    server_.Post("/admin/residual_samples", [busy](const httplib::Request& req, httplib::Response& res) {
+        nlohmann::json body = nlohmann::json::object();
+        if (!req.body.empty()) {
+            try {
+                body = nlohmann::json::parse(req.body);
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content("request body is not valid JSON", "text/plain");
+                return;
+            }
+        }
+        if (!body.is_object() || (body.contains("action") && !body.at("action").is_string()) ||
+            (body.contains("force") && !body.at("force").is_boolean())) {
+            res.status = 400;
+            res.set_content("expected {\"action\": \"flush\"|\"reset\", \"force\": bool}", "text/plain");
+            return;
+        }
+        const std::string action = body.value("action", "flush");
+        if (action != "flush" && action != "reset") {
+            res.status = 400;
+            res.set_content("action must be flush or reset", "text/plain");
+            return;
+        }
+        if (const std::size_t active = busy(); action == "reset" && active != 0 && !body.value("force", false)) {
+            res.status = 409;
+            res.set_content(std::to_string(active) + " requests are running; reset when idle or pass "
+                            "\"force\": true",
+                            "text/plain");
+            return;
+        }
+        try {
+            res.set_content(action == "reset" ? sinfer::ops::residual_samples_reset()
+                                              : sinfer::ops::residual_samples_flush(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(e.what(), "text/plain");
+        }
+    });
     server_.Post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
