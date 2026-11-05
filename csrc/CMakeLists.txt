@@ -1348,6 +1348,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
 ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/launcher/vision_attention.cu
+  ${SERVE_ROOT}/ops/launcher/vision_attention_fp8.cu
   ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/gated_delta_net.cpp

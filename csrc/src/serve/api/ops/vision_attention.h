@@ -47,4 +47,22 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                       std::int32_t segment_length, Tensor& out, cudaStream_t stream, float scale = 0.0F);
 
+/**
+ * The same packed, non-causal attention with S = Q K^T and O += P V on the e4m3 tensor cores
+ * (--vision-fp8): Q and K rounded to e4m3 with one scale per (token, head), V with one per
+ * (head, channel), P scaled by 448 before its rounding (ops/kernel/vision_attention_fp8.cuh).
+ * `scratch` holds the prepared operands, vision_attention_fp8_scratch_bytes(D, H, P) bytes,
+ * 16-byte aligned, and must not overlap the inputs or out. Returns false, having enqueued
+ * nothing, where the route does not run: a device other than compute capability 12.x, D other
+ * than 64 or 72, misaligned operands, or too small a scratch. Throws as the BF16 overload does
+ * on an invalid call.
+ */
+[[nodiscard]] bool vision_attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v,
+                                        const Tensor& cu_seqlens, WorkspaceArena& workspace,
+                                        DeviceSpan scratch, Tensor& out, cudaStream_t stream,
+                                        float scale = 0.0F);
+/// Scratch bytes vision_attention_fp8 needs for D x H x P; 0 for an unsupported D.
+[[nodiscard]] std::size_t vision_attention_fp8_scratch_bytes(std::int32_t head_dim,
+                                                             std::int32_t heads,
+                                                             std::int32_t patches);
 } // namespace sinfer::ops
