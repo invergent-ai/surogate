@@ -4,6 +4,7 @@
 //   sinfer_vision_attention_fp8_test                 correctness (one and several segments)
 //   sinfer_vision_attention_fp8_test bench [heads]   both kernels' times at the tower's widths
 
+#include "api/ops/rope.h"
 #include "api/ops/vision_attention.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
@@ -233,6 +234,49 @@ int run_case(int dim, int heads, std::vector<int> cu, std::uint32_t seed) {
     return ok ? 0 : 1;
 }
 
+/// An image's rotary positions, [P, 2] I32 axis-major (row, column of each 16-pixel patch on a
+/// grid `width` patches wide), as ops::rope takes them.
+DeviceBuffer grid_positions(int patches, int width) {
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(2) * patches);
+    for (int t = 0; t < patches; ++t) {
+        positions[t]           = t / width;
+        positions[patches + t] = t % width;
+    }
+    return to_device_i32(std::vector<int>(positions.begin(), positions.end()));
+}
+
+/// ops::rope then vision_attention_fp8, against vision_attention_fp8_rope on the unrotated
+/// projections: the same rotation rounded the same way, so the outputs must agree bit for bit.
+int run_rope_case(int dim, int heads, std::vector<int> cu, std::uint32_t seed) {
+    const Problem p = make_problem(dim, heads, std::move(cu), seed);
+    Device fused    = upload(p);
+    Device split    = upload(p);
+    DeviceBuffer positions_buffer = grid_positions(p.patches, 37);
+    Tensor positions(positions_buffer.p, DType::I32, {p.patches, 2});
+    if (!ops::vision_attention_fp8_rope(fused.q, fused.k, fused.v, positions, dim, 10000.0F,
+                                        fused.cu_tensor, fused.workspace, fused.scratch_span,
+                                        fused.o_fp8, nullptr)) {
+        std::cerr << "vision_attention_fp8_rope declined D=" << dim << '\n';
+        return 1;
+    }
+    ops::rope(positions, dim, 10000.0F, split.q, split.k, nullptr);
+    (void)ops::vision_attention_fp8(split.q, split.k, split.v, split.cu_tensor, split.workspace,
+                                    split.scratch_span, split.o_fp8, nullptr);
+    cuda_synchronize();
+    const std::size_t n = static_cast<std::size_t>(heads) * dim * p.patches;
+    const auto a = from_device<std::uint16_t>(fused.out_fp8.p, n);
+    const auto b = from_device<std::uint16_t>(split.out_fp8.p, n);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < n; ++i) { differing += a[i] != b[i]; }
+    // The unrotated inputs stay as they were: the fused route only reads q and k.
+    const bool inputs_kept = from_device<std::uint16_t>(fused.qkv.p, p.qkv.size()) == p.qkv;
+    const bool ok = differing == 0 && inputs_kept;
+    std::cout << (ok ? "ok  " : "FAIL") << " rope+fp8 D=" << dim << " H=" << heads << " P=" << p.patches
+              << " S=" << p.cu.size() - 1 << "  outputs differing from rope then fp8: " << differing
+              << (inputs_kept ? "" : "  (q/k were modified)") << '\n';
+    return ok ? 0 : 1;
+}
+
 double time_us(const std::function<void()>& launch) {
     cudaEvent_t a, b;
     cudaEventCreate(&a);
@@ -255,17 +299,28 @@ double time_us(const std::function<void()>& launch) {
 }
 
 int bench(int heads) {
-    std::cout << "vision attention, D=72 H=" << heads << " one segment (fastest of 15)\n";
-    for (const int patches : {784, 1600, 3136, 4624, 7056, 8224, 12544, 16384}) {
+    std::cout << "vision attention with its rotation, D=72 H=" << heads
+              << " one segment (fastest of 15): rope + BF16 | rope + FP8 | FP8 with the rotation fused\n";
+    for (const int patches : {784, 1600, 2304, 3136, 4624, 7056, 8224, 12544, 16384}) {
         const Problem p = make_problem(72, heads, {0, patches}, 7U);
         Device d        = upload(p);
-        const double bf16 = time_us([&] { ops::vision_attention(d.q, d.k, d.v, d.cu_tensor, d.workspace, d.o_bf16, nullptr); });
-        const double fp8  = time_us([&] {
+        DeviceBuffer positions_buffer = grid_positions(patches, 64);
+        Tensor positions(positions_buffer.p, DType::I32, {patches, 2});
+        // Rotating the same q and k over and over keeps them finite, which is all timing needs.
+        const double bf16 = time_us([&] {
+            ops::rope(positions, 72, 10000.0F, d.q, d.k, nullptr);
+            ops::vision_attention(d.q, d.k, d.v, d.cu_tensor, d.workspace, d.o_bf16, nullptr);
+        });
+        const double fp8 = time_us([&] {
+            ops::rope(positions, 72, 10000.0F, d.q, d.k, nullptr);
             (void)ops::vision_attention_fp8(d.q, d.k, d.v, d.cu_tensor, d.workspace, d.scratch_span, d.o_fp8, nullptr);
         });
-        const double flops = 4.0 * patches * static_cast<double>(patches) * 72 * heads;
-        std::printf("P=%-6d bf16 %9.1f us %6.1f TFLOP/s | fp8 (incl. prepare) %9.1f us %6.1f TFLOP/s | %.2fx\n",
-                    patches, bf16, flops / bf16 / 1e6, fp8, flops / fp8 / 1e6, bf16 / fp8);
+        const double fused = time_us([&] {
+            (void)ops::vision_attention_fp8_rope(d.q, d.k, d.v, positions, 72, 10000.0F, d.cu_tensor,
+                                                 d.workspace, d.scratch_span, d.o_fp8, nullptr);
+        });
+        std::printf("P=%-6d %9.1f us | %9.1f us (%.2fx) | %9.1f us (%.2fx)\n", patches, bf16, fp8,
+                    bf16 / fp8, fused, bf16 / fused);
     }
     return 0;
 }
@@ -294,6 +349,22 @@ int main(int argc, char** argv) {
             failures += run_case(dim, 16, {0, 300}, 12U);
             failures += run_case(dim, 16, {0, 3136}, 13U);
             failures += run_case(dim, 4, {0, 100, 164, 900, 1296}, 14U); // unequal segments
+            failures += run_rope_case(dim, 16, {0, 3136}, 15U);
+            failures += run_rope_case(dim, 16, {0, 100, 164, 900, 1296}, 16U); // unequal segments
+            {
+                // 4 heads: ops::rope's generic kernel, not the fixed one the fused route matches,
+                // so the fused route must decline (and leave q and k alone).
+                const Problem p = make_problem(dim, 4, {0, 256}, 17U);
+                Device d        = upload(p);
+                DeviceBuffer positions_buffer = grid_positions(p.patches, 16);
+                Tensor positions(positions_buffer.p, DType::I32, {p.patches, 2});
+                const bool taken = ops::vision_attention_fp8_rope(d.q, d.k, d.v, positions, dim, 10000.0F,
+                                                                  d.cu_tensor, d.workspace, d.scratch_span,
+                                                                  d.o_fp8, nullptr);
+                std::cout << (taken ? "FAIL" : "ok  ") << " rope+fp8 D=" << dim
+                          << " H=4 declined (generic rotation)\n";
+                failures += taken ? 1 : 0;
+            }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " vision attention fp8\n";
         return failures == 0 ? 0 : 1;

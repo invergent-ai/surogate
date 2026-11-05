@@ -6,9 +6,10 @@
 // fc2 -- run on cuBLASLt's MXFP8 GEMM: e4m3 operands with one power-of-two scale per 32 values
 // along K, FP32 accumulation, BF16 output (ops/linear/mxfp8/mxfp8.h). The weights are quantized
 // once at startup into a copy beside the BF16 ones (about half their size); the activations at
-// each projection. On compute capability 12.x, an image of at least 4096 patches also takes its
+// each projection. On compute capability 12.x, an image of at least 3072 patches also takes its
 // attention on the e4m3 tensor cores (ops::vision_attention_fp8: Q and K per token and head, V
-// per channel, P scaled by 448). The patch embedding, the mergers and the text model are
+// per channel, P scaled by 448; the rotary embedding folded into Q and K's preparation). The
+// patch embedding, the mergers and the text model are
 // untouched. Outputs change by FP8 rounding.
 //
 // The switch is process-wide and is set once, before the first model loads. Reading it is a
