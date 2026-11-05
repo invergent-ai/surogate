@@ -273,6 +273,9 @@ sinfer::RequestOptions to_request_options(const GenerationRequest& request,
          std::any_of(request.tools.begin(), request.tools.end(), [](const ToolDefinition& tool) { return tool.strict; }));
     // Match vLLM: tool-derived constraints take precedence over response_format.
     options.execution.json_schema = constrained_tools ? std::string{} : request.json_schema;
+    // vLLM's structured outputs wait for the end of the reasoning its reasoning parser reads: a thinking model
+    // reasons first and answers in the schema. Without a parser the output is one text, constrained throughout.
+    options.execution.json_after_reasoning = server.reasoning_format != ReasoningFormat::None;
     if (!options.execution.json_schema.empty() && (request.ignore_eos || request.min_tokens != 0 || !request.stop_strings.empty())) {
         invalid_sampling("JSON response formats require ignore_eos=false, min_tokens=0, and no custom stops", "response_format");
     }

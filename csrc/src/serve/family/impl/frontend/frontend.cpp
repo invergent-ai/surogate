@@ -1093,6 +1093,8 @@ class Frontend::Impl {
 public:
     mutable std::mutex constraint_mutex;
     mutable std::unique_ptr<JsonConstraintCompiler> constraint_compiler;
+    /// The JSON constraint compiler, built on first use. The caller holds constraint_mutex.
+    JsonConstraintCompiler& json_constraint_compiler() const;
     mutable std::unique_ptr<ToolConstraintCompiler> tool_constraint_compiler;
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
         : chat_template(compile_chat_template(resources, options.chat_template_override)),
@@ -1815,21 +1817,19 @@ void Frontend::validate_sampling_tokens(const ResolvedSamplingParameters& sampli
     }
 }
 
-std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint(const std::string& schema) const {
-    std::lock_guard lock(impl_->constraint_mutex);
-    if (!impl_->constraint_compiler) {
-        const auto& tokenizer = *impl_->tokenizer;
-        std::vector<std::string> vocab(tokenizer.vocabulary_size());
+JsonConstraintCompiler& Frontend::Impl::json_constraint_compiler() const {
+    if (!constraint_compiler) {
+        std::vector<std::string> vocab(tokenizer->vocabulary_size());
         for (std::size_t i = 0; i < vocab.size(); ++i) {
-            if (tokenizer.is_valid_token(static_cast<int>(i)) && !tokenizer.is_special_token(static_cast<int>(i))) {
-                vocab[i] = tokenizer.decode_token_bytes(static_cast<int>(i));
+            if (tokenizer->is_valid_token(static_cast<int>(i)) && !tokenizer->is_special_token(static_cast<int>(i))) {
+                vocab[i] = tokenizer->decode_token_bytes(static_cast<int>(i));
             }
         }
-        if (tokenizer.default_stop_token_ids().empty()) {
+        if (tokenizer->default_stop_token_ids().empty()) {
             throw std::invalid_argument("JSON constraints require a tokenizer with an end-of-sequence token");
         }
         std::function<std::vector<TokenId>(std::string_view)> encode =
-            [tokenizer = impl_->tokenizer](std::string_view text) {
+            [tokenizer = tokenizer](std::string_view text) {
                 return tokenizer->encode(text, {.parse_added_tokens=false, .add_bos=false});
             };
         // Grammar continuations must round-trip byte for byte. SentencePiece
@@ -1841,10 +1841,26 @@ std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint
             for (auto id : encode(probe)) { decoded += vocab.at(id); }
             if (decoded != probe) { encode = {}; break; }
         }
-        impl_->constraint_compiler = std::make_unique<JsonConstraintCompiler>(
-            std::move(vocab), tokenizer.default_stop_token_ids(), std::move(encode));
+        constraint_compiler = std::make_unique<JsonConstraintCompiler>(
+            std::move(vocab), tokenizer->default_stop_token_ids(), std::move(encode));
     }
-    return impl_->constraint_compiler->compile(schema);
+    return *constraint_compiler;
+}
+
+std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint(const std::string& schema) const {
+    std::lock_guard lock(impl_->constraint_mutex);
+    return impl_->json_constraint_compiler().compile(schema);
+}
+
+std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint_after_reasoning(
+    const std::string& schema) const {
+    // Muse Glimmer's reasoning is a message of its own, which its channel headers end: not a span.
+    const fi::ReasoningSyntax& reasoning = impl_->reasoning;
+    if (reasoning.muse_glimmer || reasoning.close.empty()) { return nullptr; }
+    const std::optional<int> close = impl_->tokenizer->token_id(reasoning.close);
+    if (!close) { return nullptr; }
+    std::lock_guard lock(impl_->constraint_mutex);
+    return impl_->json_constraint_compiler().compile_after(schema, static_cast<TokenId>(*close));
 }
 
 std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_tool_constraint(const std::string& tag) const {
