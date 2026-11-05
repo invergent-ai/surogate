@@ -15,8 +15,8 @@ jobs:
     # self-hosted build box is gone, and the build never needed it: there is no GPU in it
     # (CUDAARCHS names the architectures, and the checks read the cubins with cuobjdump), and the
     # toolkit comes from the nvidia/cuda image below, not from the host. The 32-vCPU runner has
-    # 128 GB and 1.5 TB of disk, room for 19 build jobs (see the first step). A cold build is
-    # about 8 CPU-hours -- the near-cold build of 2026-09-21 (79% ccache misses) took 57 minutes
+    # 128 GB and 1.5 TB of disk; the build runs 6 jobs on it (see the first step). A cold build
+    # is about 8 CPU-hours -- the near-cold build of 2026-09-21 (79% ccache misses) took 57 minutes
     # at 8 jobs on the old box -- and ccache, kept in the Actions cache (Blacksmith serves
     # actions/cache from its own cache next to the runners), makes the next one shorter.
     #
@@ -88,6 +88,8 @@ jobs:
       # reads it into SUROGATE_NVCC_THREADS). How many jobs is decided from the runner's memory,
       # in the first step.
       NVCC_THREADS: 1
+      # The ceiling on parallel build jobs; the first step may pick fewer on a small runner.
+      MAX_BUILD_JOBS: 6
       CUDAARCHS: ${{ matrix.archs }}
       # A wheel without an engine in it is not this package: a missing FFmpeg, libcurl or
       # toolkit must fail the build rather than quietly produce a trainer-only wheel.
@@ -110,12 +112,17 @@ jobs:
     steps:
       # Memory decides the parallelism. The CUTLASS FP4 translation units take roughly 8 GB of
       # cicc per job (measured on the self-hosted box: 12 jobs crossed a 60 GB cap and had
-      # `matmul_cutlass_fp4_sm100.cu` killed, 8 jobs peak near 64 GB), so the build runs as many
-      # jobs as memory plus swap holds at 8 GB each, and no more than there are CPUs. The runner
-      # gets a 24 GB swap file first, the margin for the moments several FP4 units and the
-      # libsinfer.so link coincide: 128 GB and 24 GB make 19 jobs on the 32-vCPU runner, and 16 GB
-      # and 24 GB make 4 on a 4-vCPU one. The file lives in /__w, the runner's own disk mounted
-      # into the container.
+      # `matmul_cutlass_fp4_sm100.cu` killed, 8 jobs peak near 64 GB), and the x86_64 wheel's
+      # three architectures plus the MoE kernels of #338 push the heaviest units past that: at
+      # 8 GB a job over memory plus swap, the x86_64 build ran 18 jobs on 113 GB + 34 GB and was
+      # OOM-killed (exit 137) on 2026-10-30 and on the v1.5.14 tag. So the build runs at most
+      # 6 jobs (MAX_BUILD_JOBS; a cold build is ~8 CPU-hours, so about 80-90 minutes at 6 jobs,
+      # well inside the 360-minute timeout, and ccache shortens the next one), and fewer on a
+      # small runner: memory counts in full, swap -- the margin for the moments several FP4 units
+      # and the libsinfer.so link coincide, and slow once it is leaned on -- counts half, each
+      # job is budgeted 10 GB, and never more jobs than CPUs (16 GB and 24 GB make 2 on a 4-vCPU
+      # runner). Memory is the container's cgroup limit when it has one, else the host's
+      # MemTotal. The swap file lives in /__w, the runner's own disk mounted into the container.
       - name: Add swap and size the build
         run: |
           set -euo pipefail
@@ -129,9 +136,13 @@ jobs:
           fi
           # The image has no procps; /proc/meminfo is the host's.
           mem_gb=$(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
+          # A container limit lower than the host's memory is the one the OOM killer enforces.
+          lim=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo max)
+          if [ "$lim" != max ] && [ "$(( lim / 1073741824 ))" -lt "$mem_gb" ]; then mem_gb=$(( lim / 1073741824 )); fi
           swap_gb=$(awk '/^SwapTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
-          jobs=$(( (mem_gb + swap_gb) / 8 )); cpus=$(nproc)
+          jobs=$(( (mem_gb + swap_gb / 2) / 10 )); cpus=$(nproc)
           [ "$jobs" -gt "$cpus" ] && jobs=$cpus
+          [ "$jobs" -gt "$MAX_BUILD_JOBS" ] && jobs=$MAX_BUILD_JOBS
           [ "$jobs" -lt 1 ] && jobs=1
           echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
           echo "${cpus} CPUs, ${mem_gb} GB memory, ${swap_gb} GB swap: ${jobs} build jobs"
