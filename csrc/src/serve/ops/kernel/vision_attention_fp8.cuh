@@ -26,6 +26,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/kernel/rope.cuh"
 #include "ops/kernel/vision_attention.cuh"
 
 #include <cuda_bf16.h>
@@ -360,6 +361,78 @@ __global__ void vision_fp8_prepare_qk_kernel(const __nv_bfloat16* __restrict__ q
     const int head           = static_cast<int>(index - static_cast<std::int64_t>(token) * heads);
     float x[D];
     vision_fp8_load_row<D>((is_k ? k : q) + head * stride_h + static_cast<std::int64_t>(token) * stride_t, x);
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < D; ++i) { amax = fmaxf(amax, fabsf(x[i])); }
+    const float scale   = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+    const float inverse = 1.0f / scale;
+    uint4 codes[RowBytes / 16];
+    auto* pairs = reinterpret_cast<__nv_fp8x2_storage_t*>(codes);
+#pragma unroll
+    for (int p = 0; p < RowBytes / 2; ++p) {
+        pairs[p] = 2 * p < D ? __nv_cvt_float2_to_fp8x2(make_float2(x[2 * p] * inverse, x[2 * p + 1] * inverse),
+                                                       __NV_SATFINITE, __NV_E4M3)
+                             : static_cast<__nv_fp8x2_storage_t>(0);
+    }
+    const std::int64_t row = static_cast<std::int64_t>(head) * patches + token;
+    auto* dst = reinterpret_cast<uint4*>((is_k ? k8 : q8) + row * RowBytes);
+#pragma unroll
+    for (int c = 0; c < RowBytes / 16; ++c) { dst[c] = codes[c]; }
+    (is_k ? sk : sq)[row] = scale;
+}
+
+/// RoPE and Q's and K's e4m3 rounding in one pass, for a tower whose rotation is the fixed
+/// Vision2D (D = 72) or Vision2D64 (D = 64) one: each row is rotated exactly as rope_fixed_kernel
+/// rotates it -- the same coefficients (fixed_sincos), the same explicitly rounded pair rotation
+/// (rope_rotated_first/_second), each value rounded to BF16 as that kernel's store rounds it --
+/// and then quantized exactly as vision_fp8_prepare_qk_kernel quantizes, so the codes and scales
+/// are bit for bit the two kernels'. The BF16 rotation is never written: only the e4m3 attention
+/// reads Q and K. A block takes `tokens_per_block` tokens, their coefficients computed once in
+/// shared memory (2 x D/2 floats per token) and shared by the token's 2 x `heads` rows.
+template <int D>
+__global__ void vision_fp8_rope_qk_kernel(const std::int32_t* __restrict__ positions,
+                                          const __nv_bfloat16* __restrict__ q,
+                                          const __nv_bfloat16* __restrict__ k,
+                                          std::int64_t stride_h, std::int64_t stride_t,
+                                          std::int32_t heads, std::int32_t patches,
+                                          std::int32_t tokens_per_block,
+                                          std::uint8_t* __restrict__ q8, std::uint8_t* __restrict__ k8,
+                                          float* __restrict__ sq, float* __restrict__ sk) {
+    static_assert(D == 72 || D == 64, "the fixed vision rotations are 72 and 64 wide");
+    constexpr RopeKernelMode Mode = D == 72 ? RopeKernelMode::Vision2D : RopeKernelMode::Vision2D64;
+    constexpr int Half     = D / 2;
+    constexpr int RowBytes = kVisionFp8RowBytes<D>;
+    extern __shared__ float rope_coefficients[]; // [token][pair] (cos, sin)
+    const int token0 = static_cast<int>(blockIdx.x) * tokens_per_block;
+    for (int i = static_cast<int>(threadIdx.x); i < tokens_per_block * Half; i += static_cast<int>(blockDim.x)) {
+        const int t     = i / Half;
+        const int pair  = i - t * Half;
+        const int token = token0 + t;
+        float sine = 0.0f, cosine = 1.0f;
+        if (token < patches) { fixed_sincos<Mode>(positions, patches, token, pair, &sine, &cosine); }
+        rope_coefficients[2 * i]     = cosine;
+        rope_coefficients[2 * i + 1] = sine;
+    }
+    __syncthreads();
+    const int per_token = 2 * heads;
+    const int t         = static_cast<int>(threadIdx.x) / per_token;
+    const int r         = static_cast<int>(threadIdx.x) - t * per_token;
+    const int token     = token0 + t;
+    if (t >= tokens_per_block || token >= patches) { return; }
+    const bool is_k = r >= heads;
+    const int head  = is_k ? r - heads : r;
+    float x[D];
+    vision_fp8_load_row<D>((is_k ? k : q) + head * stride_h + static_cast<std::int64_t>(token) * stride_t, x);
+    const float* cs = rope_coefficients + 2 * t * Half;
+#pragma unroll
+    for (int e = 0; e < Half; ++e) {
+        const float c      = cs[2 * e];
+        const float sn     = cs[2 * e + 1];
+        const float first  = x[e];
+        const float second = x[e + Half];
+        x[e]        = __bfloat162float(__float2bfloat16_rn(rope_rotated_first(first, second, c, sn)));
+        x[e + Half] = __bfloat162float(__float2bfloat16_rn(rope_rotated_second(first, second, c, sn)));
+    }
     float amax = 0.0f;
 #pragma unroll
     for (int i = 0; i < D; ++i) { amax = fmaxf(amax, fabsf(x[i])); }

@@ -101,9 +101,11 @@ std::size_t vision_attention_fp8_scratch_bytes(std::int32_t head_dim, std::int32
     return detail::vision_attention_fp8_scratch_bytes(head_dim, heads, patches);
 }
 
-bool vision_attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v,
-                          const Tensor& cu_seqlens, WorkspaceArena& workspace,
-                          DeviceSpan scratch, Tensor& out, cudaStream_t stream, float scale) {
+namespace {
+
+bool run_fp8(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_seqlens,
+             WorkspaceArena& workspace, DeviceSpan scratch, Tensor& out, cudaStream_t stream,
+             float scale, const Tensor* rope_positions) {
     if (!std::isfinite(scale) || scale < 0) { throw std::invalid_argument("vision_attention: invalid scale"); }
     const std::int32_t patches  = q.ne[2];
     const std::int32_t segments = cu_seqlens.ne[0] - 1;
@@ -133,8 +135,29 @@ bool vision_attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scratch_scope = workspace.scope();
     Tensor tiles       = allocate_workspace(workspace, patches, segments);
     Tensor* tiles_ptr  = tiles.data == nullptr ? nullptr : &tiles;
-    detail::vision_attention_fp8_launch(q, k, v, cu_seqlens, tiles_ptr, scratch, out, stream, scale);
+    detail::vision_attention_fp8_launch(q, k, v, cu_seqlens, tiles_ptr, scratch, out, stream, scale,
+                                        rope_positions);
     return true;
+}
+
+} // namespace
+
+bool vision_attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v,
+                          const Tensor& cu_seqlens, WorkspaceArena& workspace,
+                          DeviceSpan scratch, Tensor& out, cudaStream_t stream, float scale) {
+    return run_fp8(q, k, v, cu_seqlens, workspace, scratch, out, stream, scale, nullptr);
+}
+
+bool vision_attention_fp8_rope(const Tensor& q, const Tensor& k, const Tensor& v,
+                               const Tensor& positions, std::int32_t rotary_dim, float theta,
+                               const Tensor& cu_seqlens, WorkspaceArena& workspace,
+                               DeviceSpan scratch, Tensor& out, cudaStream_t stream, float scale) {
+    if (positions.dtype != DType::I32 || positions.ne[0] != q.ne[2] || positions.ne[2] != 1 ||
+        positions.ne[3] != 1 || !positions.is_contiguous() || positions.data == nullptr ||
+        !detail::vision_attention_fp8_rope_supported(q.ne[0], q.ne[1], rotary_dim, theta, positions.ne[1])) {
+        return false;
+    }
+    return run_fp8(q, k, v, cu_seqlens, workspace, scratch, out, stream, scale, &positions);
 }
 
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,

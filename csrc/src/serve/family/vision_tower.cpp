@@ -40,11 +40,12 @@ namespace {
 }
 
 // --vision-fp8's e4m3 attention runs from this many patches (an image's 16-pixel patches;
-// 4096 is about 1024x1024). The kernel is 1.3-1.5x the BF16 one from 3136 patches up, but
-// preparing its operands takes much of that back below about 4k (GB10, 16 heads, kernel +
-// preparation: 1.08x at 3136, 1.13x at 7056, 1.22x at 16384; sinfer_vision_attention_fp8_test
-// bench), and each FP8 step moves the outputs a little. SUROGATE_SERVE_VISION_FP8_ATTENTION=0
-// keeps attention BF16; SUROGATE_SERVE_VISION_FP8_ATTENTION_MIN_PATCHES moves the threshold.
+// 3072 is about 890x890). With the rotation folded into the e4m3 preparation, rotation and
+// attention together run 1.08x the BF16 pair at 3136 patches, 1.12x at 4624, 1.22x at 7056,
+// 1.24x at 12544, and break even near 2300 (GB10, 16 heads, sinfer_vision_attention_fp8_test
+// bench on a quiet GPU); each FP8 step also moves the outputs a little.
+// SUROGATE_SERVE_VISION_FP8_ATTENTION=0 keeps attention BF16;
+// SUROGATE_SERVE_VISION_FP8_ATTENTION_MIN_PATCHES moves the threshold.
 [[nodiscard]] std::int32_t vision_fp8_attention_min_patches() noexcept {
     static const std::int32_t patches = [] {
         if (const char* off = std::getenv("SUROGATE_SERVE_VISION_FP8_ATTENTION");
@@ -54,7 +55,7 @@ namespace {
         if (const char* raw = std::getenv("SUROGATE_SERVE_VISION_FP8_ATTENTION_MIN_PATCHES")) {
             return static_cast<std::int32_t>(std::max(0L, std::strtol(raw, nullptr, 10)));
         }
-        return std::int32_t{4096};
+        return std::int32_t{3072};
     }();
     return patches;
 }
@@ -435,7 +436,6 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                 q.nb[2] = qkv.nb[1];
                 k.nb[2] = qkv.nb[1];
                 v.nb[2] = qkv.nb[1];
-                if (g.rotary_dim) { ops::rope(position_ids, g.rotary_dim, g.rope_theta, q, k, stream); }
                 Tensor attended_heads = attended.view({g.head_dim(), g.heads, patches});
                 const DeviceSpan attention_backing = layout.attention_workspace
                                                          ? layout.attention_workspace->bind(backing)
@@ -443,13 +443,31 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                 WorkspaceArena attention_workspace(attention_backing);
                 // --vision-fp8 on sm_12x, large images: S = Q K^T and P V on the e4m3 tensor
                 // cores, the operands prepared in the projection-input buffer, idle between qkv
-                // and the output projection.
-                const bool fp8_attention =
-                    fp8 != nullptr && patches >= vision_fp8_attention_min_patches() &&
-                    ops::vision_attention_fp8(q, k, v, cu_seqlens, attention_workspace,
-                                              layout.fp8_codes->bind(backing), attended_heads,
-                                              stream);
-                if (!fp8_attention) {
+                // and the output projection; the rotation is applied on the way into e4m3, so
+                // the BF16 Q and K are never rotated in place.
+                bool attended_done = false;
+                bool rotated       = g.rotary_dim == 0;
+                if (fp8 != nullptr && patches >= vision_fp8_attention_min_patches()) {
+                    const DeviceSpan scratch = layout.fp8_codes->bind(backing);
+                    if (!rotated) {
+                        attended_done = ops::vision_attention_fp8_rope(
+                            q, k, v, position_ids, g.rotary_dim, g.rope_theta, cu_seqlens,
+                            attention_workspace, scratch, attended_heads, stream);
+                    }
+                    if (!attended_done) {
+                        // A rotation the fused route does not reproduce bit for bit: rotate in
+                        // place, then the e4m3 attention over the rotated BF16.
+                        if (!rotated) {
+                            ops::rope(position_ids, g.rotary_dim, g.rope_theta, q, k, stream);
+                            rotated = true;
+                        }
+                        attended_done = ops::vision_attention_fp8(q, k, v, cu_seqlens,
+                                                                  attention_workspace, scratch,
+                                                                  attended_heads, stream);
+                    }
+                }
+                if (!attended_done) {
+                    if (!rotated) { ops::rope(position_ids, g.rotary_dim, g.rope_theta, q, k, stream); }
                     ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
                                           stream);
                 }
