@@ -15,7 +15,7 @@ jobs:
     # self-hosted build box is gone, and the build never needed it: there is no GPU in it
     # (CUDAARCHS names the architectures, and the checks read the cubins with cuobjdump), and the
     # toolkit comes from the nvidia/cuda image below, not from the host. The 32-vCPU runner has
-    # 128 GB and 1.5 TB of disk; the build runs 4 jobs on it (see the first step). A cold build
+    # 128 GB and 1.5 TB of disk; the build runs 6 jobs on it (see the first step). A cold build
     # is about 8 CPU-hours -- the near-cold build of 2026-09-21 (79% ccache misses) took 57 minutes
     # at 8 jobs on the old box -- and ccache, kept in the Actions cache (Blacksmith serves
     # actions/cache from its own cache next to the runners), makes the next one shorter.
@@ -89,7 +89,7 @@ jobs:
       # in the first step.
       NVCC_THREADS: 1
       # The ceiling on parallel build jobs; the first step may pick fewer on a small runner.
-      MAX_BUILD_JOBS: 4
+      MAX_BUILD_JOBS: 6
       CUDAARCHS: ${{ matrix.archs }}
       # A wheel without an engine in it is not this package: a missing FFmpeg, libcurl or
       # toolkit must fail the build rather than quietly produce a trainer-only wheel.
@@ -116,7 +116,7 @@ jobs:
       # three architectures plus the MoE kernels of #338 push the heaviest units past that: at
       # 8 GB a job over memory plus swap, the x86_64 build ran 18 jobs on 113 GB + 34 GB and was
       # OOM-killed (exit 137) on 2026-10-30 and on the v1.5.14 tag. So the build runs at most
-      # 4 jobs (MAX_BUILD_JOBS; a cold build is ~8 CPU-hours, so about two hours at 4 jobs,
+      # 6 jobs (MAX_BUILD_JOBS; a cold build is ~8 CPU-hours, so about 80-90 minutes at 6 jobs,
       # well inside the 360-minute timeout, and ccache shortens the next one), and fewer on a
       # small runner: memory counts in full, swap -- the margin for the moments several FP4 units
       # and the libsinfer.so link coincide, and slow once it is leaned on -- counts half, each
