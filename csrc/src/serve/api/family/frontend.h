@@ -189,6 +189,11 @@ public:
     void validate_sampling_tokens(const ResolvedSamplingParameters& sampling) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_json_constraint(
         const std::string& schema) const;
+    /// The schema for the answer that follows a reasoning region a prompt opened: the region is the model's
+    /// own until it writes its close token (JsonConstraintCompiler::compile_after). Null for a model that has
+    /// no single close token, or whose reasoning is a message channel rather than a span.
+    [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_json_constraint_after_reasoning(
+        const std::string& schema) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_tool_constraint(
         const std::string& structural_tag) const;
     /// Encode a continuation fragment without adding BOS or interpreting special tokens.

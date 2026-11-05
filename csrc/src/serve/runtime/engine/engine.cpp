@@ -520,6 +520,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
 
     const std::string json_schema = options.execution.json_schema;
+    // The answer's schema waits for the end of the reasoning the prompt opened (ExecutionOptions).
+    const bool json_after_reasoning = options.execution.json_after_reasoning &&
+        family::PreparedPromptAccess::view(prompt.impl_->value).starts_in_reasoning;
     const std::string tool_tag = options.execution.structural_tag;
     if (!json_schema.empty() && !tool_tag.empty()) { throw std::invalid_argument("conflicting output constraints"); }
     if ((!json_schema.empty() || !tool_tag.empty()) && (!options.stop.include_model_defaults || options.execution.min_tokens != 0 ||
@@ -532,11 +535,17 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         target->loaded->frontend.validate_sampling_tokens(resolved_options.execution.sampling);
     }, impl_->active);
     if (!json_schema.empty()) {
-        resolved_options.execution.constraint = std::visit([&](const auto& target) {
-            return target->loaded->frontend.compile_json_constraint(json_schema);
+        std::visit([&](const auto& target) {
+            const auto& frontend = target->loaded->frontend;
+            if (json_after_reasoning) {
+                resolved_options.execution.constraint = frontend.compile_json_constraint_after_reasoning(json_schema);
+            }
+            if (!resolved_options.execution.constraint) {
+                resolved_options.execution.constraint = frontend.compile_json_constraint(json_schema);
+                // JSON from the first token is answer text, even under a reasoning region the prompt opened.
+                resolved_options.output.structured = true;
+            }
         }, impl_->active);
-        // JSON is answer text even for a template that opens a reasoning region.
-        resolved_options.output.structured = true;
     }
     if (!tool_tag.empty()) {
         resolved_options.execution.constraint = std::visit([&](const auto& target) {

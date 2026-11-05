@@ -457,6 +457,12 @@ public:
 struct ExecutionOptions {
     /// Empty means unconstrained output; otherwise a JSON Schema for the generated text.
     std::string json_schema;
+    /// With json_schema and a prompt that opened a reasoning region: the reasoning stays the model's own, the
+    /// schema constrains the answer after the model's close token, and the output is split into the two as
+    /// for free text (vLLM's structured outputs under a reasoning parser). Otherwise -- false, a prompt that
+    /// opens no region, or a model with no single close token -- the schema constrains the output from its
+    /// first token, all of it answer text.
+    bool json_after_reasoning = false;
     /// Native tool-call delimiters and argument schemas; mutually exclusive with json_schema.
     std::string structural_tag;
     SamplingOverrides sampling;

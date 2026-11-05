@@ -29,6 +29,11 @@ public:
         std::function<std::vector<TokenId>(std::string_view)> encode = {});
     ~JsonConstraintCompiler();
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile(const std::string& schema);
+    /// `compile(schema)` behind a reasoning region the prompt opened, which is the model's own: until it writes
+    /// `close`, every token but a stop is allowed (so the region is closed before the answer ends). One
+    /// whitespace-only token may then follow, the separator a chat template writes there, and the schema
+    /// constrains the rest. vLLM's structured outputs do the same under a reasoning parser.
+    [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_after(const std::string& schema, TokenId close);
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

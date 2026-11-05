@@ -520,6 +520,17 @@ int test_reject_unsupported() {
     failures +=
         check(parse_chat_completion_request(rf, default_limits()).json_schema == R"({"type":"object"})",
               "json response_format accepted");
+    {
+        const GenerationRequest json_request = parse_chat_completion_request(rf, default_limits());
+        const sinfer::RequestOptions parsed  = to_request_options(json_request, default_server());
+        failures += check(parsed.execution.json_schema == R"({"type":"object"})" &&
+                              parsed.execution.json_after_reasoning,
+                          "a JSON answer did not wait for the reasoning the reasoning parser splits off");
+        ServeOptions unparsed     = default_server();
+        unparsed.reasoning_format = ReasoningFormat::None;
+        failures += check(!to_request_options(json_request, unparsed).execution.json_after_reasoning,
+                          "without a reasoning parser the JSON was not constrained from the first token");
+    }
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};
