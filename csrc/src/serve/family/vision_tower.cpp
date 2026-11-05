@@ -39,6 +39,26 @@ namespace {
     return enabled;
 }
 
+// --vision-fp8's e4m3 attention runs from this many patches (an image's 16-pixel patches;
+// 4096 is about 1024x1024). The kernel is 1.3-1.5x the BF16 one from 3136 patches up, but
+// preparing its operands takes much of that back below about 4k (GB10, 16 heads, kernel +
+// preparation: 1.08x at 3136, 1.13x at 7056, 1.22x at 16384; sinfer_vision_attention_fp8_test
+// bench), and each FP8 step moves the outputs a little. SUROGATE_SERVE_VISION_FP8_ATTENTION=0
+// keeps attention BF16; SUROGATE_SERVE_VISION_FP8_ATTENTION_MIN_PATCHES moves the threshold.
+[[nodiscard]] std::int32_t vision_fp8_attention_min_patches() noexcept {
+    static const std::int32_t patches = [] {
+        if (const char* off = std::getenv("SUROGATE_SERVE_VISION_FP8_ATTENTION");
+            off != nullptr && std::string_view(off) == "0") {
+            return std::numeric_limits<std::int32_t>::max();
+        }
+        if (const char* raw = std::getenv("SUROGATE_SERVE_VISION_FP8_ATTENTION_MIN_PATCHES")) {
+            return static_cast<std::int32_t>(std::max(0L, std::strtol(raw, nullptr, 10)));
+        }
+        return std::int32_t{4096};
+    }();
+    return patches;
+}
+
 [[nodiscard]] bool fused(const Tensor& x, const Weight& weight, const Tensor& bias,
                          ops::LinearEpilogue epilogue, Tensor& out, cudaStream_t stream) {
     return vision_fused_enabled() &&
@@ -421,8 +441,18 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                                                          ? layout.attention_workspace->bind(backing)
                                                          : backing;
                 WorkspaceArena attention_workspace(attention_backing);
-                ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
-                                      stream);
+                // --vision-fp8 on sm_12x, large images: S = Q K^T and P V on the e4m3 tensor
+                // cores, the operands prepared in the projection-input buffer, idle between qkv
+                // and the output projection.
+                const bool fp8_attention =
+                    fp8 != nullptr && patches >= vision_fp8_attention_min_patches() &&
+                    ops::vision_attention_fp8(q, k, v, cu_seqlens, attention_workspace,
+                                              layout.fp8_codes->bind(backing), attended_heads,
+                                              stream);
+                if (!fp8_attention) {
+                    ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
+                                          stream);
+                }
             }
             // x += projection(attended) + bias, straight into the residual stream.
             if (fp8 != nullptr) {

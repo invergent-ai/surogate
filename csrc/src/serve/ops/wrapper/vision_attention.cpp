@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ops/launcher/vision_attention.h"
+#include "ops/launcher/vision_attention_fp8.h"
 #include <cmath>
 
 #include <algorithm>
@@ -93,6 +94,47 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
     Tensor tiles       = allocate_workspace(workspace, patches, segments);
     Tensor* tiles_ptr  = tiles.data == nullptr ? nullptr : &tiles;
     detail::vision_attention_launch(q, k, v, cu_seqlens, tiles_ptr, out, stream, scale);
+}
+
+std::size_t vision_attention_fp8_scratch_bytes(std::int32_t head_dim, std::int32_t heads,
+                                               std::int32_t patches) {
+    return detail::vision_attention_fp8_scratch_bytes(head_dim, heads, patches);
+}
+
+bool vision_attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v,
+                          const Tensor& cu_seqlens, WorkspaceArena& workspace,
+                          DeviceSpan scratch, Tensor& out, cudaStream_t stream, float scale) {
+    if (!std::isfinite(scale) || scale < 0) { throw std::invalid_argument("vision_attention: invalid scale"); }
+    const std::int32_t patches  = q.ne[2];
+    const std::int32_t segments = cu_seqlens.ne[0] - 1;
+    if (patches <= 0) { throw std::invalid_argument("vision_attention: P must be positive"); }
+    require_qkv(q, patches, "q");
+    require_qkv(k, patches, "k");
+    require_qkv(v, patches, "v");
+    require_qkv(out, patches, "out");
+    if (!std::equal(q.ne, q.ne + 4, k.ne) || !std::equal(q.ne, q.ne + 4, v.ne) ||
+        !std::equal(q.ne, q.ne + 4, out.ne) || !out.is_contiguous()) {
+        throw std::invalid_argument("vision_attention: q/k/v/out shapes must match, out contiguous");
+    }
+    if (cu_seqlens.dtype != DType::I32 || segments <= 0 || segments > patches ||
+        cu_seqlens.ne[1] != 1 || cu_seqlens.ne[2] != 1 || cu_seqlens.ne[3] != 1 ||
+        !cu_seqlens.is_contiguous() || cu_seqlens.data == nullptr) {
+        throw std::invalid_argument("vision_attention: cu_seqlens must be contiguous I32 [S+1]");
+    }
+    const auto aligned16 = [](const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0; };
+    const std::int32_t head_dim = q.ne[0];
+    if (!detail::vision_attention_fp8_supported(head_dim) || !aligned16(q.data) ||
+        !aligned16(k.data) || !aligned16(v.data) || q.nb[1] != k.nb[1] || q.nb[1] != v.nb[1] ||
+        q.nb[2] != k.nb[2] || q.nb[2] != v.nb[2] || (q.nb[2] % 16) != 0 || (k.nb[2] % 16) != 0 ||
+        (v.nb[2] % 16) != 0 || scratch.data == nullptr || !aligned16(scratch.data) ||
+        scratch.bytes < detail::vision_attention_fp8_scratch_bytes(head_dim, q.ne[1], patches)) {
+        return false;
+    }
+    auto scratch_scope = workspace.scope();
+    Tensor tiles       = allocate_workspace(workspace, patches, segments);
+    Tensor* tiles_ptr  = tiles.data == nullptr ? nullptr : &tiles;
+    detail::vision_attention_fp8_launch(q, k, v, cu_seqlens, tiles_ptr, scratch, out, stream, scale);
+    return true;
 }
 
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
