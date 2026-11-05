@@ -27,11 +27,13 @@
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/vision_context.h"
 #include "family/impl/runtime/vision_prefill.h"
+#include "family/vision_fp8.h"
 
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <array>
 #include <atomic>
@@ -932,6 +934,9 @@ public:
     /// And not with in-place Marlin residency opted into (SUROGATE_SERVE_MARLIN_FP8): a base
     /// round's fused MLP would adopt a weight the adapter route then could not read.
     bool base_rounds_ = false;
+    /// --vision-fp8: the MXFP8 copies of the vision tower's block projections, held for the
+    /// program's life (VisionContext finds them through family::find_vision_fp8).
+    std::shared_ptr<const family::VisionFp8Weights> vision_fp8_;
     /// Whether a round over these lanes is a base round: none of their requests selects an
     /// adapter. `more` is a mixed round's other half (its staged prompts beside its decoders).
     [[nodiscard]] bool base_round_for(std::span<const std::uint32_t> lanes,

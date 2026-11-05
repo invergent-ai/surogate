@@ -47,6 +47,9 @@ Common server options (full list: surogate serve --engine-help):
   --dflash-model PATH           separate Muse-Glimmer DFlash GGUF checkpoint
   --mmproj PATH                 matching vision projector for a supported vision GGUF
   --offload-vision               store image encoder/projector weights in system RAM
+  --vision-fp8                   run the image encoder's block projections in MXFP8 on a
+                                 Blackwell GPU (twice the BF16 math rate; outputs change by
+                                 FP8 rounding; ~0.4 GB of FP8 weights beside the BF16 ones)
   --offload-embeddings           store token embeddings in system RAM
   --offload-output-head          store output-head weights in system RAM
   --decision-temperature T       calibrate the decisions endpoint: answers are read from
@@ -132,7 +135,7 @@ _SWITCH_OPTIONS = {
         --elastic-kv-overcommit --enforce-eager --no-prefix-reuse --batch-invariant
         --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
         --enable-sleep-mode --enable-lora --thinking --preserve-thinking --cors --data-parallel
-        --capture-routing
+        --capture-routing --vision-fp8
     """.split()),
     "generate": _COMMON_SWITCHES | frozenset("""
         --raw-output --print-token-ids --prefill-warmup --no-cuda-graph

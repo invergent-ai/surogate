@@ -13,6 +13,8 @@
 
 #include "family/impl/runtime/schedule.h"
 #include "api/ops/batch_invariant.h"
+#include "api/ops/vision_fp8.h"
+#include "ops/linear/mxfp8/mxfp8.h"
 #include "api/ops/lora_store.h"
 #include "api/ops/sampled_logprob.h"
 #include "api/ops/gdn_replay.h"
@@ -517,6 +519,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // to the graph allowance. qwen4exp already prewarms it for the same reason.
     ops::detail::bf16_cublaslt_prewarm();
     trace_memory_phase("cuBLASLt prewarmed");
+    // --vision-fp8: the tower's block projections get MXFP8 copies now, once, beside the BF16
+    // weights (family/vision_fp8.h); a device or tower that cannot take them says so and stays
+    // BF16.
+    if (vision_enabled && model.vision && ops::vision_fp8()) {
+        ops::detail::mxfp8_cublaslt_prewarm();
+        vision_fp8_ = family::prepare_vision_fp8(*model.vision, model.vision_geometry, device.stream);
+        trace_memory_phase("vision MXFP8 projections prepared");
+    }
     // Adapters are bound by now (the target binds them with its frontend), so this is the
     // engine's answer for its whole life: which flavors its rounds take and, below, which
     // graphs it captures for them. The plan decided it from the options, and sized the graph

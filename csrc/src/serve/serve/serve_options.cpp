@@ -228,7 +228,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] [--spec-adaptive] "
            "[--default-max-tokens N] [--overlong-max-tokens reject|cap] "
-           "[--vision] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
+           "[--vision] [--vision-fp8] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
            "[--enforce-eager] [--no-prefix-reuse] [--batch-invariant] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
            "[--gpu-memory-limit-mib N] [--prefix-cache-host-gb N] "
@@ -258,6 +258,9 @@ std::string serve_usage_text(const char* argv0) {
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
+           "       --vision-fp8 runs the vision tower's block projections in MXFP8 on a Blackwell\n"
+           "         device (block-scaled FP8 at twice the BF16 rate; outputs change by FP8\n"
+           "         rounding). The weights are quantized once at startup, beside the BF16 ones\n"
            "       --rope-scaling takes Hugging Face's rope_scaling object, e.g.\n"
            "         '{\"rope_type\":\"yarn\",\"factor\":4,\"original_max_position_embeddings\":262144}':\n"
            "         YaRN over the Qwen3.5/3.6 MoE rotation, extending the context to\n"
@@ -609,6 +612,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--offload-vision") {
             options.offload_vision = true;
+        } else if (arg == "--vision-fp8") {
+            options.vision_fp8 = true;
         } else if (arg == "--offload-embeddings") {
             options.offload_embeddings = true;
         } else if (arg == "--offload-output-head") {
@@ -928,6 +933,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
+    }
+    if (options.vision_fp8 && !options.enable_vision) {
+        throw std::invalid_argument("--vision-fp8 needs --vision");
     }
     if (options.elastic_kv_overcommit && !options.elastic_kv) {
         throw std::invalid_argument("--elastic-kv-overcommit needs the elastic pool; drop --no-elastic-kv");
