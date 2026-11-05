@@ -269,5 +269,13 @@ void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& 
                                Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);
+/// The Flash-Next student mixtures' prefill rounds (sparse_moe_prefill_kernels_students.cu);
+/// sparse_moe_prefill_launch forwards those geometries here. Any other geometry throws.
+void sparse_moe_prefill_students_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                                        const Tensor& router_x,
+                                        const PreparedSparseMoeWeights& weights,
+                                        Tensor& destination, const SparseMoePrefillPlan& plan,
+                                        const SparseMoePrefillWorkspace& workspace,
+                                        cudaStream_t stream, const SparseMoeRoundHook* hook);
 
 } // namespace sinfer::ops::detail

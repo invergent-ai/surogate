@@ -215,6 +215,14 @@ struct PayloadRun {
 struct ExternalFile {
     std::string path;
     std::uint64_t bytes = 0;
+    /// Optional checksums the converter recorded (a shared n-gram table file, for instance):
+    /// the whole file's sha256, and `sha256_chunks` -- the sha256 of the concatenated sha256
+    /// digests of its consecutive `sha256_chunk_bytes`-byte chunks -- as lowercase hex. Empty when
+    /// the artifact declares none; a reader that verifies takes the chunked one, which it can
+    /// compute on several threads.
+    std::string sha256;
+    std::uint64_t sha256_chunk_bytes = 0;
+    std::string sha256_chunks;
 };
 
 struct ArtifactIdentity {
@@ -255,6 +263,9 @@ public:
     /// runs has no single payload span, but each of its runs does.
     std::span<const std::byte> run_span(const PayloadRun& run) const;
     const std::vector<ExternalFile>& external_files() const noexcept;
+    /// The file external source `source` (one and up) was opened from: its declared path, a
+    /// relative one resolved against the artifact's directory.
+    [[nodiscard]] const std::filesystem::path& external_path(std::uint32_t source) const;
     /// The artifact's declared dimensions, keyed as `family::TextGeometry` names them; empty
     /// for an artifact written without a `geometry` member.
     const std::map<std::string, double>& geometry() const noexcept;

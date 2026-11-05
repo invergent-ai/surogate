@@ -780,6 +780,13 @@ private:
                                  const Tensor* input_embeddings, const Tensor& positions,
                                  const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                  Tensor* final_hidden);
+    /// The trunk-block head over every column of a prompt chunk (--moe-stats-out, so its mixture
+    /// is observed on prompts): attention for every query and the mixture for every column, into
+    /// `x` in place. The served prefill does only the keys and the last column.
+    template <class V, class Block>
+    void mtp_prefill_trunk_block_all_columns(Tensor& x, const Block& block, const Tensor& positions,
+                                             const Tensor& rope_positions,
+                                             ops::GqaExecutionEnvelope envelope);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::GqaExecutionEnvelope envelope, bool final_chunk,

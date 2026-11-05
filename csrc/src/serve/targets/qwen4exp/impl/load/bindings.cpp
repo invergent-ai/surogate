@@ -4,17 +4,29 @@
 #include "artifact/reader.h"
 #include "artifact/linear_storage.h"
 #include "artifact/typed_binding.h"
+#include "family/impl/frontend/digest.h"
 #include "family/impl/load/routed_nvfp4.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <map>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace sinfer::targets::qwen4exp::detail {
@@ -295,6 +307,177 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     return out;
 }
 
+/// SUROGATE_SERVE_NGRAM_TABLE=<dir>: the n-gram table's rows read in place from the release's own
+/// shards in that directory -- the files its model.safetensors.index.json names for
+/// `model.language_model.layers.<ple layer>.ple.ple_embedding.ngram_embedding.shard_<i>.weight`, BF16
+/// or E4M3 -- instead of the artifact's copy, which is then neither verified nor pinned. An E4M3
+/// table takes the index's `...ngram_embedding.weight_scale` when it lists one (a multiplier, as
+/// ModelOpt states it), else 1; SUROGATE_SERVE_NGRAM_TABLE_SCALE overrides either. Opened once a
+/// process (every pipeline stage binds the whole artifact).
+std::shared_ptr<ops::NgramPleHostTable> open_host_table(const family::TextGeometry& g) {
+    const char* raw = std::getenv("SUROGATE_SERVE_NGRAM_TABLE");
+    if (raw == nullptr || *raw == '\0') { return nullptr; }
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<ops::NgramPleHostTable>> opened;
+    const std::lock_guard<std::mutex> lock(mutex);
+    const std::string key = std::string(raw) + "#" + std::to_string(g.ple_layer);
+    if (const auto found = opened.find(key); found != opened.end()) { return found->second; }
+
+    const std::filesystem::path dir(raw);
+    const auto fail = [&](const std::string& why) {
+        return std::runtime_error("SUROGATE_SERVE_NGRAM_TABLE=" + dir.string() + ": " + why);
+    };
+    std::ifstream index_stream(dir / "model.safetensors.index.json");
+    if (!index_stream) { throw fail("no model.safetensors.index.json"); }
+    const nlohmann::json index = nlohmann::json::parse(index_stream);
+    const nlohmann::json& weight_map = index.at("weight_map");
+    const std::string prefix = "model.language_model.layers." + std::to_string(g.ple_layer) +
+                               ".ple.ple_embedding.ngram_embedding.";
+
+    struct Header {
+        nlohmann::json tensors;
+        std::uint64_t data_start = 0;
+    };
+    std::map<std::string, Header> headers;
+    const auto header = [&](const std::string& file) -> const Header& {
+        if (const auto found = headers.find(file); found != headers.end()) { return found->second; }
+        std::ifstream in(dir / file, std::ios::binary);
+        std::uint64_t length = 0;
+        if (!in || !in.read(reinterpret_cast<char*>(&length), sizeof(length)) || length == 0 || length > (1ULL << 30)) {
+            throw fail(file + " is not a safetensors file");
+        }
+        std::string text(static_cast<std::size_t>(length), '\0');
+        if (!in.read(text.data(), static_cast<std::streamsize>(length))) { throw fail(file + ": truncated header"); }
+        return headers.emplace(file, Header{nlohmann::json::parse(text), sizeof(length) + length}).first->second;
+    };
+
+    std::vector<ops::NgramPleShard> shards;
+    std::string dtype;
+    std::int64_t rows = 0;
+    for (int shard = 0;; ++shard) {
+        const std::string name = prefix + "shard_" + std::to_string(shard) + ".weight";
+        if (!weight_map.contains(name)) { break; }
+        const std::string file = weight_map.at(name).get<std::string>();
+        const Header& h        = header(file);
+        if (!h.tensors.contains(name)) { throw fail(file + " does not hold " + name); }
+        const nlohmann::json& entry = h.tensors.at(name);
+        const std::string type      = entry.at("dtype").get<std::string>();
+        const auto shape            = entry.at("shape").get<std::vector<std::int64_t>>();
+        const auto offsets          = entry.at("data_offsets").get<std::vector<std::uint64_t>>();
+        if (type != "BF16" && type != "F8_E4M3") { throw fail(name + " is " + type + ", not BF16 or F8_E4M3"); }
+        if (!dtype.empty() && type != dtype) { throw fail("the shards mix " + dtype + " and " + type); }
+        dtype = type;
+        const std::uint64_t element = type == "BF16" ? 2 : 1;
+        if (shape.size() != 2 || shape[1] != g.ple_head_dim || shape[0] <= 0 || offsets.size() != 2 ||
+            offsets[1] - offsets[0] != static_cast<std::uint64_t>(shape[0]) * shape[1] * element) {
+            throw fail(name + " is not [rows, " + std::to_string(g.ple_head_dim) + "] " + type);
+        }
+        shards.push_back({(dir / file).string(), h.data_start + offsets[0], shape[0]});
+        rows += shape[0];
+    }
+    if (shards.empty()) { throw fail("the index names no " + prefix + "shard_0.weight"); }
+    if (rows != g.ple_table_rows) {
+        throw fail("its shards hold " + std::to_string(rows) + " rows; the artifact's table has " +
+                   std::to_string(g.ple_table_rows));
+    }
+    const ops::NgramPleRowType type = dtype == "BF16" ? ops::NgramPleRowType::Bf16 : ops::NgramPleRowType::E4m3;
+    float scale                     = 1.0F;
+    if (type == ops::NgramPleRowType::E4m3 && weight_map.contains(prefix + "weight_scale")) {
+        const std::string name = prefix + "weight_scale";
+        const std::string file = weight_map.at(name).get<std::string>();
+        const Header& h        = header(file);
+        const nlohmann::json& entry = h.tensors.at(name);
+        const std::string kind      = entry.at("dtype").get<std::string>();
+        const auto offsets          = entry.at("data_offsets").get<std::vector<std::uint64_t>>();
+        std::ifstream in(dir / file, std::ios::binary);
+        in.seekg(static_cast<std::streamoff>(h.data_start + offsets[0]));
+        std::uint8_t bytes[4] = {};
+        const std::size_t width = kind == "F32" ? 4 : 2;
+        if (!in.read(reinterpret_cast<char*>(bytes), static_cast<std::streamsize>(width))) { throw fail("cannot read " + name); }
+        if (kind == "F32") {
+            std::memcpy(&scale, bytes, 4);
+        } else if (kind == "BF16") {
+            const std::uint32_t word = static_cast<std::uint32_t>(bytes[0] | (bytes[1] << 8)) << 16;
+            std::memcpy(&scale, &word, 4);
+        } else {
+            throw fail(name + " is " + kind + "; a BF16 or F32 scale was expected");
+        }
+    }
+    if (const char* forced = std::getenv("SUROGATE_SERVE_NGRAM_TABLE_SCALE"); forced != nullptr && *forced) {
+        scale = std::strtof(forced, nullptr);
+    }
+    auto table = std::make_shared<ops::NgramPleHostTable>(std::move(shards), g.ple_head_dim, type, scale);
+    std::fprintf(stderr,
+                 "n-gram table: %lld rows of %s (scale %g) read in place from %zu shards in %s "
+                 "(the page cache is the only copy; nothing pinned but the staging)\n",
+                 static_cast<long long>(rows), dtype.c_str(), static_cast<double>(table->scale()),
+                 table->shards(), dir.c_str());
+    ops::NgramPleHostTable::set_active(table);
+    opened.emplace(key, table);
+    return table;
+}
+
+/// A table read in place from a file of its own (the converter's --ple-table) can be checked
+/// against the chunked sha256 its artifact recorded, before anything reads its rows: several
+/// artifacts share the file, and a table quantised from another release, or a rewritten one,
+/// would serve every n-gram lookup wrongly without failing anywhere. Opt-in, since it reads the
+/// whole 28.8 GB file at load: SUROGATE_SERVE_VERIFY_EXTERNAL=1 (the chunks are hashed on several
+/// threads). The reader always checks the file's size against the artifact's record.
+void verify_external_table(const artifact::Reader& reader, const artifact::PayloadSpan& span,
+                           const char* name) {
+    if (span.source == 0) { return; } // stored in the artifact itself
+    const auto& files = reader.external_files();
+    if (span.source > files.size()) { throw artifact::ArtifactError(std::string(name) + ": unknown source"); }
+    const artifact::ExternalFile& file = files[span.source - 1];
+    if (file.sha256_chunks.empty() || file.sha256_chunk_bytes == 0) { return; }
+    if (const char* raw = std::getenv("SUROGATE_SERVE_VERIFY_EXTERNAL"); raw == nullptr || std::string_view(raw) != "1") {
+        return;
+    }
+    if (span.absolute_offset != 0 || span.data.size() != file.bytes) {
+        throw artifact::ArtifactError(std::string(name) + " does not cover its whole file " + file.path +
+                                      ", which its checksum is over");
+    }
+    // Every pipeline stage binds the whole artifact; the file is checked once per process.
+    static std::mutex verified_mutex;
+    static std::set<std::string> verified;
+    const std::lock_guard<std::mutex> lock(verified_mutex);
+    if (verified.contains(file.path + "@" + file.sha256_chunks)) { return; }
+    const auto started = std::chrono::steady_clock::now();
+    const std::size_t chunk  = static_cast<std::size_t>(file.sha256_chunk_bytes);
+    const std::size_t chunks = (span.data.size() + chunk - 1) / chunk;
+    std::vector<family::frontend_internal::Sha256Digest> digests(chunks);
+    const unsigned threads = std::max(1U, std::min({std::thread::hardware_concurrency() / 2, 16U,
+                                                    static_cast<unsigned>(chunks)}));
+    std::atomic<std::size_t> next{0};
+    std::vector<std::thread> workers;
+    for (unsigned t = 0; t < threads; ++t) {
+        workers.emplace_back([&] {
+            for (std::size_t i = next++; i < chunks; i = next++) {
+                const std::size_t begin = i * chunk;
+                const std::size_t bytes = std::min(chunk, span.data.size() - begin);
+                digests[i] = family::frontend_internal::sha256(std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(span.data.data()) + begin, bytes));
+            }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    std::vector<std::uint8_t> joined;
+    joined.reserve(chunks * 32);
+    for (const auto& digest : digests) { joined.insert(joined.end(), digest.begin(), digest.end()); }
+    const std::string actual = family::frontend_internal::sha256_hex(family::frontend_internal::sha256(
+        std::span<const std::uint8_t>(joined.data(), joined.size())));
+    if (actual != file.sha256_chunks) {
+        throw artifact::ArtifactError(std::string(name) + ": " + file.path + " does not match the checksum its "
+                                      "artifact recorded (sha256_chunks " + actual + ", expected " +
+                                      file.sha256_chunks + "); the table file has changed or is another one");
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::fprintf(stderr, "%s: %s verified (sha256_chunks over %zu chunks, %u threads, %.1f s)\n", name,
+                 file.path.c_str(), chunks, threads, seconds);
+    verified.insert(file.path + "@" + file.sha256_chunks);
+}
+
 // The shortlist's ids must be distinct tokens of the tokenizer: the proposal maps a row's
 // argmax back through them.
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle,
@@ -485,14 +668,28 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             {static_cast<std::uint64_t>(g.ple_table_rows), static_cast<std::uint64_t>(g.ple_head_dim)},
             TensorPlacement::ValidateOnly);
         {
-            const auto payload = binder.payload(out.ple_table).data;
+            const artifact::PayloadSpan span = binder.payload(out.ple_table);
+            const auto payload = span.data;
             const std::uint64_t expected = static_cast<std::uint64_t>(g.ple_table_rows) *
                                            g.ple_table_row_bytes();
             if (payload.size() != expected) {
                 throw artifact::ArtifactError("PLE table has " + std::to_string(payload.size()) +
                                               " bytes, expected " + std::to_string(expected));
             }
-            out.host_bank.objects.push_back({out.ple_table, payload, "text/ple/table.iq4nl"});
+            out.ple_host_table = open_host_table(g);
+        }
+        if (!out.ple_host_table) {
+            const artifact::PayloadSpan span = binder.payload(out.ple_table);
+            const auto payload = span.data;
+            verify_external_table(binder.reader(), span, "text/ple/table.iq4nl");
+            family::HostObjectPlan table{out.ple_table, payload, "text/ple/table.iq4nl"};
+            if (span.source != 0) {
+                // A file of its own (the converter's --ple-table), which several artifacts and
+                // every replica on the host read: the bank keeps one shared copy for all of them.
+                table.shared_file        = binder.reader().external_path(span.source).string();
+                table.shared_file_offset = span.absolute_offset;
+            }
+            out.host_bank.objects.push_back(std::move(table));
         }
 
     }
@@ -710,11 +907,16 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             ple.hash.head_offsets[h]     = plan.ple_head_offsets[static_cast<std::size_t>(h)];
             ple.hash.head_vocab_sizes[h] = plan.ple_head_vocab_sizes[static_cast<std::size_t>(h)];
         }
-        const HostObject& table = host_bank->object(plan.ple_table);
-        ple.table.rows          = table.device;
-        ple.table.row_count     = g.ple_table_rows;
-        ple.table.row_bytes     = g.ple_table_row_bytes();
-        ple.table.head_dim      = g.ple_head_dim;
+        ple.table.row_count = g.ple_table_rows;
+        ple.table.head_dim  = g.ple_head_dim;
+        if (plan.ple_host_table) {
+            ple.table.host      = plan.ple_host_table.get();
+            ple.table.row_bytes = plan.ple_host_table->row_bytes();
+        } else {
+            const HostObject& table = host_bank->object(plan.ple_table);
+            ple.table.rows          = table.device;
+            ple.table.row_bytes     = g.ple_table_row_bytes();
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/prefill_graph.h"
+#include "family/impl/runtime/qsa_dump.h"
 #include "family/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <api/family/vision_control.h>
 #include "api/ops/argmax.h"
+#include "api/ops/calibration.h"
 #include "api/ops/next_token_nll.h"
 #include "api/ops/sampled_logprob.h"
 #include "api/ops/sparse_moe.h"
@@ -677,6 +679,18 @@ void TextContext::mtp_prefill_trunk_block(const Tensor& ids, const Tensor& hidde
         if (!input_embeddings) { ops::embedding(ids, *embed_, embedding, s); }
         Tensor x = roots.residual;
         V::mtp_fold(weights_, embedding, hidden, x, work_, s);
+        if (ops::moe_stats_mtp_prompt()) {
+            // --moe-stats-out (api/ops/calibration.h): the head's block over every prompt column, as
+            // a trunk full-attention layer's prefill runs it -- every column's query attends over
+            // the head's cache and every column reaches the mixture -- so the statistics see the
+            // head's experts on prompts too. The proposal reads the last column as before.
+            mtp_prefill_trunk_block_all_columns<V>(x, block, positions, rope_positions, envelope);
+            if (final_hidden) {
+                CUDA_CHECK(cudaMemcpyAsync(final_hidden->data, x.slice(1, tokens - 1, 1).data,
+                                           final_hidden->bytes(), cudaMemcpyDeviceToDevice, s));
+            }
+            return;
+        }
         Tensor last_x = x.slice(1, tokens - 1, 1);
         {
             auto attention = work_.scope();
@@ -716,6 +730,53 @@ void TextContext::mtp_prefill_trunk_block(const Tensor& ids, const Tensor& hidde
         CUDA_CHECK(cudaMemcpyAsync(final_hidden->data, last_x.data, final_hidden->bytes(),
                                    cudaMemcpyDeviceToDevice, s));
     } else {
+        throw std::logic_error("this target's draft head is not a trunk block");
+    }
+}
+
+template <class V, class Block>
+void TextContext::mtp_prefill_trunk_block_all_columns(Tensor& x, const Block& block,
+                                                      const Tensor& positions,
+                                                      const Tensor& rope_positions,
+                                                      ops::GqaExecutionEnvelope envelope) {
+    if constexpr (mtp_block_is_trunk_layer<V>()) {
+        const int tokens = x.ne[1];
+        const auto& g    = cfg_geometry();
+        const auto s     = ctx_.stream;
+        {
+            auto attention = work_.scope();
+            const auto p = workspace_recipe::text_attention_projection(work_, g, tokens);
+            Tensor h = p.hidden, q = p.query, gate = p.gate, k = p.key, v = p.value;
+            Hooks::attention_norm(x, block.input_norm, cfg_.rms_eps, block.projection, h, work_, s);
+            V::attention_projection(h, block.projection, q, gate, k, v, Phase::Verify, work_, s);
+            const auto results = workspace_recipe::text_attention_results(work_, cfg_.q_size, cfg_.kv_size, tokens);
+            Tensor kn = results.normalized_key.view({cfg_.head_dim, cfg_.n_kv, tokens});
+            Tensor qn = results.normalized_query.view({cfg_.head_dim, cfg_.n_q, tokens});
+            ops::rmsnorm(k.view({cfg_.head_dim, cfg_.n_kv, tokens}), block.key_norm, cfg_.rms_eps,
+                         norm_unit_offset<V>(), kn, s);
+            ops::rmsnorm(q.view({cfg_.head_dim, cfg_.n_q, tokens}), block.query_norm, cfg_.rms_eps,
+                         norm_unit_offset<V>(), qn, s);
+            Tensor rope = contiguous_positions(text_rope_positions<V>(rope_positions), s);
+            rope_text(cfg_, rope, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
+            rope_text(cfg_, rope, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
+            ops::gqa_kv_append(kn, v.view({cfg_.head_dim, cfg_.n_kv, tokens}), positions,
+                               mtp_kv_.layer_view(0), s);
+            Tensor a = results.attention.view({cfg_.head_dim, cfg_.n_q, tokens});
+            ops::gqa_attention_cached(qn, positions, cfg_.attention_scale, mtp_kv_.layer_view(0),
+                                      envelope, work_, a, s);
+            if constexpr (kAttentionOutputGate) {
+                apply_attention_gate<V>(gate.view({cfg_.head_dim, cfg_.n_q, tokens}), a, s);
+            }
+            Hooks::attention_output(a.view({cfg_.q_size, tokens}), block.output, block.projection, x,
+                                     Phase::Verify, work_, s);
+        }
+        {
+            auto mixture = work_.scope();
+            mlp_tail(&block.post_attention_norm, MlpW{&block.post_mixer}, x, cfg_.n_layers,
+                     Phase::Verify);
+        }
+    } else {
+        (void)x; (void)block; (void)positions; (void)rope_positions; (void)envelope;
         throw std::logic_error("this target's draft head is not a trunk block");
     }
 }
@@ -1063,6 +1124,8 @@ Tensor TextContext::lm_head_view(const Tensor& stored, cudaStream_t stream) {
         if (stored.ne[0] == weights_.geometry.residual &&
             weights_.geometry.residual != cfg_.hidden) {
             Tensor collapsed = work_.alloc(DType::BF16, {cfg_.hidden, stored.ne[1]});
+            // A stored residual read again: its forward already sampled it (--residual-samples-out).
+            const ops::ResidualSampleQuiet quiet;
             Hooks::finish(weights_, stored, cfg_.rms_eps, collapsed, work_, stream);
             return collapsed;
         }
@@ -1524,6 +1587,15 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     } else {
         ops::gqa_attention_cached(qn, cache_positions, Tensor{}, kv_table_rows, cfg_.attention_scale,
                                   kv_view, layer_envelope, work_, a, s, selection);
+    }
+    // SUROGATE_SERVE_QSA_DUMP (qsa_dump.h): this layer's QSA inputs and outputs for the reference.
+    if (!mtp) {
+        ::sinfer::family::detail::qsa_dump_attention(
+            {.path = "attn_mix", .layer = layer, .columns = T, .sequence_batch = active_sequence_batch_,
+             .sequence_width = active_sequence_width_, .max_visible_keys = layer_envelope.max_visible_keys,
+             .owns_kv = owns_kv, .head_dim = layer_head_dim, .q_heads = cfg_.n_q, .kv_heads = layer_n_kv,
+             .attention_scale = cfg_.attention_scale},
+            h, cache_positions, rope_for_op, kv_table_rows, selection, qn, kn, v, a, s);
     }
     // A dense stack writes no gate rows; see attention_output_gate<Variant>().
     if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
@@ -2756,6 +2828,13 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                   io_.text_kv_table_row, cfg_.attention_scale,
                                                   kv_view, envelope, work_, aa, s, selection);
                     }
+                    ::sinfer::family::detail::qsa_dump_attention(
+                        {.path = "mixed_prompt", .layer = layer, .columns = len, .sequence_batch = 0,
+                         .sequence_width = len, .max_visible_keys = envelope.max_visible_keys, .owns_kv = owns_kv,
+                         .head_dim = layer_head_dim, .q_heads = cfg_.n_q, .kv_heads = layer_n_kv,
+                         .attention_scale = cfg_.attention_scale},
+                        h.slice(1, off, len), positions.slice(0, off, len), rope_all.slice(0, off, len),
+                        io_.text_kv_table_row, selection, qa, ka, va, aa, s);
                 }
                 if (!packed.empty()) {
                     ops::gqa_attention_packed_prompts(qn, owns_kv ? kn : Tensor{}, owns_kv ? v : Tensor{},

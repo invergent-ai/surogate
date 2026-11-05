@@ -218,6 +218,15 @@ class ShardReader:
         handle = self._open_shard(shard)
         return handle.get_tensor(self._stored_name(name))
 
+    def get_rows(self, name: str, begin: int, end: int) -> torch.Tensor:
+        """Rows [begin, end) of a tensor (negative indices count from its end), reading only them."""
+        name = self._resolve(name)
+        handle = self._open_shard(self.weight_map[name])
+        view = handle.get_slice(self._stored_name(name))
+        rows = view.get_shape()[0]
+        begin, end = (begin + rows if begin < 0 else begin), (end + rows if end < 0 else end)
+        return view[max(0, begin):min(rows, end)]
+
     def metadata(self, names: Iterable[str]) -> dict[str, TensorMetadata]:
         self.close()
         by_shard: dict[str, list[str]] = {}

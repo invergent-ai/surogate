@@ -14,13 +14,23 @@
 #include <mutex>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <variant>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <future>
 #include <thread>
@@ -55,6 +65,228 @@ std::size_t object_bytes(const HostObjectPlan& plan) {
         return total;
     }
     return plan.payload.size();
+}
+
+bool shared_host_files_enabled() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_SHARED_HOST_FILES");
+        return raw == nullptr || *raw == '\0' || std::string_view(raw) != "0";
+    }();
+    return enabled;
+}
+
+// One shared copy per host of a plain object read as it lies in an external file
+// (HostObjectPlan::shared_file). The copy is a tmpfs file named after the source file's identity
+// (device, inode, size, mtime) and the stretch; a creation lock serialises making it, so two
+// processes starting together make one copy, and a copy appears under its name only once it is
+// complete. Every process mapping it holds a shared flock on it for as long as it does, which is
+// what tells the last one out that it may remove it.
+std::string shared_host_dir() {
+    const char* raw = std::getenv("SUROGATE_SERVE_SHARED_HOST_DIR");
+    return raw != nullptr && *raw != '\0' ? std::string(raw) : std::string("/dev/shm");
+}
+
+int lock_exclusive(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) { return -1; }
+    if (::flock(fd, LOCK_EX) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+void unlock(int fd) {
+    if (fd < 0) { return; }
+    (void)::flock(fd, LOCK_UN);
+    ::close(fd);
+}
+
+// Under the creation lock: drop this process's hold on the copy, and remove the copy when no
+// other process holds it (the name may since name a newer copy, which is left alone).
+void release_shared_copy(int fd, const std::string& path, const std::string& lock_path) {
+    if (fd < 0) { return; }
+    const int lock = lock_exclusive(lock_path);
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        struct stat held {};
+        struct stat named {};
+        if (::fstat(fd, &held) == 0 && ::stat(path.c_str(), &named) == 0 &&
+            held.st_dev == named.st_dev && held.st_ino == named.st_ino) {
+            (void)::unlink(path.c_str());
+        }
+    }
+    ::close(fd);
+    unlock(lock);
+}
+
+// Copies of crashed creators (`<base>.<pid>.tmp` whose pid is gone), under the creation lock.
+void remove_stale_partials(const std::string& dir, const std::string& stem) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with(stem + ".") || !name.ends_with(".tmp")) { continue; }
+        const std::string middle = name.substr(stem.size() + 1, name.size() - stem.size() - 5);
+        char* end = nullptr;
+        const long pid = std::strtol(middle.c_str(), &end, 10);
+        if (end == middle.c_str() || *end != '\0' || pid <= 0) { continue; }
+        if (::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) {
+            (void)::unlink(entry.path().c_str());
+        }
+    }
+}
+
+void copy_threaded(std::byte* destination, const std::byte* source, std::size_t bytes) {
+    const std::size_t workers = 16;
+    const std::size_t chunk   = (bytes + workers - 1) / workers;
+    std::vector<std::jthread> threads;
+    threads.reserve(workers);
+    for (std::size_t w = 0; w < workers; ++w) {
+        const std::size_t begin = w * chunk;
+        if (begin >= bytes) { break; }
+        const std::size_t count = std::min(chunk, bytes - begin);
+        threads.emplace_back([=] { std::memcpy(destination + begin, source + begin, count); });
+    }
+}
+
+bool map_shared_file(const HostObjectPlan& source, HostObject& object) {
+    const bool plain = source.parts.empty() && source.q4_rows == 0 && source.q5_rows == 0 &&
+                       source.decode_rows == 0 && source.q8_rows == 0 && !source.generic_decode &&
+                       source.row_scales.empty() && source.swap_half_rows == 0;
+    if (source.shared_file.empty() || !plain || !shared_host_files_enabled()) { return false; }
+    const auto refuse = [&](const std::string& why) {
+        std::fprintf(stderr, "host bank: %s is copied into this process's own pinned memory: %s\n",
+                     source.name.c_str(), why.c_str());
+        return false;
+    };
+    if (source.payload.size() != object.bytes) { return refuse("its mapping is not one run"); }
+    struct stat file {};
+    if (::stat(source.shared_file.c_str(), &file) != 0) {
+        return refuse("cannot stat " + source.shared_file + ": " + std::strerror(errno));
+    }
+    // FNV-1a over what identifies these bytes on this host.
+    std::uint64_t key = 1469598103934665603ULL;
+    for (const std::uint64_t part :
+         {static_cast<std::uint64_t>(file.st_dev), static_cast<std::uint64_t>(file.st_ino),
+          static_cast<std::uint64_t>(file.st_size), static_cast<std::uint64_t>(file.st_mtim.tv_sec),
+          static_cast<std::uint64_t>(file.st_mtim.tv_nsec), source.shared_file_offset,
+          static_cast<std::uint64_t>(object.bytes)}) {
+        for (int byte = 0; byte < 8; ++byte) {
+            key ^= (part >> (8 * byte)) & 0xFFU;
+            key *= 1099511628211ULL;
+        }
+    }
+    char hex[17];
+    std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(key));
+    const std::string dir       = shared_host_dir();
+    const std::string stem      = "surogate-host-" + std::string(hex);
+    const std::string path      = dir + "/" + stem + ".bin";
+    const std::string lock_path = dir + "/" + stem + ".lock";
+
+    const int lock = lock_exclusive(lock_path);
+    if (lock < 0) { return refuse("cannot lock " + lock_path + ": " + std::strerror(errno)); }
+    remove_stale_partials(dir, stem);
+    bool created = false;
+    int fd       = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+        struct stat existing {};
+        if (::fstat(fd, &existing) != 0 || static_cast<std::size_t>(existing.st_size) != object.bytes) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+    void* mem = MAP_FAILED;
+    if (fd < 0) {
+        struct statvfs space {};
+        if (::statvfs(dir.c_str(), &space) != 0 ||
+            static_cast<std::uint64_t>(space.f_bavail) * space.f_frsize < object.bytes + (1ULL << 30)) {
+            unlock(lock);
+            return refuse(dir + " has no room for a " + std::to_string(object.bytes >> 30) + " GiB copy");
+        }
+        const std::string partial = dir + "/" + stem + "." + std::to_string(::getpid()) + ".tmp";
+        fd = ::open(partial.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(object.bytes)) != 0) {
+            const std::string why = std::strerror(errno);
+            if (fd >= 0) { ::close(fd); }
+            (void)::unlink(partial.c_str());
+            unlock(lock);
+            return refuse("cannot create " + partial + ": " + why);
+        }
+        mem = ::mmap(nullptr, object.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mem == MAP_FAILED) {
+            ::close(fd);
+            (void)::unlink(partial.c_str());
+            unlock(lock);
+            return refuse(std::string("mmap of the new copy: ") + std::strerror(errno));
+        }
+        copy_threaded(static_cast<std::byte*>(mem), source.payload.data(), object.bytes);
+        if (::rename(partial.c_str(), path.c_str()) != 0) {
+            const std::string why = std::strerror(errno);
+            (void)::munmap(mem, object.bytes);
+            ::close(fd);
+            (void)::unlink(partial.c_str());
+            unlock(lock);
+            return refuse("cannot publish " + path + ": " + why);
+        }
+        created = true;
+        // The file's own pages served the copy; the cache may give them back.
+        const int source_fd = ::open(source.shared_file.c_str(), O_RDONLY | O_CLOEXEC);
+        if (source_fd >= 0) {
+            (void)::posix_fadvise(source_fd, static_cast<off_t>(source.shared_file_offset),
+                                  static_cast<off_t>(object.bytes), POSIX_FADV_DONTNEED);
+            ::close(source_fd);
+        }
+    }
+    // Held before the creation lock is let go, so a process on its way out cannot remove the
+    // copy between this open and this hold.
+    (void)::flock(fd, LOCK_SH);
+    unlock(lock);
+    if (mem == MAP_FAILED) {
+        mem = ::mmap(nullptr, object.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mem == MAP_FAILED) {
+            const std::string why = std::strerror(errno);
+            release_shared_copy(fd, path, lock_path);
+            return refuse("mmap of " + path + ": " + why);
+        }
+    }
+    const auto give_back = [&](bool registered) {
+        if (registered) { (void)cudaHostUnregister(mem); }
+        (void)::munmap(mem, object.bytes);
+        release_shared_copy(fd, path, lock_path);
+        return false;
+    };
+    if (cudaHostRegister(mem, object.bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) !=
+        cudaSuccess) {
+        const cudaError_t error = cudaGetLastError();
+        give_back(false);
+        return refuse(std::string("cudaHostRegister of ") + path + ": " + cudaGetErrorString(error));
+    }
+    // A copy made by another process from another file under the same identity would serve
+    // every lookup wrongly; its ends must be the bytes this artifact maps.
+    const std::size_t probe = std::min<std::size_t>(object.bytes, 1U << 20);
+    const auto* bytes       = static_cast<const std::byte*>(mem);
+    if (std::memcmp(bytes, source.payload.data(), probe) != 0 ||
+        std::memcmp(bytes + object.bytes - probe, source.payload.data() + object.bytes - probe,
+                    probe) != 0) {
+        give_back(true);
+        return refuse(path + " does not hold the bytes the artifact maps");
+    }
+    void* mapped = nullptr;
+    if (cudaHostGetDevicePointer(&mapped, mem, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        give_back(true);
+        return refuse("no device pointer for " + path);
+    }
+    object.host        = mem;
+    object.device      = mapped;
+    object.registered  = true;
+    object.file_mapped = true;
+    object.shared_fd   = fd;
+    object.shared_path = path;
+    object.shared_lock = lock_path;
+    std::fprintf(stderr, "host bank: %s shared through %s (%.2f GiB, %s)\n", source.name.c_str(),
+                 path.c_str(), static_cast<double>(object.bytes) / static_cast<double>(1ULL << 30),
+                 created ? "made the copy" : "attached to the host's copy");
+    return true;
 }
 
 } // namespace
@@ -111,6 +343,11 @@ HostBank::HostBank(const HostBankPlan& plan) : HostBank() {
         // touch workers' faults, not this thread's, place the pages. cudaHostAlloc stays as
         // the fallback when any step refuses.
         object.host = nullptr;
+        if (map_shared_file(source, object)) {
+            total_bytes_ += object.bytes;
+            report(total_bytes_);
+            continue;
+        }
         {
             void* mem = ::mmap(nullptr, object.bytes, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -414,6 +651,9 @@ HostBank::~HostBank() {
         if (object.registered) {
             (void)cudaHostUnregister(object.host);
             (void)::munmap(object.host, object.bytes);
+            if (object.file_mapped) {
+                release_shared_copy(object.shared_fd, object.shared_path, object.shared_lock);
+            }
         } else {
             (void)cudaFreeHost(object.host);
         }

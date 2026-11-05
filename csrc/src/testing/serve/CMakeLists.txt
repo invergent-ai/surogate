@@ -128,6 +128,7 @@ sinfer_add_op_test(sinfer_marlin_moe_reduce_test SOURCES ops/test_marlin_moe_red
 sinfer_add_op_test(sinfer_nvfp4_marlin_test SOURCES ops/test_nvfp4_marlin.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_fp8_sm90_test SOURCES ops/test_sparse_moe_fp8_sm90.cu LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_segments.cpp LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_ngram_ple_host_table_test SOURCES ops/test_ngram_ple_host_table.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)
   sinfer_add_op_test(${name}
@@ -645,6 +646,16 @@ set_tests_properties(sinfer_sparse_moe_width_invariance_test PROPERTIES SKIP_RET
 add_test(NAME sinfer_sparse_moe_qwen3_vl_235b_test
     COMMAND sinfer_sparse_moe_test --qwen3-vl-235b)
 set_tests_properties(sinfer_sparse_moe_qwen3_vl_235b_test PROPERTIES SKIP_RETURN_CODE 77)
+# Calibration statistics for expert pruning (api/ops/calibration.h): the observing hook leaves the
+# served round alone, the probe rounds decompose it on every route, and the dumped statistics are
+# the rounds' own -- for the Flash-Next teacher's mixture and each student's.
+sinfer_add_op_test(sinfer_moe_stats_test
+    SOURCES ops/test_moe_stats.cu
+    LIBRARIES sinfer_ops)
+foreach(experts 512 192 160)
+  add_test(NAME sinfer_moe_stats_${experts}_test COMMAND sinfer_moe_stats_test --geometry ${experts})
+  set_tests_properties(sinfer_moe_stats_${experts}_test PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 sinfer_add_op_test(sinfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES sinfer_ops)

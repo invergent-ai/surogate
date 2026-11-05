@@ -1,6 +1,7 @@
 #include "family/impl/lora_gdn.h"
 #include "targets/qwen4exp/impl/variant.h"
 
+#include "api/ops/calibration.h"
 #include "family/impl/lora_hook.h"
 #include "family/impl/storage_workspace.h"
 #include "ops/sparse_moe/shared.h"
@@ -13,6 +14,7 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "api/ops/linear.h"
 #include "api/ops/ngram_ple.h"
+#include "api/ops/ngram_ple_host_table.h"
 #include "api/ops/scatter.h"
 #include "api/ops/sparse_moe.h"
 #include "core/device.h"
@@ -25,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -115,20 +118,41 @@ graph_profiles_through(std::uint32_t max_frontier, const std::vector<std::uint32
 std::size_t round_up(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 // Debug parity dumps: SUROGATE_SERVE_DUMP_RESIDUAL=<dir> writes the residual streams before
-// every layer and the final mixed hidden state of the first forwards with at most 64 columns,
-// as raw BF16 with a 16-byte header {magic, rows, columns, forward}. Synchronises the stream.
+// every layer, the per-block intermediates of the first layers and the final mixed hidden state
+// of the first eagerly executed forwards, as raw BF16/FP32 with a 16-byte header {magic, rows,
+// columns, forward}. Synchronises the stream; forwards under graph capture are never dumped.
+// The defaults (forwards of at most 64 columns, the first two such forwards, block dumps for
+// layers 0-1) can be changed with SUROGATE_SERVE_DUMP_MAX_COLUMNS, SUROGATE_SERVE_DUMP_FORWARDS,
+// SUROGATE_SERVE_DUMP_BLOCK_LAYERS (block dumps for layers <= this) and
+// SUROGATE_SERVE_DUMP_MAX_LAYER (residual dumps before layers <= this). With
+// SUROGATE_SERVE_DUMP_ARM=<file> a forward is dumped only while that file exists, so a test can
+// skip whatever the engine runs before its own request.
 struct ResidualDump {
     std::string dir;
-    int forward = 0;
-    int limit   = 0;
+    std::string arm;
+    int forward      = 0;
+    int limit        = 0;
+    int max_columns  = 64;
+    int block_layers = 1;
+    int max_layer    = 1 << 30;
+    bool active      = false; // the current forward is being dumped
 };
+
+int env_int(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    return raw != nullptr && *raw ? std::atoi(raw) : fallback;
+}
 
 ResidualDump& residual_dump() {
     static ResidualDump dump = [] {
         ResidualDump out;
         if (const char* raw = std::getenv("SUROGATE_SERVE_DUMP_RESIDUAL"); raw != nullptr && *raw) {
-            out.dir   = raw;
-            out.limit = 2;
+            out.dir          = raw;
+            out.limit        = env_int("SUROGATE_SERVE_DUMP_FORWARDS", 2);
+            out.max_columns  = env_int("SUROGATE_SERVE_DUMP_MAX_COLUMNS", 64);
+            out.block_layers = env_int("SUROGATE_SERVE_DUMP_BLOCK_LAYERS", 1);
+            out.max_layer    = env_int("SUROGATE_SERVE_DUMP_MAX_LAYER", 1 << 30);
+            if (const char* arm = std::getenv("SUROGATE_SERVE_DUMP_ARM"); arm != nullptr) { out.arm = arm; }
         }
         return out;
     }();
@@ -149,43 +173,69 @@ void dump_tensor(const Tensor& tensor, const std::string& name, int forward, cud
     std::fclose(file);
 }
 
-// Layer 0's prologue marks the start of a forward; the layer index is kept for the
-// per-block intermediate dumps of the first two layers.
-int g_dump_layer = -1;
-int g_dump_block = 0; // mixes seen in the current layer: 0 = mixer block, 1 = MLP block
+// Layer 0's prologue marks the start of a forward and decides whether it is dumped; the layer
+// index is kept for the per-block intermediate dumps. Per thread, so the stages of a pipeline
+// (each on its own thread) do not relabel each other's blocks.
+thread_local int g_dump_layer = -1;
+thread_local int g_dump_block = 0; // mixes seen in the current layer: 0 = mixer block, 1 = MLP block
 
 void maybe_dump_layer(int layer, const Tensor& residual, cudaStream_t stream) {
     ResidualDump& dump = residual_dump();
-    if (dump.dir.empty() || residual.ne[1] > 64) { return; }
-    if (layer == 0) { dump.forward += 1; }
+    if (dump.dir.empty()) { return; }
+    if (layer == 0) {
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+        dump.active = capturing == cudaStreamCaptureStatusNone && residual.ne[1] <= dump.max_columns &&
+                      dump.forward < dump.limit &&
+                      (dump.arm.empty() || std::filesystem::exists(dump.arm));
+        if (dump.active) { dump.forward += 1; }
+    }
     g_dump_layer = layer;
     g_dump_block = 0;
-    if (dump.forward > dump.limit) { return; }
+    if (!dump.active || layer > dump.max_layer) { return; }
     dump_tensor(residual, "f" + std::to_string(dump.forward) + "_layer" + std::to_string(layer),
                 dump.forward, stream);
 }
 
+bool block_dump_wanted() {
+    const ResidualDump& dump = residual_dump();
+    return dump.active && g_dump_layer >= 0 && g_dump_layer <= dump.block_layers;
+}
+
 void maybe_dump_block(const char* tag, const Tensor& tensor, cudaStream_t stream) {
-    ResidualDump& dump = residual_dump();
-    if (dump.dir.empty() || tensor.ne[1] > 64 || dump.forward > dump.limit || g_dump_layer < 0 ||
-        g_dump_layer > 1) {
-        return;
-    }
+    if (!block_dump_wanted()) { return; }
     dump_tensor(tensor,
-                "f" + std::to_string(dump.forward) + "_L" + std::to_string(g_dump_layer) +
+                "f" + std::to_string(residual_dump().forward) + "_L" + std::to_string(g_dump_layer) +
                     (g_dump_block == 0 ? "_mixer_" : "_mlp_") + tag,
-                dump.forward, stream);
+                residual_dump().forward, stream);
 }
 
 void maybe_dump_final(const Tensor& hidden, cudaStream_t stream) {
     ResidualDump& dump = residual_dump();
-    if (dump.dir.empty() || hidden.ne[1] > 64 || dump.forward > dump.limit) { return; }
+    if (!dump.active) { return; }
     dump_tensor(hidden, "f" + std::to_string(dump.forward) + "_final", dump.forward, stream);
 }
 
 std::size_t plane_bytes(std::int32_t rows, std::int32_t tokens, DType dtype) {
     return round_up(static_cast<std::size_t>(rows) * static_cast<std::size_t>(tokens) *
                     dtype_size(dtype));
+}
+
+// Calibration residual samples (api/ops/calibration.h, --residual-samples-out): the residual
+// entering every layer group -- layer 0 and each layer after a full-attention one, so the groups
+// are the GGGA blocks -- and the final residual, the last group's output.
+bool starts_group(const family::TextGeometry& g, int layer) {
+    return layer == 0 || g.layer_attends(layer - 1);
+}
+
+std::int32_t group_boundary(const family::TextGeometry& g, int layer) {
+    std::int32_t index = 0;
+    for (int earlier = 0; earlier < layer; ++earlier) { index += starts_group(g, earlier) ? 1 : 0; }
+    return index;
+}
+
+std::int32_t group_boundaries(const family::TextGeometry& g) {
+    return group_boundary(g, g.layers) + 1;
 }
 
 std::size_t mix_capacity(const family::TextGeometry& g, std::int32_t first, std::int32_t last) {
@@ -249,7 +299,9 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
         throw std::logic_error("qwen4exp: combine without a matching mix");
     }
     if (family::ExpertCache::pool_floor() == 0) {
+        maybe_dump_block("blockout", block_output, stream);
         ops::hyper_connection_combine(block_output, t_inject, residual, stream);
+        maybe_dump_block("combined", residual, stream);
         g_dump_block += 1;
         check_device_handoff("the inject gates", t_inject_device);
         t_inject_device = -1;
@@ -357,11 +409,27 @@ void Variant::prewarm_device_scratch(const family::TextGeometry& g) {
     if (family::ExpertCache::pool_floor() != 0) {
         (void)family::ExpertCache::for_current_device(moe_geometry(g), g.layers + g.mtp_layers);
     }
+    // SUROGATE_SERVE_NGRAM_TABLE: the host table's staging on this device, before any capture,
+    // for forwards of up to SUROGATE_SERVE_NGRAM_TABLE_COLUMNS columns (default 16,384).
+    if (g.ple_ngram) {
+        if (const auto table = ops::NgramPleHostTable::active()) {
+            const char* raw = std::getenv("SUROGATE_SERVE_NGRAM_TABLE_COLUMNS");
+            const std::int64_t columns = raw != nullptr && *raw ? std::atoll(raw) : 16384;
+            table->prepare(columns * g.ple_heads());
+        }
+    }
+    // --moe-stats-out: this device's accumulators, one row per mixture (the draft head's last).
+    ops::moe_stats_prepare_device(g.layers + g.mtp_layers, g.layers, g.experts, g.experts_per_token,
+                                  g.hidden);
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
     const auto& g = model.geometry;
+    if (ops::residual_samples_enabled()) {
+        const std::int32_t boundaries = group_boundaries(g);
+        ops::residual_sample(boundaries - 1, boundaries, g.layers, residual, Tensor{}, stream);
+    }
     ops::hyper_connection_mix(residual, model.output_mix, g.hc_streams, g.rms_epsilon, hidden, nullptr,
                               workspace, stream);
     maybe_dump_final(hidden, stream);
@@ -385,6 +453,10 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
                              cudaStream_t stream) {
     const auto& g = model.geometry;
     maybe_dump_layer(layer, residual, stream);
+    if (ops::residual_samples_enabled() && starts_group(g, layer)) {
+        ops::residual_sample(group_boundary(g, layer), group_boundaries(g), layer, residual,
+                             columns.ids, stream);
+    }
     if (layer != model.ple.layer) { return; }
     if (ple_state == nullptr || ple_state->empty()) {
         throw std::logic_error("qwen4exp: the PLE layer needs its state pool");
@@ -401,13 +473,11 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
 }
 
 void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t /*layer_count*/, cudaStream_t stream) {
-    ResidualDump& dump = residual_dump();
-    if (dump.dir.empty() || dump.forward > dump.limit || g_dump_layer < 0 || g_dump_layer > 1) {
-        return;
-    }
+    if (!block_dump_wanted()) { return; }
+    const ResidualDump& dump = residual_dump();
     // Flatten to [ne0, rest] so the dump header describes the payload.
     const std::int64_t rest = tensor.numel() / tensor.ne[0];
-    if (rest > 8192) { return; }
+    if (rest > (1 << 20)) { return; }
     Tensor flat = tensor.view({tensor.ne[0], static_cast<std::int32_t>(rest)});
     dump_tensor(flat,
                 "f" + std::to_string(dump.forward) + "_L" + std::to_string(g_dump_layer) +
@@ -683,14 +753,27 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                                         weights.gate_up_planes, weights.down_planes,
                                         weights.host_gate_up, weights.host_down},
                   hidden, output, workspace, stream);
+        // The expert cache's rounds carry its own hook; --moe-stats-out leaves them unobserved
+        // and says so in the dump.
+        ops::moe_stats_note_unobserved(weights.layer);
     } else {
         const ops::SparseMoeRouting routing = family::moe_routing(phase);
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype,
             weights.op.routed_down.qtype, tokens, tokens, routing, ops::detail::native_shared(weights.op)));
         WorkspaceArena leaf(storage);
+        // --moe-stats-out: the served round records its routing through a hook that rewrites
+        // nothing; with norms, probe rounds of the same kernels then measure each selected
+        // expert's own output (api/ops/calibration.h). Both are absent otherwise.
+        ops::MoeStatsObserver observer;
+        const ops::SparseMoeRoundHook hook = ops::moe_stats_enabled()
+                                                 ? ops::moe_stats_observer(weights.layer, observer)
+                                                 : ops::SparseMoeRoundHook{};
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
-                        stream, ops::SparseMoeRoundHook{}, routing);
+                        stream, hook, routing);
+        if (ops::moe_stats_norms()) {
+            ops::moe_stats_probe(weights.layer, hidden, weights.op, routing, leaf, workspace, stream);
+        }
     }
     combine_into(output, residual, stream);
 }
@@ -788,7 +871,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     };
     auto peak = family::text_layers_workspace(g, family::WorkspaceLayers::All, capacity);
     if (g.mtp_layers) { peak = std::max(peak, capacity("mtp/layer/")); }
-    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) + round_up(peak);
+    // --moe-stats-out with norms: the probe rounds' output plane and the kept slot of each column.
+    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) + round_up(peak) +
+           ops::moe_stats_probe_workspace_bytes(g.hidden, last);
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {

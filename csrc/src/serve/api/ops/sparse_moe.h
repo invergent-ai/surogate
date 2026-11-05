@@ -106,6 +106,17 @@ inline constexpr SparseMoeGeometry kSparseMoeQwen35_122BGeometry{
 /// width.
 inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{
     2560, 512, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, true, 640};
+/// Qwen3.8-Flash-Next students (rl/flash-next-student-2026-10-31/RECIPE.md section 3.2): the
+/// teacher's mixture with whole experts dropped, the same count in every layer and in the draft
+/// head -- 192 (S-A), 160 (S-B) or 128 (S-C) of the 512. Width, top-10, expert width and the gated
+/// shared expert stay the teacher's. Their kernels live in their own translation units
+/// (`*_students.cu`), so they compile beside the other mixtures rather than after them.
+inline constexpr SparseMoeGeometry kSparseMoeFlashNext192Geometry{
+    2560, 192, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, true, 640};
+inline constexpr SparseMoeGeometry kSparseMoeFlashNext160Geometry{
+    2560, 160, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, true, 640};
+inline constexpr SparseMoeGeometry kSparseMoeFlashNext128Geometry{
+    2560, 128, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, true, 640};
 /// Qwen3-30B-A3B: 128 experts, top-8, FFN 768, hidden 2048, and no shared expert at all -- the
 /// first registered mixture that routes every token entirely.
 inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{
@@ -140,12 +151,20 @@ inline constexpr SparseMoeGeometry kSparseMoeLfm2Moe64Geometry{
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
-inline constexpr std::array<SparseMoeGeometry, 9> kSparseMoeGeometries{
+inline constexpr std::array<SparseMoeGeometry, 12> kSparseMoeGeometries{
     kSparseMoeQwen36Geometry, kSparseMoeQwen35_122BGeometry, kSparseMoeFlashNextGeometry,
     kSparseMoeQwen3MoeGeometry,
     kSparseMoeQwen3Moe235BGeometry,
     kSparseMoeGlm53Geometry, kSparseMoeGemma4Geometry,
-    kSparseMoeLfm2Moe32Geometry, kSparseMoeLfm2Moe64Geometry};
+    kSparseMoeLfm2Moe32Geometry, kSparseMoeLfm2Moe64Geometry,
+    kSparseMoeFlashNext192Geometry, kSparseMoeFlashNext160Geometry,
+    kSparseMoeFlashNext128Geometry};
+
+/// The Flash-Next student mixtures, whose kernels are compiled in the `*_students.cu` units.
+[[nodiscard]] constexpr bool sparse_moe_flash_next_student(const SparseMoeGeometry& geometry) noexcept {
+    return geometry == kSparseMoeFlashNext192Geometry || geometry == kSparseMoeFlashNext160Geometry ||
+           geometry == kSparseMoeFlashNext128Geometry;
+}
 
 struct SparseMoeWeights {
     Weight router_shared_gate;
@@ -391,6 +410,21 @@ struct SparseMoeRoundHook {
                     std::int32_t tokens, cudaStream_t stream) = nullptr;
     void* capture_context     = nullptr;
     std::int32_t capture_base = 0;
+    /// Calibration statistics (surogate serve --moe-stats-out, api/ops/calibration.h): called once
+    /// a round's selection is final -- after `resolve` and `capture` -- with the round's device ids
+    /// and FP32 router weights (`alpha`), both [experts_per_token, tokens] with the top-k
+    /// contiguous per token, its FP32 shared-expert scales ([tokens]; null where the mixture has no
+    /// always-on expert), the round's first column within the outermost sparse_moe call
+    /// (`capture_base` plus the round's offset) and its column count, before any expert kernel of
+    /// the round reads them. It may rewrite `alpha` and `shared_scale` in place, which changes
+    /// what the round adds to its destination; it never changes which path runs or which experts
+    /// are selected: path selection reads `resolve`/`resolve_experts` only. With `alpha` set to a
+    /// one-hot over one slot and `shared_scale` to zero, the round's output is that slot's
+    /// unweighted expert output, computed by the same kernels as the served round. It must only
+    /// enqueue work on `stream` (it runs at launch time, also during graph capture).
+    void (*reweight)(void* context, const Tensor& ids, float* alpha, float* shared_scale,
+                     std::int32_t first_token, std::int32_t tokens, cudaStream_t stream) = nullptr;
+    void* reweight_context = nullptr;
 };
 
 /// Where a layer's routing is copied when the runtime captures routing: `ids` has room for

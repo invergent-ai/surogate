@@ -10,15 +10,21 @@
 //   - BF16 projections through every public entry a projection takes: Linear, Linear-add, the
 //     registered 27B shape whose own kernels change with T, and the raw cuBLASLt-route call.
 //   - The fused GDN norm + gating projection at the Qwen3.5-0.8B shape (16 heads, 1024 rows).
+//   - The low-rank hyper-connection mixer at the Qwen3.8-Flash-Next shape (four streams over
+//     2560, low rank 320), with BF16 projections (whose up projection changes kernels at 128
+//     tokens, both in the fixed-order chain) and with W8 row-split ones, which run the mixer's own
+//     kernels up to 64 tokens unless the switch sends them to the fixed-order GEMM.
 
 #include "api/ops/batch_invariant.h"
 #include "api/ops/gdn_gating_proj.h"
+#include "api/ops/hyper_connection.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 
 #include <cmath>
 #include <cstdint>
@@ -287,6 +293,180 @@ int check_gdn_gating() {
     return failures;
 }
 
+// A BF16 [n,k] matrix in device memory as the mixer binds it.
+Weight bf16_matrix(void* data, std::int32_t n, std::int32_t k) {
+    Weight weight;
+    weight.qtype           = QType::BF16_CTRL;
+    weight.layout          = QuantLayout::Contiguous;
+    weight.payload         = data;
+    weight.qdata           = data;
+    weight.payload_bytes   = static_cast<std::uint64_t>(n) * k * sizeof(std::uint16_t);
+    weight.ndim            = 2;
+    weight.n               = n;
+    weight.k               = k;
+    weight.shape[0]        = n;
+    weight.shape[1]        = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    return weight;
+}
+
+std::vector<std::uint8_t> bf16_bytes(const std::vector<float>& values) {
+    std::vector<std::uint8_t> bytes(values.size() * sizeof(std::uint16_t));
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const std::uint16_t bits = f32_to_bf16(values[i]);
+        std::memcpy(bytes.data() + i * sizeof(std::uint16_t), &bits, sizeof(bits));
+    }
+    return bytes;
+}
+
+// The hyper-connection mixer: one token's output is its mixed block input (BF16 [hidden]) and its
+// inject gates (FP32 [streams]). The oracle is the op's documented math in FP64 with the BF16
+// roundings its contract stores (api/ops/hyper_connection.h; test_hyper_connection.cpp).
+int check_hyper_connection(bool w8) {
+    constexpr std::int32_t kStreams = 4;
+    constexpr std::int32_t kHidden  = 2560;
+    constexpr std::int32_t kRank    = 320;
+    constexpr std::int32_t kWidth   = kStreams * kHidden;
+    constexpr double kEps           = 1.0e-6;
+    const std::uint32_t seed        = w8 ? 151U : 131U;
+    std::vector<float> residual(static_cast<std::size_t>(kWidth) * kTokens);
+    std::vector<float> gamma(kWidth);
+    std::vector<float> down(static_cast<std::size_t>(kRank) * kWidth);
+    std::vector<float> up(static_cast<std::size_t>(kWidth) * kRank);
+    std::vector<float> inject_w(static_cast<std::size_t>(kStreams) * kWidth);
+    fill_uniform(residual, seed, -3.0F, 3.0F);
+    fill_uniform(gamma, seed + 1, 0.5F, 1.5F);
+    fill_uniform(down, seed + 2, -0.02F, 0.02F);
+    fill_uniform(up, seed + 3, -0.05F, 0.05F);
+    fill_uniform(inject_w, seed + 4, -0.02F, 0.02F);
+    round_to_bf16(residual);
+    round_to_bf16(down);
+    round_to_bf16(up);
+    round_to_bf16(inject_w);
+    quantized_weight::PackedWeight down_packed;
+    quantized_weight::PackedWeight up_packed;
+    std::vector<std::uint8_t> down_bytes;
+    std::vector<std::uint8_t> up_bytes;
+    if (w8) {
+        down_packed = quantized_weight::pack_w8g32_row_split(down, kRank, kWidth);
+        up_packed   = quantized_weight::pack_w8g32_row_split(up, kWidth, kRank);
+        down_bytes  = down_packed.payload;
+        up_bytes    = up_packed.payload;
+        // The oracle multiplies the BF16 rounding of each dequantised value, as every A16 W8 GEMM.
+        down = down_packed.dequant;
+        up   = up_packed.dequant;
+        round_to_bf16(down);
+        round_to_bf16(up);
+    } else {
+        down_bytes = bf16_bytes(down);
+        up_bytes   = bf16_bytes(up);
+    }
+    DeviceBuffer d_residual = to_device_bf16(residual);
+    DeviceBuffer d_gamma    = to_device(gamma);
+    DeviceBuffer d_down     = to_device(down_bytes);
+    DeviceBuffer d_up       = to_device(up_bytes);
+    DeviceBuffer d_inject_w = to_device_bf16(inject_w);
+    const ops::HyperConnectionWeights weights{
+        Tensor(d_gamma.p, DType::FP32, {kWidth}),
+        w8 ? down_packed.device_weight(d_down.p) : bf16_matrix(d_down.p, kRank, kWidth),
+        w8 ? up_packed.device_weight(d_up.p) : bf16_matrix(d_up.p, kWidth, kRank),
+        bf16_matrix(d_inject_w.p, kStreams, kWidth)};
+    WorkspaceArena arena(
+        ops::hyper_connection_mix_workspace_capacity_bytes(kStreams, kHidden, kRank, 1, kTokens));
+
+    constexpr std::size_t kMixedBytes  = kHidden * sizeof(std::uint16_t);
+    constexpr std::size_t kColumnBytes = kMixedBytes + kStreams * sizeof(float);
+    const auto run = [&](std::int32_t first, std::int32_t count) {
+        auto* base = static_cast<std::uint16_t*>(d_residual.p);
+        Tensor x(base + static_cast<std::size_t>(first) * kWidth, DType::BF16, {kWidth, count});
+        DeviceBuffer mixed(static_cast<std::size_t>(kHidden) * count * sizeof(std::uint16_t));
+        DeviceBuffer inject(static_cast<std::size_t>(kStreams) * count * sizeof(float));
+        Tensor mixed_t(mixed.p, DType::BF16, {kHidden, count});
+        Tensor inject_t(inject.p, DType::FP32, {kStreams, count});
+        ops::hyper_connection_mix(x, weights, kStreams, static_cast<float>(kEps), mixed_t,
+                                  &inject_t, arena, nullptr);
+        cuda_synchronize();
+        const auto m = from_device<std::uint16_t>(mixed, static_cast<std::size_t>(kHidden) * count);
+        const auto g = from_device<float>(inject, static_cast<std::size_t>(kStreams) * count);
+        std::vector<std::uint8_t> packed(kColumnBytes * static_cast<std::size_t>(count));
+        for (std::int32_t c = 0; c < count; ++c) {
+            std::uint8_t* at = packed.data() + kColumnBytes * static_cast<std::size_t>(c);
+            std::memcpy(at, m.data() + static_cast<std::size_t>(c) * kHidden, kMixedBytes);
+            std::memcpy(at + kMixedBytes, g.data() + static_cast<std::size_t>(c) * kStreams,
+                        kStreams * sizeof(float));
+        }
+        return packed;
+    };
+    const std::string label = std::string("batch-invariant hyper_connection_mix ") +
+                              (w8 ? "W8" : "BF16") + " [4 x 2560, rank 320]";
+    int failures = check_widths(label, kColumnBytes, run);
+
+    // Still the mixer's math: tokens run alone against the FP64 oracle.
+    std::vector<double> got_mixed;
+    std::vector<double> want_mixed;
+    std::vector<double> got_inject;
+    std::vector<double> want_inject;
+    for (const std::int32_t token : {0, 151, kTokens - 1}) {
+        const std::vector<std::uint8_t> column = run(token, 1);
+        const float* x = residual.data() + static_cast<std::size_t>(token) * kWidth;
+        std::vector<double> n(kWidth);
+        std::vector<double> operand(kWidth);
+        for (std::int32_t s = 0; s < kStreams; ++s) {
+            double sum_sq = 0.0;
+            for (std::int32_t d = 0; d < kHidden; ++d) {
+                sum_sq += static_cast<double>(x[s * kHidden + d]) * x[s * kHidden + d];
+            }
+            const double inv = 1.0 / std::sqrt(sum_sq / kHidden + kEps);
+            for (std::int32_t d = 0; d < kHidden; ++d) {
+                const std::int32_t i = s * kHidden + d;
+                n[static_cast<std::size_t>(i)]       = x[i] * inv * gamma[static_cast<std::size_t>(i)];
+                operand[static_cast<std::size_t>(i)] = bf16_to_f32(f32_to_bf16(static_cast<float>(n[static_cast<std::size_t>(i)])));
+            }
+        }
+        std::vector<double> low(kRank);
+        for (std::int32_t r = 0; r < kRank; ++r) {
+            double dot = 0.0;
+            for (std::int32_t i = 0; i < kWidth; ++i) {
+                dot += down[static_cast<std::size_t>(r) * kWidth + i] * operand[static_cast<std::size_t>(i)];
+            }
+            const double v = bf16_to_f32(f32_to_bf16(static_cast<float>(dot))) / kStreams;
+            low[static_cast<std::size_t>(r)] = bf16_to_f32(f32_to_bf16(static_cast<float>(v / (1.0 + std::exp(-v)))));
+        }
+        std::vector<std::uint16_t> mixed_bits(kHidden);
+        std::memcpy(mixed_bits.data(), column.data(), kMixedBytes);
+        std::vector<float> gates(kStreams);
+        std::memcpy(gates.data(), column.data() + kMixedBytes, kStreams * sizeof(float));
+        for (std::int32_t d = 0; d < kHidden; ++d) {
+            double acc = 0.0;
+            for (std::int32_t s = 0; s < kStreams; ++s) {
+                const std::int32_t i = s * kHidden + d;
+                double logit = 0.0;
+                for (std::int32_t r = 0; r < kRank; ++r) {
+                    logit += up[static_cast<std::size_t>(i) * kRank + r] * low[static_cast<std::size_t>(r)];
+                }
+                const double rounded = bf16_to_f32(f32_to_bf16(static_cast<float>(logit)));
+                acc += n[static_cast<std::size_t>(i)] / (1.0 + std::exp(-rounded));
+            }
+            got_mixed.push_back(bf16_to_f32(mixed_bits[static_cast<std::size_t>(d)]));
+            want_mixed.push_back(acc / kStreams);
+        }
+        for (std::int32_t row = 0; row < kStreams; ++row) {
+            double dot = 0.0;
+            for (std::int32_t i = 0; i < kWidth; ++i) {
+                dot += inject_w[static_cast<std::size_t>(row) * kWidth + i] * n[static_cast<std::size_t>(i)];
+            }
+            got_inject.push_back(gates[static_cast<std::size_t>(row)]);
+            want_inject.push_back(2.0 / (1.0 + std::exp(-dot / kStreams)));
+        }
+    }
+    failures += verify_pointwise((label + " oracle mixed").c_str(), got_mixed, want_mixed,
+                                 PointwiseCriterion{3.0e-3, 1.0e-2});
+    failures += verify_pointwise((label + " oracle inject").c_str(), got_inject, want_inject,
+                                 PointwiseCriterion{2.0e-5, 2.0e-5});
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +486,8 @@ int main() {
         failures += check_projection(1000, 72, 23U);
         failures += check_projection(5120, 6144, 29U);
         failures += check_gdn_gating();
+        failures += check_hyper_connection(false);
+        failures += check_hyper_connection(true);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " batch-invariant Ops\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -1,10 +1,13 @@
 """The NVFP4 safetensors release of a hyper-connected hybrid converts with its words intact."""
 
+import hashlib
 import json
 import math
+import re
 
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from surogate.serve.artifact.container import Artifact
@@ -17,20 +20,24 @@ from tests.serve.test_qwen4exp_checkpoint_config import config_for
 PARTS, PART_ROWS = 2, 100
 
 
-def _release(path, *, mtp=False):
-    """A tiny ModelOpt export: NVFP4 experts, one FP8 n-gram table, BF16 everything else, and
-    with `mtp` a NextN head whose experts are FP8 with 128 x 128 block scales."""
+def _release(path, *, mtp=False, vision=True, table=True, scale=0.002, seed=5):
+    """A tiny ModelOpt export: NVFP4 experts, one FP8 n-gram table, BF16 everything else (a
+    vision tower among it), and with `mtp` a NextN head whose experts are FP8 with 128 x 128
+    block scales. Without `table` it is a checkpoint that references its teacher's n-gram table:
+    the hash arrays without the FP8 shards."""
     config = config_for(vision=True, mtp=mtp)
     text = config["text_config"]
     text["split_ngram_parts"] = PARTS
-    g = inv.geometry_from_config(checkpoint.text_config(config, mtp=mtp), ple_table_rows=PARTS * PART_ROWS,
-                                 token_domain=500)
-    generator = torch.Generator().manual_seed(5)
+    g = inv.geometry_from_config(checkpoint.geometry_config(config, mtp=mtp, vision=vision),
+                                 ple_table_rows=PARTS * PART_ROWS, token_domain=500)
+    generator = torch.Generator().manual_seed(seed)
     tensors = {}
-    recipes = checkpoint.build_recipes(g) + (checkpoint.build_mtp_recipes(g) if mtp else ())
+    recipes = (checkpoint.build_recipes(g) + (checkpoint.build_mtp_recipes(g) if mtp else ())
+               + (checkpoint.build_vision_tower_recipes(g) if vision else ()))
     for name, item in source_requirements(recipes).items():
-        tensors[name.replace("model.", "model.language_model.", 1) if name.startswith("model.") else name] = (
-            torch.randn(item.shape, generator=generator) * 0.1).to(torch.bfloat16)
+        stored = name.replace("model.", "model.language_model.", 1) if (
+            name.startswith("model.") and not name.startswith("model.visual.")) else name
+        tensors[stored] = (torch.randn(item.shape, generator=generator) * 0.1).to(torch.bfloat16)
     quantized = {}
     if mtp:
         quantized[checkpoint.MTP_EXPERTS] = {"quant_algo": "FP8_PB_WO", "group_size": 128}
@@ -60,15 +67,18 @@ def _release(path, *, mtp=False):
                 tensors[base + "input_scale"] = input_scale.clone() * (2 if projection == "down_proj" else 1)
     ple = f"model.language_model.layers.{g.ple_layer}.ple.ple_embedding."
     quantized[ple.removesuffix(".") + ".ngram_embedding"] = {"quant_algo": "FP8"}
+    # The table's rows come from their own generator, so a checkpoint made with another `seed`
+    # (a student of this one) shares them.
+    table_rows = torch.Generator().manual_seed(11)
     for part in range(PARTS):
-        tensors[ple + f"ngram_embedding.shard_{part}.weight"] = (
-            torch.randn((PART_ROWS, g.ple_head_dim), generator=generator) * 100).clamp(-440, 440).to(
-                torch.float8_e4m3fn)
-    tensors[ple + "ngram_embedding.weight_scale"] = torch.tensor([0.002], dtype=torch.bfloat16)
+        rows = (torch.randn((PART_ROWS, g.ple_head_dim), generator=table_rows) * 100).clamp(-440, 440)
+        if table:
+            tensors[ple + f"ngram_embedding.shard_{part}.weight"] = rows.to(torch.float8_e4m3fn)
+    if table:
+        tensors[ple + "ngram_embedding.weight_scale"] = torch.tensor([scale], dtype=torch.bfloat16)
     tensors[ple + "layer_multipliers"] = torch.tensor([(1 << 40) + 3, 7], dtype=torch.int64)
     tensors[ple + "ngram_heads_offsets"] = torch.tensor([0, 90], dtype=torch.int64)
     tensors[ple + "ngram_heads_vocab_sizes"] = torch.tensor([90, 110], dtype=torch.int64)
-    tensors["model.visual.blocks.0.norm1.weight"] = torch.ones(8, dtype=torch.bfloat16)
     path.mkdir()
     save_file(tensors, path / "model.safetensors")
     config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
@@ -78,7 +88,14 @@ def _release(path, *, mtp=False):
                                                      "added_tokens": [{"id": 499}]}))
     (path / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages }}"}))
     (path / "generation_config.json").write_text(json.dumps({"eos_token_id": 1}))
-    (path / "preprocessor_config.json").write_text(json.dumps({"patch_size": 16}))
+    pixels = {"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2, "image_mean": [0.5] * 3,
+              "image_std": [0.5] * 3, "processor_class": "Qwen3VLProcessor"}
+    (path / "preprocessor_config.json").write_text(json.dumps(
+        dict(pixels, size={"longest_edge": 16777216, "shortest_edge": 65536},
+             image_processor_type="Qwen2VLImageProcessorFast")))
+    (path / "video_preprocessor_config.json").write_text(json.dumps(
+        dict(pixels, size={"longest_edge": 25165824, "shortest_edge": 4096},
+             video_processor_type="Qwen3VLVideoProcessor")))
     return g, tensors
 
 
@@ -165,8 +182,198 @@ def test_nextn_head_refuses_what_the_engine_would_run_differently():
             checkpoint.validate_mtp({**text, **change})
 
 
-def test_release_converts(tmp_path):
+def test_release_converts_its_vision_tower(tmp_path):
+    """The release's tower becomes the BF16 objects an mmproj-paired GGUF artifact carries, with
+    the release's processor configs and its own vision geometry; `vision=False` leaves all of it
+    out, which is what makes the engine refuse `--vision` against a text-only artifact."""
     g, stored = _release(tmp_path / "release")
+    output = checkpoint.convert(tmp_path / "release", tmp_path / "out.sinfer", device="cpu")
+    with Artifact(output) as artifact:
+        names = {obj.name for obj in artifact.objects}
+        specs = {spec.name: spec for spec in inv.build_vision_specs(g)}
+        assert specs and set(specs) <= names
+        assert {"frontend/preprocessor_config.json", "frontend/video_preprocessor_config.json"} <= names
+        assert json.loads(bytes(artifact.payload("frontend/preprocessor_config.json")))[
+            "image_processor_type"] == "Qwen2VLImageProcessorFast"
+        vision = artifact.vision_geometry
+        assert vision["layers"] == 2 and vision["output_hidden"] == g.hidden
+        for name in specs:
+            assert artifact.find(name).format == inv.BF16
+        qkv = _direct(artifact, "vision/layers/1/attention/qkv")
+        assert torch.equal(qkv, stored["model.visual.blocks.1.attn.qkv.weight"].float())
+        fc2 = _direct(artifact, "vision/merger/fc2")
+        assert torch.equal(fc2, stored["model.visual.merger.linear_fc2.weight"].float())
+        patch = _direct(artifact, "vision/patch_embedding")
+        assert torch.equal(patch, stored["model.visual.patch_embed.proj.weight"].float().reshape(patch.shape))
+    text_only = checkpoint.convert(tmp_path / "release", tmp_path / "text.sinfer", device="cpu", vision=False)
+    with Artifact(text_only) as artifact:
+        names = {obj.name for obj in artifact.objects}
+        assert not any(name.startswith("vision/") or name.endswith("preprocessor_config.json")
+                       for name in names)
+        assert artifact.vision_geometry == {}
+
+
+def _table_bytes(artifact):
+    obj = artifact.find(inv.PLE_TABLE_RESOURCE)
+    if not obj.runs:
+        return bytes(artifact.payload(obj))
+    (source, offset, size), = obj.runs
+    with open(artifact.external[source - 1][0], "rb") as stream:
+        stream.seek(offset)
+        return stream.read(size)
+
+
+def test_shared_ple_table(tmp_path):
+    """--ple-table: the table's IQ4_NL rows go to one file, written once with its checksums, and
+    every artifact converted against it reads it in place -- a student that ships no table
+    shards included -- while a file made from another table is refused."""
+    _release(tmp_path / "release")
+    embedded = checkpoint.convert(tmp_path / "release", tmp_path / "embedded.sinfer", device="cpu")
+    table = tmp_path / "tables" / "ple.iq4nl"
+    first = checkpoint.convert(tmp_path / "release", tmp_path / "first.sinfer", device="cpu", ple_table=table)
+    record = json.loads((tmp_path / "tables" / "ple.iq4nl.json").read_text())
+    assert record["rows"] == PARTS * PART_ROWS and record["bytes"] == table.stat().st_size
+    assert record["sha256"] == hashlib.sha256(table.read_bytes()).hexdigest()
+    assert record["sha256_chunks"]["digest"] == checkpoint.chunked_sha256(table)
+    with Artifact(embedded) as full, Artifact(first) as shared:
+        assert _table_bytes(full) == _table_bytes(shared) == table.read_bytes()
+        assert shared.external == ((str(table.resolve()), record["bytes"]),)
+        assert shared.external_checksums[0]["sha256"] == record["sha256"]
+        assert shared.external_checksums[0]["sha256_chunks"] == record["sha256_chunks"]
+        assert shared.file_bytes < full.file_bytes - record["bytes"] // 2
+    written = table.stat().st_mtime_ns
+    # A student of the same release: no shards of its own, the teacher's file reused as it is.
+    _release(tmp_path / "student", table=False, seed=6)
+    student = checkpoint.convert(tmp_path / "student", tmp_path / "student.sinfer", device="cpu",
+                                 ple_table=table)
+    assert table.stat().st_mtime_ns == written
+    with Artifact(student) as artifact:
+        assert _table_bytes(artifact) == table.read_bytes()
+        assert artifact.geometry["ple_table_rows"] == PARTS * PART_ROWS
+    with pytest.raises(ValueError, match="no n-gram table shards"):
+        checkpoint.convert(tmp_path / "student", tmp_path / "orphan.sinfer", device="cpu")
+    # Another table (its FP8 scale differs) does not pass for this one.
+    _release(tmp_path / "other", scale=0.004)
+    with pytest.raises(ValueError, match="another n-gram table"):
+        checkpoint.convert(tmp_path / "other", tmp_path / "other.sinfer", device="cpu", ple_table=table)
+    # The record names the rows' source: the hash arrays, and a digest of the FP8 rows a table-less
+    # student's builder copies from its teacher (ple_table_identity.json) and the converter checks.
+    assert len(record["hash_arrays_sha256"]) == 64 and len(record["fp8_sample_sha256"]) == 64
+    student_dir = tmp_path / "student"
+    (student_dir / checkpoint.STUDENT_TABLE_IDENTITY).write_text(
+        json.dumps({"fp8_sample_sha256": record["fp8_sample_sha256"]}))
+    checkpoint.convert(student_dir, tmp_path / "student2.sinfer", device="cpu", ple_table=table)
+    (student_dir / checkpoint.STUDENT_TABLE_IDENTITY).write_text(json.dumps({"fp8_sample_sha256": "0" * 64}))
+    with pytest.raises(ValueError, match="another n-gram table"):
+        checkpoint.convert(student_dir, tmp_path / "student3.sinfer", device="cpu", ple_table=table)
+    # A student whose hash arrays are not the table's source's is refused without any identity file.
+    _release(tmp_path / "rehashed", table=False, seed=7)
+    with safe_open(str(tmp_path / "rehashed" / "model.safetensors"), "pt") as handle:
+        stored = {name: handle.get_tensor(name) for name in handle.keys()}
+    stored[f"model.language_model.layers.1.ple.ple_embedding.layer_multipliers"] = torch.tensor([5, 9], dtype=torch.int64)
+    save_file(stored, tmp_path / "rehashed" / "model.safetensors")
+    with pytest.raises(ValueError, match="another n-gram table"):
+        checkpoint.convert(tmp_path / "rehashed", tmp_path / "rehashed.sinfer", device="cpu", ple_table=table)
+
+
+def _student_of(release, path, *, keep_layers, keep_experts):
+    """What the Stage 0 builder makes (RECIPE.md section 9.4), at this fixture's size: whole layers
+    and whole experts dropped, the kept ones renumbered, router rows sliced, config updated."""
+    config = json.loads((release / "config.json").read_text())
+    text = config["text_config"]
+    with safe_open(str(release / "model.safetensors"), "pt") as handle:
+        stored = {name: handle.get_tensor(name) for name in handle.keys()}
+    layer_map = {old: new for new, old in enumerate(keep_layers)}
+    expert_map = {old: new for new, old in enumerate(keep_experts)}
+    out = {}
+    pattern = re.compile(r"model\.language_model\.layers\.(\d+)\.(.*)")
+    for name, tensor in stored.items():
+        match = pattern.fullmatch(name)
+        if match is None:
+            out[name] = tensor
+            continue
+        layer, rest = int(match[1]), match[2]
+        if layer not in layer_map:
+            continue
+        expert = re.fullmatch(r"mlp\.experts\.(\d+)\.(.*)", rest)
+        if expert is not None:
+            if int(expert[1]) in expert_map:
+                out[f"model.language_model.layers.{layer_map[layer]}.mlp.experts."
+                    f"{expert_map[int(expert[1])]}.{expert[2]}"] = tensor
+            continue
+        if rest == "mlp.gate.weight":
+            tensor = tensor[list(keep_experts)].contiguous()
+        out[f"model.language_model.layers.{layer_map[layer]}.{rest}"] = tensor
+    text["num_hidden_layers"] = len(keep_layers)
+    text["layer_types"] = [text["layer_types"][i] for i in keep_layers]
+    text["num_experts"] = len(keep_experts)
+    quantized = {}
+    for name, entry in config["quantization_config"]["quantized_layers"].items():
+        match = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.*)", name)
+        if match is None:
+            quantized[name] = entry
+        elif int(match[1]) in layer_map:
+            quantized[f"model.language_model.layers.{layer_map[int(match[1])]}.{match[2]}"] = entry
+    config["quantization_config"]["quantized_layers"] = quantized
+    path.mkdir()
+    save_file(out, path / "model.safetensors")
+    (path / "config.json").write_text(json.dumps(config))
+    for name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json",
+                 "preprocessor_config.json", "video_preprocessor_config.json"):
+        (path / name).write_bytes((release / name).read_bytes())
+    return stored
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+def test_pruned_student_converts(tmp_path, mtp):
+    """Fewer layers and fewer routed experts, from a release-format checkpoint: the geometry
+    follows the config, every kept expert's NVFP4 words and scales are the teacher's own (in the
+    kept order), and the routers keep the kept experts' rows. The draft head shares the trunk's
+    expert count, as the students do."""
+    g, _ = _release(tmp_path / "release", mtp=mtp)
+    keep_layers, keep_experts = (0, 1), (3, 1)
+    teacher = checkpoint.convert(tmp_path / "release", tmp_path / "teacher.sinfer", device="cpu")
+    if mtp:
+        # The fixture's draft head has the trunk's four experts; a student keeps two of them.
+        release = tmp_path / "release"
+        with safe_open(str(release / "model.safetensors"), "pt") as handle:
+            stored = {name: handle.get_tensor(name) for name in handle.keys()}
+        renamed = {}
+        for name, tensor in stored.items():
+            match = re.fullmatch(r"mtp\.layers\.0\.mlp\.experts\.(\d+)\.(.*)", name)
+            if match is None:
+                renamed[name] = tensor[list(keep_experts)].contiguous() if name == "mtp.layers.0.mlp.gate.weight" else tensor
+            elif int(match[1]) in keep_experts:
+                renamed[f"mtp.layers.0.mlp.experts.{keep_experts.index(int(match[1]))}.{match[2]}"] = tensor
+        save_file(renamed, release / "model.safetensors")
+    _student_of(tmp_path / "release", tmp_path / "student", keep_layers=keep_layers, keep_experts=keep_experts)
+    student = checkpoint.convert(tmp_path / "student", tmp_path / "student.sinfer", device="cpu")
+    with Artifact(teacher) as big, Artifact(student) as small:
+        assert small.geometry["layers"] == len(keep_layers) and small.geometry["experts"] == len(keep_experts)
+        assert small.layer_types == [big.layer_types[i] for i in keep_layers]
+        assert small.geometry["mtp_layers"] == int(mtp)
+        rows = 2 * g.intermediate
+        for new, old in enumerate(keep_layers):
+            gate_up_small = decode_nvfp4_words(bytes(small.payload(f"text/layers/{new}/mlp/routed_gate_up")),
+                                               tuple(small.find(f"text/layers/{new}/mlp/routed_gate_up").shape))[0]
+            gate_up_big = decode_nvfp4_words(bytes(big.payload(f"text/layers/{old}/mlp/routed_gate_up")),
+                                             tuple(big.find(f"text/layers/{old}/mlp/routed_gate_up").shape))[0]
+            for e_new, e_old in enumerate(keep_experts):
+                assert torch.equal(gate_up_small[e_new * rows:(e_new + 1) * rows],
+                                   gate_up_big[e_old * rows:(e_old + 1) * rows])
+            alpha_small = _direct(small, f"text/layers/{new}/mlp/routed_down_alpha")
+            alpha_big = _direct(big, f"text/layers/{old}/mlp/routed_down_alpha")
+            assert torch.equal(alpha_small, alpha_big[list(keep_experts)])
+            router_small = _direct(small, f"text/layers/{new}/mlp/router_shared_gate")
+            router_big = _direct(big, f"text/layers/{old}/mlp/router_shared_gate")
+            assert torch.equal(router_small[:-1], router_big[list(keep_experts)])
+            assert torch.equal(router_small[-1], router_big[-1])  # the shared expert's gate row
+        if mtp:
+            assert small.find("mtp/layer/mlp/routed_gate_up").shape[0] == len(keep_experts) * rows
+
+
+def test_release_converts(tmp_path):
+    g, stored = _release(tmp_path / "release", vision=False)
     output = checkpoint.convert(tmp_path / "release", tmp_path / "out.sinfer", device="cpu")
     layer = "model.language_model.layers.0."
     with Artifact(output) as artifact:

@@ -1,4 +1,5 @@
 #include "api/ops/ngram_ple.h"
+#include "api/ops/ngram_ple_host_table.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
@@ -7,11 +8,15 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
 
 namespace sinfer::ops {
 namespace {
@@ -135,6 +140,17 @@ __global__ void gather_kernel(const int* __restrict__ rows, const std::uint8_t* 
         embedding[static_cast<std::int64_t>(t) * values + v] =
             __float2bfloat16_rn(scale * static_cast<float>(kIq4nlValues[nibble]));
     }
+}
+
+// The staged E4M3 rows of a host table, widened into the BF16 embedding: value = e4m3 * scale,
+// rounded once.
+__global__ void widen_e4m3_kernel(const std::uint8_t* __restrict__ codes, std::int64_t count, float scale,
+                                  __nv_bfloat16* __restrict__ out) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    __nv_fp8_e4m3 value;
+    value.__x = codes[i];
+    out[i]    = __float2bfloat16_rn(static_cast<float>(value) * scale);
 }
 
 // One block per token: per-stream gates from the normalised key and residual streams, then
@@ -400,8 +416,13 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
         hash.heads > kNgramPleMaxHeads || (hash.heads % (hash.ngram - 1)) != 0) {
         throw std::invalid_argument("ngram_ple: invalid hash geometry");
     }
-    if (table.rows == nullptr || table.row_count <= 0 || table.head_dim <= 0 ||
-        (table.head_dim % 32) != 0 || table.row_bytes != table.head_dim / 32 * 18) {
+    if (table.host != nullptr) {
+        if (table.host->rows() != table.row_count || table.host->head_dim() != table.head_dim ||
+            table.head_dim <= 0) {
+            throw std::invalid_argument("ngram_ple: the host table disagrees with the table's shape");
+        }
+    } else if (table.rows == nullptr || table.row_count <= 0 || table.head_dim <= 0 ||
+               (table.head_dim % 32) != 0 || table.row_bytes != table.head_dim / 32 * 18) {
         throw std::invalid_argument("ngram_ple: invalid table");
     }
     for (int h = 0; h < hash.heads; ++h) {
@@ -476,9 +497,17 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
     auto* history_ptr = static_cast<int*>(state.history.data);
     auto* conv_state  = static_cast<__nv_bfloat16*>(state.conv_state.data);
 
+    // A host table: the ids go straight into its pinned, device-mapped buffer for the host gather.
+    const NgramPleHostTable::Staging* staged = table.host != nullptr ? &table.host->staging() : nullptr;
+    const std::int64_t lookups = static_cast<std::int64_t>(tokens) * hash.heads;
+    if (staged != nullptr && lookups > staged->capacity) {
+        throw std::runtime_error("ngram_ple: a forward of " + std::to_string(tokens) +
+                                 " columns needs more n-gram rows than the host table's staging holds (" +
+                                 std::to_string(staged->capacity) + "; SUROGATE_SERVE_NGRAM_TABLE_COLUMNS)");
+    }
     rows_kernel<<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
         ids, begin, slots, history_ptr, hash, hash.ngram - 1, slot_count,
-        static_cast<int*>(rows.data));
+        staged != nullptr ? staged->ids_device : static_cast<int*>(rows.data));
     CUDA_CHECK(cudaGetLastError());
     if (snapshots) {
         history_update_kernel<true><<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
@@ -489,11 +518,49 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
     history_update_kernel<false><<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
         ids, begin, slots, last, hash.ngram - 1, slot_count, history_ptr, 0, nullptr);
     CUDA_CHECK(cudaGetLastError());
-    gather_kernel<<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(
-        static_cast<const int*>(rows.data), static_cast<const std::uint8_t*>(table.rows),
-        table.row_count, table.row_bytes, table.head_dim, hash.heads,
-        static_cast<__nv_bfloat16*>(embedding.data));
-    CUDA_CHECK(cudaGetLastError());
+    if (staged != nullptr) {
+        // Rows in id order are the embedding's layout: column t holds heads x head_dim values.
+        const NgramPleHostTable& host = *table.host;
+        host.enqueue_gather(lookups, stream);
+        const std::size_t bytes = static_cast<std::size_t>(lookups) * static_cast<std::size_t>(host.row_bytes());
+        if (host.type() == NgramPleRowType::Bf16) {
+            CUDA_CHECK(cudaMemcpyAsync(embedding.data, staged->rows, bytes, cudaMemcpyHostToDevice, stream));
+        } else {
+            // The raw codes land in `normalized` (2 * width bytes a column, unused until the gate).
+            CUDA_CHECK(cudaMemcpyAsync(normalized.data, staged->rows, bytes, cudaMemcpyHostToDevice, stream));
+            const std::int64_t values = lookups * host.head_dim();
+            widen_e4m3_kernel<<<static_cast<unsigned>((values + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+                static_cast<const std::uint8_t*>(normalized.data), values, host.scale(),
+                static_cast<__nv_bfloat16*>(embedding.data));
+            CUDA_CHECK(cudaGetLastError());
+        }
+        // SUROGATE_SERVE_NGRAM_TABLE_DUMP: the embedding the staged rows became, beside the gather's
+        // own dump (eager forwards only; it synchronises the stream).
+        if (const char* dir = std::getenv("SUROGATE_SERVE_NGRAM_TABLE_DUMP"); dir != nullptr && *dir) {
+            cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+            static int dumped = 0;
+            if (capturing == cudaStreamCaptureStatusNone && dumped < 64) {
+                std::vector<std::uint16_t> host_values(static_cast<std::size_t>(embedding.numel()));
+                CUDA_CHECK(cudaMemcpyAsync(host_values.data(), embedding.data, embedding.bytes(),
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const std::string path = std::string(dir) + "/embedding-" + std::to_string(dumped++) + ".bin";
+                if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+                    const std::int64_t header[2] = {lookups, embed_dim};
+                    std::fwrite(header, sizeof(header), 1, file);
+                    std::fwrite(host_values.data(), sizeof(std::uint16_t), host_values.size(), file);
+                    std::fclose(file);
+                }
+            }
+        }
+    } else {
+        gather_kernel<<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(
+            static_cast<const int*>(rows.data), static_cast<const std::uint8_t*>(table.rows),
+            table.row_count, table.row_bytes, table.head_dim, hash.heads,
+            static_cast<__nv_bfloat16*>(embedding.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
     detail::bf16_cublaslt_gemm(weights.key, embedding, key, stream);
     detail::bf16_cublaslt_gemm(weights.value, embedding, value, stream);
     gate_kernel<<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(

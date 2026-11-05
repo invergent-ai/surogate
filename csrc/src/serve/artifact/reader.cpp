@@ -510,6 +510,21 @@ struct Reader::Impl {
                 ExternalFile out;
                 out.path  = require_string(entry.at("path"), "external path");
                 out.bytes = require_unsigned(entry.at("bytes"), "external bytes", true);
+                if (entry.contains("sha256")) {
+                    out.sha256 = require_string(entry.at("sha256"), "external sha256");
+                }
+                if (entry.contains("sha256_chunks")) {
+                    const auto& chunks = entry.at("sha256_chunks");
+                    if (!chunks.is_object() || !chunks.contains("chunk_bytes") || !chunks.contains("digest")) {
+                        throw ArtifactError("external sha256_chunks must be {chunk_bytes, digest}");
+                    }
+                    out.sha256_chunk_bytes =
+                        require_unsigned(chunks.at("chunk_bytes"), "external sha256_chunks chunk_bytes", true);
+                    out.sha256_chunks = require_string(chunks.at("digest"), "external sha256_chunks digest");
+                    if (out.sha256_chunks.size() != 64) {
+                        throw ArtifactError("external sha256_chunks digest must be 64 hex digits");
+                    }
+                }
                 external.push_back(std::move(out));
             }
         }
@@ -635,6 +650,7 @@ struct Reader::Impl {
                                     "; the file it serves weights from has changed");
             }
             external_maps.push_back(std::make_unique<MappedFile>(resolved));
+            external_resolved.push_back(resolved);
         }
     }
 
@@ -658,6 +674,7 @@ struct Reader::Impl {
     std::map<std::string, double> dflash_geometry;
     std::vector<std::int32_t> dflash_target_layers;
     std::vector<std::unique_ptr<MappedFile>> external_maps; // MappedFile owns an fd and a mapping
+    std::vector<std::filesystem::path> external_resolved;   // the paths external_maps opened
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
 };
@@ -717,6 +734,13 @@ std::span<const PayloadRun> Reader::runs(const ObjectDescriptor& object) const {
 }
 
 const std::vector<ExternalFile>& Reader::external_files() const noexcept { return impl_->external; }
+
+const std::filesystem::path& Reader::external_path(std::uint32_t source) const {
+    if (source == 0 || source > impl_->external_resolved.size()) {
+        throw ArtifactError("unknown external source " + std::to_string(source));
+    }
+    return impl_->external_resolved[source - 1];
+}
 
 PayloadSpan Reader::payload(std::string_view name) const {
     const auto* object = find(name);

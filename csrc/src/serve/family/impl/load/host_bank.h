@@ -67,6 +67,17 @@ struct HostObjectPlan {
     std::uint64_t q8_stored_bytes  = 0; // the planes' size, which is the object's size in the bank
     std::vector<std::int32_t> q8_group_map;
     std::uint64_t artifact_instance = 0;
+    /// Non-empty: the object is a stretch of an external file that is read as it lies (the
+    /// converter's shared n-gram table, 28.8 GB). Instead of a pinned copy of its own, every
+    /// process on the host that banks this stretch of this file maps one shared copy of it in
+    /// tmpfs (SUROGATE_SERVE_SHARED_HOST_DIR, default /dev/shm) and registers that: one physical
+    /// copy however many replicas run. The first process makes the copy, the last one to release
+    /// it removes it (see HostObject::shared_path). `shared_file_offset` is the object's first
+    /// byte in the file. A plain object only; SUROGATE_SERVE_SHARED_HOST_FILES=0 turns it off,
+    /// and any step that refuses falls back to the private copy. (The driver pins neither a
+    /// mapping of the file itself, which is file-backed, nor read-only memory on this platform.)
+    std::string shared_file;
+    std::uint64_t shared_file_offset = 0;
     artifact::TensorDescriptor source_tensor{};
     bool generic_decode = false;
     std::int32_t swap_half_rows = 0;
@@ -93,6 +104,14 @@ struct HostObject {
     /// threaded first-touch then register, ~10 GB/s against cudaHostAlloc's 1.8); false when it
     /// came from the cudaHostAlloc fallback. Decides the release path.
     bool registered        = false;
+    /// True when `host` maps the host's shared tmpfs copy of the object (see
+    /// `HostObjectPlan::shared_file`) rather than memory of this process's own. The process holds
+    /// a shared flock on `shared_fd` while it maps the copy; releasing the object unregisters and
+    /// unmaps it, and the process that finds no other holder left removes `shared_path`.
+    bool file_mapped       = false;
+    int shared_fd          = -1;
+    std::string shared_path;
+    std::string shared_lock;
     std::string name;
 };
 

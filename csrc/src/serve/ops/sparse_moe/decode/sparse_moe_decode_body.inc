@@ -1852,6 +1852,12 @@ void launch_d2_d3(const Tensor& x, const PreparedSparseMoeWeights& weights, Tens
         hook->capture(hook->capture_context, workspace.ids, hook->capture_base,
                       static_cast<std::int32_t>(x.ne[1]), stream);
     }
+    // Calibration statistics see the final routing too, and may reweight it before D3 and D4
+    // read it (api/ops/sparse_moe.h, SparseMoeRoundHook::reweight).
+    if (hook != nullptr && hook->reweight != nullptr) {
+        hook->reweight(hook->reweight_context, workspace.ids, alpha, kHasShared ? shared_scale : nullptr,
+                       hook->capture_base, static_cast<std::int32_t>(x.ne[1]), stream);
+    }
 
     if (adapters) {
         moe_lora_low_kernel<<<dim3(moe_lora_rank_rows(workspace), 2 * kPaths, x.ne[1]), 32, 0, stream>>>(

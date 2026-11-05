@@ -1512,15 +1512,21 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_lora.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/sparse_moe_nvfp4.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels_students.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_kernels_students.cu
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels_students.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  ${SERVE_ROOT}/ops/calibration/moe_stats.cu
+  ${SERVE_ROOT}/ops/calibration/residual_samples.cpp
   ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/hyper_connection/manifold.cu
   ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu
+  ${SERVE_ROOT}/ops/ngram_ple/ngram_ple_host_table.cpp
   ${SERVE_ROOT}/ops/qsa_indexer/qsa_indexer.cu
   ${SERVE_ROOT}/ops/glm_indexer/glm_indexer.cu
   ${SERVE_ROOT}/ops/expert_slot_cache/expert_slot_cache.cu

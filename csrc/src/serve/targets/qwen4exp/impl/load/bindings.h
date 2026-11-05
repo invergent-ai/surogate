@@ -1,5 +1,7 @@
 #pragma once
 
+#include "api/ops/ngram_ple_host_table.h"
+
 #include <memory>
 #include <api/targets/qwen4exp/package.h>
 #include <api/family/frontend_resources.h>
@@ -156,6 +158,9 @@ struct BindingPlan {
     artifact::LinearBinding draft_head{};
     artifact::ObjectHandle draft_head_token_ids{};
     artifact::ObjectHandle ple_table;
+    /// SUROGATE_SERVE_NGRAM_TABLE: the table's rows read in place from the release's own shards
+    /// instead of the artifact's copy (api/ops/ngram_ple_host_table.h); null otherwise.
+    std::shared_ptr<ops::NgramPleHostTable> ple_host_table;
     // The hash constants are read out of the artifact at bind time (the reader is gone by
     // the time the model is constructed).
     std::vector<std::uint64_t> ple_multipliers{};

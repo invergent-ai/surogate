@@ -63,7 +63,8 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int3
  * projections run through cuBLASLt (prewarm before stream capture). W8 ones run on the mixer's
  * own kernels for rounds of up to 64 tokens and, wider, are dequantised to BF16 in the workspace
  * for the same cuBLASLt GEMM; either way the weights are the BF16 rounding of each dequantised
- * value, as in every A16 W8 GEMM. Workspace is caller-owned transient storage; nothing persists
+ * value, as in every A16 W8 GEMM. Under --batch-invariant (api/ops/batch_invariant.h) W8 ones take
+ * the dequantised route at every width, on the fixed-order GEMM. Workspace is caller-owned transient storage; nothing persists
  * between calls.
  */
 void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& weights,

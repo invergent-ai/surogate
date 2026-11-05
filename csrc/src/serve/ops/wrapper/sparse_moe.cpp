@@ -715,7 +715,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         }
     }
     const SparseMoeRoundHook* round_hook =
-        hook.resolve != nullptr || hook.capture != nullptr ? &hook : nullptr;
+        hook.resolve != nullptr || hook.capture != nullptr || hook.reweight != nullptr ? &hook
+                                                                                        : nullptr;
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -953,10 +954,12 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                 }
             }, &correction};
         // The decode kernels call capture after resolve, so the corrected ids are the ones
-        // captured.
-        corrected.capture         = hook.capture;
-        corrected.capture_context = hook.capture_context;
-        corrected.capture_base    = hook.capture_base;
+        // captured -- and reweighted, which comes after both.
+        corrected.capture          = hook.capture;
+        corrected.capture_context  = hook.capture_context;
+        corrected.capture_base     = hook.capture_base;
+        corrected.reweight         = hook.reweight;
+        corrected.reweight_context = hook.reweight_context;
         detail::sparse_moe_decode_launch(geometry, x, router_x, prepared, destination, views,
             stream, weights.router_bias ? &corrected : round_hook, adapters, slots);
         return;

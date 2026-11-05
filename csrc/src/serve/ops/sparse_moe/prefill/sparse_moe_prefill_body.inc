@@ -2000,6 +2000,15 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const PreparedSpars
             hook->capture(hook->capture_context, slice_ids, hook->capture_base + token0, tokens,
                           stream);
         }
+        // Calibration statistics (SparseMoeRoundHook::reweight): every sub-route below -- the
+        // TRT-LLM runner, block FP8, the family's own kernels -- reads `alpha` and the shared
+        // scale only after this point.
+        if (hook != nullptr && hook->reweight != nullptr) {
+            const Tensor slice_ids(ids, DType::I32, {kTopK, tokens});
+            hook->reweight(hook->reweight_context, slice_ids, alpha,
+                           kHasShared ? shared_scale : nullptr, hook->capture_base + token0, tokens,
+                           stream);
+        }
 
         if (plan.routed_trtllm) {
             // The routed experts are computed by the vendored TRT-LLM runner, which does its own

@@ -235,6 +235,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--capture-routing] "
+           "[--moe-stats-out DIR [--moe-stats-no-norms] [--moe-stats-no-mtp-prompt]] "
+           "[--residual-samples-out DIR [--residual-samples-every N] [--residual-samples-max-tokens N]] "
            "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] "
            "[--thinking-retention off|loop|all] [--thinking-retention-mb N] [--thinking-retention-ttl T] "
            "[--thinking-loop-guard] [--thinking-answer-reserve N] [--cors] "
@@ -345,6 +347,17 @@ std::string serve_usage_text(const char* argv0) {
            "request asks\n"
            "         for them with \"return_routed_experts\": true. Works with --spec mtp (the\n"
            "         main model's routing for every accepted token); refuses DFlash.\n"
+           "       --moe-stats-out DIR records calibration statistics for expert pruning in every MoE\n"
+           "         layer (the draft head's too): per expert the routed-token count and the sums of\n"
+           "         gate, gate x ||expert output|| (REAP) and ||expert output||, as NumPy arrays in\n"
+           "         DIR/final at shutdown and DIR/<tag> on POST /admin/moe_stats {\"tag\", \"reset\"}.\n"
+           "         The norms take one probe round per selected expert (prefill ~(1 + top-k)x the\n"
+           "         mixture's time); --moe-stats-no-norms keeps counts and gate sums only. Under\n"
+           "         --spec mtp the draft head runs over every prompt column so its mixture is observed\n"
+           "         on prompts (--moe-stats-no-mtp-prompt keeps the served prefill). Qwen3.8-Flash-Next.\n"
+           "       --residual-samples-out DIR writes the residual at every layer-group boundary for every\n"
+           "         Nth column (--residual-samples-every, default 64) of eagerly run forwards as FP16,\n"
+           "         up to --residual-samples-max-tokens columns (default 8192): block influence per group.\n"
            "       --moe-route w4a16 runs routed NVFP4 experts on BF16-activation kernels at every\n"
            "         round width, so decode, verify and prefill log-probs agree (RL rollouts); auto\n"
            "         (default) takes the faster FP4-activation runner for rounds of 2+ columns;\n"
@@ -789,6 +802,28 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.data_parallel = true;
         } else if (arg == "--enable-lora") {
             options.enable_lora = true;
+        } else if (arg == "--moe-stats-out") {
+            options.moe_stats_out = require_value("--moe-stats-out");
+            if (options.moe_stats_out.empty()) { throw std::invalid_argument("--moe-stats-out needs a directory"); }
+        } else if (arg == "--moe-stats-no-norms") {
+            options.moe_stats_norms = false;
+        } else if (arg == "--moe-stats-no-mtp-prompt") {
+            options.moe_stats_mtp_prompt = false;
+        } else if (arg == "--residual-samples-out") {
+            options.residual_samples_out = require_value("--residual-samples-out");
+            if (options.residual_samples_out.empty()) {
+                throw std::invalid_argument("--residual-samples-out needs a directory");
+            }
+        } else if (arg == "--residual-samples-every") {
+            const int every = parse_nonnegative_int(require_value("--residual-samples-every"),
+                                                    "residual-samples-every");
+            if (every == 0) { throw std::invalid_argument("--residual-samples-every must be positive"); }
+            options.residual_samples_every = every;
+        } else if (arg == "--residual-samples-max-tokens") {
+            const int tokens = parse_nonnegative_int(require_value("--residual-samples-max-tokens"),
+                                                     "residual-samples-max-tokens");
+            if (tokens == 0) { throw std::invalid_argument("--residual-samples-max-tokens must be positive"); }
+            options.residual_samples_max_tokens = tokens;
         } else if (arg == "--capture-routing") {
             options.capture_routing = true;
             // Read by every program at construction, before its graphs are captured.

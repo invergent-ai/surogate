@@ -204,6 +204,22 @@ struct ServeOptions {
     /// (choice.routed_experts). Under --spec mtp a verify round's accepted columns are stored and its
     /// rejected drafts dropped (the draft head is never recorded); DFlash is refused.
     bool capture_routing = false;
+    /// --moe-stats-out DIR: calibration statistics for expert pruning (api/ops/calibration.h). Every
+    /// MoE layer, the draft head's included, records per expert the routed-token count, the sum of
+    /// gate weights, the sum of gate x ||expert output|| (REAP's numerator) and the sum of
+    /// ||expert output||, plus its token count; dumped to DIR/final at shutdown and to DIR/<tag> by
+    /// POST /admin/moe_stats. --moe-stats-no-norms keeps counts and gate sums only (no probe rounds);
+    /// --moe-stats-no-mtp-prompt leaves the draft head's prefill as served (keys only, the mixture
+    /// on the last prompt column). Off by default.
+    std::string moe_stats_out;
+    bool moe_stats_norms      = true;
+    bool moe_stats_mtp_prompt = true;
+    /// --residual-samples-out DIR: the residual at every layer-group boundary for every Nth column
+    /// (--residual-samples-every, default 64) of eagerly run forwards, as FP16, until
+    /// --residual-samples-max-tokens columns (default 8192) are sampled. Off by default.
+    std::string residual_samples_out;
+    std::int32_t residual_samples_every      = 64;
+    std::int64_t residual_samples_max_tokens = 8192;
     std::vector<LoraModule> lora_modules;
     std::uint32_t max_loras     = 1;
     /// Banks are padded to this, so it is the rank an adapter may have and not the
