@@ -32,8 +32,10 @@ struct PlanKey {
     std::int32_t k;
     std::int32_t tokens;
     std::int32_t ldc; // output elements per column; rows for a contiguous [rows, tokens]
+    std::int32_t epilogue = 0; // 0 none, else a Bf16Epilogue
     bool operator==(const PlanKey& other) const noexcept {
-        return rows == other.rows && k == other.k && tokens == other.tokens && ldc == other.ldc;
+        return rows == other.rows && k == other.k && tokens == other.tokens && ldc == other.ldc &&
+               epilogue == other.epilogue;
     }
 };
 
@@ -42,7 +44,8 @@ struct PlanKeyHash {
         return (static_cast<std::size_t>(key.rows) * 0x9E3779B1u) ^
                (static_cast<std::size_t>(key.k) * 0x85EBCA77u) ^
                (static_cast<std::size_t>(key.tokens) * 0xC2B2AE3Du) ^
-               (static_cast<std::size_t>(key.ldc) * 0x27D4EB2Fu);
+               (static_cast<std::size_t>(key.ldc) * 0x27D4EB2Fu) ^
+               (static_cast<std::size_t>(key.epilogue) * 0x165667B1u);
     }
 };
 
@@ -52,6 +55,7 @@ struct Plan {
     cublasLtMatrixLayout_t b   = nullptr;
     cublasLtMatrixLayout_t c   = nullptr;
     cublasLtMatmulAlgo_t algo{};
+    bool valid = true; // false: cuBLASLt offered no algorithm (cached so the miss is asked once)
 };
 
 struct DeviceState {
@@ -119,6 +123,19 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key) {
     if (found != state.plans.end()) { return found->second; }
     Plan plan;
     check(cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F), "desc");
+    if (key.epilogue != 0) {
+        const cublasLtEpilogue_t epilogue =
+            key.epilogue == static_cast<std::int32_t>(Bf16Epilogue::GeluTanhBias)
+                ? CUBLASLT_EPILOGUE_GELU_BIAS
+                : CUBLASLT_EPILOGUE_BIAS;
+        check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                             sizeof(epilogue)),
+              "epilogue");
+        const cudaDataType_t bias_type = CUDA_R_16BF;
+        check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                             &bias_type, sizeof(bias_type)),
+              "bias type");
+    }
     const cublasOperation_t trans_a = CUBLAS_OP_T;
     const cublasOperation_t trans_b = CUBLAS_OP_N;
     check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a,
@@ -146,6 +163,11 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key) {
                                          preference, 1, &result, &found_count),
           "heuristic");
     cublasLtMatmulPreferenceDestroy(preference);
+    if (found_count == 0 && key.epilogue != 0) {
+        // A fused epilogue is an optimisation: its caller falls back to the separate ops.
+        plan.valid = false;
+        return state.plans.emplace(key, plan).first->second;
+    }
     if (found_count == 0) {
         throw std::runtime_error("bf16 cuBLASLt: no algorithm for rows=" +
                                  std::to_string(key.rows) + " k=" + std::to_string(key.k) +
@@ -211,6 +233,41 @@ void gemm_with_beta(const Weight& weight, const Tensor& x, Tensor& out, float be
 }
 
 } // namespace
+
+bool bf16_cublaslt_gemm_epilogue(const Weight& weight, const Tensor& x, const Tensor& bias,
+                                 Bf16Epilogue epilogue, Tensor& out, cudaStream_t stream) {
+    require_operands(weight, x, out);
+    if (epilogue != Bf16Epilogue::Bias && epilogue != Bf16Epilogue::GeluTanhBias) {
+        throw std::invalid_argument("bf16 cuBLASLt epilogue: unknown epilogue");
+    }
+    if (bias.dtype != DType::BF16 || bias.ne[0] != weight.n || bias.ne[1] != 1 ||
+        bias.ne[2] != 1 || bias.ne[3] != 1 || !bias.is_contiguous() || bias.data == nullptr) {
+        throw std::invalid_argument("bf16 cuBLASLt epilogue: bias must be contiguous BF16 [rows]");
+    }
+    // --batch-invariant keeps its own reduction order; an unaligned bias is outside what the
+    // fused kernels promise. Both leave the call to the unfused ops.
+    if (batch_invariant() || (reinterpret_cast<std::uintptr_t>(bias.data) & 15u) != 0) {
+        return false;
+    }
+    DeviceState& state = state_for_current_device();
+    const std::lock_guard<std::mutex> lock(state.mutex);
+    const Plan& plan = plan_for(state, PlanKey{weight.n, weight.k, x.ne[1], weight.n,
+                                              static_cast<std::int32_t>(epilogue)});
+    if (!plan.valid) { return false; }
+    // The bias is a per-call operand stored on the shared descriptor; the lock above keeps it
+    // from changing between this set and the enqueue that reads it.
+    const void* bias_pointer = bias.data;
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                         &bias_pointer, sizeof(bias_pointer)),
+          "bias pointer");
+    const float alpha = 1.0F;
+    const float beta  = 0.0F;
+    check(cublasLtMatmul(state.handle, plan.op, &alpha, weight.qdata, plan.a, x.data, plan.b,
+                         &beta, out.data, plan.c, out.data, plan.c, &plan.algo, state.workspace,
+                         kWorkspaceBytes, stream),
+          "matmul");
+    return true;
+}
 
 void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cudaStream_t stream) {
     gemm_with_beta(weight, x, out, 0.0F, stream);

@@ -260,6 +260,42 @@ void linear_bias(const Tensor& x, const Weight& w, const Tensor& bias, Tensor& o
     }
 }
 
+namespace {
+
+// Everything the cuBLASLt route itself would refuse is refused here, before anything is enqueued:
+// try_linear_bias_accumulate writes the bias into `out` ahead of the GEMM, so a late refusal
+// would leave it half-updated.
+[[nodiscard]] bool fused_bf16_route(const Tensor& x, const Weight& w, const Tensor& out) {
+    const auto aligned = [](const void* pointer) {
+        return (reinterpret_cast<std::uintptr_t>(pointer) & 15u) == 0;
+    };
+    return w.qtype == QType::BF16_CTRL && w.layout == QuantLayout::Contiguous && !lora_active() &&
+           (w.n % 8) == 0 && (w.k % 8) == 0 && aligned(w.qdata) && aligned(x.data) &&
+           aligned(out.data) && x.is_contiguous() && out.is_contiguous();
+}
+
+} // namespace
+
+bool try_linear_epilogue(const Tensor& x, const Weight& w, const Tensor& bias,
+                         LinearEpilogue epilogue, Tensor& out, cudaStream_t stream) {
+    if (!fused_bf16_route(x, w, out)) { return false; }
+    validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
+    return detail::bf16_cublaslt_gemm_epilogue(
+        w, x, bias,
+        epilogue == LinearEpilogue::GeluTanhBias ? detail::Bf16Epilogue::GeluTanhBias
+                                                 : detail::Bf16Epilogue::Bias,
+        out, stream);
+}
+
+bool try_linear_bias_accumulate(const Tensor& x, const Weight& w, const Tensor& bias, Tensor& out,
+                                cudaStream_t stream) {
+    if (!fused_bf16_route(x, w, out)) { return false; }
+    validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
+    add_bias(bias, out, stream);
+    detail::bf16_cublaslt_gemm_accumulate(w, x, out, stream);
+    return true;
+}
+
 void linear_projections(const Tensor& x, std::span<const LinearProjection> projections,
                         WorkspaceArena* workspace, cudaStream_t stream) {
     const auto overlaps = [](const Tensor& a, const Tensor& b) {
