@@ -7,18 +7,46 @@
 #include "api/ops/gelu.h"
 #include "api/ops/layer_norm.h"
 #include "api/ops/linear.h"
+#include "api/ops/linear_bias.h"
 #include "api/ops/residual_add.h"
 #include "api/ops/rope.h"
 #include "api/ops/vision_attention.h"
 #include "api/ops/vision_pos_embed.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sinfer::family {
 namespace {
+
+// The blocks' bias adds and tanh GELU ride their GEMMs' outputs (ops::try_linear_epilogue), and
+// the two residual projections accumulate straight into the residual stream
+// (ops::try_linear_bias_accumulate), instead of each step taking a pass over the activations --
+// about a third of a block at a megapixel image. SUROGATE_SERVE_VISION_FUSED=0 runs them as
+// separate ops, as before.
+[[nodiscard]] bool vision_fused_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_VISION_FUSED");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool fused(const Tensor& x, const Weight& weight, const Tensor& bias,
+                         ops::LinearEpilogue epilogue, Tensor& out, cudaStream_t stream) {
+    return vision_fused_enabled() &&
+           ops::try_linear_epilogue(x, weight, bias, epilogue, out, stream);
+}
+
+[[nodiscard]] bool fused_residual(const Tensor& x, const Weight& weight, const Tensor& bias,
+                                  Tensor& residual, cudaStream_t stream) {
+    return vision_fused_enabled() &&
+           ops::try_linear_bias_accumulate(x, weight, bias, residual, stream);
+}
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
@@ -308,9 +336,12 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                     Tensor h = layout.attention_norm.bind(backing);
                     ops::layer_norm(x, *block.norm1_weight, *block.norm1_bias, g.norm_epsilon, h,
                                     stream);
-                    ops::linear(h, *block.qkv, qkv, stream);
+                    if (!fused(h, *block.qkv, *block.qkv_bias, ops::LinearEpilogue::Bias, qkv,
+                               stream)) {
+                        ops::linear(h, *block.qkv, qkv, stream);
+                        ops::add_bias(*block.qkv_bias, qkv, stream);
+                    }
                 }
-                ops::add_bias(*block.qkv_bias, qkv, stream);
                 const std::int32_t plane      = g.hidden;
                 const std::size_t plane_bytes = static_cast<std::size_t>(plane) * 2;
                 Tensor q(qkv.data, DType::BF16, {g.head_dim(), g.heads, patches});
@@ -330,10 +361,13 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                 ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
                                       stream);
             }
-            Tensor projected = layout.projected.bind(backing);
-            ops::linear(attended, *block.projection, projected, stream);
-            ops::add_bias(*block.projection_bias, projected, stream);
-            ops::residual_add(projected, x, stream);
+            // x += projection(attended) + bias, straight into the residual stream.
+            if (!fused_residual(attended, *block.projection, *block.projection_bias, x, stream)) {
+                Tensor projected = layout.projected.bind(backing);
+                ops::linear(attended, *block.projection, projected, stream);
+                ops::add_bias(*block.projection_bias, projected, stream);
+                ops::residual_add(projected, x, stream);
+            }
         }
         {
             Tensor down = layout.mlp_down.bind(backing);
@@ -342,13 +376,19 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                 Tensor h = layout.mlp_norm.bind(backing);
                 ops::layer_norm(x, *block.norm2_weight, *block.norm2_bias, g.norm_epsilon, h,
                                 stream);
-                ops::linear(h, *block.fc1, up, stream);
+                if (!fused(h, *block.fc1, *block.fc1_bias, ops::LinearEpilogue::GeluTanhBias, up,
+                           stream)) {
+                    ops::linear(h, *block.fc1, up, stream);
+                    ops::add_bias(*block.fc1_bias, up, stream);
+                    ops::gelu(up, ops::GeluMode::Tanh, stream);
+                }
             }
-            ops::add_bias(*block.fc1_bias, up, stream);
-            ops::gelu(up, ops::GeluMode::Tanh, stream);
-            ops::linear(up, *block.fc2, down, stream);
-            ops::add_bias(*block.fc2_bias, down, stream);
-            ops::residual_add(down, x, stream);
+            // x += fc2(up) + bias, straight into the residual stream.
+            if (!fused_residual(up, *block.fc2, *block.fc2_bias, x, stream)) {
+                ops::linear(up, *block.fc2, down, stream);
+                ops::add_bias(*block.fc2_bias, down, stream);
+                ops::residual_add(down, x, stream);
+            }
         }
         if (deepstack_index < deepstack_.size() &&
             deepstack_[deepstack_index].first == static_cast<std::int32_t>(layer)) {

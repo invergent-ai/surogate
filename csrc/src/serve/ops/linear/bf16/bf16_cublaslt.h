@@ -28,6 +28,22 @@ void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cuda
 void bf16_cublaslt_gemm_accumulate(const Weight& weight, const Tensor& x, Tensor& out,
                                    cudaStream_t stream);
 
+enum class Bf16Epilogue : std::int32_t { Bias = 1, GeluTanhBias = 2 };
+
+/// out = epilogue(weight · x + bias) in one matmul: the bias and the tanh GELU ride the GEMM's
+/// output instead of each taking a pass over memory. `bias` is contiguous BF16 [rows], 16-byte
+/// aligned. Returns false, having enqueued nothing, when this route cannot serve the call --
+/// --batch-invariant, an unaligned bias, or no cuBLASLt algorithm for the fused problem -- and
+/// the caller runs the unfused ops.
+///
+/// There is deliberately no accumulating form: on sm_121 cuBLASLt serves an epilogue only from
+/// its legacy kernels, and with beta = 1 at k = 4304 (a vision tower's fc2) those ran 6-8x
+/// slower than the plain GEMM. A residual projection adds its bias to the residual and then
+/// accumulates with bf16_cublaslt_gemm_accumulate, which keeps the fast kernels.
+[[nodiscard]] bool bf16_cublaslt_gemm_epilogue(const Weight& weight, const Tensor& x,
+                                               const Tensor& bias, Bf16Epilogue epilogue,
+                                               Tensor& out, cudaStream_t stream);
+
 /// out[0:n, 0:tokens] = alpha·(W·x) + beta·out for raw BF16 operands, with an explicit output
 /// leading dimension so a caller may write a row range of a taller matrix. W is [n, k] with k
 /// contiguous, x is [k, tokens] with k contiguous, out has `ldc` elements per column.
