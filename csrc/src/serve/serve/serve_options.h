@@ -83,6 +83,9 @@ struct ServeOptions {
     // --gpu-layers N: layers kept on the card; every later layer is read from host memory.
     std::uint32_t gpu_layers               = 0;
     bool offload_vision = false;
+    // --vision-fp8: the vision tower's block projections run MXFP8 on a Blackwell device
+    // (api/ops/vision_fp8.h). Needs --vision.
+    bool vision_fp8 = false;
     bool offload_embeddings = false;
     bool offload_output_head = false;
     std::uint32_t expert_slots             = 0; // --expert-slots N (host-streamed MoE targets)

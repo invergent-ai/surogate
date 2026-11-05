@@ -1518,6 +1518,8 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
+  ${SERVE_ROOT}/ops/linear/mxfp8/mxfp8.cu
+  ${SERVE_ROOT}/ops/linear/mxfp8/mxfp8_cublaslt.cpp
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/hyper_connection/manifold.cu
   ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu

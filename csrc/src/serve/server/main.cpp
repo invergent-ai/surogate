@@ -1,4 +1,5 @@
 #include "api/ops/batch_invariant.h"
+#include "api/ops/vision_fp8.h"
 #include "api/ops/sparse_moe.h"
 #include "product/load_progress/load_progress.h"
 #include "product/cuda_visibility/cuda_visibility.h"
@@ -110,6 +111,7 @@ int main(int argc, char** argv) {
 
         // Before any model loads or kernel runs: every op reads it from the first forward on.
         sinfer::ops::set_batch_invariant(options.batch_invariant);
+        sinfer::ops::set_vision_fp8(options.vision_fp8);
         if (options.moe_route == "w4a16") {
             sinfer::ops::set_sparse_moe_route(sinfer::ops::SparseMoeRoute::W4A16);
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,

@@ -24,11 +24,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
 
 namespace sinfer::family {
+
+struct VisionFp8Weights;
+struct VisionFp8Block;
 
 /// The alignment the tower's workspace and its output transient are carved at.
 inline constexpr std::size_t kVisionWorkspaceAlignment = 256;
@@ -82,6 +86,8 @@ public:
     /// The tower this context encodes with.
     [[nodiscard]] const VisionGeometry& geometry() const noexcept { return cfg_; }
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
+    /// Whether this tower's block projections run MXFP8 (--vision-fp8, family/vision_fp8.h).
+    [[nodiscard]] bool fp8() const noexcept { return fp8_ != nullptr; }
     [[nodiscard]] bool encode_step(const VisionItemView& item, Tensor& output,
                                     WorkspaceArena& workspace, VisionEncodeState& state) const;
 
@@ -123,6 +129,10 @@ private:
     /// ship towers of different depths.
     std::vector<BlockW> blocks_;
     MergerW merger_{};
+    /// The MXFP8 copies of the block projections, when --vision-fp8 built them for this tower.
+    std::shared_ptr<const VisionFp8Weights> fp8_;
+    /// This layer's MXFP8 projections if all four can run MXFP8 at `patches` columns, else null.
+    [[nodiscard]] const VisionFp8Block* fp8_block(std::size_t layer, std::int32_t patches) const;
     std::vector<std::pair<std::int32_t, MergerW>> deepstack_;
 };
 

@@ -1,6 +1,7 @@
 #include "family/vision_tower.h"
 #include "family/gemma_vision.h"
 #include "family/muse_vision.h"
+#include "family/vision_fp8.h"
 
 #include "core/layout.h"
 #include "api/ops/add_bias.h"
@@ -12,6 +13,8 @@
 #include "api/ops/rope.h"
 #include "api/ops/vision_attention.h"
 #include "api/ops/vision_pos_embed.h"
+#include "api/ops/vision_fp8.h"
+#include "ops/linear/mxfp8/mxfp8.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -75,6 +78,9 @@ struct VisionWorkspaceLayout {
     TensorRegion normalized;
     TensorRegion projector_norm;
     TensorRegion merger_hidden;
+    // --vision-fp8: one projection input at a time, quantized (sized for the widest, fc2's).
+    std::optional<LayoutRegion> fp8_codes;
+    std::optional<LayoutRegion> fp8_scales;
     std::size_t bytes = 0;
 };
 
@@ -108,6 +114,15 @@ VisionWorkspaceLayout build_workspace_layout(const VisionGeometry& g,
     out.pos_weights = add(DType::FP32, {4, patches}, "vision position weights");
     out.x           = add(DType::BF16, {g.hidden, patches}, "vision residual");
     out.patch_bf16  = add(DType::BF16, {g.patch_dim, patches}, "vision BF16 patches");
+    if (ops::vision_fp8()) {
+        // Outside the scopes below: a block's projection inputs are quantized into it while the
+        // scoped activations (h, attended, up) are live, so it must not share their storage.
+        const std::int32_t widest = std::max(g.hidden, g.intermediate);
+        out.fp8_codes  = builder.add(ops::detail::mxfp8_codes_bytes(patches, widest),
+                                     kWorkspaceAlignment, "vision MXFP8 projection input");
+        out.fp8_scales = builder.add(ops::detail::mxfp8_scales_bytes(patches, widest),
+                                     kWorkspaceAlignment, "vision MXFP8 projection input scales");
+    }
     {
         auto attention_scope = builder.scope();
         out.attended         = add(DType::BF16, {g.hidden, patches}, "vision attended");
@@ -195,6 +210,30 @@ VisionContext::VisionContext(DeviceContext& ctx, const VisionWeights& vision,
     merger_.fc1_bias    = &vision.common.merger_fc1_bias;
     merger_.fc2         = &vision.merger_fc2;
     merger_.fc2_bias    = &vision.merger_fc2_bias;
+    if (ops::vision_fp8()) {
+        fp8_ = find_vision_fp8(&vision);
+        if (fp8_ && fp8_->blocks.size() != blocks_.size()) { fp8_.reset(); }
+    }
+}
+
+const VisionFp8Block* VisionContext::fp8_block(std::size_t layer, std::int32_t patches) const {
+    if (!fp8_) { return nullptr; }
+    const VisionFp8Block& b = fp8_->blocks[layer];
+    const BlockW& w         = blocks_[layer];
+    const auto aligned      = [](const Tensor* t) {
+        return t != nullptr && t->data != nullptr &&
+               (reinterpret_cast<std::uintptr_t>(t->data) & 15U) == 0;
+    };
+    using ops::detail::mxfp8_gemm_available;
+    if (!aligned(w.qkv_bias) || !aligned(w.projection_bias) || !aligned(w.fc1_bias) ||
+        !aligned(w.fc2_bias) ||
+        !mxfp8_gemm_available(b.qkv.rows, b.qkv.k, patches, true, false) ||
+        !mxfp8_gemm_available(b.projection.rows, b.projection.k, patches, true, true) ||
+        !mxfp8_gemm_available(b.fc1.rows, b.fc1.k, patches, true, false) ||
+        !mxfp8_gemm_available(b.fc2.rows, b.fc2.k, patches, true, true)) {
+        return nullptr;
+    }
+    return &b;
 }
 
 std::size_t VisionContext::workspace_bytes(const VisionGeometry& geometry,
@@ -328,6 +367,27 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
         const std::size_t layer = state.layer;
         auto& deepstack_index = state.deepstack;
         const BlockW& block = blocks_[layer];
+        // --vision-fp8: every projection input is quantized into one MXFP8 buffer just before
+        // its GEMM; the residual projections accumulate into x with their bias in the epilogue.
+        const VisionFp8Block* fp8 = fp8_block(layer, patches);
+        ops::detail::Mxfp8Matrix input;
+        if (fp8 != nullptr) {
+            input.codes  = layout.fp8_codes->bind(backing).data;
+            input.scales = layout.fp8_scales->bind(backing).data;
+            input.rows   = patches;
+        }
+        const auto quantize = [&](const Tensor& t, ops::detail::Mxfp8Transform transform) {
+            input.k = t.ne[0];
+            ops::detail::mxfp8_quantize(t.data, t.ne[0], transform, input, stream);
+        };
+        const auto mxfp8 = [&](const ops::detail::Mxfp8Matrix& weight, const Tensor* bias,
+                               bool accumulate, Tensor& out) {
+            // fp8_block checked every plan at this width, so a refusal here is a bug.
+            if (!ops::detail::mxfp8_gemm(weight, input, bias != nullptr ? bias->data : nullptr,
+                                         accumulate, out.data, stream)) {
+                throw std::logic_error("vision MXFP8 projection lost its plan");
+            }
+        };
         {
             Tensor attended = layout.attended.bind(backing);
             {
@@ -336,8 +396,11 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                     Tensor h = layout.attention_norm.bind(backing);
                     ops::layer_norm(x, *block.norm1_weight, *block.norm1_bias, g.norm_epsilon, h,
                                     stream);
-                    if (!fused(h, *block.qkv, *block.qkv_bias, ops::LinearEpilogue::Bias, qkv,
-                               stream)) {
+                    if (fp8 != nullptr) {
+                        quantize(h, ops::detail::Mxfp8Transform::None);
+                        mxfp8(fp8->qkv, block.qkv_bias, false, qkv);
+                    } else if (!fused(h, *block.qkv, *block.qkv_bias, ops::LinearEpilogue::Bias,
+                                      qkv, stream)) {
                         ops::linear(h, *block.qkv, qkv, stream);
                         ops::add_bias(*block.qkv_bias, qkv, stream);
                     }
@@ -362,7 +425,11 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                                       stream);
             }
             // x += projection(attended) + bias, straight into the residual stream.
-            if (!fused_residual(attended, *block.projection, *block.projection_bias, x, stream)) {
+            if (fp8 != nullptr) {
+                quantize(attended, ops::detail::Mxfp8Transform::None);
+                mxfp8(fp8->projection, block.projection_bias, true, x);
+            } else if (!fused_residual(attended, *block.projection, *block.projection_bias, x,
+                                       stream)) {
                 Tensor projected = layout.projected.bind(backing);
                 ops::linear(attended, *block.projection, projected, stream);
                 ops::add_bias(*block.projection_bias, projected, stream);
@@ -376,15 +443,22 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
                 Tensor h = layout.mlp_norm.bind(backing);
                 ops::layer_norm(x, *block.norm2_weight, *block.norm2_bias, g.norm_epsilon, h,
                                 stream);
-                if (!fused(h, *block.fc1, *block.fc1_bias, ops::LinearEpilogue::GeluTanhBias, up,
-                           stream)) {
+                if (fp8 != nullptr) {
+                    // fc1 + bias only: the tanh GELU rides the quantization of fc2's input below.
+                    quantize(h, ops::detail::Mxfp8Transform::None);
+                    mxfp8(fp8->fc1, block.fc1_bias, false, up);
+                } else if (!fused(h, *block.fc1, *block.fc1_bias, ops::LinearEpilogue::GeluTanhBias,
+                                  up, stream)) {
                     ops::linear(h, *block.fc1, up, stream);
                     ops::add_bias(*block.fc1_bias, up, stream);
                     ops::gelu(up, ops::GeluMode::Tanh, stream);
                 }
             }
             // x += fc2(up) + bias, straight into the residual stream.
-            if (!fused_residual(up, *block.fc2, *block.fc2_bias, x, stream)) {
+            if (fp8 != nullptr) {
+                quantize(up, ops::detail::Mxfp8Transform::GeluTanh);
+                mxfp8(fp8->fc2, block.fc2_bias, true, x);
+            } else if (!fused_residual(up, *block.fc2, *block.fc2_bias, x, stream)) {
                 ops::linear(up, *block.fc2, down, stream);
                 ops::add_bias(*block.fc2_bias, down, stream);
                 ops::residual_add(down, x, stream);

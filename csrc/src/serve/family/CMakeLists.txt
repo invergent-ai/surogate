@@ -27,6 +27,7 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision_ops.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_tower.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vision_fp8.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_standalone.cpp)
 
 target_include_directories(sinfer_engine PRIVATE

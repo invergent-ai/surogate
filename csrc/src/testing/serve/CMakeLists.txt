@@ -681,6 +681,9 @@ sinfer_add_linear_test(sinfer_linear_fp8_generic_test ops/linear/test_fp8_generi
 sinfer_add_op_test(sinfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_linear_mxfp8_test
+  SOURCES ops/linear/test_mxfp8.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_checkpoint_projection_test
   SOURCES ops/test_checkpoint_projection.cpp
   LIBRARIES sinfer_ops CUDA::cudart)
