@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <string>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -145,6 +146,77 @@ void one_device() {
     check(all_zero, "clear_slot zeroes the slot");
 }
 
+/// The prefix caches key KV by (slot, KV generation). The fault this guards (11-10): an
+/// in-place swap kept the slot number, so a prompt seen under the old adapter was served from
+/// the old adapter's KV and scores after the swap. Every change of a slot's bytes must move its
+/// generation to a value it never had, and leave the other slots' alone.
+void kv_generations() {
+    sinfer::ops::LoraStoreSet set;
+    int device = 0;
+    check(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice");
+    sinfer::ops::LoraStore& store = set.for_device(device);
+    const auto key = reinterpret_cast<const void*>(0x3000);
+    build(store, key, /*first_layer=*/0);
+
+    check(store.slot_kv_generation(0) == 0 && store.slot_kv_generation(1) == 0,
+          "a slot never loaded has KV generation 0");
+    check(store.slot_kv_generation(-1) == 0 && store.slot_kv_generation(2) == 0,
+          "out-of-range slots (the base model) have generation 0");
+    std::vector<std::uint64_t> seen;
+    const auto moved = [&](std::int32_t slot, std::uint64_t before_slot, std::uint64_t before_clock,
+                           const char* what) {
+        const std::uint64_t now = store.slot_kv_generation(slot);
+        bool fresh = now != 0 && now != before_slot;
+        for (const auto value : seen) { fresh &= value != now; }
+        seen.push_back(now);
+        check(fresh, what);
+        check(store.kv_generation_clock() > before_clock, "the clock moves with every change");
+    };
+
+    std::uint64_t clock = store.kv_generation_clock();
+    write(store, /*layer=*/0, /*slot=*/1, /*scale=*/2.0F);
+    moved(1, 0, clock, "a load moves the slot's generation");
+    check(store.slot_kv_generation(0) == 0, "a load into slot 1 leaves slot 0's generation");
+
+    // The in-place swap: the same slot, new bytes, at a round boundary.
+    const std::uint64_t loaded = store.slot_kv_generation(1);
+    const std::uint64_t slot0  = store.slot_kv_generation(0);
+    clock                      = store.kv_generation_clock();
+    const std::string module = "down_proj";
+    const std::vector<std::uint16_t> a(static_cast<std::size_t>(2) * 4, 0x4000); // bf16 2.0
+    const std::vector<std::uint16_t> b(static_cast<std::size_t>(4) * 2, 0x3F80);
+    std::vector<sinfer::ops::LoraStore::StagedModule> modules{{0, &module, &a, &b, 2, 4, 4, 1.0F}};
+    const auto staged = store.stage_modules(1, modules);
+    check(store.slot_kv_generation(1) == loaded, "staging alone does not change what the slot holds");
+    store.commit_staged(*staged);
+    moved(1, loaded, clock, "an in-place swap moves the slot's generation");
+    check(store.slot_kv_generation(0) == slot0, "an in-place swap of slot 1 leaves slot 0's generation");
+
+    // Swapping the same bytes in again still moves it: the KV was computed between the swaps.
+    const std::uint64_t swapped = store.slot_kv_generation(1);
+    clock                       = store.kv_generation_clock();
+    store.commit_staged(*store.stage_modules(1, modules));
+    moved(1, swapped, clock, "a repeated in-place swap moves the slot's generation again");
+
+    const std::uint64_t before_clear = store.slot_kv_generation(1);
+    clock                            = store.kv_generation_clock();
+    store.clear_slot(1);
+    moved(1, before_clear, clock, "an unload moves the slot's generation");
+
+    // A trainer-published module (shared GRPO adapters).
+    const std::vector<std::uint16_t> ones(8, 0x3F80);
+    sinfer::DeviceBuffer da(ones.size() * sizeof(std::uint16_t));
+    sinfer::DeviceBuffer db(ones.size() * sizeof(std::uint16_t));
+    da.copy_from_host(ones.data(), da.bytes);
+    db.copy_from_host(ones.data(), db.bytes);
+    clock = store.kv_generation_clock();
+    store.set_device_module(0, sinfer::DeviceAdapterModule{0, "down_proj", da.p, db.p, 2, 4, 4, 2.0F});
+    moved(0, slot0, clock, "a published module moves its slot's generation");
+
+    // The engine-facing accessors read the bound context's store for the current device.
+    check(sinfer::ops::lora_slot_kv_generation(-1) == 0, "the base model's generation is 0");
+}
+
 /// The defect that killed the engine: every write below happens on a thread bound
 /// to a different device than the store.
 void write_from_another_device(int other) {
@@ -267,6 +339,7 @@ int main() {
         return 77;
     }
     one_device();
+    kv_generations();
     speculative_columns();
     if (count >= 2) {
         write_from_another_device(1);

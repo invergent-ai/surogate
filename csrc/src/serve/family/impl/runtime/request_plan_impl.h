@@ -147,6 +147,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw InvalidRequest("GPU prefix readout requires one-token text requests");
     }
     prune_gpu_prefixes();
+    drop_stale_adapter_prefixes();
     if (gpu_prefix_readout) {
         if (options.gpu_prefix) {
             const auto found = gpu_prefixes.find(options.gpu_prefix.get());
@@ -400,6 +401,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     }
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;
+    // What the request's adapter slot holds now: state computed under other bytes is not reused.
+    const std::uint64_t lora_generation = adapter_kv_generation(base.lora_slot);
 
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
@@ -466,7 +469,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         if (base.gpu_prefix) {
             const auto frontier = sequence.execution_frontier;
             if (!sequence.target_only || !sequence.tail_hidden_valid || frontier > prompt.token_ids.size() ||
-                !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, frontier, base.lora_slot)) {
+                !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, frontier, base.lora_slot,
+                                                lora_generation)) {
                 throw std::invalid_argument("request does not extend its GPU prefix with the same adapter");
             }
             plan->reuse = ReusePath::AppendAtFrontier;
@@ -482,7 +486,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         std::uint32_t count = 1;
         while (count < limit && sequence.cached_scores[count].selected.token_id == prompt.token_ids[count] &&
                sequence.cached_scores[count].top.size() >= std::size_t(needed)) ++count;
-        if (limit >= 1 && family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, count, base.lora_slot)) {
+        if (limit >= 1 && family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, count, base.lora_slot,
+                                                         lora_generation)) {
             plan->reusable_scores = count;
         }
     }
@@ -511,7 +516,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
             sequence.dflash_context_frontier == sequence.execution_frontier;
         if (append_frontier != 0 && dflash_append_ready &&
             family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            append_frontier, base.lora_slot)) {
+                                            append_frontier, base.lora_slot, lora_generation)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = append_frontier;
         } else if ((!archived || decoder->can_acquire_checkpoint(lane)) &&
@@ -520,7 +525,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
                    family::detail::prefix_matches(prompt, sequence.ledger,
                                                    sequence.prefix_identity,
                                                    sequence.rewrite_checkpoint.frontier,
-                                                   base.lora_slot)) {
+                                                   base.lora_slot, lora_generation)) {
             plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
             plan->reuse_base = sequence.rewrite_checkpoint.frontier;
         }
@@ -590,7 +595,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                        desired->frontier, base.lora_slot);
+                                        desired->frontier, base.lora_slot, lora_generation);
     if (!desired) {
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
     } else if (existing_checkpoint_matches) {

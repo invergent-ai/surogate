@@ -833,10 +833,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     request.save_gpu_prefix = request_plan.save_gpu_prefix;
     request.gpu_storage = request_plan.gpu_storage;
     sequence.cacheable = request_plan.retain_prefix;
+    // The adapter bytes this request's rounds run under; its plan was made against the same
+    // (a swap moves the KV generation clock, and the executor re-plans on it).
+    const std::uint64_t lora_generation = adapter_kv_generation(request_plan.lora_slot);
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                          request_plan.reuse_base, request_plan.lora_slot))) {
+                                          request_plan.reuse_base, request_plan.lora_slot, lora_generation))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
     if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
@@ -852,7 +855,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.reuse == ReusePath::FullReset ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier,
-                                          request_plan.lora_slot))) {
+                                          request_plan.lora_slot, lora_generation))) {
         throw std::logic_error("planned rewrite checkpoint retention is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
@@ -862,7 +865,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.reuse == ReusePath::FullReset ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier,
-                                          request_plan.lora_slot))) {
+                                          request_plan.lora_slot, lora_generation))) {
         throw std::logic_error("planned rewrite checkpoint reclassification is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
@@ -1074,7 +1077,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.mtp_draft_count   = 0;
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
-        sequence.prefix_identity.assign(prompt, request_plan.lora_slot);
+        sequence.prefix_identity.assign(prompt, request_plan.lora_slot, lora_generation);
 
 
 

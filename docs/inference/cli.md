@@ -138,11 +138,11 @@ an adapter loaded) running ten agent conversations that grow to 100k tokens, fou
 85 % of the later turns' prompts cached with 8 GiB, against 15 % without the tier, and a turn took
 7.1 s instead of 18.8 s; 4 GiB held two or three of those conversations and kept 23 %.
 
-Across an in-place adapter swap (`--lora-swap in-place`), conversations on the GPU continue with
-the KV they have, as requests in flight do. The host's entries are keyed by the adapter's
-weights, so a conversation that only the host holds prefills again once under the new adapter,
-and its next finished turn is stored under it. With two swaps during the RL test above, the hit
-rate stayed at 83–90 %.
+Across an in-place adapter swap (`--lora-swap in-place`), no prefix computed under the earlier
+weights is reused: conversations retained on the GPU, shared prefixes and the host's entries of
+that adapter all prefill again once under the new weights, and their next finished turn is
+stored under them. Requests in flight continue as they are. Other adapters and the base model
+keep their cached prefixes.
 
 `0` keeps nothing on the host, not even the 512 MiB archive.
 

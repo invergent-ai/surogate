@@ -62,13 +62,16 @@ void ResidentPrefixIdentity::reserve(std::size_t tokens) {
 
 void ResidentPrefixIdentity::clear() noexcept {
     lora_slot_ = -1;
+    lora_generation_ = 0;
     token_types_.clear();
     for (auto& axis : positions_) { axis.clear(); }
     vision_items_.clear();
 }
 
-void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt, std::int32_t lora_slot) {
-    lora_slot_ = lora_slot;
+void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt, std::int32_t lora_slot,
+                                    std::uint64_t lora_generation) {
+    lora_slot_       = lora_slot;
+    lora_generation_ = lora_generation;
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
@@ -115,9 +118,13 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
 }
 
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count,
-                                     std::int32_t requester_lora_slot) const {
+                                     std::int32_t requester_lora_slot,
+                                     std::uint64_t requester_lora_generation) const {
     // Reusing zero tokens asserts nothing about whose values they were.
-    if (count != 0 && requester_lora_slot != lora_slot_) { return false; }
+    if (count != 0 &&
+        (requester_lora_slot != lora_slot_ || requester_lora_generation != lora_generation_)) {
+        return false;
+    }
     const std::size_t prompt_tokens = prompt.token_ids.size();
     if (count > prompt_tokens || count > size() || prompt.token_types.size() != prompt_tokens ||
         prompt.positions.size() != 3 * prompt_tokens) {
@@ -152,7 +159,10 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
 
 bool ResidentPrefixIdentity::is_prefix_of(const ResidentPrefixIdentity& longer) const {
     const std::size_t count = size();
-    if (lora_slot_ != longer.lora_slot_ || count > longer.size()) { return false; }
+    if (lora_slot_ != longer.lora_slot_ || lora_generation_ != longer.lora_generation_ ||
+        count > longer.size()) {
+        return false;
+    }
     if (!std::equal(token_types_.begin(), token_types_.end(), longer.token_types_.begin())) { return false; }
     for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
         if (!std::equal(positions_[axis].begin(), positions_[axis].end(), longer.positions_[axis].begin())) {
@@ -171,12 +181,12 @@ bool ResidentPrefixIdentity::is_prefix_of(const ResidentPrefixIdentity& longer) 
 
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count,
-                    std::int32_t requester_lora_slot) {
+                    std::int32_t requester_lora_slot, std::uint64_t requester_lora_generation) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
     return std::equal(prompt.token_ids.begin(),
                       prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
                       resident_tokens.begin()) &&
-           resident_identity.matches(prompt, count, requester_lora_slot);
+           resident_identity.matches(prompt, count, requester_lora_slot, requester_lora_generation);
 }
 
 } // namespace sinfer::family::detail

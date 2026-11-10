@@ -273,6 +273,9 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
         !sequence.prefix_identity.text_only()) {
         return false;
     }
+    // KV computed under adapter bytes its slot no longer holds (an in-place swap since): keyed
+    // under the slot's present identity it would be served as the new adapter's.
+    if (!adapter_kv_current(sequence.prefix_identity)) { return false; }
     const std::uint32_t frontier = reusable_append_frontier(sequence);
     if (frontier == 0 || frontier > sequence.ledger.size()) { return false; }
     drain_host_losses();
@@ -306,6 +309,7 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
             append_u64(bytes, static_cast<std::uint64_t>(slot));
             append_u64(bytes, tier.epoch);
             append_u64(bytes, tier.owner);
+            append_u64(bytes, sequence.prefix_identity.lora_generation());
             adapter = kvkeys::adapter_digest(bytes);
         }
     }
@@ -613,6 +617,7 @@ void ProgramImplCore::background_offload() noexcept {
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const SequenceState& sequence = sequences[lane];
             if (!sequence.retained || !sequence.cacheable || sequence.target_only || !sequence.kv ||
+                !adapter_kv_current(sequence.prefix_identity) ||
                 sequence.ledger.size() < min_tokens || requests[lane].lifecycle == Lifecycle::Prefilling ||
                 requests[lane].lifecycle == Lifecycle::Active || requests[lane].lifecycle == Lifecycle::Pending ||
                 lane_has_current_snapshot(lane)) {

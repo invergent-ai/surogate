@@ -118,6 +118,7 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
     max_rank_       = max_rank;
     scratch_tokens_ = max_tokens;
     versions_       = std::make_unique<std::atomic<std::uint32_t>[]>(static_cast<std::size_t>(slots));
+    kv_generations_ = std::make_unique<std::atomic<std::uint64_t>[]>(static_cast<std::size_t>(slots));
     // The device memory -- scratch, slot cell, banks -- is allocated by
     // ensure_banks, in one arena, so that under sleep mode the whole adapter
     // estate is a single Offload region of the engine. Direct users that never
@@ -159,6 +160,7 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         b.size() != static_cast<std::size_t>(out_dim) * rank) {
         throw std::invalid_argument("lora_store: A must be [rank,in] and B [out,rank]");
     }
+    advance_kv_generation(slot);
 
     const Key key{base_key, port};
     auto found = banks_.find(key);
@@ -671,6 +673,7 @@ void LoraStore::validate_device_module(const DeviceAdapterModule& m) const {
 void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& m) {
     validate_device_module(m);
     if (slot < 0 || slot >= slots_) { throw std::invalid_argument("invalid adapter slot"); }
+    advance_kv_generation(slot);
     const ScopedDevice on_store(device_);
     for (const auto& binding : module_parts(m.layer, m.module)) {
         auto& bank = banks_.at(Key{binding.key, binding.port});
@@ -728,6 +731,7 @@ void LoraStore::clear_slot(std::int32_t slot) {
         identities_.erase(slot);
     }
     if (slot < 0 || slot >= slots_) { return; }
+    advance_kv_generation(slot);
     const ScopedDevice on_store(device_);
     for (auto& [key, replacement] : replacements_) {
         void* empty = nullptr;
@@ -897,6 +901,9 @@ LoraStore::stage_modules(std::int32_t slot, const std::vector<StagedModule>& mod
 void LoraStore::commit_staged(const StagedSlot& staged) {
     const std::int32_t slot = staged.slot_;
     if (slot < 0 || slot >= slots_) { throw std::invalid_argument("lora_store: staged slot is out of range"); }
+    // Before the first byte moves: KV computed from here on is the new adapter's, and every
+    // prefix computed under the old bytes stops matching (slot_kv_generation).
+    advance_kv_generation(slot);
     const auto t0 = std::chrono::steady_clock::now();
     const ScopedDevice on_store(device_ < 0 ? current_device() : device_);
     cudaStream_t stream = nullptr;
@@ -985,6 +992,22 @@ void LoraStore::set_slot_version(std::int32_t slot, std::uint32_t version) noexc
     if (versions_ && slot >= 0 && slot < slots_) { versions_[slot].store(version, std::memory_order_relaxed); }
 }
 
+std::uint64_t LoraStore::slot_kv_generation(std::int32_t slot) const noexcept {
+    return kv_generations_ && slot >= 0 && slot < slots_ ? kv_generations_[slot].load(std::memory_order_acquire)
+                                                         : 0U;
+}
+
+void LoraStore::advance_kv_generation(std::int32_t slot) noexcept {
+    if (!kv_generations_ || slot < 0 || slot >= slots_) { return; }
+    // Unique across the process, so a value never comes back for any slot of any store. The
+    // slot's value first, then the clock: a planner that sees the new clock re-plans and reads
+    // the new generation.
+    static std::atomic<std::uint64_t> issued{0};
+    const std::uint64_t next = issued.fetch_add(1, std::memory_order_relaxed) + 1U;
+    kv_generations_[slot].store(next, std::memory_order_release);
+    kv_clock_.fetch_add(1, std::memory_order_acq_rel);
+}
+
 void LoraStore::write_uniform_slot(std::int32_t slot, cudaStream_t stream) const {
     std::int32_t* cell = uniform_cell_;
     if (cell == nullptr) { return; }
@@ -1028,6 +1051,32 @@ std::vector<int> LoraStoreSet::devices() const {
 
 LoraStore& lora_store_for_current_device() {
     return engine_slot<LoraStoreSet>().for_device(LoraStore::current_device());
+}
+
+namespace {
+const LoraStore* peek_current_store() noexcept {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    try {
+        return engine_slot<LoraStoreSet>().peek(device);
+    } catch (...) {
+        return nullptr;
+    }
+}
+} // namespace
+
+std::uint64_t lora_slot_kv_generation(std::int32_t slot) noexcept {
+    if (slot < 0) { return 0; }
+    const LoraStore* store = peek_current_store();
+    return store != nullptr ? store->slot_kv_generation(slot) : 0U;
+}
+
+std::uint64_t lora_kv_generation_clock() noexcept {
+    const LoraStore* store = peek_current_store();
+    return store != nullptr ? store->kv_generation_clock() : 0U;
 }
 
 namespace {

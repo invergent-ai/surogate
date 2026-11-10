@@ -70,6 +70,8 @@ void upload_prefix_state(std::span<const std::span<std::byte>> image,
 
 void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
     if (sequence.target_only || !sequence.retained || !sequence.cacheable || !sequence.kv || sequence.ledger.empty()) { return; }
+    // Computed under adapter bytes its slot no longer holds: nothing may reuse it.
+    if (!adapter_kv_current(sequence.prefix_identity)) { return; }
     if (host_tier) {
         // The host tier may hold it already (a background copy of the finished turn).
         if (!lane_has_current_snapshot(sequence.lane)) { (void)snapshot_lane(sequence.lane, 2); }
@@ -323,12 +325,13 @@ ProgramImplCore::shared_prefix_hashes(const PreparedPromptData& prompt, std::int
 std::shared_ptr<SharedPrefix> ProgramImplCore::find_shared_prefix(const PreparedPromptData& prompt,
     const std::vector<std::uint64_t>& hashes, std::int32_t lora_slot) const {
     std::shared_ptr<SharedPrefix> best;
+    const std::uint64_t lora_generation = adapter_kv_generation(lora_slot);
     for (const auto& [hash, entry] : shared_prefixes) {
         const std::size_t pages = entry->tokens / kPagedKVPageSize;
         if (pages == 0 || pages > hashes.size() || hashes[pages - 1] != hash ||
             (best && best->tokens >= entry->tokens) ||
             !family::detail::prefix_matches(prompt, entry->state.ledger, entry->state.prefix_identity,
-                                            entry->tokens, lora_slot)) {
+                                            entry->tokens, lora_slot, lora_generation)) {
             continue;
         }
         best = entry;
@@ -371,6 +374,30 @@ std::uint32_t ProgramImplCore::shared_prefix_pages() const noexcept {
     return pages;
 }
 
+void ProgramImplCore::drop_stale_adapter_prefixes() noexcept {
+    const std::uint64_t clock = ::sinfer::ops::lora_kv_generation_clock();
+    if (clock == adapter_kv_clock_seen) { return; }
+    adapter_kv_clock_seen = clock;
+    try {
+        // As evict_archived_prefixes does for all of them: a host-tier entry leaves the pool now,
+        // not when the last plan holding it lets go.
+        (void)archived_prefixes.erase_if([](const ArchivedSequence& value) {
+            if (adapter_kv_current(value.state.prefix_identity)) { return false; }
+            if (value.tier && value.tier->pool) { value.tier->pool->drop_entry(value.tier->entry); }
+            return true;
+        });
+    } catch (...) {}
+    // Pages a running or retained fork still borrows stay with it until it lets them go.
+    for (auto it = shared_prefixes.begin(); it != shared_prefixes.end();) {
+        if (adapter_kv_current(it->second->state.prefix_identity)) {
+            ++it;
+        } else {
+            it = shared_prefixes.erase(it);
+            ++shared_prefix_revision;
+        }
+    }
+}
+
 void ProgramImplCore::drop_shared_prefixes() noexcept {
     if (shared_prefixes.empty()) { shared_prefix_storage.reset(); return; }
     // Pages a running or retained fork still borrows stay with it until it lets them go.
@@ -385,6 +412,8 @@ void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestCont
     const std::uint64_t hash = staged.shared_capture_hash;
     staged.shared_capture.reset();
     if (shared_prefix_slots == 0) { return; }
+    // A prefill an in-place adapter swap overtook: its KV mixes the old and the new bytes.
+    if (!adapter_kv_current(sequence.prefix_identity)) { return; }
     const auto pages = tokens / static_cast<std::uint32_t>(kPagedKVPageSize);
     const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
     if (!sequence.kv || sequence.kv->backend.has_value() != mtp || sequence.text_kv_valid != tokens ||

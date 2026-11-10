@@ -2281,8 +2281,11 @@ std::string GenerationService::load_lora_adapter(const std::string& name, const 
                 store->set_slot_version(slot, version);
             }
         });
-        // Conversations kept on the GPU stay reusable: like the requests in flight, they carry on
-        // under the new adapter. Host-tier snapshots are keyed by the old identity and stop matching.
+        // Requests in flight carry on under the new adapter (lora_versions records where). No
+        // prefix computed before the swap is reused: commit_staged moved the slot's KV
+        // generation, and the prefix caches key resident, archived, shared and host-tier state by
+        // (slot, generation). They used to key it by the slot alone, so a prompt seen under the
+        // old version was served the old version's KV and prompt scores after the swap.
         char line[256];
         std::snprintf(line, sizeof(line),
                       "swapped in place: version %u, engine paused %.1f ms, %.1f MiB staged in %.2f s",

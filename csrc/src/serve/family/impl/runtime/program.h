@@ -10,6 +10,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "api/ops/lora_store.h"
 #include "api/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <api/family/prepared_prompt.h>
@@ -521,9 +522,27 @@ public:
     void set_round_burst_limit(std::uint32_t limit) noexcept { round_burst_limit = limit; }
     [[nodiscard]] std::uint32_t reusable_append_frontier(const SequenceState& sequence) const noexcept;
     [[nodiscard]] bool acquire_rewrite_checkpoint(SequenceState& sequence);
+    /// The KV generation of what adapter `slot` holds now (ops::lora_slot_kv_generation; 0 for
+    /// the base model): a resident, archived or shared prefix is reused only by a request whose
+    /// adapter slot still holds the bytes it was computed under.
+    [[nodiscard]] static std::uint64_t adapter_kv_generation(std::int32_t slot) noexcept {
+        return ::sinfer::ops::lora_slot_kv_generation(slot);
+    }
+    /// Whether `identity`'s values were computed under what its adapter slot holds now. False
+    /// after an in-place swap of that adapter (or a reload into its slot): such state is never
+    /// reused, archived or copied to the host tier.
+    [[nodiscard]] static bool adapter_kv_current(const family::detail::ResidentPrefixIdentity& identity) noexcept {
+        return identity.lora_generation() == adapter_kv_generation(identity.lora_slot());
+    }
+    /// Drops archived and shared prefixes computed under adapter bytes their slot no longer
+    /// holds (nothing can match them again), once per change of the adapters' KV generations.
+    void drop_stale_adapter_prefixes() noexcept;
     [[nodiscard]] std::uint64_t prefix_cache_revision(std::uint32_t lane) const noexcept {
+        // The adapters' KV generation clock too: a plan made before an in-place swap named state
+        // computed under the old bytes, and is made again.
         return decoder->checkpoint_revision() + archived_prefixes.revision() + shared_prefix_revision +
-               (lane < checkpoint_revisions.size() ? checkpoint_revisions[lane] : 0);
+               (lane < checkpoint_revisions.size() ? checkpoint_revisions[lane] : 0) +
+               ::sinfer::ops::lora_kv_generation_clock();
     }
     static void burst_egress_copy_host(void* user) noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
@@ -825,6 +844,8 @@ public:
     std::shared_ptr<GpuPrefixStorage> shared_prefix_storage;
     std::uint64_t shared_prefix_clock = 0;
     std::uint64_t shared_prefix_revision = 0;
+    // The adapters' KV generation clock drop_stale_adapter_prefixes last acted on.
+    std::uint64_t adapter_kv_clock_seen = 0;
     [[nodiscard]] std::shared_ptr<const std::vector<std::uint64_t>>
     shared_prefix_hashes(const PreparedPromptData& prompt, std::int32_t lora_slot) const;
     [[nodiscard]] std::shared_ptr<SharedPrefix> find_shared_prefix(const PreparedPromptData& prompt,

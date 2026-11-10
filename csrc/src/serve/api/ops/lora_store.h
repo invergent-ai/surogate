@@ -256,6 +256,20 @@ public:
     void set_slot_identity(std::int32_t slot, const std::array<std::uint8_t, 16>& digest);
     [[nodiscard]] std::array<std::uint8_t, 16> slot_identity(std::int32_t slot) const;
 
+    /// Which bytes of `slot` KV was computed under: a number that moves on every change of the
+    /// slot's bytes -- a load, an in-place swap (commit_staged), an unload (clear_slot), a
+    /// trainer-published module -- and is never reused within this store (0 until the first).
+    /// The prefix caches key resident, archived and shared KV by (slot, generation), so KV
+    /// computed under one adapter version is never served to a request running under another.
+    /// The slot number alone cannot tell them apart: an in-place swap keeps it, and so does a
+    /// caller-chosen `version`, which may repeat.
+    [[nodiscard]] std::uint64_t slot_kv_generation(std::int32_t slot) const noexcept;
+    /// Moves whenever any slot's generation does; only increases. Plans cached against the old
+    /// value are made again.
+    [[nodiscard]] std::uint64_t kv_generation_clock() const noexcept {
+        return kv_clock_.load(std::memory_order_acquire);
+    }
+
     /// The bank for a projection, or nullptr when it has none. Hot path.
     [[nodiscard]] const LoraBank* find(const void* base_key, std::int32_t port) const noexcept {
         const auto found = banks_.find(Key{base_key, port});
@@ -373,10 +387,14 @@ private:
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
     std::unique_ptr<std::atomic<std::uint32_t>[]> versions_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> kv_generations_;
+    std::atomic<std::uint64_t> kv_clock_{0};
     std::atomic<bool> active_{false};
     mutable std::mutex identity_mutex_;
     std::map<std::int32_t, std::array<std::uint8_t, 16>> identities_;
     void ensure_raw_round_state();
+    /// The slot's bytes changed (or are about to): its KV generation moves (slot_kv_generation).
+    void advance_kv_generation(std::int32_t slot) noexcept;
 };
 
 /// An engine's adapter stores, one per device.
@@ -415,6 +433,12 @@ private:
 /// The store for the calling thread's current CUDA device, from the engine bound
 /// to this thread (the process default serves single-engine paths and tools).
 [[nodiscard]] LoraStore& lora_store_for_current_device();
+
+/// The KV generation of `slot` in the current device's store (LoraStore::slot_kv_generation),
+/// 0 for the base model (a negative slot) or where no store exists. Never creates a store.
+[[nodiscard]] std::uint64_t lora_slot_kv_generation(std::int32_t slot) noexcept;
+/// The current device's LoraStore::kv_generation_clock, 0 where no store exists.
+[[nodiscard]] std::uint64_t lora_kv_generation_clock() noexcept;
 
 /// True when any adapter is resident, so the projection hooks skip the lookup in
 /// the common case. Re-read after a load or unload.

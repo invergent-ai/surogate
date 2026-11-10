@@ -592,11 +592,11 @@ curl -X POST http://localhost:8080/v1/load_lora_adapter \
 - An adapter that fails validation leaves the current one serving. In-place loads take plain
   LoRA: a module with a DoRA magnitude, a bias or a replacement weight is refused with its
   name; load such an adapter without `in_place`.
-- Conversations the server retains, and cached prefixes, stay reusable across the swap: their
-  KV, computed under the earlier weights, continues under the new ones, as a request in flight
-  does. The host prefix cache keys its entries by the adapter's weights instead, so a
-  conversation only it holds is prefilled again once
-  ([Host prefix cache](cli.md#host-prefix-cache)).
+- No prefix computed under the earlier weights is reused after the swap: a conversation the
+  server retains, a shared prefix or a host-tier entry of that adapter is prefilled again once
+  under the new weights ([Host prefix cache](cli.md#host-prefix-cache)), so a prompt sent again
+  after the swap is answered and scored under the new adapter only. Requests in flight continue
+  on the new weights from their next token, as above.
 
 ### Which version sampled each token
 
