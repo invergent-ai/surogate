@@ -335,6 +335,12 @@ int run_profile(std::string_view label, const Profile& profile,
 int run_preactivation_delta_profile(std::string_view label, const Profile& profile,
                                     std::span<const std::int32_t> token_cases, bool expect_route) {
     validate_profile(profile);
+    if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu delta test: no token cases"); }
+    for (std::size_t index = 0; index < token_cases.size(); ++index) {
+        if (token_cases[index] <= 0 || (index != 0 && token_cases[index] <= token_cases[index - 1])) {
+            throw std::invalid_argument("linear_swiglu delta test: token cases must be positive and increasing");
+        }
+    }
     if (!cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

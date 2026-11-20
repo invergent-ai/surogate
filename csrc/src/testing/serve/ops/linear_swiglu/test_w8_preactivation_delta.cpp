@@ -12,8 +12,8 @@ int main() {
     using namespace sinfer::test::linear_swiglu;
     try {
         // Qwen3.6-35B-A3B's shared expert (2048 -> 2 x 512, stored W8): the per-pair kernel at T=1, the runtime-MMA
-        // r32 tile through T=1024 and the r64 tile past it.
-        constexpr std::array<std::int32_t, 7> kSharedTokens{1, 2, 17, 64, 1024, 1025, 1500};
+        // r32 tile through T=1024 (Full at 1024) and the r64 tile past it (Full at 2048).
+        constexpr std::array<std::int32_t, 8> kSharedTokens{1, 2, 17, 64, 1024, 1025, 1500, 2048};
         int failures = run_preactivation_delta_profile(
             "W8 shared expert", {QType::W8G32_F16S, 1024, 2048, 512, 1709U, ActivationCompute::A16}, kSharedTokens,
             true);

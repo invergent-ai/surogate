@@ -587,12 +587,17 @@ void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router
             // SiLU: the delta is gathered onto a zeroed [gate; up] plane first. A zero adapter is then bit-identical
             // to a base round, and an adapter's pre-activations are not rounded to BF16 before the SiLU. A stored
             // format without the delta form keeps the materialised product (the delta added onto it in BF16).
-            CUDA_CHECK(cudaMemsetAsync(w.shared_up, 0,
-                                       sizeof(__nv_bfloat16) * 2 * static_cast<std::size_t>(g.shared_intermediate) * tokens,
-                                       stream));
-            marlin_moe_lora_delta(shared, stream);
-            if (!linear_swiglu_preactivation_delta(x, weights.shared_gate_up, product, activation,
-                                                   LinearPolicy::A16Only, stream)) {
+            if (linear_swiglu_preactivation_delta_admits(x, weights.shared_gate_up, activation,
+                                                         LinearPolicy::A16Only)) {
+                CUDA_CHECK(cudaMemsetAsync(w.shared_up, 0,
+                                           sizeof(__nv_bfloat16) * 2 * static_cast<std::size_t>(g.shared_intermediate) * tokens,
+                                           stream));
+                marlin_moe_lora_delta(shared, stream);
+                if (!linear_swiglu_preactivation_delta(x, weights.shared_gate_up, product, activation,
+                                                       LinearPolicy::A16Only, stream)) {
+                    throw std::logic_error("sparse_moe nvfp4: the admitted pre-activation delta route was refused");
+                }
+            } else {
                 // The pre-fix route: the product in BF16, the delta added onto it, then the SiLU.
                 linear(x, weights.shared_gate_up, product, LinearPolicy::A16Only, workspace, stream);
                 marlin_moe_lora_delta(shared, stream);

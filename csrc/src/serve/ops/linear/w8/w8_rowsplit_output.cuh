@@ -48,6 +48,7 @@ struct W8ContiguousOutput {
 // [gate; up] layout of the parent's product). An adapter round's shared-expert delta goes in this way
 // (sparse_moe_nvfp4.cu), so a zero delta reproduces the plain epilogue bit for bit.
 struct W8SwiGluDeltaOutput : W8ContiguousOutput {
+    static constexpr bool kPreactivationDelta = true;   // the trait w8_swiglu_value tests
     const __nv_bfloat16* delta;
     std::int32_t delta_ld;
 };

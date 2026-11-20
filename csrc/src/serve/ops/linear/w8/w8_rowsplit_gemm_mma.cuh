@@ -67,7 +67,7 @@ __device__ __forceinline__ int w8g32_swz64(int row, int col) {
 template <class Output>
 __device__ __forceinline__ float w8_swiglu_value(const Output& output, float gate, float up, std::int32_t row,
                                                  std::int32_t col, std::int32_t half) {
-    if constexpr (requires(const Output& o) { o.delta; }) {
+    if constexpr (requires { Output::kPreactivationDelta; }) {
         const __nv_bfloat16* d = output.delta + static_cast<std::int64_t>(col) * output.delta_ld;
         gate += __bfloat162float(d[row]);
         up += __bfloat162float(d[half + row]);

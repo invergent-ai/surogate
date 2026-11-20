@@ -96,6 +96,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
  * Returns false, launching nothing, when linear_swiglu would not take its fused W8 route for this weight and width
  * (only W8G32 parents outside the registered route tables have the delta form); the caller then keeps its own path.
  */
+/// Whether linear_swiglu_preactivation_delta takes this weight at this width (x [k, T], out [M, T]).
+[[nodiscard]] bool linear_swiglu_preactivation_delta_admits(const Tensor& x, const Weight& gate_up_weight,
+                                                            const Tensor& out, LinearPolicy policy);
+
 [[nodiscard]] bool linear_swiglu_preactivation_delta(const Tensor& x, const Weight& gate_up_weight,
                                                      const Tensor& delta, Tensor& out, LinearPolicy policy,
                                                      cudaStream_t stream);

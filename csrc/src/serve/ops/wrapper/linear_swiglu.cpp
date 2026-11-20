@@ -380,9 +380,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
 }
 
-bool linear_swiglu_preactivation_delta(const Tensor& x, const Weight& gate_up_weight, const Tensor& delta,
-                                       Tensor& out, LinearPolicy policy, cudaStream_t stream) {
-    // Exactly linear_swiglu's W8 branch: the same admission, checks and kernel choice, plus the delta.
+bool linear_swiglu_preactivation_delta_admits(const Tensor& x, const Weight& gate_up_weight, const Tensor& out,
+                                              LinearPolicy policy) {
+    // Exactly linear_swiglu's W8 branch: the same admission and checks.
     const auto& w        = gate_up_weight;
     const std::int32_t t = x.ne[1];
     if (row_projectable(w.qtype) || w.qtype != QType::W8G32_F16S ||
@@ -390,10 +390,9 @@ bool linear_swiglu_preactivation_delta(const Tensor& x, const Weight& gate_up_we
         return false;
     }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) { return false; }
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || delta.dtype != DType::BF16) { return false; }
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) { return false; }
     if (w.n <= 0 || (w.n % 2) != 0 || out.ne[0] != w.n / 2 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || !out.is_contiguous() || out.data == nullptr || delta.data == nullptr ||
-        delta.ne[0] != w.n || delta.ne[1] != t || !delta.is_contiguous()) {
+        out.ne[3] != 1 || !out.is_contiguous() || out.data == nullptr) {
         return false;
     }
     if (t <= 0 || x.ne[0] != w.k || x.ne[2] != 1 || x.ne[3] != 1 || !x.is_contiguous() ||
@@ -402,6 +401,17 @@ bool linear_swiglu_preactivation_delta(const Tensor& x, const Weight& gate_up_we
         w.group != 32 || w.ndim != 2 || w.shape[0] != w.n || w.shape[1] != w.k ||
         w.padded_shape[0] != w.n || w.padded_shape[1] != w.k || w.qhigh != nullptr ||
         w.high_plane_bytes != 0 || !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 2)) {
+        return false;
+    }
+    return true;
+}
+
+bool linear_swiglu_preactivation_delta(const Tensor& x, const Weight& gate_up_weight, const Tensor& delta,
+                                       Tensor& out, LinearPolicy policy, cudaStream_t stream) {
+    const auto& w = gate_up_weight;
+    if (!linear_swiglu_preactivation_delta_admits(x, w, out, policy)) { return false; }
+    if (delta.dtype != DType::BF16 || delta.data == nullptr || delta.ne[0] != w.n || delta.ne[1] != x.ne[1] ||
+        !delta.is_contiguous()) {
         return false;
     }
     const auto* d = static_cast<const __nv_bfloat16*>(delta.data);
