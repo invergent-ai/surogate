@@ -26,4 +26,9 @@ struct Profile {
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases);
 
+/// ops::linear_swiglu_preactivation_delta against linear_swiglu: a zero delta must give the same bits, a random delta
+/// the fp64 oracle of silu(gate + dg) * (up + du); `expect_route` false checks that the delta form is refused.
+int run_preactivation_delta_profile(std::string_view label, const Profile& profile,
+                                    std::span<const std::int32_t> token_cases, bool expect_route);
+
 } // namespace sinfer::test::linear_swiglu

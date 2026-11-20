@@ -561,10 +561,8 @@ void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router
             linear_swiglu(x, weights.shared_gate_up, activation, LinearPolicy::A16Only, workspace, stream);
             linear(activation, weights.shared_down, shared_out, LinearPolicy::A16Only, workspace, stream);
         } else {
-            // The adapter's shared-expert deltas go in before the SiLU and into its output: the
-            // stored [gate; up] product is materialised for them.
+            // The adapter's shared-expert deltas go in before the SiLU and into its output.
             Tensor product(w.shared_up, DType::BF16, {2 * g.shared_intermediate, tokens});
-            linear(x, weights.shared_gate_up, product, LinearPolicy::A16Only, workspace, stream);
             MarlinMoeLoraCall shared;
             shared.fixed_expert     = g.experts;
             shared.block            = 64;
@@ -585,8 +583,21 @@ void run_slice(const SparseMoeGeometry& g, const Tensor& x, const Tensor& router
             shared.parts            = 2;
             shared.column_offset[0] = 0;
             shared.column_offset[1] = g.shared_intermediate;
+            // The base round's fused kernel with the gate / up delta added to its FP32 accumulators before the
+            // SiLU: the delta is gathered onto a zeroed [gate; up] plane first. A zero adapter is then bit-identical
+            // to a base round, and an adapter's pre-activations are not rounded to BF16 before the SiLU. A stored
+            // format without the delta form keeps the materialised product (the delta added onto it in BF16).
+            CUDA_CHECK(cudaMemsetAsync(w.shared_up, 0,
+                                       sizeof(__nv_bfloat16) * 2 * static_cast<std::size_t>(g.shared_intermediate) * tokens,
+                                       stream));
             marlin_moe_lora_delta(shared, stream);
-            marlin_moe_silu_mul(w.shared_up, w.shared_act, tokens, g.shared_intermediate, stream);
+            if (!linear_swiglu_preactivation_delta(x, weights.shared_gate_up, product, activation,
+                                                   LinearPolicy::A16Only, stream)) {
+                // The pre-fix route: the product in BF16, the delta added onto it, then the SiLU.
+                linear(x, weights.shared_gate_up, product, LinearPolicy::A16Only, workspace, stream);
+                marlin_moe_lora_delta(shared, stream);
+                marlin_moe_silu_mul(w.shared_up, w.shared_act, tokens, g.shared_intermediate, stream);
+            }
             linear(activation, weights.shared_down, shared_out, LinearPolicy::A16Only, workspace, stream);
             MarlinMoeLoraCall shared_down = shared;
             shared_down.input            = w.shared_act;

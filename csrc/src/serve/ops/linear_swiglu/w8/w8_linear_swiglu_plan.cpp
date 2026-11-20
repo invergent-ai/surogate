@@ -315,4 +315,20 @@ bool w8_linear_swiglu_runtime_mma(const Tensor& x, const Weight& w, Tensor& out,
     return true;
 }
 
+bool w8_linear_swiglu_runtime_mma_delta(const Tensor& x, const Weight& w, Tensor& out,
+                                        const __nv_bfloat16* delta, cudaStream_t stream) {
+    const std::int32_t intermediate = w.n / 2;
+    if (x.ne[1] < 2 || (w.n % 2) != 0 || (w.k % kW8MmaScaleRowAlignmentK) != 0 ||
+        (intermediate % kW8MmaRowAlignmentN) != 0 || w.padded_shape[1] != w.k ||
+        out.ne[0] != intermediate) {
+        return false;
+    }
+    if (x.ne[1] <= 1024) {
+        w8_linear_swiglu_mma_r32_c128_delta_launch(x, w, out, delta, stream);
+    } else {
+        w8_linear_swiglu_mma_r64_c128_delta_launch(x, w, out, delta, stream);
+    }
+    return true;
+}
+
 } // namespace sinfer::ops::detail

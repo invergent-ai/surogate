@@ -773,6 +773,10 @@ sinfer_add_fused_linear_test(
   ops/linear_swiglu/test_w8_a16.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 sinfer_add_fused_linear_test(
+  sinfer_linear_swiglu_w8_delta_test
+  ops/linear_swiglu/test_w8_preactivation_delta.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+sinfer_add_fused_linear_test(
   sinfer_linear_swiglu_nvfp4_test
   ops/linear_swiglu/test_nvfp4.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)

@@ -87,4 +87,17 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
+/**
+ * linear_swiglu with a pre-activation delta: out = silu(gate + dgate) * (up + dup), the delta [2M, T] BF16
+ * ([gate; up] rows per token, the layout of the parent's product) added to the FP32 accumulators of the same kernel
+ * linear_swiglu runs, before the SiLU. A zero delta gives linear_swiglu's bits exactly. An adapter round's shared
+ * expert takes it (sparse_moe_nvfp4.cu), so a zero adapter is neutral.
+ *
+ * Returns false, launching nothing, when linear_swiglu would not take its fused W8 route for this weight and width
+ * (only W8G32 parents outside the registered route tables have the delta form); the caller then keeps its own path.
+ */
+[[nodiscard]] bool linear_swiglu_preactivation_delta(const Tensor& x, const Weight& gate_up_weight,
+                                                     const Tensor& delta, Tensor& out, LinearPolicy policy,
+                                                     cudaStream_t stream);
+
 } // namespace sinfer::ops

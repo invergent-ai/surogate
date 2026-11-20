@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_bf16.h>
+
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -60,5 +62,10 @@ void w8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cu
 /// (w8_launch.h: k % 256, rows % 128). False, launching nothing, when they do not.
 bool w8_linear_swiglu_runtime_mma(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream);
+
+/// w8_linear_swiglu_runtime_mma's tile choice, with a BF16 pre-activation delta [T][2 * I] added to the FP32 gate /
+/// up accumulators before the SiLU. False, launching nothing, exactly when w8_linear_swiglu_runtime_mma is.
+bool w8_linear_swiglu_runtime_mma_delta(const Tensor& x, const Weight& w, Tensor& out,
+                                        const __nv_bfloat16* delta, cudaStream_t stream);
 
 } // namespace sinfer::ops::detail
