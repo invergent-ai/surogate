@@ -33,6 +33,7 @@
 #include <utility>
 #include <cuda_runtime.h>
 #include <cstdlib>
+#include <malloc.h>
 #include <sstream>
 
 // The listen backlog. cpp-httplib's own default is 5, and this server closes every connection
@@ -761,6 +762,12 @@ void HttpServer::register_routes() {
             return;
         }
         std::string report;
+        // A load parses ~60k small A/B buffers on this handler thread; freed, they stay in whichever
+        // malloc arena the thread used, so every load (an RL step's in-place swap) would grow the
+        // process by an adapter's size. Hand them back once the load is over, loaded or not.
+        struct TrimOnExit {
+            ~TrimOnExit() { malloc_trim(0); }
+        } trim_on_exit;
         try {
             const std::vector<GenerationService*> targets = routed_management_services(req);
             GenerationService& target = *targets.front();
