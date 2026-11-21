@@ -98,6 +98,17 @@ void inkling_pair_rms_norm(const Tensor& dest, const Tensor& message, Tensor& ou
                            cudaStream_t stream);
 
 /**
+ * A looped visit's controller inputs in ONE launch: inkling_attn_res(dest_sources, dest_queries) -> `dest` FP32
+ * [2304, T, DQ], inkling_attn_res(bank, message_queries) -> `message` FP32 [2304, T, S], and
+ * inkling_pair_rms_norm(dest, message) -> `pair` BF16 [4608, T, S], with the same device code in the same order:
+ * bit-identical to the three separate calls. DQ is 1 (dest broadcast over the streams) or S; S in 1..3; `bank` is
+ * one stack source + last, no addend.
+ */
+void inkling_blend_inputs(const InklingAttnResSources& dest_sources, const Tensor& dest_queries,
+                          const InklingAttnResSources& bank, const Tensor& message_queries, std::int32_t columns,
+                          Tensor& dest, Tensor& message, Tensor& pair, cudaStream_t stream);
+
+/**
  * Loop controller, second half (vLLM `blend_rms_norm`, unfused):
  *   x = (1 - tanh(forget)) * dest + tanh(gain) * msg,  out = bf16((x * rsqrt(div_rn(sum x^2, 2304) +
  *   eps)) * w_s).

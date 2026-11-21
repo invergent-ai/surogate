@@ -85,22 +85,25 @@ struct AttnResArgs {
     std::int64_t columns    = 0;
 };
 
+/// The N sources of a column (stack..., last [+ addend]) in registers.
 template <int N>
-__global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
-    __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
-    const std::int64_t t = blockIdx.x;
-    float x[N][kPer];
+__device__ __forceinline__ void load_sources(const PlaneDev* src, const PlaneDev& addend, int has_addend,
+                                             std::int64_t t, float (&x)[N][kPer]) {
 #pragma unroll
     for (int n = 0; n < N; ++n) {
 #pragma unroll
         for (int i = 0; i < kPer; ++i) {
             const int d = threadIdx.x + i * kThreads;
-            float v     = load_plane(a.src[n], t, d);
-            if (n == N - 1 && a.has_addend) { v = v + load_plane(a.addend, t, d); }
+            float v     = load_plane(src[n], t, d);
+            if (n == N - 1 && has_addend) { v = v + load_plane(addend, t, d); }
             x[n][i] = v;
         }
     }
-    // Per-source sum of squares (fma chain per thread, as the reference's tl.fma accumulation).
+}
+
+/// Per-source rstd: fma sum of squares per thread (the reference's tl.fma accumulation), block sum, rsqrt.approx.
+template <int N>
+__device__ __forceinline__ void source_rstd(const float (&x)[N][kPer], float (&rstd)[N], float* scratch) {
     float sq[N];
 #pragma unroll
     for (int n = 0; n < N; ++n) {
@@ -110,46 +113,60 @@ __global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constan
         sq[n] = s;
     }
     block_sum<N>(sq, scratch);
-    float rstd[N];
 #pragma unroll
     for (int n = 0; n < N; ++n) { rstd[n] = rsqrt_approx(fmaf(sq[n], 1.0F / 2304.0F, 1e-6F)); }
+}
 
+/// One query's fp32 mix: softmax over the sources' normalised logits, normalised values, fma chain, * 1 / sum.
+template <int N>
+__device__ __forceinline__ void mix_query(const float (&x)[N][kPer], const float (&rstd)[N], const float* query,
+                                          float (&mix)[kPer], float* scratch) {
+    float dot[N];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        float s = 0.0F;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { s = fmaf(query[threadIdx.x + i * kThreads], x[n][i], s); }
+        dot[n] = s;
+    }
+    block_sum<N>(dot, scratch);
+    float logit[N];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        logit[n] = dot[n] * rstd[n];
+        mx       = fmaxf(mx, logit[n]);
+    }
+    float p[N];
+    float total = 0.0F;
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        p[n]  = expf(logit[n] - mx);
+        total = total + p[n];
+    }
+    const float inv_sum = __fdiv_rn(1.0F, total);
+#pragma unroll
+    for (int n = 0; n < N; ++n) { p[n] = p[n] * rstd[n]; } // normalize_values
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        float acc = 0.0F;
+#pragma unroll
+        for (int n = 0; n < N; ++n) { acc = fmaf(p[n], x[n][i], acc); }
+        mix[i] = acc * inv_sum;
+    }
+}
+
+template <int N>
+__global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
+    __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
+    const std::int64_t t = blockIdx.x;
+    float x[N][kPer];
+    load_sources<N>(a.src, a.addend, a.has_addend, t, x);
+    float rstd[N];
+    source_rstd<N>(x, rstd, scratch);
     for (int q = 0; q < a.num_queries; ++q) {
-        const float* query = a.queries + static_cast<std::int64_t>(q) * kD;
-        float dot[N];
-#pragma unroll
-        for (int n = 0; n < N; ++n) {
-            float s = 0.0F;
-#pragma unroll
-            for (int i = 0; i < kPer; ++i) { s = fmaf(query[threadIdx.x + i * kThreads], x[n][i], s); }
-            dot[n] = s;
-        }
-        block_sum<N>(dot, scratch);
-        float logit[N];
-        float mx = -INFINITY;
-#pragma unroll
-        for (int n = 0; n < N; ++n) {
-            logit[n] = dot[n] * rstd[n];
-            mx       = fmaxf(mx, logit[n]);
-        }
-        float p[N];
-        float total = 0.0F;
-#pragma unroll
-        for (int n = 0; n < N; ++n) {
-            p[n]  = expf(logit[n] - mx);
-            total = total + p[n];
-        }
-        const float inv_sum = __fdiv_rn(1.0F, total);
-#pragma unroll
-        for (int n = 0; n < N; ++n) { p[n] = p[n] * rstd[n]; } // normalize_values
         float mix[kPer];
-#pragma unroll
-        for (int i = 0; i < kPer; ++i) {
-            float acc = 0.0F;
-#pragma unroll
-            for (int n = 0; n < N; ++n) { acc = fmaf(p[n], x[n][i], acc); }
-            mix[i] = acc * inv_sum;
-        }
+        mix_query<N>(x, rstd, a.queries + static_cast<std::int64_t>(q) * kD, mix, scratch);
         const std::int64_t base = (static_cast<std::int64_t>(q) * a.columns + t) * kD;
         if (a.norm_weight != nullptr) {
             float ss[1] = {0.0F};
@@ -168,6 +185,71 @@ __global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constan
             float* out = static_cast<float*>(a.out) + base;
 #pragma unroll
             for (int i = 0; i < kPer; ++i) { out[threadIdx.x + i * kThreads] = mix[i]; }
+        }
+    }
+}
+
+// ------------------------------------------------------------------- blend inputs (fused attn_res x 2 + pair norm)
+
+struct BlendInputsArgs {
+    PlaneDev src[G::kMaxStack + 1]; // dest sources: stack..., last
+    PlaneDev addend;
+    int has_addend             = 0;
+    const float* dest_queries  = nullptr; // [D, DQ]
+    int dest_q                 = 1;       // 1 (broadcast over the streams) or `streams`
+    PlaneDev bank[2];                     // the message sources: the previous pass's B6, P12
+    const float* msg_queries   = nullptr; // [D, S]
+    int streams                = 1;
+    float* dest                = nullptr; // FP32 [D, T, DQ]
+    float* msg                 = nullptr; // FP32 [D, T, S]
+    bf16* pair                 = nullptr; // BF16 [2D, T, S]
+    std::int64_t columns       = 0;
+};
+
+/// inkling_attn_res (dest, no norm) + inkling_attn_res (message, no norm) + inkling_pair_rms_norm of one column, with
+/// the same device code and order as the three separate kernels: bit-identical to them.
+template <int N>
+__global__ void __launch_bounds__(kThreads) blend_inputs_kernel(const __grid_constant__ BlendInputsArgs a) {
+    __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
+    const std::int64_t t = blockIdx.x;
+    float x[N][kPer];
+    load_sources<N>(a.src, a.addend, a.has_addend, t, x);
+    float rstd[N];
+    source_rstd<N>(x, rstd, scratch);
+    float y[2][kPer];
+    load_sources<2>(a.bank, a.addend, 0, t, y);
+    float yr[2];
+    source_rstd<2>(y, yr, scratch);
+    float dmix[kPer];
+    for (int s = 0; s < a.streams; ++s) {
+        if (s == 0 || a.dest_q > 1) {
+            const int q = a.dest_q > 1 ? s : 0;
+            mix_query<N>(x, rstd, a.dest_queries + static_cast<std::int64_t>(q) * kD, dmix, scratch);
+            float* out = a.dest + (static_cast<std::int64_t>(q) * a.columns + t) * kD;
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) { out[threadIdx.x + i * kThreads] = dmix[i]; }
+        }
+        float mmix[kPer];
+        mix_query<2>(y, yr, a.msg_queries + static_cast<std::int64_t>(s) * kD, mmix, scratch);
+        float* mo = a.msg + (static_cast<std::int64_t>(s) * a.columns + t) * kD;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { mo[threadIdx.x + i * kThreads] = mmix[i]; }
+        // pair_rms_norm_kernel's arithmetic
+        float ss[2] = {0.0F, 0.0F};
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            ss[0] = ss[0] + dmix[i] * dmix[i];
+            ss[1] = ss[1] + mmix[i] * mmix[i];
+        }
+        block_sum<2>(ss, scratch);
+        const float rd = rsqrt_approx(__fdiv_rn(ss[0], 2304.0F) + 1e-6F);
+        const float rm = rsqrt_approx(__fdiv_rn(ss[1], 2304.0F) + 1e-6F);
+        bf16* o        = a.pair + (static_cast<std::int64_t>(s) * a.columns + t) * (2 * kD);
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int d = threadIdx.x + i * kThreads;
+            o[d]        = __float2bfloat16_rn(dmix[i] * rd);
+            o[kD + d]   = __float2bfloat16_rn(mmix[i] * rm);
         }
     }
 }
@@ -625,6 +707,57 @@ void inkling_pair_rms_norm(const Tensor& dest, const Tensor& message, Tensor& ou
     pair_rms_norm_kernel<<<dim3(static_cast<unsigned>(t), static_cast<unsigned>(s)), kThreads, 0, stream>>>(
         static_cast<const float*>(dest.data), dest_stream, static_cast<const float*>(message.data),
         static_cast<bf16*>(out.data), t);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void inkling_blend_inputs(const InklingAttnResSources& dest_sources, const Tensor& dest_queries,
+                          const InklingAttnResSources& bank, const Tensor& message_queries, std::int32_t columns,
+                          Tensor& dest, Tensor& message, Tensor& pair, cudaStream_t stream) {
+    constexpr const char* op = "inkling_blend_inputs";
+    require(columns > 0, op, "columns must be positive");
+    require(dest_sources.stack_count >= 0 && dest_sources.stack_count <= G::kMaxStack, op,
+            "stack_count must be in [0, 5]");
+    require(bank.stack_count == 1 && bank.addend.data == nullptr, op, "the bank is one stack source + last");
+    const int streams = message_queries.ne[1];
+    const int dq      = dest_queries.ne[1];
+    require(message_queries.dtype == DType::FP32 && message_queries.ne[0] == kD && streams >= 1 && streams <= 3 &&
+                message_queries.data != nullptr,
+            op, "message_queries must be FP32 [2304, S], S in 1..3");
+    require(dest_queries.dtype == DType::FP32 && dest_queries.ne[0] == kD && (dq == 1 || dq == streams) &&
+                dest_queries.data != nullptr,
+            op, "dest_queries must be FP32 [2304, 1 or S]");
+    require(contiguous_shape(dest, DType::FP32, kD, columns, dq), op, "dest must be FP32 [2304, T, DQ]");
+    require(contiguous_shape(message, DType::FP32, kD, columns, streams), op, "message must be FP32 [2304, T, S]");
+    require(contiguous_shape(pair, DType::BF16, 2 * kD, columns, streams), op, "pair must be BF16 [4608, T, S]");
+    BlendInputsArgs a;
+    for (int n = 0; n < dest_sources.stack_count; ++n) {
+        a.src[n] = plane_dev(dest_sources.stack[n], op, "stack source", false);
+    }
+    a.src[dest_sources.stack_count] = plane_dev(dest_sources.last, op, "last", true);
+    if (dest_sources.addend.data != nullptr) {
+        a.addend     = plane_dev(dest_sources.addend, op, "addend", false);
+        a.has_addend = 1;
+    }
+    a.bank[0]      = plane_dev(bank.stack[0], op, "bank source", false);
+    a.bank[1]      = plane_dev(bank.last, op, "bank last", true);
+    a.dest_queries = static_cast<const float*>(dest_queries.data);
+    a.dest_q       = dq;
+    a.msg_queries  = static_cast<const float*>(message_queries.data);
+    a.streams      = streams;
+    a.dest         = static_cast<float*>(dest.data);
+    a.msg          = static_cast<float*>(message.data);
+    a.pair         = static_cast<bf16*>(pair.data);
+    a.columns      = columns;
+    const dim3 grid(static_cast<unsigned>(columns));
+    switch (dest_sources.stack_count + 1) {
+    case 1: blend_inputs_kernel<1><<<grid, kThreads, 0, stream>>>(a); break;
+    case 2: blend_inputs_kernel<2><<<grid, kThreads, 0, stream>>>(a); break;
+    case 3: blend_inputs_kernel<3><<<grid, kThreads, 0, stream>>>(a); break;
+    case 4: blend_inputs_kernel<4><<<grid, kThreads, 0, stream>>>(a); break;
+    case 5: blend_inputs_kernel<5><<<grid, kThreads, 0, stream>>>(a); break;
+    case 6: blend_inputs_kernel<6><<<grid, kThreads, 0, stream>>>(a); break;
+    default: fail(op, "unsupported source count");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

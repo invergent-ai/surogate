@@ -132,7 +132,6 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
         shift(src.last);
         shift(src.addend);
         Tensor dest = rd.work.alloc(DType::FP32, {D, n, dq});
-        ops::inkling_attn_res(src, n, dest_queries, nullptr, 0.0F, dest, rd.s);
         // The message: the bank's two entries (the previous pass's B6 and P12) with this layer's queries.
         ops::InklingAttnResSources bank;
         bank.stack_count = 1;
@@ -140,10 +139,10 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
         bank.last        = slot_plane(rd.r.x, vi.bank[1], c0);
         Tensor msg_queries(static_cast<float*>(messages.data) + static_cast<std::int64_t>(first_stream) * D,
                            DType::FP32, {D, streams});
-        Tensor msg = rd.work.alloc(DType::FP32, {D, n, streams});
-        ops::inkling_attn_res(bank, n, msg_queries, nullptr, 0.0F, msg, rd.s);
+        Tensor msg  = rd.work.alloc(DType::FP32, {D, n, streams});
         Tensor pair = rd.work.alloc(DType::BF16, {2 * D, n, streams});
-        ops::inkling_pair_rms_norm(dest, msg, pair, rd.s);
+        // dest mix + message mix + pair norm: one launch, bit-identical to the three ops (invariance test I3).
+        ops::inkling_blend_inputs(src, dest_queries, bank, msg_queries, n, dest, msg, pair, rd.s);
         Tensor h  = rd.work.alloc(DType::BF16, {C::gate_rank, n, streams});
         Tensor gf = rd.work.alloc(DType::FP32, {2 * D, n, streams});
         // The controllers of the `streams` streams, one invariant launch each (down: a split fixed by its 64 x 4608

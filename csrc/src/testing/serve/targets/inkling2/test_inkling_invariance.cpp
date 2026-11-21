@@ -308,6 +308,63 @@ int test_blend(std::uint32_t seed) {
     return failures;
 }
 
+/// The fused controller inputs (inkling_blend_inputs) == attn_res(dest) + attn_res(message) + pair_rms_norm bit for
+/// bit, on the real layout (stack and bank slots in the [7 x 2304] residual), and a window == the full round.
+int test_blend_inputs(std::uint32_t seed, int stack, bool addend, int dq, int streams, int first_stream) {
+    constexpr int kSlots = 7;
+    const auto residual = randn_bf16(static_cast<std::size_t>(kAll) * kSlots * kD, seed, 0.8F);
+    const auto add      = randn_bf16(static_cast<std::size_t>(kAll) * kD, seed + 1, 0.3F);
+    const auto dqv      = randn_f32(static_cast<std::size_t>(dq) * kD, seed + 2, 1.0F / 48.0F);
+    const auto mqv      = randn_f32(static_cast<std::size_t>(4) * kD, seed + 3, 1.0F / 48.0F);
+    DeviceBuffer d_res = dev_bf16(residual), d_add = dev_bf16(add), d_dq = to_device(dqv), d_mq = to_device(mqv);
+    Tensor dq_t(d_dq.p, DType::FP32, {kD, dq});
+    Tensor mq_t(static_cast<float*>(d_mq.p) + static_cast<std::size_t>(first_stream) * kD, DType::FP32, {kD, streams});
+    const auto sources = [&](int c0, ops::InklingAttnResSources& dst, ops::InklingAttnResSources& bank) {
+        auto* base      = static_cast<std::uint16_t*>(d_res.p) + static_cast<std::size_t>(c0) * kSlots * kD;
+        dst.stack_count = stack;
+        for (int n = 0; n < stack; ++n) { dst.stack[n] = ops::InklingPlane{base + n * kD, DType::BF16, kSlots * kD}; }
+        dst.last = ops::InklingPlane{base + 6 * kD, DType::BF16, kSlots * kD};
+        if (addend) {
+            dst.addend = ops::InklingPlane{static_cast<std::uint16_t*>(d_add.p) + static_cast<std::size_t>(c0) * kD,
+                                           DType::BF16, kD};
+        }
+        bank.stack_count = 1;
+        bank.stack[0]    = ops::InklingPlane{base + 2 * kD, DType::BF16, kSlots * kD};
+        bank.last        = ops::InklingPlane{base + 3 * kD, DType::BF16, kSlots * kD};
+    };
+    struct Out {
+        std::vector<std::uint8_t> dest, msg, pair;
+    };
+    const auto run = [&](int c0, int T, bool fused) {
+        ops::InklingAttnResSources dst, bank;
+        sources(c0, dst, bank);
+        DeviceBuffer dd(static_cast<std::size_t>(kD) * T * dq * 4), dm(static_cast<std::size_t>(kD) * T * streams * 4),
+            dp(static_cast<std::size_t>(2 * kD) * T * streams * 2);
+        Tensor td(dd.p, DType::FP32, {kD, T, dq}), tm(dm.p, DType::FP32, {kD, T, streams}),
+            tp(dp.p, DType::BF16, {2 * kD, T, streams});
+        if (fused) {
+            ops::inkling_blend_inputs(dst, dq_t, bank, mq_t, T, td, tm, tp, nullptr);
+        } else {
+            ops::inkling_attn_res(dst, T, dq_t, nullptr, 0.0F, td, nullptr);
+            ops::inkling_attn_res(bank, T, mq_t, nullptr, 0.0F, tm, nullptr);
+            ops::inkling_pair_rms_norm(td, tm, tp, nullptr);
+        }
+        cuda_synchronize();
+        return Out{raw(dd.p, dd.bytes), raw(dm.p, dm.bytes), raw(dp.p, dp.bytes)};
+    };
+    const std::string tag = "I3 inkling_blend_inputs stack " + std::to_string(stack) + (addend ? " +addend" : "") +
+                            " DQ=" + std::to_string(dq) + " S=" + std::to_string(streams);
+    const Out f = run(0, kAll, true), u = run(0, kAll, false);
+    int failures = 0;
+    failures += same_bits(tag + " fused == unfused: dest", f.dest, u.dest, 4);
+    failures += same_bits(tag + " fused == unfused: message", f.msg, u.msg, 4);
+    failures += same_bits(tag + " fused == unfused: pair", f.pair, u.pair, 2);
+    const Out w = run(100, 37, true);
+    failures += same_bits(tag + " T=37 at 100 == T=300: pair", w.pair, gather(f.pair, 2 * kD, kAll, streams, 100, 37, 2), 2);
+    failures += same_bits(tag + " T=37 at 100 == T=300: dest", w.dest, gather(f.dest, kD, kAll, dq, 100, 37, 4), 4);
+    return failures;
+}
+
 // ------------------------------------------------------------------------------------- I4 conv paths
 
 int test_conv_paths(std::uint32_t seed) {
@@ -493,6 +550,9 @@ int main() {
     failures += test_gemm_group(2900);
     failures += test_attn_res(3001);
     failures += test_blend(3002);
+    failures += test_blend_inputs(3101, 2, false, 1, 3, 0); // looped attention inputs, local layer (dest broadcast)
+    failures += test_blend_inputs(3102, 4, false, 3, 3, 0); // looped global layer: 3 dest queries
+    failures += test_blend_inputs(3103, 3, true, 1, 1, 3);  // MLP blend: partial + attn_out addend, mlp stream
     failures += test_conv_paths(3003);
     std::cout << (failures ? "FAIL" : "PASS") << " inkling_invariance (" << failures << " failures)\n";
     return failures ? 1 : 0;
