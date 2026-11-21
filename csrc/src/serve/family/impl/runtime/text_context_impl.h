@@ -1093,7 +1093,8 @@ void TextContext::logits_from_hidden(const Tensor& hidden, Tensor& logits) {
 }
 
 bool TextContext::candidate_rows_exact() const {
-    return ops::linear_rows_match_linear(*lm_head_) && !ops::lora_active();
+    // An FP32-logits target's head is its own (Variant::lm_head): the BF16 row projection is not it.
+    return !family::logits_fp32<Variant>() && ops::linear_rows_match_linear(*lm_head_) && !ops::lora_active();
 }
 
 bool TextContext::candidate_logits_from_hidden(const Tensor& hidden,

@@ -65,7 +65,7 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *
  * Logical shapes:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
- *   I32 [K,B], logits is BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
+ *   I32 [K,B], logits is BF16 or FP32 [physical_rows,K+1,B], and current_extents/lengths/anchors/
  *   licensed_counts/accepted are I32 [B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
  *   With no_drafts=true, K=0 and drafts is unused I32 [1,B] storage.
  *   configs points to a device-resident SamplingConfig[B]. Tensor arguments, configs, and
