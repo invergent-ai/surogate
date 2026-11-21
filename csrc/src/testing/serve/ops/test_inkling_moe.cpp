@@ -547,11 +547,14 @@ int state_nonzero_words() {
     return static_cast<int>(std::count_if(words.begin(), words.end(), [](std::int32_t w) { return w != 0; }));
 }
 
+/// `workspace_tokens` > 0: the arena is booked for that many tokens and the call is told so (a prefill call may then
+/// take fewer down column passes).
 DeviceRun run_moe(const Layer& l, const std::vector<float>& x, int tokens, const int* live = nullptr,
-                  const ops::InklingMoeAdapters* adapters = nullptr, bool capture = false, bool use_state = true) {
+                  const ops::InklingMoeAdapters* adapters = nullptr, bool capture = false, bool use_state = true,
+                  int workspace_tokens = 0) {
     DeviceBuffer dx = to_device(to_bf16_bits(std::vector<float>(x.begin(), x.begin() + static_cast<std::size_t>(tokens) * H)));
     DeviceBuffer dout(static_cast<std::size_t>(tokens) * H * 2);
-    DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, tokens, adapters != nullptr));
+    DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, std::max(tokens, workspace_tokens), adapters != nullptr));
     Tensor tx(dx.p, DType::BF16, {H, tokens}), tout(dout.p, DType::BF16, {H, tokens});
     ops::InklingMoeOptions options;
     DeviceBuffer dlive, dcap;
@@ -571,6 +574,7 @@ DeviceRun run_moe(const Layer& l, const std::vector<float>& x, int tokens, const
     }
     options.adapters = adapters;
     options.state    = use_state ? persistent_state() : nullptr;
+    options.workspace_tokens = workspace_tokens;
     ops::inkling_moe(tx, l.view, tout, arena, nullptr, options);
     cuda_synchronize();
     DeviceRun run;
@@ -1189,7 +1193,12 @@ int test_moe(ops::InklingExpertFormat format) {
     const std::vector<float> chunk_tail(chunk_x.end() - static_cast<std::ptrdiff_t>(64) * H, chunk_x.end());
     const DeviceRun tail = run_moe(l, chunk_tail, 64);
     width_bad += !std::equal(tail.out.begin(), tail.out.end(), chunk.out.end() - static_cast<std::ptrdiff_t>(64) * H);
-    failures += report("width invariance T=1 / 24 / 300 / 4096 / 8192 / padded 32 (bit-exact)", width_bad);
+    // Booked for the 8,192-token chunk, narrower prefill calls take fewer down column passes: same bits.
+    const DeviceRun huge_roomy = run_moe(l, huge_x, kHuge, nullptr, nullptr, false, true, kChunk);
+    width_bad += !std::equal(huge.out.begin(), huge.out.end(), huge_roomy.out.begin());
+    const DeviceRun wide_roomy = run_moe(l, x, kWide, nullptr, nullptr, false, true, kChunk);
+    width_bad += !std::equal(wide.out.begin(), wide.out.end(), wide_roomy.out.begin());
+    failures += report("width invariance T=1 / 24 / 300 / 4096 / 8192 / padded 32, any pass count (bit-exact)", width_bad);
 
     // Expert LoRA: zero adapter neutral; base tokens untouched; delta vs host.
     Adapter zero, adapter;
@@ -1250,9 +1259,11 @@ int test_moe(ops::InklingExpertFormat format) {
         DeviceBuffer dwide_slots = to_device(wide_slots);
         ops::InklingMoeAdapters aw{static_cast<const ops::LoraBank*>(adapter.d_table.p),
                                    static_cast<const std::int32_t*>(dwide_slots.p), nullptr, 16};
-        const DeviceRun lora_wide = run_moe(l, x, kWide, nullptr, &aw);
-        failures += report("LoRA: adapted rows width invariant (T=24 vs 300 prefill, bit-exact)",
-                           std::equal(lora_run.out.begin(), lora_run.out.end(), lora_wide.out.begin()) ? 0 : 1);
+        const DeviceRun lora_wide  = run_moe(l, x, kWide, nullptr, &aw);
+        const DeviceRun lora_roomy = run_moe(l, x, kWide, nullptr, &aw, false, true, 8192);
+        failures += report("LoRA: adapted rows width invariant (T=24 vs 300 prefill, any pass count, bit-exact)",
+                           (std::equal(lora_run.out.begin(), lora_run.out.end(), lora_wide.out.begin()) &&
+                            lora_wide.out == lora_roomy.out) ? 0 : 1);
     }
     failures += report("LoRA: adapted output vs host pipeline (cos >= 0.9999, rel-L2 <= 1e-2)",
                        (worst_lora_cos >= 0.9999 && worst_lora_rel <= 1e-2) ? 0 : 1);
@@ -1644,7 +1655,10 @@ int run_bench(const char* path) {
                       x_bits.begin() + static_cast<std::size_t>(t % captured + 1) * H, xs.begin() + static_cast<std::size_t>(t) * H);
         }
         DeviceBuffer dx = to_device(xs), dout(static_cast<std::size_t>(tokens) * H * 2);
-        DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, tokens, false));
+        // INKLING_BENCH_WS_TOKENS=n: the workspace booked for n tokens (the engine's chunk) and the call told so.
+        const char* ws_text = std::getenv("INKLING_BENCH_WS_TOKENS");
+        const int ws_tokens = ws_text != nullptr ? std::atoi(ws_text) : 0;
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, std::max(tokens, ws_tokens), false));
         Tensor tx(dx.p, DType::BF16, {H, tokens}), tout(dout.p, DType::BF16, {H, tokens});
         // distinct experts of this round
         DeviceBuffer dl(static_cast<std::size_t>(tokens) * E * 4), di(static_cast<std::size_t>(tokens) * TOPK * 4),
@@ -1659,6 +1673,7 @@ int run_bench(const char* path) {
         // graph of one call (with the persistent state unless INKLING_BENCH_NOSTATE=1: the A/B of the fused route)
         ops::InklingMoeOptions bench_options;
         bench_options.state = std::getenv("INKLING_BENCH_NOSTATE") != nullptr ? nullptr : persistent_state();
+        bench_options.workspace_tokens = ws_tokens;
         // INKLING_BENCH_PRED_US=n: each graph starts with a 1-CTA kernel that triggers its PDL dependents at entry
         // and spins n us (the engine's predecessors trigger early since e1 f9ebe0eb), so the route launches early
         // as in serving. Reported: us/call - n.
