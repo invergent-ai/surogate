@@ -49,8 +49,8 @@ struct Schedule {
 // The shared kernel's three tiles (measured there on an RTX 5090); the choice follows speed only.
 using Tile16x8  = Schedule<16, 8, 16, 8, 6>;
 // Decode widths with few row tiles (wo_ud: 144 one-warp CTAs on 170 SMs walked k = 3072 at ~0.84 TB/s, lane h's nsys
-// 14:49): the same tile with 8 copies in flight instead of 5. The pipeline depth moves no product: same bits.
-using Tile16x8Deep = Schedule<16, 8, 16, 8, 9>; // cp.async.wait_group takes at most 7: 9 stages
+// 14:49): the same tile with 7 stages in flight instead of 5. The pipeline depth moves no product: same bits.
+using Tile16x8Deep = Schedule<16, 8, 16, 8, 8>; // the loop waits for STAGES - 1 groups; PTX takes at most 7
 using Tile32x32 = Schedule<32, 32, 16, 16, 4>;
 using Tile64x64 = Schedule<64, 64, 32, 32, 3>;
 
