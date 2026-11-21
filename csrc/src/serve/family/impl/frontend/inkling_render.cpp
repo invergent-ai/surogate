@@ -274,6 +274,7 @@ ChatRequest parse_chat_request(std::string_view body_json) {
     // messages: the request model's normalisation (_normalize_messages_before)
     const PyValue* messages = body.find("messages");
     if (messages == nullptr || !messages->is_array()) { throw RequestError("messages: Input should be a valid list"); }
+    if (messages->items.empty()) { throw RequestError("messages must be a non-empty list."); }
     r.messages = *messages;
     for (PyValue& m : r.messages.items) {
         if (!m.is_object()) { throw RequestError("messages: each message must be an object"); }
@@ -443,9 +444,11 @@ std::string effort_text(double effort) {
     if (!(effort >= 0.0 && effort <= kMaxEffort)) {
         throw RequestError("Inkling reasoning_effort must be in [0.0, 0.99], got " + py_float_repr(effort));
     }
-    // round() is round-half-even on the exact binary value: nearbyint in the default rounding mode.
-    const double millieffort = std::nearbyint(effort * 1000.0);
-    const double rounded = std::nearbyint((millieffort / 1000.0) * 100.0) / 100.0;
+    // round() is round-half-even on the exact binary value (nearbyint in the default rounding mode) and returns an
+    // int, so -0.0 comes out as 0 ("0", never "-0").
+    const auto millieffort = static_cast<long long>(std::nearbyint(effort * 1000.0));
+    const auto hundredths = static_cast<long long>(std::nearbyint((static_cast<double>(millieffort) / 1000.0) * 100.0));
+    const double rounded = static_cast<double>(hundredths) / 100.0;
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%g", rounded);
     return std::string("Thinking effort level: ") + buf;
