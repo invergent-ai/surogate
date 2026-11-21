@@ -182,8 +182,10 @@ struct InklingAttentionKnobs {
     bool fold_fast = true;
     // inkling_attn_linear, N > 16 (SUROGATE_INKLING_LINEAR_GEMM): 0 = gemm_kernel (x = MMA operand A), 1 = gemm_t_kernel
     // (codes = operand A in fragment order from a shared widen pass, x = operand B), 2 = gemm_t_kernel widening each
-    // warp's own A fragments (no widened tile). Same bits on every route (test attn_linear width).
-    int linear_gemm = 1;
+    // warp's own A fragments (no widened tile). Same bits on every route (test attn_linear width: 0 bit-different).
+    // Default 2 by measurement (gemm2, gpubox1 card 0, graph, us, gemm 0 / 1 / 2): qkvr N=8192 channel 1718 / 1607 /
+    // 1496, 1x128 1874 / 1771 / 1658; qkvr N=4096 channel 863 / 809 / 754; wo N=8192 channel 618 / 592 / 549.
+    int linear_gemm = 2;
     // Decode / verify with one row tile (W <= 5), not the in-kernel prologue (SUROGATE_INKLING_ATTN_DECODE_RAW): 0 =
     // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight, a worker's
     // old blocks staged before the PDL wait under metadata_static; ~72 KB smem: one CTA an SM) when workers x 8 x B <=

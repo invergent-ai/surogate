@@ -29,6 +29,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/kernel/func_attribute.cuh"
 
 #include <math_constants.h>
 
@@ -1608,11 +1609,10 @@ void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial, false>));
     static_assert(bytes <= kSmemLimit, "inkling attention: shared memory over the sm_120 limit");
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw, Pro>;
-    static const bool configured = [&] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        return true;
-    }();
-    (void)configured;
+    // Per device (ops/kernel/func_attribute.cuh): the 2-card visit split launches this kernel on both cards; a
+    // function-local static configured only the first and the second card's launch failed (cudaErrorInvalidValue,
+    // gpubox2 cards 5 + 6, 17:25).
+    CUDA_CHECK(set_func_attribute_per_device(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * KS * 32), static_cast<std::size_t>(bytes), stream};
     CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
 }
@@ -1656,12 +1656,8 @@ void launch_fold(InklingLayerKind kind, std::int64_t n, const AttnParams& p, cud
         throw std::invalid_argument("inkling rel attention: too many partial slots for the fold");
     }
     auto* kernel = kind == InklingLayerKind::Local ? fold_kernel<true, Mode> : fold_kernel<false, Mode>;
-    static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<true, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFoldDynMax));
-        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<false, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFoldDynMax));
-        return true;
-    }();
-    (void)configured;
+    // Per device, as launch_kernel above (2-card split).
+    CUDA_CHECK(set_func_attribute_per_device(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kFoldDynMax));
     const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n), Geo::kQHeads), dim3(Geo::kHeadDim), smem, stream};
     CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
 }
