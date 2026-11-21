@@ -1174,7 +1174,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 text_envelope);
                     const std::size_t accept =
                         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                            plan.geometry.token_domain, window, window, batch, batch);
+                            plan.geometry.token_domain, window, window, batch, batch,
+                            family::dspark_drafter<Variant>()); // split routes: DSpark targets only
                     const std::size_t proposal =
                         window == 0 ? 0 : dflash_proposal_capacity(round_width, batch);
                     out.dflash_round =

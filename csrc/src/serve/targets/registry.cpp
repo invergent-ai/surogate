@@ -738,10 +738,13 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
     artifact::Binder binder(reader);
     auto plan = Target::plan_load(binder, sized, weights_profile);
     StageFit fit{};
+    // + the target's own load-time derived buffers on this stage (inkling2: the DSpark drafter on the stage holding the
+    // last visit; 0 elsewhere and for every target that declares none -- M8b review)
     fit.budget_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
         projected_derived_residency_bytes(binder, plan.materialization(),
-                                          target_linear_policy<Target>()));
+                                          target_linear_policy<Target>()) +
+            target_extra_derived_bytes<Target>(stage));
     // A stage that banks experts needs a pool beside its KV, and the pool sizes itself from
     // what the weights and the runtime leave: a fit that ignored it offloaded one layer,
     // fit the KV exactly, and left the bank a pool of nothing (which a Q4 bank refuses).

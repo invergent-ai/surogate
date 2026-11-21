@@ -2954,6 +2954,15 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                         .view({cfg.token_domain});
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
+    if constexpr (family::dspark_drafter<Variant>()) {
+        // DSpark (lane e2): coupled verification of untruncated sampled rows (ops/kernel/speculative_round.cuh) --
+        // MTP on commits the tokens MTP-off decoding samples. SUROGATE_SPEC_COUPLED=0: the one-hot rejection rule.
+        static const bool coupled = [] {
+            const char* raw = std::getenv("SUROGATE_SPEC_COUPLED");
+            return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+        }();
+        request.sampling_host.speculative_coupled = coupled ? 1 : 0;
+    }
     update_constraint(sequence, request);
     const auto request_backend = request.target_only ? SpeculativeBackend::None : speculative_backend;
     const auto request_window = request.target_only ? 0U : draft_window;
@@ -5203,6 +5212,30 @@ std::uint32_t ProgramImplCore::select_dflash_draft_window(std::span<const std::u
     return adaptive_dflash->choose(static_cast<std::uint32_t>(lanes.size()), frontier);
 }
 
+void ProgramImplCore::check_dflash_row(std::span<const std::uint32_t> lanes, std::size_t row,
+                                       const runtime::RoundBudget& budget, const char* what) const {
+    const std::uint32_t lane = lanes[row];
+    if (lane >= max_concurrency ||
+        std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+            lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+        throw std::invalid_argument(std::string(what) + " contains an invalid or duplicate lane");
+    }
+    const SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Active ||
+        budget.generated_tokens_remaining == 0 || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
+        (dflash->full && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
+        sequence.execution_frontier >= capacity ||
+        sequence.text_kv_valid != sequence.execution_frontier ||
+        sequence.dflash_context_frontier > sequence.execution_frontier ||
+        sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
+        sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+        sequence.ledger.size() != sequence.ledger_frontier ||
+        sequence.prefix_identity.size() != sequence.ledger_frontier) {
+        throw std::logic_error(std::string(what) + " row is not decode-ready");
+    }
+}
+
 runtime::RoundHandle
 ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets, std::span<const std::uint32_t> prefill_lanes) {
@@ -5222,25 +5255,8 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency ||
-            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
-                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
-            throw std::invalid_argument("DFlash batch contains an invalid or duplicate lane");
-        }
+        check_dflash_row(lanes, row, budgets[row], "DFlash batch");
         const SequenceState& sequence = sequences[lane];
-        const RequestControl& request = requests[lane];
-        if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
-            (dflash->full && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
-            sequence.execution_frontier >= capacity ||
-            sequence.text_kv_valid != sequence.execution_frontier ||
-            sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier) {
-            throw std::logic_error("DFlash batch row is not decode-ready");
-        }
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
@@ -5383,20 +5399,19 @@ std::span<const std::byte> ProgramImplCore::prepare_pipeline_drafts(std::span<co
     if (lanes.empty() || lanes.size() > batch_capacity || budgets.size() != lanes.size()) {
         throw std::invalid_argument("DSpark pipeline proposal membership is invalid");
     }
+    // launch_dflash_round's row check, for every row before anything is written (M8b review): a lane at capacity
+    // (frontier >= capacity) would underflow `capacity - frontier - 1U` below
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        check_dflash_row(lanes, row, budgets[row], "DSpark pipeline proposal");
+    }
     bind_dflash_window(window);
     const std::uint32_t width      = active_dflash_window + 1U;
     std::uint32_t maximum_frontier = 0;
+    try {
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency) { throw std::invalid_argument("DSpark pipeline proposal lane is invalid"); }
         SequenceState& sequence = sequences[lane];
         RequestControl& request = requests[lane];
-        if (request.lifecycle != Lifecycle::Active || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
-            sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1) {
-            throw std::logic_error("DSpark pipeline proposal row is not decode-ready");
-        }
         const std::uint32_t frontier      = sequence.execution_frontier;
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
@@ -5441,6 +5456,17 @@ std::span<const std::byte> ProgramImplCore::prepare_pipeline_drafts(std::span<co
                                       dflash_envelopes(0, maximum_frontier, active_dflash_window),
                                       dspark_draft_export.data);
     device.synchronize();
+    } catch (...) {
+        // as launch_dflash_round: a failed proposal clears its lanes (M8b review)
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
     return std::span<const std::byte>(static_cast<const std::byte*>(dspark_draft_export.data),
                                       2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t));
 }
