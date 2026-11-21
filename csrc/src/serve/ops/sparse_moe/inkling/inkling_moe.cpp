@@ -373,6 +373,10 @@ void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& 
                           static_cast<__nv_bfloat16*>(y.data), stream);
 }
 
+void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream) {
+    launch_bench_predecessor(nanoseconds, stream);
+}
+
 void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,
                                  std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
                                  cudaStream_t stream) {

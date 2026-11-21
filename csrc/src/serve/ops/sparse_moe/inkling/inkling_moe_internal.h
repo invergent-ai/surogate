@@ -52,6 +52,8 @@ struct RouteOutputs {
     /// rows (bf16 [T][2304]) written as zeros here (no down row ever arrives for them).
     std::int32_t* arrivals        = nullptr;
     __nv_bfloat16* combined       = nullptr;
+    /// Device-side only (one-tile fused route): the selector's shared-memory copy of the ids.
+    std::int32_t* local_ids       = nullptr;
 };
 
 /// Router logits fp32 [T][128] (`(p0 + p1) + p2` of bf16 m16n8k16 chains per 1024-wide K group).
@@ -132,6 +134,9 @@ void launch_lora_shrink(const __nv_bfloat16* source, std::int32_t source_k, bool
 /// per-expert factor [count] (null to skip). See `inkling_decode_expert_units`.
 void launch_decode_expert_units(const InklingExpertBank& bank, bool nvfp4, std::int32_t k, std::int32_t first,
                                 std::int32_t count, __nv_bfloat16* unit, float* factor, cudaStream_t stream);
+
+/// inkling_bench_predecessor's kernel (benchmark only).
+void launch_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream);
 
 /// Grouped expert GEMM operands of one projection.
 struct GemmParams {

@@ -1635,6 +1635,12 @@ int run_bench(const char* path) {
         // graph of one call (with the persistent state unless INKLING_BENCH_NOSTATE=1: the A/B of the fused route)
         ops::InklingMoeOptions bench_options;
         bench_options.state = std::getenv("INKLING_BENCH_NOSTATE") != nullptr ? nullptr : persistent_state();
+        // INKLING_BENCH_PRED_US=n: each graph starts with a 1-CTA kernel that triggers its PDL dependents at entry
+        // and spins n us (the engine's predecessors trigger early since e1 f9ebe0eb), so the route launches early
+        // as in serving. Reported: us/call - n.
+        const char* pred_text  = std::getenv("INKLING_BENCH_PRED_US");
+        const double pred_us   = pred_text != nullptr ? std::atof(pred_text) : 0.0;
+        const std::int32_t pred_ns = static_cast<std::int32_t>(pred_us * 1000.0);
         ops::inkling_moe(tx, l.view, tout, arena, stream, bench_options);
         arena.reset();
         cuda_synchronize(stream);
@@ -1642,6 +1648,7 @@ int run_bench(const char* path) {
         std::vector<cudaGraphExec_t> execs(views.size(), nullptr);
         for (std::size_t c = 0; c < views.size(); ++c) {
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+            if (pred_text != nullptr) { ops::inkling_bench_predecessor(pred_ns, stream); }
             ops::inkling_moe(tx, views[c], tout, arena, stream, bench_options);
             arena.reset();
             cuda_check(cudaStreamEndCapture(stream, &graphs[c]), "end capture");
@@ -1658,7 +1665,7 @@ int run_bench(const char* path) {
         cuda_check(cudaEventSynchronize(stop), "sync");
         float ms = 0.0F;
         cuda_check(cudaEventElapsedTime(&ms, start, stop), "elapsed");
-        const double us    = 1000.0 * ms / iterations;
+        const double us    = 1000.0 * ms / iterations - pred_us;
         const double bytes = distinct * expert_bytes + router_bytes;
         std::printf("  %6d %10.2f %9d %10.2f %9.1f %6.1f%%\n", tokens, us, distinct, bytes / 1e6, bytes / us / 1e3,
                     100.0 * (bytes / us / 1e3) / 1707.0);
