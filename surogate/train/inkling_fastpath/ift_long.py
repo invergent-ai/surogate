@@ -63,7 +63,7 @@ class TokenChunked(torch.autograd.Function):
         if ctx.offload:  # token inputs to pinned host (non-blocking), params stay
             ctx.host = []
             for i, x in enumerate(keep[:n_tok]):
-                h = torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
+                h = torch.empty(x.shape, dtype=x.dtype, device="cpu", pin_memory=True)
                 h.copy_(x, non_blocking=True)  # stream-ordered: x's memory is reused only after the copy
                 ctx.host.append(h)
             ctx.dev = inputs[0].device
@@ -362,7 +362,7 @@ def _pinned(name, shape, dtype):
         n *= s
     buf = _PINNED.get(name)
     if buf is None or buf.numel() < n or buf.dtype != dtype:
-        buf = torch.empty(max(n, 1), dtype=dtype, pin_memory=True)
+        buf = torch.empty(max(n, 1), dtype=dtype, device="cpu", pin_memory=True)
         _PINNED[name] = buf
     return buf[:n].view(shape)
 
