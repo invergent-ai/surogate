@@ -155,6 +155,9 @@ sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_seg
 # Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1): T1-T5 of lanes/e1/DESIGN-target.md 8.
 sinfer_add_op_test(sinfer_inkling_mix_test SOURCES targets/inkling2/test_inkling_mix.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_inkling_invariance.cpp LIBRARIES sinfer_ops)
+# Inkling-2-Mini's mixture (ENGINE-INKLING lane d): quantisers bit-exact, SiTU, router, MoE vs a host
+# pipeline, width invariance, capture rows, expert LoRA (rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md 9).
+sinfer_add_op_test(sinfer_inkling_moe_test SOURCES ops/test_inkling_moe.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)
   sinfer_add_op_test(${name}
