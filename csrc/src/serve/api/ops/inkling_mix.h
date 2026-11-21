@@ -277,6 +277,19 @@ struct InklingGemmProblem {
 void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
                             DType out_dtype, cudaStream_t stream);
 
+/// ---- The trainer's log-prob (agent-EN 11:3x; g1b's ENGINE-OP IR) ----
+///
+/// out[t] = log softmax(softcap(W_head . hidden[:, t]))[token_ids[t]] over the first `token_domain` rows, bit for bit
+/// the value every log-prob the engine returns carries (completion token_logprobs and prompt_logprobs are
+/// RawTokenScores.selected): the FP32 head of inkling_gemm_inv + inkling_softcap_f32 (Variant::lm_head), then the
+/// kernel of ops::score_logprobs_device (the raw logits, temperature 1: a 512-thread max tree, per-thread expf sums,
+/// a tree add, max + log(sum)). `hidden` BF16 [hidden_size, T]; `out` FP32 [T] (NaN for an id outside the domain).
+[[nodiscard]] std::size_t inkling_head_logprob_workspace_bytes(std::int32_t vocab_rows, std::int32_t tokens) noexcept;
+void inkling_head_logprob(const void* head_weight, std::int32_t vocab_rows, std::int32_t hidden_size,
+                          std::int32_t token_domain, float softcap, const void* hidden, std::int32_t tokens,
+                          const std::int32_t* token_ids, float* out, void* workspace, std::size_t workspace_bytes,
+                          cudaStream_t stream);
+
 /// In place: x = (tanh(x / cap)) * cap in fp32 (vLLM LogitsProcessor soft_cap), FP32 [rows, T] with
 /// `ldc` elements per column, first `rows` rows of each column.
 void inkling_softcap_f32(float* logits, std::int32_t rows, std::int32_t tokens, std::int32_t ldc,

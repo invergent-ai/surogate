@@ -9,6 +9,7 @@
 // I1 also checks the GEMM against a float64 host product (a loose bound: a wrong chain is off by O(1)).
 
 #include "api/ops/inkling_mix.h"
+#include "api/ops/sampled_logprob.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
 
@@ -554,6 +555,57 @@ int test_conv_paths(std::uint32_t seed) {
     return failures;
 }
 
+// ------------------------------------------------------------------------------------- I5 trainer log-prob
+
+/// inkling_head_logprob == the engine's own path (invariant FP32 head + softcap, then the scoring kernel through
+/// score_logprobs_batch) bit for bit; one column alone == in the round; an id outside the domain gives NaN.
+int test_head_logprob(std::uint32_t seed) {
+    constexpr int kRows = 32768, kDomain = 32000, T = 64;
+    const auto w_bits = hash_bf16(static_cast<std::size_t>(kRows) * kD, seed, 0.06F);
+    const auto h_bits = hash_bf16(static_cast<std::size_t>(T) * kD, seed + 1, 1.0F);
+    std::vector<int> ids(T);
+    std::mt19937 g(seed + 2);
+    for (auto& id : ids) { id = static_cast<int>(g() % kDomain); }
+    ids[T - 1] = kDomain + 5; // outside the domain
+    DeviceBuffer d_w = to_device(w_bits), d_h = to_device(h_bits), d_ids = to_device(ids);
+    const auto run = [&](int c0, int n) {
+        const std::size_t ws = ops::inkling_head_logprob_workspace_bytes(kRows, n);
+        DeviceBuffer d_ws(ws), d_out(static_cast<std::size_t>(n) * 4);
+        ops::inkling_head_logprob(d_w.p, kRows, kD, kDomain, 30.0F,
+                                  static_cast<const std::uint16_t*>(d_h.p) + static_cast<std::size_t>(c0) * kD, n,
+                                  static_cast<const std::int32_t*>(d_ids.p) + c0, static_cast<float*>(d_out.p), d_ws.p,
+                                  ws, nullptr);
+        cuda_synchronize();
+        return from_device<float>(d_out.p, static_cast<std::size_t>(n));
+    };
+    const auto full = run(0, T);
+    // the engine's path for the T - 1 in-domain columns
+    DeviceBuffer d_logits(static_cast<std::size_t>(kRows) * T * 4);
+    ops::inkling_gemm_inv(d_w.p, kRows, kD, d_h.p, T, d_logits.p, DType::FP32, kRows, {}, nullptr, 0, nullptr);
+    ops::inkling_softcap_f32(static_cast<float*>(d_logits.p), kRows, T, kRows, 30.0F, nullptr);
+    cuda_synchronize();
+    const Tensor logits(d_logits.p, DType::FP32, {kRows, T});
+    std::vector<TokenId> valid(ids.begin(), ids.end() - 1);
+    const auto ref = ops::score_logprobs_batch(logits, valid, kDomain, 0, nullptr);
+    std::size_t bad = 0;
+    for (int t = 0; t + 1 < T; ++t) { bad += std::memcmp(&full[t], &ref[t].selected.logprob, 4) != 0; }
+    int failures = 0;
+    std::cout << (bad ? "FAIL " : "ok   ") << "I5 inkling_head_logprob == head + score_logprobs_batch (" << T - 1
+              << " columns): " << bad << " differ\n";
+    failures += bad ? 1 : 0;
+    const bool nan_last = std::isnan(full[T - 1]);
+    std::cout << (nan_last ? "ok   " : "FAIL ") << "I5 an id outside the domain gives NaN\n";
+    failures += nan_last ? 0 : 1;
+    std::size_t bad_w = 0;
+    for (const int c : {0, 17, T - 2}) {
+        const auto one = run(c, 1);
+        bad_w += std::memcmp(&one[0], &full[c], 4) != 0;
+    }
+    std::cout << (bad_w ? "FAIL " : "ok   ") << "I5 one column alone == in the round (3 columns): " << bad_w << " differ\n";
+    failures += bad_w ? 1 : 0;
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -579,6 +631,7 @@ int main() {
     failures += test_blend_inputs(3102, 4, false, 3, 3, 0); // looped global layer: 3 dest queries
     failures += test_blend_inputs(3103, 3, true, 1, 1, 3);  // MLP blend: partial + attn_out addend, mlp stream
     failures += test_conv_paths(3003);
+    failures += test_head_logprob(3201);
     std::cout << (failures ? "FAIL" : "PASS") << " inkling_invariance (" << failures << " failures)\n";
     return failures ? 1 : 0;
 }
