@@ -631,6 +631,16 @@ bool persistent_state_zero() {
     return true;
 }
 
+/// FNV-1a of a result vector, for INKLING_ATTN_DIGEST=1: every invariance route prints one line, so two engine libraries
+/// run by one test binary can be compared bitwise with diff.
+template <class T>
+std::uint64_t fnv1a64(const std::vector<T>& v) {
+    std::uint64_t h = 14695981039346656037ULL;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(v.data());
+    for (std::size_t i = 0; i < v.size() * sizeof(T); ++i) { h = (h ^ bytes[i]) * 1099511628211ULL; }
+    return h;
+}
+
 InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& layer, int W, const std::vector<InvRow>& rws,
                      bool meta_static = false, bool state = false) {
     const int B = static_cast<int>(rws.size()), N = W * B;
@@ -693,6 +703,14 @@ InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& lay
     o.gated = from_device<std::uint16_t>(dy, static_cast<std::size_t>(N) * 3072);
     o.out   = from_device<std::uint32_t>(dof, static_cast<std::size_t>(N) * 3072);
     o.lse   = from_device<std::uint32_t>(dl, static_cast<std::size_t>(N) * 24);
+    if (std::getenv("INKLING_ATTN_DIGEST") != nullptr) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "DIGEST attn kind=%d W=%d B=%d meta=%d state=%d %016llx %016llx %016llx",
+                      static_cast<int>(kind), W, B, meta_static ? 1 : 0, state ? 1 : 0,
+                      static_cast<unsigned long long>(fnv1a64(o.gated)), static_cast<unsigned long long>(fnv1a64(o.out)),
+                      static_cast<unsigned long long>(fnv1a64(o.lse)));
+        std::cout << line << "\n";
+    }
     return o;
 }
 
@@ -796,8 +814,8 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B4 scan fold", run_inv_route(c.kind, ip, layer, 1, r4));
         compare("decode B8 idle row scan fold", run_inv_route(c.kind, ip, layer, 1, r8));
         ops::inkling_attention_knobs().fold_fast = true;
-        // Decode with the cp.async raw ring (decode_raw 2: both blocks of a group in flight, old blocks staged before the
-        // PDL wait under static metadata) and with register staging (0), whatever the default is; the default restored.
+        // Decode with the cp.async raw ring (decode_raw 2: both blocks of a group in flight) and with register staging (0),
+        // whatever the default is; the default restored.
         const int raw_saved = ops::inkling_attention_knobs().decode_raw;
         for (const int raw : {0, 2}) {
             ops::inkling_attention_knobs().decode_raw = raw;
