@@ -187,6 +187,106 @@ __device__ __forceinline__ int active_workers(const GroupSpec& gs, int lo, int h
 inline constexpr int kFoldRowsMax = Geo::kGroup * Geo::kMaxSmallColumns; // rows of one decode / verify set
 inline constexpr int kStateRows   = 128;                                   // rows InklingAttentionRows::state covers
 
+/// fold_set's chains for columns [c0, c1) of a round: TM teams of 128 / TM threads (thread t: team t / (128 / TM), dims
+/// TM (t % (128 / TM)) .. + TM - 1), each column's three heads together; fold_kernel's L / A chains in slot order and its
+/// epilogue, per element.
+template <int TM>
+__device__ __forceinline__ void fold_chains(const AttnParams& p, int b, int kvh, int valid, int c0, int c1,
+                                            const int* row_count, const float* row_max, const float4* coef, int tid) {
+    constexpr int U  = 8 / TM; // slots a pass (loads first)
+    const int team   = tid / (Geo::kHeadDim / TM);
+    const int d0     = (tid % (Geo::kHeadDim / TM)) * TM;
+    const int W      = p.width;
+    const int S      = p.max_slots;
+    const std::int64_t stride = static_cast<std::int64_t>(W) * p.batch * Geo::kQHeads;
+    for (int j = c0 + team; j < c1; j += TM) {
+        const int rb         = Geo::kGroup * (j - c0);
+        const int cnt        = row_count[rb];
+        const int count      = max(cnt, 0);
+        const std::int64_t n = static_cast<std::int64_t>(j) + static_cast<std::int64_t>(W) * b;
+        const bool ok        = j < valid;
+        const bool gated     = p.final_mode == kGated || p.final_mode == kTrain;
+        float gate_v[Geo::kGroup][TM], sink_v[Geo::kGroup];
+#pragma unroll
+        for (int hh = 0; hh < Geo::kGroup; ++hh) {
+            const int h = kvh * Geo::kGroup + hh;
+            sink_v[hh]  = (ok && gated) ? __bfloat162float(p.sink[n * p.sink_stride + h]) : 0.0F;
+#pragma unroll
+            for (int e = 0; e < TM; ++e) {
+                gate_v[hh][e] = (ok && gated) ? __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d0 + e]) : 0.0F;
+            }
+        }
+        const float* acc0 = p.part_acc + (n * Geo::kQHeads + kvh * Geo::kGroup) * Geo::kHeadDim + d0;
+        const float4* cf0 = coef + static_cast<std::int64_t>(rb) * S;
+        float L[Geo::kGroup] = {0.0F, 0.0F, 0.0F};
+        float A[Geo::kGroup][TM];
+#pragma unroll
+        for (int hh = 0; hh < Geo::kGroup; ++hh) {
+#pragma unroll
+            for (int e = 0; e < TM; ++e) { A[hh][e] = 0.0F; }
+        }
+        for (int s0 = 0; s0 < count; s0 += U) {
+            float x[Geo::kGroup][U][TM];
+            float4 cf[Geo::kGroup][U];
+#pragma unroll
+            for (int i = 0; i < U; ++i) {
+                const bool in = s0 + i < count;
+#pragma unroll
+                for (int hh = 0; hh < Geo::kGroup; ++hh) {
+                    const float* src = acc0 + ((s0 + i) * stride + hh) * Geo::kHeadDim;
+                    if constexpr (TM == 4) {
+                        const float4 v = in ? __ldcg(reinterpret_cast<const float4*>(src)) : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+                        x[hh][i][0] = v.x; x[hh][i][TM > 1 ? 1 : 0] = v.y; x[hh][i][TM > 2 ? 2 : 0] = v.z; x[hh][i][TM > 3 ? 3 : 0] = v.w;
+                    } else if constexpr (TM == 2) {
+                        const float2 v = in ? __ldcg(reinterpret_cast<const float2*>(src)) : make_float2(0.0F, 0.0F);
+                        x[hh][i][0] = v.x; x[hh][i][TM > 1 ? 1 : 0] = v.y;
+                    } else {
+                        x[hh][i][0] = in ? __ldcg(src) : 0.0F;
+                    }
+                    cf[hh][i] = in ? cf0[hh * S + s0 + i] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < U; ++i) {
+#pragma unroll
+                for (int hh = 0; hh < Geo::kGroup; ++hh) {
+                    if (cf[hh][i].z > 0.0F) {
+                        L[hh] = fold_value(L[hh], cf[hh][i].x, cf[hh][i].z, cf[hh][i].y);
+#pragma unroll
+                        for (int e = 0; e < TM; ++e) { A[hh][e] = fold_value(A[hh][e], cf[hh][i].x, x[hh][i][e], cf[hh][i].y); }
+                    }
+                }
+            }
+        }
+        // fold_kernel's epilogue.
+#pragma unroll
+        for (int hh = 0; hh < Geo::kGroup; ++hh) {
+            const int h      = kvh * Geo::kGroup + hh;
+            const bool has   = ok && L[hh] > 0.0F;
+            const float lse2 = has ? final_lse2(row_max[rb + hh], L[hh], p.variant) : -CUDART_INF_F;
+            const float sig  = (ok && gated) ? gated_sink_factor(lse2, sink_v[hh]) : 0.0F;
+#pragma unroll
+            for (int e = 0; e < TM; ++e) {
+                const int d = d0 + e;
+                float o     = has ? final_o(A[hh][e], L[hh], p.variant) : 0.0F;
+                if (cnt < 0) { o = CUDART_NAN_F; }
+                if (gated) {
+                    float y = 0.0F;
+                    if (ok) { y = gated_value(o, gate_v[hh][e], sig); }
+                    p.out[n * Geo::kAttnWidth + h * Geo::kHeadDim + d] = __float2bfloat16_rn(y);
+                }
+                if (p.final_mode == kOutLse || p.final_mode == kTrain) {
+                    p.out_f32[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = ok ? o : 0.0F;
+                    if (d == 0) { p.lse[n * Geo::kQHeads + h] = ok ? __fmul_rn(lse2, kLn2) : 0.0F; }
+                }
+                if (p.final_mode == kDraft) {
+                    p.out[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = __float2bfloat16_rn(ok ? o : 0.0F);
+                }
+            }
+        }
+    }
+}
+
 /// The fused fold of one decode / verify set (row b, KV head kvh: 3 heads x W columns), run by the set's last worker
 /// CTA after every worker's partials landed (or by worker 0 of a set without any group, which only writes zeros).
 /// The SAME arithmetic as fold_kernel, so the same bits: per row, each slot's coefficients are fold_coeffs(running
@@ -256,72 +356,16 @@ __device__ void fold_set(const AttnParams& p, int b, int kvh, int valid, unsigne
             }
         }
         __syncthreads();
-        // The chains: thread d = head dim d of every column of the round, the column's three heads together.
+        // The chains: TM teams of 128 / TM threads take columns c0 + team, + TM, ...; a thread owns TM consecutive head
+        // dims of its column's three heads (TM = 1 / 2 / 4 by the round's width: more columns in flight, same chains).
         if (tid < Geo::kHeadDim) {
-            const int d = tid;
-            for (int j = c0; j < c1; ++j) {
-                const int rb         = Geo::kGroup * (j - c0);
-                const int cnt        = row_count[rb];
-                const int count      = max(cnt, 0);
-                const std::int64_t n = static_cast<std::int64_t>(j) + static_cast<std::int64_t>(W) * b;
-                const bool ok        = j < valid;
-                float gate_v[Geo::kGroup], sink_v[Geo::kGroup];
-#pragma unroll
-                for (int hh = 0; hh < Geo::kGroup; ++hh) {
-                    gate_v[hh] = sink_v[hh] = 0.0F;
-                    if (ok && (p.final_mode == kGated || p.final_mode == kTrain)) {
-                        const int h = kvh * Geo::kGroup + hh;
-                        gate_v[hh]  = __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d]);
-                        sink_v[hh]  = __bfloat162float(p.sink[n * p.sink_stride + h]);
-                    }
-                }
-                const float* acc0 = p.part_acc + (n * Geo::kQHeads + kvh * Geo::kGroup) * Geo::kHeadDim + d;
-                const float4* cf0 = coef + static_cast<std::int64_t>(rb) * S;
-                float L[Geo::kGroup] = {0.0F, 0.0F, 0.0F}, A[Geo::kGroup] = {0.0F, 0.0F, 0.0F};
-                for (int s0 = 0; s0 < count; s0 += 8) {
-                    float x[Geo::kGroup][8];
-                    float4 cf[Geo::kGroup][8];
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const bool in = s0 + i < count;
-#pragma unroll
-                        for (int hh = 0; hh < Geo::kGroup; ++hh) {
-                            x[hh][i]  = in ? __ldcg(acc0 + ((s0 + i) * stride + hh) * Geo::kHeadDim) : 0.0F;
-                            cf[hh][i] = in ? cf0[hh * S + s0 + i] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-                        }
-                    }
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-#pragma unroll
-                        for (int hh = 0; hh < Geo::kGroup; ++hh) {
-                            if (cf[hh][i].z > 0.0F) {
-                                L[hh] = fold_value(L[hh], cf[hh][i].x, cf[hh][i].z, cf[hh][i].y);
-                                A[hh] = fold_value(A[hh], cf[hh][i].x, x[hh][i], cf[hh][i].y);
-                            }
-                        }
-                    }
-                }
-                // fold_kernel's epilogue.
-#pragma unroll
-                for (int hh = 0; hh < Geo::kGroup; ++hh) {
-                    const int h      = kvh * Geo::kGroup + hh;
-                    const bool has   = ok && L[hh] > 0.0F;
-                    const float lse2 = has ? final_lse2(row_max[rb + hh], L[hh], p.variant) : -CUDART_INF_F;
-                    float o          = has ? final_o(A[hh], L[hh], p.variant) : 0.0F;
-                    if (cnt < 0) { o = CUDART_NAN_F; }
-                    if (p.final_mode == kGated || p.final_mode == kTrain) {
-                        float y = 0.0F;
-                        if (ok) { y = gated_value(o, gate_v[hh], gated_sink_factor(lse2, sink_v[hh])); }
-                        p.out[n * Geo::kAttnWidth + h * Geo::kHeadDim + d] = __float2bfloat16_rn(y);
-                    }
-                    if (p.final_mode == kOutLse || p.final_mode == kTrain) {
-                        p.out_f32[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = ok ? o : 0.0F;
-                        if (d == 0) { p.lse[n * Geo::kQHeads + h] = ok ? __fmul_rn(lse2, kLn2) : 0.0F; }
-                    }
-                    if (p.final_mode == kDraft) {
-                        p.out[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = __float2bfloat16_rn(ok ? o : 0.0F);
-                    }
-                }
+            const int ncol = c1 - c0;
+            if (ncol >= 4) {
+                fold_chains<4>(p, b, kvh, valid, c0, c1, row_count, row_max, coef, tid);
+            } else if (ncol >= 2) {
+                fold_chains<2>(p, b, kvh, valid, c0, c1, row_count, row_max, coef, tid);
+            } else {
+                fold_chains<1>(p, b, kvh, valid, c0, c1, row_count, row_max, coef, tid);
             }
         }
         __syncthreads(); // the next round rewrites the fold terms
