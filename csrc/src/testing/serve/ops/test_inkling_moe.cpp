@@ -1821,6 +1821,91 @@ int run_bench(const char* path) {
 
 } // namespace
 
+// ---- --digest <capture>: bitwise identity of two engine libraries --------------------------------------------------
+// One test binary runs against each libsinfer (LD_LIBRARY_PATH); the two outputs are compared with diff. One line per
+// inkling_moe call: an FNV-1a digest of its output rows, on the capture's real layer and on a synthetic layer (with and
+// without an adapter), through the fused-y (T < 32) and plain (32 <= T <= 64) narrow downs and the wide path.
+std::uint64_t fnv1a64(const std::vector<std::uint16_t>& v) {
+    std::uint64_t h = 14695981039346656037ULL;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(v.data());
+    for (std::size_t i = 0; i < v.size() * 2; ++i) { h = (h ^ bytes[i]) * 1099511628211ULL; }
+    return h;
+}
+
+void digest_call(const char* tag, const Layer& l, const std::vector<std::uint16_t>& x, int first, int tokens, int live,
+                 bool state, const Adapter* adapter) {
+    const auto begin = x.begin() + static_cast<std::ptrdiff_t>(first) * H;
+    DeviceBuffer dx = to_device(std::vector<std::uint16_t>(begin, begin + static_cast<std::ptrdiff_t>(tokens) * H));
+    DeviceBuffer dout(static_cast<std::size_t>(tokens) * H * 2);
+    DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, tokens, adapter != nullptr));
+    Tensor tx(dx.p, DType::BF16, {H, tokens}), tout(dout.p, DType::BF16, {H, tokens});
+    ops::InklingMoeOptions options;
+    options.state = state ? persistent_state() : nullptr;
+    DeviceBuffer dlive, dslots;
+    if (live < tokens) {
+        dlive = to_device(std::vector<int>{live});
+        options.live_tokens = static_cast<const std::int32_t*>(dlive.p);
+    }
+    ops::InklingMoeAdapters adapters{};
+    if (adapter != nullptr) {
+        std::vector<int> slots(tokens);
+        for (int t = 0; t < tokens; ++t) { slots[t] = t % 3 == 2 ? -1 : t % 2; }
+        dslots = to_device(slots);
+        adapters = ops::InklingMoeAdapters{static_cast<const ops::LoraBank*>(adapter->d_table.p),
+                                           static_cast<const std::int32_t*>(dslots.p), nullptr, 16};
+        options.adapters = &adapters;
+    }
+    ops::inkling_moe(tx, l.view, tout, arena, nullptr, options);
+    cuda_synchronize();
+    const auto rows = from_device<std::uint16_t>(dout, static_cast<std::size_t>(tokens) * H);
+    std::printf("DIGEST %s T=%d first=%d live=%d state=%d adapter=%d %016llx\n", tag, tokens, first, live, state ? 1 : 0,
+                adapter != nullptr ? 1 : 0, static_cast<unsigned long long>(fnv1a64(rows)));
+}
+
+void digest_layer(const char* tag, const Layer& l, const std::vector<std::uint16_t>& x, int available, const Adapter* adapter) {
+    static constexpr int kNarrow[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 48, 63, 64};
+    for (const int tokens : kNarrow) {
+        for (const int first : {0, (available - tokens) / 2, available - tokens}) {
+            for (const bool state : {true, false}) { digest_call(tag, l, x, first, tokens, tokens, state, adapter); }
+        }
+        if (tokens >= 8) { digest_call(tag, l, x, 0, tokens, tokens - tokens / 3, true, adapter); } // padded round
+    }
+    for (const int tokens : {65, 256}) { digest_call(tag, l, x, 0, tokens, tokens, false, adapter); }
+    // Wide rounds: the available tokens repeated (real rows, a prefill-sized call).
+    std::vector<std::uint16_t> cycled(static_cast<std::size_t>(8192) * H);
+    for (std::size_t i = 0; i < cycled.size(); ++i) { cycled[i] = x[i % (static_cast<std::size_t>(available) * H)]; }
+    for (const int tokens : {4096, 8192}) { digest_call(tag, l, cycled, 0, tokens, tokens, false, adapter); }
+}
+
+int run_digest(const char* path) {
+    {
+        const SafeTensors st = read_safetensors(path);
+        const bool nv = st.meta.at("format") == "nvfp4";
+        Layer real;
+        load_capture_layer(st, nv, real);
+        digest_layer(nv ? "real-nvfp4" : "real-mxfp8", real, st.vec<std::uint16_t>("x"), std::stoi(st.meta.at("tokens")),
+                     nullptr);
+    }
+    for (const auto format : {ops::InklingExpertFormat::Nvfp4, ops::InklingExpertFormat::Mxfp8}) {
+        const bool nv = format == ops::InklingExpertFormat::Nvfp4;
+        Layer synthetic;
+        build_layer(synthetic, format, nv ? 7 : 8);
+        constexpr int kTokens = 300;
+        Rng rng(nv ? 27 : 28);
+        std::vector<float> x(static_cast<std::size_t>(kTokens) * H);
+        for (auto& v : x) { v = rng.uniform(-2.0F, 2.0F); }
+        round_to_bf16(x);
+        const auto bits = to_bf16_bits(x);
+        Adapter adapter;
+        build_adapter(adapter, 37, false);
+        digest_layer(nv ? "synthetic-nvfp4" : "synthetic-mxfp8", synthetic, bits, kTokens, nullptr);
+        digest_layer(nv ? "synthetic-nvfp4" : "synthetic-mxfp8", synthetic, bits, kTokens, &adapter);
+    }
+    const int dirty = state_nonzero_words();
+    std::printf("DIGEST persistent state words left nonzero: %d\n", dirty);
+    return dirty == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::printf("no CUDA device: skipped\n");
@@ -1835,6 +1920,7 @@ int main(int argc, char** argv) {
     }
     int failures = 0;
     if (argc == 3 && std::string(argv[1]) == "--bench") { return run_bench(argv[2]); }
+    if (argc == 3 && std::string(argv[1]) == "--digest") { return run_digest(argv[2]); }
     if ((argc == 3 || argc == 5) && std::string(argv[1]) == "--capture") {
         const char* dump = argc == 5 && std::string(argv[3]) == "--dump" ? argv[4] : nullptr;
         failures = run_capture(argv[2], dump);
