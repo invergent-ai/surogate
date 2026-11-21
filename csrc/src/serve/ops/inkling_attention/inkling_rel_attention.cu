@@ -140,7 +140,7 @@ struct AttnSmem {
     static constexpr int kDtw         = 16 / KS;          // output dim n-tiles of a warp
     static constexpr int kX           = KS > 1 ? MTiles : 1; // (zero-length arrays are not C++)
     static constexpr int kF           = Fold ? kWarps : 1;
-    std::uint8_t raw[Raw][2][kBn * Geo::kHeadDim];
+    static constexpr int kRawBytes    = Raw * 2 * kBn * Geo::kHeadDim; // Raw = 0: register-staged (decode)
     __nv_bfloat16 k[kBn * Geo::kHeadDim];
     __nv_bfloat16 v[kBn * Geo::kHeadDim];
     __nv_bfloat16 strip[kWarps][16 * kStripStride];
@@ -148,6 +148,7 @@ struct AttnSmem {
     float xq[kX][4][16];
     uint4 xpk[kX][4][32];
     float fold_a[kF][kDtw * 4][32]; // thread-private fold totals: [warp][dim tile x element][lane]
+    alignas(16) std::uint8_t raw[kRawBytes > 0 ? kRawBytes : 16]; // [slot][K | V][key][128]
 };
 
 template <int MTiles, int KS, bool Fold>
@@ -160,7 +161,7 @@ constexpr int pick_raw() {
 // = 3 j + h); prefill rows are 64 consecutive columns of one query head. Mode kPartial writes each group's state per
 // row (split route, fold_kernel folds); kGated / kOutLse fold in the kernel (workers == 1) and finish.
 template <bool Local, bool Decode, int MTiles, int KS, int Mode, int Raw>
-__global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const AttnParams p) {
+__global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attention_kernel(const AttnParams p) {
     constexpr bool Fold    = Mode != kPartial;
     constexpr int Threads  = MTiles * KS * 32;
     constexpr int NTW      = 8 / KS;  // score n-tiles of a warp
@@ -276,19 +277,38 @@ __global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const A
         for (int i = 0; i < DTW * 4; ++i) { sm.fold_a[warp][i][lane] = 0.0F; }
     }
 
-    // Block cursor over this worker's groups (g_first + worker, + workers, ...), each group's blocks in key order.
+    // This worker's groups [g_start, g_stop): the CTA's blocks split into `workers` contiguous, equal block ranges,
+    // each group owned by the worker whose range holds the group's first block (balanced by keys to one group; free:
+    // every group is computed the same way wherever it runs).
+    int g_start = g_first, g_stop = g_last + 1;
+    if (p.workers > 1 && any) {
+        const int kb_lo   = lo >> 6;
+        const int kb_last = (hi - 1) >> 6;
+        const int nb      = kb_last + 1 - kb_lo;
+        const auto first_group_from = [&](int blk) {
+            if (blk <= kb_lo) { return g_first; }
+            if (blk > kb_last) { return g_last + 1; }
+            int g = group_of(gs, blk * kBn);
+            if (group_begin(gs, g) < blk * kBn) { ++g; }
+            return g;
+        };
+        g_start = first_group_from(kb_lo + static_cast<int>(static_cast<std::int64_t>(worker) * nb / p.workers));
+        g_stop  = first_group_from(kb_lo + static_cast<int>(static_cast<std::int64_t>(worker + 1) * nb / p.workers));
+    }
+
+    // Block cursor over the worker's groups, each group's blocks in key order.
     struct Cursor {
         int g, kb, kb_end;
     };
     const auto start = [&](Cursor& c, int g) {
         c.g = g;
-        if (g <= g_last) {
+        if (g < g_stop) {
             c.kb     = max(group_begin(gs, g), lo) >> 6;
             c.kb_end = ((min(group_begin(gs, g + 1), hi) - 1) >> 6) + 1;
         }
     };
     const auto advance = [&](Cursor& c) {
-        if (++c.kb == c.kb_end) { start(c, c.g + p.workers); }
+        if (++c.kb == c.kb_end) { start(c, c.g + 1); }
     };
 
     // Land block kb's K and V codes in raw slot `slot`; keys outside [lo, hi) are zero-filled and never read.
@@ -302,7 +322,7 @@ __global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const A
             const int key   = cc >> 3;
             const int part  = cc & 7;
             const int kabs  = k0 + key;
-            std::uint8_t* dst = sm.raw[slot][which] + key * Geo::kHeadDim + part * 16;
+            std::uint8_t* dst = sm.raw + (slot * 2 + which) * (kBn * Geo::kHeadDim) + key * Geo::kHeadDim + part * 16;
             const std::uint8_t* src = (which ? p.v_pages : p.k_pages) + off + key * Geo::kHeadDim + part * 16;
             cp_async_zfill<16>(dst, src, (kabs >= lo && kabs < hi) ? 16 : 0);
         }
@@ -314,7 +334,7 @@ __global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const A
             const int cc    = c - which * (kBn * 16);
             const int key   = cc >> 4;
             const int ch    = cc & 15;
-            const std::uint8_t* src = sm.raw[slot][which] + key * Geo::kHeadDim + ch * 8;
+            const std::uint8_t* src = sm.raw + (slot * 2 + which) * (kBn * Geo::kHeadDim) + key * Geo::kHeadDim + ch * 8;
             __nv_bfloat16* dst      = (which ? sm.v : sm.k) + key * Geo::kHeadDim + ((ch ^ (key & 7)) << 3);
             store_vec(dst, e4m3x8_to_bf16x8(load_vec<int2>(src)));
         }
@@ -550,35 +570,82 @@ __global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const A
     };
 
     Cursor ld, cu;
-    start(ld, g_first + worker);
-    start(cu, g_first + worker);
+    start(ld, g_start);
+    start(cu, g_start);
+    if constexpr (Raw == 0) {
+        // Register staging (decode / verify): the next block's codes are loaded into registers while the current one
+        // is computed, then widened into the tiles; no raw ring, so two CTAs fit an SM.
+        constexpr int NR = (kBn * 16 + Threads - 1) / Threads; // 8-byte chunks of K (and of V) per thread
+        int2 rk[NR], rv[NR];
+        const auto load_raw = [&](int kb) {
+            const int k0           = kb * kBn;
+            const std::int64_t off = kv_page_offset(table_row[k0 >> kPageShift], kvh, 0);
 #pragma unroll
-    for (int s = 0; s < Raw; ++s) {
-        if (ld.g <= g_last) {
-            stage(ld.kb, s);
+            for (int i = 0; i < NR; ++i) {
+                const int c    = tid + i * Threads;
+                const int key  = c >> 4;
+                const int kabs = k0 + key;
+                const bool ok  = c < kBn * 16 && kabs >= lo && kabs < hi;
+                const std::int64_t o = off + key * Geo::kHeadDim + (c & 15) * 8;
+                rk[i] = ok ? load_ldg<int2>(p.k_pages + o) : make_int2(0, 0);
+                rv[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
+            }
+        };
+        if (ld.g < g_stop) {
+            load_raw(ld.kb);
             advance(ld);
         }
-        cp_commit();
-    }
-    int it = 0;
-    while (cu.g <= g_last) {
-        const int slot = it % Raw;
-        cp_wait<Raw - 1>();
-        __syncthreads(); // block visible; every warp is done with the previous tiles
-        widen(slot);
-        __syncthreads(); // tiles ready; the raw slot is free
-        if (ld.g <= g_last) {
-            stage(ld.kb, slot);
-            advance(ld);
+        while (cu.g < g_stop) {
+            __syncthreads(); // every warp is done with the previous block's tiles
+#pragma unroll
+            for (int i = 0; i < NR; ++i) {
+                const int c = tid + i * Threads;
+                if (c < kBn * 16) {
+                    const int key = c >> 4;
+                    const int e   = key * Geo::kHeadDim + (((c & 15) ^ (key & 7)) << 3);
+                    store_vec(sm.k + e, e4m3x8_to_bf16x8(rk[i]));
+                    store_vec(sm.v + e, e4m3x8_to_bf16x8(rv[i]));
+                }
+            }
+            __syncthreads();
+            if (ld.g < g_stop) {
+                load_raw(ld.kb); // in flight during this block's math
+                advance(ld);
+            }
+            compute_block(cu.kb);
+            const int g = cu.g;
+            advance(cu);
+            if (cu.g != g) { finish_group(g); }
         }
-        cp_commit();
-        compute_block(cu.kb);
-        const int g = cu.g;
-        advance(cu);
-        if (cu.g != g) { finish_group(g); }
-        ++it;
+    } else {
+#pragma unroll
+        for (int s = 0; s < Raw; ++s) {
+            if (ld.g < g_stop) {
+                stage(ld.kb, s);
+                advance(ld);
+            }
+            cp_commit();
+        }
+        int it = 0;
+        while (cu.g < g_stop) {
+            const int slot = it % Raw;
+            cp_wait<Raw - 1>();
+            __syncthreads(); // block visible; every warp is done with the previous tiles
+            widen(slot);
+            __syncthreads(); // tiles ready; the raw slot is free
+            if (ld.g < g_stop) {
+                stage(ld.kb, slot);
+                advance(ld);
+            }
+            cp_commit();
+            compute_block(cu.kb);
+            const int g = cu.g;
+            advance(cu);
+            if (cu.g != g) { finish_group(g); }
+            ++it;
+        }
+        cp_wait<0>();
     }
-    cp_wait<0>();
 
     if constexpr (Fold) {
         // Epilogue (A5-A7) on the folded total. Row i of this thread holds dims 8 (kq DTW + n) + 2 lid, + 1.
@@ -622,9 +689,13 @@ __global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const A
 }
 
 // The split route's fold: per (column, head), the row's group partials folded in group order by the same formula as
-// the in-kernel route, then the same epilogue. A thread per head dim.
+// the in-kernel route, then the same epilogue. A thread per head dim. The fold's scalars are computed in parallel
+// (exactly: the running maximum is a max scan, and every coefficient is fold_coeffs of the same two operands as in
+// the sequential walk); only the fma chains of L and of A[d] walk the slots in order, with their loads in flight.
 template <bool Local, int Mode>
 __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
+    extern __shared__ float fold_smem[]; // [4][max_slots]: m, l, a, c
+    __shared__ float seg_max[128];
     pdl::wait_for_dependencies();
     const std::int64_t n         = blockIdx.x;
     const int h                  = static_cast<int>(blockIdx.y);
@@ -636,28 +707,63 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     int valid                    = W;
     if (p.valid_columns != nullptr) { valid = max(0, min(p.valid_columns[b], W)); }
     const bool ok = j < valid;
-    float M = -CUDART_INF_F, L = 0.0F, A = 0.0F;
-    bool poison = false;
+    bool poison   = false;
+    int count     = 0;
     if (ok) {
         const GroupSpec gs = p.groups;
         const int pos      = p.positions[static_cast<std::int64_t>(W) * b + j];
         const int g0       = group_of(gs, Local ? max(0, pos - (Geo::kWindow - 1)) : 0);
         const int ns       = group_of(gs, pos) - g0 + 1;
         poison             = ns > p.max_slots;
-        const std::int64_t stride = n_columns * Geo::kQHeads;
-        const float2* ml   = p.part_ml + n * Geo::kQHeads + h;
-        const float* pa    = p.part_acc + (n * Geo::kQHeads + h) * Geo::kHeadDim + d;
-        const int count    = poison ? 0 : ns;
-#pragma unroll 4
-        for (int s = 0; s < count; ++s) {
-            const float2 st = ml[s * stride];
-            const float as  = pa[s * stride * Geo::kHeadDim];
-            if (st.y > 0.0F) {
-                float Mn, a, c;
-                fold_coeffs(M, st.x, Mn, a, c);
-                M = Mn;
-                L = fold_value(L, a, st.y, c);
-                A = fold_value(A, a, as, c);
+        count              = poison ? 0 : ns;
+    }
+    float* sm_m = fold_smem;
+    float* sm_l = sm_m + p.max_slots;
+    float* sm_a = sm_l + p.max_slots;
+    float* sm_c = sm_a + p.max_slots;
+    const std::int64_t stride = n_columns * Geo::kQHeads;
+    const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
+    for (int s = d; s < count; s += 128) {
+        const float2 st = ml[s * stride];
+        sm_m[s]         = st.x;
+        sm_l[s]         = st.y;
+    }
+    __syncthreads();
+    const int per = (count + 127) / 128;
+    const int s0  = min(d * per, count);
+    const int s1  = min(s0 + per, count);
+    float mx      = -CUDART_INF_F;
+    for (int s = s0; s < s1; ++s) {
+        if (sm_l[s] > 0.0F) { mx = fmaxf(mx, sm_m[s]); }
+    }
+    seg_max[d] = mx;
+    __syncthreads();
+    float Mp = -CUDART_INF_F, M = -CUDART_INF_F;
+    for (int t = 0; t < 128; ++t) {
+        if (t == d) { Mp = M; }
+        M = fmaxf(M, seg_max[t]);
+    }
+    for (int s = s0; s < s1; ++s) {
+        if (sm_l[s] > 0.0F) {
+            float Mn, a, c;
+            fold_coeffs(Mp, sm_m[s], Mn, a, c);
+            sm_a[s] = a;
+            sm_c[s] = c;
+            Mp      = Mn;
+        }
+    }
+    __syncthreads();
+    float L = 0.0F, A = 0.0F;
+    const float* pa = p.part_acc + (n * Geo::kQHeads + h) * Geo::kHeadDim + d;
+    for (int s = 0; s < count; s += 8) {
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { v[i] = s + i < count ? pa[(s + i) * stride * Geo::kHeadDim] : 0.0F; }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (s + i < count && sm_l[s + i] > 0.0F) {
+                L = fold_value(L, sm_a[s + i], sm_l[s + i], sm_c[s + i]);
+                A = fold_value(A, sm_a[s + i], v[i], sm_c[s + i]);
             }
         }
     }
@@ -768,8 +874,8 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
         plan.mtiles      = (Geo::kGroup * width + 15) / 16;
         plan.ks          = plan.mtiles == 1 ? 4 : 2;
         const int work   = Geo::kKvHeads * batch;
-        const int target = env_int("SUROGATE_INKLING_ATTN_CTAS", 2 * sms);
-        plan.workers     = std::clamp((target + work - 1) / work, 1, slot_cap);
+        const int target = env_int("SUROGATE_INKLING_ATTN_CTAS", 2 * sms); // two CTAs per SM: one wave
+        plan.workers     = std::clamp(target / work, 1, slot_cap);
     } else {
         plan.decode     = false;
         plan.mtiles     = 4;
@@ -791,7 +897,7 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
 
 template <bool Local, bool Decode, int MTiles, int KS, int Mode>
 void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
-    constexpr int Raw   = pick_raw<MTiles, KS, Mode != kPartial>();
+    constexpr int Raw   = Decode ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
     constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial>));
     static_assert(bytes <= kSmemLimit, "inkling attention: shared memory over the sm_120 limit");
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw>;
@@ -826,7 +932,9 @@ void dispatch(InklingLayerKind kind, int mode, const Plan& plan, const AttnParam
 
 template <int Mode>
 void launch_fold(InklingLayerKind kind, std::int64_t n, const AttnParams& p, cudaStream_t stream) {
-    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n), Geo::kQHeads), dim3(Geo::kHeadDim), 0, stream};
+    const std::size_t smem = static_cast<std::size_t>(p.max_slots) * 16;
+    if (smem > 48 * 1024) { throw std::invalid_argument("inkling rel attention: too many partial slots for the fold"); }
+    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n), Geo::kQHeads), dim3(Geo::kHeadDim), smem, stream};
     if (kind == InklingLayerKind::Local) {
         CUDA_CHECK(pdl::launch_dependent(launch, fold_kernel<true, Mode>, p));
     } else {

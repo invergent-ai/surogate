@@ -91,6 +91,16 @@ __device__ __forceinline__ void mma_bf16_k8(float& c0, float& c1, float& c2, flo
                  : "r"(a0), "r"(a1), "r"(b0));
 }
 
+/// m16n8k16 bf16 MMA (fp32 accumulate) WITHOUT `volatile`: the same instruction as ops::mma_bf16 (same bits), but the
+/// compiler may interleave independent chains around it (the volatile form keeps every MMA in program order).
+__device__ __forceinline__ void mma_bf16_nv(float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1,
+                                            unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 /// The reference's `_sigmoid` (ops/attention.py): rcp.approx(ex2.approx(-x * log2 e) + 1).
 __device__ __forceinline__ float ref_sigmoid(float x) {
     return ptx_rcp(__fadd_rn(ptx_ex2(__fmul_rn(-x, kLog2e)), 1.0F));

@@ -62,23 +62,32 @@ __device__ __forceinline__ int segment_of(const LinearParams& p, int block) {
 // chunk is two steps: step A puts K offsets 8 l + {0, 1} at k slots 2 l + {0, 1} and 8 l + {2, 3} at 2 l + 8 + {0, 1}
 // (l = 0..3), step B likewise 8 l + {4, 5} and 8 l + {6, 7}. So lane (g, l) of a fragment holds the 8 consecutive K
 // values [8 l, 8 l + 8) of its token / row: one 16-byte load of x and one 8-byte load of codes per chunk. A 128-column
-// cell's steps chain into `part` from zero; at the cell's end acc = fmaf(scale, part, acc) (cells in order); a
-// per-channel row chains every step into acc and is multiplied by its scale once. Output rounded once to bf16. The
+// cell's steps chain into `part` from zero; at the cell's end acc = fmaf(scale, part, acc) (1x128 / 128x128) or
+// acc = acc + part (per-channel; the row's scale multiplies acc once at the end), cells in order. Cells are
+// independent chains, so a kernel may interleave them (it does not change any element's operations). Output rounded
+// once to bf16. The
 // narrow kernel (N <= 16, one m16 tile) and the GEMM (N > 16) issue exactly this chain per element, so a column's
 // bits do not depend on N (test: attn_linear width invariance).
 
 /// One chunk's two MMA steps into c: a token fragment pair (u: token gid, v: token gid + 8) and a code fragment w.
 __device__ __forceinline__ void chunk_steps(float (&c)[4], const uint4& u, const uint4& v, const int4& w) {
-    mma_bf16(c[0], c[1], c[2], c[3], u.x, v.x, u.y, v.y, static_cast<unsigned>(w.x), static_cast<unsigned>(w.y));
-    mma_bf16(c[0], c[1], c[2], c[3], u.z, v.z, u.w, v.w, static_cast<unsigned>(w.z), static_cast<unsigned>(w.w));
+    mma_bf16_nv(c[0], c[1], c[2], c[3], u.x, v.x, u.y, v.y, static_cast<unsigned>(w.x), static_cast<unsigned>(w.y));
+    mma_bf16_nv(c[0], c[1], c[2], c[3], u.z, v.z, u.w, v.w, static_cast<unsigned>(w.z), static_cast<unsigned>(w.w));
 }
 
-/// Cell end: acc = fmaf(scale, part, acc) per element (rows 2 lid, 2 lid + 1 of the n8 tile = elements 0 / 2, 1 / 3).
+/// Cell end: acc = fmaf(scale, part, acc) per element (rows 2 lid, 2 lid + 1 of the n8 tile = elements 0 / 2, 1 / 3),
+/// or acc = acc + part for a per-channel row (PerRow).
+template <bool PerRow>
 __device__ __forceinline__ void cell_end(float (&acc)[4], float (&part)[4], float s0, float s1) {
-    acc[0]  = fmaf(s0, part[0], acc[0]);
-    acc[1]  = fmaf(s1, part[1], acc[1]);
-    acc[2]  = fmaf(s0, part[2], acc[2]);
-    acc[3]  = fmaf(s1, part[3], acc[3]);
+    if constexpr (PerRow) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { acc[e] = __fadd_rn(acc[e], part[e]); }
+    } else {
+        acc[0] = fmaf(s0, part[0], acc[0]);
+        acc[1] = fmaf(s1, part[1], acc[1]);
+        acc[2] = fmaf(s0, part[2], acc[2]);
+        acc[3] = fmaf(s1, part[3], acc[3]);
+    }
     part[0] = part[1] = part[2] = part[3] = 0.0F;
 }
 
@@ -89,8 +98,9 @@ __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, i
 
 // ---- narrow: N <= 16 columns (decode, verify) ------------------------------------------------------------------------
 // A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Lane (gid, lid) streams row gid's codes,
-// 8 a chunk, through a register ring 16 chunks deep (issued before the PDL wait: weights never depend on the previous
-// kernel), and reads tokens gid / gid + 8 of x (L1 / L2 resident) after it.
+// 8 a chunk, through a register ring kNarrowDepth chunks deep (the first issued before the PDL wait: weights never
+// depend on the previous kernel), and reads tokens gid / gid + 8 of x (L1 / L2 resident; unconditional loads from a
+// clamped address, masked after, so the compiler can hoist them). Two cells run interleaved (independent chains).
 inline constexpr int kNarrowWarps = 2;
 inline constexpr int kNarrowRows  = kNarrowWarps * 8;
 inline constexpr int kNarrowDepth = 16;
@@ -98,6 +108,8 @@ inline constexpr int kNarrowDepth = 16;
 template <int K, bool PerRow>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
     constexpr int Chunks   = K / 32;
+    constexpr int Cells    = K / 128;
+    static_assert(Cells % 2 == 0, "cells run in pairs");
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
@@ -108,32 +120,46 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     // A row past the end re-reads the last row and writes nothing.
     const std::uint8_t* row = s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + gid, s.rows - 1)) * K + 8 * lid;
 
+    // Consumption order: cell pair (2 i, 2 i + 1), chunk j of the first then chunk j of the second, j = 0..3.
+    const auto order = [](int t) { return (t >> 3) * 8 + ((t & 1) << 2) + ((t >> 1) & 3); };
     uint2 ring[kNarrowDepth];
 #pragma unroll
-    for (int i = 0; i < kNarrowDepth; ++i) { ring[i] = load_ldg<uint2>(row + 32 * i); }
+    for (int i = 0; i < kNarrowDepth; ++i) { ring[i] = load_ldg<uint2>(row + 32 * order(i)); }
     pdl::wait_for_dependencies();
 
-    const int n_tok              = p.columns;
-    const bool t0                = gid < n_tok;
-    const bool t1                = gid + 8 < n_tok;
-    const __nv_bfloat16* x0      = s.x + static_cast<std::int64_t>(gid) * K + 8 * lid;
-    const __nv_bfloat16* x1      = s.x + static_cast<std::int64_t>(gid + 8) * K + 8 * lid;
-    float acc[4]  = {0.0F, 0.0F, 0.0F, 0.0F};
-    float part[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    const int n_tok         = p.columns;
+    const bool t0           = gid < n_tok;
+    const bool t1           = gid + 8 < n_tok;
+    const __nv_bfloat16* x0 = s.x + static_cast<std::int64_t>(t0 ? gid : 0) * K + 8 * lid;
+    const __nv_bfloat16* x1 = s.x + static_cast<std::int64_t>(t1 ? gid + 8 : 0) * K + 8 * lid;
+    const auto mask         = [](uint4 v, bool ok) { return ok ? v : make_uint4(0, 0, 0, 0); };
+    float acc[4]   = {0.0F, 0.0F, 0.0F, 0.0F};
+    float part0[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
-    for (int ch = 0; ch < Chunks; ++ch) {
-        const uint2 cw = ring[ch % kNarrowDepth];
-        if (ch + kNarrowDepth < Chunks) { ring[ch % kNarrowDepth] = load_ldg<uint2>(row + 32 * (ch + kNarrowDepth)); }
+    for (int t = 0; t < Chunks; ++t) {
+        const int ch   = order(t);
+        const uint2 cw = ring[t % kNarrowDepth];
+        if (t + kNarrowDepth < Chunks) { ring[t % kNarrowDepth] = load_ldg<uint2>(row + 32 * order(t + kNarrowDepth)); }
         const int4 w  = e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
-        const uint4 u = t0 ? load_ldg<uint4>(x0 + 32 * ch) : make_uint4(0, 0, 0, 0);
-        const uint4 v = t1 ? load_ldg<uint4>(x1 + 32 * ch) : make_uint4(0, 0, 0, 0);
-        if constexpr (PerRow) {
-            chunk_steps(acc, u, v, w);
+        const uint4 u = mask(load_ldg<uint4>(x0 + 32 * ch), t0);
+        const uint4 v = mask(load_ldg<uint4>(x1 + 32 * ch), t1);
+        if ((t & 1) == 0) {
+            chunk_steps(part0, u, v, w);
         } else {
-            chunk_steps(part, u, v, w);
-            if ((ch & 3) == 3) {
-                cell_end(acc, part, cell_scale(s, local0 + 2 * lid, ch >> 2), cell_scale(s, local0 + 2 * lid + 1, ch >> 2));
+            chunk_steps(part1, u, v, w);
+        }
+        if ((t & 7) == 7) { // both cells of the pair complete: join them in cell order
+            const int c0 = ch >> 2; // = the second cell
+            float s00 = 1.0F, s01 = 1.0F, s10 = 1.0F, s11 = 1.0F;
+            if constexpr (!PerRow) {
+                s00 = cell_scale(s, local0 + 2 * lid, c0 - 1);
+                s01 = cell_scale(s, local0 + 2 * lid + 1, c0 - 1);
+                s10 = cell_scale(s, local0 + 2 * lid, c0);
+                s11 = cell_scale(s, local0 + 2 * lid + 1, c0);
             }
+            cell_end<PerRow>(acc, part0, s00, s01);
+            cell_end<PerRow>(acc, part1, s10, s11);
         }
     }
 #pragma unroll
@@ -245,7 +271,7 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
 #pragma unroll
             for (int mt = 0; mt < 2; ++mt) {
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) { chunk_steps(PerRow ? acc[mt][nt] : part[mt][nt], u[mt], v[mt], w[nt]); }
+                for (int nt = 0; nt < 4; ++nt) { chunk_steps(part[mt][nt], u[mt], v[mt], w[nt]); }
             }
         }
         __syncthreads(); // the w tile and this stage's slots are free
@@ -254,14 +280,15 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
             stage_x(st + 2, slot);
         }
         cp_commit();
-        // A cell ends every 128 columns (two steps): scale its partial into the total.
-        if (!PerRow && (st & 1) == 1) {
+        // A cell ends every 128 columns (two steps): join its partial to the total.
+        if ((st & 1) == 1) {
             const int cell = st >> 1;
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
-                const float s0 = cell_scale(s, out_row(nt, 0), cell), s1 = cell_scale(s, out_row(nt, 1), cell);
+                const float s0 = PerRow ? 1.0F : cell_scale(s, out_row(nt, 0), cell);
+                const float s1 = PerRow ? 1.0F : cell_scale(s, out_row(nt, 1), cell);
 #pragma unroll
-                for (int mt = 0; mt < 2; ++mt) { cell_end(acc[mt][nt], part[mt][nt], s0, s1); }
+                for (int mt = 0; mt < 2; ++mt) { cell_end<PerRow>(acc[mt][nt], part[mt][nt], s0, s1); }
             }
         }
     }
