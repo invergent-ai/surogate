@@ -1830,6 +1830,33 @@ void bench_attention_wo(const char* name, InklingLayerKind kind, int first) {
                 t_wo, t_att + t_wo);
 }
 
+// A/B of the decode kernel's latency knobs (L2 prefetch distance, PDL trigger at entry): same bits, different speed.
+void run_bench_ab() {
+    using K = InklingLayerKind;
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
+    for (const char* l2 : {"0", "2", "4", "8"}) {
+        for (const char* trig : {"0", "1"}) {
+            setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
+            setenv("SUROGATE_INKLING_ATTN_PDL_TRIGGER", trig, 1);
+            const std::string tag = std::string(" [p1 l2=") + l2 + " trig=" + trig + "]";
+            bench_attention(("decode global 1x8k" + tag).c_str(), K::Global, 1, 1, 8191);
+            bench_attention(("decode global 1x64k" + tag).c_str(), K::Global, 1, 1, 65535);
+            bench_attention(("decode global 1x262k" + tag).c_str(), K::Global, 1, 1, 262143);
+            bench_attention(("decode global 8x8k" + tag).c_str(), K::Global, 1, 8, 8191);
+            bench_attention(("decode local 1x8k" + tag).c_str(), K::Local, 1, 1, 8191);
+            bench_attention(("verify W8 global 1x8k" + tag).c_str(), K::Global, 8, 1, 8184);
+            bench_attention_wo(("pair global 1x8k + wo" + tag).c_str(), K::Global, 8191);
+        }
+    }
+    unsetenv("SUROGATE_INKLING_ATTN_L2AHEAD");
+    unsetenv("SUROGATE_INKLING_ATTN_PDL_TRIGGER");
+    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    bench_linear("attn_linear qkvr narrow N=1 1x128", 2304, 128, 1);
+    bench_linear("attn_linear wo narrow N=1 1x128", 3072, 128, 1);
+    bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
+}
+
 void run_bench() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
@@ -1894,6 +1921,10 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::string(argv[1]) == "bench") {
         try {
+            if (argc > 2 && std::string(argv[2]) == "ab") {
+                run_bench_ab();
+                return 0;
+            }
             run_bench();
         } catch (const std::exception& e) {
             std::cerr << "EXCEPTION " << e.what() << '\n';

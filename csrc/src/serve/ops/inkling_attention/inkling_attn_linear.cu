@@ -113,13 +113,14 @@ __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, i
 // cells run interleaved (independent chains).
 inline constexpr int kNarrowWarps  = 2;
 inline constexpr int kNarrowRows   = kNarrowWarps * 8;
-inline constexpr int kNarrowStages = 8;
+inline constexpr int kNarrowStages = 16;
 
 template <int K, bool PerRow>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
     constexpr int Cells = K / 128;
     static_assert(Cells % 2 == 0, "cells run in pairs");
     __shared__ __align__(16) std::uint8_t ring_all[kNarrowWarps][kNarrowStages][8 * 128];
+    static_assert(kNarrowStages % 2 == 0 && kNarrowStages <= 16, "pairs of cells; cp.async.wait_group immediate");
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
@@ -143,9 +144,19 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
             cp_async<16, Cache::cg>(dst, src);
         }
     };
+    if (lane == 0) { // the warp's whole slab of codes, asked of L2 at entry: the ring's refills then hit L2
+        const int first = min(local0, s.rows - 1);
+        prefetch_l2_bulk(s.codes + static_cast<std::int64_t>(s.row_begin + first) * K,
+                         static_cast<unsigned>(min(8, s.rows - first) * K));
+    }
+    // One cp.async group per pair of cells: kNarrowStages / 2 - 1 pairs in flight ahead of the pair being computed.
+    constexpr int Pairs = kNarrowStages / 2;
 #pragma unroll
-    for (int c = 0; c < kNarrowStages - 1; ++c) {
-        if (c < Cells) { stage(c); }
+    for (int pr = 0; pr < Pairs - 1; ++pr) {
+        if (2 * pr < Cells) {
+            stage(2 * pr);
+            stage(2 * pr + 1);
+        }
         cp_commit();
     }
     pdl::wait_for_dependencies();
@@ -165,7 +176,7 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll 1
     for (int c = 0; c < Cells; c += 2) {
-        cp_wait<kNarrowStages - 3>(); // cells c and c + 1 have landed (this lane's copies) ...
+        cp_wait<Pairs - 2>(); // cells c and c + 1 have landed (this lane's copies) ...
         __syncwarp();                 // ... and every lane's
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -182,10 +193,11 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
         }
         cell_end<PerRow>(acc, part0, s00, s01);
         cell_end<PerRow>(acc, part1, s10, s11);
-        __syncwarp(); // every lane is done with the two slots before they are refilled
-        if (c + kNarrowStages - 1 < Cells) { stage(c + kNarrowStages - 1); }
-        cp_commit();
-        if (c + kNarrowStages < Cells) { stage(c + kNarrowStages); }
+        __syncwarp(); // every lane is done with the previous pair's slots before they are refilled
+        if (c + kNarrowStages - 2 < Cells) {
+            stage(c + kNarrowStages - 2);
+            stage(c + kNarrowStages - 1);
+        }
         cp_commit();
     }
 #pragma unroll

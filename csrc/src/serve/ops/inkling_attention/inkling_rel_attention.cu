@@ -47,7 +47,6 @@ inline constexpr int kRowBytes    = Geo::kHeadDim * 2;  // a bf16 tile row
 inline constexpr int kPrefillRows = 64;                 // query columns of one prefill CTA (4 row tiles)
 inline constexpr int kMaxWorkers  = 64;
 inline constexpr int kSmemLimit   = 101376;             // sm_120 opt-in shared memory per block
-inline constexpr int kL2Ahead     = 4;                  // blocks whose K / V pages are asked of L2 ahead of their loads
 
 enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2 };
 
@@ -102,6 +101,8 @@ struct AttnParams {
     // per call, so every route of a call uses the same): 1 bias as s + bf16(b) * log2e (else fma), 8 o = A / L with
     // div.rn (else div.full), 16 lse with accurate log2f (else lg2.approx), 32 l = l * alpha + sum unfused.
     int variant;
+    int l2_ahead;    // blocks asked of L2 ahead of their loads (SUROGATE_INKLING_ATTN_L2AHEAD, default 4; 0 = off)
+    int pdl_trigger; // trigger dependents at entry (SUROGATE_INKLING_ATTN_PDL_TRIGGER, default 1)
 };
 
 __device__ __forceinline__ unsigned word_or_zero(const __nv_bfloat16* p, bool ok) {
@@ -182,7 +183,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     pdl::wait_for_dependencies();
     // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch now;
     // they read nothing of ours before their wait, which waits for this grid to finish.
-    pdl::trigger_dependents();
+    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -610,8 +611,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         };
         Cursor pf;
         start(pf, g_start);
-#pragma unroll
-        for (int i = 0; i < kL2Ahead; ++i) {
+        for (int i = 0; i < p.l2_ahead; ++i) {
             if (pf.g < g_stop) {
                 prefetch_block_l2(pf.kb);
                 advance(pf);
@@ -622,7 +622,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             advance(ld);
         }
         while (cu.g < g_stop) {
-            if (pf.g < g_stop) {
+            if (p.l2_ahead > 0 && pf.g < g_stop) {
                 prefetch_block_l2(pf.kb);
                 advance(pf);
             }
@@ -657,8 +657,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             cp_commit();
         }
         Cursor pf = ld;
-#pragma unroll
-        for (int i = 0; i + 1 < kL2Ahead; ++i) {
+        for (int i = 0; i + 1 < p.l2_ahead; ++i) {
             if (pf.g < g_stop) {
                 prefetch_block_l2(pf.kb);
                 advance(pf);
@@ -666,7 +665,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         }
         int it = 0;
         while (cu.g < g_stop) {
-            if (pf.g < g_stop) {
+            if (p.l2_ahead > 0 && pf.g < g_stop) {
                 prefetch_block_l2(pf.kb);
                 advance(pf);
             }
@@ -739,7 +738,7 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     extern __shared__ float fold_smem[]; // [4][max_slots]: m, l, a, c
     __shared__ float seg_max[128];
     pdl::wait_for_dependencies();
-    pdl::trigger_dependents(); // as in rel_attention_kernel
+    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); } // as in rel_attention_kernel
     const std::int64_t n         = blockIdx.x;
     const int h                  = static_cast<int>(blockIdx.y);
     const int d                  = static_cast<int>(threadIdx.x);
@@ -1036,7 +1035,9 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.qk_scale_log2   = scale * kLog2e;
     // Default 17 = bias added unfused (s + bf16(b) * log2e) and lse with the accurate log2f: decided against lane
     // a's capture of vLLM's own sm_120 prefill kernel (M3 run 2). The env override remains for the experiment.
-    p.variant = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17) & (1 | 8 | 16 | 32);
+    p.variant     = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17) & (1 | 8 | 16 | 32);
+    p.l2_ahead    = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", 4), 0, 16);
+    p.pdl_trigger = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0 ? 1 : 0;
     return p;
 }
 
