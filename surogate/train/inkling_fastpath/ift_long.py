@@ -44,7 +44,7 @@ class TokenChunked(torch.autograd.Function):
     parameter gradients are summed over chunks."""
 
     @staticmethod
-    def forward(ctx, fn, tdims_in, tdims_out, n_tok, chunk, store_bf16, vals, *inputs):
+    def forward(ctx, fn, tdims_in, tdims_out, n_tok, chunk, store_bf16, vals, sinks, *inputs):
         T = inputs[0].shape[tdims_in[0]]
         parts = None
         dev = inputs[0].device
@@ -69,6 +69,7 @@ class TokenChunked(torch.autograd.Function):
         ctx.fn, ctx.tdi, ctx.tdo, ctx.n_tok, ctx.chunk = fn, tdims_in, tdims_out, n_tok, chunk
         ctx.in_dtypes = [x.dtype for x in inputs]
         ctx.vals = vals
+        ctx.sinks = sinks or (None,) * n_tok
         keep = [x if i >= n_tok else (None if vals[i] is not None else (x.detach().to(BF16) if store_bf16[i] else x))
                 for i, x in enumerate(inputs)]
         ctx.offload = T >= OFFLOAD_MIN
@@ -113,13 +114,15 @@ class TokenChunked(torch.autograd.Function):
             return x.float() if (x.dtype == BF16 and ctx.in_dtypes[i] == F32) else x
         params = [p.detach().requires_grad_(bool(need[n_tok + i]) and p.is_floating_point())
                   for i, p in enumerate(params_saved)]
+        sinks = ctx.sinks
         gin = [torch.zeros(toks[i].shape, dtype=F32, device=dev)
-               if (need[i] and (toks[i].is_floating_point())) else None for i in range(n_tok)]
+               if (need[i] and sinks[i] is None and toks[i].is_floating_point()) else None for i in range(n_tok)]
         pgr = [None] * len(params)
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
             with torch.enable_grad(), torch.device(dev):
-                ins = [chunk_of(i, c0, n).detach().requires_grad_(gin[i] is not None) for i in range(n_tok)]
+                ins = [chunk_of(i, c0, n).detach().requires_grad_(gin[i] is not None or sinks[i] is not None)
+                       for i in range(n_tok)]
                 o = ctx.fn(*ins, *params)
                 o = o if isinstance(o, tuple) else (o,)
                 outs, grads_o = [], []
@@ -135,7 +138,11 @@ class TokenChunked(torch.autograd.Function):
             for i, t in enumerate(ins):
                 if t.requires_grad:
                     g = next(it)
-                    if g is not None:
+                    if g is None:
+                        continue
+                    if sinks[i] is not None:  # straight into the caller's accumulator (card or host)
+                        sinks[i].narrow(tdi[i], c0, n).add_(g.to(sinks[i].device))
+                    else:
                         gin[i].narrow(tdi[i], c0, n).copy_(g)
             for i, p in enumerate(params):
                 if p.requires_grad:
@@ -144,15 +151,17 @@ class TokenChunked(torch.autograd.Function):
                         pgr[i] = g if pgr[i] is None else pgr[i] + g
         res = [None if g is None else g.to(ctx.in_dtypes[i]) for i, g in enumerate(gin)]
         res += [None if g is None else g.to(ctx.in_dtypes[n_tok + i]) for i, g in enumerate(pgr)]
-        return (None, None, None, None, None, None, None, *res)
+        return (None, None, None, None, None, None, None, None, *res)
 
 
-def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None, vals=None):
+def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None, vals=None, sinks=None):
     """vals: per token input, None or a (host) tensor holding its VALUES; the input itself is then only a graph node
-    (a zero placeholder leaf) that receives the gradient."""
+    (a zero placeholder). sinks: per token input, None or an fp32 accumulator (card or host) that receives the input's
+    gradient chunk by chunk (the input then gets None from autograd)."""
     store = store_bf16 if store_bf16 is not None else [False] * len(tok)
     return TokenChunked.apply(fn, tuple(tdims_in), tuple(tdims_out), len(tok), chunk or CHUNK, tuple(store),
-                              tuple(vals) if vals is not None else None, *tok, *params)
+                              tuple(vals) if vals is not None else None, tuple(sinks) if sinks is not None else None,
+                              *tok, *params)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -248,7 +257,8 @@ class _Shift:
 # ---------------------------------------------------------------------------------------------------------------
 # a visit's recompute, staged
 # ---------------------------------------------------------------------------------------------------------------
-def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chunk=None, act_vals=None):
+def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chunk=None, act_vals=None,
+                     act_sinks=None):
     """Same function as B.visit_torch (new partial [T, D] fp32), built from token-chunked stages. act_vals: host
     values of (stack..., partial, bank...) when the passed tensors are zero placeholders (graph nodes only)."""
     L = W.layers[vi.layer]
@@ -316,8 +326,10 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
     with B._tick("fwd.ain_proj"):
         tok = act + ([tau] if tau is not None else [])
         tvals = (list(act_vals) + [None] * (len(tok) - len(act))) if act_vals is not None else None
+        tsinks = (list(act_sinks) + [None] * (len(tok) - len(act))) if act_sinks is not None else None
         pr = tc(f_ain_proj, tok, [0] * len(tok), [0] * (8 if not L.is_local else 6),
-                store_bf16=[True] * len(act) + [False] * (len(tok) - len(act)), chunk=chunk, vals=tvals)
+                store_bf16=[True] * len(act) + [False] * (len(tok) - len(act)), chunk=chunk, vals=tvals,
+                sinks=tsinks)
     q_out, r_out, gate, sink, k_raw, v_raw = pr[:6]
     # 3. K / V causal convs + clip / norm (full T)
     with B._tick("fwd.kv"):
@@ -373,17 +385,25 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
 
     with B._tick("fwd.moe"):
         tok = list(stack) + [partial, attn_out] + (list(bank) if has_bank else []) + [ids]
-        mvals = None
+        mvals = msinks = None
         if act_vals is not None:
             mvals = list(act_vals[:n + 1]) + [None] + list(act_vals[n + 1:]) + [None]
+        if act_sinks is not None:
+            msinks = list(act_sinks[:n + 1]) + [None] + list(act_sinks[n + 1:]) + [None]
         moe_out = tc(f_moe, tok, [0] * len(tok), [0], params=lt,
                      store_bf16=[True] * (n + 1) + [True] + ([True, True] if has_bank else []) + [False], chunk=chunk,
-                     vals=mvals)
+                     vals=mvals, sinks=msinks)
     # 8. MLP-output conv (full T)
     with B._tick("fwd.out_conv"):
         res_ = None
-        if not first:  # the partial's value (+ its graph node: a zero placeholder when the value is on the host)
-            res_ = partial.float() if act_vals is None else partial + act_vals[n].to(partial.device).float()
+        if not first:  # the partial's value (+ its graph node: a zero placeholder when the value is on the host;
+            # with sinks the caller adds the output gradient to the partial's sink itself: d residual = d out, STE)
+            if act_vals is None:
+                res_ = partial.float()
+            elif act_sinks is not None:
+                res_ = act_vals[n].to(partial.device).float()
+            else:
+                res_ = partial + act_vals[n].to(partial.device).float()
         new_partial, _ = RA.inkling_short_conv(moe_out, L.mlp_sconv, None, addend=attn_out, residual=res_)
     return new_partial
 
@@ -574,17 +594,16 @@ class LongModel(torch.autograd.Function):
             host_vals[v] = vals["outs"][v]
         acc_dev, acc_host = {}, {}
 
-        def add_grad(p, gr, next_v):
-            if p < 0 or gr is None:
-                return
-            if p == next_v:  # consumed by the very next iteration: keep it on the card
-                acc_dev[p] = gr if p not in acc_dev else acc_dev[p].add_(gr)
-            else:
-                h = gr.to("cpu")
-                if p in acc_host:
-                    acc_host[p].add_(h)
-                else:
-                    acc_host[p] = h
+        def sink_for(p, next_v):
+            if p < 0:
+                return None
+            if p == next_v:
+                if p not in acc_dev:
+                    acc_dev[p] = torch.zeros(T, D, dtype=F32, device=dev)
+                return acc_dev[p]
+            if p not in acc_host:
+                acc_host[p] = torch.zeros(T, D, dtype=F32, device="cpu", pin_memory=True)
+            return acc_host[p]
 
         # head + final mix
         with B._tick("bwd.head"):
@@ -594,21 +613,18 @@ class LongModel(torch.autograd.Function):
             del hid
         fin_slots = (0, 1, 2, 3, 6)
         fin_prod = [last[s] for s in fin_slots]
+        dummy = torch.zeros(1, dtype=F32, device=dev, requires_grad=True)
 
-        def f_mix(a, b, c, d, e):
+        def f_mix(a, b, c, d, e, dm):
             return RA.inkling_attn_res([a.float(), b.float(), c.float(), d.float()], e.float(), None, W.q_out,
-                                       W.final_norm.reshape(1, D), EPS)[0]
+                                       W.final_norm.reshape(1, D), EPS)[0] + 0.0 * dm
 
         with torch.enable_grad(), torch.device(dev):
-            ph = [torch.zeros(1, dtype=F32, device=dev).expand(T, D).requires_grad_(p >= 0) for p in fin_prod]
-            hm = tc(f_mix, ph, [0] * 5, [0], store_bf16=[True] * 5, vals=[host_vals[p] for p in fin_prod])
-            want = [t for t in ph if t.requires_grad]
-            gr = torch.autograd.grad(hm, want, g_hid)
-        it = iter(gr)
-        for p, t in zip(fin_prod, ph):
-            if t.requires_grad:
-                add_grad(p, next(it), len(visits) - 1)
-        del g_hid, hm, ph, gr
+            ph = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in fin_prod]
+            hm = tc(f_mix, ph, [0] * 5, [0], params=[dummy], store_bf16=[True] * 5,
+                    vals=[host_vals[p] for p in fin_prod], sinks=[sink_for(p, len(visits) - 1) for p in fin_prod])
+            torch.autograd.grad(hm, [dummy], g_hid)
+        del g_hid, hm, ph
         # visits, last to first
         for v in range(len(visits) - 1, -1, -1):
             vi = visits[v]
@@ -620,23 +636,20 @@ class LongModel(torch.autograd.Function):
                 continue
             ps = prod[v]
             lt = list(lt_all[vi.layer * nl:(vi.layer + 1) * nl]) if ctx.scale is not None else []
+            n = len(vi.stack)
+            sinks = [sink_for(p, v - 1) for p in ps]
             with torch.enable_grad(), torch.device(dev):
-                ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D).requires_grad_(p >= 0) for p in ps]
+                ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in ps]
                 leaves = [t.detach().requires_grad_() for t in lt]
-                n = len(vi.stack)
                 lora = dict(zip(B.LORA_KEYS, leaves)) | {"scale": ctx.scale} if ctx.scale is not None else None
                 out = visit_torch_long(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
-                                       vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps])
-                want = [t for t in ins + leaves if t.requires_grad]
+                                       vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps], act_sinks=sinks)
                 with B._tick("bwd.autograd"):
-                    gr = torch.autograd.grad(out, want, g_out, allow_unused=True)
+                    gr = torch.autograd.grad(out, leaves, g_out, allow_unused=True)
+            if not vi.first and sinks[n] is not None:  # the MLP-output conv's residual: d partial += d out (STE)
+                sinks[n].add_(g_out.to(sinks[n].device))
             del out, g_out
-            it = iter(gr)
-            for p, t in zip(ps, ins):
-                if t.requires_grad:
-                    add_grad(p, next(it), v - 1)
-            for j, t in enumerate(leaves):
-                gj = next(it)
+            for j, gj in enumerate(gr):
                 if gj is None:
                     continue
                 k = vi.layer * nl + j
