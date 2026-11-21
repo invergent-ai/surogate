@@ -85,6 +85,22 @@ int compare_exact(const std::string& label, const std::vector<float>& got, const
 
 constexpr double kBf16Rel = 1.0 / 128.0; // one bf16 ulp at the bottom of a binade
 
+/// |got - ref| <= limit[i] for every element (a limit per element: see test_attn_res).
+int compare_limits(const std::string& label, const std::vector<float>& got, const std::vector<double>& ref,
+                   const std::vector<double>& limit) {
+    double worst = 0.0;
+    std::size_t at = 0, bad = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const double err   = std::fabs(static_cast<double>(got[i]) - ref[i]);
+        if (!(err <= limit[i])) { ++bad; }
+        const double ratio = err / limit[i];
+        if (!(ratio <= worst)) { worst = ratio; at = i; }
+    }
+    std::cout << (bad ? "FAIL " : "ok   ") << label << ": worst err/limit " << worst << " at " << at
+              << " (got " << got[at] << " ref " << ref[at] << "), " << bad << " over\n";
+    return bad ? 1 : 0;
+}
+
 // ------------------------------------------------------------------------------------- T1 embed
 
 int test_embed() {
@@ -191,7 +207,12 @@ int test_attn_res(const AttnResCase& c, std::uint32_t seed) {
     ops::inkling_attn_res(s, T, q_t, c.norm ? &w_t : nullptr, 1e-6F, out_t, nullptr);
     cuda_synchronize();
     std::vector<float> got = c.norm ? host_bf16(d_out.p, out_n) : from_device<float>(d_out.p, out_n);
-    std::vector<double> ref(out_n);
+    std::vector<double> ref(out_n), limit(out_n);
+    // The kernel sums the N mix terms in fp32: where they cancel (|mix| << sum |term|) its value carries an absolute
+    // error of a few fp32 ulps of the terms, which no relative bf16 bound on |ref| covers (5 of 592k elements at
+    // T = 257 in session 1, 10:30). Limit = the output's own rounding (1 bf16 ulp, or the fp32 bound) + 8 fp32 ulps
+    // of sum |term|, carried through the norm.
+    constexpr double kF32Ulp = 1.0 / 16777216.0;
     for (int t = 0; t < T; ++t) {
         std::vector<double> rstd(N);
         for (int n = 0; n < N; ++n) {
@@ -217,23 +238,27 @@ int test_attn_res(const AttnResCase& c, std::uint32_t seed) {
             double tot = 0;
             std::vector<double> p(N);
             for (int n = 0; n < N; ++n) { tot += (p[n] = std::exp(logit[n] - mx)); }
-            std::vector<double> mix(kD, 0.0);
+            std::vector<double> mix(kD, 0.0), mag(kD, 0.0);
             for (int n = 0; n < N; ++n) {
                 for (int d = 0; d < kD; ++d) {
-                    mix[d] += p[n] / tot * rstd[n] * src[n][static_cast<std::size_t>(t) * kD + d];
+                    const double term = p[n] / tot * rstd[n] * src[n][static_cast<std::size_t>(t) * kD + d];
+                    mix[d] += term;
+                    mag[d] += std::fabs(term);
                 }
             }
             double ss = 0;
             for (double m : mix) { ss += m * m; }
             const double orstd = 1.0 / std::sqrt(ss / kD + 1e-6);
             for (int d = 0; d < kD; ++d) {
-                ref[(static_cast<std::size_t>(qq) * T + t) * kD + d] =
-                    c.norm ? mix[d] * orstd * w[static_cast<std::size_t>(qq) * kD + d] : mix[d];
+                const std::size_t i = (static_cast<std::size_t>(qq) * T + t) * kD + d;
+                const double wd     = w[static_cast<std::size_t>(qq) * kD + d];
+                ref[i]              = c.norm ? mix[d] * orstd * wd : mix[d];
+                const double floor  = 8.0 * kF32Ulp * mag[d] * (c.norm ? orstd * std::fabs(wd) : 1.0);
+                limit[i] = (c.norm ? 1e-30 + kBf16Rel * std::fabs(ref[i]) : 2e-6 + 3e-5 * std::fabs(ref[i])) + floor;
             }
         }
     }
-    return compare(std::string("T2 inkling_attn_res ") + c.name, got, ref, c.norm ? 1e-30 : 2e-6,
-                   c.norm ? kBf16Rel : 3e-5);
+    return compare_limits(std::string("T2 inkling_attn_res ") + c.name, got, ref, limit);
 }
 
 // ------------------------------------------------------------------------- T3 pair / blend norms

@@ -102,7 +102,8 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
-    frontend = family::take_frontend_resources(backing, plan.plan.frontend);
+    // Lane b binds the text-only set (no pixel configs): take exactly that set.
+    frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
     weights  = load::load_weights(plan.plan, backing);
     derive_queries(weights.globals, queries);
     model.weights = &weights;
