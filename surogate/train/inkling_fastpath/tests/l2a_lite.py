@@ -9,6 +9,8 @@ last section; config agreed with agent-EN-L 18:4x):
             lane T's long-row LEVEL-0 path (S2)
   evaluate  steps 0 / 5 / ... / 25: the engine's W4A4 free-routing forward + head log-prob with the adapter (ONE
             evaluator throughout), per-window NLL sums / counts of all 256 + 64 windows
+  adapter   (LANE-RULES 22) the masters at every evaluation as the engine's BF16 PEFT adapter, <out>/adapter_latest + its sha in
+            the JSON ("adapters"); needs surogate.inkling_rl on PYTHONPATH (checked at the start); --no-save-adapter = off
   output    run_2a's JSON format (lanes/L/rig/analyze_2a.py) + the step-1 gradient of batch 1 (per-tensor norms per
             layer, 16-expert slices of layers 0 / 5 / 13 / 20 / 23) for lane L's cosine vs the rig
 Usage: python l2a_lite.py --bin B --artifact A --data data_2a.pt --lr 5e-5 --out DIR [--steps 25] [--eval-every 5]
@@ -20,6 +22,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import sys
 import time
 
@@ -80,6 +83,20 @@ def evaluate(eng, banks, data):
     return out
 
 
+def save_adapter(lora, out_dir, step, lr):
+    """LANE-RULES 22: the current masters as the engine's PEFT adapter (BF16 = what the engine's bank fold reads), written
+    to a temporary directory and renamed, so a stop never leaves a half-written adapter. Returns the safetensors sha256."""
+    from surogate.inkling_rl import adapter as AD
+
+    layers = [{k: lo[k].detach().cpu().numpy() for k in B.LORA_KEYS} for lo in lora]
+    tmp = out_dir + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    sha = AD.export_adapter(layers, tmp, B.RANK, int(B.ALPHA), "BF16", metadata={"step": str(step), "lr": f"{lr:g}"})
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.replace(tmp, out_dir)
+    return sha
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -91,8 +108,11 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--no-save-adapter", action="store_true", help="LANE-RULES 22: say so in the pre-registration")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    if not a.no_save_adapter:
+        from surogate.inkling_rl import adapter as _  # noqa: F401  (fail here, not after the run)
     data = torch.load(a.data, weights_only=False)
     eng = InklingEngine(a.bin, a.artifact, 0)
     W = B.EngineWeights(eng)
@@ -104,7 +124,7 @@ def main():
     out_f = os.path.join(a.out, f"run_2a_lr{a.lr:g}.json")
     rec = {"args": vars(a) | {"trainer": "lane T engine-op (forward = engine, LEVEL-0 S2 backward)",
                               "chunk": LG.CHUNK, "moe_gm": LG.MOE_GM, "fast_gemm": LG.FAST_GEMM, "tf32": LG.TF32},
-           "evals": {}, "steps": []}
+           "evals": {}, "steps": [], "adapters": {}}
     rng = random.Random(a.seed)
     perm = []
 
@@ -154,6 +174,9 @@ def main():
             rec["evals"][str(step)] = evaluate(eng, banks, data)
             log(f"step {step} eval: train {rec['evals'][str(step)]['train']['nll']:.4f} heldout "
                 f"{rec['evals'][str(step)]['heldout']['nll']:.4f} ({time.time() - t1:.0f}s)")
+            if not a.no_save_adapter:  # the adapter of this evaluation (latest only; 0.8 GB)
+                rec["adapters"] = {str(step): save_adapter(lora, os.path.join(a.out, "adapter_latest"), step, a.lr)}
+                log(f"step {step}: adapter saved, sha {rec['adapters'][str(step)][:16]}")
         save()
     rec["done"] = True
     save()
