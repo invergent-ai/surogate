@@ -251,6 +251,32 @@ class Shim:
             shutil.rmtree(path, ignore_errors=True)
         log(f"Saving checkpoint at step {step}... done ({final})")
 
+    def noise_dump(self, step: int) -> None:
+        """The gated start's S6 dump (the kit's run/grpo_train_noise_dump.py contract): with env NOISE_DUMP_DIR, after each optimizer step in
+        NOISE_DUMP_STEPS (default "0 1") write <dir>/step_<k>/lora_optimizer.rank0.safetensors holding `lora_adamw.state1` = the fp32
+        AdamW first moment m of every master, concatenated in the optimizer's order (per layer A13, B13, A2, B2, each flattened in C
+        order), then a DONE marker. Outside the run's checkpoint dir; a step already DONE is not dumped again (a trainer restart).
+        tools/si/si_noise_check.py recovers g0 = m0 / (1 - b1), g1 = (m1 - b1 m0) / (1 - b1), given Inkling's geometry as arguments
+        (plan [24], mods gate_up / down): its defaults are W's and refuse this layout (verdict GEOMETRY)."""
+        d = os.environ.get("NOISE_DUMP_DIR")
+        if not d or step not in {int(x) for x in os.environ.get("NOISE_DUMP_STEPS", "0 1").split()}:
+            return
+        out = os.path.join(d, f"step_{step:08d}")
+        done = os.path.join(out, "DONE")
+        if os.path.exists(done):
+            return
+        os.makedirs(out, exist_ok=True)
+        parts = []
+        for master in self.opt.masters:
+            st = self.opt.opt.state.get(master) or {}
+            parts.append(st["exp_avg"].numpy().ravel() if "exp_avg" in st else np.zeros(master.numel(), np.float32))
+        AD.write_safetensors(os.path.join(out, "lora_optimizer.rank0.safetensors"),
+                             {"lora_adamw.state1": ("F32", np.concatenate(parts).astype(np.float32))},
+                             metadata={"step": step, "engine_release_sha": self.engine_sha})
+        with open(done, "w") as f:
+            f.write(f"noise dump after optimizer step {step}\n")
+        log(f"noise dump after optimizer step {step}: {out}")
+
     def wait_batch(self, n: int) -> str | None:
         path = os.path.join(self.run_dir, "rollouts", f"step_{n}", "rollouts.bin")
         t0 = time.time()
@@ -310,6 +336,7 @@ class Shim:
                     entry[f"train/{k}"] = float(v)
             with open(self.metrics_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+            self.noise_dump(step)
             if self.save_steps > 0 and step > 0 and step % self.save_steps == 0:
                 self.checkpoint(step)
             step += 1
