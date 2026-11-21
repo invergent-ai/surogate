@@ -45,6 +45,11 @@ class TokenChunked(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, fn, tdims_in, tdims_out, n_tok, chunk, store_bf16, vals, sinks, *inputs):
+        # with sinks, the LAST input is a zero-size dummy leaf (tc() makes it): it ties this node into the graph and
+        # the caller lists it among autograd.grad's inputs, so the backward runs and fills the sinks
+        nd = 1 if sinks is not None else 0
+        ctx.nd = nd
+        inputs = inputs[:len(inputs) - nd]
         T = inputs[0].shape[tdims_in[0]]
         parts = None
         dev = inputs[0].device
@@ -151,7 +156,7 @@ class TokenChunked(torch.autograd.Function):
                         pgr[i] = g if pgr[i] is None else pgr[i] + g
         res = [None if g is None else g.to(ctx.in_dtypes[i]) for i, g in enumerate(gin)]
         res += [None if g is None else g.to(ctx.in_dtypes[n_tok + i]) for i, g in enumerate(pgr)]
-        return (None, None, None, None, None, None, None, None, *res)
+        return (None, None, None, None, None, None, None, None, *res, *([None] * ctx.nd))
 
 
 def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None, vals=None, sinks=None):
@@ -159,9 +164,21 @@ def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None, val
     (a zero placeholder). sinks: per token input, None or an fp32 accumulator (card or host) that receives the input's
     gradient chunk by chunk (the input then gets None from autograd)."""
     store = store_bf16 if store_bf16 is not None else [False] * len(tok)
+    extra = ()
+    if sinks is not None:
+        if any(x is not None for x in sinks):
+            d = torch.zeros(0, dtype=F32, device=tok[0].device, requires_grad=True)
+            SINK_DUMMIES.append(d)
+            extra = (d,)
+        else:
+            sinks = None
     return TokenChunked.apply(fn, tuple(tdims_in), tuple(tdims_out), len(tok), chunk or CHUNK, tuple(store),
                               tuple(vals) if vals is not None else None, tuple(sinks) if sinks is not None else None,
-                              *tok, *params)
+                              *tok, *params, *extra)
+
+
+# the dummy leaves of the sink-carrying TokenChunked nodes built since the last clear (see tc)
+SINK_DUMMIES = []
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -613,17 +630,17 @@ class LongModel(torch.autograd.Function):
             del hid
         fin_slots = (0, 1, 2, 3, 6)
         fin_prod = [last[s] for s in fin_slots]
-        dummy = torch.zeros(1, dtype=F32, device=dev, requires_grad=True)
-
-        def f_mix(a, b, c, d, e, dm):
+        def f_mix(a, b, c, d, e):
             return RA.inkling_attn_res([a.float(), b.float(), c.float(), d.float()], e.float(), None, W.q_out,
-                                       W.final_norm.reshape(1, D), EPS)[0] + 0.0 * dm
+                                       W.final_norm.reshape(1, D), EPS)[0]
 
         with torch.enable_grad(), torch.device(dev):
             ph = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in fin_prod]
-            hm = tc(f_mix, ph, [0] * 5, [0], params=[dummy], store_bf16=[True] * 5,
+            SINK_DUMMIES.clear()
+            hm = tc(f_mix, ph, [0] * 5, [0], store_bf16=[True] * 5,
                     vals=[host_vals[p] for p in fin_prod], sinks=[sink_for(p, len(visits) - 1) for p in fin_prod])
-            torch.autograd.grad(hm, [dummy], g_hid)
+            torch.autograd.grad(hm, list(SINK_DUMMIES), g_hid, allow_unused=True)
+            SINK_DUMMIES.clear()
         del g_hid, hm, ph
         # visits, last to first
         for v in range(len(visits) - 1, -1, -1):
@@ -642,10 +659,13 @@ class LongModel(torch.autograd.Function):
                 ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in ps]
                 leaves = [t.detach().requires_grad_() for t in lt]
                 lora = dict(zip(B.LORA_KEYS, leaves)) | {"scale": ctx.scale} if ctx.scale is not None else None
+                SINK_DUMMIES.clear()
                 out = visit_torch_long(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
                                        vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps], act_sinks=sinks)
                 with B._tick("bwd.autograd"):
-                    gr = torch.autograd.grad(out, leaves, g_out, allow_unused=True)
+                    gr = torch.autograd.grad(out, leaves + list(SINK_DUMMIES), g_out, allow_unused=True)
+                gr = gr[:len(leaves)]
+                SINK_DUMMIES.clear()
             if not vi.first and sinks[n] is not None:  # the MLP-output conv's residual: d partial += d out (STE)
                 sinks[n].add_(g_out.to(sinks[n].device))
             del out, g_out
