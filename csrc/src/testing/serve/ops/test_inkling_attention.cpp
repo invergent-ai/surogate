@@ -1212,6 +1212,7 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
     exact("state", dstate, state_ref);
     if (c.mode == ops::InklingConvMode::Record) { exact("records", drec, rec_ref); }
 
+    const std::size_t sn0 = static_cast<std::size_t>(N);
     if (c.fused) {
         // The attention part on its own: rerun the prologue op alone on the original state and plane (it must
         // write the same KV and state as the fused call: determinism), then feed the FP64 attention oracle the
@@ -1263,7 +1264,7 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
         ops::InklingConvStateArgs conv3 = conv;
         conv3.states = Tensor(dstate3.p, DType::BF16, {kC, 3, S});
         if (c.mode == ops::InklingConvMode::Record) { conv3.records = Tensor(drec3.p, DType::BF16, {kC, Wmax, c.B}); }
-        const std::size_t sn = static_cast<std::size_t>(N);
+        const std::size_t sn = sn0;
         DeviceBuffer tq(sn * 3072 * 2), tr(sn * 384 * 2), ttau(sn * 4), to(sn * 3072 * 4), tl(sn * 24 * 4), ty(sn * 3072 * 2),
             ro(sn * 3072 * 4), rl(sn * 24 * 4);
         ops::InklingAttentionTrainOutputs tro;
@@ -1274,6 +1275,33 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
         tro.lse = Tensor(tl.p, DType::FP32, {24, N});
         Tensor tyt(ty.p, DType::BF16, {3072, N}), rot(ro.p, DType::FP32, {128, 24, N}), rlt(rl.p, DType::FP32, {24, N});
         WorkspaceArena work3(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope, view.key_groups) + 4096);
+        // The fused call again with the persistent state (W = 1 InPlace: in-kernel prologue, no zeroing launch) and with
+        // the separate prologue (knob off), each on a fresh copy of the original plane / state: out, KV, slot == the
+        // default call's, bitwise.
+        for (const int variant : {0, 1}) {
+            Plane plane4(c.B, maxk + 64, 0x7F, seed + 2);
+            plane4.hk = plane_k0;
+            plane4.hv = plane_v0;
+            plane4.upload();
+            DeviceBuffer dstate4 = to_device_bf16(state), drec4 = to_device_bf16(records), dout4(sn0 * 3072 * 2);
+            ops::InklingConvStateArgs conv4 = conv;
+            conv4.states = Tensor(dstate4.p, DType::BF16, {kC, 3, S});
+            if (c.mode == ops::InklingConvMode::Record) { conv4.records = Tensor(drec4.p, DType::BF16, {kC, Wmax, c.B}); }
+            auto view4 = view;
+            if (variant == 0) { view4.state = persistent_state(); } else { ops::inkling_attention_knobs().fused_prologue = false; }
+            WorkspaceArena work4(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope, view.key_groups) + 4096);
+            Tensor out4(dout4.p, DType::BF16, {3072, N});
+            ops::inkling_attention(in, layer.weights(), c.kind, view4, conv4, plane4.view(), work4, out4, nullptr);
+            ops::inkling_attention_knobs().fused_prologue = true;
+            cuda_synchronize();
+            plane4.download();
+            const bool same = from_device<std::uint16_t>(dout4, sn0 * 3072) == from_device<std::uint16_t>(dout, sn0 * 3072) &&
+                              plane4.hk == plane.hk && plane4.hv == plane.hv &&
+                              from_device<std::uint16_t>(dstate4, state.size()) == from_device<std::uint16_t>(dstate, state.size());
+            const char* what = variant == 0 ? "fused call with persistent state" : "fused call, separate prologue";
+            std::printf("%-44s %-8s %s == default call (out, KV, slot): %s\n", c.name.c_str(), "route", what, same ? "yes" : "NO");
+            check(same, c.name + " " + what);
+        }
         auto view_state  = view; // the training call takes its fold counters from the persistent state
         view_state.state = persistent_state();
         ops::inkling_attention_train(in, layer.weights(), c.kind, view_state, conv3, plane3.view(), work3, tyt, tro, nullptr);
@@ -2088,6 +2116,7 @@ void bench_fused_call(const char* name, InklingLayerKind kind, int W, int B, int
     for (const auto& rr : rot) {
         views.push_back(rr.view(keys));
         views.back().metadata_static = std::getenv("BENCH_META_STATIC") != nullptr;
+        if (std::getenv("BENCH_STATE") != nullptr) { views.back().state = persistent_state(); }
     }
     WorkspaceArena work(ops::inkling_attention_workspace_capacity_bytes(kind, B, W, W, views[0].envelope, views[0].key_groups) + 4096);
     DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2);
@@ -2122,15 +2151,34 @@ void run_bench_fold() {
             bench_attention(nm("verify W8 local 1x8k"), K::Local, 8, 1, 8184);
             bench_attention(nm("verify W8 global 1x64k"), K::Global, 8, 1, 65528);
             bench_attention(nm("verify W8 global 8x8k"), K::Global, 8, 8, 8184);
-            bench_fused_call(nm("call decode global 1x8k"), K::Global, 1, 1, 8191);
-            bench_fused_call(nm("call decode local 1x8k"), K::Local, 1, 1, 8191);
-            bench_fused_call(nm("call decode global 8x8k"), K::Global, 1, 8, 8191);
-            bench_fused_call(nm("call decode local 8x8k"), K::Local, 1, 8, 8191);
-            bench_fused_call(nm("call verify W8 local 1x8k"), K::Local, 8, 1, 8184);
         }
     }
+    // The engine's fused call (prologue + attention): separate prologue + fold_kernel (the old shape), separate
+    // prologue + fused fold, in-kernel prologue + fused fold with the persistent state, in-kernel + a zeroing launch.
+    setenv("BENCH_META_STATIC", "1", 1);
+    struct Mode {
+        const char* tag;
+        int fold_max;
+        bool pro, state;
+    };
+    const Mode modes[4] = {{"[sep prologue, fold kernel]", 0, false, false}, {"[sep prologue, fused fold]", 1 << 30, false, false},
+                           {"[in-kernel prologue, state]", 1 << 30, true, true}, {"[in-kernel prologue, zeroing]", 1 << 30, true, false}};
+    for (const Mode& m : modes) {
+        ops::inkling_attention_knobs().fused_fold_max = m.fold_max;
+        ops::inkling_attention_knobs().fused_prologue = m.pro;
+        if (m.state) { setenv("BENCH_STATE", "1", 1); } else { unsetenv("BENCH_STATE"); }
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + " " + m.tag; return x.c_str(); };
+        bench_fused_call(nm("call decode global 1x8k"), K::Global, 1, 1, 8191);
+        bench_fused_call(nm("call decode local 1x8k"), K::Local, 1, 1, 8191);
+        bench_fused_call(nm("call decode global 8x8k"), K::Global, 1, 8, 8191);
+        bench_fused_call(nm("call decode local 8x8k"), K::Local, 1, 8, 8191);
+        bench_fused_call(nm("call decode global 1x64k"), K::Global, 1, 1, 65535);
+        bench_fused_call(nm("call verify W8 local 1x8k"), K::Local, 8, 1, 8184);
+    }
+    unsetenv("BENCH_STATE");
     unsetenv("BENCH_META_STATIC");
     ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
+    ops::inkling_attention_knobs().fused_prologue = true;
     // Narrow attn_linear: one-warp-per-tile (split 0) vs cell-split (split 1).
     for (const int split : {0, 1}) {
         ops::inkling_attention_knobs().linear_split = split != 0;

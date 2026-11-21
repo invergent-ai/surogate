@@ -165,6 +165,10 @@ struct InklingAttentionKnobs {
     // inkling_attn_linear, N <= 16: the cell-split narrow kernel (a row tile's cells over several warps, joined in cell
     // order; SUROGATE_INKLING_LINEAR_SPLIT=0 = the one-warp-per-tile narrow kernel). Same bits either way.
     bool linear_split = true;
+    // inkling_attention (the fused call) on plain decode rows (W = 1, InPlace, no capture): the decode attention kernel
+    // runs the prologue itself -- q / r per CTA, the K / V conv by the CTA owning the new key -- instead of a prologue
+    // launch (SUROGATE_INKLING_ATTN_FUSED_PROLOGUE=0 = the separate prologue). Same bits either way.
+    bool fused_prologue = true;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
