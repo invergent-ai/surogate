@@ -36,6 +36,11 @@ import time as _time
 
 PROFILE = {"on": _os.environ.get("IFT_PROFILE", "0") == "1", "t": {}}
 
+# The vendored reference's fma runs through fp64 (an exactly rounded fused op on the CPU reference); its autograd keeps
+# fp64 copies of both operands per source (2 x 8 B x Q x T x D per AttnRes source: ~3 GB per visit at 3k tokens).
+# The recompute only feeds the gradient, so an fp32 addcmul (one rounding off at most) is used instead.
+RA.fma = lambda a, b, c: torch.addcmul(c.float(), a.float(), b.float())
+
 
 class _tick:
     """IFT_PROFILE=1: accumulated wall time per named section (synchronising; profiling runs only)."""
@@ -249,6 +254,99 @@ def moe_vec(x, w, ids, lora=None):
 # ---------------------------------------------------------------------------------------------------------------
 # one visit in torch, cut exactly as the engine's forward.cpp::run_visit (inputs at the start, partial at the end)
 # ---------------------------------------------------------------------------------------------------------------
+def _rel_scores(q, k, rel, b0, b1, k0, window, scale):
+    """Scores of query rows [b0, b1) against keys [k0, b1) as lane L's inkling_rel_attention forms them:
+    [Hk, G, nq, K] fp32 (masked -inf), plus the distance index and the bias-validity mask for d_rel."""
+    nq = b1 - b0
+    hq, dh = q.shape[1], q.shape[2]
+    hk = k.shape[1]
+    g = hq // hk
+    qq = q[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)  # [Hk, G, nq, D]
+    kk = k[k0:b1].permute(1, 0, 2)  # [Hk, K, D]
+    s = torch.einsum("hgbd,hkd->hgbk", qq, kk) * scale
+    dist = torch.arange(b0, b1, device=q.device)[:, None] - torch.arange(k0, b1, device=q.device)[None, :]
+    gi = dist.clamp(0, 1023)
+    rr = rel[b0:b1].permute(1, 0, 2)  # [Hq, nq, E]
+    bias = torch.gather(rr, 2, gi[None].expand(hq, -1, -1))
+    in_band = (dist >= 0) & (dist < 1024)
+    bias = torch.where(in_band, bias, torch.zeros((), dtype=bias.dtype, device=bias.device))
+    s = s + bias.reshape(hk, g, nq, -1)
+    vis = dist >= 0
+    if window > 0:
+        vis &= dist < window
+    s = s.masked_fill(~vis, float("-inf"))
+    return s, gi, in_band & vis
+
+
+class RelAttention(torch.autograd.Function):
+    """lane L's inkling_rel_attention (one segment, positions 0..T-1; exact fp32 softmax) with a flash-style backward:
+    the forward keeps (q, k, v, rel, out, lse) only, the backward recomputes each query block's probabilities from lse.
+    Gradients for q, k, v and rel (the dense relative logits) incl. the lse path (the sink gate reads lse)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, rel, window, q_block=128):
+        T, hq, dh = q.shape
+        hk = k.shape[1]
+        g = hq // hk
+        scale = 128 ** -0.5
+        out = torch.empty(T, hq, dh, dtype=F32, device=q.device)
+        lse = torch.empty(T, hq, dtype=F32, device=q.device)
+        vv = v.permute(1, 0, 2)
+        for b0 in range(0, T, q_block):
+            b1 = min(T, b0 + q_block)
+            k0 = max(0, b0 - window + 1) if window > 0 else 0
+            sc, _, _ = _rel_scores(q, k, rel, b0, b1, k0, window, scale)
+            m = sc.amax(-1, keepdim=True)
+            p = RA.t_exp(sc - m)
+            l = p.sum(-1, keepdim=True)
+            o = torch.einsum("hgbk,hkd->hgbd", p, vv[:, k0:b1]) / l
+            out[b0:b1] = o.permute(2, 0, 1, 3).reshape(b1 - b0, hq, dh)
+            lse[b0:b1] = (m + RA.t_log(l))[..., 0].permute(2, 0, 1).reshape(b1 - b0, hq)
+        ctx.save_for_backward(q, k, v, rel, out, lse)
+        ctx.window, ctx.q_block, ctx.scale = window, q_block, scale
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, dlse):
+        q, k, v, rel, out, lse = ctx.saved_tensors
+        window, qb, scale = ctx.window, ctx.q_block, ctx.scale
+        T, hq, dh = q.shape
+        hk = k.shape[1]
+        g = hq // hk
+        if dout is None:
+            dout = torch.zeros_like(out)
+        if dlse is None:
+            dlse = torch.zeros_like(lse)
+        dq = torch.zeros_like(q)
+        dk = torch.zeros(k.shape, dtype=F32, device=k.device)
+        dv = torch.zeros(v.shape, dtype=F32, device=v.device)
+        drel = torch.zeros(rel.shape, dtype=F32, device=rel.device)
+        vv = v.permute(1, 0, 2)
+        kk = k.permute(1, 0, 2)
+        for b0 in range(0, T, qb):
+            b1 = min(T, b0 + qb)
+            nq = b1 - b0
+            k0 = max(0, b0 - window + 1) if window > 0 else 0
+            sc, gi, valid = _rel_scores(q, k, rel, b0, b1, k0, window, scale)
+            lb = lse[b0:b1].reshape(nq, hk, g).permute(1, 2, 0)[..., None]  # [Hk, G, nq, 1]
+            p = RA.t_exp(sc - lb)
+            do = dout[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)  # [Hk, G, nq, D]
+            ob = out[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
+            dlb = dlse[b0:b1].reshape(nq, hk, g).permute(1, 2, 0)[..., None]
+            dp = torch.einsum("hgbd,hkd->hgbk", do, vv[:, k0:b1])
+            dterm = (do * ob).sum(-1, keepdim=True)
+            ds = p * (dp - dterm + dlb)  # [Hk, G, nq, K]
+            qq = q[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
+            dq[b0:b1] += (torch.einsum("hgbk,hkd->hgbd", ds, kk[:, k0:b1]) * scale).permute(2, 0, 1, 3).reshape(nq, hq, dh)
+            dk[k0:b1] += (torch.einsum("hgbk,hgbd->hkd", ds, qq) * scale).permute(1, 0, 2)
+            dv[k0:b1] += torch.einsum("hgbk,hgbd->hkd", p, do).permute(1, 0, 2)
+            dsr = (ds.reshape(hq, nq, -1) * valid[None]).float()
+            drel_blk = torch.zeros(hq, nq, rel.shape[2], dtype=F32, device=rel.device)
+            drel_blk.scatter_add_(2, gi[None].expand(hq, -1, -1), dsr)
+            drel[b0:b1] += drel_blk.permute(1, 0, 2)
+        return dq, dk, dv, drel, None, None
+
+
 def attention(L, attn_in, pos, tau):
     """lane L's InklingRef._attention for one fresh visit (one chunk, no carried state): [T, 3072] gated output."""
     if L.is_local and attn_in.shape[0] == 1:
@@ -269,7 +367,7 @@ def attention(L, attn_in, pos, tau):
         vc = (L.v_static, RA.rb(RA.mm(xv, L.v_wproj)))
     pro = RA.inkling_attention_prologue(q, r, k, v, L.q_scale, L.r_scale, tau, L.rel_proj, kc, vc, None, None, True)
     window = 1024 if L.is_local else 0
-    out, lse = RA.inkling_rel_attention(pro.q, pro.k.float(), pro.v.float(), pro.rel, pos, pos, window)
+    out, lse = RelAttention.apply(pro.q, pro.k.float(), pro.v.float(), pro.rel.float(), window)
     return RA.inkling_gate_sink(out, lse, gate, sink)
 
 
@@ -394,7 +492,10 @@ class EngineVisit(torch.autograd.Function):
     def forward(ctx, W, vi, ids, n_stack, has_bank, lora_scale, engine_out, *tensors):
         # tensors = stack[0..n_stack-1], partial, [bank0, bank1], A13, B13, A2, B2
         ctx.W, ctx.vi, ctx.ids, ctx.n_stack, ctx.has_bank, ctx.lora_scale = W, vi, ids, n_stack, has_bank, lora_scale
-        ctx.save_for_backward(*tensors)
+        ctx.in_dtypes = [t.dtype for t in tensors]
+        n_act = len(tensors) - (4 if lora_scale is not None else 0)
+        # activations: bf16 copies (their values are bf16: exact, half the bytes); LoRA tensors: as they are
+        ctx.save_for_backward(*[t.detach().to(BF16) if i < n_act else t for i, t in enumerate(tensors)])
         return engine_out.float()
 
     @staticmethod
@@ -402,7 +503,9 @@ class EngineVisit(torch.autograd.Function):
         saved = ctx.saved_tensors
         dev = g.device
         with torch.enable_grad(), torch.device(dev):
-            ins = [t.detach().requires_grad_(t.dtype.is_floating_point) for t in saved]
+            need = ctx.needs_input_grad[7:]
+            ins = [(t.detach().float() if t.dtype == BF16 else t.detach()).requires_grad_(bool(nd))
+                   for t, nd in zip(saved, need)]
             n = ctx.n_stack
             stack, partial = ins[:n], ins[n]
             bank = (ins[n + 1], ins[n + 2]) if ctx.has_bank else None
@@ -415,7 +518,10 @@ class EngineVisit(torch.autograd.Function):
             with _tick("bwd.autograd"):
                 grads = torch.autograd.grad(out, want, g, allow_unused=True)
         it = iter(grads)
-        res = [next(it) if t.requires_grad else None for t in ins]
+        res = []
+        for t, dt in zip(ins, ctx.in_dtypes):
+            gr = next(it) if t.requires_grad else None
+            res.append(None if gr is None else gr.to(dt))
         return (None, None, None, None, None, None, None, *res)
 
 
@@ -436,6 +542,14 @@ class FinalMix(torch.autograd.Function):
         return (None, None, *grads)
 
 
+def _mm_f32(a_bf16, w_bf16):
+    """a [n, K] @ w [m, K]^T, bf16 operands, fp32 accumulate and output (torch out_dtype; fp32 upcast fallback)."""
+    try:
+        return torch.mm(a_bf16, w_bf16.T, out_dtype=F32)
+    except (TypeError, RuntimeError):
+        return a_bf16.float() @ w_bf16.float().T
+
+
 class HeadLogprob(torch.autograd.Function):
     """log p(target | hidden) per row: value = the engine's; gradient = d/dh of log_softmax(30 tanh(W h / 30))[tgt]
     in fp32 over the 200,058 real rows (vocabulary-chunked; nothing of size [N, V] is kept)."""
@@ -449,22 +563,25 @@ class HeadLogprob(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g):
         hidden, targets = ctx.saved_tensors
-        head = ctx.W.head
-        dh = torch.empty(hidden.shape, dtype=F32, device=hidden.device)
-        headf = head.float()  # 1.84 GB transient, once per backward
-        rows = 256
+        head = ctx.W.head  # bf16 [200058, 2304]
+        V = head.shape[0]
+        dh = torch.zeros(hidden.shape, dtype=F32, device=hidden.device)
+        rows, vchunk = 256, 32768
         for a in range(0, hidden.shape[0], rows):
-            h = hidden[a:a + rows].float()
-            raw = h @ headf.T  # [n, V] fp32
+            hb = hidden[a:a + rows].to(BF16)  # bf16 values: exact
+            ga = g[a:a + rows]
+            raw = torch.cat([_mm_f32(hb, head[v0:v0 + vchunk]) for v0 in range(0, V, vchunk)], 1)
             th = torch.tanh(raw / 30.0)
-            z = th * 30.0
-            p = torch.softmax(z, -1)
-            dz = -p * g[a:a + rows, None]
-            dz.scatter_add_(1, targets[a:a + rows].long()[:, None], g[a:a + rows, None])
+            del raw
+            p = torch.softmax(th * 30.0, -1)
+            dz = -p * ga[:, None]
+            del p
+            dz.scatter_add_(1, targets[a:a + rows].long()[:, None], ga[:, None])
             draw = dz * (1.0 - th * th)
-            dh[a:a + rows] = draw @ headf
-            del raw, th, z, p, dz, draw
-        del headf
+            del dz, th
+            for v0 in range(0, V, vchunk):
+                dh[a:a + rows] += draw[:, v0:v0 + vchunk] @ head[v0:v0 + vchunk].float()
+            del draw
         return None, None, dh, None
 
 
