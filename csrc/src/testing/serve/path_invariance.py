@@ -11,8 +11,9 @@ Paths
   decode    prompt P, max_tokens |X| + K: X and Z come from decode rounds (X is P's greedy continuation, so S = P + X)
   verify    as decode, on an engine started with --verify-args (MTP / DFlash): X and Z from verify rounds
   cut@b     prompt S[:b] (max_tokens 1), then S: the suffix prefills from b (a GPU prefix hit = a chunk cut at b)
-  host@b    as cut@b on an engine with a host tier, with one unrelated request per lane in between (they take every
-            lane, the retained one included, so its prefix goes to the host tier); S restores it from there
+  host@b    as cut@b on an engine with a host tier and a KV capacity of --host-capacity tokens, with one long
+            unrelated prompt in between that needs the retained lane's pages: the prefix spills to the host tier and
+            S restores it from there (checked: the engine log must show `reuse=host` for S)
 Exit status 0 iff every path equals the reference bitwise; the JSON report has the per-path detail.
 
 Example (gpubox2, Gemma 3 270M fixture):
@@ -40,10 +41,11 @@ def post(port, path, body, timeout=900):
 
 
 class Engine:
-    def __init__(self, args, tag, extra_args="", lanes=None, host_gb=None):
+    def __init__(self, args, tag, extra_args="", lanes=None, host_gb=None, max_model_len=None):
         self.port = args.port
+        self.log_path = os.path.join(args.workdir, f"engine-{tag}.log")
         cmd = [args.engine, args.artifact, "--port", str(args.port), "--served-model-name", "m",
-               "--max-model-len", str(args.max_model_len), "--max-num-seqs", str(lanes or args.lanes)]
+               "--max-model-len", str(max_model_len or args.max_model_len), "--max-num-seqs", str(lanes or args.lanes)]
         if host_gb is not None:
             cmd += ["--prefix-cache-host-gb", str(host_gb)]
         cmd += shlex.split(args.engine_args) + shlex.split(extra_args)
@@ -52,7 +54,7 @@ class Engine:
         for item in args.env:
             key, _, value = item.partition("=")
             env[key] = value
-        self.log = open(os.path.join(args.workdir, f"engine-{tag}.log"), "w")
+        self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(cmd, env=env, stdout=self.log, stderr=subprocess.STDOUT)
         for _ in range(300):
             if self.proc.poll() is not None:
@@ -137,6 +139,8 @@ def main():
     ap.add_argument("--x-tokens", type=int, default=48, help="|X|: tokens decoded after P that become part of S")
     ap.add_argument("--k-tokens", type=int, default=16, help="|Z|: tokens whose log-probs are compared")
     ap.add_argument("--cuts", default="512,1061", help="prefix-hit cut points b (tokens)")
+    ap.add_argument("--host-capacity", type=int, default=4096,
+                    help="max-model-len = kv-capacity of the host-path engine (small, so the evicting prompt spills)")
     ap.add_argument("--workdir", default=".")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -188,13 +192,18 @@ def main():
             report["paths"][f"cut@{cut}"] = compare(ref, tail(eng.complete(s_text, k), k))
         finally:
             eng.close()
-        eng = Engine(args, f"host{cut}", host_gb=1)
+        cap = args.host_capacity
+        eng = Engine(args, f"host{cut}", host_gb=1, max_model_len=cap, extra_args=f"--kv-capacity {cap}")
         try:
             eng.complete(text, 1)
-            # One unrelated request per lane, at once: the retained lane is taken too and spilled to the host tier.
-            with ThreadPoolExecutor(max_workers=args.lanes) as pool:
-                list(pool.map(lambda i: eng.complete(material[-2000 - 37 * i:-1 - 37 * i], 1), range(args.lanes)))
-            report["paths"][f"host@{cut}"] = compare(ref, tail(eng.complete(s_text, k), k))
+            # An unrelated prompt that needs nearly the whole cache: the retained lane must give its pages back.
+            filler = (material[::-1] * (1 + 4 * cap // max(1, len(material))))[:int(3.2 * (cap - 400))]
+            eng.complete(filler, 1)
+            result = compare(ref, tail(eng.complete(s_text, k), k))
+            with open(eng.log_path, errors="replace") as log:
+                lines = [line for line in log if "done finish" in line]
+            result["restored_from_host"] = bool(lines) and "reuse=host" in lines[-1]
+            report["paths"][f"host@{cut}"] = result
         finally:
             eng.close()
 
@@ -203,7 +212,8 @@ def main():
     json.dump(report, open(args.out, "w"), indent=1)
     print(f"S = {len(s_ids)} tokens, K = {k}")
     for name, path in report["paths"].items():
-        print(f"  {name:12s} {'EQUAL' if path['equal'] else 'DIFF '} cached={path['cached']} "
+        spilled = "" if "restored_from_host" not in path else f" host_restore={path['restored_from_host']}"
+        print(f"  {name:12s} {'EQUAL' if path['equal'] else 'DIFF '} cached={path['cached']}{spilled} "
               f"first_mismatch={path['first_logprob_mismatch']} max|d|={path['max_abs_logprob_diff']:.3g}")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
