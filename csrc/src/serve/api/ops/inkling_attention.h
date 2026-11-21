@@ -80,6 +80,26 @@ enum class InklingLayerKind : std::uint8_t {
 };
 
 /**
+ * Key groups of the invariant attention: the keys of every row are cut into groups whose boundaries depend only on the
+ * absolute key position; a group is walked in 64-key blocks with one running softmax state, groups are folded in order
+ * (inkling_rel_attention.cu header). The cut is part of the arithmetic: the engine and the trainer must use the SAME
+ * value (it is a field of InklingAttentionRows, which both entry points take). Global / local group sizes:
+ * P1 512 / 128; P2 2,048 (8,192 from key 65,536) / 256; P3 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128;
+ * P4 (measurement) P3 / 64; P5 (measurement) 256 below 65,536 then P3 / 128. Default = the process default: the
+ * compiled kInklingDefaultKeyGroups (P3 until lane h's price session decides), unless SUROGATE_INKLING_ATTN_GROUPS
+ * (p1 .. p5) was set when the process first used these ops (read once; a test override).
+ */
+enum class InklingKeyGroups : std::uint8_t {
+    Default,
+    P1,
+    P2,
+    P3,
+    P4,
+    P5,
+};
+inline constexpr InklingKeyGroups kInklingDefaultKeyGroups = InklingKeyGroups::P3;
+
+/**
  * The rows of one attention call (shared by the prologue and the attention of the same visit).
  *
  * `positions` is contiguous I32 [W, B]: the absolute position of column j of row b. A row's valid
@@ -105,7 +125,29 @@ struct InklingAttentionRows {
     /// were written by earlier steps. The attention then reads them before its programmatic-dependency wait and asks
     /// L2 for its first old blocks, overlapping the prologue. Same bits either way.
     bool metadata_static = false;
+    /// The key-group cut (see InklingKeyGroups); engine and trainer must pass the same value.
+    InklingKeyGroups key_groups = InklingKeyGroups::Default;
 };
+
+/**
+ * Process-wide tuning knobs of these ops: read ONCE from the environment when the process first uses them
+ * (SUROGATE_INKLING_ATTN_GROUPS / _SPLITS / _CTAS / _PARTIAL_MB / _L2AHEAD / _PDL_TRIGGER / _VARIANT / _EARLY_META,
+ * SUROGATE_INKLING_PREFILL_KS), never per call. Every knob changes the plan or the speed only, never the bits, except
+ * `variant` (a numerics experiment; 17 = production) and `default_groups` (the cut for rows that pass Default).
+ * Tests and benches may edit them between calls through inkling_attention_knobs(): not thread safe, never in serving.
+ */
+struct InklingAttentionKnobs {
+    InklingKeyGroups default_groups = kInklingDefaultKeyGroups;
+    int splits                      = 0;    // > 0: force this many workers (split route)
+    int cta_target                  = 0;    // decode CTA target (0: 2 x SMs)
+    int prefill_ks                  = 2;    // 2: 8-warp prefill kernel, 1: 4-warp
+    int l2_ahead                    = -1;   // blocks asked of L2 ahead (-1: decode 0, prefill 4)
+    bool pdl_trigger                = true; // trigger dependents at kernel entry
+    int variant                     = 17;   // numerics variant bits (production 17)
+    bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
+    std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
+};
+[[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
 /// InPlace (prefill, decode, the narrow MTP round): each row's slot is read, then replaced by the
 /// window after its last valid column. Record (speculative verify): the slot is only read; every valid
@@ -197,7 +239,8 @@ void inkling_attention(const InklingProjections& projections, const InklingAtten
                                                                      std::int32_t batch,
                                                                      std::int32_t min_width,
                                                                      std::int32_t max_width,
-                                                                     GqaExecutionEnvelope envelope);
+                                                                     GqaExecutionEnvelope envelope,
+                                                                     InklingKeyGroups key_groups = InklingKeyGroups::Default);
 
 // ---- The component ops (op tests against lane a's vectors; also callable on their own). ------------
 
@@ -242,12 +285,22 @@ struct InklingAttentionInputs {
     Tensor rel_table;
 };
 
-/// Workspace for inkling_rel_attention / _out_lse at B rows of W columns (split partials); zero when
-/// the call plans a single split. Throws outside the supported domain.
+/// Workspace for inkling_rel_attention / _out_lse / _train at B rows of W columns: the split route's partials, zero when
+/// the call plans one worker. Exactly (N = W * B):
+///   slots   = local: (1023 >> log2(local group)) + 2 (9 at 128-key groups);  global: group_of(max_visible_keys - 1) + 1
+///             (P3: max_visible_keys <= 65,536 -> ceil(keys / 512); then + ceil((keys - 65,536) / 2,048) up to 131,072,
+///             then + ceil((keys - 131,072) / 8,192); 176 at 262,144)
+///   bytes   = workers > 1 ? slots * N * 24 * (128 * 4 + 8) + 512 : 0
+///   workers = decode / verify (W <= 16): clamp(floor(2 * SMs / (8 B)), 1, global 64 | local slots);
+///             prefill: 1 when tiles * 24 * B >= 2 * SMs (tiles = ceil(W / 64)), else clamp(ceil(2 SMs / CTAs), 1, min(32, slots));
+///             1 whenever bytes would exceed the partial cap (InklingAttentionKnobs::partial_cap_bytes, default 1 GiB).
+/// The plan (workers, cap) changes only the speed and this size, never the output bits. The call must use the same
+/// envelope and key_groups as this query. Throws outside the supported domain.
 [[nodiscard]] std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind,
                                                                 std::int32_t width,
                                                                 std::int32_t batch,
-                                                                GqaExecutionEnvelope envelope);
+                                                                GqaExecutionEnvelope envelope,
+                                                                InklingKeyGroups key_groups = InklingKeyGroups::Default);
 
 /**
  * Op inkling_rel_attention, production route (ref `inkling_rel_attention` + `inkling_gate_sink`; D1

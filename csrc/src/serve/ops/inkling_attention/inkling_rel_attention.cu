@@ -6,9 +6,9 @@
 // INVARIANCE (agent-EN decision 10:2x, FEASIBILITY-ANSWER.md; lanes/c/NOTES.md "INVARIANT ATTENTION"). The bits of a
 // row (query token x head) depend only on its own q / r / gate / sink, its position and the keys in the plane --
 // never on the batch, the width W, the envelope, the chunk cut, the split count or the other rows of a tile:
-// - Keys go in fixed GROUPS whose boundaries depend only on the absolute key position (GroupSpec, chosen at run time
-//   by SUROGATE_INKLING_ATTN_GROUPS: p1 = 512 global / 128 local, p2 = 2,048 global growing to 8,192 from key 65,536
-//   / 256 local, p3 = 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128 local). Inside a group: 64-key blocks aligned at key 0, in key order, one running softmax state per row
+// - Keys go in fixed GROUPS whose boundaries depend only on the absolute key position (GroupSpec from the call's
+//   InklingAttentionRows::key_groups, default P3: 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128 local;
+//   P1 / P2 / P4 / P5 for measurement, api/ops/inkling_attention.h). Inside a group: 64-key blocks aligned at key 0, in key order, one running softmax state per row
 //   (log2 domain; P rounded to bf16 against the running maximum; P V as k16 MMA steps in key order). A group's
 //   state (m, l, acc) is folded into the row's total in group order by ONE sequential formula (fold_*), in
 //   registers / shared memory (in-kernel route) or by fold_kernel over per-group partials (split route): the same
@@ -960,36 +960,49 @@ int env_int(const char* name, int fallback) {
     return raw == nullptr || raw[0] == '\0' ? fallback : std::atoi(raw);
 }
 
-/// SUROGATE_INKLING_ATTN_GROUPS: "p1" (default: 512 global / 128 local), "p2" (2,048 global, 8,192 from key 65,536 /
-/// 256 local), "p3" (graded, agent-EN 11:1x: 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128 local). Read
-/// per call, so one process can compare them (measurement and tests; frozen by agent-EN later).
-GroupSpec group_spec(InklingLayerKind kind) {
-    const char* raw = std::getenv("SUROGATE_INKLING_ATTN_GROUPS");
-    int which       = 1;
-    if (raw != nullptr && raw[0] != '\0') {
-        if (std::strcmp(raw, "p1") == 0) {
-            which = 1;
-        } else if (std::strcmp(raw, "p2") == 0) {
-            which = 2;
-        } else if (std::strcmp(raw, "p3") == 0) {
-            which = 3;
-        } else if (std::strcmp(raw, "p4") == 0) {
-            which = 4; // measurement: p3's global groups, local groups of 64 keys (one block)
-        } else if (std::strcmp(raw, "p5") == 0) {
-            which = 5; // measurement: global 256 below 65,536 then p3's tiers, local 128
-        } else {
-            throw std::invalid_argument("SUROGATE_INKLING_ATTN_GROUPS must be p1 .. p5");
-        }
-    }
-    GroupSpec g; // p1
+InklingKeyGroups parse_groups(const char* raw) {
+    if (raw == nullptr || raw[0] == '\0') { return kInklingDefaultKeyGroups; }
+    const std::string v(raw);
+    if (v == "p1") { return InklingKeyGroups::P1; }
+    if (v == "p2") { return InklingKeyGroups::P2; }
+    if (v == "p3") { return InklingKeyGroups::P3; }
+    if (v == "p4") { return InklingKeyGroups::P4; }
+    if (v == "p5") { return InklingKeyGroups::P5; }
+    throw std::invalid_argument("SUROGATE_INKLING_ATTN_GROUPS must be p1 .. p5");
+}
+
+/// The knobs, read from the environment once (the first use in the process), then only edited by tests.
+InklingAttentionKnobs& knobs() {
+    static InklingAttentionKnobs k = [] {
+        InklingAttentionKnobs x;
+        x.default_groups    = parse_groups(std::getenv("SUROGATE_INKLING_ATTN_GROUPS"));
+        x.splits            = std::max(0, env_int("SUROGATE_INKLING_ATTN_SPLITS", 0));
+        x.cta_target        = std::max(0, env_int("SUROGATE_INKLING_ATTN_CTAS", 0));
+        x.prefill_ks        = env_int("SUROGATE_INKLING_PREFILL_KS", 2) == 1 ? 1 : 2;
+        x.l2_ahead          = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", -1), -1, 16);
+        x.pdl_trigger       = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0;
+        x.variant           = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17);
+        x.early_meta        = env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0;
+        x.partial_cap_bytes = static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PARTIAL_MB", 1024))) << 20;
+        return x;
+    }();
+    return k;
+}
+
+/// The group cut of `which` (Default: the process default). Global / local: P1 512 / 128; P2 2,048 (8,192 from key
+/// 65,536) / 256; P3 512 below 65,536, 2,048 to 131,072, 8,192 beyond / 128; P4 P3 / 64; P5 256 below 65,536 then P3 / 128.
+GroupSpec group_spec(InklingLayerKind kind, InklingKeyGroups which) {
+    if (which == InklingKeyGroups::Default) { which = knobs().default_groups; }
+    if (which == InklingKeyGroups::Default) { which = kInklingDefaultKeyGroups; }
+    GroupSpec g; // P1
     if (kind == InklingLayerKind::Local) {
-        g.s1 = g.s2 = g.s3 = which == 2 ? 8 : which == 4 ? 6 : 7;
-    } else if (which == 2) {
+        g.s1 = g.s2 = g.s3 = which == InklingKeyGroups::P2 ? 8 : which == InklingKeyGroups::P4 ? 6 : 7;
+    } else if (which == InklingKeyGroups::P2) {
         g.s1 = 11;
         g.s2 = g.s3 = 13;
         g.t1 = 65536;
-    } else if (which == 3 || which == 4 || which == 5) {
-        g.s1 = which == 5 ? 8 : 9;
+    } else if (which != InklingKeyGroups::P1) {
+        g.s1 = which == InklingKeyGroups::P5 ? 8 : 9;
         g.s2 = 11;
         g.s3 = 13;
         g.t1 = 65536;
@@ -1033,22 +1046,22 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
         plan.mtiles      = (Geo::kGroup * width + 15) / 16;
         plan.ks          = plan.mtiles == 1 ? 4 : 2;
         const int work   = Geo::kKvHeads * batch;
-        const int target = env_int("SUROGATE_INKLING_ATTN_CTAS", 2 * sms); // two CTAs per SM: one wave
+        const int target = knobs().cta_target > 0 ? knobs().cta_target : 2 * sms; // two CTAs per SM: one wave
         plan.workers     = std::clamp(target / work, 1, slot_cap);
     } else {
         plan.decode     = false;
         plan.mtiles     = 4;
         // KS = 2 (8 warps, two per SM sub-partition: one warp's softmax overlaps another's MMAs) or 1 (4 warps);
         // SUROGATE_INKLING_PREFILL_KS picks (measurement); same bits either way.
-        plan.ks         = env_int("SUROGATE_INKLING_PREFILL_KS", 2) == 1 ? 1 : 2;
+        plan.ks         = knobs().prefill_ks == 1 ? 1 : 2;
         const int tiles = (width + kPrefillRows - 1) / kPrefillRows;
         const long ctas = static_cast<long>(tiles) * Geo::kQHeads * batch;
         plan.workers    = ctas >= 2L * sms ? 1 : std::clamp(static_cast<int>((2L * sms + ctas - 1) / ctas), 1,
                                                             std::min(32, plan.max_slots));
     }
-    const int forced = env_int("SUROGATE_INKLING_ATTN_SPLITS", 0);
+    const int forced = knobs().splits;
     if (forced > 0) { plan.workers = std::min(forced, kMaxWorkers); }
-    const std::size_t cap = static_cast<std::size_t>(env_int("SUROGATE_INKLING_ATTN_PARTIAL_MB", 1024)) << 20;
+    const std::size_t cap = knobs().partial_cap_bytes;
     if (forced <= 0 && partial_bytes(plan, static_cast<std::int64_t>(width) * batch) > cap) { plan.workers = 1; }
     plan.grid = plan.decode ? dim3(static_cast<unsigned>(plan.workers), Geo::kKvHeads, static_cast<unsigned>(batch))
                             : dim3(static_cast<unsigned>((width + kPrefillRows - 1) / kPrefillRows), Geo::kQHeads,
@@ -1146,10 +1159,11 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.qk_scale_log2   = scale * kLog2e;
     // Default 17 = bias added unfused (s + bf16(b) * log2e) and lse with the accurate log2f: decided against lane
     // a's capture of vLLM's own sm_120 prefill kernel (M3 run 2). The env override remains for the experiment.
-    p.variant     = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17) & (1 | 8 | 16 | 32);
-    p.l2_ahead    = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", -1), -1, 16); // -1: the route's default (run)
-    p.pdl_trigger = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0 ? 1 : 0;
-    p.metadata_static = (rows.metadata_static && env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0) ? 1 : 0;
+    const InklingAttentionKnobs& k = knobs();
+    p.variant         = k.variant & (1 | 8 | 16 | 32);
+    p.l2_ahead        = std::clamp(k.l2_ahead, -1, 16); // -1: the route's default (run)
+    p.pdl_trigger     = k.pdl_trigger ? 1 : 0;
+    p.metadata_static = (rows.metadata_static && k.early_meta) ? 1 : 0;
     return p;
 }
 
@@ -1169,7 +1183,7 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
         p.out_f32 = static_cast<float*>(out_f32->data);
         p.lse     = static_cast<float*>(lse->data);
     }
-    p.groups        = group_spec(kind);
+    p.groups        = group_spec(kind, rows.key_groups);
     const Plan plan = make_plan(kind, p.groups, rs.width, rs.batch, static_cast<std::int32_t>(rows.envelope.max_visible_keys));
     p.workers       = plan.workers;
     p.max_slots     = plan.max_slots;
@@ -1198,18 +1212,19 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
 } // namespace inkling_detail
 
 std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind, std::int32_t width,
-                                                  std::int32_t batch, GqaExecutionEnvelope envelope) {
+                                                  std::int32_t batch, GqaExecutionEnvelope envelope,
+                                                  InklingKeyGroups key_groups) {
     using namespace inkling_detail;
     if (width <= 0 || batch <= 0 || envelope.max_visible_keys > static_cast<std::uint32_t>(1 << 20)) {
         throw std::invalid_argument("inkling_rel_attention_workspace_bytes: outside the supported domain");
     }
-    const Plan plan = make_plan(kind, group_spec(kind), width, batch, static_cast<std::int32_t>(envelope.max_visible_keys));
+    const Plan plan = make_plan(kind, group_spec(kind, key_groups), width, batch, static_cast<std::int32_t>(envelope.max_visible_keys));
     return partial_bytes(plan, static_cast<std::int64_t>(width) * batch);
 }
 
 std::size_t inkling_attention_workspace_capacity_bytes(InklingLayerKind kind, std::int32_t batch,
                                                        std::int32_t min_width, std::int32_t max_width,
-                                                       GqaExecutionEnvelope envelope) {
+                                                       GqaExecutionEnvelope envelope, InklingKeyGroups key_groups) {
     using namespace inkling_detail;
     if (batch <= 0 || min_width <= 0 || max_width < min_width) {
         throw std::invalid_argument("inkling_attention_workspace_capacity_bytes: outside the supported domain");
@@ -1218,7 +1233,7 @@ std::size_t inkling_attention_workspace_capacity_bytes(InklingLayerKind kind, st
     for (std::int32_t w = min_width; w <= max_width; ++w) {
         const std::int64_t n   = static_cast<std::int64_t>(w) * batch;
         const std::size_t qr   = static_cast<std::size_t>(n * Geo::kQHeads * (Geo::kHeadDim + Geo::kRelDim) * 2) + 512;
-        most                   = std::max(most, qr + inkling_rel_attention_workspace_bytes(kind, w, batch, envelope));
+        most                   = std::max(most, qr + inkling_rel_attention_workspace_bytes(kind, w, batch, envelope, key_groups));
     }
     return most;
 }
@@ -1284,6 +1299,8 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
     const InklingAttentionInputs in{train.q, train.r, projections.gate, projections.sink, weights.rel_table};
     inkling_rel_attention_train(in, kind, rows, cache, workspace, out, train.o, train.lse, stream);
 }
+
+InklingAttentionKnobs& inkling_attention_knobs() { return inkling_detail::knobs(); }
 
 void inkling_gate_sink(const Tensor& out, const Tensor& lse, const Tensor& gate, const Tensor& sink,
                        Tensor& result, cudaStream_t stream) {

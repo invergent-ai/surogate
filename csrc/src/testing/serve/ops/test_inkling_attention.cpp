@@ -49,6 +49,17 @@ constexpr ReductionCriterion kGatedCriterion{4.0e-3, 1.5e-3, 4.0e-3};
 constexpr double kLseAbs = 1.0e-3;
 
 int g_failures = 0;
+
+// The key-group cut every attention call of the test / bench passes (InklingAttentionRows::key_groups).
+ops::InklingKeyGroups g_key_groups = ops::InklingKeyGroups::Default;
+ops::InklingKeyGroups groups_of(const std::string& name) {
+    if (name == "p1") { return ops::InklingKeyGroups::P1; }
+    if (name == "p2") { return ops::InklingKeyGroups::P2; }
+    if (name == "p3") { return ops::InklingKeyGroups::P3; }
+    if (name == "p4") { return ops::InklingKeyGroups::P4; }
+    if (name == "p5") { return ops::InklingKeyGroups::P5; }
+    return ops::InklingKeyGroups::Default;
+}
 void check(bool ok, const std::string& what) {
     if (!ok) {
         ++g_failures;
@@ -288,6 +299,7 @@ struct Rows {
         r.valid_columns = masked ? Tensor(dvalid.p, DType::I32, {B}) : Tensor{};
         r.kv_table_rows = Tensor(dtables.p, DType::I32, {B});
         r.envelope.max_visible_keys = static_cast<std::uint32_t>(max_keys);
+        r.key_groups                = g_key_groups;
         return r;
     }
     int max_keys() const {
@@ -467,13 +479,9 @@ void run_attention_case(const AttnCase& c, std::uint32_t seed) {
     in.sink      = strided_bf16(dqs.p, G::kRowsSink, {24}, N, 6552);
     in.rel_table = Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows});
 
-    if (c.force_splits > 0) {
-        setenv("SUROGATE_INKLING_ATTN_SPLITS", std::to_string(c.force_splits).c_str(), 1);
-    } else {
-        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
-    }
+    ops::inkling_attention_knobs().splits = std::max(c.force_splits, 0);
     const auto view = rows.view(maxk);
-    WorkspaceArena work(std::max<std::size_t>(ops::inkling_rel_attention_workspace_bytes(c.kind, c.W, c.B, view.envelope), 1) + 4096);
+    WorkspaceArena work(std::max<std::size_t>(ops::inkling_rel_attention_workspace_bytes(c.kind, c.W, c.B, view.envelope, view.key_groups), 1) + 4096);
     DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2), dof(static_cast<std::size_t>(N) * 3072 * 4),
         dl(static_cast<std::size_t>(N) * 24 * 4);
     cudaMemset(dout.p, 0x7f, dout.bytes);
@@ -482,7 +490,7 @@ void run_attention_case(const AttnCase& c, std::uint32_t seed) {
     ops::inkling_rel_attention(in, c.kind, view, plane.view(), work, out, nullptr);
     ops::inkling_rel_attention_out_lse(in, c.kind, view, plane.view(), work, of, lse, nullptr);
     cuda_synchronize();
-    unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
+    ops::inkling_attention_knobs().splits = 0;
 
     std::vector<double> ref_o, ref_l;
     attention_oracle(layer, rows, plane, q, r, ref_o, ref_l);
@@ -640,7 +648,7 @@ InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& lay
     in.rel_table = Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows});
     auto view            = rows.view(rows.max_keys());
     view.metadata_static = meta_static;
-    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope) + 4096);
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope, view.key_groups) + 4096);
     DeviceBuffer dy(static_cast<std::size_t>(N) * 3072 * 2), dof(static_cast<std::size_t>(N) * 3072 * 4),
         dl(static_cast<std::size_t>(N) * 24 * 4);
     cudaMemset(dy.p, 0x7f, dy.bytes);
@@ -676,7 +684,7 @@ struct InvCase {
 };
 
 void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t seed) {
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", groups, 1);
+    g_key_groups          = groups_of(groups);
     const std::string tag = "invariance " + c.name + " " + groups;
     const InvPlane ip = make_inv_plane(c.L0, seed);
     const Layer layer(c.kind, seed + 7);
@@ -741,14 +749,22 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B8", run_inv_route(c.kind, ip, layer, 1, r8));
         r8.back().valid = 0; // an idle padding row
         compare("decode B8 idle row", run_inv_route(c.kind, ip, layer, 1, r8));
-        for (const char* splits : {"1", "3", "64"}) {
-            setenv("SUROGATE_INKLING_ATTN_SPLITS", splits, 1);
-            compare(std::string("decode B1 workers ") + splits, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}));
+        for (const int splits : {1, 3, 64}) {
+            ops::inkling_attention_knobs().splits = splits;
+            compare("decode B1 workers " + std::to_string(splits), run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}));
         }
-        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
-        setenv("SUROGATE_INKLING_ATTN_CTAS", "20", 1);
+        ops::inkling_attention_knobs().splits     = 0;
+        ops::inkling_attention_knobs().cta_target = 20;
         compare("decode B4 cta target 20", run_inv_route(c.kind, ip, layer, 1, r4));
-        unsetenv("SUROGATE_INKLING_ATTN_CTAS");
+        ops::inkling_attention_knobs().cta_target = 0;
+        ops::inkling_attention_knobs().partial_cap_bytes = 0; // the cap forces one worker: a plan change only
+        compare("decode B4 partial cap 0", run_inv_route(c.kind, ip, layer, 1, r4));
+        ops::inkling_attention_knobs().partial_cap_bytes = std::size_t{1} << 30;
+        if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
+            g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
+            compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
+            g_key_groups = ops::InklingKeyGroups::P3;
+        }
     }
     for (const int v : c.verify) {
         const int w = std::min(8, c.L0 - v);
@@ -761,29 +777,29 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("verify W8 B1 valid 5", run_inv_route(c.kind, ip, layer, 8, {{0, v, std::min(5, w)}}));
         compare("verify W3 B2", run_inv_route(c.kind, ip, layer, 3, {{r4[0].seq, r4[0].first, std::min(3, r4[0].valid)}, {0, v, std::min(3, w)}}));
         compare("verify W16 B1", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
-        setenv("SUROGATE_INKLING_ATTN_SPLITS", "1", 1);
+        ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
-        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
+        ops::inkling_attention_knobs().splits = 0;
     }
     // The whole segment again with the 4-warp prefill kernel (KS = 1; the default is KS = 2).
-    setenv("SUROGATE_INKLING_PREFILL_KS", "1", 1);
+    ops::inkling_attention_knobs().prefill_ks = 1;
     compare("prefill KS1 one segment", run_inv_route(c.kind, ip, layer, c.L0 - c.P0, {{0, c.P0, c.L0 - c.P0}}));
-    unsetenv("SUROGATE_INKLING_PREFILL_KS");
+    ops::inkling_attention_knobs().prefill_ks = 2;
     // A short prefill segment forced through the split route (partials + fold kernel) and through 1 worker.
     {
         const int s0 = std::max(c.P0, c.L0 - 40);
-        for (const char* splits : {"1", "3"}) {
-            setenv("SUROGATE_INKLING_ATTN_SPLITS", splits, 1);
-            compare(std::string("prefill W40 workers ") + splits, run_inv_route(c.kind, ip, layer, c.L0 - s0, {{0, s0, c.L0 - s0}}));
+        for (const int splits : {1, 3}) {
+            ops::inkling_attention_knobs().splits = splits;
+            compare("prefill W40 workers " + std::to_string(splits), run_inv_route(c.kind, ip, layer, c.L0 - s0, {{0, s0, c.L0 - s0}}));
         }
-        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
+        ops::inkling_attention_knobs().splits = 0;
     }
     std::printf("%-44s routes %zu, target columns compared %zu, bit-different %zu, training entry != production on %zu "
                 "routes%s%s\n",
                 tag.c_str(), routes, columns, bad_columns, train_bad + (ref.train_same ? 0 : 1),
                 first_bad.empty() ? "" : "  first: ", first_bad.c_str());
     check(bad_columns == 0 && train_bad == 0 && ref.train_same && columns > 0, tag);
-    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    g_key_groups = ops::InklingKeyGroups::Default;
 }
 
 void test_invariance(const std::function<bool(const std::string&)>& want) {
@@ -887,7 +903,7 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
     qr.q = Tensor(dqo.p, DType::BF16, {128, 24, N});
     qr.r = Tensor(dro.p, DType::BF16, {16, 24, N});
     if (c.fused) {
-        WorkspaceArena work(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope) + 4096);
+        WorkspaceArena work(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope, view.key_groups) + 4096);
         Tensor out(dout.p, DType::BF16, {3072, N});
         ops::inkling_attention(in, layer.weights(), c.kind, view, conv, plane.view(), work, out, nullptr);
     } else {
@@ -1101,7 +1117,7 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
         tro.o   = Tensor(to.p, DType::FP32, {128, 24, N});
         tro.lse = Tensor(tl.p, DType::FP32, {24, N});
         Tensor tyt(ty.p, DType::BF16, {3072, N}), rot(ro.p, DType::FP32, {128, 24, N}), rlt(rl.p, DType::FP32, {24, N});
-        WorkspaceArena work3(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope) + 4096);
+        WorkspaceArena work3(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope, view.key_groups) + 4096);
         ops::inkling_attention_train(in, layer.weights(), c.kind, view, conv3, plane3.view(), work3, tyt, tro, nullptr);
         const ops::InklingAttentionInputs ain{tro.q, tro.r, in.gate, in.sink, layer.weights().rel_table};
         ops::inkling_rel_attention_out_lse(ain, c.kind, view, plane3.view(), work3, rot, rlt, nullptr);
@@ -1525,7 +1541,7 @@ void run_capture(const std::string& dir) {
         const auto view = rows.view(pos[0] + T);
         ops::inkling_attention_prologue(in, w, kind, view, conv, plane.view(), qr, nullptr);
 
-        WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, T, 1, view.envelope) + 4096);
+        WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, T, 1, view.envelope, view.key_groups) + 4096);
         DeviceBuffer dof(static_cast<std::size_t>(T) * 3072 * 4), dl(static_cast<std::size_t>(T) * 24 * 4),
             dy(static_cast<std::size_t>(T) * 3072 * 2), dgs(static_cast<std::size_t>(T) * 3072 * 2);
         Tensor of(dof.p, DType::FP32, {128, 24, T}), lse(dl.p, DType::FP32, {24, T}), y(dy.p, DType::BF16, {3072, T});
@@ -1628,7 +1644,7 @@ void run_capture(const std::string& dir) {
             std::vector<Score> scores;
             for (int variant = 0; variant < 64; ++variant) {
                 if ((variant & 6) != 0) { continue; } // bits 2 / 4 (old P V modes) are gone
-                setenv("SUROGATE_INKLING_ATTN_VARIANT", std::to_string(variant).c_str(), 1);
+                ops::inkling_attention_knobs().variant = variant;
                 ops::inkling_rel_attention_out_lse(vin, kind, view, plane.view(), work, of, lse, nullptr);
                 cuda_synchronize();
                 const std::vector<float> go32 = from_device<float>(dof, ro32.size());
@@ -1638,7 +1654,7 @@ void run_capture(const std::string& dir) {
                 for (std::size_t i = 0; i < gl32.size(); ++i) { el += std::memcmp(&gl32[i], &rl32[i], 4) == 0; }
                 scores.push_back({variant, 100.0 * eo / go32.size(), 100.0 * el / gl32.size()});
             }
-            unsetenv("SUROGATE_INKLING_ATTN_VARIANT");
+            ops::inkling_attention_knobs().variant = 17;
             std::sort(scores.begin(), scores.end(), [](const Score& a, const Score& b) {
                 return a.out_eq != b.out_eq ? a.out_eq > b.out_eq : a.lse_eq > b.lse_eq;
             });
@@ -1768,7 +1784,7 @@ void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int 
         views.push_back(rr.view(keys));
         views.back().metadata_static = std::getenv("BENCH_META_STATIC") != nullptr;
     }
-    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, views[0].envelope) + 4096);
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, views[0].envelope, views[0].key_groups) + 4096);
     DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2);
     Tensor out(dout.p, DType::BF16, {3072, N});
     const auto pv  = plane.view(B * R);
@@ -1881,7 +1897,7 @@ void bench_attention_wo(const char* name, InklingLayerKind kind, int first) {
                                    Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
     std::vector<ops::InklingAttentionRows> views;
     for (const auto& rr : rot) { views.push_back(rr.view(keys)); }
-    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, 1, 1, views[0].envelope) + 4096);
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, 1, 1, views[0].envelope, views[0].key_groups) + 4096);
     DeviceBuffer dout(3072 * 2), dy(2304 * 2);
     Tensor out(dout.p, DType::BF16, {3072, 1}), y(dy.p, DType::BF16, {2304, 1});
     std::vector<std::unique_ptr<Fp8Weight>> ws;
@@ -1903,7 +1919,7 @@ void bench_attention_wo(const char* name, InklingLayerKind kind, int first) {
 void run_bench_ab() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 1);
+    g_key_groups = groups_of("p3");
     // Static-metadata pre-wait L2 ask (decode / verify) off vs on; prefill L2 distance 0 vs 4.
     for (const char* meta : {"0", "1"}) {
         if (meta[0] == '1') { setenv("BENCH_META_STATIC", "1", 1); } else { unsetenv("BENCH_META_STATIC"); }
@@ -1917,26 +1933,26 @@ void run_bench_ab() {
         bench_attention(("verify W8 local 1x8k" + tag).c_str(), K::Local, 8, 1, 8184);
     }
     unsetenv("BENCH_META_STATIC");
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p4", 1);
+    g_key_groups = groups_of("p4");
     bench_attention("decode local 1x8k [p4]", K::Local, 1, 1, 8191);
     bench_attention("decode local 8x8k [p4]", K::Local, 1, 8, 8191);
     bench_attention("verify W8 local 1x8k [p4]", K::Local, 8, 1, 8184);
     bench_attention("prefill local W8192 past 8k [p4]", K::Local, 8192, 1, 8192);
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p5", 1);
+    g_key_groups = groups_of("p5");
     bench_attention("decode global 1x8k [p5]", K::Global, 1, 1, 8191);
     bench_attention("decode global 1x64k [p5]", K::Global, 1, 1, 65535);
     bench_attention("decode global 8x8k [p5]", K::Global, 1, 8, 8191);
     bench_attention("verify W8 global 1x8k [p5]", K::Global, 8, 1, 8184);
     bench_attention("prefill global W8192 from 0 [p5]", K::Global, 8192, 1, 0);
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 1);
+    g_key_groups = groups_of("p3");
     for (const char* l2 : {"0", "4"}) {
-        setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
+        ops::inkling_attention_knobs().l2_ahead = std::atoi(l2);
         const std::string tag = std::string(" [p3 l2=") + l2 + "]";
         bench_attention(("prefill global W8192 from 0" + tag).c_str(), K::Global, 8192, 1, 0);
         bench_attention(("prefill local W8192 past 8k" + tag).c_str(), K::Local, 8192, 1, 8192);
     }
-    unsetenv("SUROGATE_INKLING_ATTN_L2AHEAD");
-    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    ops::inkling_attention_knobs().l2_ahead = -1;
+    g_key_groups = ops::InklingKeyGroups::Default;
     bench_linear("attn_linear qkvr narrow N=1 1x128", 2304, 128, 1);
     bench_linear("attn_linear qkvr narrow N=8 1x128", 2304, 128, 8);
     bench_linear("attn_linear wo narrow N=1 1x128", 3072, 128, 1);
@@ -1948,12 +1964,12 @@ void run_bench_ab() {
 void run_bench_prof() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
+    g_key_groups = groups_of("p1");
     bench_attention("prof decode global 1x8k", K::Global, 1, 1, 8191);
     bench_attention("prof decode global 1x262k", K::Global, 1, 1, 262143);
     bench_attention("prof decode local 1x8k", K::Local, 1, 1, 8191);
     bench_attention("prof verify W8 global 1x8k", K::Global, 8, 1, 8184);
-    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    g_key_groups = ops::InklingKeyGroups::Default;
     bench_linear("prof wo narrow N=1 1x128", 3072, 128, 1);
 }
 
@@ -1964,7 +1980,7 @@ void run_bench() {
     const char* only_groups = std::getenv("BENCH_GROUPS");
     for (const char* groups : {"p1", "p2", "p3"}) {
         if (only_groups != nullptr && std::string(only_groups) != groups) { continue; }
-        setenv("SUROGATE_INKLING_ATTN_GROUPS", groups, 1);
+        g_key_groups = groups_of(groups);
         const auto name = [&](const char* what) { static std::string s; s = std::string(what) + " [" + groups + "]"; return s.c_str(); };
         bench_attention(name("attn decode global 1x8k"), K::Global, 1, 1, 8191);
         bench_attention(name("attn decode global 1x64k"), K::Global, 1, 1, 65535);
@@ -1989,15 +2005,15 @@ void run_bench() {
         bench_attention(name("attn prefill global W8192 past 256k"), K::Global, 8192, 1, 262144);
     }
     // The 4-warp prefill kernel (KS = 1) for comparison, p1.
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
-    setenv("SUROGATE_INKLING_PREFILL_KS", "1", 1);
+    g_key_groups = groups_of("p1");
+    ops::inkling_attention_knobs().prefill_ks = 1;
     bench_attention("attn prefill global W8192 from 0 [p1 KS1]", K::Global, 8192, 1, 0);
     bench_attention("attn prefill global W8192 past 64k [p1 KS1]", K::Global, 8192, 1, 65536);
     bench_attention("attn prefill local W8192 past 8k [p1 KS1]", K::Local, 8192, 1, 8192);
-    unsetenv("SUROGATE_INKLING_PREFILL_KS");
+    ops::inkling_attention_knobs().prefill_ks = 2;
     bench_attention_wo("decode global 1x8k + wo N=1 1x128 [p1]", K::Global, 8191);
     bench_attention_wo("decode local 1x8k + wo N=1 1x128 [p1]", K::Local, 8191);
-    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    g_key_groups = ops::InklingKeyGroups::Default;
     if (std::getenv("BENCH_ATTN_ONLY") != nullptr) { return; }
     bench_prologue("prologue local 1x1", K::Local, 1, 1, 8191);
     bench_prologue("prologue global 8x1", K::Global, 1, 8, 8191);
