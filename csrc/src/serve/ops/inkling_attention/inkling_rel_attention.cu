@@ -1036,7 +1036,7 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     // Default 17 = bias added unfused (s + bf16(b) * log2e) and lse with the accurate log2f: decided against lane
     // a's capture of vLLM's own sm_120 prefill kernel (M3 run 2). The env override remains for the experiment.
     p.variant     = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17) & (1 | 8 | 16 | 32);
-    p.l2_ahead    = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", 4), 0, 16);
+    p.l2_ahead    = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", -1), -1, 16); // -1: the route's default (run)
     p.pdl_trigger = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0 ? 1 : 0;
     return p;
 }
@@ -1060,6 +1060,9 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
     const Plan plan = make_plan(kind, p.groups, rs.width, rs.batch, static_cast<std::int32_t>(rows.envelope.max_visible_keys));
     p.workers       = plan.workers;
     p.max_slots     = plan.max_slots;
+    // L2 prefetch ahead of the loads: measured 11:30 (perf6ab) to slow decode / verify at every distance (1x262k 376 ->
+    // 387 us at 4, 464 at 8): off there; prefill keeps 4 (not yet A/B-measured).
+    if (p.l2_ahead < 0) { p.l2_ahead = plan.decode ? 0 : 4; }
     if (plan.workers == 1) {
         dispatch(kind, final_mode, plan, p, stream);
         return;

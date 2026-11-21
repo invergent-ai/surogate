@@ -1835,26 +1835,42 @@ void run_bench_ab() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
     setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
-    for (const char* l2 : {"0", "2", "4", "8"}) {
-        for (const char* trig : {"0", "1"}) {
-            setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
-            setenv("SUROGATE_INKLING_ATTN_PDL_TRIGGER", trig, 1);
-            const std::string tag = std::string(" [p1 l2=") + l2 + " trig=" + trig + "]";
-            bench_attention(("decode global 1x8k" + tag).c_str(), K::Global, 1, 1, 8191);
-            bench_attention(("decode global 1x64k" + tag).c_str(), K::Global, 1, 1, 65535);
-            bench_attention(("decode global 1x262k" + tag).c_str(), K::Global, 1, 1, 262143);
-            bench_attention(("decode global 8x8k" + tag).c_str(), K::Global, 1, 8, 8191);
-            bench_attention(("decode local 1x8k" + tag).c_str(), K::Local, 1, 1, 8191);
-            bench_attention(("verify W8 global 1x8k" + tag).c_str(), K::Global, 8, 1, 8184);
-            bench_attention_wo(("pair global 1x8k + wo" + tag).c_str(), K::Global, 8191);
-        }
+    // Prefill: L2 prefetch distance (decode settled 11:30: off).
+    for (const char* l2 : {"0", "2", "4"}) {
+        setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
+        const std::string tag = std::string(" [p1 l2=") + l2 + "]";
+        bench_attention(("prefill global W8192 from 0" + tag).c_str(), K::Global, 8192, 1, 0);
+        bench_attention(("prefill global W8192 past 64k" + tag).c_str(), K::Global, 8192, 1, 65536);
+        bench_attention(("prefill local W8192 past 8k" + tag).c_str(), K::Local, 8192, 1, 8192);
     }
     unsetenv("SUROGATE_INKLING_ATTN_L2AHEAD");
-    unsetenv("SUROGATE_INKLING_ATTN_PDL_TRIGGER");
+    // Decode defaults (l2 off, trigger on) and the pair with wo.
+    bench_attention("decode global 1x8k [p1 default]", K::Global, 1, 1, 8191);
+    bench_attention("decode global 1x262k [p1 default]", K::Global, 1, 1, 262143);
+    bench_attention("verify W8 global 1x8k [p1 default]", K::Global, 8, 1, 8184);
+    bench_attention_wo("pair global 1x8k + wo [p1 default]", K::Global, 8191);
+    bench_attention_wo("pair local 1x8k + wo [p1 default]", K::Local, 8191);
     unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    bench_linear("attn_linear qkvr narrow N=1 channel", 2304, 2304, 1);
     bench_linear("attn_linear qkvr narrow N=1 1x128", 2304, 128, 1);
+    bench_linear("attn_linear qkvr narrow N=8 1x128", 2304, 128, 8);
+    bench_linear("attn_linear qkvr narrow N=16 1x128", 2304, 128, 16);
     bench_linear("attn_linear wo narrow N=1 1x128", 3072, 128, 1);
+    bench_linear("attn_linear wo narrow N=1 channel", 3072, 3072, 1);
     bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
+}
+
+// For nsys (per-kernel durations inside the graphs): a few decode probes and the wo projection, p1.
+void run_bench_prof() {
+    using K = InklingLayerKind;
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
+    bench_attention("prof decode global 1x8k", K::Global, 1, 1, 8191);
+    bench_attention("prof decode global 1x262k", K::Global, 1, 1, 262143);
+    bench_attention("prof decode local 1x8k", K::Local, 1, 1, 8191);
+    bench_attention("prof verify W8 global 1x8k", K::Global, 8, 1, 8184);
+    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    bench_linear("prof wo narrow N=1 1x128", 3072, 128, 1);
 }
 
 void run_bench() {
@@ -1923,6 +1939,10 @@ int main(int argc, char** argv) {
         try {
             if (argc > 2 && std::string(argv[2]) == "ab") {
                 run_bench_ab();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "prof") {
+                run_bench_prof();
                 return 0;
             }
             run_bench();
