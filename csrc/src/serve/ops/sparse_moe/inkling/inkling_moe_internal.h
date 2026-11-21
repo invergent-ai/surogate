@@ -110,6 +110,8 @@ enum class GemmSchedule : std::uint8_t { Narrow, Wide };
 /// The token rows one tile of `schedule` carries (the routed rows of an expert are cut into
 /// tiles of this many).
 [[nodiscard]] std::int32_t gemm_tile_rows(InklingExpertFormat format, GemmSchedule schedule);
+[[nodiscard]] std::int32_t nvfp4_tile_rows(GemmSchedule schedule);
+[[nodiscard]] std::int32_t mxfp8_tile_rows(GemmSchedule schedule);
 
 void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                           cudaStream_t stream);

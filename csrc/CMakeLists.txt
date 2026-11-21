@@ -1516,6 +1516,11 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  # Inkling-2-Mini's mixture (ENGINE-INKLING lane d; api/ops/inkling_moe.h).
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_nvfp4_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_mxfp8_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe.cpp
   ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/hyper_connection/manifold.cu
@@ -1699,6 +1704,13 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # constructor, which then died with SIGILL on hosts without it (seen on one of Modal's H100
 # machines; four other serve tests that build a pool died the same way).
 sinfer_cuda_archive(sinfer_ops)
+# Inkling's MoE reproduces the reference kernels' rounding points (`enable_fp_fusion=False`): no
+# multiply-add contraction in its own sources. Its numerics use explicit _rn intrinsics as well.
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_nvfp4_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_mxfp8_gemm.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.

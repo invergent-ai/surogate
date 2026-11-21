@@ -128,6 +128,9 @@ sinfer_add_op_test(sinfer_marlin_moe_reduce_test SOURCES ops/test_marlin_moe_red
 sinfer_add_op_test(sinfer_nvfp4_marlin_test SOURCES ops/test_nvfp4_marlin.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_fp8_sm90_test SOURCES ops/test_sparse_moe_fp8_sm90.cu LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_segments.cpp LIBRARIES sinfer_ops)
+# Inkling-2-Mini's mixture (ENGINE-INKLING lane d): quantisers bit-exact, SiTU, router, MoE vs a host
+# pipeline, width invariance, capture rows, expert LoRA (rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md 9).
+sinfer_add_op_test(sinfer_inkling_moe_test SOURCES ops/test_inkling_moe.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)
   sinfer_add_op_test(${name}

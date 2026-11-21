@@ -83,7 +83,13 @@ struct InklingMoeWeights {
     InklingExpertBank w2;
 };
 
-/// Routed-expert capture for routing replay (R3): one row per VISIT. Token t's ids (global
+/// The per-layer MoE payload lane e1's ModelView carries (`InklingMoePayload`, DESIGN-target 4).
+using InklingMoePayload = InklingMoeWeights;
+
+/// Routed-expert capture for routing replay (R3): one row per VISIT. With the runtime's capture
+/// buffer (`io.routing_capture`, [served layers][columns][8]; Inkling's served layers are the 48
+/// visits): ids = base + visit * columns * 8, capacity_tokens = columns, first_token = the call's
+/// first column, token_stride = 8. Token t's ids (global
 /// expert ids, selection order = descending sigmoid(logit) + bias, ties to the lower id, as
 /// vLLM's `routed_expert_ids`) land at `ids + (first_token + t) * token_stride + [0, 8)`, for
 /// t < live tokens and first_token + t < capacity_tokens. `token_stride` >= 8 lets the runtime
@@ -156,10 +162,10 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
 // ---- Sub-ops (OPS.md names). Each is the exact stage `inkling_moe` runs, exposed for the op
 // ---- tests against the golden vectors and for the trainer lanes' cross-checks.
 
-/// Router: x BF16 [2304, T] -> ids I32 [8, T] (selection order), weights FP32 [8, T] (x 8.0),
-/// and, when `logits` is not null, FP32 [128, T].
-void inkling_route(const Tensor& x, const InklingMoeWeights& weights, Tensor& ids, Tensor& route_weights,
-                   Tensor* logits, cudaStream_t stream);
+/// Router: x BF16 [2304, T] -> logits FP32 [128, T], ids I32 [8, T] (selection order),
+/// weights FP32 [8, T] (x 8.0).
+void inkling_route(const Tensor& x, const InklingMoeWeights& weights, Tensor& logits, Tensor& ids,
+                   Tensor& route_weights, cudaStream_t stream);
 
 /// Per-row NVFP4 "four-over-six" (`ops/nvfp4.py`): x BF16 [K, R] (K % 16 == 0) -> codes U8 [K/2, R]
 /// (low nibble = even column), scales U8 (e4m3) [K/16, R] row-major, amax FP32 [R].
