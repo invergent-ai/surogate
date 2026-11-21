@@ -71,6 +71,21 @@ std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& s
         }
         ++linear;
     }
+    if (linear == 0 && decoder->linear_attention.layer_count() != 0) {
+        // Every served layer attends and still keeps a short-conv state of its own (Inkling: one
+        // per visit in the linear-attention pool, lanes/e1/DESIGN-target.md section 2): the state
+        // layers are the served layers. No other target gets here: a hybrid stack has layers that
+        // do not attend, a pure attention stack has no state layers.
+        if (decoder->linear_attention.layer_count() != static_cast<std::uint32_t>(cfg.layers)) {
+            throw std::logic_error("per-layer conv state does not match the served layers");
+        }
+        for (int layer = first; layer < last; ++layer) {
+            tensors.push_back(decoder->linear_attention.conv_slot(static_cast<std::uint32_t>(layer), slot));
+            if (decoder->linear_attention.spec.has_recurrent()) {
+                tensors.push_back(decoder->linear_attention.recurrent_slot(static_cast<std::uint32_t>(layer), slot));
+            }
+        }
+    }
     if (!decoder->ple.empty() && model.geometry.ple_layer >= first && model.geometry.ple_layer < last) {
         tensors.push_back(decoder->ple.history_slot(slot));
         tensors.push_back(decoder->ple.conv_slot(slot));
