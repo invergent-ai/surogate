@@ -2451,6 +2451,24 @@ void test_pdl_chain() {
     ops::inkling_attention_knobs().linear_x_nc = xnc_saved;
 }
 
+// Narrow attn_linear rows (decode / verify widths), x via ld.cg (production) and via the old ld.nc (linear_x_nc, which
+// the compiler hoisted above the PDL wait in the cell-split kernel: the incorrect form, timed for reference only).
+void run_bench_linear() {
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    const bool saved = ops::inkling_attention_knobs().linear_x_nc;
+    for (const bool nc : {false, true}) {
+        ops::inkling_attention_knobs().linear_x_nc = nc;
+        const std::string t = nc ? " [x ld.nc, old]" : " [x ld.cg]";
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + t; return x.c_str(); };
+        bench_linear(nm("attn_linear qkvr N=1 channel"), 2304, 2304, 1);
+        bench_linear(nm("attn_linear qkvr N=8 channel"), 2304, 2304, 8);
+        bench_linear(nm("attn_linear wo N=1 channel"), 3072, 3072, 1);
+        bench_linear(nm("attn_linear wo N=8 channel"), 3072, 3072, 8);
+        bench_linear(nm("attn_linear wo N=1 1x128"), 3072, 128, 1);
+    }
+    ops::inkling_attention_knobs().linear_x_nc = saved;
+}
+
 // Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
 // static metadata off / on; then the engine's fused call (separate prologue + fold kernel) on the decode rows.
 void run_bench_raw() {
@@ -2599,6 +2617,10 @@ int main(int argc, char** argv) {
             }
             if (argc > 2 && std::string(argv[2]) == "fold") {
                 run_bench_fold();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "linear") {
+                run_bench_linear();
                 return 0;
             }
             if (argc > 2 && std::string(argv[2]) == "raw") {
