@@ -151,6 +151,7 @@ class Shim:
         self.wait_timeout = float(ir.get("wait_timeout_s", 0))
         self.rank, self.alpha = int(cfg.get("lora_rank", 16)), int(cfg.get("lora_alpha", 32))
         self.engine_sha = ir.get("engine_release_sha")
+        self.require_sha = bool(ir.get("require_engine_sha", True))
         self.step_cfg = StepConfig.from_train_yaml(cfg)
         self.lr = float(cfg.get("learning_rate", 5e-5))
         if cfg.get("optimizer", "adamw") != "adamw":
@@ -248,10 +249,13 @@ class Shim:
                 return None
             time.sleep(self.poll)
         shaf = os.path.join(os.path.dirname(path), "ENGINE_SHA")
-        if self.engine_sha is not None and os.path.exists(shaf):
-            got = open(shaf).read().strip()
-            if got != self.engine_sha:
-                raise SystemExit(f"REFUSED batch step_{n}: sampled on engine release {got}, the run names {self.engine_sha}")
+        if self.engine_sha is not None:
+            if not os.path.exists(shaf):
+                if self.require_sha:
+                    raise SystemExit(f"REFUSED batch step_{n}: no ENGINE_SHA beside it (the kit branch inkling-rl writes one)")
+            elif open(shaf).read().strip() != self.engine_sha:
+                raise SystemExit(f"REFUSED batch step_{n}: sampled on engine release {open(shaf).read().strip()}, the run "
+                                 f"names {self.engine_sha}")
         return path
 
     # ------------------------------------------------------------------ loop

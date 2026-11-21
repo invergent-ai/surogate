@@ -155,9 +155,11 @@ def make_batch(es, eng, adapter_dir, version, step, prompts, n, new, seed):
     return records.encode_batch(TB(examples=ex, step=step)), held
 
 
-def write_batch(run_dir, step, data):
+def write_batch(run_dir, step, data, sha="fake-engine-sha"):
     d = os.path.join(run_dir, "rollouts", f"step_{step}")
     os.makedirs(d, exist_ok=True)
+    if sha is not None:
+        open(os.path.join(d, "ENGINE_SHA"), "w").write(sha + "\n")    # as the kit branch inkling-rl's loop writes it
     open(os.path.join(d, "rollouts.bin"), "wb").write(data)
 
 
@@ -239,6 +241,17 @@ def test_e2e_and_resume():
     assert open(st).read() == s_a
     met = [json.loads(x) for x in open(c2["surogate_metrics_path"])]
     assert met[1]["train/offpolicy_dropped_samples"] == 0 and met[1]["train/engine_mismatch_kl"] > 0   # step 1 trained on v0 rows
+    # engine identity: a batch from another release, or without ENGINE_SHA, is refused
+    for sha, tag in (("other-sha", "wrong"), (None, "missing")):
+        t3 = os.path.join(tmp, tag)
+        c3 = _cfg(t3, max_steps=1)
+        write_batch(c3["inkling_rl"]["run_dir"], 0, data, sha=sha)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                Shim(c3, backend=FakeInkling(seed=0, rank=4, alpha=8)).run()
+            raise AssertionError(f"{tag} ENGINE_SHA not refused")
+        except SystemExit as e:
+            assert "REFUSED" in str(e), e
     shutil.rmtree(tmp)
 
 
