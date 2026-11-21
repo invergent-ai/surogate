@@ -104,6 +104,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     // Lane b binds the text-only set (no pixel configs): take exactly that set.
     frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
+    // The release's chat_template.jinja is for HF tooling: vLLM renders Inkling prompts natively from the request
+    // (renderers/inkling_encoding.py), and so does lane f2's frontend, which takes that path only when the artifact
+    // states no template. The engine's Jinja reader also cannot parse this one. `--chat-template` still overrides.
+    frontend.chat_template_jinja.clear();
     weights  = load::load_weights(plan.plan, backing);
     derive_queries(weights.globals, queries);
     model.weights = &weights;

@@ -220,6 +220,38 @@ void inkling_gemm_bf16_f32(const void* weight, std::int32_t n, std::int32_t k, c
                            std::int32_t tokens, float* out, std::int32_t ldc, cudaStream_t stream);
 void inkling_gemm_f32_prepare(std::int32_t n, std::int32_t k, std::int32_t tokens, std::int32_t ldc);
 
+/// ---- Batch- and path-invariant GEMM (agent-EN 10:2x: one invariant forward for engine and trainer) ----
+///
+/// out[0:n, t] = W[n, k] . x[:, t] for t < tokens, BF16 operands, FP32 accumulation, stored as `out_dtype`
+/// (BF16: one rounding at the end; FP32: the accumulator). W is [n, k] with k contiguous, x is [k, tokens] with k
+/// contiguous, out has `ldc` elements per token column.
+///
+/// Every output element is fixed by (n, k) alone, never by `tokens`, the batch, or the tile:
+/// - the k range is cut into `inkling_gemm_split(n, k)` equal chunks (one chunk unless n is small and k long: the
+///   controller `down` 64 x 4608 runs as 18 x 256, the dynamic taps 32 x 2304 as 9 x 256);
+/// - each chunk is ONE accumulator from zero running the m16n8k16 BF16 MMA over its k in increasing 16-wide steps
+///   (k padded with zeros to a multiple of 64) -- the chain of ops/linear/bf16/bf16_invariant_gemm;
+/// - the chunks' FP32 partials are added in chunk order (p0 + p1 + ... ) and the sum is stored.
+/// The tile follows `tokens` for speed only; no tile changes a chain, no split-K follows the width.
+///
+/// `batch` runs `count` independent problems of one shape in one launch (the 3 streams of a blend): problem b reads
+/// weight + b * weight_stride, x + b * x_stride (elements) and writes out + b * out_stride.
+struct InklingGemmBatch {
+    std::int32_t count        = 1;
+    std::int64_t weight_stride = 0;
+    std::int64_t x_stride      = 0;
+    std::int64_t out_stride    = 0;
+};
+[[nodiscard]] std::int32_t inkling_gemm_split(std::int32_t n, std::int32_t k) noexcept;
+/// Scratch for the chunks' partials (0 when the shape runs as one chunk).
+[[nodiscard]] std::size_t inkling_gemm_inv_workspace_bytes(std::int32_t n, std::int32_t k, std::int32_t tokens,
+                                                           std::int32_t batch) noexcept;
+/// k a positive multiple of 8, ldc >= n, weight and x 16-byte aligned, `workspace` at least
+/// inkling_gemm_inv_workspace_bytes(n, k, tokens, batch.count) bytes (16-byte aligned) when the shape splits.
+void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const void* x, std::int32_t tokens,
+                      void* out, DType out_dtype, std::int32_t ldc, const InklingGemmBatch& batch, void* workspace,
+                      std::size_t workspace_bytes, cudaStream_t stream);
+
 /// In place: x = (tanh(x / cap)) * cap in fp32 (vLLM LogitsProcessor soft_cap), FP32 [rows, T] with
 /// `ldc` elements per column, first `rows` rows of each column.
 void inkling_softcap_f32(float* logits, std::int32_t rows, std::int32_t tokens, std::int32_t ldc,

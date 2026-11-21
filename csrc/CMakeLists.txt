@@ -1607,6 +1607,7 @@ set_source_files_properties(
 # where it says fma, and so must these kernels (rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md 3).
 target_sources(sinfer_ops PRIVATE
   ${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_inv.cu
   ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_f32.cpp)
 set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
