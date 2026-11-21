@@ -178,11 +178,19 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device, c
 }
 
 std::vector<int> Package::pipeline_stage_bounds(int stage_count) {
-    // 2 stages: cut after visit 24 (layer 11 of pass 1). Both stages then hold 18 physical layers (0-17 | 6-23) and
-    // 4 of the 8 global visits (layers 5, 11, 17 of pass 0, 11 of pass 1 | 17 of pass 1, 11 and 17 of pass 2, 23),
-    // so the 1M-token global KV splits evenly.
-    if (stage_count == 2) { return {0, 24, detail::TextConfig::layers}; }
-    throw std::invalid_argument("inkling2: the visit split is defined for 2 stages");
+    // 2 stages: cut after visit 30 (the end of core pass 1; f1c's DESIGN-2card-1M.md 3, counting KV, not only weights).
+    // Card 0 = prelude + core passes 0-1 (layers 0-17, 5 global visits, embedding); card 1 = core pass 2 + coda + head
+    // (+ DSpark's planes / drafter): layers 6-23, 3 global visits. At 1M both cards land near 22 GiB (f1c's estimate).
+    // SUROGATE_SERVE_INKLING_STAGE_CUT=<visit> overrides the cut (measurement only).
+    if (stage_count != 2) { throw std::invalid_argument("inkling2: the visit split is defined for 2 stages"); }
+    int cut = 30;
+    if (const char* raw = std::getenv("SUROGATE_SERVE_INKLING_STAGE_CUT"); raw != nullptr && *raw != '\0') {
+        cut = std::atoi(raw);
+        if (cut <= 0 || cut >= detail::TextConfig::layers) {
+            throw std::invalid_argument("SUROGATE_SERVE_INKLING_STAGE_CUT must be a visit in 1..47");
+        }
+    }
+    return {0, cut, detail::TextConfig::layers};
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
