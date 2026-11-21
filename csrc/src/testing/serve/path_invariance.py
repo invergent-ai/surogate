@@ -27,6 +27,7 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -219,8 +220,13 @@ def main():
             chars_per_token = len(s_text) / max(1, len(s_ids))
             long_text = (material * (2 + int(4 * cap * chars_per_token) // max(1, len(material))))[777:]
             length = int((cap - 300) * chars_per_token)
-            while length > 0 and len(eng.tokenize(long_text[:length])[0]) > cap - 300:
-                length = int(length * 0.95)
+            def fits(n):
+                try:
+                    return len(eng.tokenize(long_text[:n])[0]) <= cap - 300
+                except urllib.error.HTTPError:  # /tokenize refuses a prompt past the context too
+                    return False
+            while length > 0 and not fits(length):
+                length = int(length * 0.9)
             filler = long_text[:length]
             eng.complete(filler, 1)
             before = eng.host_restores()
