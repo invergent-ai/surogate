@@ -124,7 +124,12 @@ struct Round {
     std::vector<Group> groups;
     ops::InklingConvRecords records{};
     ops::InklingConvPool pool{};
+    /// The segments' ints went in one host copy this round: everything the step wrote before is complete.
+    bool seg_barrier = false;
 };
+
+/// Lane c's key-group cut, passed explicitly (engine and trainer must pass the same value; lane h froze P3).
+constexpr ops::InklingKeyGroups kKeyGroups = ops::InklingKeyGroups::P3;
 
 ops::InklingConvStateView state_view(const Round& rd, int visit) {
     const Tensor& conv = rd.r.state->conv.at(static_cast<std::size_t>(visit));
@@ -598,6 +603,12 @@ void run_visit(Round& rd, int v) {
             rows.positions     = g.positions;
             rows.valid_columns = g.valid;
             rows.kv_table_rows = g.table_rows;
+            rows.key_groups    = kKeyGroups;
+            // Lane c's early metadata read (c2's metadata_static, e1's Q3 answer 12:41): segments when their ints went
+            // in the round's host copy (a full barrier after everything the step wrote before); the ordinary decode
+            // block (ingress copy, the step's first node) or any non-verify block behind that barrier; never verify.
+            rows.metadata_static = seg != nullptr ? rd.seg_barrier
+                                                  : !g.record && (rd.r.block->metadata_static || rd.seg_barrier);
             if (rd.r.block != nullptr && seg == nullptr) {
                 rows.envelope = rd.r.block->envelope;
             } else {
@@ -776,6 +787,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
         if (seg_capture == cudaStreamCaptureStatusNone) {
             CUDA_CHECK(cudaMemcpyAsync(seg_dev.data, seg_ints.data(), seg_ints.size() * sizeof(std::int32_t),
                                        cudaMemcpyHostToDevice, rd.s));
+            rd.seg_barrier = true;
         } else {
             for (std::size_t i = 0; i < seg_ints.size(); ++i) {
                 naive::fill_i32(static_cast<std::int32_t*>(seg_dev.data) + i, 1, seg_ints[i], rd.s);
@@ -861,11 +873,12 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     std::size_t attention     = 0;
     for (const auto kind : {ops::InklingLayerKind::Local, ops::InklingLayerKind::Global}) {
         if (max_columns > 0) {
-            attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, 1, 1, max_columns, envelope));
+            attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, 1, 1, max_columns, envelope,
+                                                                                            kKeyGroups));
         }
         if (batch_size > 0 && max_width > 0) {
             attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, batch_size, 1, max_width,
-                                                                                            envelope));
+                                                                                            envelope, kKeyGroups));
         }
     }
     // An engine started with adapters (--enable-lora / --lora-modules) books the expert LoRA buffers.
