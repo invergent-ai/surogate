@@ -63,6 +63,10 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScale128Fp8V1;
     case NumericFormat::FP8_E4M3FN_ROW_F32S:
         return StorageLayout::RowScaleF32V1;
+    case NumericFormat::MXFP8:
+        return StorageLayout::Mxfp8K32V1;
+    case NumericFormat::FP8_E4M3FN_1X128_F32S:
+        return StorageLayout::Fp8Grid1x128F32V1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -135,8 +139,11 @@ Weight fp8_block_weight(const MaterializedArtifact& materialized, ObjectHandle h
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
     const bool per_row = format == NumericFormat::FP8_E4M3FN_ROW_F32S;
+    const bool grid_1x128 = format == NumericFormat::FP8_E4M3FN_1X128_F32S;
     const BlockScale128Geometry geometry =
-        per_row ? row_scale_f32_geometry(format, shape) : block_scale128_geometry(format, shape);
+        per_row      ? row_scale_f32_geometry(format, shape)
+        : grid_1x128 ? fp8_grid_1x128_geometry(format, shape)
+                     : block_scale128_geometry(format, shape);
     const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
     Weight out{};
     out.payload         = bytes;
@@ -146,7 +153,7 @@ Weight fp8_block_weight(const MaterializedArtifact& materialized, ObjectHandle h
     // The scale grid's cell: [k per scale, rows per scale] -- 128 x 128 for the block export,
     // k x 1 for a per-channel one. The kernels index the grid through these.
     out.scale_ne[0]     = per_row ? columns : 128;
-    out.scale_ne[1]     = per_row ? 1 : 128;
+    out.scale_ne[1]     = (per_row || grid_1x128) ? 1 : 128;
     out.group_size      = 128;
     out.qdata           = bytes;
     out.qhigh           = nullptr;
@@ -304,6 +311,13 @@ QType qtype_for(NumericFormat format) {
         return QType::FP8_E4M3FN_BLK128_F32S;
     case NumericFormat::FP8_E4M3FN_ROW_F32S:
         return QType::FP8_E4M3FN_ROW_F32S;
+    case NumericFormat::FP8_E4M3FN_1X128_F32S:
+        // No QType of its own (core/tensor.h is not this lane's file): the block route's qtype
+        // with a [128 columns x 1 row] scale cell, which the existing FP8 block kernels refuse
+        // (they accept only 128x128 and k x 1 cells) instead of misreading.
+        return QType::FP8_E4M3FN_BLK128_F32S;
+    case NumericFormat::MXFP8:
+        throw std::invalid_argument("MXFP8 has no runtime QType: bind it as a raw expert bank");
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -416,8 +430,12 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
         return row_scale_weight(materialized, handle, format, rows, columns);
     }
+    if (format == NumericFormat::MXFP8) {
+        throw std::invalid_argument("materialized_weight: MXFP8 is a raw expert bank, not a Weight");
+    }
     if (storage_layout_for(format) == StorageLayout::BlockScale128Fp8V1 ||
-        storage_layout_for(format) == StorageLayout::RowScaleF32V1) {
+        storage_layout_for(format) == StorageLayout::RowScaleF32V1 ||
+        storage_layout_for(format) == StorageLayout::Fp8Grid1x128F32V1) {
         return fp8_block_weight(materialized, handle, format, rows, columns);
     }
     if (storage_layout_for(format) == StorageLayout::GgmlBlocksV1) {
@@ -485,9 +503,11 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::Q1_0:
     case NumericFormat::Q2_0:
     case NumericFormat::F16:
+    case NumericFormat::FP8_E4M3FN_1X128_F32S:
         return true;
     case NumericFormat::FP32:
     case NumericFormat::I32:
+    case NumericFormat::MXFP8:
         return false;
     }
     return false;

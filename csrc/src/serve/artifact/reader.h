@@ -62,6 +62,13 @@ enum class NumericFormat {
     /// a divisor, and there is no activation divisor, because the activations are never
     /// quantised. A routed bank stores the identity there and its multipliers per expert.
     NVFP4_A16,
+    /// OCP MX FP8 (Inkling-2-Mini's experts, layers 20-23): E4M3FN codes [rows][columns] and one
+    /// E8M0 scale word (2^(word - 127); 0xFF refused) per row per 32 columns, natural order.
+    /// Not a linear format: the MoE op binds it as a raw bank through `mxfp8_geometry`.
+    MXFP8,
+    /// E4M3FN codes with one FP32 scale per row per 128 columns (Inkling's FP8-attention
+    /// candidates "1x128" and, with each block's scale repeated per row, "128x128").
+    FP8_E4M3FN_1X128_F32S,
 };
 
 enum class StorageLayout {
@@ -72,6 +79,11 @@ enum class StorageLayout {
     GgmlBlocksV1,
     BlockScale128Fp8V1,
     RowScaleF32V1,
+    /// mxfp8-k32-v1: E4M3FN codes [rows][columns], then, 256-aligned, E8M0 words [rows][columns/32].
+    Mxfp8K32V1,
+    /// fp8-1x128-f32-v1: E4M3FN codes [rows][columns], then, 256-aligned, FP32 scales
+    /// [rows][columns/128].
+    Fp8Grid1x128F32V1,
 };
 
 enum class ResourceEncoding {
@@ -148,6 +160,22 @@ BlockScale128Geometry block_scale128_geometry(NumericFormat format, std::span<co
 /// row-scale-f32-v1: the E4M3 code plane [rows][columns], then, 256-aligned, one FP32 scale
 /// per row. The block route reads it as a [rows][1] grid.
 BlockScale128Geometry row_scale_f32_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+/// fp8-1x128-f32-v1: the E4M3 code plane [rows][columns], then, 256-aligned, an FP32 scale grid
+/// [rows][columns/128]; columns a whole number of 128s.
+BlockScale128Geometry fp8_grid_1x128_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+/// mxfp8-k32-v1: the E4M3 code plane [rows][columns], then, 256-aligned, the E8M0 scale plane
+/// [rows][columns/32] row-major; columns a whole number of 32s.
+struct Mxfp8Geometry {
+    std::uint64_t rows               = 0;
+    std::uint64_t columns            = 0;
+    std::uint64_t groups_per_row     = 0;
+    std::uint64_t code_plane_bytes   = 0;
+    std::uint64_t scale_plane_offset = 0;
+    std::uint64_t scale_plane_bytes  = 0;
+    std::uint64_t encoded_bytes      = 0;
+};
+Mxfp8Geometry mxfp8_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
 /// How an object's runs become its stored form. `None` is a copy, which is what every object
 /// written into the artifact's own payload is. `Q8ToW8RowSplit` rearranges Q8_0 blocks into the

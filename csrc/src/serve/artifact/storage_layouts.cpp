@@ -140,6 +140,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "Q2_0";
     case NumericFormat::F16:
         return "F16";
+    case NumericFormat::MXFP8:
+        return "MXFP8";
+    case NumericFormat::FP8_E4M3FN_1X128_F32S:
+        return "FP8_E4M3FN_1X128_F32S";
     }
     return {};
 }
@@ -154,6 +158,12 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::Mxfp8K32V1:
+        return "mxfp8-k32-v1";
+    case StorageLayout::Fp8Grid1x128F32V1:
+        return "fp8-1x128-f32-v1";
+    default:
+        break;
     }
     return {};
 }
@@ -253,6 +263,12 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleF32V1) {
         return row_scale_f32_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::Mxfp8K32V1) {
+        return mxfp8_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::Fp8Grid1x128F32V1) {
+        return fp8_grid_1x128_geometry(format, shape).encoded_bytes;
     }
     if (layout == StorageLayout::GgmlBlocksV1) {
         const auto values = ggml_block_values(format);
@@ -358,6 +374,47 @@ BlockScale128Geometry row_scale_f32_geometry(NumericFormat format,
     out.scale_plane_offset = align_up(out.code_plane_bytes, kTensorAlignment, "FP8 row scale plane offset");
     out.scale_plane_bytes = checked_mul(out.rows, 4, "FP8 row scale plane bytes");
     out.encoded_bytes = checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 row tensor encoded size");
+    return out;
+}
+
+BlockScale128Geometry fp8_grid_1x128_geometry(NumericFormat format,
+                                              std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_1X128_F32S) {
+        throw ArtifactError("fp8-1x128-f32-v1 requires FP8_E4M3FN_1X128_F32S");
+    }
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % 128) != 0) {
+        throw ArtifactError("fp8-1x128-f32-v1 requires a rank-two shape with k a whole number of 128s");
+    }
+    BlockScale128Geometry out;
+    out.rows             = shape[0];
+    out.columns          = shape[1];
+    out.code_plane_bytes = checked_mul(out.rows, out.columns, "FP8 element count");
+    out.scale_plane_offset =
+        align_up(out.code_plane_bytes, kTensorAlignment, "FP8 1x128 scale plane offset");
+    out.scale_plane_bytes = checked_mul(checked_mul(out.rows, out.columns / 128, "FP8 1x128 cell count"), 4,
+                                        "FP8 1x128 scale plane bytes");
+    out.encoded_bytes =
+        checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 1x128 tensor encoded size");
+    return out;
+}
+
+Mxfp8Geometry mxfp8_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::MXFP8) {
+        throw ArtifactError("mxfp8-k32-v1 requires MXFP8");
+    }
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % 32) != 0) {
+        throw ArtifactError("mxfp8-k32-v1 requires a rank-two shape with k a whole number of 32s");
+    }
+    Mxfp8Geometry out;
+    out.rows             = shape[0];
+    out.columns          = shape[1];
+    out.groups_per_row   = shape[1] / 32;
+    out.code_plane_bytes = checked_mul(out.rows, out.columns, "MXFP8 element count");
+    out.scale_plane_offset =
+        align_up(out.code_plane_bytes, kTensorAlignment, "MXFP8 scale plane offset");
+    out.scale_plane_bytes = checked_mul(out.rows, out.groups_per_row, "MXFP8 scale plane bytes");
+    out.encoded_bytes =
+        checked_add(out.scale_plane_offset, out.scale_plane_bytes, "MXFP8 tensor encoded size");
     return out;
 }
 
