@@ -12,8 +12,10 @@
 
 #include "family/impl/frontend/inkling_json.h"
 
+#include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,6 +37,7 @@ struct SpecialTokens {
     int content_invoke_tool_json = -1;
     int content_invoke_tool_text = -1;  // parser only
     int end_message = -1;
+    int image_pad = -1;                 // <|unused_200054|>: one per decoder image token (vLLM IMAGE_PAD_ID); optional
 
     /// Throws std::invalid_argument naming the spellings the vocabulary lacks.
     static SpecialTokens resolve(const std::function<std::optional<int>(std::string_view)>& token_id);
@@ -55,14 +58,30 @@ struct ChatRequest {
     bool parallel_tool_calls = true;    // `parallel_tool_calls is not False`
     bool include_reasoning = true;
     PyValue template_kwargs;            // the effective chat_template_kwargs
+    /// The image parts' sources (data: / http(s) URLs), in vLLM's order (message order, part order): the order
+    /// parse_chat_messages fetches them in and render_chat meets their <|content_image|> markers. Empty unless the
+    /// request was parsed with an image limit above 0 (lane V-b).
+    std::vector<std::string> image_urls;
 };
 
-/// Throws RequestError where the reference's request validation refuses the body.
-[[nodiscard]] ChatRequest parse_chat_request(std::string_view body_json);
+/// Throws RequestError where the reference's request validation refuses the body. `image_limit` is vLLM's per-prompt
+/// image count (--limit-mm-per-prompt): 0 = vision off (every image part refused with vLLM's text at limit 0, "At most
+/// 0 image(s) may be provided in one prompt."); otherwise image_url / input_image parts are accepted up to the limit and
+/// their sources collected in ChatRequest::image_urls.
+[[nodiscard]] ChatRequest parse_chat_request(std::string_view body_json, std::uint64_t image_limit = 0);
 
-/// render_inkling2_messages for this request. Throws RequestError where the reference raises.
+/// vLLM's per-prompt image refusal, word for word (multimodal/processing/context.py validate_num_items; Inkling's
+/// supported limit is unbounded, so no "--limit-mm-per-prompt" hint follows).
+[[nodiscard]] std::string image_count_message(std::uint64_t limit);
+
+/// render_inkling2_messages for this request. Throws RequestError where the reference raises. With images, the ids are
+/// the ones vLLM's engine sees after the multimodal prompt update: each image part renders as
+/// <|message_ROLE|> [author] <|content_image|> N x <|unused_200054|> <|end_message|>, N = image_tokens[k] for the k-th
+/// image part (ceil(H/40) * ceil(W/40), lane V-b's inkling_vision.h). `image_tokens` must hold one count per entry of
+/// request.image_urls.
 [[nodiscard]] std::vector<int> render_chat(const ChatRequest& request, const TextEncoder& encode_text,
-                                           const SpecialTokens& special);
+                                           const SpecialTokens& special,
+                                           std::span<const std::uint64_t> image_tokens = {});
 
 /// The reasoning effort the renderer uses for this request (chat_template_kwargs / top-level reasoning_effort, named
 /// levels, numeric strings; default 0.99 by the owner's rule of 2026-11-21 -- vLLM's is 0.9). Throws RequestError for
