@@ -86,8 +86,10 @@ enum class InklingLayerKind : std::uint8_t {
  * value (it is a field of InklingAttentionRows, which both entry points take). Global / local group sizes:
  * P1 512 / 128; P2 2,048 (8,192 from key 65,536) / 256; P3 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128;
  * P4 (measurement) P3 / 64; P5 (measurement) 256 below 65,536 then P3 / 128. Default = the process default: the
- * compiled kInklingDefaultKeyGroups (P3 until lane h's price session decides), unless SUROGATE_INKLING_ATTN_GROUPS
- * (p1 .. p5) was set when the process first used these ops (read once; a test override).
+ * compiled kInklingDefaultKeyGroups = P3, FROZEN by lane h's price session (2026-11-21 14:1x: P3 mean -0.93 % vs the
+ * non-invariant BASE, worst +1.1 % at 1x262k; P1 +5.4 %, P2 +10.8 % on their worst probes). P1 / P2 / P4 / P5 are
+ * test / measurement options only. SUROGATE_INKLING_ATTN_GROUPS (p1 .. p5), if set when the process first uses these
+ * ops, overrides the default (read once; a test override).
  */
 enum class InklingKeyGroups : std::uint8_t {
     Default,
