@@ -494,6 +494,9 @@ struct OutputOptions {
     bool structured = false; // generated JSON stays in content; stop tokens are still hidden
     bool raw                     = false;
     bool preserve_special_tokens = false;
+    /// Each round also publishes the token ids it accepted (OutputDelta::token_ids), for a reader that parses the
+    /// stream from ids (Inkling-2 streaming). Off for every other request: their deltas are unchanged.
+    bool report_token_ids = false;
 };
 
 struct RequestOptions {
@@ -826,6 +829,9 @@ struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
     std::optional<TokenScoreDelta> scores;
+    /// OutputOptions::report_token_ids only: the generated tokens this round accepted, in order, without the stop
+    /// token that ended the generation (carried by a delta of its own, `text` empty). Empty otherwise.
+    std::vector<TokenId> token_ids;
 };
 
 class OutputSink {

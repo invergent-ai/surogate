@@ -1527,6 +1527,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
+                if (stream->prepared.inkling_request) {
+                    // Inkling-2 streams its calls as they are read (GenerationService, inkling::StreamParser).
+                    output.on_tool_call_delta = [&](const std::vector<ToolCallDelta>& deltas) {
+                        ensure_role();
+                        offer_stream_item(sink, *stream,
+                                          make_chat_chunk_tool_call_deltas(id, model, created, deltas, include_usage));
+                    };
+                }
                 output.on_scores = [&](const GenerationOutcome& scored) {
                     ensure_role();
                     TokenDetail detail;
@@ -1575,9 +1583,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                                   std::string(remaining),
                                                                   include_usage));
                     }
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_tool_calls(
-                                          id, model, created, outcome.tool_calls, include_usage));
+                    if (!outcome.tool_calls_streamed) {
+                        write_stream_item(sink, *stream,
+                                          make_chat_chunk_tool_calls(
+                                              id, model, created, outcome.tool_calls, include_usage));
+                    }
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,

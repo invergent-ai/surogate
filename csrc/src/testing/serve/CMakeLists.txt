@@ -76,6 +76,27 @@ target_link_libraries(sinfer_inkling_frontend_test PRIVATE sinfer_text Threads::
 add_test(NAME sinfer_inkling_frontend_test COMMAND sinfer_inkling_frontend_test)
 set_tests_properties(sinfer_inkling_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_frontend_test)
+# The same sources: Inkling-2 streaming (inkling::StreamParser) -- the concatenated deltas equal the non-streamed
+# message for every parser vector, and deltas come as the tokens do. The frontend gate's streaming check.
+add_executable(sinfer_inkling_stream_test
+  inkling/test_inkling_stream.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_parse.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_stream_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_stream_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_stream_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_stream_test PRIVATE sinfer_text Threads::Threads)
+add_test(NAME sinfer_inkling_stream_test COMMAND sinfer_inkling_stream_test)
+set_tests_properties(sinfer_inkling_stream_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_stream_test)
 
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
