@@ -114,13 +114,18 @@ __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, i
 // with an L2 slab prefetch (perf6) and all codes at entry (perf7 / 8) were slower.
 inline constexpr int kNarrowWarps  = 2;
 inline constexpr int kNarrowRows   = kNarrowWarps * 8;
-inline constexpr int kNarrowStages = 8;
+inline constexpr int kNarrowStages = 8; // qkvr (K = 2304, 1,075 warps); wo (K = 3072, 288 warps) uses 16: fewer warps,
+                                         // so more of each warp's slab in flight (copies grouped in pairs then)
 
 template <int K, bool PerRow>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
     constexpr int Cells = K / 128;
     static_assert(Cells % 2 == 0, "cells run in pairs");
-    __shared__ __align__(16) std::uint8_t ring_all[kNarrowWarps][kNarrowStages][8 * 128];
+    constexpr int Stages  = K == 3072 ? 2 * kNarrowStages : kNarrowStages;
+    constexpr int G       = Stages / 8;                              // cells per cp.async group
+    constexpr int Pending = G == 1 ? Stages - 3 : Stages / 2 - 2;    // groups allowed in flight at a pair's wait
+    static_assert(Pending <= 7, "cp.async.wait_group immediate");
+    __shared__ __align__(16) std::uint8_t ring_all[kNarrowWarps][Stages][8 * 128];
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
@@ -140,13 +145,16 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
             const int q     = piece & 7; // 16-byte piece of the row's 128-byte cell
             const std::uint8_t* src =
                 s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + r, s.rows - 1)) * K + c * 128 + q * 16;
-            std::uint8_t* dst = &ring[c % kNarrowStages][r * 128 + ((((q >> 1) ^ (r & 3)) << 5) | ((q & 1) << 4))];
+            std::uint8_t* dst = &ring[c % Stages][r * 128 + ((((q >> 1) ^ (r & 3)) << 5) | ((q & 1) << 4))];
             cp_async<16, Cache::cg>(dst, src);
         }
     };
 #pragma unroll
-    for (int c = 0; c < kNarrowStages - 1; ++c) {
-        if (c < Cells) { stage(c); }
+    for (int c = 0; c < Stages - G; c += G) {
+#pragma unroll
+        for (int i = 0; i < G; ++i) {
+            if (c + i < Cells) { stage(c + i); }
+        }
         cp_commit();
     }
     pdl::wait_for_dependencies();
@@ -158,7 +166,7 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     const __nv_bfloat16* x1 = s.x + static_cast<std::int64_t>(t1 ? gid + 8 : 0) * K + 8 * lid;
     const auto mask         = [](uint4 v, bool ok) { return ok ? v : make_uint4(0, 0, 0, 0); };
     const auto codes        = [&](int c, int j) {
-        const uint2 cw = load_vec<uint2>(&ring[c % kNarrowStages][gid * 128 + ((j ^ (gid & 3)) << 5) + 8 * lid]);
+        const uint2 cw = load_vec<uint2>(&ring[c % Stages][gid * 128 + ((j ^ (gid & 3)) << 5) + 8 * lid]);
         return e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
     };
     float acc[4]   = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -166,7 +174,7 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll 1
     for (int c = 0; c < Cells; c += 2) {
-        cp_wait<kNarrowStages - 3>(); // cells c and c + 1 have landed (this lane's copies) ...
+        cp_wait<Pending>(); // cells c and c + 1 have landed (this lane's copies) ...
         __syncwarp();                 // ... and every lane's
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -184,10 +192,18 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
         cell_end<PerRow>(acc, part0, s00, s01);
         cell_end<PerRow>(acc, part1, s10, s11);
         __syncwarp(); // every lane is done with the two slots before they are refilled
-        if (c + kNarrowStages - 1 < Cells) { stage(c + kNarrowStages - 1); }
-        cp_commit();
-        if (c + kNarrowStages < Cells) { stage(c + kNarrowStages); }
-        cp_commit();
+        if constexpr (G == 1) {
+            if (c + Stages - 1 < Cells) { stage(c + Stages - 1); }
+            cp_commit();
+            if (c + Stages < Cells) { stage(c + Stages); }
+            cp_commit();
+        } else {
+            if (c + Stages - 2 < Cells) {
+                stage(c + Stages - 2);
+                stage(c + Stages - 1);
+            }
+            cp_commit();
+        }
     }
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
