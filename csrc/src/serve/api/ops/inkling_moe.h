@@ -128,6 +128,9 @@ struct InklingMoeTaps {
     void* down            = nullptr; ///< BF16 [T * 8][2304]: the down projection's rows
     void* gate_up         = nullptr; ///< BF16 [T * 8][2304]: the bf16 gate_up rows (interleaved), as the SiTU reads them
     void* y               = nullptr; ///< BF16 [T * 8][1152]: the SiTU output before re-quantisation
+    /// FP32 [T][128]: the router logits (`(p0 + p1) + p2`, before the bias; the trainer's routing
+    /// backward). The routing probabilities are sigmoid(logits) and the weights are `gammas`.
+    float* logits         = nullptr;
 };
 
 struct InklingMoeOptions {

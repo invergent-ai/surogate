@@ -290,6 +290,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
             copy(taps->y_amax, b.y_amax, s * sizeof(float));
         }
         copy(taps->down, b.down, s * kHidden * sizeof(__nv_bfloat16));
+        copy(taps->logits, b.logits, static_cast<std::size_t>(tokens) * kExperts * sizeof(float));
         copy(taps->y, b.y, s * kIntermediate * sizeof(__nv_bfloat16));
     }
 }
