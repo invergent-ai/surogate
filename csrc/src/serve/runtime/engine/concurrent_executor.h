@@ -1996,6 +1996,12 @@ private:
         auto& program = *instance_.program;
         const std::uint32_t groups = program.group_count();
         if (group_meta_.size() != groups) { group_meta_.resize(groups); }
+        // Lane f1 M3-C: an elastic window class compacts between rounds, never under one in flight.
+        if constexpr (requires { program.kv_round_boundary(); }) {
+            bool idle = true;
+            for (std::uint32_t g = 0; g < groups && idle; ++g) { idle = !program.group_in_flight(g); }
+            if (idle) { program.kv_round_boundary(); }
+        }
         // Admission is CPU-only (deferred first chunk) and stages the prompt into the mixed
         // prefill set; top_up admits while that set has room and a lane is free, which is
         // exactly the bound the set can hold.

@@ -235,6 +235,9 @@ public:
     /// Round boundary on the executor thread: gives back the reserve if another engine on the
     /// device asked, and reports whether the device is under pressure.
     bool kv_service_pressure() noexcept;
+    /// Round boundary with no round in flight (the pipelined executor; the lockstep one does it in
+    /// kv_service_pressure): compacts an elastic window class (lane f1 M3-C). No-op without one.
+    void kv_round_boundary() noexcept;
     void reset_memory_peaks() noexcept;
     /// --kv-admission (DESIGN-kv-admission.md): set once by the executor, before any request.
     void configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept;

@@ -5487,6 +5487,13 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
     return kv_under_pressure();
 }
 
+void ProgramImplCore::kv_round_boundary() noexcept {
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        region->flush_reserve_release();
+        compact_window_kv();
+    }
+}
+
 bool ProgramImplCore::kv_under_pressure() const noexcept {
     return decoder->text_kv.pool().elastic_region() != nullptr &&
            elastic_kv_device_pressure(device.device);

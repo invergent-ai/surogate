@@ -423,6 +423,14 @@ public:
         for (Stage* stage : stages_) { pressure = stage->program->kv_service_pressure() || pressure; }
         return pressure;
     }
+    /// Lane f1 M3-C: every stage compacts its elastic window class (no-op without one). The
+    /// executor calls it only while no group is in flight.
+    void kv_round_boundary() noexcept {
+        for (std::size_t s = 0; s < stages_.size(); ++s) {
+            select(s);
+            stages_[s]->program->kv_round_boundary();
+        }
+    }
     void reset_memory_peaks() noexcept {
         for (Stage* stage : stages_) { stage->program->reset_memory_peaks(); }
     }

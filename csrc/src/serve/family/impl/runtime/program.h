@@ -621,6 +621,7 @@ public:
     [[nodiscard]] bool kv_under_pressure() const noexcept;
     /// Round boundary: perform a reserve release another engine asked for, report pressure.
     bool kv_service_pressure() noexcept;
+    void kv_round_boundary() noexcept; ///< lane f1 M3-C: window-class compaction (pipelined executor)
 
     /// --kv-admission (DESIGN-kv-admission.md), set once by the executor before any request is
     /// planned. On demand only where a recompute reproduces a sequence: not on a pipeline stage
