@@ -190,7 +190,12 @@ struct InklingAttentionKnobs {
     // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight, a worker's
     // old blocks staged before the PDL wait under metadata_static; ~72 KB smem: one CTA an SM) when workers x 8 x B <=
     // SMs, 2 = the ring always. Same bits either way.
-    int decode_raw = 1;
+    // Measured SLOWER (raw1, gpubox1 card 0, meta 1, us, raw 0 / 2): local 1x8k 6.4 / 7.4, global 1x8k 18.4 / 19.1, local
+    // 8x8k 15.6 / 21.0, global 1x64k 94.5 / 106.0, verify W3 local 6.3 / 7.0 -> default 0 (kept, tested bitwise).
+    int decode_raw = 0;
+    // Fused fold arrival (fused_fold_max > 0 only; SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT): fence.acq_rel.gpu + a relaxed
+    // atomic (Marlin's barrier pattern) instead of __threadfence (MEMBAR.SC.GPU + CCTL.IVALL) + atomicAdd. Same bits.
+    bool fold_fence_light = true;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 

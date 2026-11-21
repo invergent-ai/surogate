@@ -118,6 +118,7 @@ struct AttnParams {
     std::int32_t* fold_counters;
     int final_mode; // the fused fold's output (kGated / kOutLse / kTrain / kDraft)
     int fold_fast;  // fold_kernel's scan-free path for short rows (InklingAttentionKnobs::fold_fast)
+    int fold_fence_light; // fused fold arrival: fence.acq_rel.gpu + relaxed atomic (else __threadfence + atomicAdd)
     // In-kernel prologue (plain decode, W = 1, InPlace; the fused call only): the prologue's parameters. Each CTA forms
     // its 3 heads' q / r itself (q_values / r_value: prologue_kernel's functions) and the CTA whose groups hold the new
     // key runs kv_unit for its KV head (plane codes + the conv slot it alone reads). q / r stay in shared memory.
@@ -1223,12 +1224,26 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             __shared__ int last_flag;
             __syncthreads();
             if (tid == 0) {
-                __threadfence();
                 std::int32_t* counter = p.fold_counters + b * Geo::kKvHeads + kvh;
-                last_flag             = atomicAdd(counter, 1) == active - 1 ? 1 : 0;
-                if (last_flag != 0) {
-                    *counter = 0; // every worker arrived: back to zero (persistent state)
+                if (p.fold_fence_light != 0) {
+                    // Marlin's barrier pattern (ops/linear/marlin/vendor/marlin_template.h barrier_release /
+                    // barrier_acquire): fence.acq_rel.gpu, then a relaxed gpu-scope atomic; the last arrival's own
+                    // fence.acq_rel.gpu orders its CTA's partial loads (after the barrier below) after every worker's.
+                    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                    int old = 0;
+                    asm volatile("atom.relaxed.gpu.global.add.s32 %0, [%1], 1;" : "=r"(old) : "l"(counter) : "memory");
+                    last_flag = old == active - 1 ? 1 : 0;
+                    if (last_flag != 0) {
+                        *counter = 0; // every worker arrived: back to zero (persistent state; next use = a later grid)
+                        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                    }
+                } else {
                     __threadfence();
+                    last_flag = atomicAdd(counter, 1) == active - 1 ? 1 : 0;
+                    if (last_flag != 0) {
+                        *counter = 0; // every worker arrived: back to zero (persistent state)
+                        __threadfence();
+                    }
                 }
             }
             __syncthreads();
@@ -1509,6 +1524,7 @@ InklingAttentionKnobs& knobs() {
         x.fold_fast         = env_int("SUROGATE_INKLING_ATTN_FOLD_FAST", 1) != 0;
         x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
         x.decode_raw        = std::clamp(env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", x.decode_raw), 0, 2);
+        x.fold_fence_light  = env_int("SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT", x.fold_fence_light ? 1 : 0) != 0;
         return x;
     }();
     return k;
@@ -1717,6 +1733,7 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.pdl_trigger     = k.pdl_trigger ? 1 : 0;
     p.metadata_static = (rows.metadata_static && k.early_meta) ? 1 : 0;
     p.fold_fast       = k.fold_fast ? 1 : 0;
+    p.fold_fence_light = k.fold_fence_light ? 1 : 0;
     p.window          = Geo::kWindow;
     return p;
 }

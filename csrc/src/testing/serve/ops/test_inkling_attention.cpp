@@ -787,6 +787,9 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B8 idle row fused fold", run_inv_route(c.kind, ip, layer, 1, r8));
         compare("decode B4 persistent state", run_inv_route(c.kind, ip, layer, 1, r4, false, true));
         compare("decode B8 idle row persistent state", run_inv_route(c.kind, ip, layer, 1, r8, true, true));
+        ops::inkling_attention_knobs().fold_fence_light = false; // the __threadfence arrival
+        compare("decode B4 fused fold heavy fence", run_inv_route(c.kind, ip, layer, 1, r4));
+        ops::inkling_attention_knobs().fold_fence_light = true;
         ops::inkling_attention_knobs().fused_fold_max = 0;
         ops::inkling_attention_knobs().fold_fast = false; // fold_kernel's scan path for every row
         compare("decode B4 scan fold", run_inv_route(c.kind, ip, layer, 1, r4));
