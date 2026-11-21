@@ -255,7 +255,7 @@ __global__ __launch_bounds__(256) void quant_nvfp4_kernel(const __nv_bfloat16* _
     for (int block = lane; block < blocks; block += 32) {
         float x[16];
         load16(source + block * 16, x);
-        const Nvfp4Block quantized = nvfp4_quantize_block_4o6(x, row_scales);
+        const Nvfp4Block quantized = nvfp4_quantize_block_4o6(x, row_scales, nvfp4_block_in_head(block, k));
         *reinterpret_cast<uint2*>(codes + static_cast<std::int64_t>(row) * (k / 2) + block * 8) =
             make_uint2(static_cast<std::uint32_t>(quantized.codes),
                        static_cast<std::uint32_t>(quantized.codes >> 32));

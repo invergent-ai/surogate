@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -43,6 +44,8 @@ struct Mxfp8Schedule {
     static constexpr int kActStride  = kBlockK + 8;     ///< bf16 elements
     static_assert(kWarpM % 16 == 0 && kWarpN % 8 == 0);
 };
+
+inline constexpr int kMxfp8DefaultKWidth = 2;
 
 using NarrowSchedule = Mxfp8Schedule<64, 8, 4, 1, 3>;
 using WideSchedule   = Mxfp8Schedule<64, 32, 2, 2, 2>;
@@ -91,7 +94,27 @@ __device__ __forceinline__ unsigned dequant_fragment(const std::uint8_t* codes, 
     return *reinterpret_cast<const unsigned*>(&pair);
 }
 
-template <class Schedule, int K, bool GateUp>
+/// The K index behind fragment position pair (2q, 2q + 1) [k_lo] and (2q + 8, 2q + 9) [k_hi] of MMA
+/// step `step` of a stage. KWidth 2 = the canonical m16n8k16 layout. KWidth > 2 = Triton's dot-operand
+/// layout for operands upcast from narrow types: each thread holds KWidth consecutive K values, split over
+/// KWidth / 4 MMAs (the same permutation on A and B, so the dot product is unchanged; the order of the
+/// sum inside each MMA is not).
+template <int KWidth>
+__device__ __forceinline__ int mxfp8_k_lo(int step, int quad) {
+    if constexpr (KWidth == 2) {
+        return step * 16 + 2 * quad;
+    } else {
+        constexpr int kGroup = KWidth * 4;
+        constexpr int kSteps = kGroup / 16;
+        return (step / kSteps) * kGroup + KWidth * quad + 4 * (step % kSteps);
+    }
+}
+template <int KWidth>
+__device__ __forceinline__ int mxfp8_k_hi(int step, int quad) {
+    return KWidth == 2 ? mxfp8_k_lo<KWidth>(step, quad) + 8 : mxfp8_k_lo<KWidth>(step, quad) + 2;
+}
+
+template <class Schedule, int K, bool GateUp, int KWidth>
 __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(GemmParams p) {
     __shared__ Mxfp8Shared<Schedule> shared;
     __shared__ int tile_info[3];
@@ -146,7 +169,8 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
         const __nv_bfloat16* act   = shared.act[stage];
 #pragma unroll
         for (int kk = 0; kk < Schedule::kBlockK / 16; ++kk) {
-            const int column = kk * 16 + 2 * quad;
+            const int k_lo = mxfp8_k_lo<KWidth>(kk, quad);
+            const int k_hi = mxfp8_k_hi<KWidth>(kk, quad);
             unsigned a_fragments[Schedule::kMmaM][4];
             unsigned b_fragments[Schedule::kMmaN][2];
 #pragma unroll
@@ -154,19 +178,21 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
                 const int base  = warp_m * Schedule::kWarpM + mma_m * 16;
                 const int row_a = GateUp ? base + 2 * group_id : base + group_id;
                 const int row_b = GateUp ? base + 2 * group_id + 1 : base + group_id + 8;
-                const float scale_a = e8m0_to_f32(scales[row_a * 4 + (kk >> 1)]);
-                const float scale_b = e8m0_to_f32(scales[row_b * 4 + (kk >> 1)]);
-                a_fragments[mma_m][0] = dequant_fragment(codes + row_a * Schedule::kCodeStride + column, scale_a);
-                a_fragments[mma_m][1] = dequant_fragment(codes + row_b * Schedule::kCodeStride + column, scale_b);
-                a_fragments[mma_m][2] = dequant_fragment(codes + row_a * Schedule::kCodeStride + column + 8, scale_a);
-                a_fragments[mma_m][3] = dequant_fragment(codes + row_b * Schedule::kCodeStride + column + 8, scale_b);
+                const float scale_a_lo = e8m0_to_f32(scales[row_a * 4 + (k_lo >> 5)]);
+                const float scale_b_lo = e8m0_to_f32(scales[row_b * 4 + (k_lo >> 5)]);
+                const float scale_a_hi = e8m0_to_f32(scales[row_a * 4 + (k_hi >> 5)]);
+                const float scale_b_hi = e8m0_to_f32(scales[row_b * 4 + (k_hi >> 5)]);
+                a_fragments[mma_m][0] = dequant_fragment(codes + row_a * Schedule::kCodeStride + k_lo, scale_a_lo);
+                a_fragments[mma_m][1] = dequant_fragment(codes + row_b * Schedule::kCodeStride + k_lo, scale_b_lo);
+                a_fragments[mma_m][2] = dequant_fragment(codes + row_a * Schedule::kCodeStride + k_hi, scale_a_hi);
+                a_fragments[mma_m][3] = dequant_fragment(codes + row_b * Schedule::kCodeStride + k_hi, scale_b_hi);
             }
 #pragma unroll
             for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
                 const int token = warp_n * Schedule::kWarpN + mma_n * 8 + group_id;
                 const __nv_bfloat16* row = act + token * Schedule::kActStride;
-                b_fragments[mma_n][0] = *reinterpret_cast<const unsigned*>(row + column);
-                b_fragments[mma_n][1] = *reinterpret_cast<const unsigned*>(row + column + 8);
+                b_fragments[mma_n][0] = *reinterpret_cast<const unsigned*>(row + k_lo);
+                b_fragments[mma_n][1] = *reinterpret_cast<const unsigned*>(row + k_hi);
             }
 #pragma unroll
             for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
@@ -235,13 +261,35 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     }
 }
 
+/// The fragment K layout (see mxfp8_k_lo). Test knob SUROGATE_INKLING_MXFP8_KWIDTH (2, 4, 8, 16) while the
+/// layout of the reference's Triton build is being matched (M3); the default is the matched one.
+int mxfp8_kwidth() {
+    static const int value = [] {
+        const char* text = std::getenv("SUROGATE_INKLING_MXFP8_KWIDTH");
+        const int v      = text != nullptr ? std::atoi(text) : kMxfp8DefaultKWidth;
+        return (v == 2 || v == 4 || v == 8 || v == 16) ? v : kMxfp8DefaultKWidth;
+    }();
+    return value;
+}
+
+template <class Schedule, int K, bool GateUp, int KWidth>
+cudaError_t launch_kwidth(const dim3& grid, const GemmParams& params, cudaStream_t stream) {
+    return pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
+                                 mxfp8_expert_gemm_kernel<Schedule, K, GateUp, KWidth>, params);
+}
+
 template <class Schedule, int K, bool GateUp>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockN;
     if (max_tiles == 0) { return; }
     const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockM);
-    const cudaError_t status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
-                                                     mxfp8_expert_gemm_kernel<Schedule, K, GateUp>, params);
+    cudaError_t status = cudaSuccess;
+    switch (mxfp8_kwidth()) {
+    case 4: status = launch_kwidth<Schedule, K, GateUp, 4>(grid, params, stream); break;
+    case 8: status = launch_kwidth<Schedule, K, GateUp, 8>(grid, params, stream); break;
+    case 16: status = launch_kwidth<Schedule, K, GateUp, 16>(grid, params, stream); break;
+    default: status = launch_kwidth<Schedule, K, GateUp, 2>(grid, params, stream); break;
+    }
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: mxfp8 expert gemm: ") + cudaGetErrorString(status));
     }

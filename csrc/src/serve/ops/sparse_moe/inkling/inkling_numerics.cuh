@@ -134,7 +134,8 @@ struct Nvfp4Block {
 
 /// One candidate of `_candidate`: packed codes and the pairwise-adjacent error sum.
 __device__ __forceinline__ std::uint64_t nvfp4_candidate(const float (&x)[16], float inverse,
-                                                         float scale, float outer, float& error) {
+                                                         float scale, float outer, bool fused_error,
+                                                         float& error) {
     std::uint64_t packed = 0;
     float pair_error[8];
 #pragma unroll
@@ -144,11 +145,18 @@ __device__ __forceinline__ std::uint64_t nvfp4_candidate(const float (&x)[16], f
         const std::uint32_t byte =
             e2m1_pair(__fmul_rn(x[2 * k], inverse), __fmul_rn(x[2 * k + 1], inverse), low, high);
         packed |= static_cast<std::uint64_t>(byte & 0xFFU) << (8 * k);
-        // MEASURED (lanes/d/NOTES.md, vLLM eager capture p000, layer 0): the image's compiled kernel forms
-        // this error as fma(rec, outer, -x) -- the Python source's `enable_fp_fusion=False` notwithstanding.
-        // The unfused form picks the other candidate in 3 of 36,864 blocks; the fused one reproduces all.
-        const float error_low  = fabsf(__fmaf_rn(__fmul_rn(low, scale), outer, -x[2 * k]));
-        const float error_high = fabsf(__fmaf_rn(__fmul_rn(high, scale), outer, -x[2 * k + 1]));
+        // MEASURED (lanes/d/NOTES.md, vLLM eager capture p000): the image's compiled kernels form this error
+        // as fma(rec, outer, -x) in a row's power-of-two HEAD segment and unfused, (rec * outer) - x, in its
+        // TAIL segment (`_quantize_x` / `_situ_quantize_kernel` quantise head and tail as two inlined
+        // `_quantize_block` instances; only the head one was contracted). This rule reproduces every byte of
+        // layer 0's x (2048 + 256 columns) and y (1024 + 128) quantisation; all-fused misses 2 y blocks,
+        // all-unfused misses 3 x and 13 y blocks.
+        const float rec_low  = __fmul_rn(low, scale);
+        const float rec_high = __fmul_rn(high, scale);
+        const float error_low  = fused_error ? fabsf(__fmaf_rn(rec_low, outer, -x[2 * k]))
+                                             : fabsf(__fsub_rn(__fmul_rn(rec_low, outer), x[2 * k]));
+        const float error_high = fused_error ? fabsf(__fmaf_rn(rec_high, outer, -x[2 * k + 1]))
+                                             : fabsf(__fsub_rn(__fmul_rn(rec_high, outer), x[2 * k + 1]));
         pair_error[k] = __fadd_rn(error_low, error_high);
     }
     const float quad0  = __fadd_rn(pair_error[0], pair_error[1]);
@@ -161,9 +169,17 @@ __device__ __forceinline__ std::uint64_t nvfp4_candidate(const float (&x)[16], f
     return packed;
 }
 
-/// One 16-column block of a row with row scales `row`.
+/// Whether the 16-column block `block` of a row of `k` columns lies in the row's power-of-two head
+/// (`ops/moe.py` / `ops/activation.py`: head = 1 << floor(log2(k)) columns, tail = the rest).
+__device__ __forceinline__ bool nvfp4_block_in_head(int block, int k) {
+    const int head = 1 << (31 - __clz(k));
+    return block * 16 < head;
+}
+
+/// One 16-column block of a row with row scales `row` (`fused_error`: see nvfp4_candidate).
 __device__ __forceinline__ Nvfp4Block nvfp4_quantize_block_4o6(const float (&x)[16],
-                                                               const Nvfp4RowScales& row) {
+                                                               const Nvfp4RowScales& row,
+                                                               bool fused_error) {
     float block_max = fabsf(x[0]);
 #pragma unroll
     for (int j = 1; j < 16; ++j) { block_max = fmaxf(block_max, fabsf(x[j])); }
@@ -177,8 +193,8 @@ __device__ __forceinline__ Nvfp4Block nvfp4_quantize_block_4o6(const float (&x)[
     const float inverse4 = fminf(__fdiv_rn(1.0F, __fmul_rn(scale4, row.decoder)), FLT_MAX);
     float error6         = 0.0F;
     float error4         = 0.0F;
-    const std::uint64_t packed6 = nvfp4_candidate(x, inverse6, scale6, row.outer, error6);
-    const std::uint64_t packed4 = nvfp4_candidate(x, inverse4, scale4, row.outer, error4);
+    const std::uint64_t packed6 = nvfp4_candidate(x, inverse6, scale6, row.outer, fused_error, error6);
+    const std::uint64_t packed4 = nvfp4_candidate(x, inverse4, scale4, row.outer, fused_error, error4);
     const bool choose4          = error4 < error6;
     return {choose4 ? packed4 : packed6, choose4 ? code4 : code6};
 }

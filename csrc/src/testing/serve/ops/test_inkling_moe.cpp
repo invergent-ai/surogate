@@ -96,6 +96,9 @@ Nvfp4Row quant_nvfp4(const float* x, int k) {
     const float outer = amax * kInv1536;
     for (int b = 0; b < k / 16; ++b) {
         const float* xb = x + 16 * b;
+        int head_cols = 1;
+        while (head_cols * 2 <= k) { head_cols *= 2; }
+        const bool head = 16 * b < head_cols;
         float bmax = 0.0F;
         for (int j = 0; j < 16; ++j) { bmax = std::fmax(bmax, std::fabs(xb[j])); }
         const std::uint8_t c6 = e4m3(std::fmin(bmax * (enc * kOneSixth), 448.0F));
@@ -108,9 +111,15 @@ Nvfp4Row quant_nvfp4(const float* x, int k) {
         for (int j = 0; j < 16; ++j) {
             code6[j] = e2m1(xb[j] * inv6, v6[j]);
             code4[j] = e2m1(xb[j] * inv4, v4[j]);
-            // fused, as the vLLM image's compiled kernel (measured on lane a's capture)
-            err6[j]  = std::fabs(std::fma(v6[j] * s6, outer, -xb[j]));
-            err4[j]  = std::fabs(std::fma(v4[j] * s4, outer, -xb[j]));
+            // as the vLLM image's compiled kernels (measured on lane a's capture): fused in the row's power-of-two
+            // head, unfused in its tail
+            if (head) {
+                err6[j] = std::fabs(std::fma(v6[j] * s6, outer, -xb[j]));
+                err4[j] = std::fabs(std::fma(v4[j] * s4, outer, -xb[j]));
+            } else {
+                err6[j] = std::fabs((v6[j] * s6) * outer - xb[j]);
+                err4[j] = std::fabs((v4[j] * s4) * outer - xb[j]);
+            }
         }
         for (int w = 16; w > 1; w /= 2) {
             for (int j = 0; j < w / 2; ++j) {
