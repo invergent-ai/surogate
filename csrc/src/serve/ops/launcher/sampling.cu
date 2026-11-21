@@ -8,6 +8,9 @@
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
 
+#include <cstdlib>
+#include <limits>
+
 namespace sinfer::ops::detail {
 namespace {
 
@@ -34,6 +37,15 @@ void sampling_update_greedy_targets_launch(const Tensor& logits, Tensor& targets
         sampling_update_greedy_targets_launch_typed<__nv_bfloat16>(logits, targets, token_domain,
                                                                    configs, stream);
     }
+}
+
+bool& sampling_full_vocab_split() {
+    // SUROGATE_SAMPLING_FULL_VOCAB_SPLIT=0: the one-CTA-per-row full-vocabulary draw (read once; tests edit it).
+    static bool on = [] {
+        const char* raw = std::getenv("SUROGATE_SAMPLING_FULL_VOCAB_SPLIT");
+        return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+    }();
+    return on;
 }
 
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
@@ -65,10 +77,24 @@ void sample_batch_launch_typed(const Tensor& logits, Tensor& out, std::int32_t t
     // untruncated columns and returns immediately for the rest, and the candidate
     // routes below do the reverse. Always launched, so a captured graph records the
     // same node set whatever a later round happens to ask for.
-    sampling_full_vocab_kernel<LogitT><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
-        static_cast<const LogitT*>(logits.data), static_cast<std::int32_t*>(out.data),
-        configs, positions, purpose, token_domain, physical_rows);
-    CUDA_CHECK(cudaGetLastError());
+    if (scratch.full_vocab_partials != nullptr && sampling_full_vocab_split()) {
+        // The same draw, a row cut into chunks of one CTA each (sampling_full_vocab_partial_kernel).
+        const std::int32_t chunks = div_up(token_domain, kSamplerFullVocabChunkItems);
+        sampling_full_vocab_partial_kernel<LogitT>
+            <<<dim3(static_cast<unsigned int>(chunks), static_cast<unsigned int>(batch)), kSamplerBlock, 0, stream>>>(
+                static_cast<const LogitT*>(logits.data), configs, positions, purpose, token_domain, physical_rows,
+                scratch.full_vocab_partials, chunks, -std::numeric_limits<float>::infinity());
+        CUDA_CHECK(cudaGetLastError());
+        sampling_full_vocab_finalize_kernel<LogitT><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+            static_cast<const LogitT*>(logits.data), static_cast<std::int32_t*>(out.data), configs, positions,
+            purpose, token_domain, physical_rows, scratch.full_vocab_partials, chunks);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        sampling_full_vocab_kernel<LogitT><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+            static_cast<const LogitT*>(logits.data), static_cast<std::int32_t*>(out.data),
+            configs, positions, purpose, token_domain, physical_rows);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (!layout.multiblock) {
         sample_row_kernel<LogitT><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
             static_cast<const LogitT*>(logits.data), static_cast<std::int32_t*>(out.data),
