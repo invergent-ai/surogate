@@ -133,6 +133,18 @@ def make_backend(cfg: dict):
         from .backend_rig import RigBackend
 
         return RigBackend(cfg)
+    if kind == "engine":
+        # agent-EN-T's engine-op trainer (branch inkling/T, surogate/train/inkling_fastpath/backend_engine.py, class
+        # EngineBackend(cfg)): the forward = the pinned release libsinfer.so's own ops. Its modules import each other flat,
+        # so its directory goes on sys.path (inkling_rl.engine.code_dir; nothing of it is vendored here).
+        ec = ir.get("engine") or {}
+        code_dir = ec.get("code_dir")
+        if not code_dir or not os.path.isdir(code_dir):
+            raise ValueError("inkling_rl.engine.code_dir must name inkling/T's surogate/train/inkling_fastpath")
+        sys.path.insert(0, code_dir)
+        from backend_engine import EngineBackend  # noqa: E402
+
+        return EngineBackend(cfg)
     raise ValueError(f"inkling_rl.backend {kind!r}")
 
 
