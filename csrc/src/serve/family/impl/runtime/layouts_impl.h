@@ -1609,6 +1609,18 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         }
     }
     const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    // Lane f1: the upper bound validate_target_options leaves to the curve. A pipeline stage's shared
+    // capacity resolved from auto is the smallest stage's resolution of its own curve, so it never exceeds
+    // this stage's maximum (lanes x (logical + window charge)); one that does means the stages planned
+    // different curves, and clamping it here would give this stage a pool the others do not share.
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.kv_capacity_resolved_automatically &&
+        page_count(options.kv_capacity.explicit_tokens) > maximum_pages) {
+        throw std::invalid_argument(
+            "pipeline stage KV capacity " + std::to_string(options.kv_capacity.explicit_tokens) +
+            " tokens exceeds this stage's maximum of " +
+            std::to_string(static_cast<std::uint64_t>(maximum_pages) * kPagedKVPageSize) +
+            " (max_concurrency x (max_context + window charge))");
+    }
     planner->curve   = runtime::SequenceCapacityCurve{
           .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
           .minimum_main_page_groups             = minimum_pages,
