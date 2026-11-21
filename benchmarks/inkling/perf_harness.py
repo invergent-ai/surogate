@@ -134,8 +134,14 @@ def decode_summary(outs):
     per = [(o["usage"]["completion_tokens"] - 1) / max(1e-9, o["t_end"] - o["t_first"]) for o in outs]
     if len(outs) == 1:
         agg = per[0]
-    else:  # tokens emitted after every stream has started decoding, over that window
-        agg = sum(sum(1 for s in o["stamps"] if s > t_all_first) for o in outs) / max(1e-9, t_end - t_all_first)
+    else:  # tokens emitted after every stream has started decoding, over that window. Counted from the exact
+        # completion counts, pro rata over each stream's own decode time: SSE content chunks under-count tokens
+        # (special / reasoning-boundary tokens arrive without a content delta on vLLM).
+        after = 0.0
+        for o in outs:
+            dur = max(1e-9, o["t_end"] - o["t_first"])
+            after += (o["usage"]["completion_tokens"] - 1) * max(0.0, o["t_end"] - max(t_all_first, o["t_first"])) / dur
+        agg = after / max(1e-9, t_end - t_all_first)
     return dict(aggregate_tok_s=round(agg, 1), per_stream_tok_s=[round(x, 1) for x in per],
                 ttft_s=[round(o["t_first"] - o["t0"], 3) for o in outs],
                 prompt_tokens=[o["usage"]["prompt_tokens"] for o in outs],

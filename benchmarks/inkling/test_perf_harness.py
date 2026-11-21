@@ -52,8 +52,8 @@ class Mock(BaseHTTPRequestHandler):
 
         time.sleep(PREFILL_S_PER_KTOK * prompt_tokens / 1000.0)
         t_next = time.time()
-        for _ in range(n):
-            chunk({"choices": [{"delta": {"content": "x"}}]})
+        for i in range(n):  # every 5th token without a content delta (as vLLM's special / boundary tokens)
+            chunk({"choices": [{"delta": {} if i % 5 == 4 else {"content": "x"}}]})
             t_next += TOKEN_S
             time.sleep(max(0.0, t_next - time.time()))
         chunk({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": n}})
