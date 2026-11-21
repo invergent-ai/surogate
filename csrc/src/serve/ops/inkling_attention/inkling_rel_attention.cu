@@ -642,21 +642,35 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             const int g_new = group_of(gs, positions[0]);
             pro_owner       = g_new >= g_start && g_new < g_stop;
         }
-        if (warp < Geo::kGroup) {
+        // Tasks: q of head hh (0-2), r pass 0 (heads 0, 1) / 1 (head 2), and in the owner K / V. Owner: warps 0 / 1 run
+        // K / V (the longest chain) while warps 2 / 3 take q 0, q 1 / q 2, r; otherwise warps 0-2 q, warp 3 r.
+        const auto q_task = [&](int hh) {
             float y[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-            if (row_ok) { q_values<!Local>(p.pro, n0, kvh * Geo::kGroup + warp, lane, y); }
-            store_vec(qs + warp * Geo::kHeadDim + 4 * lane, make_uint2(pack_bf16x2(y[0], y[1]), pack_bf16x2(y[2], y[3])));
-        } else {
-#pragma unroll
-            for (int pass = 0; pass < 2; ++pass) {
-                const int hh = 2 * pass + (lane >> 4);
-                // every lane joins the half-warp sums (head 2 twice in pass 1); only heads 0-2 are stored
-                const float y = row_ok ? r_value<!Local>(p.pro, n0, kvh * Geo::kGroup + min(hh, 2), lane & 15) : 0.0F;
-                if (hh < Geo::kGroup) { rsm[hh * Geo::kRelDim + (lane & 15)] = __float2bfloat16_rn(y); }
+            if (row_ok) { q_values<!Local>(p.pro, n0, kvh * Geo::kGroup + hh, lane, y); }
+            store_vec(qs + hh * Geo::kHeadDim + 4 * lane, make_uint2(pack_bf16x2(y[0], y[1]), pack_bf16x2(y[2], y[3])));
+        };
+        const auto r_task = [&](int pass) {
+            const int hh = 2 * pass + (lane >> 4);
+            // every lane joins the half-warp sums (head 2 twice in pass 1); only heads 0-2 are stored
+            const float y = row_ok ? r_value<!Local>(p.pro, n0, kvh * Geo::kGroup + min(hh, 2), lane & 15) : 0.0F;
+            if (hh < Geo::kGroup) { rsm[hh * Geo::kRelDim + (lane & 15)] = __float2bfloat16_rn(y); }
+        };
+        if (pro_owner) {
+            if (warp < 2) {
+                kv_unit<!Local>(p.pro, (static_cast<std::int64_t>(b) * Geo::kKvHeads + kvh) * 2 + warp);
+            } else if (warp == 2) {
+                q_task(0);
+                q_task(1);
+            } else {
+                q_task(2);
+                r_task(0);
+                r_task(1);
             }
-        }
-        if (pro_owner && warp < 2) {
-            kv_unit<!Local>(p.pro, (static_cast<std::int64_t>(b) * Geo::kKvHeads + kvh) * 2 + warp);
+        } else if (warp < Geo::kGroup) {
+            q_task(warp);
+        } else {
+            r_task(0);
+            r_task(1);
         }
         __syncthreads(); // q / r visible; the new key's codes visible to this CTA's (coherent) loads
         const __nv_bfloat16* q0 = qs + (w_rho0 + gid) * Geo::kHeadDim + 2 * lid;
