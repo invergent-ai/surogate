@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -110,6 +111,17 @@ struct NarrowGemmSchedule {
     static constexpr int kSegmentsPerRow = kCodeRowBytes / 16;
 };
 
+/// The fused-y-quant down keeps its A operand in its own resident arrays: its stages hold weights only (keeps a
+/// small-T down CTA small enough to sit next to two gate_up CTAs on one SM while it prefetches w2).
+template <class Schedule>
+struct WeightOnlyStorage {
+    alignas(16) std::uint8_t b_codes[Schedule::kStages][Schedule::kBlockN * Schedule::kCodeRowBytes];
+    alignas(16) std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
+};
+template <class Schedule, bool FusedYQuant>
+using NarrowStorage =
+    std::conditional_t<FusedYQuant, WeightOnlyStorage<Schedule>, Nvfp4W4a4SharedStorage<Schedule>>;
+
 // BlockK 128: 1152 is not a multiple of 256.
 using NarrowSchedule = Nvfp4W4a4MmaSchedule<16, 64, 128, 1, 4, 4, 4>;
 using ResidentDownSchedule = NarrowGemmSchedule<16, 64, 128, 1, 4, kIntermediate / 128, 1>;
@@ -149,9 +161,9 @@ __device__ __forceinline__ void stage_gathered_activation(const GemmParams& p, c
 
 /// `stage_nvfp4_w4a4_weight` (ops/linear/nvfp4/nvfp4_w4a4_mma.cuh) for contiguous expert rows, with the
 /// L2 prefetch hint on the code loads (`p.l2_prefetch`). Same destinations, same bytes.
-template <class Geometry, class Schedule>
-__device__ __forceinline__ void stage_expert_weight(const GemmParams& p, Nvfp4W4a4SharedStorage<Schedule>& shared,
-                                                    int stage, int k_tile, int row_begin) {
+template <class Geometry, class Schedule, class Storage>
+__device__ __forceinline__ void stage_expert_weight(const GemmParams& p, Storage& shared, int stage, int k_tile,
+                                                    int row_begin) {
     constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
     for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
         const int row             = task / Schedule::kSegmentsPerRow;
@@ -215,7 +227,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #else
     using Geometry = Nvfp4Geometry<K>;
     extern __shared__ __align__(16) unsigned char narrow_dynamic[];
-    auto& shared = *reinterpret_cast<Nvfp4W4a4SharedStorage<Schedule>*>(narrow_dynamic);
+    auto& shared = *reinterpret_cast<NarrowStorage<Schedule, FusedYQuant>*>(narrow_dynamic);
     __shared__ int tile_info[3];
     __shared__ int slots[Schedule::kBlockM];
     __shared__ int source_rows[Schedule::kBlockM];
@@ -762,7 +774,7 @@ void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t 
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
     const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockN);
-    constexpr std::size_t kShared = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
+    constexpr std::size_t kShared = sizeof(NarrowStorage<Schedule, FusedYQuant>);
     auto* kernel = nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>;
     cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kShared));
