@@ -220,6 +220,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     gate_up.weights     = weights.w13;
     gate_up.out         = b.y;
     gate_up.lora        = lora;
+    gate_up.gate_up_tap = options.taps != nullptr ? static_cast<__nv_bfloat16*>(options.taps->gate_up) : nullptr;
     if (nvfp4) {
         launch_nvfp4_gate_up(gate_up, slots, schedule, stream);
         launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
@@ -272,6 +273,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
             copy(taps->y_amax, b.y_amax, s * sizeof(float));
         }
         copy(taps->down, b.down, s * kHidden * sizeof(__nv_bfloat16));
+        copy(taps->y, b.y, s * kIntermediate * sizeof(__nv_bfloat16));
     }
 }
 

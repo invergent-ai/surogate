@@ -126,6 +126,8 @@ struct InklingMoeTaps {
     std::uint8_t* y_scales = nullptr; ///< its block scales, row-major: NVFP4 [T*8][72] | MXFP8 [T*8][36]
     float* y_amax         = nullptr; ///< NVFP4 only: FP32 [T * 8]
     void* down            = nullptr; ///< BF16 [T * 8][2304]: the down projection's rows
+    void* gate_up         = nullptr; ///< BF16 [T * 8][2304]: the bf16 gate_up rows (interleaved), as the SiTU reads them
+    void* y               = nullptr; ///< BF16 [T * 8][1152]: the SiTU output before re-quantisation
 };
 
 struct InklingMoeOptions {

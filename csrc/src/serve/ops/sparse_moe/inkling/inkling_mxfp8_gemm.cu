@@ -212,6 +212,10 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
                         first  = __fadd_rn(first, lora_expand(gate, adapter, column, low));
                         second = __fadd_rn(second, lora_expand(up, adapter, column, low + gate.rank));
                     }
+                    if (p.gate_up_tap != nullptr) {
+                        *reinterpret_cast<__nv_bfloat162*>(p.gate_up_tap + static_cast<std::int64_t>(slot) * kGateUpRows +
+                                                           2 * column) = __floats2bfloat162_rn(first, second);
+                    }
                     p.out[static_cast<std::int64_t>(slot) * kIntermediate + column] =
                         situ(round_bf16(first), round_bf16(second), p.gammas[slot]);
                 } else {

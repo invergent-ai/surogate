@@ -107,6 +107,8 @@ struct GemmParams {
     InklingExpertBank weights;
     // Output (gate_up: y bf16 [T * 8][1152]; down: bf16 [T * 8][2304]).
     __nv_bfloat16* out = nullptr;
+    /// Test tap (gate_up only): the bf16 gate_up rows [T * 8][2304], interleaved. Null in serving.
+    __nv_bfloat16* gate_up_tap = nullptr;
     // Adapter (table null = none).
     LoraRound lora;
 };

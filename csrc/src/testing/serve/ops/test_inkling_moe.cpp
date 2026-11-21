@@ -677,7 +677,7 @@ int test_moe(ops::InklingExpertFormat format) {
     failures += report("LoRA: zero adapter output == base (bit-exact)", zero_run.out == base.out ? 0 : 1);
     const DeviceRun lora_run = run_moe(l, x, kT, nullptr, &aa);
     int base_tokens_bad = 0;
-    double worst_delta_cos = 1.0;
+    double worst_delta_cos = 1.0, worst_lora_cos = 1.0, worst_lora_rel = 0.0;
     for (int t = 0; t < kT; ++t) {
         const auto begin = static_cast<std::size_t>(t) * H;
         if (slots[t] < 0) {
@@ -686,17 +686,27 @@ int test_moe(ops::InklingExpertFormat format) {
         }
         const auto ref_base = host_moe_token(l, w13, w2, x.data() + begin, ids.data() + t * TOPK, gammas.data() + t * TOPK, nullptr, -1);
         const auto ref_lora = host_moe_token(l, w13, w2, x.data() + begin, ids.data() + t * TOPK, gammas.data() + t * TOPK, &adapter, slots[t]);
-        double dot = 0, na = 0, nb = 0;
+        double dot = 0, na = 0, nb = 0, fd = 0, fr = 0, fg = 0, fdiff = 0;
         for (int n = 0; n < H; ++n) {
-            const double dg = double(bf16_to_f32(lora_run.out[begin + n])) - bf16_to_f32(base.out[begin + n]);
+            const double g  = bf16_to_f32(lora_run.out[begin + n]);
+            const double dg = g - bf16_to_f32(base.out[begin + n]);
             const double dr = double(ref_lora[n]) - ref_base[n];
             dot += dg * dr; na += dg * dg; nb += dr * dr;
+            fd += g * ref_lora[n]; fr += double(ref_lora[n]) * ref_lora[n]; fg += g * g;
+            fdiff += (g - ref_lora[n]) * (g - ref_lora[n]);
         }
         worst_delta_cos = std::min(worst_delta_cos, dot / std::sqrt(na * nb + 1e-300));
+        worst_lora_cos  = std::min(worst_lora_cos, fd / std::sqrt(fr * fg + 1e-300));
+        worst_lora_rel  = std::max(worst_lora_rel, std::sqrt(fdiff / (fr + 1e-300)));
     }
-    std::printf("  lora: base tokens changed %d, worst delta cosine %.5f\n", base_tokens_bad, worst_delta_cos);
+    std::printf("  lora: base tokens changed %d, adapted outputs vs host: worst cos %.6f rel-L2 %.3e; worst delta cos %.5f\n",
+                base_tokens_bad, worst_lora_cos, worst_lora_rel, worst_delta_cos);
     failures += report("LoRA: base tokens bit-exact in an adapter round", base_tokens_bad);
-    failures += report("LoRA: delta vs host (cos >= 0.999)", worst_delta_cos >= 0.999 ? 0 : 1);
+    failures += report("LoRA: adapted output vs host pipeline (cos >= 0.9999, rel-L2 <= 1e-2)",
+                       (worst_lora_cos >= 0.9999 && worst_lora_rel <= 1e-2) ? 0 : 1);
+    // The delta is the difference of two bf16-rounded outputs: an indexing check (a wrong expert / slot / port gives
+    // cos ~ 0), not a precision one.
+    failures += report("LoRA: delta direction vs host (cos >= 0.99)", worst_delta_cos >= 0.99 ? 0 : 1);
     return failures;
 }
 
@@ -757,7 +767,7 @@ int count_mismatch(const std::vector<T>& a, const std::vector<T>& b) {
     return bad;
 }
 
-int run_capture(const char* path) {
+int run_capture(const char* path, const char* dump_dir) {
     const SafeTensors st = read_safetensors(path);
     const bool nv   = st.meta.at("format") == "nvfp4";
     const int tokens = std::stoi(st.meta.at("tokens"));
@@ -857,11 +867,20 @@ int run_capture(const char* path) {
     }
     // 3. SiTU + requantisation on the CAPTURED gate_up rows (isolates them from the GEMM)
     const std::size_t slots = static_cast<std::size_t>(tokens) * TOPK;
+    std::vector<std::uint16_t> y_sub;
     {
         DeviceBuffer gu = to_device(st.vec<std::uint16_t>("gate_up")), g = to_device(ref_gammas), y(slots * I * 2);
         Tensor tgu(gu.p, DType::BF16, {2 * I, static_cast<int>(slots)}), tg(g.p, DType::FP32, {static_cast<int>(slots)}),
             ty(y.p, DType::BF16, {I, static_cast<int>(slots)});
         ops::inkling_softcap_swiglu(tgu, tg, ty, nullptr);
+        cuda_synchronize();
+        y_sub = from_device<std::uint16_t>(y, slots * I);
+        if (dump_dir != nullptr) {
+            const std::string out = std::string(dump_dir) + "/y_sub_v" + st.meta.at("visit") + ".bf16";
+            std::ofstream f(out, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(y_sub.data()), static_cast<std::streamsize>(y_sub.size() * 2));
+            std::printf("  dumped GPU SiTU of the captured gate_up -> %s\n", out.c_str());
+        }
         int bad = 0;
         const auto ref_codes  = st.vec<std::uint8_t>("y_codes");
         const auto ref_scales = st.vec<std::uint8_t>("y_scales");
@@ -871,8 +890,25 @@ int run_capture(const char* path) {
                 ta(a.p, DType::FP32, {static_cast<int>(slots)});
             ops::inkling_quant_nvfp4_4o6(ty, tc, ts, ta, nullptr);
             cuda_synchronize();
-            bad += count_mismatch(from_device<std::uint8_t>(c, c.bytes), ref_codes);
-            bad += count_mismatch(from_device<std::uint8_t>(s, s.bytes), ref_scales);
+            const auto got_codes  = from_device<std::uint8_t>(c, c.bytes);
+            const auto got_scales = from_device<std::uint8_t>(s, s.bytes);
+            bad += count_mismatch(got_codes, ref_codes);
+            bad += count_mismatch(got_scales, ref_scales);
+            int shown = 0;
+            for (std::size_t i = 0; i < got_scales.size() && shown < 8; ++i) {
+                if (got_scales[i] != ref_scales[i]) {
+                    std::printf("    y scale differs: slot %zu block %zu ours 0x%02x ref 0x%02x\n", i / (I / 16), i % (I / 16),
+                                got_scales[i], ref_scales[i]);
+                    ++shown;
+                }
+            }
+            for (std::size_t i = 0, shown_codes = 0; i < got_codes.size() && shown_codes < 8; ++i) {
+                if (got_codes[i] != ref_codes[i] && got_scales[i / 8] == ref_scales[i / 8]) {
+                    std::printf("    y code byte differs with equal scale: slot %zu byte %zu ours 0x%02x ref 0x%02x\n",
+                                i / (I / 2), i % (I / 2), got_codes[i], ref_codes[i]);
+                    ++shown_codes;
+                }
+            }
             const auto amax   = from_device<float>(a, slots);
             const auto ref_rs = st.vec<float>("y_rowscale");
             const float rcp   = 1.0F / (1536.0F * l.den);
@@ -899,6 +935,9 @@ int run_capture(const char* path) {
         taps.y_scales = static_cast<std::uint8_t*>(y_scales.p);
         taps.y_amax   = static_cast<float*>(y_amax.p);
         taps.down     = down.p;
+        DeviceBuffer gate_up_tap(slots * 2 * I * 2), y_tap(slots * I * 2);
+        taps.gate_up = gate_up_tap.p;
+        taps.y       = y_tap.p;
         ops::InklingMoeOptions options;
         options.taps = &taps;
         DeviceArena arena(ops::inkling_moe_workspace_bytes(format, tokens, false));
@@ -910,6 +949,41 @@ int run_capture(const char* path) {
         const int bad_down = count_mismatch(from_device<std::uint16_t>(down, slots * H), st.vec<std::uint16_t>("down"));
         const int bad_out  = count_mismatch(from_device<std::uint16_t>(out, static_cast<std::size_t>(tokens) * H), st.vec<std::uint16_t>("out"));
         std::printf("  inkling_moe: y_q bytes off %d, down elements off %d, output elements off %d\n", bad_y, bad_down, bad_out);
+        // Stage localisation: gate_up vs the capture, y vs the SiTU of the captured gate_up, down on equal y_q rows.
+        const auto got_gu = from_device<std::uint16_t>(gate_up_tap, slots * 2 * I);
+        const auto ref_gu = st.vec<std::uint16_t>("gate_up");
+        int gu_off = 0, gu_shown = 0, gu_max_ulp = 0;
+        for (std::size_t i = 0; i < got_gu.size(); ++i) {
+            if (got_gu[i] != ref_gu[i]) {
+                ++gu_off;
+                const int ulp = std::abs(static_cast<int>(static_cast<std::int16_t>(got_gu[i])) -
+                                         static_cast<int>(static_cast<std::int16_t>(ref_gu[i])));
+                gu_max_ulp = std::max(gu_max_ulp, ulp);
+                if (gu_shown++ < 6) {
+                    std::printf("    gate_up differs: slot %zu col %zu ours %.8g ref %.8g\n", i / (2 * I), i % (2 * I),
+                                bf16_to_f32(got_gu[i]), bf16_to_f32(ref_gu[i]));
+                }
+            }
+        }
+        const auto got_y = from_device<std::uint16_t>(y_tap, slots * I);
+        const int y_off  = count_mismatch(got_y, y_sub);
+        const auto got_yc = from_device<std::uint8_t>(y_codes, y_codes.bytes);
+        const auto ref_yc = st.vec<std::uint8_t>("y_codes");
+        const auto got_down = from_device<std::uint16_t>(down, slots * H);
+        const auto ref_down = st.vec<std::uint16_t>("down");
+        const std::size_t code_row = nv ? I / 2 : I;
+        int down_off_clean = 0;
+        std::size_t clean_rows = 0;
+        for (std::size_t r = 0; r < slots; ++r) {
+            if (!std::equal(got_yc.begin() + r * code_row, got_yc.begin() + (r + 1) * code_row, ref_yc.begin() + r * code_row)) { continue; }
+            ++clean_rows;
+            for (int n = 0; n < H; ++n) { down_off_clean += got_down[r * H + n] != ref_down[r * H + n]; }
+        }
+        std::printf("  stages: gate_up elements off %d (max %d bf16 ulp); y (op) vs SiTU(captured gate_up) off %d; "
+                    "down elements off on the %zu rows with equal y_q codes: %d\n",
+                    gu_off, gu_max_ulp, y_off, clean_rows, down_off_clean);
+        failures += report("capture: gate_up GEMM rows bit-exact", gu_off);
+        failures += report("capture: down GEMM bit-exact on rows with equal y_q", down_off_clean);
         failures += report("capture: gate_up GEMM + SiTU + requant (y_q) bit-exact", bad_y);
         failures += report("capture: down GEMM rows bit-exact", bad_down);
         failures += report("capture: combined output bit-exact", bad_out);
@@ -932,8 +1006,9 @@ int main(int argc, char** argv) {
         return 77;
     }
     int failures = 0;
-    if (argc == 3 && std::string(argv[1]) == "--capture") {
-        failures = run_capture(argv[2]);
+    if ((argc == 3 || argc == 5) && std::string(argv[1]) == "--capture") {
+        const char* dump = argc == 5 && std::string(argv[3]) == "--dump" ? argv[4] : nullptr;
+        failures = run_capture(argv[2], dump);
         std::printf("%s (%d failing checks)\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);
         return failures == 0 ? 0 : 1;
     }

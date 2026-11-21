@@ -218,6 +218,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                         value0 = __fadd_rn(value0, lora_expand(gate, adapter, column, low));
                         value1 = __fadd_rn(value1, lora_expand(up, adapter, column, low + gate.rank));
                     }
+                    if (p.gate_up_tap != nullptr) {
+                        *reinterpret_cast<__nv_bfloat162*>(p.gate_up_tap + static_cast<std::int64_t>(slot) * kGateUpRows + n) =
+                            __floats2bfloat162_rn(value0, value1);
+                    }
                     p.out[static_cast<std::int64_t>(slot) * kIntermediate + column] =
                         situ(round_bf16(value0), round_bf16(value1), p.gammas[slot]);
                 } else {
