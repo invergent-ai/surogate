@@ -440,7 +440,40 @@ void run_visit(Round& rd, int v) {
     Tensor qkvr = rd.work.alloc(DType::BF16, {C::qkvr_rows, T});
     const auto in = [&](int stream) { return bf16_ptr(attn_in) + static_cast<std::int64_t>(stream) * T * D; };
     Tensor k_dyn, v_dyn;
-    if (Q == 1) {
+    if (L.fp8_attention) {
+        // FP8 attention weights (the artifact's per-channel / 1x128 objects, SUROGATE_SERVE_INKLING_ATTENTION=fp8-*):
+        // lane c's inkling_attn_linear, every row range of the visit in ONE launch; the dynamic taps (BF16) ride the
+        // grouped invariant GEMM.
+        Tensor x0(in(0), DType::BF16, {D, T});
+        Tensor x1(in(Q == 3 ? 1 : 0), DType::BF16, {D, T});
+        Tensor x2(in(Q == 3 ? 2 : 0), DType::BF16, {D, T});
+        if (Q == 1) {
+            if (vi.global) { throw std::logic_error("inkling2: a global visit has three attention inputs"); }
+            Tensor out(qkvr.data, DType::BF16, {C::qkvr_rows, T});
+            const ops::InklingProjection pr[] = {{&x0, &L.qkvr, 0, &out}};
+            ops::inkling_attn_linear(pr, &rd.work, s);
+        } else {
+            Tensor out_q = column_view(qkvr.data, DType::BF16, {C::qkvr_query_end, T}, C::qkvr_rows);
+            Tensor out_k = column_view(bf16_ptr(qkvr) + C::qkvr_k_begin, DType::BF16,
+                                       {C::qkvr_v_begin - C::qkvr_k_begin, T}, C::qkvr_rows);
+            Tensor out_v = column_view(bf16_ptr(qkvr) + C::qkvr_v_begin, DType::BF16,
+                                       {C::qkvr_rows - C::qkvr_v_begin, T}, C::qkvr_rows);
+            const ops::InklingProjection pr[] = {{&x0, &L.qkvr, 0, &out_q},
+                                                 {&x1, &L.qkvr, C::qkvr_k_begin, &out_k},
+                                                 {&x2, &L.qkvr, C::qkvr_v_begin, &out_v}};
+            ops::inkling_attn_linear(pr, &rd.work, s);
+        }
+        if (vi.global) {
+            if (!L.k_conv_proj.has_value() || !L.v_conv_proj.has_value()) {
+                throw std::logic_error("inkling2: a global visit without its dynamic-conv projections");
+            }
+            k_dyn = rd.work.alloc(DType::BF16, {32, T});
+            v_dyn = rd.work.alloc(DType::BF16, {32, T});
+            const ops::InklingGemmProblem taps[] = {{L.k_conv_proj->qdata, 32, in(1), k_dyn.data, 32},
+                                                    {L.v_conv_proj->qdata, 32, in(2), v_dyn.data, 32}};
+            ops::inkling_gemm_inv_group(taps, static_cast<std::int32_t>(L.k_conv_proj->k), T, DType::BF16, s);
+        }
+    } else if (Q == 1) {
         if (vi.global) { throw std::logic_error("inkling2: a global visit has three attention inputs"); }
         gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_rows, in(0), T, qkvr.data, C::qkvr_rows, s);
     } else {
@@ -591,7 +624,12 @@ void run_visit(Round& rd, int v) {
     dump("gated", v, gated.data, DType::BF16, C::attn_width, C::attn_width, T, 1, s);
     // 4. wo_ud
     Tensor attn_partial = rd.work.alloc(DType::BF16, {D, T});
-    gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
+    if (L.fp8_attention) {
+        const ops::InklingProjection pr[] = {{&gated, &L.output, 0, &attn_partial}};
+        ops::inkling_attn_linear(pr, &rd.work, s);
+    } else {
+        gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
+    }
     // 5. attention-output conv
     Tensor attn_out = rd.work.alloc(DType::BF16, {D, T});
     for (const Group& g : rd.groups) {
