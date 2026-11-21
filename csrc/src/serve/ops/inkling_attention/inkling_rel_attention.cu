@@ -975,8 +975,10 @@ GroupSpec group_spec(InklingLayerKind kind) {
             which = 3;
         } else if (std::strcmp(raw, "p4") == 0) {
             which = 4; // measurement: p3's global groups, local groups of 64 keys (one block)
+        } else if (std::strcmp(raw, "p5") == 0) {
+            which = 5; // measurement: global 256 below 65,536 then p3's tiers, local 128
         } else {
-            throw std::invalid_argument("SUROGATE_INKLING_ATTN_GROUPS must be p1, p2, p3 or p4");
+            throw std::invalid_argument("SUROGATE_INKLING_ATTN_GROUPS must be p1 .. p5");
         }
     }
     GroupSpec g; // p1
@@ -986,8 +988,8 @@ GroupSpec group_spec(InklingLayerKind kind) {
         g.s1 = 11;
         g.s2 = g.s3 = 13;
         g.t1 = 65536;
-    } else if (which == 3 || which == 4) {
-        g.s1 = 9;
+    } else if (which == 3 || which == 4 || which == 5) {
+        g.s1 = which == 5 ? 8 : 9;
         g.s2 = 11;
         g.s3 = 13;
         g.t1 = 65536;

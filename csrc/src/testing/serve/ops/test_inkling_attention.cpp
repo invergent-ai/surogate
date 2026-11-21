@@ -801,8 +801,9 @@ void test_invariance(const std::function<bool(const std::string&)>& want) {
     };
     std::uint32_t seed = 7000;
     for (const auto& c : cases) {
-        for (const char* groups : {"p1", "p2", "p3", "p4"}) {
+        for (const char* groups : {"p1", "p2", "p3", "p4", "p5"}) {
             if (std::string(groups) == "p4" && c.kind != InklingLayerKind::Local) { continue; } // p4 = p3 on global layers
+            if (std::string(groups) == "p5" && c.kind != InklingLayerKind::Global) { continue; } // p5 = p3 on local layers
             if (want("invariance " + c.name + " " + groups)) { run_invariance_case(c, groups, seed); }
         }
         seed += 31;
@@ -1921,6 +1922,12 @@ void run_bench_ab() {
     bench_attention("decode local 8x8k [p4]", K::Local, 1, 8, 8191);
     bench_attention("verify W8 local 1x8k [p4]", K::Local, 8, 1, 8184);
     bench_attention("prefill local W8192 past 8k [p4]", K::Local, 8192, 1, 8192);
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p5", 1);
+    bench_attention("decode global 1x8k [p5]", K::Global, 1, 1, 8191);
+    bench_attention("decode global 1x64k [p5]", K::Global, 1, 1, 65535);
+    bench_attention("decode global 8x8k [p5]", K::Global, 1, 8, 8191);
+    bench_attention("verify W8 global 1x8k [p5]", K::Global, 8, 1, 8184);
+    bench_attention("prefill global W8192 from 0 [p5]", K::Global, 8192, 1, 0);
     setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 1);
     for (const char* l2 : {"0", "4"}) {
         setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
