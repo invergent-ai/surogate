@@ -145,7 +145,8 @@ void check(sinfer::PagedKVPlaneOrder order, cudaStream_t stream) {
     b.release();
     const auto occupancy = pool.window_occupancy();
     expect(occupancy.lane_in_use == 0 && occupancy.image_in_use == 0, tag + ": every window page returned");
-    expect(occupancy.lane_peak >= 5, tag + ": peak recorded");
+    // a held 3 pages, settled to 2, then b restored 2 (images live in their own region): peak 4.
+    expect(occupancy.lane_peak == 4, tag + ": peak recorded");
 }
 
 void check_without_windows(cudaStream_t stream) {
