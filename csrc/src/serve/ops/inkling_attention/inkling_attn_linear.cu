@@ -527,7 +527,9 @@ __global__ __launch_bounds__(128) void gemm_t_kernel(const LinearParams p) {
 
     const auto stage_codes = [&](int step, int slot) {
         const int k0 = step * kTk;
-        for (int c = tid; c < 256; c += 128) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) { // 256 pieces, two a thread (unrolled: blockDim is 128)
+            const int c   = tid + 128 * i;
             const int row = c >> 2, piece = c & 3;
             const int local = local0 + row;
             const bool ok   = local < s.rows;
@@ -538,7 +540,9 @@ __global__ __launch_bounds__(128) void gemm_t_kernel(const LinearParams p) {
     };
     const auto stage_x = [&](int step, int slot) {
         const int k0 = step * kTk;
-        for (int c = tid; c < 512; c += 128) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int c   = tid + 128 * i;
             const int tok = c >> 3, chunk = c & 7;
             const bool ok = col0 + tok < p.columns;
             const __nv_bfloat16* src = s.x + static_cast<std::int64_t>(ok ? col0 + tok : 0) * K + k0 + chunk * 8;
