@@ -26,6 +26,7 @@ import torch
 from ift_engine import InklingEngine, sha256_file
 import ift_backward as B
 import ift_forward as F
+import ift_long as LG
 
 
 class EngineBackend:
@@ -44,7 +45,7 @@ class EngineBackend:
         self.W = B.EngineWeights(self.eng)
         self.lora = B.make_lora(self.eng.dev, seed=int(ec.get("lora_seed", 0)), b_std=0.0)
         self.banks = B.EngineBanks(self.lora, self.eng.dev)
-        self.tf = B.TrainForward(self.eng, self.W)
+        self.tf = LG.TrainForwardLong(self.eng, self.W)  # the long-row path (== ift_backward's gradient on short rows)
         self.r3_check = {"rows": 0, "covered_positions": 0, "mismatched_positions": 0}
 
     # ------------------------------------------------------------------ contract
