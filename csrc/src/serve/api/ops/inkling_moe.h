@@ -154,6 +154,10 @@ struct InklingMoeOptions {
     /// counters choose only WHICH CTA selects / places, never the order of any sum: the bits are those of
     /// the call without state. Null = the separate select kernel.
     std::int32_t* state = nullptr;
+    /// The max_tokens the caller passed to `inkling_moe_workspace_bytes` when it booked `workspace` (0 = unknown).
+    /// A prefill call narrower than that may then use a less compact layout that still fits the booking (fewer
+    /// down column passes: faster at small T). Never more than the booking; the bits are the same either way.
+    std::int32_t workspace_tokens = 0;
 };
 
 /// Bytes of `InklingMoeOptions::state`.

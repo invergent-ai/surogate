@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -67,16 +68,23 @@ struct Buffers {
 
 constexpr std::int32_t kCounterWords = kExperts + 1;
 
-/// Prefill (T > kNarrowMaxTokens): the down GEMM and its fused combine run in this many column passes, so the
-/// down rows buffer holds 2304 / passes columns per slot (each pass covers whole N tiles of every down schedule:
-/// NVFP4 768 = 3 x 256 / 6 x 128, MXFP8 384 = 3 x 128). The arrival counters are per (token, 64-column tile), so
-/// the combine of a column tile completes inside its pass; every weight byte is still read once.
-constexpr std::int32_t down_passes(InklingExpertFormat format) {
+/// Prefill (T > kNarrowMaxTokens): the down GEMM and its fused combine may run in column passes, so the down rows
+/// buffer holds 2304 / passes columns per slot. Allowed pass counts cover whole N tiles of every down schedule
+/// (NVFP4 768 = 3 x 256 / 6 x 128; MXFP8 1152 / 768 / 384 = 9 / 6 / 3 x 128). The arrival counters are per (token,
+/// 64-column tile), so the combine of a column tile completes inside its pass; every weight byte is still read once.
+/// The most passes = the compact layout `inkling_moe_workspace_bytes` books; a call uses the fewest passes whose
+/// layout fits what the caller booked (InklingMoeOptions::workspace_tokens), measured 15:5x: 6 passes cost MXFP8
+/// +10 % at T = 256, ~0 at 8,192.
+constexpr std::int32_t kNvfp4DownPasses[] = {1, 3};
+constexpr std::int32_t kMxfp8DownPasses[] = {1, 2, 3, 6};
+
+constexpr std::int32_t max_down_passes(InklingExpertFormat format) {
     return format == InklingExpertFormat::Nvfp4 ? 3 : 6;
 }
 
 template <class Allocate>
-Buffers carve(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank, Allocate&& allocate) {
+Buffers carve(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank, std::int32_t passes,
+              Allocate&& allocate) {
     const std::size_t t     = static_cast<std::size_t>(tokens);
     const std::size_t slots = t * kTopK;
     const bool nvfp4        = format == InklingExpertFormat::Nvfp4;
@@ -87,7 +95,7 @@ Buffers carve(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank
         //             PLACE, so A also holds y_bf16 for the down) | NVFP4: the down pass rows (y is dead after the
         //             y quant);
         //   region B (MXFP8): x_bf16 (dead after gate_up) | the down pass rows.
-        const std::size_t pass_columns = static_cast<std::size_t>(kHidden / down_passes(format));
+        const std::size_t pass_columns = static_cast<std::size_t>(kHidden / passes);
         const std::size_t logits_bytes = t * kExperts * sizeof(float);
         const std::size_t y_bytes      = slots * kIntermediate * sizeof(__nv_bfloat16);
         const std::size_t pass_bytes   = slots * pass_columns * sizeof(__nv_bfloat16);
@@ -179,6 +187,34 @@ void require_weights(const InklingMoeWeights& w) {
     }
 }
 
+/// Bytes of one call's layout (carve) with `passes` down column passes, incl. the alignment slack.
+std::size_t layout_bytes(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank, std::int32_t passes) {
+    std::size_t total = kAlignment; // the arena's offset may be unaligned when the call starts
+    carve(format, tokens, rank, passes, [&](std::size_t bytes) -> void* {
+        total += aligned(bytes);
+        return nullptr;
+    });
+    return total;
+}
+
+/// The fewest down column passes whose layout fits what the caller booked for `workspace_tokens` (0 = unknown:
+/// the compact layout of this call).
+std::int32_t choose_down_passes(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank,
+                                std::int32_t workspace_tokens) {
+    if (tokens <= kNarrowMaxTokens) { return 1; }
+    const std::int32_t most = max_down_passes(format);
+    if (workspace_tokens <= 0) { return most; }
+    const std::size_t booked =
+        layout_bytes(format, std::max(workspace_tokens, tokens), rank, most);
+    const bool nvfp4 = format == InklingExpertFormat::Nvfp4;
+    const std::int32_t* first = nvfp4 ? std::begin(kNvfp4DownPasses) : std::begin(kMxfp8DownPasses);
+    const std::int32_t* last  = nvfp4 ? std::end(kNvfp4DownPasses) : std::end(kMxfp8DownPasses);
+    for (const std::int32_t* passes = first; passes != last; ++passes) {
+        if (layout_bytes(format, tokens, rank, *passes) <= booked) { return *passes; }
+    }
+    return most;
+}
+
 } // namespace
 
 std::size_t inkling_moe_state_bytes() {
@@ -189,16 +225,11 @@ std::size_t inkling_moe_workspace_bytes(InklingExpertFormat format, std::int32_t
     if (max_tokens <= 0) { throw std::invalid_argument("inkling_moe_workspace_bytes: max_tokens must be positive"); }
     // The largest layout of any width <= max_tokens: the narrow one at min(max_tokens, 64) and, above 64,
     // the prefill one at max_tokens (both grow with T).
-    const auto layout_bytes = [&](std::int32_t tokens) {
-        std::size_t total = kAlignment; // the arena's offset may be unaligned when the call starts
-        carve(format, tokens, adapters ? InklingMoeGeometry::kMaxAdapterRank : 0, [&](std::size_t bytes) -> void* {
-            total += aligned(bytes);
-            return nullptr;
-        });
-        return total;
-    };
-    std::size_t total = layout_bytes(std::min(max_tokens, kNarrowMaxTokens));
-    if (max_tokens > kNarrowMaxTokens) { total = std::max(total, layout_bytes(max_tokens)); }
+    const std::int32_t rank = adapters ? InklingMoeGeometry::kMaxAdapterRank : 0;
+    std::size_t total       = layout_bytes(format, std::min(max_tokens, kNarrowMaxTokens), rank, 1);
+    if (max_tokens > kNarrowMaxTokens) {
+        total = std::max(total, layout_bytes(format, max_tokens, rank, max_down_passes(format)));
+    }
     return total;
 }
 
@@ -221,7 +252,8 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         throw std::invalid_argument("inkling_moe: an adapter round needs token slots or a uniform slot");
     }
 
-    const Buffers b = carve(weights.format, tokens, rank, [&](std::size_t bytes) -> void* {
+    const std::int32_t passes = choose_down_passes(weights.format, tokens, rank, options.workspace_tokens);
+    const Buffers b = carve(weights.format, tokens, rank, passes, [&](std::size_t bytes) -> void* {
         return workspace.alloc_bytes(bytes, kAlignment).data;
     });
     const LiveTokens live{options.live_tokens, tokens};
@@ -371,8 +403,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     down.lora        = lora;
     down.arrivals    = b.arrivals; // combine fused into down (summed in slot order by the last arriver)
     down.combined    = static_cast<__nv_bfloat16*>(out.data);
-    // Prefill: column passes (down_passes); the down rows buffer holds one pass's columns.
-    const std::int32_t passes       = narrow ? 1 : down_passes(weights.format);
+    // Prefill: column passes (choose_down_passes); the down rows buffer holds one pass's columns.
     const std::int32_t pass_columns = kHidden / passes;
     for (std::int32_t pass = 0; pass < passes; ++pass) {
         GemmParams columns  = down;
