@@ -782,6 +782,10 @@ __global__ __launch_bounds__(MTiles * 128) void rel_decode_kernel(const AttnPara
 // The split merge of `_rel_decode_combine_kernel` (A6), then the gate and sink (A7) or out / lse.
 template <int Mode>
 __global__ __launch_bounds__(128) void combine_kernel(const AttnParams p) {
+    // One CTA per (column, head), a thread per head dim. The split LSEs are loaded in parallel (a thread per split,
+    // S <= 64), reduced in shared memory; the partial outputs are then summed with the loads of 8 splits in flight.
+    __shared__ float w_s[64];
+    __shared__ float red[4];
     const std::int64_t n         = blockIdx.x;
     const int h                  = static_cast<int>(blockIdx.y);
     const int d                  = static_cast<int>(threadIdx.x);
@@ -789,25 +793,32 @@ __global__ __launch_bounds__(128) void combine_kernel(const AttnParams p) {
     const int b                  = static_cast<int>(n / W);
     const int j                  = static_cast<int>(n % W);
     const std::int64_t n_columns = static_cast<std::int64_t>(W) * p.batch;
+    const int S                  = p.splits;
     int valid                    = W;
     if (p.valid_columns != nullptr) { valid = max(0, min(p.valid_columns[b], W)); }
     const bool ok = j < valid;
 
-    float lmax = -CUDART_INF_F;
-    for (int s = 0; s < p.splits; ++s) {
-        lmax = fmaxf(lmax, p.part_lse2[(s * n_columns + n) * Geo::kQHeads + h]);
-    }
-    const float lm = lmax == -CUDART_INF_F ? 0.0F : lmax;
-    float wsum     = 0.0F;
-    for (int s = 0; s < p.splits; ++s) {
-        wsum = __fadd_rn(wsum, ptx_ex2_ftz(__fsub_rn(p.part_lse2[(s * n_columns + n) * Geo::kQHeads + h], lm)));
-    }
+    const float lse_d = d < S ? p.part_lse2[(d * n_columns + n) * Geo::kQHeads + h] : -CUDART_INF_F;
+    float mx          = warp_max(lse_d);
+    if ((d & 31) == 0) { w_s[d >> 5] = mx; }
+    __syncthreads();
+    mx = fmaxf(fmaxf(w_s[0], w_s[1]), fmaxf(w_s[2], w_s[3]));
+    const float lm = mx == -CUDART_INF_F ? 0.0F : mx;
+    __syncthreads();
+    const float w = d < S ? ptx_ex2_ftz(__fsub_rn(lse_d, lm)) : 0.0F;
+    const float ws = warp_sum(w);
+    if (d < S) { w_s[d] = w; }
+    if ((d & 31) == 0) { red[d >> 5] = ws; }
+    __syncthreads();
+    const float wsum  = __fadd_rn(__fadd_rn(__fadd_rn(red[0], red[1]), red[2]), red[3]); // fixed order: deterministic
     const float denom = wsum == 0.0F ? 1.0F : wsum;
     float o           = 0.0F;
-    for (int s = 0; s < p.splits; ++s) {
-        const std::int64_t part = (s * n_columns + n) * Geo::kQHeads + h;
-        const float w           = ptx_ex2_ftz(__fsub_rn(p.part_lse2[part], lm));
-        if (w > 0.0F) { o = __fadd_rn(o, __fmul_rn(p.part_o[part * Geo::kHeadDim + d], ptx_div_full(w, denom))); }
+    const float* po   = p.part_o + (n * Geo::kQHeads + h) * Geo::kHeadDim + d;
+    const std::int64_t split_stride = n_columns * Geo::kQHeads * Geo::kHeadDim;
+#pragma unroll 8
+    for (int s = 0; s < S; ++s) {
+        const float ww = w_s[s];
+        if (ww > 0.0F) { o = __fadd_rn(o, __fmul_rn(po[s * split_stride], ptx_div_full(ww, denom))); }
     }
     const float lse = __fmul_rn(__fadd_rn(ptx_lg2_ftz(wsum), lm), kLn2);
     if constexpr (Mode == kGated) {
