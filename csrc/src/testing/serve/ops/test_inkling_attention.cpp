@@ -792,6 +792,22 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B4 scan fold", run_inv_route(c.kind, ip, layer, 1, r4));
         compare("decode B8 idle row scan fold", run_inv_route(c.kind, ip, layer, 1, r8));
         ops::inkling_attention_knobs().fold_fast = true;
+        // Decode with the cp.async raw ring (decode_raw 2: both blocks of a group in flight, old blocks staged before the
+        // PDL wait under static metadata) and with register staging (0), whatever the auto rule picks for the default.
+        for (const int raw : {0, 2}) {
+            ops::inkling_attention_knobs().decode_raw = raw;
+            const std::string t = " decode_raw " + std::to_string(raw);
+            compare("decode B1" + t, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}));
+            compare("decode B1 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}, true));
+            compare("decode B4 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r4, true));
+            compare("decode B8 idle row static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r8, true));
+            ops::inkling_attention_knobs().splits = 3;
+            compare("decode B1 workers 3 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}, true));
+            ops::inkling_attention_knobs().splits = 1;
+            compare("decode B4 workers 1 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r4, true));
+            ops::inkling_attention_knobs().splits = 0;
+        }
+        ops::inkling_attention_knobs().decode_raw = 1;
         if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
             g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
             compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
@@ -820,6 +836,14 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         ops::inkling_attention_knobs().splits = 0;
+        for (const int raw : {0, 2}) { // one-row-tile verify (W3) through both decode staging forms
+            ops::inkling_attention_knobs().decode_raw = raw;
+            const std::string t = " decode_raw " + std::to_string(raw);
+            const std::vector<InvRow> r2 = {{r4[0].seq, r4[0].first, std::min(3, r4[0].valid)}, {0, v, std::min(3, w)}};
+            compare("verify W3 B2" + t, run_inv_route(c.kind, ip, layer, 3, r2));
+            compare("verify W3 B2 static metadata" + t, run_inv_route(c.kind, ip, layer, 3, r2, true));
+        }
+        ops::inkling_attention_knobs().decode_raw = 1;
     }
     // The whole segment again with the 4-warp prefill kernel (KS = 1; the default is KS = 2).
     ops::inkling_attention_knobs().prefill_ks = 1;
@@ -2318,6 +2342,42 @@ void run_bench_ab() {
     bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
 }
 
+// Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
+// static metadata off / on; then the engine's fused call (separate prologue + fold kernel) on the decode rows.
+void run_bench_raw() {
+    using K = InklingLayerKind;
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    g_key_groups = ops::InklingKeyGroups::Default;
+    for (const char* meta : {"1", "0"}) {
+        if (meta[0] == '1') { setenv("BENCH_META_STATIC", "1", 1); } else { unsetenv("BENCH_META_STATIC"); }
+        for (const int raw : {0, 2, 1}) {
+            ops::inkling_attention_knobs().decode_raw = raw;
+            const std::string tag = " [raw " + std::to_string(raw) + " meta=" + meta + "]";
+            const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
+            bench_attention(nm("decode local 1x8k"), K::Local, 1, 1, 8191);
+            bench_attention(nm("decode global 1x8k"), K::Global, 1, 1, 8191);
+            bench_attention(nm("decode local 2x8k"), K::Local, 1, 2, 8191);
+            bench_attention(nm("decode local 8x8k"), K::Local, 1, 8, 8191);
+            bench_attention(nm("decode global 8x8k"), K::Global, 1, 8, 8191);
+            bench_attention(nm("decode global 1x64k"), K::Global, 1, 1, 65535);
+            bench_attention(nm("decode global 1x262k"), K::Global, 1, 1, 262143);
+            bench_attention(nm("verify W3 local 1x8k"), K::Local, 3, 1, 8189);
+            bench_attention(nm("verify W3 global 1x8k"), K::Global, 3, 1, 8189);
+        }
+    }
+    setenv("BENCH_META_STATIC", "1", 1);
+    for (const int raw : {0, 2, 1}) {
+        ops::inkling_attention_knobs().decode_raw = raw;
+        const std::string tag = " [raw " + std::to_string(raw) + " meta=1]";
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
+        bench_fused_call(nm("call decode local 1x8k"), K::Local, 1, 1, 8191);
+        bench_fused_call(nm("call decode global 1x8k"), K::Global, 1, 1, 8191);
+        bench_fused_call(nm("call decode local 8x8k"), K::Local, 1, 8, 8191);
+    }
+    ops::inkling_attention_knobs().decode_raw = 1;
+    unsetenv("BENCH_META_STATIC");
+}
+
 // The "GEMM 6 %" question (agent-EN): the qkvr GEMM rows, interleaved three times (pair with the BASE binary's bench).
 void run_bench_gemm() {
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
@@ -2429,6 +2489,10 @@ int main(int argc, char** argv) {
             }
             if (argc > 2 && std::string(argv[2]) == "fold") {
                 run_bench_fold();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "raw") {
+                run_bench_raw();
                 return 0;
             }
             if (argc > 2 && std::string(argv[2]) == "gemm") {

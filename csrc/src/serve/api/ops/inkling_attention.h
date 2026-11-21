@@ -184,6 +184,11 @@ struct InklingAttentionKnobs {
     // (codes = operand A in fragment order from a shared widen pass, x = operand B), 2 = gemm_t_kernel widening each
     // warp's own A fragments (no widened tile). Same bits on every route (test attn_linear width).
     int linear_gemm = 1;
+    // Decode / verify with one row tile (W <= 5), not the in-kernel prologue (SUROGATE_INKLING_ATTN_DECODE_RAW): 0 =
+    // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight, a worker's
+    // old blocks staged before the PDL wait under metadata_static; ~72 KB smem: one CTA an SM) when workers x 8 x B <=
+    // SMs, 2 = the ring always. Same bits either way.
+    int decode_raw = 1;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
