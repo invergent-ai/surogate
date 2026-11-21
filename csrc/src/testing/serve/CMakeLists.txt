@@ -130,6 +130,7 @@ sinfer_add_op_test(sinfer_sparse_moe_fp8_sm90_test SOURCES ops/test_sparse_moe_f
 sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_segments.cpp LIBRARIES sinfer_ops)
 # Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1): T1-T5 of lanes/e1/DESIGN-target.md 8.
 sinfer_add_op_test(sinfer_inkling_mix_test SOURCES targets/inkling2/test_inkling_mix.cpp LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_inkling_invariance.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)
   sinfer_add_op_test(${name}

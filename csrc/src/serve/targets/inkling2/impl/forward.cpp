@@ -11,7 +11,6 @@
 
 #include "api/ops/inkling_mix.h"
 #include "core/device.h"
-#include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -61,14 +60,24 @@ Tensor slot_tensor(const Tensor& x, int slot, int columns) {
     return t;
 }
 
-void gemm_bf16(const Weight& w, std::int32_t row_begin, std::int32_t rows, const void* x, std::int32_t tokens,
-               void* out, std::int32_t ldc, cudaStream_t s) {
+/// The FP32 scratch a split shape of the invariant GEMM needs (none for one chunk), from the round's arena.
+void* gemm_scratch(WorkspaceArena& work, std::size_t bytes) {
+    if (bytes == 0) { return nullptr; }
+    return work.alloc(DType::FP32, {static_cast<std::int32_t>((bytes + 3) / 4)}).data;
+}
+
+/// Every projection runs the batch- and path-invariant GEMM (agent-EN 10:2x): a column's bits depend on the weights
+/// and that column only, never on the round's width or on the other columns.
+void gemm_bf16(WorkspaceArena& work, const Weight& w, std::int32_t row_begin, std::int32_t rows, const void* x,
+               std::int32_t tokens, void* out, std::int32_t ldc, cudaStream_t s) {
     if (w.qtype != QType::BF16_CTRL || w.qdata == nullptr) {
         throw std::logic_error("inkling2: only the BF16 attention / controller weights are wired (FP8 attention: "
                                "lanes b / c, DESIGN 10.1)");
     }
-    const auto* base = static_cast<const std::uint16_t*>(w.qdata) + static_cast<std::int64_t>(row_begin) * w.k;
-    ops::detail::bf16_cublaslt_gemm_raw(base, rows, w.k, x, tokens, out, ldc, 0.0F, s);
+    const auto* base   = static_cast<const std::uint16_t*>(w.qdata) + static_cast<std::int64_t>(row_begin) * w.k;
+    auto scope         = work.scope();
+    const std::size_t bytes = ops::inkling_gemm_inv_workspace_bytes(rows, w.k, tokens, 1);
+    ops::inkling_gemm_inv(base, rows, w.k, x, tokens, out, DType::BF16, ldc, {}, gemm_scratch(work, bytes), bytes, s);
 }
 
 /// One attention / conv call: a prompt segment (B = 1) or the decode / verify block.
@@ -137,18 +146,23 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
         ops::inkling_pair_rms_norm(dest, msg, pair, rd.s);
         Tensor h  = rd.work.alloc(DType::BF16, {C::gate_rank, n, streams});
         Tensor gf = rd.work.alloc(DType::FP32, {2 * D, n, streams});
-        for (int j = 0; j < streams; ++j) {
-            const int stream_index = first_stream + j;
-            const auto* down = bf16_ptr(L.loop_down) + static_cast<std::int64_t>(stream_index) * C::gate_rank * 2 * D;
-            const auto* gfw  = bf16_ptr(L.loop_gain_forget) + static_cast<std::int64_t>(stream_index) * 2 * D * C::gate_rank;
-            ops::detail::bf16_cublaslt_gemm_raw(down, C::gate_rank, 2 * D,
-                                                bf16_ptr(pair) + static_cast<std::int64_t>(j) * n * 2 * D, n,
-                                                bf16_ptr(h) + static_cast<std::int64_t>(j) * n * C::gate_rank,
-                                                C::gate_rank, 0.0F, rd.s);
-            ops::inkling_gemm_bf16_f32(gfw, 2 * D, C::gate_rank,
-                                       bf16_ptr(h) + static_cast<std::int64_t>(j) * n * C::gate_rank, n,
-                                       static_cast<float*>(gf.data) + static_cast<std::int64_t>(j) * n * 2 * D,
-                                       2 * D, rd.s);
+        // The controllers of the `streams` streams, one invariant launch each (down: a split fixed by its 64 x 4608
+        // shape; gain / forget: FP32 out).
+        {
+            const auto* down = bf16_ptr(L.loop_down) + static_cast<std::int64_t>(first_stream) * C::gate_rank * 2 * D;
+            const auto* gfw  = bf16_ptr(L.loop_gain_forget) + static_cast<std::int64_t>(first_stream) * 2 * D * C::gate_rank;
+            const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(C::gate_rank) * 2 * D,
+                                                   static_cast<std::int64_t>(n) * 2 * D,
+                                                   static_cast<std::int64_t>(n) * C::gate_rank};
+            const ops::InklingGemmBatch gf_batch{streams, static_cast<std::int64_t>(2) * D * C::gate_rank,
+                                                 static_cast<std::int64_t>(n) * C::gate_rank,
+                                                 static_cast<std::int64_t>(n) * 2 * D};
+            auto gemm_scope         = rd.work.scope();
+            const std::size_t bytes = ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, n, streams);
+            ops::inkling_gemm_inv(down, C::gate_rank, 2 * D, pair.data, n, h.data, DType::BF16, C::gate_rank,
+                                  down_batch, gemm_scratch(rd.work, bytes), bytes, rd.s);
+            ops::inkling_gemm_inv(gfw, 2 * D, C::gate_rank, h.data, n, gf.data, DType::FP32, 2 * D, gf_batch, nullptr,
+                                  0, rd.s);
         }
         Tensor blended = rd.work.alloc(DType::BF16, {D, n, streams});
         ops::inkling_blend_rms_norm(dest, msg, gf, norm_weight, C::rms_epsilon, blended, rd.s);
@@ -336,20 +350,20 @@ void run_visit(Round& rd, int v) {
     Tensor qkvr = rd.work.alloc(DType::BF16, {C::qkvr_rows, T});
     const auto in = [&](int stream) { return bf16_ptr(attn_in) + static_cast<std::int64_t>(stream) * T * D; };
     if (Q == 1) {
-        gemm_bf16(L.qkvr, 0, C::qkvr_rows, in(0), T, qkvr.data, C::qkvr_rows, s);
+        gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_rows, in(0), T, qkvr.data, C::qkvr_rows, s);
     } else {
-        gemm_bf16(L.qkvr, 0, C::qkvr_query_end, in(0), T, qkvr.data, C::qkvr_rows, s);
-        gemm_bf16(L.qkvr, C::qkvr_k_begin, C::qkvr_v_begin - C::qkvr_k_begin, in(1), T,
+        gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_query_end, in(0), T, qkvr.data, C::qkvr_rows, s);
+        gemm_bf16(rd.work, L.qkvr, C::qkvr_k_begin, C::qkvr_v_begin - C::qkvr_k_begin, in(1), T,
                   bf16_ptr(qkvr) + C::qkvr_k_begin, C::qkvr_rows, s);
-        gemm_bf16(L.qkvr, C::qkvr_v_begin, C::qkvr_rows - C::qkvr_v_begin, in(2), T,
+        gemm_bf16(rd.work, L.qkvr, C::qkvr_v_begin, C::qkvr_rows - C::qkvr_v_begin, in(2), T,
                   bf16_ptr(qkvr) + C::qkvr_v_begin, C::qkvr_rows, s);
     }
     Tensor k_dyn, v_dyn;
     if (vi.global) {
         k_dyn = rd.work.alloc(DType::BF16, {32, T});
         v_dyn = rd.work.alloc(DType::BF16, {32, T});
-        gemm_bf16(*L.k_conv_proj, 0, 32, in(1), T, k_dyn.data, 32, s);
-        gemm_bf16(*L.v_conv_proj, 0, 32, in(2), T, v_dyn.data, 32, s);
+        gemm_bf16(rd.work, *L.k_conv_proj, 0, 32, in(1), T, k_dyn.data, 32, s);
+        gemm_bf16(rd.work, *L.v_conv_proj, 0, 32, in(2), T, v_dyn.data, 32, s);
     }
     // 3. attention per group (NAIVE)
     Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
@@ -413,7 +427,7 @@ void run_visit(Round& rd, int v) {
     dump("gated", v, gated.data, DType::BF16, C::attn_width, C::attn_width, T, 1, s);
     // 4. wo_ud
     Tensor attn_partial = rd.work.alloc(DType::BF16, {D, T});
-    gemm_bf16(L.output, 0, D, gated.data, T, attn_partial.data, D, s);
+    gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
     // 5. attention-output conv
     Tensor attn_out = rd.work.alloc(DType::BF16, {D, T});
     for (const Group& g : rd.groups) {
@@ -539,7 +553,14 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(rd.s, &capturing));
     // A prompt round only (the graph warmup's dummy decode rows come first and are not a parity prompt).
-    d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty();
+    // SUROGATE_SERVE_INKLING_DUMP_MIN_COLUMNS (default 64): the engine's warmup prompt is a few tokens and must not
+    // take the one-shot dump meant for the parity prompt.
+    static const int min_columns = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_DUMP_MIN_COLUMNS");
+        return raw != nullptr ? std::atoi(raw) : 64;
+    }();
+    d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
+               rd.T >= min_columns;
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
     if (d.active) {
         dumped   = true;
@@ -562,6 +583,9 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     // the looped blend tile: dest + msg fp32, pair, h, gf fp32, blended
     bytes += up(tile * D * 3 * 4) + up(tile * D * 3 * 4) + up(tile * 2 * D * 3 * 2) + up(tile * C::gate_rank * 3 * 2) +
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);
+    // the invariant GEMM's split partials: the controller `down` of a blend tile, the dynamic taps of a round
+    bytes += up(ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, static_cast<std::int32_t>(tile), 3));
+    bytes += up(ops::inkling_gemm_inv_workspace_bytes(32, D, static_cast<std::int32_t>(T), 1));
     bytes += naive::moe_workspace_bytes(static_cast<std::int32_t>(T));
     return bytes + (1U << 20);
 }

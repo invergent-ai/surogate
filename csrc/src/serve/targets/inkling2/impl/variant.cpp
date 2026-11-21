@@ -103,16 +103,15 @@ void Variant::lm_head(const ModelView& model, const Tensor& hidden, Tensor& logi
         throw std::logic_error("inkling2: the LM head writes FP32 [201024, T] logits from a [2304, T] hidden");
     }
     const std::int32_t tokens = hidden.ne[1] * hidden.ne[2];
-    ops::inkling_gemm_bf16_f32(model.output_head.qdata, C::output_rows, C::hidden, hidden.data, tokens,
-                               static_cast<float*>(logits.data), C::output_rows, stream);
+    // The invariant GEMM (agent-EN 10:2x): a column's logits do not depend on how many columns share the head.
+    ops::inkling_gemm_inv(model.output_head.qdata, C::output_rows, C::hidden, hidden.data, tokens, logits.data,
+                          DType::FP32, C::output_rows, {}, nullptr, 0, stream);
     ops::inkling_softcap_f32(static_cast<float*>(logits.data), C::output_rows, tokens, C::output_rows,
                              C::logit_softcap, stream);
 }
 
-void Variant::prepare_lm_head(std::int32_t max_columns) {
-    for (std::int32_t t = 1; t <= max_columns; t = t < 16 ? t + 1 : t * 2) {
-        ops::inkling_gemm_f32_prepare(C::output_rows, C::hidden, t, C::output_rows);
-    }
+void Variant::prepare_lm_head(std::int32_t) {
+    // The invariant head needs no per-width plan (the cuBLASLt route it replaced did, before graph capture).
 }
 
 // ---- leaves of the family layer loop (never reached: visit_schedule replaces the loop) ----
